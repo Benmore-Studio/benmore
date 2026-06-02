@@ -1,5 +1,11 @@
 # Benmore
 
+[![CI](https://github.com/Benmore-Studio/benmore/actions/workflows/ci.yml/badge.svg)](https://github.com/Benmore-Studio/benmore/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Benmore-Studio/benmore?sort=semver&display_name=tag)](https://github.com/Benmore-Studio/benmore/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/Benmore-Studio/benmore)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 **Turn Prisma + HTML/TSX + YAML into a self-hostable web app — one Go binary, no Node, no build step.**
 
 Benmore is an application framework. You describe your data in a Prisma schema,
@@ -72,6 +78,46 @@ Everything below is handled by the runtime — no app code required:
 
 See `docs/agent/build.md` and `benmore docs` for the full app-builder guide.
 
+## Project layout
+
+The framework is a single Go binary — one flat `package main` at the repo root,
+no internal packages.
+
+```text
+benmore/
+├─ main.go              # CLI entry point + command dispatch
+├─ *.go                 # the framework: one flat `package main`, ~136 source files (+38 tests)
+├─ embedded/            # frontend assets compiled into the binary
+│                       #   bm SDK, Tailwind, HTMX, Alpine, Chart.js, Lucide, Mermaid, markdown…
+├─ docs/
+│  ├─ agent/build.md    # the app-builder guide (also served by `benmore docs`)
+│  └─ cli-conventions.md
+├─ .github/
+│  ├─ workflows/        # ci.yml (vet · build · test) · release.yml (tag → GoReleaser)
+│  ├─ ISSUE_TEMPLATE/
+│  └─ PULL_REQUEST_TEMPLATE.md
+├─ .goreleaser.yaml     # cross-platform release build (runs in goreleaser-cross)
+├─ install.sh           # one-line installer (the curl command above)
+├─ go.mod · go.sum
+├─ CHANGELOG.md · CLAUDE.md
+└─ LICENSE · NOTICE · SECURITY.md · CONTRIBUTING.md · CODE_OF_CONDUCT.md
+```
+
+The `.go` files group by concern by filename:
+
+| Area | Representative files |
+|---|---|
+| Entry / CLI | `main.go`, `*_dispatch*.go`, `docs.go`, `cli_*` |
+| HTTP · server · realtime | `server.go`, `main_server.go`, `sse.go`, `websocket*.go`, `webrtc.go`, `presence.go` |
+| Auth & security | `auth.go`, `mfa.go`, `oauth_tokens.go`, `rbac.go`, `scopes.go`, `encryption.go`, `blindindex.go`, `ratelimit.go` |
+| Data & schema | `schema*.go`, `crud.go`, `query.go`, `db.go`, `computed.go`, `aggregates*.go`, `fts.go`, `*migrate*.go` |
+| Business logic | `flows.go`, `hooks.go`, `workflows.go`, `pipes*.go`, `compute*.go`, `*recipe*.go` |
+| Frontend / TSX | `bm_tsx_compile.go`, `scaffold_*.go`, `layout.go`, `tailwind_embed.go`, `libs_embed.go` |
+| Ops | `upload*.go`, `pdf.go`, `s3_presign.go`, `media_cdn.go`, `metrics.go`, `cron.go`, `circuitbreaker.go` |
+
+Agents and contributors: see [`CLAUDE.md`](CLAUDE.md) for the build-tag details
+(`sqlite_fts5` / `platform` / `cli`), conventions, and gotchas.
+
 ## Status & scope
 
 This repository is the **open-source Benmore framework** — the engine you can
@@ -83,6 +129,40 @@ commercial product and is **not** part of this repository.
 
 - Go 1.26+
 - A C toolchain (the SQLite driver uses cgo)
+
+## Contributing
+
+Issues and pull requests are welcome. The whole workflow is three commands — no
+Docker, no make, no frontend build:
+
+```bash
+go build -tags sqlite_fts5 -o benmore .   # build
+go vet  -tags sqlite_fts5 ./...           # static analysis — must pass before a PR
+go test -tags sqlite_fts5 ./...           # tests
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards. Please **do
+not** file security vulnerabilities as public issues — follow
+[SECURITY.md](SECURITY.md).
+
+## Releasing
+
+Releases are tag-driven and follow [semantic versioning](https://semver.org).
+Pushing a `vX.Y.Z` tag triggers
+[`release.yml`](.github/workflows/release.yml), which runs
+[GoReleaser](https://goreleaser.com) inside the `goreleaser-cross` image to
+cross-build the cgo binaries for linux/macOS/windows × amd64/arm64 and publish a
+GitHub Release with archives and checksums.
+
+```bash
+# after bumping `version` in main.go and updating CHANGELOG.md:
+git tag -a v2.7.151 -m "benmore v2.7.151"
+git push origin v2.7.151
+```
+
+Past releases and notes live in [CHANGELOG.md](CHANGELOG.md) and on the
+[Releases](https://github.com/Benmore-Studio/benmore/releases) page.
 
 ## License
 
