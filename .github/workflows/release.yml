@@ -1,0 +1,39 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g.:
+#   git tag v2.7.151 && git push origin v2.7.151
+#
+# GoReleaser runs INSIDE the goreleaser-cross image, which carries the cgo
+# cross-toolchains (osxcross / mingw / linux GCCs) the SQLite driver needs to
+# build every target from a single Linux runner.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release + upload assets
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    container:
+      # Pin to the image whose bundled Go matches go.mod. Bump in lockstep with
+      # the `go` directive in go.mod.
+      image: ghcr.io/goreleaser/goreleaser-cross:v1.26.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the changelog can be built
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Release
+        run: goreleaser release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Uncomment when the Homebrew tap + secret are set up (see .goreleaser.yaml):
+          # HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
