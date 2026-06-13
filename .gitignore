@@ -1,0 +1,9 @@
+/benmore
+/benmore-*
+*.db
+*.db-wal
+*.db-shm
+**/uploads/
+**/env.yaml
+**/.benmore/
+.DS_Store
