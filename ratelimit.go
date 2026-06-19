@@ -6,10 +6,17 @@ import (
 	"database/sql"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
+
+// realtimeMaxVisitors bounds the in-memory visitor map. H-17: the map
+// was previously unbounded, so a flood of distinct keys (one per spoofed
+// credential / source IP) could grow it without limit and exhaust memory
+// before the 5-minute cleanup ran. When the cap is reached we evict the
+// stalest entry so the map can never exceed this size. Sized generously
+// so legitimate per-IP traffic on a busy single instance never trips it.
+const realtimeMaxVisitors = 50000
 
 // RateLimiter implements a simple per-IP token bucket rate limiter.
 // In single-instance mode, uses in-memory tracking (fast, zero overhead).
@@ -111,6 +118,14 @@ func (rl *RateLimiter) allowLocal(key string) bool {
 
 	v, exists := rl.visitors[key]
 	if !exists || time.Since(v.lastReset) > rl.window {
+		// H-17: bound the visitor map. Before inserting a brand-new key,
+		// enforce the size cap by evicting the stalest entry. Invariant:
+		// len(rl.visitors) never exceeds realtimeMaxVisitors, so a flood
+		// of distinct keys cannot drive unbounded memory growth between
+		// cleanup ticks.
+		if !exists && len(rl.visitors) >= realtimeMaxVisitors {
+			rl.evictStalestLocked()
+		}
 		rl.visitors[key] = &visitor{tokens: rl.rate - 1, lastReset: time.Now()}
 		return true
 	}
@@ -172,6 +187,26 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
+// evictStalestLocked removes the single least-recently-reset visitor.
+// Caller MUST hold rl.mu. Used as the overflow valve when the map hits
+// realtimeMaxVisitors (H-17): O(n) but only runs at the cap, which a
+// healthy instance never reaches.
+func (rl *RateLimiter) evictStalestLocked() {
+	var oldestKey string
+	var oldest time.Time
+	first := true
+	for k, v := range rl.visitors {
+		if first || v.lastReset.Before(oldest) {
+			oldestKey = k
+			oldest = v.lastReset
+			first = false
+		}
+	}
+	if !first {
+		delete(rl.visitors, oldestKey)
+	}
+}
+
 func (rl *RateLimiter) cleanupShared() {
 	if rl.db == nil {
 		return
@@ -200,30 +235,31 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 			return
 		}
 
-		// Prefer user-based rate limiting when authenticated
-		key := ""
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			key = "user:" + strings.TrimPrefix(auth, "Bearer ")
+		// H-17: NEVER key the bucket on the raw, attacker-supplied
+		// bearer/session value. This middleware runs before (and without
+		// access to app.DB for) token validation, so it cannot tell a
+		// real principal from a forged one. Keying on the raw credential
+		// let an attacker mint a fresh bucket per request simply by
+		// sending a random Bearer token each time - bypassing the anon
+		// limit entirely and growing the visitor map without bound.
+		//
+		// The only principal we can RESOLVE without trusting unvalidated
+		// input is the source IP, so we always key on the host here.
+		// Per-user fairness for *validated* principals is enforced
+		// downstream where the session is actually authenticated; this
+		// budget is the fail-closed anti-abuse floor. RemoteAddr (not
+		// X-Forwarded-For, which is spoofable) is authoritative.
+		//
+		// Key on the HOST only, never the ip:PORT pair: RemoteAddr's
+		// ephemeral port differs every TCP connection, so keying on the
+		// whole thing gave a connection that reconnects per request its
+		// own fresh bucket. SplitHostPort drops the port; fall back to the
+		// raw value if it has no port.
+		host := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			host = h
 		}
-		if key == "" {
-			if cookie, err := r.Cookie("_benmore_session"); err == nil {
-				key = "session:" + cookie.Value
-			}
-		}
-		if key == "" {
-			// Key on the HOST only, never the ip:PORT pair: RemoteAddr's
-			// ephemeral port differs every TCP connection, so keying on the
-			// whole thing gave a connection that reconnects per request its
-			// own fresh bucket - i.e. effectively no anonymous limit, plus a
-			// visitor-map entry per connection. SplitHostPort drops the port;
-			// fall back to the raw value if it has no port. (Still
-			// RemoteAddr, not X-Forwarded-For - that's spoofable.)
-			host := r.RemoteAddr
-			if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-				host = h
-			}
-			key = "ip:" + host
-		}
+		key := "ip:" + host
 
 		if !rl.Allow(key) {
 			http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)

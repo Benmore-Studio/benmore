@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,6 +26,18 @@ type sseClient struct {
 	groupID string
 	isAdmin bool
 }
+
+// LOWER (sse.go): SSE connections previously had no connection cap and no
+// read/idle bound, so a client could open many streams and hold them open
+// indefinitely (slow-loris style) to exhaust server goroutines/sockets.
+//   - realtimeSSEMaxConnsGlobal caps total concurrent SSE streams.
+//   - realtimeSSEMaxConnLifetime forces a stream to close after a bounded
+//     time; EventSource clients auto-reconnect, so this is transparent to
+//     legitimate users but reclaims connections held open by abusers.
+const (
+	realtimeSSEMaxConnsGlobal  = 5000
+	realtimeSSEMaxConnLifetime = 30 * time.Minute
+)
 
 // SSEHub manages SSE connections with per-client scoping.
 type SSEHub struct {
@@ -54,7 +67,14 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		// because broadcastToSSE filters anonymous clients out - only
 		// framework-level reload events deliver to them.
 		var client sseClient
-		if needsAuth && !app.DevMode && !wsAnonymous {
+		// Allow anonymous SSE wherever the dev reload client is injected so
+		// the injected EventSource is never rejected with 401. This must
+		// track devReloadClientEnabled (DevMode || testing) exactly - the
+		// injection gate and the auth gate cannot be allowed to drift, or
+		// testing-mode pages would connect but get rejected and the reload
+		// would never fire.
+		reloadAllowedAnonymous := devReloadClientEnabled(app)
+		if needsAuth && !reloadAllowedAnonymous && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
 				http.Error(w, "authentication required", http.StatusUnauthorized)
@@ -63,7 +83,7 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 			client.userID = session.UserID
 			client.groupID = session.GroupID
 			client.isAdmin = session.IsAdmin()
-		} else if needsAuth && (app.DevMode || wsAnonymous) {
+		} else if needsAuth && (reloadAllowedAnonymous || wsAnonymous) {
 			// Try to attach session metadata if present so the dev
 			// connection still receives scoped data events when the
 			// user is logged in.
@@ -100,7 +120,15 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		w.Header().Set("X-Accel-Buffering", "no") // for nginx
 
 		client.ch = make(chan string, 10)
+		// LOWER: enforce the global SSE connection cap under the write
+		// lock so the hub size can never exceed realtimeSSEMaxConnsGlobal,
+		// even under a flood of concurrent connects.
 		sseHub.mu.Lock()
+		if len(sseHub.clients) >= realtimeSSEMaxConnsGlobal {
+			sseHub.mu.Unlock()
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
 		sseHub.clients[&client] = true
 		sseHub.mu.Unlock()
 
@@ -120,8 +148,18 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		ticker := time.NewTicker(25 * time.Second)
 		defer ticker.Stop()
 
+		// LOWER: bound the connection lifetime. Without this an idle or
+		// deliberately-stalled client could hold the stream (and its
+		// goroutine) open forever. EventSource transparently reconnects
+		// after the server closes, so capping lifetime is invisible to
+		// legitimate clients but caps the resource an abuser can pin.
+		maxLifetime := time.NewTimer(realtimeSSEMaxConnLifetime)
+		defer maxLifetime.Stop()
+
 		for {
 			select {
+			case <-maxLifetime.C:
+				return
 			case msg, ok := <-client.ch:
 				if !ok {
 					return
@@ -167,7 +205,8 @@ func BroadcastReload(reason string) {
 	if reason == "" {
 		reason = "src-changed"
 	}
-	payload := `reload|{"reason":"` + reason + `"}`
+	data, _ := json.Marshal(map[string]string{"reason": reason})
+	payload := `reload|` + string(data)
 	sseHub.mu.RLock()
 	n := len(sseHub.clients)
 	for c := range sseHub.clients {
@@ -221,7 +260,10 @@ func BroadcastChangeScoped(table, action string, groupID string, userID int64) {
 const SSEClientScript = `
 (function() {
   if (!document.querySelector('[data-live]') && !document.querySelector('[data-live-table]')) return;
-  var source = new EventSource('/sse/events');
+  // Reuse a single shared EventSource so a page that also injects the dev
+  // reload client does not open two connections (two sseClient entries) per
+  // tab. The dev reload script attaches its own listener to the same source.
+  var source = window.__bmSSE || (window.__bmSSE = new EventSource('/sse/events'));
   source.addEventListener('change', function(e) {
     try {
       var data = JSON.parse(e.data);
@@ -233,3 +275,33 @@ const SSEClientScript = `
   source.onerror = function() { source.close(); };
 })();
 `
+
+// DevReloadClientScript listens for framework-level hot reload events.
+// It is injected only in dev/testing pages, independent of live data
+// components, so a plain static HTML page reloads after a SIGHUP swap.
+const DevReloadClientScript = `
+(function() {
+  if (window.__bmDevReloadClient) return;
+  window.__bmDevReloadClient = true;
+  // Reuse the shared EventSource if SSEClientScript already opened one (live
+  // page), otherwise open our own. Either way only a single connection per
+  // tab is created.
+  var source = window.__bmSSE || (window.__bmSSE = new EventSource('/sse/events'));
+  source.addEventListener('reload', function() {
+    if (window.__bmDevReloading) return;
+    window.__bmDevReloading = true;
+    // Defer briefly so the server can flush the SSE write and any rapidly
+    // coalesced reload events settle before we navigate away.
+    setTimeout(function() { window.location.reload(); }, 25);
+  });
+  // Without this, a 401 (auth app outside DevMode/testing) or a disabled
+  // sse feature makes EventSource reconnect roughly every 3s forever,
+  // flooding the server with failing requests. Close on error to match
+  // SSEClientScript.
+  source.onerror = function() { source.close(); };
+})();
+`
+
+func devReloadClientEnabled(app *App) bool {
+	return app != nil && (app.DevMode || app.FeatureEnabled("testing"))
+}

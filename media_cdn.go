@@ -305,6 +305,15 @@ func cfBase64(b []byte) string {
 
 // signCloudFrontURL builds a CloudFront canned-policy signed URL (RSA-SHA1)
 // valid until `expires` (unix seconds). resourceURL is the full https URL.
+//
+// SECURITY CONSTRAINT: the RSA-SHA1 signature here is NOT a free choice - it is
+// the only algorithm AWS CloudFront accepts for signed URLs/cookies, so it
+// cannot be upgraded to SHA-256 without CloudFront rejecting the signature.
+// Because the digest can't be strengthened, the mitigation is to keep `expires`
+// SHORT: a leaked signed URL is a replayable bearer credential until it expires,
+// so the caller (RegisterSignedURLRoutes) clamps the TTL to oauthMaxSignedURLTTL
+// rather than the prior 24h. Keep that cap tight; do not widen the window to
+// compensate for the weak-by-mandate signing alg.
 func signCloudFrontURL(resourceURL string, expires int64, keyPairID string, priv *rsa.PrivateKey) (string, error) {
 	if priv == nil || keyPairID == "" {
 		return "", fmt.Errorf("media: CloudFront signing not configured (key pair id / private key missing)")

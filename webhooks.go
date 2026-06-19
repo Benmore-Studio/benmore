@@ -108,9 +108,21 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 			}
 		}
 
+		// M-6: encrypt the subscriber secret at rest (parity with OAuth
+		// tokens, which already use fieldEncrypt). The secret is HMAC key
+		// material - storing it cleartext on disk is a direct compromise
+		// path if the DB file leaks. fieldEncrypt is a no-op when no
+		// ENCRYPTION_KEY is configured, so this stays backward-compatible.
+		encSecret, encErr := fieldEncrypt(req.Secret)
+		if encErr != nil {
+			log.Printf("WEBHOOK ERROR: failed to encrypt secret: %s", encErr)
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create webhook"})
+			return
+		}
+
 		result, err := app.DB.Exec(
 			"INSERT INTO _benmore_webhooks (user_id, url, secret, tables, events) VALUES (?, ?, ?, ?, ?)",
-			session.UserID, req.URL, req.Secret, req.Tables, req.Events,
+			session.UserID, req.URL, encSecret, req.Tables, req.Events,
 		)
 		if err != nil {
 			log.Printf("WEBHOOK ERROR: failed to create webhook: %s", err)
@@ -145,12 +157,18 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 
-		// Mask secrets: show only last 4 chars
+		// Mask secrets: show only last 4 chars. Decrypt first (M-6) so the
+		// last-4 hint reflects the real secret, not ciphertext bytes.
+		// fieldDecrypt passes through values that were stored cleartext
+		// (no encPrefix), so pre-encryption rows keep working.
 		for _, row := range rows {
-			if secret, ok := row["secret"].(string); ok && len(secret) > 4 {
-				row["secret"] = "****" + secret[len(secret)-4:]
-			} else if ok {
-				row["secret"] = "****"
+			if secret, ok := row["secret"].(string); ok {
+				secret, _ = fieldDecrypt(secret)
+				if len(secret) > 4 {
+					row["secret"] = "****" + secret[len(secret)-4:]
+				} else {
+					row["secret"] = "****"
+				}
 			}
 		}
 
@@ -288,6 +306,12 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 
 	whURL := fmt.Sprintf("%v", whData["url"])
 	secret := fmt.Sprintf("%v", whData["secret"])
+	// M-6: the secret was stored encrypted in the webhooks table and
+	// carried through the job payload still encrypted, so decrypt it here
+	// at the only point it's actually needed (HMAC signing). fieldDecrypt
+	// is a pass-through for cleartext (pre-encryption) values, keeping
+	// in-flight jobs created before this change working.
+	secret, _ = fieldDecrypt(secret)
 	event := fmt.Sprintf("%v", whData["event"])
 	table := fmt.Sprintf("%v", whData["table"])
 

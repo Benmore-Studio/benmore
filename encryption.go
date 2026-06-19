@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,12 +21,29 @@ import (
 	"strings"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/argon2"
 	"gopkg.in/yaml.v3"
 )
 
 // Field encryption prefix - makes encrypted values self-describing.
 // scanRows auto-decrypts any value starting with this prefix.
+//
+// Two on-disk ciphertext versions coexist:
+//   - encPrefix   ("enc:v1:") legacy AES-256-GCM, NO additional
+//     authenticated data (AAD). Still DECRYPTABLE for backward compat;
+//     never produced on new writes.
+//   - encPrefixV2 ("enc:v2:") AES-256-GCM with table||column bound as
+//     AAD (see M-3). New writes use v2 whenever the column context is
+//     known (the SQLite trigger path passes it); otherwise v2 with an
+//     empty AAD context. Any value that still carries the v1 prefix is
+//     decrypted with the legacy no-AAD path.
 const encPrefix = "enc:v1:"
+
+// encPrefixV2 tags AAD-bound ciphertext. The benmore_decrypt SQL function,
+// DecryptRowFields, and the rotation primitive all dispatch on prefix so
+// v1 and v2 values can sit side-by-side in the same column during a
+// gradual re-encrypt / key rotation.
+const encPrefixV2 = "enc:v2:"
 
 // stringifyForCrypto produces a stable, deterministic TEXT
 // representation of any scalar SQLite value for crypto operations
@@ -76,6 +94,20 @@ func stringifyForCrypto(v any) string {
 	default:
 		return fmt.Sprintf("%v", x)
 	}
+}
+
+// cryptoCtxArgs extracts the optional (table, column) context passed to
+// the benmore_encrypt / benmore_decrypt SQL functions as trailing
+// arguments. Either may be absent (returns ""). Used to bind v2
+// ciphertext to its column via GCM AAD (M-3).
+func cryptoCtxArgs(ctx []any) (table, column string) {
+	if len(ctx) >= 1 && ctx[0] != nil {
+		table = stringifyForCrypto(ctx[0])
+	}
+	if len(ctx) >= 2 && ctx[1] != nil {
+		column = stringifyForCrypto(ctx[1])
+	}
+	return table, column
 }
 
 // appEncryptionKey holds the derived 32-byte AES key for the current app.
@@ -170,8 +202,11 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 		}
 	}
 
-	hash := sha256.Sum256([]byte(keyStr))
-	appEncryptionKey = hash[:]
+	derived, err := cryptoDeriveAppKey(keyStr)
+	if err != nil {
+		return fmt.Errorf("encryption key derivation: %w", err)
+	}
+	appEncryptionKey = derived
 	// Blind-index key is HKDF-derived from the AES key so it has the
 	// same lifecycle (rotated with the encryption key) but is
 	// cryptographically distinct material. Failure to derive is fatal
@@ -270,41 +305,58 @@ func RegisterEncryptedSQLiteDriver() {
 			//      coerces back to the declared column type
 			//      (DecryptRowFields → scanRows). A REAL column
 			//      written as 1.5 must come back as 1.5, not 1.500000.
-			if err := conn.RegisterFunc("benmore_encrypt", func(value any) (any, error) {
+			// benmore_encrypt(value[, table, column]) → "enc:v2:...".
+			// The optional table/column context (passed by the auto-
+			// encryption triggers as SQL literals) binds the ciphertext
+			// to its location via GCM AAD (M-3), so a DB-writer can't move
+			// an encrypted value to another column and still decrypt it.
+			// Called with one arg (no context) it still encrypts, just
+			// without the column binding - backward compatible with any
+			// hand-written SQL that calls benmore_encrypt(col).
+			if err := conn.RegisterFunc("benmore_encrypt", func(value any, ctx ...any) (any, error) {
 				if value == nil {
 					return nil, nil
 				}
 				plaintext := stringifyForCrypto(value)
+				// M-2: fail closed. Without a key we must NOT write
+				// plaintext into a column declared encrypted.
 				if appEncryptionKey == nil {
 					return "", fmt.Errorf("benmore_encrypt called but ENCRYPTION_KEY not initialized")
 				}
-				if strings.HasPrefix(plaintext, encPrefix) {
-					return plaintext, nil // already encrypted - idempotent
+				if cryptoIsEncrypted(plaintext) {
+					return plaintext, nil // already encrypted (v1 or v2) - idempotent
 				}
-				return fieldEncrypt(plaintext)
+				table, column := cryptoCtxArgs(ctx)
+				return fieldEncryptCtx(appEncryptionKey, table, column, plaintext)
 			}, true); err != nil {
 				return err
 			}
 
-			// benmore_decrypt(ciphertext) → plaintext (always TEXT).
+			// benmore_decrypt(ciphertext[, table, column]) → plaintext (TEXT).
 			// Type coercion back to INTEGER/REAL happens at the read
 			// boundary (scanRows) where the column's declared schema
 			// type is known. Keeping the SQL function returning TEXT
 			// avoids guesswork - a SQL caller of benmore_decrypt
 			// always sees the raw plaintext string and decides what
 			// to do with it.
-			if err := conn.RegisterFunc("benmore_decrypt", func(value any) (string, error) {
+			//
+			// When the column is supplied it is enforced against the v2
+			// AAD binding (M-3): decrypting a value whose embedded column
+			// doesn't match fails closed instead of returning a moved
+			// plaintext. Legacy v1 values carry no AAD and skip the check.
+			if err := conn.RegisterFunc("benmore_decrypt", func(value any, ctx ...any) (string, error) {
 				if value == nil {
 					return "", nil
 				}
 				s := stringifyForCrypto(value)
-				if !strings.HasPrefix(s, encPrefix) {
+				if !cryptoIsEncrypted(s) {
 					return s, nil // not encrypted - return as-is
 				}
 				if appEncryptionKey == nil {
 					return "", fmt.Errorf("benmore_decrypt called but ENCRYPTION_KEY not initialized")
 				}
-				return fieldDecrypt(s)
+				_, column := cryptoCtxArgs(ctx)
+				return fieldDecryptCtx(appEncryptionKey, column, s)
 			}, true); err != nil {
 				return err
 			}
@@ -368,11 +420,17 @@ func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 	for table, defs := range config.Fields {
 		for _, def := range defs {
 			col := def.Column
+			// table/column SQL string literals passed to benmore_encrypt
+			// so the ciphertext is GCM-AAD-bound to its location (M-3).
+			// Single-quotes doubled defensively even though these are
+			// framework-controlled identifiers, not user input.
+			tableLit := "'" + strings.ReplaceAll(table, "'", "''") + "'"
+			colLit := "'" + strings.ReplaceAll(col, "'", "''") + "'"
 			// AFTER INSERT: encrypt the column value
 			triggerName := fmt.Sprintf("_benmore_enc_%s_%s_insert", table, col)
 			triggerSQL := fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s) WHERE id = NEW.id; END",
-				triggerName, table, col, col, table, col, col,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s, %s, %s) WHERE id = NEW.id; END",
+				triggerName, table, col, col, table, col, col, tableLit, colLit,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
 				log.Printf("ENCRYPTION TRIGGER ERROR [%s]: %s", triggerName, err)
@@ -383,8 +441,8 @@ func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 			// AFTER UPDATE: encrypt if value changed and isn't already encrypted
 			triggerName = fmt.Sprintf("_benmore_enc_%s_%s_update", table, col)
 			triggerSQL = fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s) WHERE id = NEW.id; END",
-				triggerName, col, table, col, col, table, col, col,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s, %s, %s) WHERE id = NEW.id; END",
+				triggerName, col, table, col, col, table, col, col, tableLit, colLit,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
 				log.Printf("ENCRYPTION TRIGGER ERROR [%s]: %s", triggerName, err)
@@ -676,13 +734,24 @@ func encryptOneAuditField(row map[string]any, key string) {
 		// only encryption, see integer-encryption TODO). Leave as-is.
 		return
 	}
-	if s == "" || strings.HasPrefix(s, encPrefix) {
-		// Empty or already-encrypted - idempotent.
+	if s == "" || cryptoIsEncrypted(s) {
+		// Empty or already-encrypted (v1 or v2) - idempotent.
 		return
 	}
+	// Audit-log copies live in a different storage shape (JSON blob) than
+	// the source table, so there's no stable table/column to bind as AAD
+	// here - encrypt without context. The value is still confidential at
+	// rest; the M-3 column-move protection applies to the source columns.
 	if enc, err := fieldEncrypt(s); err == nil {
 		row[key] = enc
 	}
+}
+
+// cryptoIsEncrypted reports whether s carries a field-encryption prefix
+// (legacy v1 or AAD-bound v2). Centralised so prefix checks stay in sync
+// as new versions are added.
+func cryptoIsEncrypted(s string) bool {
+	return strings.HasPrefix(s, encPrefix) || strings.HasPrefix(s, encPrefixV2)
 }
 
 // DecryptRowFields auto-decrypts any values in a row that have the enc: prefix.
@@ -692,15 +761,125 @@ func DecryptRowFields(row map[string]any) {
 		return
 	}
 	for k, v := range row {
-		if s, ok := v.(string); ok && strings.HasPrefix(s, encPrefix) {
-			if decrypted, err := fieldDecrypt(s); err == nil {
+		if s, ok := v.(string); ok && cryptoIsEncrypted(s) {
+			// Pass expectColumn="" here: a result-set key may be an alias
+			// or a JOINed column, so we can't reliably equate it with the
+			// AAD-bound source column without false rejections. The v2 AAD
+			// is still GCM-authenticated (tamper-evident); strict column-
+			// move enforcement happens in the benmore_decrypt SQL function
+			// where the true column is known.
+			if decrypted, err := fieldDecryptCtx(appEncryptionKey, "", s); err == nil {
 				row[k] = decrypted
 			}
 		}
 	}
 }
 
+// ===== Key derivation (M-4) =====
+
+// cryptoArgon2Prefix tags an ENCRYPTION_KEY value that should be stretched
+// with Argon2id instead of a bare SHA-256. Format (all fields decimal /
+// base64-std, '$'-separated):
+//
+//	argon2id$<timeCost>$<memKiB>$<parallelism>$<base64Salt>$<base64Secret>
+//
+// The derived AES key is Argon2id over <Secret> with <Salt>. This is the
+// opt-in strong path: an operator who has a human passphrase encodes it
+// once (a small helper / docs cover the encoding) and from then on the
+// passphrase is no longer offline-brute-forceable at SHA-256 speed, and
+// the per-tenant salt makes identical passphrases derive distinct keys.
+const cryptoArgon2Prefix = "argon2id$"
+
+// cryptoDeriveAppKey turns the ENCRYPTION_KEY source string into the
+// 32-byte AES-256 key.
+//
+// Versioned, backward-compatible derivation (M-4):
+//
+//   - "argon2id$..."  → Argon2id(secret, salt) with embedded params. The
+//     safe path for human passphrases: salted + memory-hard, so identical
+//     operator strings across tenants no longer collide and offline brute
+//     force is expensive.
+//   - 64 hex chars / 44-char base64 of exactly 32 bytes → ALREADY strong
+//     random key material. We feed it through SHA-256 to land on 32 bytes,
+//     which is exactly what InitFieldEncryption + RotateEncryptionKey have
+//     always done, so existing ciphertext keeps decrypting.
+//   - anything else (a raw passphrase) → legacy SHA-256(passphrase). This
+//     is preserved ONLY for backward compatibility with data already
+//     encrypted under the v1 single-SHA-256 scheme; changing it would make
+//     every existing row undecryptable. We log a loud warning steering the
+//     operator to strong key material or the argon2id$ path.
+func cryptoDeriveAppKey(keyStr string) ([]byte, error) {
+	if strings.HasPrefix(keyStr, cryptoArgon2Prefix) {
+		return cryptoDeriveArgon2(keyStr)
+	}
+	if !cryptoIsStrongKeyMaterial(keyStr) {
+		// Warn but stay back-compat: existing rows were sealed under
+		// SHA-256(passphrase) and MUST keep decrypting.
+		log.Printf("  encryption: WARN ENCRYPTION_KEY looks like a human passphrase, not 32 bytes of random key material. " +
+			"Human passphrases are offline-brute-forceable and identical across tenants. " +
+			"Use `openssl rand -hex 32`, or the argon2id$ key format, for new apps.")
+	}
+	// Legacy v1 derivation - kept for backward compatibility.
+	hash := sha256.Sum256([]byte(keyStr))
+	out := make([]byte, len(hash))
+	copy(out, hash[:])
+	return out, nil
+}
+
+// cryptoIsStrongKeyMaterial reports whether keyStr is exactly 32 bytes of
+// random material encoded as hex or standard/URL base64 - i.e. the output
+// of `openssl rand -hex 32` / `rand -base64 32`. Used only to decide
+// whether to emit the weak-passphrase warning; derivation is unchanged.
+func cryptoIsStrongKeyMaterial(keyStr string) bool {
+	if b, err := hex.DecodeString(keyStr); err == nil && len(b) == 32 {
+		return true
+	}
+	if b, err := base64.StdEncoding.DecodeString(keyStr); err == nil && len(b) == 32 {
+		return true
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(keyStr); err == nil && len(b) == 32 {
+		return true
+	}
+	return false
+}
+
+// cryptoDeriveArgon2 parses the argon2id$ envelope and stretches the
+// embedded secret with the embedded salt + params into a 32-byte key.
+func cryptoDeriveArgon2(keyStr string) ([]byte, error) {
+	parts := strings.Split(keyStr, "$")
+	// argon2id $ time $ mem $ par $ salt $ secret  => 6 fields
+	if len(parts) != 6 || parts[0] != "argon2id" {
+		return nil, fmt.Errorf("argon2id key must be argon2id$<time>$<memKiB>$<par>$<b64salt>$<b64secret>")
+	}
+	timeCost, err1 := strconv.ParseUint(parts[1], 10, 32)
+	memKiB, err2 := strconv.ParseUint(parts[2], 10, 32)
+	par, err3 := strconv.ParseUint(parts[3], 10, 8)
+	if err1 != nil || err2 != nil || err3 != nil || timeCost == 0 || memKiB == 0 || par == 0 {
+		return nil, fmt.Errorf("argon2id params must be positive integers")
+	}
+	salt, err := base64.StdEncoding.DecodeString(parts[4])
+	if err != nil || len(salt) < 8 {
+		return nil, fmt.Errorf("argon2id salt must be >=8 bytes of base64")
+	}
+	secret, err := base64.StdEncoding.DecodeString(parts[5])
+	if err != nil || len(secret) == 0 {
+		return nil, fmt.Errorf("argon2id secret must be non-empty base64")
+	}
+	return argon2.IDKey(secret, salt, uint32(timeCost), uint32(memKiB), uint8(par), 32), nil
+}
+
 // ===== AES-256-GCM field encryption =====
+
+// cryptoBuildAAD assembles the additional-authenticated-data string that
+// binds a v2 ciphertext to its location (M-3). Encoded as
+// "<table>\x00<column>". GCM authenticates this value, so a DB-writer who
+// copies an encrypted blob into a different column/table produces an AAD
+// mismatch and decryption FAILS closed rather than silently returning the
+// moved plaintext. Either component may be empty when the context isn't
+// known at the call site.
+func cryptoBuildAAD(table, column string) []byte {
+	return []byte(table + "\x00" + column)
+}
 
 func fieldEncrypt(plaintext string) (string, error) {
 	return fieldEncryptWithKey(appEncryptionKey, plaintext)
@@ -709,9 +888,33 @@ func fieldEncrypt(plaintext string) (string, error) {
 // fieldEncryptWithKey is the explicit-key variant - used by the key
 // rotation primitive so the rotator can re-encrypt against a NEW key
 // while the global appEncryptionKey is still set to the OLD one.
+//
+// AAD-less convenience wrapper around fieldEncryptCtx. Callers that know
+// the table/column should use fieldEncryptCtx so the ciphertext is bound
+// to its location (M-3).
 func fieldEncryptWithKey(key []byte, plaintext string) (string, error) {
+	return fieldEncryptCtx(key, "", "", plaintext)
+}
+
+// fieldEncryptCtx seals plaintext with AES-256-GCM, binding table||column
+// as AAD, and emits a v2 envelope:
+//
+//	enc:v2:<hex(aad)>:<hex(nonce||ciphertext)>
+//
+// The AAD is stored in the envelope so a context-free decrypt (e.g. the
+// rotation re-encrypt loop, which only sees the blob) can still recover
+// the exact bytes GCM authenticated. GCM integrity means tampering with
+// the stored AAD breaks decryption; an additional caller-supplied-context
+// check (fieldDecryptCtx) catches column moves where the stored AAD is
+// internally consistent but points at the wrong column.
+func fieldEncryptCtx(key []byte, table, column, plaintext string) (string, error) {
+	// M-2: fail closed. The Go helper used to return plaintext when the
+	// key was nil, silently writing cleartext into a column declared
+	// encrypted (the SQL benmore_encrypt already failed closed - this
+	// brings the Go path in line). A missing key is a configuration
+	// error, never a license to store plaintext.
 	if key == nil {
-		return plaintext, nil
+		return "", fmt.Errorf("field encryption requested but no encryption key is initialized (ENCRYPTION_KEY missing)")
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -725,39 +928,49 @@ func fieldEncryptWithKey(key []byte, plaintext string) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", err
 	}
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	aad := cryptoBuildAAD(table, column)
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), aad)
 	incEncryptionEnc()
-	return encPrefix + hex.EncodeToString(ciphertext), nil
+	return encPrefixV2 + hex.EncodeToString(aad) + ":" + hex.EncodeToString(ciphertext), nil
 }
 
 func fieldDecrypt(value string) (string, error) {
-	if appEncryptionKey == nil {
-		return value, nil
-	}
-
-	if !strings.HasPrefix(value, encPrefix) {
-		return value, nil
-	}
-	return fieldDecryptWithKey(appEncryptionKey, value)
+	return fieldDecryptCtx(appEncryptionKey, "", value)
 }
 
 // fieldDecryptWithKey is the explicit-key variant - used by the key
 // rotation primitive so the rotator can decrypt with the OLD key
 // while the global appEncryptionKey may already point at the NEW one.
 func fieldDecryptWithKey(key []byte, value string) (string, error) {
-	if key == nil {
-		return value, nil
+	return fieldDecryptCtx(key, "", value)
+}
+
+// fieldDecryptCtx decrypts a v1 (no-AAD) or v2 (AAD-bound) ciphertext.
+//
+// expectColumn, when non-empty, is the column the value is being read
+// from. For v2 values it is checked against the column component embedded
+// in the authenticated AAD: a mismatch means the blob was moved between
+// columns by a DB-writer, so we fail closed rather than hand back the
+// plaintext that GCM would otherwise validate (it validates because the
+// stored AAD is self-consistent; only the caller knows the expected
+// location). v1 values predate AAD and skip this check.
+func fieldDecryptCtx(key []byte, expectColumn, value string) (string, error) {
+	switch {
+	case strings.HasPrefix(value, encPrefixV2):
+		// fall through to v2 path
+	case strings.HasPrefix(value, encPrefix):
+		// fall through to legacy v1 path
+	default:
+		return value, nil // not encrypted - return as-is
 	}
-	if !strings.HasPrefix(value, encPrefix) {
-		return value, nil
+	if key == nil {
+		// M-2 (read side): no key means we cannot authenticate the
+		// ciphertext. Never strip the prefix and hand back a raw blob as
+		// if it were plaintext; surface the misconfiguration instead.
+		return "", fmt.Errorf("encrypted value encountered but no encryption key is initialized (ENCRYPTION_KEY missing)")
 	}
 	incEncryptionDec()
 
-	ciphertextHex := strings.TrimPrefix(value, encPrefix)
-	ciphertext, err := hex.DecodeString(ciphertextHex)
-	if err != nil {
-		return "", err
-	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -767,15 +980,66 @@ func fieldDecryptWithKey(key []byte, value string) (string, error) {
 		return "", err
 	}
 	nonceSize := gcm.NonceSize()
+
+	if strings.HasPrefix(value, encPrefixV2) {
+		body := strings.TrimPrefix(value, encPrefixV2)
+		sep := strings.IndexByte(body, ':')
+		if sep < 0 {
+			return "", fmt.Errorf("malformed v2 ciphertext envelope")
+		}
+		aad, err := hex.DecodeString(body[:sep])
+		if err != nil {
+			return "", fmt.Errorf("v2 ciphertext: bad AAD encoding: %w", err)
+		}
+		// Bind-check: the stored AAD's column component must match the
+		// column we're reading from. Catches a DB-writer relocating an
+		// encrypted value to a different column.
+		if expectColumn != "" {
+			if _, gotCol, ok := cryptoParseAAD(aad); !ok || gotCol != expectColumn {
+				return "", fmt.Errorf("v2 ciphertext AAD does not match column %q (value may have been moved)", expectColumn)
+			}
+		}
+		ciphertext, err := hex.DecodeString(body[sep+1:])
+		if err != nil {
+			return "", err
+		}
+		if len(ciphertext) < nonceSize {
+			return "", fmt.Errorf("ciphertext too short")
+		}
+		nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
+		plaintext, err := gcm.Open(nil, nonce, ct, aad)
+		if err != nil {
+			return "", err
+		}
+		return string(plaintext), nil
+	}
+
+	// Legacy v1: no AAD.
+	ciphertextHex := strings.TrimPrefix(value, encPrefix)
+	ciphertext, err := hex.DecodeString(ciphertextHex)
+	if err != nil {
+		return "", err
+	}
 	if len(ciphertext) < nonceSize {
 		return "", fmt.Errorf("ciphertext too short")
 	}
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
 		return "", err
 	}
 	return string(plaintext), nil
+}
+
+// cryptoParseAAD splits a "<table>\x00<column>" AAD blob back into its
+// components. ok is false when the blob isn't in the expected shape.
+func cryptoParseAAD(aad []byte) (table, column string, ok bool) {
+	i := strings.IndexByte(string(aad), 0)
+	if i < 0 {
+		return "", "", false
+	}
+	s := string(aad)
+	return s[:i], s[i+1:], true
 }
 
 // ===== Key rotation =====
@@ -836,8 +1100,14 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	if len(newKeySource) < 32 {
 		return 0, fmt.Errorf("new key source must be at least 32 chars for adequate entropy (got %d). Use `openssl rand -hex 32` to generate a strong one.", len(newKeySource))
 	}
-	derivedNew := sha256.Sum256([]byte(newKeySource))
-	newKey := derivedNew[:]
+	// Derive the new AES key via the SAME versioned derivation as
+	// InitFieldEncryption (M-4), so a restart that re-reads the persisted
+	// source string lands on the identical key (whether it's strong hex
+	// material or an argon2id$ envelope).
+	newKey, err := cryptoDeriveAppKey(newKeySource)
+	if err != nil {
+		return 0, fmt.Errorf("derive new key: %w", err)
+	}
 
 	// Refuse no-op rotation (would re-encrypt every row with the same
 	// key - pointless work + audit-log noise). Constant-time compare
@@ -858,7 +1128,10 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	totalRows := 0
 	for table, defs := range app.Encrypted.Fields {
 		for _, def := range defs {
-			q := fmt.Sprintf("SELECT id FROM %s WHERE %s LIKE 'enc:v1:%%'", table, def.Column)
+			// Catch BOTH legacy v1 and AAD-bound v2 ciphertext (M-3) so a
+			// key rotation re-encrypts every encrypted row regardless of
+			// which format it was last written in.
+			q := fmt.Sprintf("SELECT id FROM %s WHERE %s LIKE 'enc:v1:%%' OR %s LIKE 'enc:v2:%%'", table, def.Column, def.Column)
 			rows, err := app.DB.Query(q)
 			if err != nil {
 				return 0, fmt.Errorf("count rows for %s.%s: %w", table, def.Column, err)
@@ -893,11 +1166,17 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 			if err := app.DB.QueryRow(fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", p.Column, p.Table), id).Scan(&raw); err != nil {
 				return rotated, fmt.Errorf("rotate %s.%s id=%d: read: %w", p.Table, p.Column, id, err)
 			}
-			plaintext, err := fieldDecryptWithKey(oldKey, raw)
+			// Decrypt enforcing the v2 column binding: a value whose AAD
+			// names a different column than where it lives is a tamper /
+			// move and must not be silently re-bound under the new key.
+			// v1 values carry no AAD and skip the check.
+			plaintext, err := fieldDecryptCtx(oldKey, p.Column, raw)
 			if err != nil {
-				return rotated, fmt.Errorf("rotate %s.%s id=%d: decrypt with OLD key: %w (row may be corrupt or already rotated)", p.Table, p.Column, id, err)
+				return rotated, fmt.Errorf("rotate %s.%s id=%d: decrypt with OLD key: %w (row may be corrupt, moved, or already rotated)", p.Table, p.Column, id, err)
 			}
-			recrypted, err := fieldEncryptWithKey(newKey, plaintext)
+			// Re-encrypt as v2, re-binding table||column as AAD (M-3) so
+			// rotation upgrades legacy v1 rows to the bound format too.
+			recrypted, err := fieldEncryptCtx(newKey, p.Table, p.Column, plaintext)
 			if err != nil {
 				return rotated, fmt.Errorf("rotate %s.%s id=%d: encrypt with NEW key: %w", p.Table, p.Column, id, err)
 			}

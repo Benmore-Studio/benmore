@@ -34,6 +34,12 @@ package main
 //   - 5-second wall-clock timeout per invocation via goja.Interrupt.
 //     Caller can override via Step.Timeout. CPU loops break at
 //     statement boundaries.
+//   - Resource bounds (M-10): input/output payloads are size-capped and
+//     recursion depth is bounded (see the Resource bounds block below).
+//     NOTE: goja exposes no hard heap cap, so a module that allocates a
+//     huge structure internally can still OOM the process before the
+//     wall-clock interrupt fires. This is a documented limitation, not a
+//     fully sandboxed memory guarantee.
 //
 // Sandbox
 //   - No fetch, no XMLHttpRequest, no fs, no process, no require -
@@ -80,6 +86,59 @@ var (
 	computeCacheMu sync.RWMutex
 	computeCache   = map[string]*computeCacheEntry{} // key = absolute source path
 )
+
+// ===== Resource bounds (M-10) =====
+//
+// LIMITATION: goja (this version) exposes NO heap/allocation cap - there
+// is no Runtime.SetMemoryLimit and no per-allocation hook. A single
+// pathological allocation inside the JS module (e.g. `new Array(1e9)`,
+// or building one enormous string) can therefore OOM the per-app process
+// BEFORE the wall-clock Interrupt fires, because the interrupt is only
+// checked between statements / loop iterations, not mid-allocation. A
+// hard memory cap is NOT achievable here without forking goja or running
+// each invocation in a separate, cgroup/rlimit-constrained child process
+// (a larger change tracked separately).
+//
+// What IS feasible, and is enforced below as defense-in-depth, are bounds
+// on the things we control at the Go boundary plus a stack-depth cap:
+//   - cap the SIZE of the args we marshal INTO the runtime (a huge input
+//     is the most common way a caller blows up compute);
+//   - cap the SIZE of the result we marshal OUT of the runtime;
+//   - bound the call-stack depth so runaway recursion fails fast with a
+//     RangeError instead of growing Go's stack unbounded.
+// These do not stop a module that allocates internally without touching
+// the boundary, but they remove the easy OOM vectors and make the limits
+// explicit. The wall-clock timeout remains the backstop for CPU loops.
+const (
+	// cryptoComputeMaxInputBytes caps the JSON size of args passed into a
+	// compute call. 8 MiB comfortably covers row/object payloads from a
+	// preceding sql step while rejecting obviously abusive inputs.
+	cryptoComputeMaxInputBytes = 8 << 20 // 8 MiB
+	// cryptoComputeMaxOutputBytes caps the JSON size of the value a
+	// compute function may return. Prevents a module from handing back a
+	// multi-gigabyte structure that then has to be materialised in Go.
+	cryptoComputeMaxOutputBytes = 16 << 20 // 16 MiB
+	// cryptoComputeMaxCallStack bounds recursion depth. goja turns an
+	// overflow into a catchable RangeError ("Maximum call stack size
+	// exceeded") rather than letting recursion grow Go's stack until the
+	// process dies.
+	cryptoComputeMaxCallStack = 2000
+)
+
+// cryptoComputeWithinSize reports whether v, JSON-encoded, is at most
+// limit bytes. Non-serialisable values (which json.Marshal rejects) are
+// treated as within-limit here - they'll surface their own error later at
+// the goja boundary; this guard is specifically about runaway SIZE.
+func cryptoComputeWithinSize(v any, limit int) (int, bool) {
+	if v == nil {
+		return 0, true
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0, true
+	}
+	return len(b), len(b) <= limit
+}
 
 // computeWrapperJS wraps the bundled module in an IIFE that exposes
 // `__exports` after evaluation. esbuild emits CommonJS-shape code
@@ -213,6 +272,12 @@ func RunCompute(app *App, moduleName, functionName string, args any, timeout tim
 	if functionName == "" {
 		return nil, fmt.Errorf("compute: function name required")
 	}
+	// M-10: reject oversized inputs BEFORE we build the runtime - a huge
+	// args payload is the cheapest way to OOM compute and goja gives us no
+	// in-runtime memory cap to fall back on.
+	if n, ok := cryptoComputeWithinSize(args, cryptoComputeMaxInputBytes); !ok {
+		return nil, fmt.Errorf("compute: input too large (%d bytes > %d cap) - fetch/aggregate less data before the compute step", n, cryptoComputeMaxInputBytes)
+	}
 	modulePath, err := resolveComputeModulePath(app.Dir, moduleName)
 	if err != nil {
 		return nil, err
@@ -223,6 +288,9 @@ func RunCompute(app *App, moduleName, functionName string, args any, timeout tim
 	}
 
 	vm := goja.New()
+	// M-10: bound recursion depth so runaway recursion fails with a
+	// catchable RangeError instead of exhausting the process.
+	vm.SetMaxCallStackSize(cryptoComputeMaxCallStack)
 	// Disable eval + new Function. Defense in depth - compute modules
 	// shouldn't need either, and removing them shrinks the attack
 	// surface if someone slips a payload through the agent.
@@ -333,7 +401,14 @@ func RunCompute(app *App, moduleName, functionName string, args any, timeout tim
 	if result == nil {
 		return nil, nil
 	}
-	return result.Export(), nil
+	out := result.Export()
+	// M-10: cap the size of what we hand back. A module can't be stopped
+	// from allocating internally (no goja memory cap), but we refuse to
+	// materialise an unbounded result into the rest of the process.
+	if n, ok := cryptoComputeWithinSize(out, cryptoComputeMaxOutputBytes); !ok {
+		return nil, fmt.Errorf("compute: %s.%s returned too much data (%d bytes > %d cap)", moduleName, functionName, n, cryptoComputeMaxOutputBytes)
+	}
+	return out, nil
 }
 
 // resolveComputeModulePath maps a YAML `module: foo` name to a file
