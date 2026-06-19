@@ -103,7 +103,7 @@ func runVerifyRecipe(v *FlowVerify, r *http.Request, appDir string) error {
 	case "hmac_sha256_body":
 		return verifyHMACBody(v, r, body, secret)
 	case "hmac_timestamp_dot_body":
-		return verifyHMACTimestampDotBody(v, r, body, secret)
+		return verifyHMACTimestampDotBody(v, r, body, secret, appDir)
 	default:
 		return fmt.Errorf("verify: unknown recipe %q (known: hmac_sha256_body, hmac_timestamp_dot_body)", v.Recipe)
 	}
@@ -134,7 +134,7 @@ func verifyHMACBody(v *FlowVerify, r *http.Request, body []byte, secret string) 
 // configurable skew window read off TimestampHeader. The `.` separator
 // is literal - DO NOT change without updating every receiver that
 // expects this shape.
-func verifyHMACTimestampDotBody(v *FlowVerify, r *http.Request, body []byte, secret string) error {
+func verifyHMACTimestampDotBody(v *FlowVerify, r *http.Request, body []byte, secret string, appDir string) error {
 	if v.Header == "" {
 		return fmt.Errorf("verify: header: is required for hmac_timestamp_dot_body")
 	}
@@ -150,6 +150,16 @@ func verifyHMACTimestampDotBody(v *FlowVerify, r *http.Request, body []byte, sec
 		return fmt.Errorf("verify: timestamp %q is not a unix integer: %w", tsStr, err)
 	}
 	skew := v.SkewSeconds
+	// Replay protection clamp: a negative skew_seconds disables the
+	// timestamp-drift check entirely, which is only ever safe in tests.
+	// In production, clamp negative -> 0 so it falls through to the 300s
+	// default below and replay protection stays ON. A misconfigured or
+	// hostile negative value must never silently open the replay window.
+	// The escape hatch for tests is the explicit per-app env flag
+	// WEBHOOK_SKEW_ALLOW_NEGATIVE=1 (opt-in, never the default).
+	if skew < 0 && GetAppEnv(appDir, "WEBHOOK_SKEW_ALLOW_NEGATIVE") != "1" {
+		skew = 0
+	}
 	if skew == 0 {
 		skew = 300 // 5 minutes default
 	}

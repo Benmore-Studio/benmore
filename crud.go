@@ -692,6 +692,57 @@ func coerceSQLValue(v any) any {
 	return v
 }
 
+// crudSelectFields resolves the `?fields=` projection for a list/read
+// request, but - unlike the bare selectFields helper - intersects the
+// requested columns with this table's real schema AND drops any column
+// the sensitive-field denylist (isSensitiveUserColumn) would mask on a
+// write-back.
+//
+// M-5: without this, `?fields=password_hash` projected secret columns
+// directly even though the same columns are stripped from write
+// responses and user-object payloads. fail closed: an unknown or
+// sensitive requested column is dropped, and a projection that resolves
+// to NOTHING falls back to the default ("*") rather than emitting an
+// empty/invalid SELECT - "*" itself is still masked downstream by
+// MaskEncryptedFields, so this never widens exposure.
+func crudSelectFields(r *http.Request, app *App, table, defaultFields string) string {
+	raw := r.URL.Query().Get("fields")
+	if raw == "" {
+		return defaultFields
+	}
+
+	// Real columns for this table form the allowlist. If we can't read
+	// the schema, fall back to the default rather than trusting client
+	// input.
+	allowed := make(map[string]bool)
+	cols, err := GetTableColumns(app.DB, table)
+	if err != nil {
+		return defaultFields
+	}
+	for _, c := range cols {
+		allowed[c.Name] = true
+	}
+
+	var safe []string
+	for _, f := range strings.Split(raw, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" || !isValidColumnName(f) {
+			continue
+		}
+		// Must be a real column on this table (allowlist) and must not be
+		// a sensitive/secret column (denylist) - same denylist used to
+		// mask write-backs and user payloads.
+		if !allowed[f] || isSensitiveUserColumn(f) {
+			continue
+		}
+		safe = append(safe, f)
+	}
+	if len(safe) == 0 {
+		return defaultFields
+	}
+	return strings.Join(safe, ", ")
+}
+
 func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) {
 	// Declarative access gate (v2.7.12). Decides whether the request
 	// can hit this endpoint AT ALL. Also drives the per-row filter
@@ -721,8 +772,11 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		LogReadAccess(table, "", "list", session)
 	}
 
-	// Field selection: ?fields=name,email (default: all)
-	fields := selectFields(r, "*")
+	// Field selection: ?fields=name,email (default: all). Intersected with
+	// the table schema AND the sensitive-field denylist so a projection
+	// like ?fields=password_hash can't bypass the masking applied to
+	// write-backs (M-5).
+	fields := crudSelectFields(r, app, table, "*")
 	baseSQL := fmt.Sprintf("SELECT %s FROM %s", fields, table)
 
 	// Soft delete filter: exclude deleted rows if table has deleted_at
@@ -1110,6 +1164,14 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
+	}
+	// H-10: the configurable in-tenant RoleField (e.g. member_role) must be
+	// protected on the membership table, otherwise a tenant member could
+	// PATCH their own membership row to elevate their role. The hard-coded
+	// "role" above only covers the default column name; RoleField may differ.
+	// invariant: a member must never self-set their in-tenant role via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
 	}
 	// Block workflow-controlled fields (must use transition API)
 	for _, f := range workflowProtectedFields(app, table) {
@@ -2135,6 +2197,16 @@ func handleBatchUpdate(w http.ResponseWriter, r *http.Request, app *App, table s
 	protected := map[string]bool{
 		"id": true, "user_id": true, "created_at": true,
 		"updated_at": true, "password_hash": true, "role": true, "_csrf": true,
+	}
+	if app.Group != nil && app.Group.Key != "" {
+		protected[app.Group.Key] = true
+	}
+	// H-10: same self-escalation guard as the single-row update path - the
+	// configurable in-tenant RoleField must be protected on the membership
+	// table so a batch update can't elevate a member's role.
+	// invariant: a member must never self-set their in-tenant role via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
 	}
 	for _, f := range workflowProtectedFields(app, table) {
 		protected[f] = true

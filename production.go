@@ -320,10 +320,28 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 	var args []any
 	query := baseSQL
 
-	// Build column allowlist
+	// Build column allowlist.
+	//
+	// M-7: the allowlist is MANDATORY and the helper fails closed. When no
+	// allowlist is supplied (no validCols arg, or a nil map), we refuse to
+	// apply ANY `?col=val` / `?where[...]` filter rather than permitting
+	// filtering on arbitrary real columns - an empty allowlist used to be
+	// treated as "allow everything", a fail-open footgun that let callers
+	// filter (and, via applyAPIFilters, ORDER BY) on columns the endpoint
+	// never meant to expose. invariant: no allowlist => no user-supplied
+	// filter or sort columns are honored.
+	hasAllowlist := len(validCols) > 0 && validCols[0] != nil
 	allowed := make(map[string]bool)
-	if len(validCols) > 0 && validCols[0] != nil {
-		allowed = validCols[0]
+	if hasAllowlist {
+		for k, v := range validCols[0] {
+			allowed[k] = v
+		}
+	}
+	if !hasAllowlist {
+		// fail closed: skip all filter parsing - return the base query
+		// unchanged so the caller still gets rows, just no client-driven
+		// WHERE narrowing on an unvalidated column set.
+		return query, args
 	}
 	// Blind-indexed columns on this table - built once outside the loop
 	// so a request with N filters does one config lookup, not N.
@@ -398,8 +416,10 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 				continue // unknown operator → silently skip
 			}
 		}
-		// Validate column name against schema allowlist
-		if len(allowed) > 0 && !allowed[col] {
+		// Validate column name against schema allowlist. fail closed: a
+		// column not on the allowlist is dropped unconditionally (an
+		// explicitly-empty allowlist therefore permits nothing).
+		if !allowed[col] {
 			continue
 		}
 		// Extra safety: only allow alphanumeric + underscore
@@ -502,8 +522,14 @@ func applyAPIFilters(baseSQL string, r *http.Request, table string, validCols ..
 func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *App, validCols ...map[string]bool) (string, []any) {
 	query, args := applyAPIWhereWithApp(baseSQL, r, table, app, validCols...)
 
+	// M-7: sorting honors the same mandatory, fail-closed allowlist as
+	// filtering. Without an explicit allowlist we never emit a
+	// client-controlled ORDER BY - an empty/absent allowlist permits no
+	// sort column, so ?sort=<arbitrary_real_column> can't leak ordering
+	// over columns the endpoint never meant to expose.
+	hasAllowlist := len(validCols) > 0 && validCols[0] != nil
 	allowed := map[string]bool{}
-	if len(validCols) > 0 && validCols[0] != nil {
+	if hasAllowlist {
 		allowed = validCols[0]
 	}
 
@@ -524,7 +550,7 @@ func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *
 			sortOrder = parts[1]
 		}
 	}
-	if sortField != "" && isValidColumnName(sortField) && (len(allowed) == 0 || allowed[sortField]) {
+	if sortField != "" && isValidColumnName(sortField) && allowed[sortField] {
 		if sortOrder == "" {
 			sortOrder = "asc"
 		}

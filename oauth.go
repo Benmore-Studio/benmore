@@ -3,7 +3,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +18,17 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// oauthPKCEChallenge derives the S256 PKCE code_challenge from a code_verifier
+// (RFC 7636): BASE64URL(SHA256(verifier)), no padding. Sending the challenge in
+// the authorization request and the verifier in the token exchange binds the
+// returned code to THIS client, so an intercepted code can't be redeemed by an
+// attacker who never held the verifier. Defense-in-depth on top of the state
+// (CSRF) cookie.
+func oauthPKCEChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
 
 // OAuthProvider defines an OAuth2 provider configuration.
 // Built-in providers (Google, GitHub, Microsoft) are defaults.
@@ -191,6 +204,33 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request, app *App, provi
 		MaxAge:   600, // 10 minutes
 	})
 
+	// PKCE (RFC 7636) + OIDC nonce, defense-in-depth. The verifier and nonce
+	// stay server-side in HttpOnly cookies (never exposed to JS, never sent to
+	// the IdP); only the derived challenge and the nonce go on the wire. The
+	// callback re-reads these from the cookies to (a) prove possession of the
+	// verifier in the token exchange and (b) bind any returned id_token to this
+	// login attempt, blocking authorization-code interception and token replay.
+	codeVerifier := generateToken(32) // 64 hex chars, within RFC 7636's 43-128 range
+	oidcNonce := generateToken(16)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "_oauth_pkce",
+		Value:    codeVerifier,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   !app.DevMode,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   600, // 10 minutes, matches state
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "_oauth_nonce",
+		Value:    oidcNonce,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   !app.DevMode,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   600,
+	})
+
 	// Build callback URL from the actual request (works in both dev and hosted mode).
 	// Use protoOf() so we honor X-Forwarded-Proto when running behind a
 	// TLS-terminating proxy (Cloudflare → benmore router → app). Otherwise
@@ -199,11 +239,14 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request, app *App, provi
 	callbackURL := fmt.Sprintf("%s://%s/auth/%s/callback", protoOf(r), r.Host, name)
 
 	params := url.Values{
-		"client_id":     {provider.ClientID},
-		"redirect_uri":  {callbackURL},
-		"scope":         {strings.Join(provider.Scopes, " ")},
-		"response_type": {"code"},
-		"state":         {state},
+		"client_id":             {provider.ClientID},
+		"redirect_uri":          {callbackURL},
+		"scope":                 {strings.Join(provider.Scopes, " ")},
+		"response_type":         {"code"},
+		"state":                 {state},
+		"code_challenge":        {oauthPKCEChallenge(codeVerifier)},
+		"code_challenge_method": {"S256"},
+		"nonce":                 {oidcNonce},
 	}
 
 	http.Redirect(w, r, provider.AuthURL+"?"+params.Encode(), http.StatusTemporaryRedirect)
@@ -232,8 +275,19 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 		return
 	}
 
-	// Clear state cookie
+	// Read the PKCE verifier + OIDC nonce stashed at redirect time, then clear
+	// all three flow cookies (single-use: never replay a verifier/nonce).
+	codeVerifier := ""
+	if c, err := r.Cookie("_oauth_pkce"); err == nil {
+		codeVerifier = c.Value
+	}
+	expectedNonce := ""
+	if c, err := r.Cookie("_oauth_nonce"); err == nil {
+		expectedNonce = c.Value
+	}
 	http.SetCookie(w, &http.Cookie{Name: "_oauth_state", Value: "", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: "_oauth_pkce", Value: "", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: "_oauth_nonce", Value: "", MaxAge: -1, Path: "/"})
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -253,6 +307,12 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 		"code":          {code},
 		"redirect_uri":  {callbackURL},
 		"grant_type":    {"authorization_code"},
+	}
+	// Present the PKCE verifier so the IdP can match it against the challenge
+	// it stored with the code. Omitted only if the redirect never set it (e.g.
+	// an in-flight upgrade); providers that didn't see a challenge ignore it.
+	if codeVerifier != "" {
+		tokenData.Set("code_verifier", codeVerifier)
 	}
 
 	if isPrivateURL(provider.TokenURL) {
@@ -289,6 +349,24 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 		log.Printf("OAuth no access token in token-endpoint response (%d bytes)", len(body))
 		http.Error(w, "Authentication failed", http.StatusInternalServerError)
 		return
+	}
+
+	// OIDC nonce check (defense-in-depth). When the IdP returns an id_token
+	// (OpenID Connect), it MUST echo the nonce we sent. A mismatch means the
+	// id_token was minted for a DIFFERENT login attempt - reject as replay.
+	// When no id_token is returned, or it carries no nonce claim (plain OAuth2
+	// providers), behavior is unchanged: we can't verify what we weren't told.
+	// Signature verification is out of scope here (no JWKS fetch); the access
+	// token from the same response is what actually authenticates downstream,
+	// so this only adds a binding check, never a new trust assumption.
+	if expectedNonce != "" {
+		if idTok, _ := tokenResp["id_token"].(string); idTok != "" {
+			if claimNonce, present := oauthIDTokenNonce(idTok); present && claimNonce != expectedNonce {
+				log.Printf("OAuth nonce mismatch for provider %s: rejecting id_token", provider.Name)
+				http.Error(w, "Authentication failed", http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	// Get user info
@@ -498,6 +576,32 @@ func truthyClaim(v any) bool {
 	default:
 		return false
 	}
+}
+
+// oauthIDTokenNonce extracts the `nonce` claim from an OIDC id_token's payload
+// WITHOUT verifying the signature - it's used only for the defense-in-depth
+// nonce-binding check (the access token from the same response is the real
+// credential). Returns (nonce, true) only when the claim is present and a
+// string; (.., false) for absent/unparseable tokens so callers leave behavior
+// unchanged for plain OAuth2 providers that send no id_token.
+func oauthIDTokenNonce(idToken string) (string, bool) {
+	parts := strings.Split(idToken, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", false
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return "", false
+	}
+	n, ok := claims["nonce"].(string)
+	if !ok || n == "" {
+		return "", false
+	}
+	return n, true
 }
 
 // HasOAuthProviders returns true if any OAuth provider is configured.

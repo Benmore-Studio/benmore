@@ -45,6 +45,13 @@ func RegisterFileUploadRoute(mux *http.ServeMux, app *App) {
 			}
 		}
 
+		// Cap the request body BEFORE parsing. ParseMultipartForm's
+		// argument is only the in-memory threshold; anything larger
+		// streams to a temp file with no ceiling. MaxBytesReader makes
+		// the read itself fail closed once the body exceeds the cap, so
+		// an oversized upload can't spill unbounded bytes to disk.
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+
 		// Parse multipart up front so we can pull the file header for
 		// the response payload. HandleFileUpload will re-read via
 		// r.FormFile internally - both calls work against the same

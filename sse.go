@@ -26,6 +26,18 @@ type sseClient struct {
 	isAdmin bool
 }
 
+// LOWER (sse.go): SSE connections previously had no connection cap and no
+// read/idle bound, so a client could open many streams and hold them open
+// indefinitely (slow-loris style) to exhaust server goroutines/sockets.
+//   - realtimeSSEMaxConnsGlobal caps total concurrent SSE streams.
+//   - realtimeSSEMaxConnLifetime forces a stream to close after a bounded
+//     time; EventSource clients auto-reconnect, so this is transparent to
+//     legitimate users but reclaims connections held open by abusers.
+const (
+	realtimeSSEMaxConnsGlobal  = 5000
+	realtimeSSEMaxConnLifetime = 30 * time.Minute
+)
+
 // SSEHub manages SSE connections with per-client scoping.
 type SSEHub struct {
 	mu      sync.RWMutex
@@ -100,7 +112,15 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		w.Header().Set("X-Accel-Buffering", "no") // for nginx
 
 		client.ch = make(chan string, 10)
+		// LOWER: enforce the global SSE connection cap under the write
+		// lock so the hub size can never exceed realtimeSSEMaxConnsGlobal,
+		// even under a flood of concurrent connects.
 		sseHub.mu.Lock()
+		if len(sseHub.clients) >= realtimeSSEMaxConnsGlobal {
+			sseHub.mu.Unlock()
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
 		sseHub.clients[&client] = true
 		sseHub.mu.Unlock()
 
@@ -120,8 +140,18 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		ticker := time.NewTicker(25 * time.Second)
 		defer ticker.Stop()
 
+		// LOWER: bound the connection lifetime. Without this an idle or
+		// deliberately-stalled client could hold the stream (and its
+		// goroutine) open forever. EventSource transparently reconnects
+		// after the server closes, so capping lifetime is invisible to
+		// legitimate clients but caps the resource an abuser can pin.
+		maxLifetime := time.NewTimer(realtimeSSEMaxConnLifetime)
+		defer maxLifetime.Stop()
+
 		for {
 			select {
+			case <-maxLifetime.C:
+				return
 			case msg, ok := <-client.ch:
 				if !ok {
 					return
