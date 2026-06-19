@@ -209,10 +209,8 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 		ra = *runAt
 	}
 	token := generateToken(18)
-	var (
-		result sql.Result
-		err    error
-	)
+	// err is already declared by the json.Marshal above; only result is new.
+	var result sql.Result
 	if opts.maxAttempts > 0 {
 		result, err = exec.Exec(
 			"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -279,23 +277,25 @@ func findJobByUniqueKey(q jobEnqueueExecer, uniqueKey string, anyStatus bool) (i
 		LIMIT 1
 	`
 	}
-	err := q.QueryRow(query, uniqueKey).Scan(&id, &token)
-	return id, token, err == nil
+	if err := q.QueryRow(query, uniqueKey).Scan(&id, &token); err != nil {
+		return 0, "", false
+	}
+	// Guard against legacy pre-status_token rows carrying the same key:
+	// returning an empty token would make the caller build a status_url the
+	// status endpoint rejects. Treat a tokenless row as "no usable dedup hit"
+	// so a fresh row (with a token) is inserted instead of handing back a
+	// broken status URL.
+	if token == "" {
+		return 0, "", false
+	}
+	return id, token, true
 }
 
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}
-	// Guard against legacy pre-status_token active rows carrying the same key:
-	// returning an empty token would make the caller build a status_url the
-	// status endpoint rejects. Treat a tokenless active row as "no usable dedup
-	// hit" so a fresh row (with a token) is inserted instead of handing back a
-	// broken status URL.
-	if token == "" {
-		return 0, "", false
-	}
-	return id, token, true
+	return s
 }
 
 // isUniqueJobConstraintErr reports whether err is the UNIQUE-constraint
