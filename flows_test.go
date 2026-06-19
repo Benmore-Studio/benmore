@@ -307,11 +307,11 @@ func TestInterpolateCtxSafe_ParamWordBoundary(t *testing.T) {
 	defer cleanup()
 
 	ctx := &FlowContext{
-		App: app,
+		App:  app,
 		Data: map[string]any{},
 		Params: map[string]string{
-			"expo":   "5",     // shorter param
-			"export": "10",    // longer param starting with the shorter one
+			"expo":   "5",  // shorter param
+			"export": "10", // longer param starting with the shorter one
 		},
 	}
 	// The query uses BOTH params. Each should bind to its own value,
@@ -337,8 +337,8 @@ func TestInterpolateCtxSafe_ParamWordBoundary(t *testing.T) {
 }
 
 // TestEvaluateCondition_MissingKeyNotEqualEmpty pins the v2.7.6 fix
-// for `field != ''` firing on missing keys. Pre-fix, nil formatted
-// as `"<nil>"` via fmt.Sprintf, so `<nil> != ''` always evaluated
+// for `field != ”` firing on missing keys. Pre-fix, nil formatted
+// as `"<nil>"` via fmt.Sprintf, so `<nil> != ”` always evaluated
 // true - agents gating on optional columns hit this every time.
 func TestEvaluateCondition_MissingKeyNotEqualEmpty(t *testing.T) {
 	// Missing key: should compare equal to '' (i.e. != '' is false).
@@ -367,7 +367,7 @@ func TestEvaluateCondition_MissingKeyNotEqualEmpty(t *testing.T) {
 }
 
 // TestResolveBindExpr_DefaultPipeShortCircuit pins the v2.7.6 fix
-// where `${{ params.optional | default:'' }}` should resolve to the
+// where `${{ params.optional | default:” }}` should resolve to the
 // default value when the base ref is missing - instead of returning
 // (nil, false) and triggering the v2.7.5 loud-fail unresolved-template
 // halt. Optional JSON body fields can't be expressed cleanly without
@@ -952,7 +952,7 @@ func TestExecStepAPI_AppendsQueryParams(t *testing.T) {
 	// Simpler: parse the URL manually like the helper.
 	prevURL := step.API.URL
 	step.API.URL = strings.Replace(prevURL, "127.0.0.1", "localhost", 1) // both blocked; just for clarity
-	step.API.URL = prevURL                                                 // restore
+	step.API.URL = prevURL                                               // restore
 	// Use the buildAPIResponseEnvelope helper indirection: directly
 	// exercise the URL-building branch by checking the constructed URL.
 	// To do that without modifying execStepAPI to expose internals,
@@ -1032,7 +1032,7 @@ func TestInterpolateRowSafe_UnknownColonParamPassesThrough(t *testing.T) {
 // --- A5: if: evaluator stops interpolating LHS ------------------------
 
 // Pre-v2.5.9 evaluateFlowCondition interpolated the whole condition
-// then treated the LHS as a row-key lookup. So `${{ user.customer_id }} != ''`
+// then treated the LHS as a row-key lookup. So `${{ user.customer_id }} != ”`
 // resolved the LHS to the value, then looked up `row["abc"]` (nonexistent)
 // → `<nil> != ""` → always true.
 func TestEvaluateFlowCondition_TemplatedLHS_FindsValue(t *testing.T) {
@@ -1068,8 +1068,10 @@ func TestEvaluateFlowCondition_TemplatedLHS_EmptyValue(t *testing.T) {
 
 // Pre-v2.7.32 a condition with a pipe on the LHS was handed to
 // evaluateCondition as a row-key literally containing the pipe text:
-//   row["existing.account_id | default:''"] - always missing → "" → true.
-// That made every Stripe-onboard `if: ${{...|default:''}} == ''` fire
+//
+//	row["existing.account_id | default:''"] - always missing → "" → true.
+//
+// That made every Stripe-onboard `if: ${{...|default:”}} == ”` fire
 // the no_account branch even when the row was present, producing a
 // fresh Stripe Connect account on every click.
 func TestEvaluateFlowCondition_PipeOnLHS_AccountPresent(t *testing.T) {
@@ -1120,11 +1122,11 @@ func TestEvaluateFlowCondition_LegacyBareKey(t *testing.T) {
 
 // --- v2.7.136: operator-less `if:` on an optional param ----------------
 //
-// The agent reported `if: ${{ params.invite_token }}` (and the `| default:''`
-// / `|| ''` variants) firing the branch even when the param was empty or
+// The agent reported `if: ${{ params.invite_token }}` (and the `| default:”`
+// / `|| ”` variants) firing the branch even when the param was empty or
 // absent. ghaIfToFlowCondition translates those operator-less GHA refs to a
-// bare token (`invite_token`, `invite_token | default:''`, `invite_token ||
-// ''`). Pre-fix the no-op path matched no row key, ran no pipe/`||`, and
+// bare token (`invite_token`, `invite_token | default:”`, `invite_token ||
+// ”`). Pre-fix the no-op path matched no row key, ran no pipe/`||`, and
 // rendered the bare token to ITSELF - a non-empty string → always truthy.
 func TestEvaluateFlowCondition_OptionalParam_NoOp(t *testing.T) {
 	app, cleanup := newTestApp(t)
@@ -1283,8 +1285,8 @@ func TestInterpolateJSONValues_DecodesJSONString(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	ctx := &FlowContext{
-		App:  app,
-		Data: map[string]any{"rows_json": `[{"id":1},{"id":2}]`},
+		App:    app,
+		Data:   map[string]any{"rows_json": `[{"id":1},{"id":2}]`},
 		Params: map[string]string{},
 	}
 	m := map[string]any{
@@ -1305,8 +1307,8 @@ func TestInterpolateJSONValues_DecodesJSONObject(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	ctx := &FlowContext{
-		App:  app,
-		Data: map[string]any{"obj_json": `{"name":"Walmart","tier":"enterprise"}`},
+		App:    app,
+		Data:   map[string]any{"obj_json": `{"name":"Walmart","tier":"enterprise"}`},
 		Params: map[string]string{},
 	}
 	m := map[string]any{"customer": "{{obj_json}}"}
@@ -1325,8 +1327,8 @@ func TestInterpolateJSONValues_NonJSONStringPassthrough(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	ctx := &FlowContext{
-		App:  app,
-		Data: map[string]any{"msg": "hello world"},
+		App:    app,
+		Data:   map[string]any{"msg": "hello world"},
 		Params: map[string]string{},
 	}
 	m := map[string]any{"greeting": "{{msg}}"}
@@ -1656,7 +1658,10 @@ func TestIsTruthyCondition(t *testing.T) {
 }
 
 func TestIsTruthyConditionEmptyCollections(t *testing.T) {
-	cases := []struct{ v any; want bool }{
+	cases := []struct {
+		v    any
+		want bool
+	}{
 		{[]any{}, false},
 		{[]any{1}, true},
 		{[]map[string]any{}, false},
@@ -1675,13 +1680,16 @@ func TestIsTruthyConditionEmptyCollections(t *testing.T) {
 
 func TestResolveBindExprOrFallback(t *testing.T) {
 	flat := map[string]any{"present": "hi", "blank": "", "emptyrows": []any{}}
-	cases := []struct{ expr, want string; ok bool }{
-		{"present || 'X'", "hi", true},        // present → keep
-		{"absent || 'X'", "X", true},          // missing → fallback literal
-		{"blank || 'X'", "X", true},           // empty string → fallback
-		{"emptyrows || 'X'", "X", true},       // empty collection → fallback
-		{"absent || present", "hi", true},     // chain to a ref
-		{"absent | default:'D'", "D", true},   // | default still works on absent
+	cases := []struct {
+		expr, want string
+		ok         bool
+	}{
+		{"present || 'X'", "hi", true},      // present → keep
+		{"absent || 'X'", "X", true},        // missing → fallback literal
+		{"blank || 'X'", "X", true},         // empty string → fallback
+		{"emptyrows || 'X'", "X", true},     // empty collection → fallback
+		{"absent || present", "hi", true},   // chain to a ref
+		{"absent | default:'D'", "D", true}, // | default still works on absent
 	}
 	for _, c := range cases {
 		v, ok := resolveBindExpr(c.expr, flat)

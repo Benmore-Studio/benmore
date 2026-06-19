@@ -560,7 +560,7 @@ export function EmptyState(opts: { message: string; cta?: string }): string {
 `
 
 // htmlScaffoldDomTS - keyed list rendering. THE fix for the #1 live-update bug:
-// re-rendering with ul.innerHTML = rows.map(...).join('') rebuilds EVERY row on
+// re-rendering with ul.innerHTML = rows.map(...).join(”) rebuilds EVERY row on
 // every update, so an SSE refresh (e.g. toggling one item complete) flashes the
 // whole list, drops input focus, and re-initialises icons. reconcileList reuses
 // unchanged rows and only touches what changed.
@@ -816,4 +816,3 @@ const htmlScaffoldStylesCSS = `/* styles.css - opt-in custom styles.
    you never use the hidden attribute alongside a display utility class). */
 [hidden] { display: none !important; }
 `
-

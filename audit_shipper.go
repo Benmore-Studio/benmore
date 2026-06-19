@@ -77,27 +77,27 @@ const (
 //
 // Security model:
 //
-//   1. URL must be HTTPS. HTTP destinations leak the entire audit
-//      stream (PII, user actions, old/new values) in plaintext over
-//      the wire. Override only with BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1
-//      for the rare on-prem-internal case where the operator has
-//      separately confirmed the path is on a private link.
+//  1. URL must be HTTPS. HTTP destinations leak the entire audit
+//     stream (PII, user actions, old/new values) in plaintext over
+//     the wire. Override only with BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1
+//     for the rare on-prem-internal case where the operator has
+//     separately confirmed the path is on a private link.
 //
-//   2. URL must resolve to a PUBLIC IP. Same SSRF protection the
-//      framework applies to webhooks + flows: no loopback, no RFC1918,
-//      no link-local. Blocks "ship our audit log to 169.254.169.254"
-//      (cloud metadata) and "ship to localhost:<random>" (escalation
-//      via a co-resident process).
+//  2. URL must resolve to a PUBLIC IP. Same SSRF protection the
+//     framework applies to webhooks + flows: no loopback, no RFC1918,
+//     no link-local. Blocks "ship our audit log to 169.254.169.254"
+//     (cloud metadata) and "ship to localhost:<random>" (escalation
+//     via a co-resident process).
 //
-//   3. On any URL-validation failure the shipper REFUSES to start -
-//      no goroutine, no ticker, no first request. The operator sees
-//      a clear log line at boot and the audit data stays local. Fail
-//      closed, not fail noisy.
+//  3. On any URL-validation failure the shipper REFUSES to start -
+//     no goroutine, no ticker, no first request. The operator sees
+//     a clear log line at boot and the audit data stays local. Fail
+//     closed, not fail noisy.
 //
-//   4. The destination URL is set via an environment file owned by the
-//      app's system user (mode 0600). Setting it requires either being root
-//      or editing that file - which on a multi-tenant host is admin-only, so
-//      a tenant user with no admin role cannot configure this.
+//  4. The destination URL is set via an environment file owned by the
+//     app's system user (mode 0600). Setting it requires either being root
+//     or editing that file - which on a multi-tenant host is admin-only, so
+//     a tenant user with no admin role cannot configure this.
 //
 // What this protects against:
 //   - SSRF to AWS/GCP metadata services and other internal endpoints.
@@ -161,11 +161,12 @@ func StartAuditShipper(app *App) {
 	log.Printf("audit-shipper: enabled - dest=%s interval=%s batch=%d", redactURL(url), interval, batch)
 
 	safeGo("audit.shipper", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				shipOnce(app.DB, url, secret, token, batch, appName)
@@ -185,16 +186,16 @@ func ensureAuditShipperCursor(db *sql.DB) {
 }
 
 type auditRow struct {
-	ID         int64           `json:"id"`
-	Action     string          `json:"action"`
-	TableName  string          `json:"table_name"`
-	RowID      string          `json:"row_id,omitempty"`
-	UserID     int64           `json:"user_id,omitempty"`
-	UserEmail  string          `json:"user_email,omitempty"`
-	OldValues  json.RawMessage `json:"old_values,omitempty"`
-	NewValues  json.RawMessage `json:"new_values,omitempty"`
-	CreatedAt  string          `json:"created_at"`
-	App        string          `json:"app"`
+	ID        int64           `json:"id"`
+	Action    string          `json:"action"`
+	TableName string          `json:"table_name"`
+	RowID     string          `json:"row_id,omitempty"`
+	UserID    int64           `json:"user_id,omitempty"`
+	UserEmail string          `json:"user_email,omitempty"`
+	OldValues json.RawMessage `json:"old_values,omitempty"`
+	NewValues json.RawMessage `json:"new_values,omitempty"`
+	CreatedAt string          `json:"created_at"`
+	App       string          `json:"app"`
 }
 
 func shipOnce(db *sql.DB, url, secret, token string, batch int, appName string) {

@@ -118,11 +118,12 @@ func StartAggregateWorker(app *App, configs []AggregateConfig) {
 	for _, config := range configs {
 		c := config
 		safeGo("aggregates.refresh:"+c.Name, func() {
+			stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 			ticker := time.NewTicker(c.Refresh)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-app.Stop:
+				case <-stop:
 					return // hot reload / shutdown - don't leak a refresher per push
 				case <-ticker.C:
 					if err := refreshAggregate(app.DB, c); err != nil {
@@ -245,4 +246,3 @@ func InjectAggregateData(ctx *RenderContext) {
 		ctx.Data["aggregate"] = values
 	}
 }
-

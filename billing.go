@@ -101,12 +101,12 @@ func RegisterBillingRoutes(mux *http.ServeMux, app *App) {
 		}
 		row := app.DB.QueryRow(`SELECT id, stripe_subscription_id, status, plan, current_period_end, cancel_at_period_end FROM _benmore_subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`, session.UserID)
 		var sub struct {
-			ID                 int64   `json:"id"`
-			SubscriptionID     string  `json:"stripe_subscription_id"`
-			Status             string  `json:"status"`
-			Plan               string  `json:"plan"`
-			CurrentPeriodEnd   *string `json:"current_period_end"`
-			CancelAtPeriodEnd  bool    `json:"cancel_at_period_end"`
+			ID                int64   `json:"id"`
+			SubscriptionID    string  `json:"stripe_subscription_id"`
+			Status            string  `json:"status"`
+			Plan              string  `json:"plan"`
+			CurrentPeriodEnd  *string `json:"current_period_end"`
+			CancelAtPeriodEnd bool    `json:"cancel_at_period_end"`
 		}
 		err := row.Scan(&sub.ID, &sub.SubscriptionID, &sub.Status, &sub.Plan, &sub.CurrentPeriodEnd, &sub.CancelAtPeriodEnd)
 		w.Header().Set("Content-Type", "application/json")
@@ -230,7 +230,7 @@ func handleStripeWebhook(w http.ResponseWriter, r *http.Request, app *App, cfg *
 	}
 
 	var evt struct {
-		Type string                 `json:"type"`
+		Type string `json:"type"`
 		Data struct {
 			Object map[string]any `json:"object"`
 		} `json:"data"`

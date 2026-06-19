@@ -12,57 +12,57 @@ import (
 
 // AppContext is a single-shot dump of everything an LLM needs to understand and modify an app.
 type AppContext struct {
-	AppDir     string              `json:"app_dir"`
-	Schema     []TableContext      `json:"schema"`
-	Routes     []RouteContext      `json:"routes"`
-	API        []string            `json:"api_endpoints"`
-	Hooks      map[string]int      `json:"hooks"`
-	Flows      []string            `json:"flows"`
-	EnvVars    []string            `json:"env_vars"`
-	Design     map[string]string   `json:"design"`
-	Auth       AuthContext         `json:"auth"`
-	Components []string            `json:"available_components"`
-	Pipes      []string            `json:"available_pipes"`
-	Files      []FileContext       `json:"files"`
-	Issues     []string            `json:"issues"`
+	AppDir     string            `json:"app_dir"`
+	Schema     []TableContext    `json:"schema"`
+	Routes     []RouteContext    `json:"routes"`
+	API        []string          `json:"api_endpoints"`
+	Hooks      map[string]int    `json:"hooks"`
+	Flows      []string          `json:"flows"`
+	EnvVars    []string          `json:"env_vars"`
+	Design     map[string]string `json:"design"`
+	Auth       AuthContext       `json:"auth"`
+	Components []string          `json:"available_components"`
+	Pipes      []string          `json:"available_pipes"`
+	Files      []FileContext     `json:"files"`
+	Issues     []string          `json:"issues"`
 }
 
 type TableContext struct {
-	Name       string   `json:"name"`
-	Columns    []string `json:"columns"`
-	RowCount   int64    `json:"rows"`
+	Name        string   `json:"name"`
+	Columns     []string `json:"columns"`
+	RowCount    int64    `json:"rows"`
 	ForeignKeys []string `json:"foreign_keys,omitempty"`
 }
 
 type RouteContext struct {
-	Path  string `json:"path"`
-	File  string `json:"file"`
-	Auth  string `json:"auth"`
-	Role  string `json:"role,omitempty"`
-	Title string `json:"title,omitempty"`
-	Type  string `json:"type,omitempty"`
+	Path     string   `json:"path"`
+	File     string   `json:"file"`
+	Auth     string   `json:"auth"`
+	Role     string   `json:"role,omitempty"`
+	Title    string   `json:"title,omitempty"`
+	Type     string   `json:"type,omitempty"`
 	Features []string `json:"features,omitempty"`
 }
 
 type AuthContext struct {
-	Enabled    bool     `json:"enabled"`
-	OAuth      []string `json:"oauth_providers,omitempty"`
-	UserCount  int64    `json:"user_count"`
-	HasAdmin   bool     `json:"has_admin"`
+	Enabled   bool     `json:"enabled"`
+	OAuth     []string `json:"oauth_providers,omitempty"`
+	UserCount int64    `json:"user_count"`
+	HasAdmin  bool     `json:"has_admin"`
 }
 
 type FileContext struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-	Lines int   `json:"lines"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Lines int    `json:"lines"`
 }
 
 // BuildContext generates the full app context for LLM consumption.
 func BuildContext(app *App) AppContext {
 	ctx := AppContext{
-		AppDir:  app.Dir,
-		Hooks:   make(map[string]int),
-		Design:  make(map[string]string),
+		AppDir: app.Dir,
+		Hooks:  make(map[string]int),
+		Design: make(map[string]string),
 	}
 
 	// Schema
@@ -75,9 +75,15 @@ func BuildContext(app *App) AppContext {
 		var colStrs []string
 		for _, c := range cols {
 			s := c.Name + " " + c.Type
-			if c.PK { s += " PK" }
-			if c.NotNull { s += " NOT NULL" }
-			if c.Default != "" { s += " DEFAULT " + c.Default }
+			if c.PK {
+				s += " PK"
+			}
+			if c.NotNull {
+				s += " NOT NULL"
+			}
+			if c.Default != "" {
+				s += " DEFAULT " + c.Default
+			}
 			colStrs = append(colStrs, s)
 		}
 		var count int64
@@ -127,9 +133,15 @@ func BuildContext(app *App) AppContext {
 	// Flows
 	for _, flow := range app.Flows {
 		trigger := flow.Trigger.Type
-		if flow.Trigger.Path != "" { trigger += " " + flow.Trigger.Method + " " + flow.Trigger.Path }
-		if flow.Trigger.Table != "" { trigger += " " + flow.Trigger.Table }
-		if flow.Trigger.Cron != "" { trigger += " " + flow.Trigger.Cron }
+		if flow.Trigger.Path != "" {
+			trigger += " " + flow.Trigger.Method + " " + flow.Trigger.Path
+		}
+		if flow.Trigger.Table != "" {
+			trigger += " " + flow.Trigger.Table
+		}
+		if flow.Trigger.Cron != "" {
+			trigger += " " + flow.Trigger.Cron
+		}
 		ctx.Flows = append(ctx.Flows, fmt.Sprintf("%s → %s (%d steps)", flow.Name, trigger, len(flow.Steps)))
 	}
 
@@ -140,10 +152,18 @@ func BuildContext(app *App) AppContext {
 
 	// Design
 	if app.Design != nil {
-		if t, ok := app.Design.Colors["_theme"]; ok { ctx.Design["theme"] = t }
-		if m, ok := app.Design.Colors["_mode"]; ok { ctx.Design["mode"] = m }
-		if f, ok := app.Design.Colors["_font"]; ok { ctx.Design["font"] = f }
-		if b, ok := app.Design.Colors["_brand"]; ok { ctx.Design["brand"] = b }
+		if t, ok := app.Design.Colors["_theme"]; ok {
+			ctx.Design["theme"] = t
+		}
+		if m, ok := app.Design.Colors["_mode"]; ok {
+			ctx.Design["mode"] = m
+		}
+		if f, ok := app.Design.Colors["_font"]; ok {
+			ctx.Design["font"] = f
+		}
+		if b, ok := app.Design.Colors["_brand"]; ok {
+			ctx.Design["brand"] = b
+		}
 	}
 
 	// Auth
@@ -197,21 +217,34 @@ func BuildContext(app *App) AppContext {
 	// Files
 	entries, _ := os.ReadDir(app.Dir)
 	for _, entry := range entries {
-		if entry.IsDir() { continue }
+		if entry.IsDir() {
+			continue
+		}
 		name := entry.Name()
 		ftype := "other"
 		switch {
-		case name == "schema.sql": ftype = "schema"
-		case strings.HasSuffix(name, ".html"): ftype = "page"
-		case name == "app.yaml": ftype = "design"
-		case name == "hooks.yaml": ftype = "hooks"
-		case name == "flows.yaml": ftype = "flows"
-		case name == "env.yaml": ftype = "env"
-		case name == "seeds.sql": ftype = "seeds"
-		case name == "head.html": ftype = "head"
-		case name == "theme.css": ftype = "css"
+		case name == "schema.sql":
+			ftype = "schema"
+		case strings.HasSuffix(name, ".html"):
+			ftype = "page"
+		case name == "app.yaml":
+			ftype = "design"
+		case name == "hooks.yaml":
+			ftype = "hooks"
+		case name == "flows.yaml":
+			ftype = "flows"
+		case name == "env.yaml":
+			ftype = "env"
+		case name == "seeds.sql":
+			ftype = "seeds"
+		case name == "head.html":
+			ftype = "head"
+		case name == "theme.css":
+			ftype = "css"
 		}
-		if ftype == "other" { continue }
+		if ftype == "other" {
+			continue
+		}
 
 		lines := 0
 		if data, err := os.ReadFile(filepath.Join(app.Dir, name)); err == nil {
@@ -225,14 +258,30 @@ func BuildContext(app *App) AppContext {
 
 func detectPageFeatures2(html string) []string {
 	var f []string
-	if strings.Contains(html, "<stat ") { f = append(f, "stat") }
-	if strings.Contains(html, `:model="`) { f = append(f, "model") }
-	if strings.Contains(html, `<board `) { f = append(f, "board") }
-	if strings.Contains(html, `<chart `) { f = append(f, "chart") }
-	if strings.Contains(html, `:create=`) { f = append(f, "create-form") }
-	if strings.Contains(html, `<query `) { f = append(f, "query") }
-	if strings.Contains(html, `<modal `) { f = append(f, "modal") }
-	if strings.Contains(html, `<fetch `) { f = append(f, "fetch") }
+	if strings.Contains(html, "<stat ") {
+		f = append(f, "stat")
+	}
+	if strings.Contains(html, `:model="`) {
+		f = append(f, "model")
+	}
+	if strings.Contains(html, `<board `) {
+		f = append(f, "board")
+	}
+	if strings.Contains(html, `<chart `) {
+		f = append(f, "chart")
+	}
+	if strings.Contains(html, `:create=`) {
+		f = append(f, "create-form")
+	}
+	if strings.Contains(html, `<query `) {
+		f = append(f, "query")
+	}
+	if strings.Contains(html, `<modal `) {
+		f = append(f, "modal")
+	}
+	if strings.Contains(html, `<fetch `) {
+		f = append(f, "fetch")
+	}
 	return f
 }
 

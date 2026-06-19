@@ -312,7 +312,7 @@ func sendToSentry(dsn string, body struct {
 		return
 	}
 	payload := map[string]any{
-		"event_id": fmt.Sprintf("%032x", time.Now().UnixNano()),
+		"event_id":  fmt.Sprintf("%032x", time.Now().UnixNano()),
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"platform":  "javascript",
 		"level":     "error",

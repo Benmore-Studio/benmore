@@ -68,7 +68,7 @@ func InvalidateQueryCacheForTable(table string) {
 }
 
 var (
-	queryTagRe   = regexp.MustCompile(`(?s)<query\s+([^>]*)>(.*?)</query>`)
+	queryTagRe = regexp.MustCompile(`(?s)<query\s+([^>]*)>(.*?)</query>`)
 	// Self-closing required: <include src="..." />. Docs (pages.md,
 	// templates.md, docs-templates.html) all show this form.
 	includeTagRe = regexp.MustCompile(`<include\s+src="([^"]+)"\s*/>`)
@@ -450,183 +450,183 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 		for li := len(leaves) - 1; li >= 0; li-- {
 			q := queries[leaves[li]]
 
-		var sql string
-		var args []any
+			var sql string
+			var args []any
 
-		if q.From != "" {
-			// Shorthand mode: expand from/pick/where/owned/sort into SQL.
-			// Pre-resolve mustache vars in attribute values so authors can
-			// write where="id = {{param_id}}" the same as raw <query sql>.
-			// Issue #7. Vars resolve to escaped string values inline since
-			// shorthand builds WHERE via concatenation (not ? placeholders).
-			resolvedAttrs := make(map[string]string, len(q.Attrs))
-			for k, v := range q.Attrs {
-				resolvedAttrs[k] = resolveShorthandVars(v, ctx.Data)
-			}
-			var userID int64
-			if ctx.User != nil {
-				userID = ctx.User.UserID
-			}
-			sql, args = ExpandShorthand(app, q.From, resolvedAttrs, userID)
-		} else if q.SQL != "" {
-			// Raw SQL mode - resolve mustache vars (e.g. {{param_id}}) as parameterized args
-			sql, args = resolveQueryParams(q.SQL, ctx.Data, args)
-		} else {
-			continue
-		}
-
-		// Replace :current_user with session user ID
-		if ctx.User != nil && strings.Contains(sql, ":current_user") {
-			sql = strings.ReplaceAll(sql, ":current_user", "?")
-			args = append(args, ctx.User.UserID)
-		}
-
-		// Handle scope="owner" - inject WHERE clause
-		if ctx.Page != nil && ctx.Page.Scope == "owner" && ctx.User != nil {
-			sql = injectOwnerScope(sql, ctx.User.UserID)
-		}
-
-		// Query cache: <query cache="5m" ...> caches results for the given duration
-		var cacheTTL time.Duration
-		if cacheStr := q.Attrs["cache"]; cacheStr != "" {
-			cacheTTL, _ = time.ParseDuration(cacheStr)
-		}
-		var cacheKey string
-		if cacheTTL > 0 {
-			cacheKey = queryCacheKey(sql, args)
-			if cachedRows, ok := queryCacheGet(cacheKey); ok {
-				if q.As != "" {
-					ctx.Data[q.As] = cachedRows
-					if len(cachedRows) == 1 {
-						for k, v := range cachedRows[0] {
-							ctx.Data[q.As+"."+k] = v
-						}
-					}
+			if q.From != "" {
+				// Shorthand mode: expand from/pick/where/owned/sort into SQL.
+				// Pre-resolve mustache vars in attribute values so authors can
+				// write where="id = {{param_id}}" the same as raw <query sql>.
+				// Issue #7. Vars resolve to escaped string values inline since
+				// shorthand builds WHERE via concatenation (not ? placeholders).
+				resolvedAttrs := make(map[string]string, len(q.Attrs))
+				for k, v := range q.Attrs {
+					resolvedAttrs[k] = resolveShorthandVars(v, ctx.Data)
 				}
-				if q.Inner != "" {
-					var rendered strings.Builder
-					if q.As != "" && len(cachedRows) > 0 {
-						sectionTag := "{{#" + q.As + "}}"
-						hasSectionLoop := strings.Contains(q.Inner, sectionTag)
-						if hasSectionLoop {
-							innerProtected := protectFetchInner(q.Inner)
-							expanded := RenderMustache(innerProtected, ctx.Data)
-							rendered.WriteString(restoreFetchInner(expanded))
-						} else {
-							for _, row := range cachedRows {
-								rowData := mergeData(ctx.Data, row)
-								innerProtected := protectFetchInner(q.Inner)
-								expanded := RenderMustache(innerProtected, rowData)
-								rendered.WriteString(restoreFetchInner(expanded))
-							}
-						}
-					} else {
-						rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
-					}
-					content = content[:q.Start] + rendered.String() + content[q.End:]
-				} else {
-					content = content[:q.Start] + content[q.End:]
+				var userID int64
+				if ctx.User != nil {
+					userID = ctx.User.UserID
 				}
+				sql, args = ExpandShorthand(app, q.From, resolvedAttrs, userID)
+			} else if q.SQL != "" {
+				// Raw SQL mode - resolve mustache vars (e.g. {{param_id}}) as parameterized args
+				sql, args = resolveQueryParams(q.SQL, ctx.Data, args)
+			} else {
 				continue
 			}
-		}
 
-		// Mock query mode: <query mock="5" ...> generates fake rows without hitting DB.
-		// Used in prototype phase - pages render with realistic dummy data before schema exists.
-		var rows []map[string]any
-		var err error
-
-		if mockStr := q.Attrs["mock"]; mockStr != "" {
-			mockCount := 3 // default
-			// Accept 0 explicitly to render the empty-state branch
-			// (inverted mustache section).
-			if n, e := strconv.Atoi(mockStr); e == nil && n >= 0 {
-				mockCount = n
+			// Replace :current_user with session user ID
+			if ctx.User != nil && strings.Contains(sql, ":current_user") {
+				sql = strings.ReplaceAll(sql, ":current_user", "?")
+				args = append(args, ctx.User.UserID)
 			}
-			rows = generateMockRows(app, q, mockCount)
-		} else {
-			rows, err = QueryRows(app.DB, sql, args...)
-		}
 
-		// N+1 detection: track query count and log SQL
-		ctx.QueryCount++
-		if app.DevMode {
-			logSQL := sql
-			if len(logSQL) > 200 {
-				logSQL = logSQL[:200] + "..."
+			// Handle scope="owner" - inject WHERE clause
+			if ctx.Page != nil && ctx.Page.Scope == "owner" && ctx.User != nil {
+				sql = injectOwnerScope(sql, ctx.User.UserID)
 			}
-			ctx.QueryLog = append(ctx.QueryLog, logSQL)
-		}
 
-		if err != nil {
-			var errHTML string
-			if app.DevMode {
-				// Dev mode: show full error with SQL for debugging
-				errHTML = fmt.Sprintf(`<div class="benmore-error"><strong>SQL Error</strong><pre>%s</pre><p>%s</p></div>`,
-					html.EscapeString(q.SQL), html.EscapeString(err.Error()))
-			} else {
-				// Production: generic error, log details to stderr
-				log.Printf("ERROR [query] %s: %s", q.SQL, err.Error())
-				errHTML = `<div class="benmore-error">An error occurred loading this content.</div>`
+			// Query cache: <query cache="5m" ...> caches results for the given duration
+			var cacheTTL time.Duration
+			if cacheStr := q.Attrs["cache"]; cacheStr != "" {
+				cacheTTL, _ = time.ParseDuration(cacheStr)
 			}
-			content = content[:q.Start] + errHTML + content[q.End:]
-			continue
-		}
-
-		// Cache results if cache attribute was set
-		if cacheKey != "" && cacheTTL > 0 {
-			// Determine table name for per-table cache invalidation
-			cacheTable := q.From
-			if cacheTable == "" {
-				cacheTable = extractTableFromSQL(sql)
-			}
-			queryCacheSet(cacheKey, rows, cacheTTL, cacheTable)
-		}
-
-		// Store results in context
-		if q.As != "" {
-			// Always store as array (enables {{#var}} iteration and {{var.0.field}} access)
-			ctx.Data[q.As] = rows
-			if len(rows) == 1 {
-				// Single row: also flatten fields for direct access: {{var.field}}
-				for k, v := range rows[0] {
-					ctx.Data[q.As+"."+k] = v
+			var cacheKey string
+			if cacheTTL > 0 {
+				cacheKey = queryCacheKey(sql, args)
+				if cachedRows, ok := queryCacheGet(cacheKey); ok {
+					if q.As != "" {
+						ctx.Data[q.As] = cachedRows
+						if len(cachedRows) == 1 {
+							for k, v := range cachedRows[0] {
+								ctx.Data[q.As+"."+k] = v
+							}
+						}
+					}
+					if q.Inner != "" {
+						var rendered strings.Builder
+						if q.As != "" && len(cachedRows) > 0 {
+							sectionTag := "{{#" + q.As + "}}"
+							hasSectionLoop := strings.Contains(q.Inner, sectionTag)
+							if hasSectionLoop {
+								innerProtected := protectFetchInner(q.Inner)
+								expanded := RenderMustache(innerProtected, ctx.Data)
+								rendered.WriteString(restoreFetchInner(expanded))
+							} else {
+								for _, row := range cachedRows {
+									rowData := mergeData(ctx.Data, row)
+									innerProtected := protectFetchInner(q.Inner)
+									expanded := RenderMustache(innerProtected, rowData)
+									rendered.WriteString(restoreFetchInner(expanded))
+								}
+							}
+						} else {
+							rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
+						}
+						content = content[:q.Start] + rendered.String() + content[q.End:]
+					} else {
+						content = content[:q.Start] + content[q.End:]
+					}
+					continue
 				}
 			}
-		}
 
-		// Render the inner template with query results
-		if q.Inner != "" {
-			var rendered strings.Builder
-			if q.As != "" && len(rows) > 0 {
-				// Check if inner content contains a {{#as}}...{{/as}} section matching
-				// the query's as name. If so, let mustache handle iteration (render once).
-				// Otherwise, render per-row (backward compat for templates without sections).
-				sectionTag := "{{#" + q.As + "}}"
-				hasSectionLoop := strings.Contains(q.Inner, sectionTag)
-				if hasSectionLoop {
-					// Render once - mustache {{#as}} section handles row iteration
-					innerProtected := protectFetchInner(q.Inner)
-					expanded := RenderMustache(innerProtected, ctx.Data)
-					rendered.WriteString(restoreFetchInner(expanded))
+			// Mock query mode: <query mock="5" ...> generates fake rows without hitting DB.
+			// Used in prototype phase - pages render with realistic dummy data before schema exists.
+			var rows []map[string]any
+			var err error
+
+			if mockStr := q.Attrs["mock"]; mockStr != "" {
+				mockCount := 3 // default
+				// Accept 0 explicitly to render the empty-state branch
+				// (inverted mustache section).
+				if n, e := strconv.Atoi(mockStr); e == nil && n >= 0 {
+					mockCount = n
+				}
+				rows = generateMockRows(app, q, mockCount)
+			} else {
+				rows, err = QueryRows(app.DB, sql, args...)
+			}
+
+			// N+1 detection: track query count and log SQL
+			ctx.QueryCount++
+			if app.DevMode {
+				logSQL := sql
+				if len(logSQL) > 200 {
+					logSQL = logSQL[:200] + "..."
+				}
+				ctx.QueryLog = append(ctx.QueryLog, logSQL)
+			}
+
+			if err != nil {
+				var errHTML string
+				if app.DevMode {
+					// Dev mode: show full error with SQL for debugging
+					errHTML = fmt.Sprintf(`<div class="benmore-error"><strong>SQL Error</strong><pre>%s</pre><p>%s</p></div>`,
+						html.EscapeString(q.SQL), html.EscapeString(err.Error()))
 				} else {
-					// No section wrapper - render per-row (each row's fields available directly)
-					for _, row := range rows {
-						rowData := mergeData(ctx.Data, row)
-						innerProtected := protectFetchInner(q.Inner)
-						expanded := RenderMustache(innerProtected, rowData)
-						rendered.WriteString(restoreFetchInner(expanded))
+					// Production: generic error, log details to stderr
+					log.Printf("ERROR [query] %s: %s", q.SQL, err.Error())
+					errHTML = `<div class="benmore-error">An error occurred loading this content.</div>`
+				}
+				content = content[:q.Start] + errHTML + content[q.End:]
+				continue
+			}
+
+			// Cache results if cache attribute was set
+			if cacheKey != "" && cacheTTL > 0 {
+				// Determine table name for per-table cache invalidation
+				cacheTable := q.From
+				if cacheTable == "" {
+					cacheTable = extractTableFromSQL(sql)
+				}
+				queryCacheSet(cacheKey, rows, cacheTTL, cacheTable)
+			}
+
+			// Store results in context
+			if q.As != "" {
+				// Always store as array (enables {{#var}} iteration and {{var.0.field}} access)
+				ctx.Data[q.As] = rows
+				if len(rows) == 1 {
+					// Single row: also flatten fields for direct access: {{var.field}}
+					for k, v := range rows[0] {
+						ctx.Data[q.As+"."+k] = v
 					}
 				}
-			} else if len(rows) == 0 {
-				// Empty state - render {{^as}}...{{/as}} blocks
-				rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
 			}
-			content = content[:q.Start] + rendered.String() + content[q.End:]
-		} else {
-			// No inner content - just remove the tag
-			content = content[:q.Start] + content[q.End:]
-		}
+
+			// Render the inner template with query results
+			if q.Inner != "" {
+				var rendered strings.Builder
+				if q.As != "" && len(rows) > 0 {
+					// Check if inner content contains a {{#as}}...{{/as}} section matching
+					// the query's as name. If so, let mustache handle iteration (render once).
+					// Otherwise, render per-row (backward compat for templates without sections).
+					sectionTag := "{{#" + q.As + "}}"
+					hasSectionLoop := strings.Contains(q.Inner, sectionTag)
+					if hasSectionLoop {
+						// Render once - mustache {{#as}} section handles row iteration
+						innerProtected := protectFetchInner(q.Inner)
+						expanded := RenderMustache(innerProtected, ctx.Data)
+						rendered.WriteString(restoreFetchInner(expanded))
+					} else {
+						// No section wrapper - render per-row (each row's fields available directly)
+						for _, row := range rows {
+							rowData := mergeData(ctx.Data, row)
+							innerProtected := protectFetchInner(q.Inner)
+							expanded := RenderMustache(innerProtected, rowData)
+							rendered.WriteString(restoreFetchInner(expanded))
+						}
+					}
+				} else if len(rows) == 0 {
+					// Empty state - render {{^as}}...{{/as}} blocks
+					rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
+				}
+				content = content[:q.Start] + rendered.String() + content[q.End:]
+			} else {
+				// No inner content - just remove the tag
+				content = content[:q.Start] + content[q.End:]
+			}
 		} // end leaf iteration
 	} // end pass loop
 
@@ -716,7 +716,8 @@ func injectOwnerScope(sql string, userID int64) string {
 // extractPrimaryAlias returns the alias (or table name) of the primary FROM table.
 // Uses indexTopLevel to skip FROM inside subqueries.
 // e.g. "SELECT ..., (SELECT ... FROM x) FROM players p LEFT JOIN teams t" → "p"
-//      "FROM teams ORDER BY" → "teams"
+//
+//	"FROM teams ORDER BY" → "teams"
 func extractPrimaryAlias(upper, original string) string {
 	idx := indexTopLevel(upper, "FROM ")
 	if idx < 0 {
@@ -1414,13 +1415,13 @@ func LoadPages(dir string) (map[string]*Page, map[string]string, error) {
 			Description: description,
 			Image:       image,
 			Robots:      robots,
-			Auth:    auth,
-			Scope:   scope,
-			Title:   title,
-			Layout:  layout,
-			Require:  ExtractPageRequire(content),
-			Type:     ExtractPageType(content),
-			Redirect: ExtractPageRedirect(content),
+			Auth:        auth,
+			Scope:       scope,
+			Title:       title,
+			Layout:      layout,
+			Require:     ExtractPageRequire(content),
+			Type:        ExtractPageType(content),
+			Redirect:    ExtractPageRedirect(content),
 		}
 		// Frontmatter takes effect when the legacy <page> tag is absent -
 		// otherwise the <page> tag wins so a mixed file stays self-consistent.

@@ -35,10 +35,10 @@ import (
 // Prisma models and the live database. Multiple drifts are returned
 // as a slice; each is independent.
 type SchemaDrift struct {
-	Kind    string // "missing_table" | "extra_table" | "missing_column" | "extra_column" | "type_mismatch"
-	Table   string
-	Column  string // empty for table-level drifts
-	Detail  string // human-readable extra context (expected type, etc.)
+	Kind   string // "missing_table" | "extra_table" | "missing_column" | "extra_column" | "type_mismatch"
+	Table  string
+	Column string // empty for table-level drifts
+	Detail string // human-readable extra context (expected type, etc.)
 }
 
 // DetectSchemaDrift compares the declared schema against the live
@@ -231,7 +231,7 @@ func getLiveColumns(db *sql.DB, table string) (map[string]LiveColumn, error) {
 // sqliteTypesMatch is a loose comparison for SQLite types. SQLite
 // stores types as strings without strict enforcement (type affinity),
 // so a column declared INTEGER might be shown as INT, INTEGER, or
-// even bare ''. We accept any of these as matching.
+// even bare ”. We accept any of these as matching.
 func sqliteTypesMatch(declared, live string) bool {
 	d := strings.ToUpper(strings.TrimSpace(declared))
 	l := strings.ToUpper(strings.TrimSpace(live))

@@ -45,11 +45,11 @@ func renderInstallPage(w http.ResponseWriter, r *http.Request, app *App) {
 }
 
 type installVars struct {
-	Name        string // Display name, e.g. "TaskFlow"
-	ShortName   string // Fallback letter for the icon, e.g. "T"
-	ThemeColor  string // Brand color hex, e.g. "#7c3aed"
-	BgColor     string // Page background hex, e.g. "#09090b"
-	IconURL     string // App icon URL, may be ""
+	Name       string // Display name, e.g. "TaskFlow"
+	ShortName  string // Fallback letter for the icon, e.g. "T"
+	ThemeColor string // Brand color hex, e.g. "#7c3aed"
+	BgColor    string // Page background hex, e.g. "#09090b"
+	IconURL    string // App icon URL, may be ""
 }
 
 // resolveInstallVars pulls branding out of app.Design with sensible

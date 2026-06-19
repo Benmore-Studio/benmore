@@ -253,3 +253,34 @@ func TestUploadsHandlerBlocksSymlinkEscape(t *testing.T) {
 		t.Fatalf("Cache-Control = %q, want no-store", cc)
 	}
 }
+
+// TestUploadsNestedPrivateSymlinkBypassBlocked covers round-2 #3: a symlink
+// resolving into a NESTED private dir (x/private/...) must also require a signed
+// URL. The pre-fix re-check matched only a top-level "private/" prefix while the
+// URL gate used isPrivateUploadPath (any /private/ segment), so this leaked.
+func TestUploadsNestedPrivateSymlinkBypassBlocked(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	uploadsDir := filepath.Join(app.Dir, "uploads")
+	nestedPrivate := filepath.Join(uploadsDir, "userdocs", "private")
+	if err := os.MkdirAll(nestedPrivate, 0o755); err != nil {
+		t.Fatalf("mkdir nested private: %v", err)
+	}
+	secret := "BENMORE_NESTED_PRIVATE_MUST_NOT_LEAK"
+	if err := os.WriteFile(filepath.Join(nestedPrivate, "ssn.pdf"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	// A non-private URL symlinked into the NESTED private dir.
+	if err := os.Symlink(filepath.Join("userdocs", "private", "ssn.pdf"), filepath.Join(uploadsDir, "public.png")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/uploads/public.png", nil)
+	rec := httptest.NewRecorder()
+	serveUploadAsset(rec, req, app, false, "public.png")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (nested-private resolved target needs a signed URL)", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatal("nested-private file served via non-private symlink without a signed URL")
+	}
+}

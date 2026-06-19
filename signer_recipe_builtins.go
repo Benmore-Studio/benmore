@@ -376,22 +376,23 @@ headers:
 // HMAC the body with a secret, hex-encode, set a header.
 //
 // Caller-supplied bindings (all optional):
-//   secret  - value of the signing secret. If omitted, falls back to
-//             env.WEBHOOK_SECRET so the original single-secret demos
-//             keep working. New code should pass `secret:` explicitly:
 //
-//                 sign:
-//                   recipe: hmac_sha256_body
-//                   secret: "${{ env.MY_API_SECRET }}"
+//	secret  - value of the signing secret. If omitted, falls back to
+//	          env.WEBHOOK_SECRET so the original single-secret demos
+//	          keep working. New code should pass `secret:` explicitly:
 //
-//             so each integration can carry its own secret rather
-//             than aliasing WEBHOOK_SECRET.
-//   header  - header name to set the signature on. Default X-Signature.
-//             Override for vendors that pick a different name
-//             (e.g. `header: X-Hub-Signature-256` for GitHub-style).
-//   prefix  - string prepended to the hex signature in the header.
-//             Default empty. Use `prefix: "sha256="` for the GitHub
-//             scheme.
+//	              sign:
+//	                recipe: hmac_sha256_body
+//	                secret: "${{ env.MY_API_SECRET }}"
+//
+//	          so each integration can carry its own secret rather
+//	          than aliasing WEBHOOK_SECRET.
+//	header  - header name to set the signature on. Default X-Signature.
+//	          Override for vendors that pick a different name
+//	          (e.g. `header: X-Hub-Signature-256` for GitHub-style).
+//	prefix  - string prepended to the hex signature in the header.
+//	          Default empty. Use `prefix: "sha256="` for the GitHub
+//	          scheme.
 const recipeHMACSHA256 = `
 compute:
   secret: "{{ params.secret | or_env:'WEBHOOK_SECRET' | required:'sign.secret or env.WEBHOOK_SECRET must be set' }}"
@@ -430,20 +431,21 @@ headers:
 // step, no HMAC.
 //
 // Caller-supplied bindings (all optional):
-//   token   - the bearer value WITHOUT the "Bearer " prefix. If omitted,
-//             falls back to env.API_TOKEN. New code should pass
-//             `token:` explicitly so each integration can carry its
-//             own token without aliasing API_TOKEN.
 //
-//                 sign:
-//                   recipe: bearer_token
-//                   token: "${{ env.FREIGHTWISE_API_TOKEN }}"
+//	token   - the bearer value WITHOUT the "Bearer " prefix. If omitted,
+//	          falls back to env.API_TOKEN. New code should pass
+//	          `token:` explicitly so each integration can carry its
+//	          own token without aliasing API_TOKEN.
 //
-//   header  - header name. Default Authorization. Override when the
-//             vendor uses a non-standard name (e.g. x-api-key).
-//   prefix  - string prepended to the token. Default "Bearer ".
-//             Set to "" for raw token (e.g. `prefix: ""` with
-//             `header: x-api-key` for Anthropic-style API keys).
+//	              sign:
+//	                recipe: bearer_token
+//	                token: "${{ env.FREIGHTWISE_API_TOKEN }}"
+//
+//	header  - header name. Default Authorization. Override when the
+//	          vendor uses a non-standard name (e.g. x-api-key).
+//	prefix  - string prepended to the token. Default "Bearer ".
+//	          Set to "" for raw token (e.g. `prefix: ""` with
+//	          `header: x-api-key` for Anthropic-style API keys).
 const recipeBearerToken = `
 compute:
   token:  "{{ params.token | or_env:'API_TOKEN' | required:'sign.token or env.API_TOKEN must be set' }}"

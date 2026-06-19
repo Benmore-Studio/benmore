@@ -93,14 +93,15 @@ var markdownJS []byte
 
 // RegisterLibRoutes serves embedded JS libraries from /_internal/ paths.
 // Available libs (drop-in CDN replacements):
-//   /_internal/chart.js     - Chart.js for line/bar/pie charts
-//   /_internal/mermaid.js   - Mermaid for diagrams
-//   /_internal/alpine.js    - Alpine.js for reactive sprinkles
-//   /_internal/htmx.js      - HTMX for declarative HTTP
-//   /_internal/lucide.js    - Lucide icon set
-//   /_internal/libavoid.js  - Libavoid for graph routing
-//   /_internal/libavoid.wasm - Libavoid WASM module
-//   /_internal/bm.js        - Benmore frontend SDK (special handling)
+//
+//	/_internal/chart.js     - Chart.js for line/bar/pie charts
+//	/_internal/mermaid.js   - Mermaid for diagrams
+//	/_internal/alpine.js    - Alpine.js for reactive sprinkles
+//	/_internal/htmx.js      - HTMX for declarative HTTP
+//	/_internal/lucide.js    - Lucide icon set
+//	/_internal/libavoid.js  - Libavoid for graph routing
+//	/_internal/libavoid.wasm - Libavoid WASM module
+//	/_internal/bm.js        - Benmore frontend SDK (special handling)
 func RegisterLibRoutes(mux *http.ServeMux) {
 	serve := func(path string, data []byte) {
 		mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {

@@ -23,7 +23,7 @@ const (
 	cbStateOpen     = "open"
 	cbStateHalfOpen = "half-open"
 
-	cbFailureThreshold = 5              // consecutive failures to trip
+	cbFailureThreshold = 5                // consecutive failures to trip
 	cbCooldown         = 60 * time.Second // how long to stay open
 )
 

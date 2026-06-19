@@ -47,15 +47,15 @@ import (
 // assignment. v2.7.59+ supports tenant-scoped grants via the optional
 // `group_id` column:
 //
-//   group_id IS NULL  → role applies globally (every group context)
-//   group_id = 'X'    → role applies only when the session's effective
-//                       group is X (native group OR act-as target)
+//	group_id IS NULL  → role applies globally (every group context)
+//	group_id = 'X'    → role applies only when the session's effective
+//	                    group is X (native group OR act-as target)
 //
 // Uniqueness: a user can hold each (role, group_id) pair at most once.
 // The classic global form ({user 3, 'editor', NULL}) is allowed
 // alongside group-scoped forms ({user 3, 'editor', '1'}). Because
 // SQLite PRIMARY KEY treats each NULL as distinct, we enforce
-// uniqueness via a UNIQUE INDEX that normalises NULL → '' for the
+// uniqueness via a UNIQUE INDEX that normalises NULL → ” for the
 // comparison.
 //
 // Migration: an older table without the group_id column is migrated
@@ -312,11 +312,12 @@ func StartRoleExpirySweeper(app *App) {
 		return
 	}
 	go func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				sweepExpiredRoles(app)

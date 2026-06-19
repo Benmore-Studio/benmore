@@ -109,62 +109,82 @@ func RegisterCRUD(mux *http.ServeMux, app *App) {
 		t := table // capture for closure
 		// POST /api/{table} - create
 		mux.HandleFunc(fmt.Sprintf("POST /api/%s", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleCreate(w, r, app, t)
 		})
 
 		// GET /api/{table} - list
 		mux.HandleFunc(fmt.Sprintf("GET /api/%s", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleList(w, r, app, t)
 		})
 
 		// GET /api/{table}/{id} - read
 		mux.HandleFunc(fmt.Sprintf("GET /api/%s/", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleRead(w, r, app, t)
 		})
 
 		// PATCH /api/{table}/{id} - update
 		mux.HandleFunc(fmt.Sprintf("PATCH /api/%s/", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleUpdate(w, r, app, t)
 		})
 
 		// PATCH /api/{table} - singleton-row upsert for tables with UNIQUE(user_id).
 		// Closes the profile/settings save loop: one row per user, no ID needed.
 		mux.HandleFunc(fmt.Sprintf("PATCH /api/%s", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleSingletonUpdate(w, r, app, t)
 		})
 
 		// DELETE /api/{table}/{id} - delete
 		mux.HandleFunc(fmt.Sprintf("DELETE /api/%s/", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleDelete(w, r, app, t)
 		})
 
 		// POST /api/{table}/batch - batch create (JSON array)
 		mux.HandleFunc(fmt.Sprintf("POST /api/%s/batch", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleBatchCreate(w, r, app, t)
 		})
 
 		// PATCH /api/{table}/batch - bulk update (JSON: {ids: [...], fields: {...}})
 		mux.HandleFunc(fmt.Sprintf("PATCH /api/%s/batch", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleBatchUpdate(w, r, app, t)
 		})
 
 		// DELETE /api/{table}/batch - bulk delete (JSON: {ids: [...]})
 		mux.HandleFunc(fmt.Sprintf("DELETE /api/%s/batch", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleBatchDelete(w, r, app, t)
 		})
 
 		// POST /api/{table}/ingest - streaming NDJSON ingestion
 		mux.HandleFunc(fmt.Sprintf("POST /api/%s/ingest", t), func(w http.ResponseWriter, r *http.Request) {
-			if requireAPIAuth(w, r, app, t) { return }
+			if requireAPIAuth(w, r, app, t) {
+				return
+			}
 			handleStreamingIngest(w, r, app, t)
 		})
 	}
@@ -1752,7 +1772,9 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 		var values []any
 
 		for _, col := range cols {
-			if col.PK { continue }
+			if col.PK {
+				continue
+			}
 			if col.Name == "user_id" {
 				if session != nil {
 					fields = append(fields, col.Name)
@@ -1767,7 +1789,9 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 				values = append(values, session.EffectiveGroupID())
 				continue
 			}
-			if protected[col.Name] { continue }
+			if protected[col.Name] {
+				continue
+			}
 
 			if val, ok := item[col.Name]; ok && val != nil {
 				fields = append(fields, col.Name)
@@ -1776,7 +1800,9 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 			}
 		}
 
-		if len(fields) == 0 { continue }
+		if len(fields) == 0 {
+			continue
+		}
 
 		// Validate fields against rules
 		if len(validationRules) > 0 {

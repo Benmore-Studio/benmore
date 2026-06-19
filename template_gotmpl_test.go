@@ -181,13 +181,13 @@ func TestGotmplHelpers_SprigMathAvailable(t *testing.T) {
 	// dead end last time - `{{sub a b}}` returned "function not
 	// defined". Now Sprig's full FuncMap is registered.
 	cases := map[string]string{
-		`{{add 2 3}}`:                "5",
-		`{{sub 10 4}}`:               "6",
-		`{{mul 3 7}}`:                "21",
-		`{{div 10 2}}`:               "5",
-		`{{mod 10 3}}`:               "1",
-		`{{max 5 8}}`:                "8",
-		`{{min 5 8}}`:                "5",
+		`{{add 2 3}}`:                 "5",
+		`{{sub 10 4}}`:                "6",
+		`{{mul 3 7}}`:                 "21",
+		`{{div 10 2}}`:                "5",
+		`{{mod 10 3}}`:                "1",
+		`{{max 5 8}}`:                 "8",
+		`{{min 5 8}}`:                 "5",
 		`{{add (add 1 2) (add 3 4)}}`: "10",
 	}
 	for tmpl, want := range cases {
@@ -208,18 +208,18 @@ func TestGotmplHelpers_SprigMathAvailable(t *testing.T) {
 
 func TestGotmplHelpers_SprigStringsAvailable(t *testing.T) {
 	cases := map[string]string{
-		`{{upper "hi"}}`:                                "HI",
-		`{{lower "HELLO"}}`:                             "hello",
-		`{{title "hello world"}}`:                       "Hello World",
-		`{{trim "  spaces  "}}`:                         "spaces",
-		`{{replace "x" "y" "axb"}}`:                     "ayb",
-		`{{contains "ell" "hello"}}`:                    "true",
-		`{{hasPrefix "he" "hello"}}`:                    "true",
-		`{{hasSuffix "lo" "hello"}}`:                    "true",
-		`{{default "fallback" ""}}`:                     "fallback",
-		`{{default "fallback" "actual"}}`:               "actual",
-		`{{repeat 3 "ab"}}`:                             "ababab",
-		`{{join ", " (list "a" "b" "c")}}`:              "a, b, c",
+		`{{upper "hi"}}`:                   "HI",
+		`{{lower "HELLO"}}`:                "hello",
+		`{{title "hello world"}}`:          "Hello World",
+		`{{trim "  spaces  "}}`:            "spaces",
+		`{{replace "x" "y" "axb"}}`:        "ayb",
+		`{{contains "ell" "hello"}}`:       "true",
+		`{{hasPrefix "he" "hello"}}`:       "true",
+		`{{hasSuffix "lo" "hello"}}`:       "true",
+		`{{default "fallback" ""}}`:        "fallback",
+		`{{default "fallback" "actual"}}`:  "actual",
+		`{{repeat 3 "ab"}}`:                "ababab",
+		`{{join ", " (list "a" "b" "c")}}`: "a, b, c",
 	}
 	for tmpl, want := range cases {
 		body := tmpl
@@ -275,14 +275,14 @@ func TestGotmplHelpers_FrameworkOverridesEnv(t *testing.T) {
 
 func TestIsSingleRowQuery(t *testing.T) {
 	cases := map[string]bool{
-		"SELECT * FROM users WHERE id = 1 LIMIT 1":     true,
-		"SELECT * FROM users WHERE id = 1 LIMIT 1;":    true,
-		"select * from users limit 1":                  true,
-		"SELECT * FROM users LIMIT  1":                 true, // multiple spaces
-		"SELECT * FROM users":                          false,
-		"SELECT * FROM users LIMIT 10":                 false,
-		"SELECT * FROM users LIMIT 1 OFFSET 5":         false, // not a bare LIMIT 1
-		"SELECT * FROM users WHERE name = 'limit 1'":   false, // string literal
+		"SELECT * FROM users WHERE id = 1 LIMIT 1":   true,
+		"SELECT * FROM users WHERE id = 1 LIMIT 1;":  true,
+		"select * from users limit 1":                true,
+		"SELECT * FROM users LIMIT  1":               true, // multiple spaces
+		"SELECT * FROM users":                        false,
+		"SELECT * FROM users LIMIT 10":               false,
+		"SELECT * FROM users LIMIT 1 OFFSET 5":       false, // not a bare LIMIT 1
+		"SELECT * FROM users WHERE name = 'limit 1'": false, // string literal
 	}
 	for sql, want := range cases {
 		if got := isSingleRowQuery(sql); got != want {

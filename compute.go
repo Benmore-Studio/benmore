@@ -106,6 +106,7 @@ var (
 //   - cap the SIZE of the result we marshal OUT of the runtime;
 //   - bound the call-stack depth so runaway recursion fails fast with a
 //     RangeError instead of growing Go's stack unbounded.
+//
 // These do not stop a module that allocates internally without touching
 // the boundary, but they remove the easy OOM vectors and make the limits
 // explicit. The wall-clock timeout remains the backstop for CPU loops.

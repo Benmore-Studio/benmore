@@ -69,16 +69,16 @@ type wsConn struct {
 
 // wsClient represents a connected WebSocket client.
 type wsClient struct {
-	ws            *wsConn
-	send          chan []byte
-	appID         string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
-	userID        int64
-	email         string // session email - ws_rooms membership checks against email-shaped user columns
-	groupID       string
-	isAdmin       bool
+	ws      *wsConn
+	send    chan []byte
+	appID   string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
+	userID  int64
+	email   string // session email - ws_rooms membership checks against email-shaped user columns
+	groupID string
+	isAdmin bool
 	// remoteIP is the connecting client's source host (no port), captured
 	// at connect time for the H-16 per-anonymous-IP connection cap.
-	remoteIP      string
+	remoteIP string
 	// wsAnonShared signals that this app has features.ws_anonymous: true
 	// AND no groups: scoping - i.e. the developer explicitly opted in to
 	// "let anon viewers participate in the same rooms as authed users."
@@ -680,11 +680,11 @@ func wsTableExists(app *App, name string) bool {
 // with the app ID first so the process-global wsHub can host many apps
 // without room collisions in `benmore host` mode:
 //
-//   anon  (no userID)       → "<appID>|anon:<room>"
-//   group ("groups:" set)   → "<appID>|g<groupID>:<room>"
-//   solo  (auth, no group)  → "<appID>|app:<room>"   ← shared across all
-//                                                       authed users in
-//                                                       the same app
+//	anon  (no userID)       → "<appID>|anon:<room>"
+//	group ("groups:" set)   → "<appID>|g<groupID>:<room>"
+//	solo  (auth, no group)  → "<appID>|app:<room>"   ← shared across all
+//	                                                    authed users in
+//	                                                    the same app
 //
 // The solo case being app-wide (not per-user) is what makes chat,
 // huddle signaling, presence - any multi-user broadcast room - work

@@ -56,13 +56,13 @@ package main
 // operators are GHA-shaped (`==`, `!=`, `>`, `<`, `&&`, `||`).
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"encoding/json"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -70,17 +70,17 @@ import (
 
 // FlowFileGHA is the top-level shape of the new flows.yaml.
 type FlowFileGHA struct {
-	On   FlowTriggerGHA               `yaml:"on"`
+	On   FlowTriggerGHA        `yaml:"on"`
 	Jobs map[string]FlowJobGHA `yaml:"jobs"`
 }
 
 // FlowTriggerGHA is the `on:` map. Mirrors the shape every GitHub
 // Actions workflow file uses.
 //
-//   on:
-//     request: { method, path, ... }
-//     schedule: { cron: "*/5 * * * *" }
-//     event: { table: notes, op: insert }
+//	on:
+//	  request: { method, path, ... }
+//	  schedule: { cron: "*/5 * * * *" }
+//	  event: { table: notes, op: insert }
 type FlowTriggerGHA struct {
 	Request  *FlowRequestTrigger  `yaml:"request"`
 	Schedule *FlowScheduleTrigger `yaml:"schedule"`
@@ -169,24 +169,24 @@ type FlowJobGHA struct {
 //     containing step (or any sibling earlier in the on_error block)
 //     errored out
 type FlowStepGHA struct {
-	ID    string         `yaml:"id"`
-	If    string         `yaml:"if"`
-	Run   string         `yaml:"run"`
-	Query string         `yaml:"query"` // shorthand for run: sql, with: { query: ... }
+	ID    string `yaml:"id"`
+	If    string `yaml:"if"`
+	Run   string `yaml:"run"`
+	Query string `yaml:"query"` // shorthand for run: sql, with: { query: ... }
 	// RawParams accepts `params:` at the step root (sibling to the
 	// `query:` shorthand). When the agent uses the shorthand they
 	// don't have a `with:` block to put params under, so we pull
 	// them up to the step level. Equivalent to `with.params:` semantically.
-	RawParams any           `yaml:"params"`
-	With  map[string]any `yaml:"with"`
-	Steps []FlowStepGHA  `yaml:"steps"`  // nested for compound if/for_each branches
-	Else  []FlowStepGHA  `yaml:"else"`
-	ForEach string        `yaml:"for_each"`
-	As      string        `yaml:"as"`
-	OnError []FlowStepGHA `yaml:"on_error"`
-	Retry int            `yaml:"retry"`
-	RetryDelay string    `yaml:"retry_delay"`
-	Timeout    string    `yaml:"timeout"`
+	RawParams  any            `yaml:"params"`
+	With       map[string]any `yaml:"with"`
+	Steps      []FlowStepGHA  `yaml:"steps"` // nested for compound if/for_each branches
+	Else       []FlowStepGHA  `yaml:"else"`
+	ForEach    string         `yaml:"for_each"`
+	As         string         `yaml:"as"`
+	OnError    []FlowStepGHA  `yaml:"on_error"`
+	Retry      int            `yaml:"retry"`
+	RetryDelay string         `yaml:"retry_delay"`
+	Timeout    string         `yaml:"timeout"`
 }
 
 // LoadFlowsGHA reads flows.yaml (and every flows/*.yaml file beside it)
@@ -930,7 +930,8 @@ func translateGHAExpr(expr string) string {
 
 // ghaIfToFlowCondition translates a GHA-style condition into the shape
 // the legacy condition evaluator (hooks.go evaluateCondition) expects:
-//   `<row-key> <op> <literal-or-template>`
+//
+//	`<row-key> <op> <literal-or-template>`
 //
 // The evaluator treats the LEFT side as a key into the flow's row map
 // and the RIGHT side as a literal string to compare against. So we

@@ -3,8 +3,8 @@
 package main
 
 import (
-	"crypto/rsa"
 	"crypto/rand"
+	"crypto/rsa"
 	"strings"
 	"testing"
 )

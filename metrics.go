@@ -71,9 +71,9 @@ func httpStatusBucket(code int) string {
 	}
 }
 
-func incDBQuery()        { metricDBQueries.Add(1) }
-func incEncryptionEnc()  { metricEncryptionEncOps.Add(1) }
-func incEncryptionDec()  { metricEncryptionDecOps.Add(1) }
+func incDBQuery()       { metricDBQueries.Add(1) }
+func incEncryptionEnc() { metricEncryptionEncOps.Add(1) }
+func incEncryptionDec() { metricEncryptionDecOps.Add(1) }
 
 // ===== Histograms =====
 

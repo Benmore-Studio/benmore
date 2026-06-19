@@ -97,9 +97,14 @@ func installHotReloadSignal(app *App, dev bool) {
 func hotReloadApp(app *App, dev bool) error {
 	// Stop any goroutines that listen on app.Stop (cron, jobs worker,
 	// retention sweeper). Then refresh the channel so a fresh round of
-	// goroutines can restart with the new config.
+	// goroutines can restart with the new config. Under app.mu so the swap is
+	// serialized against Shutdown's locked read; restarted workers each capture
+	// their own copy of app.Stop at spawn, so the old generation observes the
+	// close and exits while the new generation gets the fresh channel.
+	app.mu.Lock()
 	close(app.Stop)
 	app.Stop = make(chan struct{})
+	app.mu.Unlock()
 
 	// Re-run the per-app loaders. reloadAppConfig is the in-place
 	// variant of loadApp's config-reading section - it does NOT
@@ -134,10 +139,11 @@ func reloadAppConfig(app *App) error {
 	// the simple key-value parser for legacy app.yaml files. Treat nil
 	// as "keep the previous Design" rather than an error so an in-
 	// flight typo doesn't kick the server back to scaffold defaults.
+	design := app.Design // preserve previous on nil (in-flight typo)
 	if cfg := LoadAppConfigYAML(app.Dir); cfg != nil {
-		app.Design = cfg
+		design = cfg
 	} else if cfg := LoadAppConfig(app.Dir); cfg != nil {
-		app.Design = cfg
+		design = cfg
 	}
 	// schema - rerun migrations (idempotent).
 	//
@@ -167,10 +173,12 @@ func reloadAppConfig(app *App) error {
 		}
 		return fmt.Errorf("schema: %w", err)
 	}
-	app.Tables = tables
-	app.UUIDTables = DetectUUIDTables(tables)
-	annotateFullTextFromPrisma(app.Dir, app.Tables)
-	EnsureFTSTables(app.DB, app.Tables)
+	// Compute into locals + annotate the local; published under app.mu below
+	// alongside flows/cron so concurrent readers (hasColumn ranging app.Tables,
+	// request handlers reading app.Design) never see a mid-reload reassignment.
+	uuidTables := DetectUUIDTables(tables)
+	annotateFullTextFromPrisma(app.Dir, tables)
+	EnsureFTSTables(app.DB, tables)
 	if _, err := Migrate(app.DB, tables, false); err != nil {
 		log.Printf("  hot reload migrate warning: %s", err)
 	}
@@ -210,6 +218,9 @@ func reloadAppConfig(app *App) error {
 	group := LoadGroupConfig(app.Dir)
 	encrypted := LoadEncryptedFieldsConfig(app.Dir)
 	app.mu.Lock()
+	app.Design = design
+	app.Tables = tables
+	app.UUIDTables = uuidTables
 	app.Flows = flows
 	app.Hooks = hooks
 	app.Workflows = workflows
@@ -220,8 +231,10 @@ func reloadAppConfig(app *App) error {
 	app.Group = group
 	app.Encrypted = encrypted
 	app.mu.Unlock()
-	// Restart cron scheduler on the new Stop channel.
-	StartCronScheduler(app)
+	// NOTE: cron is (re)started by buildAppMux, which always runs after this on
+	// the hot-reload path - starting it here too double-spawned the scheduler
+	// each reload (the second start closed the first's channel and respawned),
+	// relying entirely on cronUniqueKey dedup to avoid a duplicate fire.
 	// Re-load env.yaml. LoadEnv doesn't return an error - missing file
 	// is treated as no-op there, so this is just a courtesy refresh of
 	// the in-process env map. Platform env lives in the router
@@ -772,7 +785,11 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 		privateBase = realUploads
 	}
 	if rel, err := filepath.Rel(privateBase, resolved); err != nil ||
-		rel == "private" || strings.HasPrefix(rel, "private"+string(filepath.Separator)) {
+		isPrivateUploadPath("uploads/"+filepath.ToSlash(rel)) {
+		// Use the SAME predicate as the URL gate (matches any /private/
+		// segment, not just a top-level one) so a symlink resolving into a
+		// NESTED private dir (e.g. public.png -> x/private/secret) can't be
+		// served unsigned.
 		if err != nil || !ValidateSignedURL(relativePath, r) {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
@@ -813,7 +830,7 @@ func wrapMiddleware(handler http.Handler, app *App, dev bool) http.Handler {
 	if rateLimit > 0 {
 		var limiter *RateLimiter
 		if IsClusterMode() {
-			limiter = NewSharedRateLimiter(app.DB, rateLimit, time.Minute)
+			limiter = NewSharedRateLimiter(app.DB, rateLimit, time.Minute, app.Stop)
 		} else {
 			limiter = NewRateLimiterStoppable(rateLimit, time.Minute, app.Stop)
 		}

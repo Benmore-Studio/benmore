@@ -85,4 +85,3 @@ func TestFailedMigrationDedup(t *testing.T) {
 		t.Errorf("different migration deduped against %q", dup)
 	}
 }
-

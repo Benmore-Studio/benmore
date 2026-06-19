@@ -79,30 +79,30 @@ import (
 // PrismaModel is one `model X { ... }` block, partially resolved into
 // the bits we need to emit SQL.
 type PrismaModel struct {
-	Name      string         // PascalCase from the .prisma file
-	Table     string         // snake-cased, pluralized, or @@map override
-	Fields    []PrismaField  // scalar + FK-owning fields, in declaration order
-	Indexes   []PrismaIndex  // @@index entries
-	Uniques   []PrismaIndex  // @@unique entries (same shape, different emit)
-	CompoundID []string       // @@id([a, b]) columns; empty when single-field @id
-	FullText   []PrismaIndex  // @@fulltext([title, body]) - backed by SQLite FTS5
+	Name       string        // PascalCase from the .prisma file
+	Table      string        // snake-cased, pluralized, or @@map override
+	Fields     []PrismaField // scalar + FK-owning fields, in declaration order
+	Indexes    []PrismaIndex // @@index entries
+	Uniques    []PrismaIndex // @@unique entries (same shape, different emit)
+	CompoundID []string      // @@id([a, b]) columns; empty when single-field @id
+	FullText   []PrismaIndex // @@fulltext([title, body]) - backed by SQLite FTS5
 }
 
 // PrismaField is one line inside a model block. Reverse-relation list
 // fields (`notes Note[]`) are recognized and excluded - they have no
 // column.
 type PrismaField struct {
-	Name        string // original PascalCase/camelCase
-	Column      string // snake-cased or @map override
-	Type        string // SQLite type (INTEGER/TEXT/REAL/DATETIME/BLOB)
-	Optional    bool   // `?` suffix
-	IsID        bool   // @id
-	IsUnique    bool   // @unique
-	Default     string // SQL default expression, already quoted/literal
-	Autoincr    bool   // @default(autoincrement()) on @id Int
-	UpdatedAt   bool   // @updatedAt - emit AFTER UPDATE trigger
-	FKTable     string // FOREIGN KEY target table (snake-cased)
-	FKColumn    string // FOREIGN KEY target column
+	Name      string // original PascalCase/camelCase
+	Column    string // snake-cased or @map override
+	Type      string // SQLite type (INTEGER/TEXT/REAL/DATETIME/BLOB)
+	Optional  bool   // `?` suffix
+	IsID      bool   // @id
+	IsUnique  bool   // @unique
+	Default   string // SQL default expression, already quoted/literal
+	Autoincr  bool   // @default(autoincrement()) on @id Int
+	UpdatedAt bool   // @updatedAt - emit AFTER UPDATE trigger
+	FKTable   string // FOREIGN KEY target table (snake-cased)
+	FKColumn  string // FOREIGN KEY target column
 }
 
 // PrismaIndex is `@@index([a, b])` or `@@unique([a, b])` - columns

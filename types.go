@@ -13,15 +13,15 @@ import (
 
 // App holds the entire application state.
 type App struct {
-	Dir             string
-	DB              *sql.DB
-	Pages           map[string]*Page
-	Tables          []Table
-	Design          *DesignConfig
-	Partials        map[string]string
-	Sessions        *SessionStore
-	Hooks           *HookConfig
-	Flows           []Flow
+	Dir      string
+	DB       *sql.DB
+	Pages    map[string]*Page
+	Tables   []Table
+	Design   *DesignConfig
+	Partials map[string]string
+	Sessions *SessionStore
+	Hooks    *HookConfig
+	Flows    []Flow
 	// Scopes lets app.yaml declare per-table override SQL fragments
 	// for the auto-CRUD's read filter. Keyed by table name. The most
 	// common use is `public_read_when: "status = 'published'"` so a
@@ -36,7 +36,7 @@ type App struct {
 	// "room-:id"-shaped rooms requires a membership row - the same
 	// EXISTS semantics as the member-of: access mode. Rooms matching
 	// no pattern keep the historical any-authed-user behavior.
-	WSRooms []WSRoomRule
+	WSRooms         []WSRoomRule
 	Workflows       *WorkflowConfig
 	Computed        *ComputedFieldConfig
 	Encrypted       *EncryptedFieldConfig
@@ -47,7 +47,7 @@ type App struct {
 	Roles           *RolesConfig
 	Paths           *AuthPaths
 	Validators      *ValidatorConfig
-	Admin           *AdminConfig // admin.yaml - Django-ModelAdmin-style auto-admin customisation
+	Admin           *AdminConfig  // admin.yaml - Django-ModelAdmin-style auto-admin customisation
 	SessionDuration time.Duration // per-app session lifetime (no global race in multi-tenant)
 	AppID           string        // auto-generated UUID for this app (persisted in .benmore/app_id)
 	ExternalID      string        // optional external system ID from app.yaml (e.g., project tracker ID)
@@ -143,7 +143,6 @@ func (app *App) FeatureEnabled(name string) bool {
 func (app *App) IsUUIDTable(table string) bool {
 	return app.UUIDTables != nil && app.UUIDTables[table]
 }
-
 
 // AuthPaths holds discovered URL paths for auth routes.
 // Paths are discovered from page type="" attributes at load time.
@@ -290,7 +289,7 @@ type Workflow struct {
 	Initial      string
 	States       []string
 	Transitions  map[string]map[string]Transition // from_state → to_state → rule
-	OnTransition map[string][]Hook               // state_entered → hooks to fire
+	OnTransition map[string][]Hook                // state_entered → hooks to fire
 	Timeouts     map[string]WorkflowTimeout       // state → auto-transition
 }
 
@@ -352,25 +351,25 @@ type ForeignKey struct {
 
 // QueryTag represents a <query sql="..." as="..."> or <query from="..." pick="..."> in a template.
 type QueryTag struct {
-	SQL    string
-	As     string
-	From   string            // shorthand mode: table name
-	Attrs  map[string]string // all attributes for shorthand expansion
-	Start  int
-	End    int
-	Inner  string
+	SQL   string
+	As    string
+	From  string            // shorthand mode: table name
+	Attrs map[string]string // all attributes for shorthand expansion
+	Start int
+	End   int
+	Inner string
 }
 
 // FeaturesConfig holds opt-in/opt-out flags for framework features.
 // All features default to enabled (true) for backwards compatibility.
 type FeaturesConfig struct {
-	Admin  *bool    `yaml:"admin"`  // /admin panel (default: true)
+	Admin *bool `yaml:"admin"` // /admin panel (default: true)
 	// Search removed - opinionated feature, not a framework concern
-	SSE    *bool    `yaml:"sse"`    // /sse/events endpoint (default: true)
-	WS     *bool    `yaml:"ws"`     // /ws WebSocket endpoint (default: true)
-	Docs     *bool    `yaml:"docs"`     // /api/_docs + /docs endpoints (default: true)
-	Testing   *bool    `yaml:"testing"`  // testing/QA mode: password gate, feedback widget, session banner (default: false, opt-in)
-	Analytics *bool    `yaml:"analytics"` // per-app analytics beacon + cookie tracking (default: true)
+	SSE       *bool `yaml:"sse"`       // /sse/events endpoint (default: true)
+	WS        *bool `yaml:"ws"`        // /ws WebSocket endpoint (default: true)
+	Docs      *bool `yaml:"docs"`      // /api/_docs + /docs endpoints (default: true)
+	Testing   *bool `yaml:"testing"`   // testing/QA mode: password gate, feedback widget, session banner (default: false, opt-in)
+	Analytics *bool `yaml:"analytics"` // per-app analytics beacon + cookie tracking (default: true)
 
 	// WSAnonymous, when true, drops the auth gate on /ws and /sse/events.
 	// Default false - authed apps require a session as before. Opt-in for
@@ -382,7 +381,6 @@ type FeaturesConfig struct {
 	// DocsVisibility controls access to /api/_docs, /docs, /llms.txt.
 	// "public" (default) = accessible to anyone; "auth" = requires login.
 	DocsVisibility string `yaml:"-"`
-
 }
 
 // IsEnabled returns whether a feature is enabled for this config. Each
@@ -429,11 +427,11 @@ func (f *FeaturesConfig) DocsRequireAuth() bool {
 // ScopeConfig carries per-table read-filter overrides. Read from
 // app.yaml's `scopes:` section:
 //
-//   scopes:
-//     stories:
-//       public_read_when: "status = 'published'"
-//     comments:
-//       public_read_when: "1=1"  # all comments are public-readable
+//	scopes:
+//	  stories:
+//	    public_read_when: "status = 'published'"
+//	  comments:
+//	    public_read_when: "1=1"  # all comments are public-readable
 //
 // Only `public_read_when` is supported today. The SQL fragment is
 // inserted into the auto-CRUD read query AND-OR'd with the standard
@@ -468,21 +466,21 @@ type AutoMembershipConfig struct {
 }
 
 type DesignConfig struct {
-	CSS              string            // "default", "tailwind", "both", "none"
-	Colors           map[string]string `yaml:"colors"`
-	Typography       map[string]string `yaml:"typography"`
-	Spacing          map[string]string `yaml:"spacing"`
-	Radius           string            `yaml:"radius"`
-	Shadow           string            `yaml:"shadow"`
-	Nav              map[string]string `yaml:"nav"`
-	Table            map[string]any    `yaml:"table"`
-	SEO              map[string]string // site_name, description, image, url, favicon
-	CSP              map[string]string // per-directive CSP allowlist extensions - keys: script_src, style_src, img_src, font_src, connect_src, frame_src
-	Auth             map[string]string // domain, otp, redirect
-	PWA              map[string]string // name, short_name, icon, theme_color, offline
-	Recording        map[string]string // enabled, production, mask_inputs
-	Features         *FeaturesConfig   // opt-in/opt-out for admin, search, sse, docs
-	AutoMemberships  map[string]AutoMembershipConfig `yaml:"auto_memberships"`
+	CSS             string                          // "default", "tailwind", "both", "none"
+	Colors          map[string]string               `yaml:"colors"`
+	Typography      map[string]string               `yaml:"typography"`
+	Spacing         map[string]string               `yaml:"spacing"`
+	Radius          string                          `yaml:"radius"`
+	Shadow          string                          `yaml:"shadow"`
+	Nav             map[string]string               `yaml:"nav"`
+	Table           map[string]any                  `yaml:"table"`
+	SEO             map[string]string               // site_name, description, image, url, favicon
+	CSP             map[string]string               // per-directive CSP allowlist extensions - keys: script_src, style_src, img_src, font_src, connect_src, frame_src
+	Auth            map[string]string               // domain, otp, redirect
+	PWA             map[string]string               // name, short_name, icon, theme_color, offline
+	Recording       map[string]string               // enabled, production, mask_inputs
+	Features        *FeaturesConfig                 // opt-in/opt-out for admin, search, sse, docs
+	AutoMemberships map[string]AutoMembershipConfig `yaml:"auto_memberships"`
 }
 
 // SessionStore manages user sessions.
@@ -493,9 +491,9 @@ type SessionStore struct {
 
 // Session represents an authenticated user session.
 type Session struct {
-	ID       string
-	UserID   int64
-	Email    string
+	ID     string
+	UserID int64
+	Email  string
 	// GroupID is the tenant key from the configured `groups:` table.
 	// Originally INTEGER-only; v2.5.10 widened to string so UUID /
 	// slug / opaque-ID tenants work natively. SQLite's dynamic typing
@@ -503,8 +501,8 @@ type Session struct {
 	// _benmore_sessions.group_id still has INTEGER affinity, but a
 	// string value lands fine and round-trips cleanly. Pre-existing
 	// INTEGER values stringify to their decimal form ("0", "1", …).
-	GroupID  string
-	Role     string // PRIMARY role from _benmore_users.role - back-compat field used by getSession callers and `role: "admin"` shortcut checks
+	GroupID string
+	Role    string // PRIMARY role from _benmore_users.role - back-compat field used by getSession callers and `role: "admin"` shortcut checks
 	// Roles is the FULL set of roles the user holds (v2.7.54+):
 	// _benmore_users.role + every active row in _benmore_user_roles,
 	// expanded transitively through `inherits:` declared in the
@@ -519,7 +517,7 @@ type Session struct {
 	// scope checks in that case).
 	Permissions []string
 	Scopes      string // OAuth2-style space-separated: "contacts:read deals:write". Empty = full access.
-	Verified bool   // from _benmore_users.verified - loaded at session resolution
+	Verified    bool   // from _benmore_users.verified - loaded at session resolution
 	// ActingAsGroup is the platform-admin "step-in" tenant. Non-empty
 	// means an admin has explicitly scoped this session to one group
 	// via POST /api/_auth/act_as. While set, the framework applies
@@ -640,7 +638,7 @@ type RenderContext struct {
 
 // CheckResult represents a validation finding.
 type CheckResult struct {
-	Level   string `json:"level"`   // "error", "warning", "info"
+	Level   string `json:"level"` // "error", "warning", "info"
 	File    string `json:"file"`
 	Line    int    `json:"line"`
 	Message string `json:"message"`

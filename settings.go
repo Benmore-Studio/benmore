@@ -505,12 +505,13 @@ func userDirectoryMode(app *App) string {
 // empty list, not 403, so client code can branch on shape).
 //
 // Modes:
-//   "off"       - never reached (handler short-circuits)
-//   "admin"     - admin sees everyone; non-admin sees only themselves
-//   "self"      - everyone sees only themselves
-//   "group"     - JOIN to the membership table on the requester's group
-//                 column; admin bypasses and sees everyone
-//   "everyone"  - everyone sees everyone (chat-style apps opt in)
+//
+//	"off"       - never reached (handler short-circuits)
+//	"admin"     - admin sees everyone; non-admin sees only themselves
+//	"self"      - everyone sees only themselves
+//	"group"     - JOIN to the membership table on the requester's group
+//	              column; admin bypasses and sees everyone
+//	"everyone"  - everyone sees everyone (chat-style apps opt in)
 func buildUserListQuery(app *App, session *Session, mode string, limit, offset int) (string, []any, bool) {
 	deactivatedClause := "(deactivated_at IS NULL OR deactivated_at = '')"
 	isAdmin := session != nil && session.IsAdmin()

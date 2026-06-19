@@ -29,7 +29,7 @@ type AppTestFile struct {
 type AppTestCase struct {
 	Setup  []AppTestSetup `yaml:"setup"`
 	Steps  []AppTestStep  `yaml:"steps"`
-	Users  []string       `yaml:"users"`   // pre-create these users before running steps (for multi-actor tests)
+	Users  []string       `yaml:"users"` // pre-create these users before running steps (for multi-actor tests)
 	AsUser string         `yaml:"as_user"`
 	AsRole string         `yaml:"as_role"` // "admin" to create user with admin role (default: "user")
 	Anon   bool           `yaml:"anon"`    // true = no auth, no CSRF injection
@@ -49,8 +49,8 @@ type AppTestStep struct {
 	SQL     string         `yaml:"sql"`      // execute SQL and check results
 	Flush   string         `yaml:"flush"`    // drain async queue: "jobs" flushes the job worker
 	SetAuth string         `yaml:"set_auth"` // switch Bearer token: "{{my_token}}" or "none" for anonymous
-	Data  map[string]any `yaml:"data"`  // form data for POST/PATCH
-	JSON  map[string]any `yaml:"json"`  // JSON object body for POST/PATCH
+	Data    map[string]any `yaml:"data"`     // form data for POST/PATCH
+	JSON    map[string]any `yaml:"json"`     // JSON object body for POST/PATCH
 
 	// JSONArray sends a raw JSON array body (e.g., for batch endpoints)
 	JSONArray []any `yaml:"json_array"`

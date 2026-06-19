@@ -58,11 +58,11 @@ const encPrefixV2 = "enc:v2:"
 // most of the time, but "1.5e+00" with %v in some paths; int64 stays
 // stable as "%d"). Lock the format here:
 //
-//   int64   → strconv.FormatInt(v, 10)          // "50000"
-//   float64 → strconv.FormatFloat(v, 'f', -1, 64) // "1.5", "0.1", "1e-300" never
-//   string  → as-is
-//   []byte  → string(v)
-//   bool    → "0" / "1" (SQLite affinity)
+//	int64   → strconv.FormatInt(v, 10)          // "50000"
+//	float64 → strconv.FormatFloat(v, 'f', -1, 64) // "1.5", "0.1", "1e-300" never
+//	string  → as-is
+//	[]byte  → string(v)
+//	bool    → "0" / "1" (SQLite affinity)
 //
 // 'f', -1 is the shortest decimal representation that round-trips
 // back to the same float - same plaintext on re-encrypt produces
@@ -1059,7 +1059,7 @@ func cryptoParseAAD(aad []byte) (table, column string, ok bool) {
 //     swapped yet, the next process start still loads OLD. Re-running
 //     rotation against the SAME new key will skip already-rotated rows
 //     (decrypt fails with OLD on those, succeeds on the unrotated ones)
-//     - caller can pass `--resume-skip-undecryptable` to make this safe.
+//   - caller can pass `--resume-skip-undecryptable` to make this safe.
 //   - env.yaml write failure AFTER DB rotation → the most dangerous
 //     case. DB is rotated but persisted key file is stale. We restart
 //     the app process here so it reloads the file and the in-memory key
@@ -1264,7 +1264,7 @@ func RegisterEncryptionRotationRoute(mux *http.ServeMux, app *App) {
 		}
 		if !body.Confirm {
 			httpJSON(w, http.StatusOK, map[string]any{
-				"dry_run":               true,
+				"dry_run":                true,
 				"rows_that_would_rotate": rotated,
 			})
 			return

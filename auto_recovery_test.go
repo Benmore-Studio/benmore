@@ -117,7 +117,7 @@ func TestIsCorruptDBErr_ClassifiesCorrectly(t *testing.T) {
 		"file is not a database",
 		"database disk image is malformed",
 		"disk I/O error",
-		"open database: file is not a database",  // wrapped
+		"open database: file is not a database", // wrapped
 	}
 	notCorruption := []string{
 		"permission denied",

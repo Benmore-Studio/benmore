@@ -506,19 +506,19 @@ func generateShortID() string {
 //
 // Accepts multipart/form-data with:
 //
-//   file       (required) the file blob
-//   kind       (optional) subfolder under uploads/ - "avatars", "imports",
-//              "feedback", etc. Defaults to "files".
-//   _csrf      (required for cookie auth) framework's CSRF token.
-//              Bearer-auth requests are exempt.
+//	file       (required) the file blob
+//	kind       (optional) subfolder under uploads/ - "avatars", "imports",
+//	           "feedback", etc. Defaults to "files".
+//	_csrf      (required for cookie auth) framework's CSRF token.
+//	           Bearer-auth requests are exempt.
 //
 // Returns JSON:
 //
-//   { "path": "/uploads/<kind>/<id>.<ext>",
-//     "url":  "<absolute or signed url>",
-//     "size": <bytes>,
-//     "mime": "<detected mime>",
-//     "filename": "<original filename>" }
+//	{ "path": "/uploads/<kind>/<id>.<ext>",
+//	  "url":  "<absolute or signed url>",
+//	  "size": <bytes>,
+//	  "mime": "<detected mime>",
+//	  "filename": "<original filename>" }
 //
 // 200 on success, 401 if anonymous + auth required, 403 on CSRF mismatch,
 // 413 (Payload Too Large) when the file exceeds the per-app cap,

@@ -52,14 +52,14 @@ func SendEmail(appDir, to, subject, body string) error {
 // transactional path; use SendEmailOpts when you need List-Unsubscribe
 // headers (marketing) or a specific SES configuration set.
 type EmailOpts struct {
-	To              string // single recipient or comma-list
-	Subject         string
-	BodyHTML        string
-	BodyText        string // optional plain-text alt; if set, sends multipart/alternative
-	UnsubscribeURL  string // when set: adds List-Unsubscribe + RFC 8058 one-click
+	To               string // single recipient or comma-list
+	Subject          string
+	BodyHTML         string
+	BodyText         string // optional plain-text alt; if set, sends multipart/alternative
+	UnsubscribeURL   string // when set: adds List-Unsubscribe + RFC 8058 one-click
 	ConfigurationSet string // optional SES config set (e.g., "my-config-set")
-	From            string // override SMTP_FROM
-	ReplyTo         string
+	From             string // override SMTP_FROM
+	ReplyTo          string
 }
 
 func SendEmailOpts(appDir string, opts EmailOpts) error {
@@ -291,15 +291,15 @@ func firstNonEmptyStr(values ...string) string {
 // AddResendContact best-effort-adds a new signup to a Resend audience
 // (contacts list) for marketing blasts. Reads from app env:
 //
-//   RESEND_API_KEY      - required (already used by SendEmail)
-//   RESEND_AUDIENCE_ID  - required (the audience to add to)
-//   RESEND_CONTACT_TAG  - optional. When set, the value is appended
-//                         to last_name as " [<tag>]" so contacts can
-//                         be filtered by source in the Resend dashboard.
-//                         Useful when multiple sites populate the same
-//                         audience: Resend's contacts API has no custom
-//                         fields, so embedding the source in last_name
-//                         is the only Resend-native way to differentiate.
+//	RESEND_API_KEY      - required (already used by SendEmail)
+//	RESEND_AUDIENCE_ID  - required (the audience to add to)
+//	RESEND_CONTACT_TAG  - optional. When set, the value is appended
+//	                      to last_name as " [<tag>]" so contacts can
+//	                      be filtered by source in the Resend dashboard.
+//	                      Useful when multiple sites populate the same
+//	                      audience: Resend's contacts API has no custom
+//	                      fields, so embedding the source in last_name
+//	                      is the only Resend-native way to differentiate.
 //
 // Silently no-ops if RESEND_API_KEY or RESEND_AUDIENCE_ID is missing.
 // Runs synchronously so callers can fire-and-forget with `go`.
@@ -483,14 +483,14 @@ func brandMark(brand EmailBrand, brandColor string) string {
 // (e.g. inserting a space between groups for readability).
 func RenderBrandedCodeEmail(brand EmailBrand, headline, intro, code, outro string) string {
 	const (
-		brandDark = "#1c1c20"
-		bgPage    = "#fafafa"
-		bgCard    = "#ffffff"
-		fgText    = "#1c1c20"
-		fgMuted   = "#4b4b54"
-		fgSubtle  = "#7a7a85"
-		border    = "rgba(0,0,0,0.08)"
-		codeBg    = "#f4f4f6"
+		brandDark  = "#1c1c20"
+		bgPage     = "#fafafa"
+		bgCard     = "#ffffff"
+		fgText     = "#1c1c20"
+		fgMuted    = "#4b4b54"
+		fgSubtle   = "#7a7a85"
+		border     = "rgba(0,0,0,0.08)"
+		codeBg     = "#f4f4f6"
 		codeBorder = "rgba(0,0,0,0.12)"
 	)
 

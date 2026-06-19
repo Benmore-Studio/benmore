@@ -55,7 +55,7 @@ func gitDirLock(dir string) *sync.Mutex {
 // Cached after first probe so the per-write commit path doesn't pay
 // the exec("git --version") cost every time.
 var (
-	gitProbeOnce     sync.Once
+	gitProbeOnce      sync.Once
 	gitProbeAvailable bool
 )
 
@@ -216,12 +216,12 @@ func gitHardRestore(dir, sha string) error {
 // --format=%H|%h|%an|%ad|%s` parsed back into a typed record so
 // callers don't have to deal with the raw `git` stdout.
 type GitCommit struct {
-	SHA       string `json:"sha"`
-	ShortSHA  string `json:"short_sha"`
-	Author    string `json:"author"`
-	AuthorAt  string `json:"author_at"`
-	Message   string `json:"message"`
-	NumFiles  int    `json:"files_changed"`
+	SHA      string `json:"sha"`
+	ShortSHA string `json:"short_sha"`
+	Author   string `json:"author"`
+	AuthorAt string `json:"author_at"`
+	Message  string `json:"message"`
+	NumFiles int    `json:"files_changed"`
 }
 
 // gitLog returns the last `limit` commits, newest first. limit <= 0
@@ -361,10 +361,10 @@ func gitRun(dir string, args ...string) (string, error) {
 		env = append(env, kv)
 	}
 	cmd.Env = append(env,
-		"HOME=/tmp",                // sandboxed home git can always read
-		"GIT_CONFIG_NOSYSTEM=1",    // skip /etc/gitconfig
-		"GIT_TERMINAL_PROMPT=0",    // never block on a credentials prompt
-		"GIT_OPTIONAL_LOCKS=0",     // skip the gc/maintenance lock dance
+		"HOME=/tmp",             // sandboxed home git can always read
+		"GIT_CONFIG_NOSYSTEM=1", // skip /etc/gitconfig
+		"GIT_TERMINAL_PROMPT=0", // never block on a credentials prompt
+		"GIT_OPTIONAL_LOCKS=0",  // skip the gc/maintenance lock dance
 	)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf

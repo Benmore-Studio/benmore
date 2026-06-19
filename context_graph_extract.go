@@ -123,12 +123,12 @@ func extractTables(tx *sql.Tx, app *App, userTables []string) {
 		var rowCount int64
 		app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %q", t)).Scan(&rowCount)
 		meta := map[string]any{
-			"columns":     colNames,
-			"primary_key": pks,
-			"row_count":   rowCount,
+			"columns":         colNames,
+			"primary_key":     pks,
+			"row_count":       rowCount,
 			"has_soft_delete": hasColumnInList(cols, "deleted_at"),
-			"has_timestamps": hasColumnInList(cols, "created_at"),
-			"has_user_id":    hasColumnInList(cols, "user_id"),
+			"has_timestamps":  hasColumnInList(cols, "created_at"),
+			"has_user_id":     hasColumnInList(cols, "user_id"),
 		}
 		insertNode(tx, "table", "table:"+t, t, meta)
 	}
@@ -373,8 +373,8 @@ func extractAggregates(tx *sql.Tx, app *App, userTables []string) {
 	for _, agg := range configs {
 		ref := "aggregate:" + agg.Name
 		meta := map[string]any{
-			"sql":              agg.SQL,
-			"refresh_seconds":  int(agg.Refresh.Seconds()),
+			"sql":             agg.SQL,
+			"refresh_seconds": int(agg.Refresh.Seconds()),
 		}
 		insertNode(tx, "aggregate", ref, agg.Name, meta)
 		// Heuristic: link the aggregate to every user table whose name
@@ -425,9 +425,9 @@ func extractEncryptedFields(tx *sql.Tx, app *App) {
 		for _, def := range defs {
 			ref := "encrypted_field:" + table + "." + def.Column
 			insertNode(tx, "encrypted_field", ref, table+"."+def.Column, map[string]any{
-				"table":         table,
-				"column":        def.Column,
-				"unmask_roles":  def.Roles,
+				"table":        table,
+				"column":       def.Column,
+				"unmask_roles": def.Roles,
 			})
 			insertEdge(tx, ref, "table:"+table, "encrypts_in", nil)
 		}
@@ -441,9 +441,9 @@ func extractRetention(tx *sql.Tx, app *App) {
 	for _, p := range policies {
 		ref := "retention:" + p.Table
 		insertNode(tx, "retention", ref, p.Table, map[string]any{
-			"table":        p.Table,
-			"ttl_seconds":  int(p.TTL.Seconds()),
-			"column":       p.Column,
+			"table":       p.Table,
+			"ttl_seconds": int(p.TTL.Seconds()),
+			"column":      p.Column,
 		})
 		insertEdge(tx, ref, "table:"+p.Table, "retains_from", nil)
 	}

@@ -124,7 +124,9 @@ func installExprTriggers(db *sql.DB, cf *ComputedField) int {
 // Source table: deals, FK: contact_id
 // → AFTER INSERT ON deals: UPDATE contacts SET deal_count = (...) WHERE id = NEW.contact_id
 // → AFTER UPDATE ON deals: UPDATE contacts SET deal_count = (...) WHERE id = NEW.contact_id
-//                          (also recalc OLD.contact_id if FK changed)
+//
+//	(also recalc OLD.contact_id if FK changed)
+//
 // → AFTER DELETE ON deals: UPDATE contacts SET deal_count = (...) WHERE id = OLD.contact_id
 func installAggregateTriggers(db *sql.DB, cf *ComputedField) int {
 	count := 0
