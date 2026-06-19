@@ -857,6 +857,12 @@ func cryptoDeriveArgon2(keyStr string) ([]byte, error) {
 	if err1 != nil || err2 != nil || err3 != nil || timeCost == 0 || memKiB == 0 || par == 0 {
 		return nil, fmt.Errorf("argon2id params must be positive integers")
 	}
+	// Warn (don't reject - rejecting would make an existing key un-derivable
+	// and lose access to data already encrypted with it) when params are below
+	// the OWASP-ish floor. A sub-floor KDF is a memory-hard KDF in name only.
+	if timeCost < 2 || memKiB < 19456 {
+		log.Printf("SECURITY: ENCRYPTION_KEY argon2id params are weak (time=%d mem=%dKiB) - recommend time>=2, mem>=19456KiB (19MiB)", timeCost, memKiB)
+	}
 	salt, err := base64.StdEncoding.DecodeString(parts[4])
 	if err != nil || len(salt) < 8 {
 		return nil, fmt.Errorf("argon2id salt must be >=8 bytes of base64")
@@ -1070,8 +1076,10 @@ func cryptoParseAAD(aad []byte) (table, column string, ok bool) {
 //
 // newKeySource is what gets written to env.yaml as the new
 // ENCRYPTION_KEY value - an arbitrary string. The actual 32-byte AES
-// key is derived via sha256(newKeySource), matching what
-// InitFieldEncryption does on process start. Default-generated keys
+// key is derived via cryptoDeriveAppKey(newKeySource) (the same versioned
+// derivation InitFieldEncryption uses on process start - SHA-256 for a bare
+// string, or Argon2id for an argon2id$... envelope), NOT a bare SHA-256.
+// Default-generated keys
 // are 32 random bytes hex-encoded (64-char string) for operator
 // readability, but the rotation accepts any non-empty string the
 // operator provides - same behavior as the env-var path.
