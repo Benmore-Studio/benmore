@@ -182,27 +182,44 @@ func reloadAppConfig(app *App) error {
 	// based parser. Without this, every SIGHUP wipes GHA-shaped flows
 	// because LoadFlows can't parse them - they were live after process
 	// start but disappeared on the first hot reload.
-	app.Flows = LoadFlowsYAML(app.Dir)
-	if app.Flows == nil {
-		app.Flows = LoadFlows(app.Dir)
+	// Load every config into locals FIRST (the loaders do file I/O - keep that
+	// off the lock), then publish the pointers under app.mu. The job worker and
+	// request handlers read these fields concurrently - findCronJob takes
+	// app.mu.RLock to read app.Cron, executeFlowJob reads app.Flows, etc. - so
+	// reassigning them on hot reload must be serialized against those readers or
+	// it's a data race (the read side already locks; the write side must too).
+	flows := LoadFlowsYAML(app.Dir)
+	if flows == nil {
+		flows = LoadFlows(app.Dir)
 	}
-	app.Hooks = LoadHooksYAML(app.Dir)
-	if app.Hooks == nil {
-		app.Hooks = LoadHooks(app.Dir)
+	hooks := LoadHooksYAML(app.Dir)
+	if hooks == nil {
+		hooks = LoadHooks(app.Dir)
 	}
-	app.Workflows = LoadWorkflowsYAML(app.Dir)
-	app.Cron = LoadCron(app.Dir)
+	workflows := LoadWorkflowsYAML(app.Dir)
+	cron := LoadCron(app.Dir)
 	// v2.7.17: re-load the configs that hot-reload was missing.
 	// Without these, every change to app.yaml's `roles:` / `access:` /
 	// `aggregates:` / `groups:` was invisible until a full systemd
 	// restart, and the bm.d.ts generator served stale types reflecting
 	// the boot-time state. Same loader functions app_loader.loadApp uses
 	// on cold start - keep them in sync if any are added.
-	app.Roles = LoadRolesConfig(app.Dir)
-	app.Access = LoadAccess(app.Dir)
-	app.Scopes = LoadScopes(app.Dir)
-	app.Group = LoadGroupConfig(app.Dir)
-	app.Encrypted = LoadEncryptedFieldsConfig(app.Dir)
+	roles := LoadRolesConfig(app.Dir)
+	access := LoadAccess(app.Dir)
+	scopes := LoadScopes(app.Dir)
+	group := LoadGroupConfig(app.Dir)
+	encrypted := LoadEncryptedFieldsConfig(app.Dir)
+	app.mu.Lock()
+	app.Flows = flows
+	app.Hooks = hooks
+	app.Workflows = workflows
+	app.Cron = cron
+	app.Roles = roles
+	app.Access = access
+	app.Scopes = scopes
+	app.Group = group
+	app.Encrypted = encrypted
+	app.mu.Unlock()
 	// Restart cron scheduler on the new Stop channel.
 	StartCronScheduler(app)
 	// Re-load env.yaml. LoadEnv doesn't return an error - missing file

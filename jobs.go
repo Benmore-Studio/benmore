@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,18 +58,38 @@ func EnsureJobsTable(db *sql.DB) {
 	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')")
 }
 
-// jobsLeaseTTL bounds how long a claimed job may run before its lease is
+// defaultJobsLeaseTTL bounds how long a claimed job may run before its lease is
 // considered orphaned. The worker heartbeats (extends) the lease on this
 // cadence while the job body runs, so a live worker never loses its claim;
 // only a crashed/hung worker lets the lease lapse. Sized well above a typical
 // hook/flow runtime; long jobs are kept alive by the heartbeat.
-const jobsLeaseTTL = 5 * time.Minute
+const defaultJobsLeaseTTL = 5 * time.Minute
+
+// jobsLeaseTTL resolves the effective lease window, overridable per-deployment
+// via the BENMORE_JOB_LEASE_SECONDS env var (the main knob for crash-recovery
+// latency: shorter recovers faster but heartbeats more often). Invalid or
+// absent values fall back to the 5m default.
+func jobsLeaseTTL() time.Duration {
+	if v := os.Getenv("BENMORE_JOB_LEASE_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return defaultJobsLeaseTTL
+}
 
 // jobsHeartbeatInterval is how often the running worker re-extends its lease.
-// Must be comfortably below jobsLeaseTTL so a brief stall never drops the
-// claim. (H-2: a fixed lease with no heartbeat let a second worker re-run any
-// job that outran the lease.)
-const jobsHeartbeatInterval = jobsLeaseTTL / 3
+// Must be comfortably below the lease window so a brief stall never drops the
+// claim (one third gives two renewal chances before expiry). A 1s floor keeps
+// it sane for very short test windows. (H-2: a fixed lease with no heartbeat
+// let a second worker re-run any job that outran the lease.)
+func jobsHeartbeatInterval() time.Duration {
+	hb := jobsLeaseTTL() / 3
+	if hb < time.Second {
+		hb = time.Second
+	}
+	return hb
+}
 
 // jobsRerunSafeTypes is the allowlist of job types whose side effects are
 // idempotent enough to re-run after a worker crash mid-execution (C-1:
@@ -309,7 +331,7 @@ func StartJobWorker(app *App) {
 	EnsureJobsTable(app.DB)
 
 	safeGo("jobs.worker", func() {
-		recoverCheck := time.NewTicker(jobsHeartbeatInterval)
+		recoverCheck := time.NewTicker(jobsHeartbeatInterval())
 		defer recoverCheck.Stop()
 		jobsRecoverOrphanedJobs(app) // sweep stale leases left by a previous crash on startup
 		for {
@@ -396,7 +418,7 @@ func processNextJob(app *App) (worked bool) {
 	// goroutines can SELECT the same id; the AND status='pending' guard +
 	// RowsAffected check ensures exactly one runs it, preventing duplicate
 	// emails / webhook deliveries / double-executed SQL hooks.
-	leaseUntil := time.Now().Add(jobsLeaseTTL).UTC().Format(sqliteDateTimeLayout)
+	leaseUntil := time.Now().Add(jobsLeaseTTL()).UTC().Format(sqliteDateTimeLayout)
 	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1, lease_expires_at = ? WHERE id = ? AND status = 'pending'", leaseUntil, id)
 	if claimErr != nil {
 		return false
@@ -411,7 +433,7 @@ func processNextJob(app *App) (worked bool) {
 	hbDone := make(chan struct{})
 	defer close(hbDone)
 	go func() {
-		ticker := time.NewTicker(jobsHeartbeatInterval)
+		ticker := time.NewTicker(jobsHeartbeatInterval())
 		defer ticker.Stop()
 		for {
 			select {
@@ -420,7 +442,7 @@ func processNextJob(app *App) (worked bool) {
 			case <-app.Stop:
 				return
 			case <-ticker.C:
-				next := time.Now().Add(jobsLeaseTTL).UTC().Format(sqliteDateTimeLayout)
+				next := time.Now().Add(jobsLeaseTTL()).UTC().Format(sqliteDateTimeLayout)
 				app.DB.Exec("UPDATE _benmore_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'", next, id)
 			}
 		}

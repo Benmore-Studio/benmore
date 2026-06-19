@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -402,4 +403,36 @@ func newWALJobsTestApp(t *testing.T) *App {
 	t.Cleanup(func() { _ = db.Close() })
 	EnsureJobsTable(db)
 	return &App{DB: db, Dir: t.TempDir(), Stop: make(chan struct{})}
+}
+
+// TestJobsLeaseTTLEnvOverride covers the BENMORE_JOB_LEASE_SECONDS knob
+// (carried over from the original lease-recovery work): a valid positive value
+// overrides the 5m default; absent/invalid/non-positive falls back.
+func TestJobsLeaseTTLEnvOverride(t *testing.T) {
+	cases := []struct {
+		val  string
+		want time.Duration
+	}{
+		{"", defaultJobsLeaseTTL},
+		{"30", 30 * time.Second},
+		{"0", defaultJobsLeaseTTL},
+		{"-5", defaultJobsLeaseTTL},
+		{"notanumber", defaultJobsLeaseTTL},
+	}
+	for _, c := range cases {
+		t.Setenv("BENMORE_JOB_LEASE_SECONDS", c.val)
+		if got := jobsLeaseTTL(); got != c.want {
+			t.Fatalf("BENMORE_JOB_LEASE_SECONDS=%q -> jobsLeaseTTL()=%v, want %v", c.val, got, c.want)
+		}
+	}
+	// The heartbeat interval tracks the (overridden) window at one-third, with
+	// a 1s floor so a tiny window can't produce a zero ticker.
+	t.Setenv("BENMORE_JOB_LEASE_SECONDS", "30")
+	if got := jobsHeartbeatInterval(); got != 10*time.Second {
+		t.Fatalf("heartbeat = %v, want 10s (window/3)", got)
+	}
+	t.Setenv("BENMORE_JOB_LEASE_SECONDS", "1")
+	if got := jobsHeartbeatInterval(); got != time.Second {
+		t.Fatalf("heartbeat = %v, want 1s floor", got)
+	}
 }
