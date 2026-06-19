@@ -133,7 +133,13 @@ func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *ti
 }
 
 func enqueueJob(exec jobEnqueueExecer, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	data, _ := json.Marshal(payload)
+	// Surface marshal failures rather than silently enqueuing an
+	// empty/partial body: a payload that fails to marshal (e.g. a
+	// non-serializable value) would otherwise run the flow with no input.
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", fmt.Errorf("marshal job payload: %w", err)
+	}
 	ra := time.Now()
 	if runAt != nil {
 		ra = *runAt
