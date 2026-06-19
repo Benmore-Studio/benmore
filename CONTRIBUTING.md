@@ -27,16 +27,19 @@ a C toolchain).
   before adding code. The framework may already support the behavior and the
   missing piece may be documentation, generated types, or a harness check.
 - When closing a gap, decide whether it belongs as a framework primitive or as
-  an escape-hatch recipe. Framework primitives should be configurable with a few
-  YAML lines or SDK calls; genuine gaps are things that cannot be solved safely
-  even with flows/hooks.
+  an escape-hatch recipe (see the [Gap Tiers](#gap-tiers) table for the full
+  decision matrix).
 - Every new primitive must update the docs surfaces that agents read:
-  `docs/agent/build.md`, generated SDK/types where relevant, and any runtime
-  docs endpoint or command help that exposes the feature.
+  `docs/agent/build.md`, the generated SDK/type surface where relevant
+  (`bm` SDK helpers and the YAML config types in `types.go`), and the runtime
+  docs endpoint that exposes the feature (`GET /api/_docs` / `GET /docs`, served
+  from `apidocs.go`).
 
 ## Production-Readiness Loop
 
-Use this loop when hardening Benmore for real apps:
+Use this loop when hardening Benmore for real apps. The diagram committed below is
+the single source of truth for the loop; any copy in a PR description is for
+convenience only.
 
 ```mermaid
 flowchart TD
@@ -63,13 +66,17 @@ flowchart TD
 
 ### PR Tags
 
-Use PR titles/bodies to identify the surface:
+This is a new, opt-in convention for identifying the surface a PR touches. It is
+being introduced here; existing PRs that use the `[codex]` prefix (or no tag) are
+exempt and do not need to be retagged. New PRs should prefix the title with one of
+the bracketed tags below (a bracketed `[CLI]` style is used so the tags are safe in
+shells and commit history):
 
 | Tag | Surface | Examples |
 | --- | --- | --- |
-| OSS | Open-source framework runtime and SDK | `bm` SDK, OpenAPI, app runtime, generated types |
-| !CLI | Tooling that ships with the hosted/internal CLI workflow | release gates, deploy/push/pull contracts, command output rules |
-| Platform | Hosted Benmore platform and deployment layer | docs site, systemd hardening, security scans, router behavior |
+| `[OSS]` | Open-source framework runtime and SDK | `bm` SDK, OpenAPI, app runtime, generated types |
+| `[CLI]` | Tooling that ships with the hosted/internal CLI workflow | release gates, deploy/push/pull contracts, command output rules |
+| `[Platform]` | Hosted Benmore platform and deployment layer | docs site, systemd hardening, security scans, router behavior |
 
 ## Reporting issues
 
