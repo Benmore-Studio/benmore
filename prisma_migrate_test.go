@@ -439,3 +439,49 @@ func TestApplyPrismaMigration_FullLifecycle(t *testing.T) {
 		t.Errorf("expected 2 migration rows, got %d", count)
 	}
 }
+
+// TestNotNullBackfillDefault: a new NOT NULL column on an existing table must
+// back-fill with a type-appropriate zero, not a text ” jammed into a numeric
+// or date column (which read-side coercion then mangles).
+func TestNotNullBackfillDefault(t *testing.T) {
+	cases := map[string]string{
+		"INTEGER": "0", "BIGINT": "0", "REAL": "0", "BOOLEAN": "0",
+		"DATETIME": "CURRENT_TIMESTAMP", "DATE": "CURRENT_TIMESTAMP",
+		"TEXT": "''", "BLOB": "''", "": "''",
+	}
+	for typ, want := range cases {
+		if got := notNullBackfillDefault(typ); got != want {
+			t.Errorf("notNullBackfillDefault(%q) = %q, want %q", typ, got, want)
+		}
+	}
+	// End-to-end: an INTEGER NOT NULL add emits DEFAULT 0, not DEFAULT ''.
+	prev := parseOrFail(t, `model Note { id Int @id @default(autoincrement()) }`)
+	curr := parseOrFail(t, `model Note {
+  id    Int @id @default(autoincrement())
+  count Int
+}`)
+	sql := emitUpSQL(DiffSchemas(prev, curr))
+	if !strings.Contains(sql, "NOT NULL DEFAULT 0") {
+		t.Errorf("expected INTEGER NOT NULL backfill with DEFAULT 0, got:\n%s", sql)
+	}
+	if strings.Contains(sql, "count INTEGER NOT NULL DEFAULT ''") {
+		t.Errorf("INTEGER column wrongly back-filled with text '':\n%s", sql)
+	}
+}
+
+// TestBackupTimestampSort: backups must order by timestamp suffix, not by the
+// (prefix-dominated) whole filename - else a recent pre-migrate-* backup is
+// shadowed by an older scheduled-* one and restore loses recent data.
+func TestBackupTimestampSort(t *testing.T) {
+	older := "/x/.benmore/backups/scheduled-20260101T000000Z.db"
+	newer := "/x/.benmore/backups/pre-migrate-20260601T120000Z.db"
+	got := []string{newer, older}
+	sortBackupsByTimestamp(got) // oldest first
+	if got[0] != older || got[1] != newer {
+		t.Fatalf("sortBackupsByTimestamp ordered by prefix not timestamp: %v", got)
+	}
+	if backupTimestamp(newer) <= backupTimestamp(older) {
+		t.Fatalf("newer pre-migrate ts (%s) should sort after older scheduled ts (%s)",
+			backupTimestamp(newer), backupTimestamp(older))
+	}
+}

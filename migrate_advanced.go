@@ -268,6 +268,22 @@ func RunMigrationFile(db *sql.DB, path string) error {
 	upSQL, _ := extractMigrationSection(string(data))
 
 	statements := splitStatements(upSQL)
+	// Apply every statement in the file inside ONE transaction so a mid-file
+	// failure rolls the whole file back instead of committing a partial prefix.
+	// Without this, a file that failed on statement N left 1..N-1 committed but
+	// unrecorded, so the next boot re-ran from the top and the already-applied
+	// prefix errored ("duplicate column") forever - a wedged, half-migrated
+	// schema. Rolling back on failure means a retry always starts clean.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 	for _, stmt := range statements {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
@@ -279,14 +295,19 @@ func RunMigrationFile(db *sql.DB, path string) error {
 		// (router keeps retrying the migration, every retry fails the
 		// same way). Surface the actual duplicate values instead so the
 		// agent/user can decide whether to dedupe or rename the
-		// constraint.
+		// constraint. (Reads committed state via db - a freshly-created
+		// table in this same file is empty, so no false positive.)
 		if dupErr := precheckUniqueIndex(db, stmt); dupErr != nil {
 			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), dupErr)
 		}
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
+	}
+	committed = true
 	return nil
 }
 

@@ -19,6 +19,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,6 +64,18 @@ func PrunePrismaDrift(db *sql.DB, dir string) (PruneResult, error) {
 	}
 	if len(dropColumns) == 0 && len(dropTables) == 0 {
 		return PruneResult{}, nil
+	}
+
+	// Prune is destructive (DROP COLUMN / DROP TABLE) and its generated
+	// migration's DOWN section can't restore the data. Take a fresh consistent
+	// backup BEFORE touching anything so `bm db rollback` / auto-restore has a
+	// pre-prune snapshot to recover from.
+	if bkPath, bkErr := backupDatabase(dir); bkErr != nil {
+		log.Printf("WARNING: pre-prune backup failed (dropping %d column(s), %d table(s)): %s",
+			len(dropColumns), len(dropTables), bkErr)
+	} else if bkPath != "" {
+		log.Printf("PRUNE: dropping %d column(s) + %d table(s) - backed up to %s before applying",
+			len(dropColumns), len(dropTables), filepath.Base(bkPath))
 	}
 
 	// Build the SQL statements + emit a migration file for the trace.

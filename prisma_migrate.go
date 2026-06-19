@@ -39,12 +39,12 @@ import (
 // It carries enough structure that the SQL emitter and the
 // human-readable summary can be generated from one source of truth.
 type MigrationDiff struct {
-	TablesAdded   []PrismaModel        // new model: CREATE TABLE + indexes + triggers
-	TablesDropped []string             // model removed: DROP TABLE
+	TablesAdded   []PrismaModel            // new model: CREATE TABLE + indexes + triggers
+	TablesDropped []string                 // model removed: DROP TABLE
 	ColumnsAdded  map[string][]PrismaField // table → new fields: ALTER ADD COLUMN
 	IndexesAdded  map[string][]PrismaIndex // table → new @@index entries
 	UniquesAdded  map[string][]PrismaIndex // table → new @@unique entries
-	Warnings      []string                  // schema changes we can't safely auto-apply
+	Warnings      []string                 // schema changes we can't safely auto-apply
 }
 
 // Empty reports whether the diff actually changes anything.
@@ -250,6 +250,21 @@ func EmitMigrationSQL(diff MigrationDiff, name, timestamp string) string {
 	return out.String()
 }
 
+// notNullBackfillDefault picks a type-appropriate DEFAULT for back-filling a
+// new NOT NULL column on an existing table, so the back-fill value matches the
+// column's SQLite affinity instead of jamming a text ” into a numeric/date
+// column (which read-side numeric coercion then silently mangles).
+func notNullBackfillDefault(sqlType string) string {
+	switch strings.ToUpper(strings.TrimSpace(sqlType)) {
+	case "INTEGER", "INT", "BIGINT", "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL", "BOOLEAN", "BOOL":
+		return "0"
+	case "DATETIME", "TIMESTAMP", "DATE", "TIME":
+		return "CURRENT_TIMESTAMP"
+	default: // TEXT, BLOB, and anything unknown → empty string is the safe zero.
+		return "''"
+	}
+}
+
 // emitUpSQL renders the forward direction of a diff.
 func emitUpSQL(diff MigrationDiff) string {
 	var out strings.Builder
@@ -280,7 +295,12 @@ func emitUpSQL(diff MigrationDiff) string {
 				parts := []string{f.Column, f.Type}
 				if !f.Optional {
 					if f.Default == "" {
-						parts = append(parts, "NOT NULL DEFAULT ''")
+						// Back-fill existing rows with a TYPE-APPROPRIATE zero
+						// value. Always defaulting to '' stored a text empty
+						// string into INTEGER/REAL/DATETIME columns, which then
+						// silently fails numeric coercion on read (corrupt
+						// sentinel). Pick a default matching the column affinity.
+						parts = append(parts, "NOT NULL DEFAULT "+notNullBackfillDefault(f.Type))
 					} else {
 						parts = append(parts, "NOT NULL")
 					}
@@ -699,6 +719,21 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	sqlText := EmitMigrationSQL(diff, slug, timestamp)
 	if err := os.WriteFile(filePath, []byte(sqlText), 0644); err != nil {
 		return "", fmt.Errorf("write migration: %w", err)
+	}
+
+	// Destructive migrations (table drops) permanently delete every row in
+	// the dropped table. Take a fresh VACUUM-INTO snapshot BEFORE applying so
+	// `bm db rollback` / auto-restore has a pre-drop backup to recover from.
+	// The boot-time backup in loadApp runs AFTER LoadSchema (which calls us),
+	// so without this the only "pre-migrate" backup would already reflect the
+	// post-drop state - the exact gap that made a dropped table unrecoverable.
+	if len(diff.TablesDropped) > 0 {
+		if bkPath, bkErr := backupDatabase(dir); bkErr != nil {
+			log.Printf("WARNING: pre-drop backup failed before destructive migration %s: %s", filename, bkErr)
+		} else if bkPath != "" {
+			log.Printf("DESTRUCTIVE MIGRATION %s: dropping table(s) %v - backed up to %s before applying",
+				filename, diff.TablesDropped, filepath.Base(bkPath))
+		}
 	}
 
 	// Apply the migration atomically. Every statement runs inside a
