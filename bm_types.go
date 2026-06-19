@@ -54,6 +54,7 @@ func GenerateBMTypes(app *App) string {
 //
 //   bm.table('notes').list({where:{user_id:5}})    typed CRUD reads
 //   bm.table('notes').create({title:'x'})          typed CRUD writes
+//   bm.store / bm.query                            app state + cached reads
 //   bm.live.scoped('notes', refresh)               SSE subs (debounced)
 //   bm.auth.me() / bm.auth.signOut()               session
 //   bm.upload(file)                                multipart upload → {path}
@@ -449,6 +450,78 @@ export interface RoomClient {
     persistent(name: string, version: string | number): CacheClient | null;
   };
 
+  // ── store - selector-based app state ───────────────────────────────
+  export type StoreUnsubscribe = () => void;
+  export interface StorePersistOpts {
+    name: string;
+    version?: string | number;
+    /** Default is sessionStorage. Use persistent for localStorage. */
+    storage?: 'session' | 'persistent';
+  }
+  export interface StoreClient<S> {
+    get(): S;
+    /** Object patches merge shallowly. Function patches receive current state. */
+    set(patch: Partial<S> | S | ((state: S) => Partial<S> | S | void | null)): S;
+    /** Subscribe to the whole state. */
+    subscribe(listener: (state: S, prev: S) => void): StoreUnsubscribe;
+    /** Subscribe to a selected slice; listener fires only when equality fails. */
+    subscribe<T>(
+      selector: (state: S) => T,
+      listener: (slice: T, prev: T) => void,
+      equal?: (a: T, b: T) => boolean
+    ): StoreUnsubscribe;
+    reset(nextState?: S): S;
+  }
+  export function createStore<S extends Record<string, any>>(
+    initialState: S,
+    opts?: { persist?: StorePersistOpts; cache?: StorePersistOpts }
+  ): StoreClient<S>;
+
+  // ── query - key-based cached reads + optimistic mutations ──────────
+  export interface QueryAgg { fn: 'count' | 'sum' | 'avg' | 'min' | 'max'; col?: string; as?: string; }
+  export interface QueryWhere { [col: string]: string | number | boolean | { eq?: any; ne?: any; gt?: any; gte?: any; lt?: any; lte?: any; like?: string; in?: any[] }; }
+  export interface QueryOrder { col: string; dir?: 'asc' | 'desc'; }
+  export interface QuerySpec { table: TableName; select?: string[]; where?: QueryWhere; group_by?: string[]; aggregates?: QueryAgg[]; order_by?: QueryOrder[]; limit?: number; }
+  export interface QuerySnapshot<T = any> {
+    data: T | undefined;
+    error: any;
+    updatedAt: number;
+    pending: boolean;
+  }
+  export interface QueryFetchOpts {
+    key?: unknown;
+    /** Canonical name for the stale window in milliseconds. */
+    staleTime?: number;
+    /** @deprecated Alias for staleTime; prefer staleTime. */
+    staleMs?: number;
+    force?: boolean;
+    live?: boolean;
+  }
+  export interface QueryMutateOpts<T = any> {
+    key?: unknown;
+    keys?: unknown[];
+    request: () => Promise<T>;
+    apply?: (current: any, key: unknown) => any;
+    rollback?: (snapshot: any, error: any, key: unknown) => any;
+    invalidate?: unknown | ((rawKey: unknown, stableKey: string) => boolean);
+    refetch?: boolean;
+  }
+  export const query: {
+    key(key: unknown): string;
+    stableStringify(value: unknown): string;
+    get<T = any>(key: unknown): T | undefined;
+    set<T = any>(key: unknown, data: T): T;
+    subscribe<T = any>(key: unknown, fn: (snapshot: QuerySnapshot<T>) => void): StoreUnsubscribe;
+    fetch<T = any>(key: unknown, fetcher: () => Promise<T> | T, opts?: QueryFetchOpts): Promise<T>;
+    refetch<T = any>(key: unknown): Promise<T | undefined>;
+    invalidate(match: unknown | ((rawKey: unknown, stableKey: string) => boolean), opts?: { refetch?: boolean }): string[];
+    tableKey(table: TableName, spec?: Record<string, unknown>): unknown[];
+    read<T = any>(spec: QuerySpec, opts?: QueryFetchOpts): Promise<T[]>;
+    table<T = any>(table: TableName, opts?: Omit<QuerySpec, 'table'> & QueryFetchOpts): Promise<T[]>;
+    invalidateTable(table: TableName, opts?: { refetch?: boolean }): string[];
+    mutate<T = any>(opts: QueryMutateOpts<T>): Promise<T>;
+  };
+
   // ── flows (from flows.yaml - typed per HTTP-triggered flow) ─────────
   export const flows: FlowMap;
 
@@ -613,6 +686,13 @@ declare const bm: {
   mfa: typeof mfa;
   webrtc: typeof webrtc;
   broadcast: typeof broadcast;
+  markdown: typeof markdown;
+  presence: typeof presence;
+  cache: typeof cache;
+  createStore: typeof createStore;
+  query: typeof query;
+  html: typeof html;
+  raw: typeof raw;
 };
 export default bm;
 
