@@ -25,29 +25,12 @@ func init() {
 // OpenDB opens the app database. Uses DATABASE_URL env var if set (for remote SQLite/Turso),
 // otherwise creates a local data.db in the app directory.
 func OpenDB(dir string) (*sql.DB, error) {
-	// Check for external database URL (Turso, remote SQLite, etc.)
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		// Also check app-level env
-		dbURL = GetEnv(dir, "DATABASE_URL")
+	cfg := buildDBOpenConfig(dir, resolveDatabaseURL(dir))
+	if cfg.Backend == DatabaseBackendPostgres {
+		return nil, unsupportedPostgresRuntimeError()
 	}
 
-	var dsn string
-	if dbURL != "" {
-		dsn = dbURL
-	} else {
-		dbPath := filepath.Join(dir, "data.db")
-		// Performance-optimized connection string
-		dsn = dbPath + "?_journal_mode=WAL" +
-			"&_foreign_keys=on" +
-			"&_busy_timeout=5000" +
-			"&_synchronous=NORMAL" +
-			"&_cache_size=-64000" +
-			"&_mmap_size=268435456" +
-			"&_temp_store=MEMORY"
-	}
-
-	db, err := sql.Open("sqlite3_benmore", dsn)
+	db, err := sql.Open(cfg.DriverName, cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -64,12 +47,12 @@ func OpenDB(dir string) (*sql.DB, error) {
 		// so a human can post-mortem it; the backup becomes the new
 		// data.db. Logged loudly so the operator knows recovery
 		// happened.
-		if dbURL == "" && isCorruptDBErr(err) {
+		if cfg.LocalSQLite && isCorruptDBErr(err) {
 			if recovered, rErr := autoRestoreFromBackup(dir, err); rErr == nil && recovered {
 				log.Printf("DB AUTO-RECOVERY: %s - restored from most recent pre-migrate backup, original moved to data.db.corrupt-*", dir)
 				_ = db.Close()
 				// Re-open with the same DSN; the file underneath is now the backup.
-				db, err = sql.Open("sqlite3_benmore", dsn)
+				db, err = sql.Open(cfg.DriverName, cfg.DSN)
 				if err != nil {
 					return nil, fmt.Errorf("re-open after recovery: %w", err)
 				}
@@ -98,7 +81,7 @@ func OpenDB(dir string) (*sql.DB, error) {
 	//
 	// SQLite creates these with the OS default umask (typically 0644 -
 	// world-readable). Best-effort: ignore errors on remote DBs (Turso).
-	if dbURL == "" {
+	if cfg.LocalSQLite {
 		dbPath := filepath.Join(dir, "data.db")
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			os.Chmod(dbPath+suffix, 0660)
@@ -110,12 +93,13 @@ func OpenDB(dir string) (*sql.DB, error) {
 
 // LoadSchema reads the app's schema definition and executes it against
 // the database. Source-of-truth precedence:
-//   1. schema.prisma - Prisma DSL, compiled to SQL by prisma_schema.go.
-//      This is the recommended shape for new apps; the agent has seen
-//      thousands of these in training.
-//   2. schema.sql - raw SQLite DDL. Still supported for hand-tuned
-//      schemas or when the Prisma subset doesn't express what's needed
-//      (e.g. CHECK constraints, custom triggers).
+//  1. schema.prisma - Prisma DSL, compiled to SQL by prisma_schema.go.
+//     This is the recommended shape for new apps; the agent has seen
+//     thousands of these in training.
+//  2. schema.sql - raw SQLite DDL. Still supported for hand-tuned
+//     schemas or when the Prisma subset doesn't express what's needed
+//     (e.g. CHECK constraints, custom triggers).
+//
 // If both files exist, schema.prisma wins. The compiled SQL is stored
 // in memory only - we don't write it back to disk to avoid confusing
 // "where did this file come from" moments.
@@ -316,9 +300,9 @@ func QueryRows(db *sql.DB, query string, args ...any) ([]map[string]any, error) 
 //
 //   - []byte    → string (SQLite default for TEXT)
 //   - BOOLEAN   → bool   (declared as Boolean in schema.prisma → stored
-//                          as 0/1 by SQLite → coerced back so JSON emits
-//                          true/false, avoiding the `0 && <X/>` React
-//                          gotcha where falsy SQLite booleans render "0")
+//     as 0/1 by SQLite → coerced back so JSON emits
+//     true/false, avoiding the `0 && <X/>` React
+//     gotcha where falsy SQLite booleans render "0")
 //
 // The column-type lookup happens once per result set (not per row).
 func scanRows(rows *sql.Rows) ([]map[string]any, error) {
@@ -1244,4 +1228,3 @@ func StartAppWALMaintenance(app *App) {
 		}
 	})
 }
-
