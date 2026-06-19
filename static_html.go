@@ -57,8 +57,12 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 	rel := strings.TrimPrefix(clean, "/")
 
 	// Reject any traversal attempts up front - filepath.Clean shouldn't
-	// produce ".." for absolute paths, but defense-in-depth.
+	// produce ".." for absolute paths, but defense-in-depth. Mark the
+	// response no-store so a blocked probe can't get its 404 pinned in a
+	// browser/CDN cache across a deploy (same hardening the /static/ and
+	// /uploads/ handlers apply on a miss).
 	if strings.Contains(rel, "..") {
+		w.Header().Set("Cache-Control", "no-store")
 		return false
 	}
 
@@ -72,8 +76,17 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 		filepath.Join(staticRoot, rel),
 	}
 	for _, candidate := range candidates {
-		resolved, _, ok := resolveServableFile(staticRoot, candidate)
+		resolved, ok := resolveServableFile(staticRoot, candidate)
 		if !ok {
+			// A candidate that exists on disk (even as a symlink) but is
+			// rejected by the resolver is a containment block, not a plain
+			// miss. Mark no-store so the resulting 404 isn't cached, then
+			// stop - falling through to other candidates or the SPA index
+			// for an escaping symlink would be wrong.
+			if _, lerr := os.Lstat(candidate); lerr == nil {
+				w.Header().Set("Cache-Control", "no-store")
+				return false
+			}
 			continue
 		}
 		// Only inject CSRF on actual .html files. Other extensions
@@ -118,7 +131,7 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path string) bool {
 	if app != nil {
 		staticRoot := filepath.Join(app.Dir, "static")
-		resolved, _, ok := resolveServableFile(staticRoot, path)
+		resolved, ok := resolveServableFile(staticRoot, path)
 		if !ok {
 			return false
 		}

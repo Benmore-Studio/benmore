@@ -8,40 +8,45 @@ import (
 	"strings"
 )
 
-func resolveServableFile(root, target string) (string, os.FileInfo, bool) {
+// resolveServableFile fail-closed resolves target under root, enforcing both
+// lexical and evaluated-symlink containment, and returns the real absolute
+// path of an existing regular file (ok=false otherwise). Callers don't need
+// the FileInfo - http.ServeFile re-stats the path itself - so it isn't
+// returned.
+func resolveServableFile(root, target string) (string, bool) {
 	rootAbs, err := filepath.Abs(filepath.Clean(root))
 	if err != nil {
-		return "", nil, false
+		return "", false
 	}
 	targetAbs, err := filepath.Abs(filepath.Clean(target))
 	if err != nil || !pathWithinDir(rootAbs, targetAbs) {
-		return "", nil, false
+		return "", false
 	}
-	st, err := os.Stat(targetAbs)
-	if err != nil || st.IsDir() {
-		return "", nil, false
-	}
+	// No pre-EvalSymlinks os.Stat here: the post-resolution os.Stat below is
+	// the authoritative existence/dir check, and dropping the redundant stat
+	// also closes one TOCTOU window (the gap between resolution and ServeFile
+	// remains, but it's a low-risk, read-only race).
 	realRoot, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
-		return "", nil, false
+		return "", false
 	}
 	realTarget, err := filepath.EvalSymlinks(targetAbs)
 	if err != nil {
-		return "", nil, false
+		return "", false
 	}
 	realRootAbs, err := filepath.Abs(filepath.Clean(realRoot))
 	if err != nil {
-		return "", nil, false
+		return "", false
 	}
 	realTargetAbs, err := filepath.Abs(filepath.Clean(realTarget))
 	if err != nil || !pathWithinDir(realRootAbs, realTargetAbs) {
-		return "", nil, false
+		return "", false
 	}
-	st, err = os.Stat(realTargetAbs)
+	st, err := os.Stat(realTargetAbs)
 	if err != nil || st.IsDir() {
-		return "", nil, false
+		return "", false
 	}
-	return realTargetAbs, st, true
+	return realTargetAbs, true
 }
 
 func pathWithinDir(root, target string) bool {

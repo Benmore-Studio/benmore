@@ -277,7 +277,7 @@ func resolveTSXSource(appDir, urlRel string) string {
 	staticRoot := filepath.Join(appDir, "static")
 	for _, c := range candidates {
 		full := filepath.Join(staticRoot, c)
-		if resolved, _, ok := resolveServableFile(staticRoot, full); ok {
+		if resolved, ok := resolveServableFile(staticRoot, full); ok {
 			return resolved
 		}
 	}

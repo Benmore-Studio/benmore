@@ -243,7 +243,7 @@ func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	}
 	fullPath := filepath.Join(app.Dir, "static", requested)
 	staticRoot := filepath.Join(app.Dir, "static")
-	resolved, _, ok := resolveServableFile(staticRoot, fullPath)
+	resolved, ok := resolveServableFile(staticRoot, fullPath)
 	if !ok {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
@@ -268,11 +268,33 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 			return
 		}
 	}
-	resolved, _, ok := resolveServableFile(uploadsRoot, fullPath)
+	resolved, ok := resolveServableFile(uploadsRoot, fullPath)
 	if !ok {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
+	}
+	// Re-check the private gate against the symlink-resolved target, not
+	// just the requested URL. A non-private link such as
+	// uploads/public.png -> private/secret.png passes the URL-based prefix
+	// check above (the URL doesn't start with "private/") yet resolves to a
+	// file still inside private/. Without this second check it would be
+	// served without a valid signed URL. resolved is already symlink-
+	// evaluated, so compare it against the symlink-evaluated uploadsRoot
+	// (EvalSymlinks normalizes e.g. macOS /var -> /private/var on both
+	// sides). A relative path starting with "private/" means a private
+	// file - require a valid signed URL no matter how the URL was spelled.
+	privateBase := uploadsRoot
+	if realUploads, err := filepath.EvalSymlinks(uploadsRoot); err == nil {
+		privateBase = realUploads
+	}
+	if rel, err := filepath.Rel(privateBase, resolved); err != nil ||
+		rel == "private" || strings.HasPrefix(rel, "private"+string(filepath.Separator)) {
+		if err != nil || !ValidateSignedURL(relativePath, r) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
+			return
+		}
 	}
 	if !dev {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -281,6 +303,9 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	// .html / .svg / .xml can't execute JS in the app's origin.
 	// Extension allowlist for inline render covers the common safe
 	// media types; everything else gets attachment disposition.
+	// NOTE: disposition is keyed on the symlink-resolved path, so for an
+	// in-root symlink the attachment filename is the link target's name,
+	// not the requested URL's basename.
 	applyUploadDispositionHeaders(w, resolved)
 	http.ServeFile(w, r, resolved)
 }
