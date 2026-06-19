@@ -4,11 +4,14 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 const lockTTL = 30 * time.Second
@@ -163,8 +166,18 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 		table, id, session.UserID, session.Email, expiresAt,
 	)
 	if err != nil {
-		// Race condition: another user just acquired it
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+		// Race condition: another user inserted the lock between our SELECT and
+		// this INSERT, so the UNIQUE(table_name,row_id) constraint fired.
+		// LOWER: detect this structurally via the driver's typed error code
+		// (sqlite3.ErrConstraint / extended ErrConstraintUnique) instead of
+		// string-matching "UNIQUE constraint" - the message text is fragile
+		// (driver/version/locale dependent) and a wording change would silently
+		// turn a benign lock-race into a 500. Fall back to the substring match
+		// only if the error isn't a typed *sqlite3.Error (e.g. wrapped).
+		var sqliteErr sqlite3.Error
+		isUnique := errors.As(err, &sqliteErr) &&
+			sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique
+		if isUnique || strings.Contains(err.Error(), "UNIQUE constraint") {
 			httpJSON(w, http.StatusConflict, map[string]any{"error": "record is locked by another user"})
 			return
 		}
@@ -316,4 +329,3 @@ func lockErrorResponse(devMode bool, lockedBy string) map[string]any {
 	}
 	return resp
 }
-
