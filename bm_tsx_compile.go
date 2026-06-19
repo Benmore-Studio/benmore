@@ -274,13 +274,11 @@ func resolveTSXSource(appDir, urlRel string) string {
 	}
 	stem := strings.TrimSuffix(urlRel, ".js")
 	candidates := []string{stem + ".tsx", stem + ".ts", stem + ".jsx"}
+	staticRoot := filepath.Join(appDir, "static")
 	for _, c := range candidates {
-		full := filepath.Join(appDir, "static", c)
-		if !strings.HasPrefix(full, filepath.Join(appDir, "static")) {
-			continue
-		}
-		if _, err := os.Stat(full); err == nil {
-			return full
+		full := filepath.Join(staticRoot, c)
+		if resolved, _, ok := resolveServableFile(staticRoot, full); ok {
+			return resolved
 		}
 	}
 	return ""

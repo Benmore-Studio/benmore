@@ -233,6 +233,58 @@ func isDBHandleWedged(err error) bool {
 		strings.Contains(msg, "database disk image is malformed")
 }
 
+func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool, requested string) {
+	// v2.7.21+: TSX-by-default. When the agent writes static/index.tsx,
+	// the HTML still references /static/index.js - we look for a .tsx
+	// counterpart, transpile via embedded esbuild (Go API; no Node),
+	// serve the JS. Cached in-memory by file mtime.
+	if serveTSXIfPresent(w, r, app, requested) {
+		return
+	}
+	fullPath := filepath.Join(app.Dir, "static", requested)
+	staticRoot := filepath.Join(app.Dir, "static")
+	resolved, _, ok := resolveServableFile(staticRoot, fullPath)
+	if !ok {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if !dev {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	http.ServeFile(w, r, resolved)
+}
+
+func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool, relativePath string) {
+	fullPath := filepath.Join(app.Dir, "uploads", relativePath)
+	uploadsRoot := filepath.Join(app.Dir, "uploads")
+	// Private files require signed URLs. Keep this check before file
+	// resolution so unsigned callers cannot distinguish missing private
+	// files from existing private files.
+	if strings.HasPrefix(relativePath, "private/") || strings.HasPrefix(relativePath, "private\\") {
+		if !ValidateSignedURL(relativePath, r) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
+			return
+		}
+	}
+	resolved, _, ok := resolveServableFile(uploadsRoot, fullPath)
+	if !ok {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if !dev {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	}
+	// Force download for active-content types so a user-uploaded
+	// .html / .svg / .xml can't execute JS in the app's origin.
+	// Extension allowlist for inline render covers the common safe
+	// media types; everything else gets attachment disposition.
+	applyUploadDispositionHeaders(w, resolved)
+	http.ServeFile(w, r, resolved)
+}
+
 // buildAppMux creates the full HTTP mux for an app with all route groups registered.
 // This is the single source of truth for route registration - used by both StartServer and HostPlatform.
 func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
@@ -608,56 +660,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// SECURITY: all file paths sanitized to prevent directory traversal
 	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
 		requested := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/static/"))
-		// v2.7.21+: TSX-by-default. When the agent writes static/index.tsx,
-		// the HTML still references /static/index.js - we look for a .tsx
-		// counterpart, transpile via embedded esbuild (Go API; no Node),
-		// serve the JS. Cached in-memory by file mtime.
-		if serveTSXIfPresent(w, r, app, requested) {
-			return
-		}
-		if !dev {
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		}
-		fullPath := filepath.Join(app.Dir, "static", requested)
-		// Verify path stays within static directory. Separator-terminated
-		// prefix check (not bare HasPrefix) so a sibling like `static-old/`
-		// can't be reached via `/static/../static-old/x` - same containment
-		// bug class as the platform deploy extractor. ServeMux normalizes
-		// `..` before routing, so this is defense-in-depth, but it must be
-		// correct regardless of the front proxy.
-		staticRoot := filepath.Join(app.Dir, "static")
-		if fullPath != staticRoot && !strings.HasPrefix(fullPath, staticRoot+string(filepath.Separator)) {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, fullPath)
+		serveStaticAsset(w, r, app, dev, requested)
 	})
 	mux.HandleFunc("GET /uploads/", func(w http.ResponseWriter, r *http.Request) {
 		relativePath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/uploads/"))
-		fullPath := filepath.Join(app.Dir, "uploads", relativePath)
-		// Verify path stays within uploads directory (separator-terminated
-		// prefix - see the /static/ handler above for the rationale).
-		uploadsRoot := filepath.Join(app.Dir, "uploads")
-		if fullPath != uploadsRoot && !strings.HasPrefix(fullPath, uploadsRoot+string(filepath.Separator)) {
-			http.NotFound(w, r)
-			return
-		}
-		// Private files require signed URLs
-		if strings.HasPrefix(relativePath, "private/") || strings.HasPrefix(relativePath, "private\\") {
-			if !ValidateSignedURL(relativePath, r) {
-				http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
-				return
-			}
-		}
-		if !dev {
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-		}
-		// Force download for active-content types so a user-uploaded
-		// .html / .svg / .xml can't execute JS in the app's origin.
-		// Extension allowlist for inline render covers the common safe
-		// media types; everything else gets attachment disposition.
-		applyUploadDispositionHeaders(w, fullPath)
-		http.ServeFile(w, r, fullPath)
+		serveUploadAsset(w, r, app, dev, relativePath)
 	})
 	RegisterSignedURLRoutes(mux, app)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
