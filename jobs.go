@@ -37,6 +37,10 @@ func EnsureJobsTable(db *sql.DB) {
 	// tenants' (or anonymous) job status + error strings. Best-effort ALTER
 	// covers both fresh and upgraded tables.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN status_token TEXT")
+	// Lease deadline for crash recovery. A worker sets this when it claims a
+	// job; if the process dies before completion, the next worker pass can
+	// recover the stale running job instead of leaving it stuck forever.
+	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN lease_expires_at DATETIME")
 }
 
 // EnqueueJob adds a flow job to the background queue.
@@ -49,6 +53,8 @@ func EnsureJobsTable(db *sql.DB) {
 // sat forever in `pending` while every hook job (which already used
 // `datetime('now')` directly) ran fine.
 const sqliteDateTimeLayout = "2006-01-02 15:04:05"
+
+const jobLeaseDuration = 5 * time.Minute
 
 type jobEnqueueExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -152,6 +158,8 @@ func processNextJob(app *App) (worked bool) {
 		}
 	}()
 
+	recoverStaleRunningJobs(app.DB, time.Now())
+
 	// Claim the next pending job
 	var id int64
 	var jobType, flowName, payload string
@@ -173,7 +181,8 @@ func processNextJob(app *App) (worked bool) {
 	// goroutines can SELECT the same id; the AND status='pending' guard +
 	// RowsAffected check ensures exactly one runs it, preventing duplicate
 	// emails / webhook deliveries / double-executed SQL hooks.
-	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1 WHERE id = ? AND status = 'pending'", id)
+	leaseUntil := time.Now().Add(jobLeaseDuration).UTC().Format(sqliteDateTimeLayout)
+	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1, lease_expires_at = ? WHERE id = ? AND status = 'pending'", leaseUntil, id)
 	if claimErr != nil {
 		return false
 	}
@@ -201,20 +210,46 @@ func processNextJob(app *App) (worked bool) {
 
 	if jobErr != nil {
 		if attempts+1 >= maxAttempts {
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now') WHERE id = ?",
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?",
 				jobErr.Error(), id)
 			log.Printf("JOB FAILED [%s/%s] #%d: %s (no more retries)", jobType, flowName, id, jobErr)
 		} else {
 			backoff := time.Duration(1<<uint(attempts)) * 30 * time.Second
 			nextRun := time.Now().Add(backoff)
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ? WHERE id = ?",
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ?, lease_expires_at = NULL WHERE id = ?",
 				jobErr.Error(), nextRun.UTC().Format(sqliteDateTimeLayout), id)
 			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, next at %s)", jobType, flowName, id, jobErr, attempts+1, nextRun.Format("15:04:05"))
 		}
 	} else {
-		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?", id)
+		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?", id)
 	}
 	return true
+}
+
+func recoverStaleRunningJobs(db *sql.DB, now time.Time) {
+	nowStr := now.UTC().Format(sqliteDateTimeLayout)
+	db.Exec(`
+		UPDATE _benmore_jobs
+		SET status = 'pending',
+		    error = 'worker lease expired; retrying',
+		    run_at = ?,
+		    lease_expires_at = NULL
+		WHERE status = 'running'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at <= ?
+		  AND attempts < max_attempts
+	`, nowStr, nowStr)
+	db.Exec(`
+		UPDATE _benmore_jobs
+		SET status = 'failed',
+		    error = 'worker lease expired after max attempts',
+		    completed_at = ?,
+		    lease_expires_at = NULL
+		WHERE status = 'running'
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at <= ?
+		  AND attempts >= max_attempts
+	`, nowStr, nowStr)
 }
 
 func executeFlowJob(app *App, flowName string, data map[string]any) error {

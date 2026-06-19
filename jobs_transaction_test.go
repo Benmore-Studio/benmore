@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -106,6 +107,62 @@ func TestExecuteFlowJobHonorsTransactionCommit(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("transactional job committed %d event(s), want 1", count)
+	}
+}
+
+func TestRecoverStaleRunningJobsRetriesBeforeMaxAttempts(t *testing.T) {
+	app := newJobsTestApp(t)
+	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at)
+		VALUES ('flow', 'stuck', '{}', 'running', 1, 3, ?)
+	`, expired); err != nil {
+		t.Fatalf("insert stale running job: %v", err)
+	}
+
+	recoverStaleRunningJobs(app.DB, time.Now())
+
+	var status, errMsg string
+	var lease sql.NullString
+	if err := app.DB.QueryRow("SELECT status, COALESCE(error,''), lease_expires_at FROM _benmore_jobs").Scan(&status, &errMsg, &lease); err != nil {
+		t.Fatalf("query recovered job: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("status = %q, want pending", status)
+	}
+	if errMsg != "worker lease expired; retrying" {
+		t.Fatalf("error = %q", errMsg)
+	}
+	if lease.Valid {
+		t.Fatalf("lease should be cleared, got %q", lease.String)
+	}
+}
+
+func TestRecoverStaleRunningJobsFailsAtMaxAttempts(t *testing.T) {
+	app := newJobsTestApp(t)
+	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at)
+		VALUES ('flow', 'stuck', '{}', 'running', 3, 3, ?)
+	`, expired); err != nil {
+		t.Fatalf("insert stale max-attempt job: %v", err)
+	}
+
+	recoverStaleRunningJobs(app.DB, time.Now())
+
+	var status, errMsg string
+	var lease sql.NullString
+	if err := app.DB.QueryRow("SELECT status, COALESCE(error,''), lease_expires_at FROM _benmore_jobs").Scan(&status, &errMsg, &lease); err != nil {
+		t.Fatalf("query recovered job: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("status = %q, want failed", status)
+	}
+	if errMsg != "worker lease expired after max attempts" {
+		t.Fatalf("error = %q", errMsg)
+	}
+	if lease.Valid {
+		t.Fatalf("lease should be cleared, got %q", lease.String)
 	}
 }
 

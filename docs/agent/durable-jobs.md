@@ -12,14 +12,26 @@ flowchart LR
   Enqueue[run: enqueue] --> Jobs
   Hooks[hooks] --> Jobs
   Jobs --> Worker[StartJobWorker]
+  Worker --> Lease[lease_expires_at]
   Worker --> Flow[executeFlowJob]
   Flow --> Tx{transaction: true?}
   Tx -->|yes| Commit[commit all steps]
   Tx -->|error| Rollback[rollback all steps]
   Tx -->|no| Direct[existing step behavior]
+  Lease --> Recovery[stale-running recovery]
 ```
 
 This does not import River. It keeps the existing embedded queue and makes the
-transaction boundary reliable before adding leases, uniqueness, stale-running
-recovery, or cron-to-jobs conversion.
+transaction boundary and worker leases reliable before adding uniqueness or
+cron-to-jobs conversion.
 
+## Leases
+
+When a worker claims a job it sets `lease_expires_at`. If the process crashes
+before marking the job completed/failed, the next worker pass recovers expired
+`running` jobs:
+
+- `attempts < max_attempts` -> back to `pending`
+- `attempts >= max_attempts` -> `failed`
+
+This prevents jobs from staying in `running` forever after a crash.
