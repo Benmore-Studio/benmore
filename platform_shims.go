@@ -24,6 +24,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -42,7 +43,14 @@ import (
 // (a request that reached us with that header necessarily traversed the
 // trusted router). Otherwise we fall back to RemoteAddr.
 func authTrustProxyHeaders(r *http.Request) bool {
-	if r.Header.Get("X-Benmore-App") != "" {
+	// The in-fabric router injects X-Benmore-App and connects to the app over
+	// loopback. Only honor that marker when the peer is ACTUALLY loopback -
+	// otherwise a direct client on a self-hosted deployment could send
+	// `X-Benmore-App: 1` plus a forged X-Forwarded-For to spoof its IP and
+	// defeat the per-IP login lockout / poison audit attribution (round-2 #M).
+	// For a front proxy on a non-loopback address, operators opt in explicitly
+	// via BENMORE_TRUST_PROXY.
+	if r.Header.Get("X-Benmore-App") != "" && remoteAddrIsLoopback(r) {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("BENMORE_TRUST_PROXY"))) {
@@ -50,6 +58,17 @@ func authTrustProxyHeaders(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// remoteAddrIsLoopback reports whether the transport-level peer is a loopback
+// address (the only place the trusted in-fabric router connects from).
+func remoteAddrIsLoopback(r *http.Request) bool {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // clientIP extracts the originating client IP. Forwarded headers

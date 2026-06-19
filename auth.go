@@ -496,14 +496,24 @@ func validateCSRFReason(r *http.Request) (string, bool) {
 
 	nonce, tsStr, providedSig := parts[0], parts[1], parts[2]
 
-	// H-11: defense-in-depth Origin check. When the browser sends an
-	// Origin header it MUST match our own Host; a cross-site form post
-	// carries the attacker's Origin and is rejected here before the HMAC
-	// is even considered. Requests with no Origin (same-origin navigations,
-	// CLI/native clients) fall through to the token check, so this never
-	// breaks legitimate non-browser callers.
-	if !isSameOriginRequest(r) {
-		return "origin_mismatch", false
+	// CSRF origin gate (round-2 #2). The session cookie is SameSite=Lax so a
+	// cross-site POST/fetch won't even carry it; this is the second layer and
+	// is what actually stops a forged request - the HMAC token below is
+	// defense-in-depth. A cross-site request must NOT be able to reach the HMAC
+	// check (which would otherwise accept a session-less/unbound token lifted
+	// from /api/_csrf or the page meta tag).
+	//   - Origin present -> must match our Host.
+	//   - Origin absent  -> consult Sec-Fetch-Site (sent by all modern
+	//     browsers): reject cross-site / same-site. Earlier this treated a
+	//     missing Origin as same-origin, which let a no-Origin cross-site POST
+	//     through. A request with neither header (old/native client) still
+	//     falls through to the token, preserving legitimate non-browser callers.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return "origin_mismatch", false
+		}
+	} else if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" || sfs == "same-site" {
+		return "sec_fetch_" + sfs, false
 	}
 
 	// Verify HMAC. H-11: prefer the session-bound MAC (token tied to the
@@ -865,14 +875,16 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 			SameSite: http.SameSiteLaxMode,
 		})
 
+		// NOTE: the originating admin session id is NOT returned. end-impersonation
+		// restores it server-side from impersonator_session_id on the impersonation
+		// row, so echoing the raw admin token here would only be an exfil risk.
 		httpJSON(w, http.StatusOK, map[string]any{
-			"token":       impersonatedSessionID,
-			"admin_token": adminSessionID,
-			"user_id":     body.UserID,
-			"email":       email,
-			"role":        role,
-			"expires_in":  "1h",
-			"admin_note":  "Impersonated session - 1h TTL, all actions audited",
+			"token":      impersonatedSessionID,
+			"user_id":    body.UserID,
+			"email":      email,
+			"role":       role,
+			"expires_in": "1h",
+			"admin_note": "Impersonated session - 1h TTL, all actions audited",
 		})
 	})
 
@@ -883,45 +895,31 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
 		}
-		var body struct {
-			AdminToken string `json:"admin_token"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.AdminToken == "" {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "admin_token required"})
-			return
-		}
-		// Verify the admin token is a valid, non-expired admin session
-		adminSession := GetSessionFromDB(app.DB, body.AdminToken)
-		if adminSession == nil || !adminSession.IsAdmin() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid admin session"})
-			return
-		}
-		// Verify current session IS an impersonation AND that the supplied
-		// admin_token is the EXACT session that started THIS impersonation
-		// (H-13). Previously any valid admin token was accepted, so a
-		// leaked impersonate response (which echoes admin_token) combined
-		// with any admin's token let an attacker restore into that admin's
-		// session. Binding to impersonator_session_id closes that pivot:
-		// the token must equal the originating admin session id recorded
-		// at start time.
-		var isImpersonation int
-		var impersonatorSessionID string
+		// Restore the ORIGINATING admin session recorded on this impersonation
+		// session row (impersonator_session_id, set at start). Driven entirely
+		// server-side from the caller's impersonation cookie - the client never
+		// supplies, and the impersonate response never echoes, the admin token.
+		// This closes the round-2 pivot where a leaked admin_token plus any
+		// valid admin session could restore into that admin (H-13).
 		cookie, cookieErr := r.Cookie(sessionCookieName)
-		if cookieErr == nil {
-			app.DB.QueryRow(
-				"SELECT COALESCE(is_impersonation, 0), COALESCE(impersonator_session_id, '') FROM _benmore_sessions WHERE id = ?",
-				cookie.Value,
-			).Scan(&isImpersonation, &impersonatorSessionID)
-		}
-		if isImpersonation != 1 {
+		if cookieErr != nil || cookie.Value == "" {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
 			return
 		}
-		// The presented admin_token MUST resolve to the session that
-		// originated this impersonation. constant-time compare avoids
-		// leaking the bound id via timing.
-		if impersonatorSessionID == "" || subtle.ConstantTimeCompare([]byte(body.AdminToken), []byte(impersonatorSessionID)) != 1 {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin_token does not match the originating admin session"})
+		var isImpersonation int
+		var impersonatorSessionID string
+		app.DB.QueryRow(
+			"SELECT COALESCE(is_impersonation, 0), COALESCE(impersonator_session_id, '') FROM _benmore_sessions WHERE id = ?",
+			cookie.Value,
+		).Scan(&isImpersonation, &impersonatorSessionID)
+		if isImpersonation != 1 || impersonatorSessionID == "" {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
+			return
+		}
+		// The originating admin session must still be a valid, non-expired admin.
+		adminSession := GetSessionFromDB(app.DB, impersonatorSessionID)
+		if adminSession == nil || !adminSession.IsAdmin() {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "originating admin session is no longer valid - please log in again"})
 			return
 		}
 		// Authorized: tear down the impersonation session before restoring.
@@ -929,7 +927,7 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 		// Restore admin session cookie (see #18 - protoOf for proxy-correct Secure flag).
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookieName,
-			Value:    body.AdminToken,
+			Value:    impersonatorSessionID,
 			Path:     "/",
 			MaxAge:   int(app.SessionDuration.Seconds()),
 			HttpOnly: true,
@@ -1581,6 +1579,14 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		authRedirect(w, r, app.Paths.Signup, "Email and password are required")
 		return
 	}
+	// Reject pipe / control chars in the identifier (round-2 #M). The signed
+	// OTP / MFA-setup / signed-URL cookies are `|`-delimited over this value;
+	// a `|` (or CR/LF/NUL) would shift the field boundaries and let a crafted
+	// identifier desync the parsed fields from what was signed.
+	if strings.ContainsAny(email, "|\r\n\x00") {
+		authRedirect(w, r, app.Paths.Signup, "Invalid email")
+		return
+	}
 
 	// Brute force protection on signup
 	if isAccountLocked(app.DB, email) {
@@ -1685,7 +1691,7 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		app.DB.Exec("INSERT INTO _benmore_password_resets (token, email, expires_at, type) VALUES (?, ?, ?, 'verify')",
 			hashResetToken(token), email, expires.UTC().Format(time.RFC3339))
 
-		verifyURL := fmt.Sprintf("%s/verify-email?token=%s", baseURL(app, r), token)
+		verifyURL := fmt.Sprintf("%s/verify-email?token=%s", securityLinkBaseURL(app, r), token)
 
 		siteName := "App"
 		if sn, ok := app.Design.SEO["site_name"]; ok && sn != "" {
@@ -2050,6 +2056,26 @@ func baseURL(app *App, r *http.Request) string {
 	return fmt.Sprintf("%s://%s", protoOf(r), r.Host)
 }
 
+// securityLinkBaseURL is baseURL for links emailed as credentials (password
+// reset, email verification). It must NOT be derived from the attacker-
+// controllable Host / X-Forwarded-Proto headers when an operator-configured
+// origin exists: a host-header-poisoning attacker could otherwise make the
+// genuine reset email point the token at their domain (round-2 #5 - pre-auth
+// account takeover). Preference: configured seo.url -> BENMORE_PUBLIC_URL /
+// CORS_ORIGIN -> request host (logged, so operators see the unsafe fallback).
+func securityLinkBaseURL(app *App, r *http.Request) string {
+	if app.Design != nil {
+		if seoURL, ok := app.Design.SEO["url"]; ok && seoURL != "" {
+			return strings.TrimRight(seoURL, "/")
+		}
+	}
+	if origin := uploadsCanonicalOrigin(app); origin != "" {
+		return strings.TrimRight(origin, "/")
+	}
+	log.Printf("SECURITY: building a credential link (reset/verify) from the request Host %q - set BENMORE_PUBLIC_URL or seo.url so a host-header-poisoning attacker can't redirect the token", r.Host)
+	return fmt.Sprintf("%s://%s", protoOf(r), r.Host)
+}
+
 // ===== Password Reset =====
 
 // EnsurePasswordResetsTable creates the password reset tokens table.
@@ -2105,7 +2131,7 @@ func handleForgotPassword(w http.ResponseWriter, r *http.Request, app *App) {
 			hashResetToken(token), email, expires.UTC().Format(time.RFC3339))
 
 		// Build reset URL - prefer configured SEO URL over r.Host to prevent header injection
-		resetURL := fmt.Sprintf("%s%s?token=%s", baseURL(app, r), app.Paths.ResetPassword, token)
+		resetURL := fmt.Sprintf("%s%s?token=%s", securityLinkBaseURL(app, r), app.Paths.ResetPassword, token)
 
 		siteName := "App"
 		if app.Design != nil {
