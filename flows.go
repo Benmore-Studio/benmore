@@ -301,6 +301,15 @@ type FlowContext struct {
 	FailedType string        // step.Type of the failure (sql / api / parse / respond / etc) - drives step-type-specific hints
 	StepsRun   int           // count of steps actually executed before stopped/errored
 	Tx      *sql.Tx          // active transaction (nil if not transactional)
+	// TxMu serializes access to Tx. database/sql's *sql.Tx is NOT safe for
+	// concurrent use, but a flow that is both `transaction: true` and
+	// contains a `parallel:` block fans SQL steps out across goroutines
+	// that all resolve the same ctx.Tx via flowDB. Without serialization
+	// those concurrent Query/Exec calls race and error at runtime. When no
+	// transaction is active (ctx.Tx == nil) the underlying *sql.DB pool is
+	// already concurrency-safe, so this lock is only taken on the
+	// transactional path.
+	TxMu sync.Mutex
 	// DataMu protects Data + Params + StepsRun + Error + FailedStep +
 	// Stopped from concurrent step writes. Only the `parallel:` step
 	// fans out goroutines today; sequential paths take Lock+Unlock as
@@ -1246,6 +1255,15 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 	startsWithRowProducer := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "WITH")
 	hasReturning := !startsWithRowProducer && hasReturningClause(upper)
+	// Serialize the actual DB call when running inside a transaction:
+	// *sql.Tx is not safe for concurrent use, so a `parallel:` block of
+	// SQL steps inside a `transaction: true` flow would otherwise race.
+	// The DB pool (ctx.Tx == nil path) is already concurrency-safe, so we
+	// only pay the lock on the transactional path.
+	if ctx.Tx != nil {
+		ctx.TxMu.Lock()
+		defer ctx.TxMu.Unlock()
+	}
 	if startsWithRowProducer || hasReturning {
 		sqlRows, err := db.Query(query, args...)
 		if err != nil {
@@ -1941,7 +1959,21 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 			runAt = &t
 		}
 	}
-	id, jobToken, err := EnqueueJob(ctx.App.DB, flowName, payload, runAt)
+	var (
+		id       int64
+		jobToken string
+		err      error
+	)
+	if ctx.Tx != nil {
+		// Serialize Tx access: a `parallel:` block inside a transactional
+		// flow may enqueue concurrently, and *sql.Tx is not safe for
+		// concurrent use. See FlowContext.TxMu.
+		ctx.TxMu.Lock()
+		id, jobToken, err = EnqueueJobTx(ctx.Tx, flowName, payload, runAt)
+		ctx.TxMu.Unlock()
+	} else {
+		id, jobToken, err = EnqueueJob(ctx.App.DB, flowName, payload, runAt)
+	}
 	if err != nil {
 		return fmt.Errorf("enqueue %s: %w", flowName, err)
 	}

@@ -545,8 +545,8 @@ export interface RoomClient {
 
   // ── jobs (async-flow status + wait) ──────────────────────────────────
   export const jobs: {
-    status<T = unknown>(jobId: string): Promise<JobStatus<T>>;
-    wait<T = unknown>(jobId: string, opts?: { intervalMs?: number; timeoutMs?: number }): Promise<T>;
+    status<T = unknown>(jobId: string, statusUrl?: string): Promise<JobStatus<T>>;
+    wait<T = unknown>(jobId: string, opts?: { intervalMs?: number; timeoutMs?: number; statusUrl?: string }): Promise<T>;
   };
 
   // ── notifications (in-app inbox) ─────────────────────────────────────
@@ -1584,7 +1584,7 @@ func writeAncillaryTypes(b *strings.Builder) {
 	b.WriteString("  readonly status_url: string;\n")
 	b.WriteString("  status(): Promise<JobStatus<T>>;\n")
 	b.WriteString("  /** Polls until completed or failed. Throws on failure. */\n")
-	b.WriteString("  wait(opts?: { intervalMs?: number; timeoutMs?: number }): Promise<T>;\n")
+	b.WriteString("  wait(opts?: { intervalMs?: number; timeoutMs?: number; statusUrl?: string }): Promise<T>;\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("export interface JobStatus<T = unknown> {\n")
