@@ -37,6 +37,37 @@ func EnsureJobsTable(db *sql.DB) {
 	// tenants' (or anonymous) job status + error strings. Best-effort ALTER
 	// covers both fresh and upgraded tables.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN status_token TEXT")
+	// Lease expiry for in-flight ('running') jobs (H-2). A claimed job carries
+	// a lease the worker heartbeats while it runs; if the worker dies the lease
+	// expires and a recovery pass can act on the orphan. Without a lease an
+	// orphaned 'running' job either sticks forever or (worse) gets blindly
+	// re-run. Best-effort ALTER covers fresh + upgraded tables.
+	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN lease_expires_at DATETIME")
+}
+
+// jobsLeaseTTL bounds how long a claimed job may run before its lease is
+// considered orphaned. The worker heartbeats (extends) the lease on this
+// cadence while the job body runs, so a live worker never loses its claim;
+// only a crashed/hung worker lets the lease lapse. Sized well above a typical
+// hook/flow runtime; long jobs are kept alive by the heartbeat.
+const jobsLeaseTTL = 5 * time.Minute
+
+// jobsHeartbeatInterval is how often the running worker re-extends its lease.
+// Must be comfortably below jobsLeaseTTL so a brief stall never drops the
+// claim. (H-2: a fixed lease with no heartbeat let a second worker re-run any
+// job that outran the lease.)
+const jobsHeartbeatInterval = jobsLeaseTTL / 3
+
+// jobsRerunSafeTypes is the allowlist of job types whose side effects are
+// idempotent enough to re-run after a worker crash mid-execution (C-1:
+// at-least-once delivery). Lease-recovery only requeues these; every other
+// type is failed-closed rather than risk a duplicate email / webhook / SQL
+// mutation. "flow" jobs are NOT here: a flow can send mail or mutate rows and
+// the framework can't prove a partial run left no trace. Hooks are likewise
+// excluded for the same reason (duplicate webhook/email delivery).
+var jobsRerunSafeTypes = map[string]bool{
+	// (none today) - add a type here only once its handler is proven
+	// idempotent (e.g. guarded by a per-job completion marker).
 }
 
 // EnqueueJob adds a flow job to the background queue.
@@ -111,6 +142,9 @@ func StartJobWorker(app *App) {
 	EnsureJobsTable(app.DB)
 
 	safeGo("jobs.worker", func() {
+		recoverCheck := time.NewTicker(jobsHeartbeatInterval)
+		defer recoverCheck.Stop()
+		jobsRecoverOrphanedJobs(app) // sweep stale leases left by a previous crash on startup
 		for {
 			select {
 			case <-app.Stop:
@@ -123,12 +157,46 @@ func StartJobWorker(app *App) {
 			select {
 			case <-app.Stop:
 				return
+			case <-recoverCheck.C:
+				// Periodically reclaim jobs whose worker died mid-flight.
+				jobsRecoverOrphanedJobs(app)
 			case <-time.After(1 * time.Second):
 			}
 		}
 	})
 
 	log.Printf("  jobs: background worker started")
+}
+
+// jobsRecoverOrphanedJobs handles 'running' jobs whose lease has expired - the
+// signature of a worker that crashed mid-execution.
+//
+// C-1 invariant (at-least-once vs duplicate side effects): the job body runs
+// OUTSIDE the claim transaction, so we cannot know whether a crashed job's
+// emails/webhooks/mutations already fired. Re-running could duplicate them.
+// We therefore fail CLOSED: only job types on the jobsRerunSafeTypes allowlist
+// (proven idempotent) are requeued to 'pending'; all others are marked
+// 'failed' with an explanatory error so an admin can inspect/retry rather than
+// risk a silent duplicate delivery.
+func jobsRecoverOrphanedJobs(app *App) {
+	now := time.Now().UTC().Format(sqliteDateTimeLayout)
+	// Requeue only the safe-to-rerun types.
+	for jobType := range jobsRerunSafeTypes {
+		app.DB.Exec(
+			"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = ? AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+			jobType, now,
+		)
+	}
+	// Everything else: fail closed rather than re-run a non-idempotent body.
+	res, err := app.DB.Exec(
+		"UPDATE _benmore_jobs SET status = 'failed', error = 'worker died mid-execution; not re-run to avoid duplicate side effects (C-1)', completed_at = datetime('now') WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+		now,
+	)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("jobs: failed %d orphaned job(s) with expired lease (worker crash; not re-run to avoid duplicate side effects)", n)
+		}
+	}
 }
 
 // processNextJob claims and runs at most one job. Returns true if a job was
@@ -161,13 +229,35 @@ func processNextJob(app *App) (worked bool) {
 	// goroutines can SELECT the same id; the AND status='pending' guard +
 	// RowsAffected check ensures exactly one runs it, preventing duplicate
 	// emails / webhook deliveries / double-executed SQL hooks.
-	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1 WHERE id = ? AND status = 'pending'", id)
+	leaseUntil := time.Now().Add(jobsLeaseTTL).UTC().Format(sqliteDateTimeLayout)
+	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1, lease_expires_at = ? WHERE id = ? AND status = 'pending'", leaseUntil, id)
 	if claimErr != nil {
 		return false
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return true // another worker claimed it first; keep draining
 	}
+
+	// H-2: heartbeat the lease while the job body runs so a job that legitimately
+	// outruns jobsLeaseTTL is not treated as orphaned and re-run concurrently by
+	// a second worker. The heartbeat stops as soon as the body returns (done).
+	hbDone := make(chan struct{})
+	defer close(hbDone)
+	go func() {
+		ticker := time.NewTicker(jobsHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbDone:
+				return
+			case <-app.Stop:
+				return
+			case <-ticker.C:
+				next := time.Now().Add(jobsLeaseTTL).UTC().Format(sqliteDateTimeLayout)
+				app.DB.Exec("UPDATE _benmore_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'", next, id)
+			}
+		}
+	}()
 
 	// Parse payload
 	var data map[string]any
@@ -187,20 +277,29 @@ func processNextJob(app *App) (worked bool) {
 		jobErr = executeFlowJob(app, flowName, data)
 	}
 
+	// Every terminal/transition below clears lease_expires_at so a finished or
+	// requeued job is never mistaken for an orphan by jobsRecoverOrphanedJobs.
 	if jobErr != nil {
 		if attempts+1 >= maxAttempts {
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now') WHERE id = ?",
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?",
 				jobErr.Error(), id)
 			log.Printf("JOB FAILED [%s/%s] #%d: %s (no more retries)", jobType, flowName, id, jobErr)
 		} else {
-			backoff := time.Duration(1<<uint(attempts)) * 30 * time.Second
+			// LOWER: cap the backoff shift so a high attempt count can't overflow
+			// the shift (1<<attempts wraps negative around attempt 58 -> a
+			// negative/zero duration -> hot retry loop). Cap at 2^16 * 30s (~22d).
+			shift := uint(attempts)
+			if shift > 16 {
+				shift = 16
+			}
+			backoff := time.Duration(1<<shift) * 30 * time.Second
 			nextRun := time.Now().Add(backoff)
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ? WHERE id = ?",
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ?, lease_expires_at = NULL WHERE id = ?",
 				jobErr.Error(), nextRun.UTC().Format(sqliteDateTimeLayout), id)
 			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, next at %s)", jobType, flowName, id, jobErr, attempts+1, nextRun.Format("15:04:05"))
 		}
 	} else {
-		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?", id)
+		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?", id)
 	}
 	return true
 }
@@ -490,9 +589,13 @@ func RegisterJobsAPI(mux *http.ServeMux, app *App) {
 // JobStats returns job queue statistics.
 func JobStats(db *sql.DB) map[string]int64 {
 	stats := make(map[string]int64)
+	// LOWER: parameterize the status literal instead of fmt.Sprintf-ing it into
+	// the SQL. The values are a fixed allowlist today, but a parameterized query
+	// keeps this off the string-building path so a future caller can't turn it
+	// into an injection vector.
 	for _, status := range []string{"pending", "running", "completed", "failed"} {
 		var count int64
-		db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM _benmore_jobs WHERE status = '%s'", status)).Scan(&count)
+		db.QueryRow("SELECT COUNT(*) FROM _benmore_jobs WHERE status = ?", status).Scan(&count)
 		stats[status] = count
 	}
 	return stats
