@@ -166,6 +166,75 @@ func TestRecoverStaleRunningJobsFailsAtMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestEnqueueJobUniqueReturnsExistingActiveJob(t *testing.T) {
+	app := newJobsTestApp(t)
+	firstID, firstToken, err := EnqueueJobUnique(app.DB, "report:42", "report", map[string]any{"id": 42}, nil)
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	secondID, secondToken, err := EnqueueJobUnique(app.DB, "report:42", "report", map[string]any{"id": 42}, nil)
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if secondID != firstID {
+		t.Fatalf("second enqueue id = %d, want existing %d", secondID, firstID)
+	}
+	if secondToken != firstToken {
+		t.Fatalf("second enqueue token = %q, want existing %q", secondToken, firstToken)
+	}
+	if got := countJobs(t, app.DB); got != 1 {
+		t.Fatalf("unique active enqueue inserted %d jobs, want 1", got)
+	}
+}
+
+func TestEnqueueJobUniqueAllowsNewJobAfterCompletion(t *testing.T) {
+	app := newJobsTestApp(t)
+	firstID, _, err := EnqueueJobUnique(app.DB, "report:42", "report", map[string]any{"id": 42}, nil)
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	if _, err := app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed' WHERE id = ?", firstID); err != nil {
+		t.Fatalf("complete first job: %v", err)
+	}
+	secondID, _, err := EnqueueJobUnique(app.DB, "report:42", "report", map[string]any{"id": 42}, nil)
+	if err != nil {
+		t.Fatalf("second enqueue after completion: %v", err)
+	}
+	if secondID == firstID {
+		t.Fatalf("completed job should not block a new unique enqueue")
+	}
+	if got := countJobs(t, app.DB); got != 2 {
+		t.Fatalf("expected 2 total jobs after completed re-enqueue, got %d", got)
+	}
+}
+
+func TestExecStepEnqueueUsesUniqueKey(t *testing.T) {
+	app := newJobsTestApp(t)
+	ctx := &FlowContext{
+		App:    app,
+		Data:   map[string]any{"user_id": 42},
+		Params: map[string]string{},
+	}
+	step := &FlowStep{
+		Name: "queued",
+		Type: "enqueue",
+		Enqueue: &FlowEnqueue{
+			Flow:      "worker",
+			With:      map[string]string{"source": "unique"},
+			UniqueKey: "worker:${{ user_id }}",
+		},
+	}
+	if err := execStepEnqueue(ctx, step); err != nil {
+		t.Fatalf("first enqueue step: %v", err)
+	}
+	if err := execStepEnqueue(ctx, step); err != nil {
+		t.Fatalf("second enqueue step: %v", err)
+	}
+	if got := countJobs(t, app.DB); got != 1 {
+		t.Fatalf("unique enqueue step inserted %d jobs, want 1", got)
+	}
+}
+
 func newJobsTestApp(t *testing.T) *App {
 	t.Helper()
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "jobs.db"))

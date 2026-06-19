@@ -11,6 +11,7 @@ flowchart LR
   HTTP[async HTTP flow] --> Jobs[_benmore_jobs]
   Enqueue[run: enqueue] --> Jobs
   Hooks[hooks] --> Jobs
+  Unique[unique_key] --> Jobs
   Jobs --> Worker[StartJobWorker]
   Worker --> Lease[lease_expires_at]
   Worker --> Flow[executeFlowJob]
@@ -35,3 +36,19 @@ before marking the job completed/failed, the next worker pass recovers expired
 - `attempts >= max_attempts` -> `failed`
 
 This prevents jobs from staying in `running` forever after a crash.
+
+## Unique Keys
+
+`unique_key` is an optional idempotency key for active work. If a `pending` or
+`running` job already has the same key, enqueue returns that existing job id and
+status token instead of inserting another row. Once the earlier job completes or
+fails, the same key can enqueue fresh work again.
+
+Flow enqueue steps can set it with:
+
+```yaml
+- id: report
+  enqueue:
+    flow: generate_report
+    unique_key: "report:${{ user_id }}:${{ params.month }}"
+```

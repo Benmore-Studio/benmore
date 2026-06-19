@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -41,6 +42,10 @@ func EnsureJobsTable(db *sql.DB) {
 	// job; if the process dies before completion, the next worker pass can
 	// recover the stale running job instead of leaving it stuck forever.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN lease_expires_at DATETIME")
+	// Optional idempotency/uniqueness key. Active jobs with the same key
+	// collapse to the existing job instead of duplicating work.
+	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN unique_key TEXT")
+	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')")
 }
 
 // EnqueueJob adds a flow job to the background queue.
@@ -58,6 +63,7 @@ const jobLeaseDuration = 5 * time.Minute
 
 type jobEnqueueExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 // EnqueueJob returns (id, statusToken, error). statusToken is the unguessable
@@ -65,14 +71,28 @@ type jobEnqueueExecer interface {
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
 // every job to id-enumeration.
 func EnqueueJob(db *sql.DB, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(db, flowName, payload, runAt)
+	return enqueueJob(db, "", flowName, payload, runAt)
+}
+
+func EnqueueJobUnique(db *sql.DB, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	return enqueueJob(db, uniqueKey, flowName, payload, runAt)
 }
 
 func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(tx, flowName, payload, runAt)
+	return enqueueJob(tx, "", flowName, payload, runAt)
 }
 
-func enqueueJob(exec jobEnqueueExecer, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	return enqueueJob(tx, uniqueKey, flowName, payload, runAt)
+}
+
+func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	uniqueKey = strings.TrimSpace(uniqueKey)
+	if uniqueKey != "" {
+		if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+			return id, token, nil
+		}
+	}
 	data, _ := json.Marshal(payload)
 	ra := time.Now()
 	if runAt != nil {
@@ -80,14 +100,46 @@ func enqueueJob(exec jobEnqueueExecer, flowName string, payload map[string]any, 
 	}
 	token := generateToken(18)
 	result, err := exec.Exec(
-		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token) VALUES ('flow', ?, ?, ?, ?)",
-		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token,
+		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES ('flow', ?, ?, ?, ?, ?)",
+		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
 	)
 	if err != nil {
+		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
+			if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+				return id, token, nil
+			}
+		}
 		return 0, "", err
 	}
 	id, err := result.LastInsertId()
 	return id, token, err
+}
+
+func findActiveJobByUniqueKey(q jobEnqueueExecer, uniqueKey string) (int64, string, bool) {
+	var id int64
+	var token string
+	err := q.QueryRow(`
+		SELECT id, COALESCE(status_token, '')
+		FROM _benmore_jobs
+		WHERE unique_key = ?
+		  AND status IN ('pending', 'running')
+		ORDER BY id DESC
+		LIMIT 1
+	`, uniqueKey).Scan(&id, &token)
+	return id, token, err == nil
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func isUniqueJobConstraintErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique") &&
+		(strings.Contains(msg, "idx_jobs_unique_active") || strings.Contains(msg, "unique_key"))
 }
 
 // EnqueueHookJob adds a hook execution job to the background queue.

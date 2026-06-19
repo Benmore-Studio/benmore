@@ -161,9 +161,10 @@ type FlowCompute struct {
 //         date_range: "30d"
 //       run_at: "{{now + 1h}}"   # optional scheduled delivery
 type FlowEnqueue struct {
-	Flow    string
-	With    map[string]string
-	RunAt   string // optional ISO timestamp; empty = run ASAP
+	Flow      string
+	With      map[string]string
+	RunAt     string // optional ISO timestamp; empty = run ASAP
+	UniqueKey string // optional idempotency key for active pending/running jobs
 }
 
 // FlowWS broadcasts a payload to a WebSocket room. Used by `ws:` steps
@@ -1697,15 +1698,19 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 			runAt = &t
 		}
 	}
+	uniqueKey := ""
+	if step.Enqueue.UniqueKey != "" {
+		uniqueKey = interpolateCtx(step.Enqueue.UniqueKey, ctx)
+	}
 	var (
 		id       int64
 		jobToken string
 		err      error
 	)
 	if ctx.Tx != nil {
-		id, jobToken, err = EnqueueJobTx(ctx.Tx, flowName, payload, runAt)
+		id, jobToken, err = EnqueueJobTxUnique(ctx.Tx, uniqueKey, flowName, payload, runAt)
 	} else {
-		id, jobToken, err = EnqueueJob(ctx.App.DB, flowName, payload, runAt)
+		id, jobToken, err = EnqueueJobUnique(ctx.App.DB, uniqueKey, flowName, payload, runAt)
 	}
 	if err != nil {
 		return fmt.Errorf("enqueue %s: %w", flowName, err)
