@@ -369,6 +369,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
 	}
+	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
+	// on the membership table so a member cannot self-elevate via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
+	}
 
 	// Surface stripped fields via response header. When a client (or
 	// agent) submits a protected field, the framework silently swaps
@@ -1739,6 +1744,11 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
 	}
+	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
+	// on the membership table so a member cannot self-elevate via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
+	}
 
 	// Wrap entire batch in a transaction
 	tx, err := app.DB.Begin()
@@ -1952,6 +1962,11 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	}
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
+	}
+	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
+	// on the membership table so a member cannot self-elevate via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
 	}
 
 	// Extract validation rules once
@@ -2720,6 +2735,11 @@ func txInsert(tx *sql.Tx, app *App, table string, data map[string]any, session *
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
 	}
+	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
+	// on the membership table so a member cannot self-elevate via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
+	}
 	for _, f := range workflowProtectedFields(app, table) {
 		protected[f] = true
 	}
@@ -2794,6 +2814,11 @@ func txUpdate(tx *sql.Tx, app *App, table string, id string, data map[string]any
 	}
 	if app.Group != nil && app.Group.Key != "" {
 		protected[app.Group.Key] = true
+	}
+	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
+	// on the membership table so a member cannot self-elevate via CRUD.
+	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
+		protected[app.Group.RoleField] = true
 	}
 	for _, f := range workflowProtectedFields(app, table) {
 		protected[f] = true

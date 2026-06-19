@@ -373,8 +373,11 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 	// listing is empty anyway).
 	mux.HandleFunc("GET /api/_auth/roles", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil {
-			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		// Admin-only (matches the doc above): the full role catalogue + effective
+		// scopes is reconnaissance for in-tenant escalation (tells an attacker
+		// which role name to target). A regular member has no need for it.
+		if session == nil || !session.IsAdmin() {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
 		out := make([]map[string]any, 0)
