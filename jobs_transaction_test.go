@@ -5,6 +5,7 @@ package main
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,12 +111,18 @@ func TestExecuteFlowJobHonorsTransactionCommit(t *testing.T) {
 	}
 }
 
-func TestRecoverStaleRunningJobsRetriesBeforeMaxAttempts(t *testing.T) {
+// C-1: the exact double-send scenario. A 'flow' job (which may send an email /
+// webhook / mutate rows - NOT idempotent) is claimed, the worker dies
+// mid-execution leaving it 'running' with an expired lease. Recovery must NOT
+// re-queue it (that would risk a second delivery); it must fail CLOSED. attempts
+// stays put so it is never re-run, and the lease is cleared so it no longer
+// sticks in 'running' forever.
+func TestRecoverStaleRunningJobsFailsClosedNonIdempotent(t *testing.T) {
 	app := newJobsTestApp(t)
 	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
 	if _, err := app.DB.Exec(`
 		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at)
-		VALUES ('flow', 'stuck', '{}', 'running', 1, 3, ?)
+		VALUES ('flow', 'send-email', '{}', 'running', 1, 3, ?)
 	`, expired); err != nil {
 		t.Fatalf("insert stale running job: %v", err)
 	}
@@ -123,18 +130,52 @@ func TestRecoverStaleRunningJobsRetriesBeforeMaxAttempts(t *testing.T) {
 	recoverStaleRunningJobs(app.DB, time.Now())
 
 	var status, errMsg string
+	var attempts int
 	var lease sql.NullString
-	if err := app.DB.QueryRow("SELECT status, COALESCE(error,''), lease_expires_at FROM _benmore_jobs").Scan(&status, &errMsg, &lease); err != nil {
+	if err := app.DB.QueryRow("SELECT status, COALESCE(error,''), attempts, lease_expires_at FROM _benmore_jobs").Scan(&status, &errMsg, &attempts, &lease); err != nil {
 		t.Fatalf("query recovered job: %v", err)
 	}
-	if status != "pending" {
-		t.Fatalf("status = %q, want pending", status)
+	if status != "failed" {
+		t.Fatalf("status = %q, want failed (non-idempotent orphan must NOT be re-queued: double-send risk)", status)
 	}
-	if errMsg != "worker lease expired; retrying" {
-		t.Fatalf("error = %q", errMsg)
+	if !strings.Contains(errMsg, "not re-run to avoid duplicate side effects") {
+		t.Fatalf("error = %q, want the C-1 fail-closed reason", errMsg)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (recovery must not consume/advance an attempt by re-running)", attempts)
 	}
 	if lease.Valid {
 		t.Fatalf("lease should be cleared, got %q", lease.String)
+	}
+}
+
+// The flip side of C-1: a job type explicitly registered as idempotent IS
+// re-queued (with backoff) on recovery, because re-running it is safe.
+func TestRecoverStaleRunningJobsRequeuesIdempotentType(t *testing.T) {
+	jobRerunSafeTypes["idempotent_test"] = true
+	defer delete(jobRerunSafeTypes, "idempotent_test")
+
+	app := newJobsTestApp(t)
+	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at)
+		VALUES ('idempotent_test', 'safe', '{}', 'running', 1, 3, ?)
+	`, expired); err != nil {
+		t.Fatalf("insert stale idempotent job: %v", err)
+	}
+
+	recoverStaleRunningJobs(app.DB, time.Now())
+
+	var status string
+	var lease sql.NullString
+	if err := app.DB.QueryRow("SELECT status, lease_expires_at FROM _benmore_jobs").Scan(&status, &lease); err != nil {
+		t.Fatalf("query recovered job: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("status = %q, want pending (idempotent type should be re-queued)", status)
+	}
+	if lease.Valid {
+		t.Fatalf("lease should be cleared on re-queue, got %q", lease.String)
 	}
 }
 
@@ -158,8 +199,8 @@ func TestRecoverStaleRunningJobsFailsAtMaxAttempts(t *testing.T) {
 	if status != "failed" {
 		t.Fatalf("status = %q, want failed", status)
 	}
-	if errMsg != "worker lease expired after max attempts" {
-		t.Fatalf("error = %q", errMsg)
+	if !strings.Contains(errMsg, "not re-run to avoid duplicate side effects") {
+		t.Fatalf("error = %q, want the C-1 fail-closed reason", errMsg)
 	}
 	if lease.Valid {
 		t.Fatalf("lease should be cleared, got %q", lease.String)
@@ -218,15 +259,18 @@ func TestRecoverStaleRunningJobsLeavesNullLeaseUntouched(t *testing.T) {
 	}
 }
 
-// The recovery retry path must apply the same exponential backoff as a normal
-// failure (finding #2), so a crash-looping job is not re-queued for immediate
-// pickup. attempts=1 -> backoff = 1<<1 * 30s = 60s.
+// The recovery retry path (idempotent types only) must apply the same
+// exponential backoff as a normal failure (finding #2), so a crash-looping job
+// is not re-queued for immediate pickup. attempts=1 -> backoff = 1<<1 * 30s = 60s.
 func TestRecoverStaleRunningJobsAppliesBackoff(t *testing.T) {
+	jobRerunSafeTypes["idempotent_test"] = true
+	defer delete(jobRerunSafeTypes, "idempotent_test")
+
 	app := newJobsTestApp(t)
 	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
 	if _, err := app.DB.Exec(`
 		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at, lease_owner)
-		VALUES ('flow', 'crashloop', '{}', 'running', 1, 3, ?, 'owner-A')
+		VALUES ('idempotent_test', 'crashloop', '{}', 'running', 1, 3, ?, 'owner-A')
 	`, expired); err != nil {
 		t.Fatalf("insert stale job: %v", err)
 	}
@@ -360,7 +404,9 @@ func TestLeaseHeartbeatPreventsReclaim(t *testing.T) {
 
 	// Once the owner stops heartbeating, the lease eventually lapses and
 	// recovery reclaims the job - proving recovery still works when the owner
-	// is genuinely gone.
+	// is genuinely gone. This 'flow' job is non-idempotent, so C-1 fail-closed
+	// recovery moves it to 'failed' (not 'pending') - it is reclaimed out of the
+	// stuck 'running' state without risking a duplicate re-run.
 	stop()
 	// The last heartbeat pushed the lease to ~now+9s (the window), so allow a
 	// little over a full window for it to lapse and recovery to reclaim.
@@ -371,8 +417,8 @@ func TestLeaseHeartbeatPreventsReclaim(t *testing.T) {
 		if err := app.DB.QueryRow("SELECT status FROM _benmore_jobs").Scan(&status); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		if status == "pending" {
-			return // reclaimed as expected
+		if status == "failed" {
+			return // reclaimed (fail-closed) as expected
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

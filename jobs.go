@@ -336,50 +336,73 @@ func startLeaseHeartbeat(app *App, id int64, leaseOwner string, leaseDur time.Du
 // either re-queues them for retry or fails them at max attempts. The
 // `lease_expires_at IS NOT NULL` guard means a freshly-claimed row that has not
 // yet stamped a lease is never touched.
+// jobRerunSafeTypes is the allowlist of job types whose side effects are
+// idempotent enough to safely re-run after a worker crashes mid-execution.
+// Lease recovery re-queues ONLY these types; every other orphaned job is
+// failed closed instead of being re-run.
+//
+// C-1 (at-least-once vs duplicate side effects): a job body runs OUTSIDE the
+// claim transaction, so when a worker dies mid-flight we cannot know whether
+// its email/webhook/SQL side effects already fired. Re-queuing a non-idempotent
+// job (e.g. a "send email" flow) would deliver it a second time. "flow" and
+// hook jobs are therefore intentionally NOT listed here. Add a type only once
+// its handler is proven idempotent (e.g. guarded by a per-job completion
+// marker that makes a second run a no-op).
+var jobRerunSafeTypes = map[string]bool{
+	// (none today)
+}
+
 func recoverStaleRunningJobs(db *sql.DB, now time.Time) {
 	nowStr := now.UTC().Format(sqliteDateTimeLayout)
-	// Re-queue below max attempts. Two corrections vs the original sweep:
-	//  - finding #2: apply the same exponential backoff as the normal failure
-	//    path so a job that reliably kills its worker doesn't hot-loop. The
-	//    backoff (1<<attempts * 30s) is computed in SQL from the row's own
-	//    attempts so each stale row gets the delay matching its retry count.
-	//  - nit: the prior real `error` is preserved (appended to) rather than
-	//    overwritten, so a meaningful failure reason from an earlier attempt
-	//    isn't lost on recovery.
-	retryRes, retryErr := db.Exec(`
-		UPDATE _benmore_jobs
-		SET status = 'pending',
-		    error = TRIM(COALESCE(error || '; ', '') || 'worker lease expired; retrying'),
-		    run_at = datetime(?, '+' || ((1 << attempts) * 30) || ' seconds'),
-		    lease_expires_at = NULL,
-		    lease_owner = NULL
-		WHERE status = 'running'
-		  AND lease_expires_at IS NOT NULL
-		  AND lease_expires_at <= ?
-		  AND attempts < max_attempts
-	`, nowStr, nowStr)
-	if retryErr != nil {
-		log.Printf("JOB RECOVERY: re-queue sweep failed: %v", retryErr)
-	} else if n, _ := retryRes.RowsAffected(); n > 0 {
-		log.Printf("JOB RECOVERY: re-queued %d stale running job(s) for retry", n)
+
+	// Recovery is FAIL-CLOSED (C-1). Step 1: re-queue ONLY the job types proven
+	// idempotent (jobRerunSafeTypes) that are below max attempts, applying the
+	// same exponential backoff as the normal failure path (finding #2) so a job
+	// that reliably kills its worker doesn't hot-loop. The prior `error` is
+	// preserved (appended to) rather than overwritten (nit).
+	for jobType := range jobRerunSafeTypes {
+		retryRes, retryErr := db.Exec(`
+			UPDATE _benmore_jobs
+			SET status = 'pending',
+			    error = TRIM(COALESCE(error || '; ', '') || 'worker lease expired; retrying (idempotent type)'),
+			    run_at = datetime(?, '+' || ((1 << attempts) * 30) || ' seconds'),
+			    lease_expires_at = NULL,
+			    lease_owner = NULL
+			WHERE status = 'running'
+			  AND lease_expires_at IS NOT NULL
+			  AND lease_expires_at <= ?
+			  AND job_type = ?
+			  AND attempts < max_attempts
+		`, nowStr, nowStr, jobType)
+		if retryErr != nil {
+			log.Printf("JOB RECOVERY: re-queue sweep failed for %q: %v", jobType, retryErr)
+		} else if n, _ := retryRes.RowsAffected(); n > 0 {
+			log.Printf("JOB RECOVERY: re-queued %d stale idempotent %q job(s) for retry", n, jobType)
+		}
 	}
 
+	// Step 2: fail CLOSED every orphan still stuck - i.e. every 'running' job
+	// whose lease expired that was NOT re-queued above (a non-idempotent type,
+	// or an idempotent type already at max attempts). The orphan no longer
+	// sticks in 'running' forever, but it is marked 'failed' and NEVER re-run,
+	// because re-running a crashed non-idempotent job risks a duplicate side
+	// effect (double-sent email, double webhook, double SQL mutation). An
+	// operator can inspect the failed row and re-trigger deliberately if safe.
 	failRes, failErr := db.Exec(`
 		UPDATE _benmore_jobs
 		SET status = 'failed',
-		    error = TRIM(COALESCE(error || '; ', '') || 'worker lease expired after max attempts'),
+		    error = TRIM(COALESCE(error || '; ', '') || 'worker died mid-execution; not re-run to avoid duplicate side effects (C-1)'),
 		    completed_at = ?,
 		    lease_expires_at = NULL,
 		    lease_owner = NULL
 		WHERE status = 'running'
 		  AND lease_expires_at IS NOT NULL
 		  AND lease_expires_at <= ?
-		  AND attempts >= max_attempts
 	`, nowStr, nowStr)
 	if failErr != nil {
 		log.Printf("JOB RECOVERY: fail sweep failed: %v", failErr)
 	} else if n, _ := failRes.RowsAffected(); n > 0 {
-		log.Printf("JOB RECOVERY: failed %d stale running job(s) at max attempts", n)
+		log.Printf("JOB RECOVERY: failed %d orphaned job(s) (worker crash; not re-run to avoid duplicate side effects)", n)
 	}
 }
 
