@@ -413,8 +413,12 @@ func autoRestoreFromBackup(dir string, cause error) (bool, error) {
 	if len(candidates) == 0 {
 		return false, fmt.Errorf("auto-restore: no backups found in %s (cause: %v)", backupDir, cause)
 	}
-	// Newest first - backup filenames carry a sortable UTC timestamp.
-	sort.Sort(sort.Reverse(sort.StringSlice(candidates)))
+	// Newest first - sort by the timestamp suffix, not the whole filename, so a
+	// recent pre-migrate-* backup isn't shadowed by an older scheduled-* one
+	// (the prefix would otherwise dominate a plain string sort).
+	sort.Slice(candidates, func(i, j int) bool {
+		return backupTimestamp(candidates[i]) > backupTimestamp(candidates[j])
+	})
 
 	var pickedBackup string
 	for _, cand := range candidates {
@@ -537,36 +541,17 @@ func scheduledBackup(dir string) (string, error) {
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(backupDir, scheduledBackupPrefix+timestamp+".db")
 
-	src, err := os.Open(dbPath)
-	if err != nil {
-		return "", fmt.Errorf("open database for backup: %w", err)
+	// Use VACUUM INTO for a transactionally-consistent snapshot, exactly like
+	// backupDatabase. The previous raw io.Copy of data.db plus a SEPARATE copy
+	// of the -wal under active writes produced an internally inconsistent
+	// backup (the WAL frames and the base file could disagree) - if such a
+	// backup were later selected by restore/auto-recovery it could fail
+	// validation or silently lose committed transactions.
+	if err := sqliteVacuumInto(dbPath, backupPath); err != nil {
+		_ = os.Remove(backupPath)
+		return "", fmt.Errorf("vacuum into scheduled backup: %w", err)
 	}
-	defer src.Close()
-
-	dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, backupPermission)
-	if err != nil {
-		return "", fmt.Errorf("create backup file: %w", err)
-	}
-	defer dst.Close()
-
-	if _, err := io.Copy(dst, src); err != nil {
-		os.Remove(backupPath)
-		return "", fmt.Errorf("copy database to backup: %w", err)
-	}
-
-	// Also copy WAL file if it exists (for consistency)
-	walPath := dbPath + "-wal"
-	if _, err := os.Stat(walPath); err == nil {
-		walSrc, err := os.Open(walPath)
-		if err == nil {
-			defer walSrc.Close()
-			walDst, err := os.OpenFile(backupPath+"-wal", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, backupPermission)
-			if err == nil {
-				defer walDst.Close()
-				io.Copy(walDst, walSrc)
-			}
-		}
-	}
+	_ = os.Chmod(backupPath, backupPermission)
 
 	return backupPath, nil
 }
@@ -628,6 +613,28 @@ func StartBackupWorker(app *App, config *BackupConfig) {
 	})
 }
 
+// backupTimestamp extracts the sortable UTC timestamp (20060102T150405Z) from a
+// backup filename, stripping whichever prefix it carries. Sorting by this rather
+// than the whole filename prevents the PREFIX from dominating the order: a
+// scheduled-* backup is not "newer" than a pre-migrate-* one just because
+// 's' > 'p'. Without this, rollback/auto-restore could pick a days-old scheduled
+// backup over a minutes-old pre-migrate one and silently discard recent data.
+func backupTimestamp(path string) string {
+	b := filepath.Base(path)
+	b = strings.TrimSuffix(b, ".db")
+	b = strings.TrimPrefix(b, backupPrefix)
+	b = strings.TrimPrefix(b, scheduledBackupPrefix)
+	return b
+}
+
+// sortBackupsByTimestamp orders backup paths oldest-first by their timestamp
+// suffix (prefix-independent).
+func sortBackupsByTimestamp(backups []string) {
+	sort.Slice(backups, func(i, j int) bool {
+		return backupTimestamp(backups[i]) < backupTimestamp(backups[j])
+	})
+}
+
 // listAllBackups returns all backup file paths (both pre-migrate and scheduled), sorted oldest first.
 func listAllBackups(dir string) []string {
 	backupDir := filepath.Join(dir, backupDirName)
@@ -645,6 +652,8 @@ func listAllBackups(dir string) []string {
 			}
 		}
 	}
-	sort.Strings(backups)
+	// Sort by timestamp suffix, not filename: the two prefixes would otherwise
+	// order all scheduled-* after all pre-migrate-* regardless of recency.
+	sortBackupsByTimestamp(backups)
 	return backups
 }
