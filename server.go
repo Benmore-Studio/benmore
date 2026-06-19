@@ -179,16 +179,26 @@ func reloadAppConfig(app *App) error {
 	// based parser. Without this, every SIGHUP wipes GHA-shaped flows
 	// because LoadFlows can't parse them - they were live after process
 	// start but disappeared on the first hot reload.
-	app.Flows = LoadFlowsYAML(app.Dir)
-	if app.Flows == nil {
-		app.Flows = LoadFlows(app.Dir)
+	// Load flows/cron into locals first (the loaders do file I/O - keep
+	// that off the lock), then publish app.Flows and app.Cron under
+	// app.mu. The job worker reads both fields concurrently
+	// (executeFlowJob, findCronJob, runCronJob's flow lookup), so the
+	// reassignment must be serialized against those readers to avoid a
+	// data race on hot reload (review finding #4).
+	flows := LoadFlowsYAML(app.Dir)
+	if flows == nil {
+		flows = LoadFlows(app.Dir)
 	}
+	cron := LoadCron(app.Dir)
+	app.mu.Lock()
+	app.Flows = flows
+	app.Cron = cron
+	app.mu.Unlock()
 	app.Hooks = LoadHooksYAML(app.Dir)
 	if app.Hooks == nil {
 		app.Hooks = LoadHooks(app.Dir)
 	}
 	app.Workflows = LoadWorkflowsYAML(app.Dir)
-	app.Cron = LoadCron(app.Dir)
 	// v2.7.17: re-load the configs that hot-reload was missing.
 	// Without these, every change to app.yaml's `roles:` / `access:` /
 	// `aggregates:` / `groups:` was invisible until a full systemd
@@ -305,7 +315,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// API routes
 	RegisterQueryAPI(mux, app)      // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
 	RegisterSchedulingAPI(mux, app) // /api/_scheduled + /api/_approvals - per-record deferred tasks + approvals
-	RegisterLockRoutes(mux, app) // must register before CRUD so /api/{table}/{id}/lock is more specific
+	RegisterLockRoutes(mux, app)    // must register before CRUD so /api/{table}/{id}/lock is more specific
 	RegisterCRUD(mux, app)
 	RegisterFileUploadRoute(mux, app)
 	if NeedsAuth(app) {
@@ -477,9 +487,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Embedded libraries + PWA + dev tools
 	RegisterTailwindRoute(mux)
 	RegisterLibRoutes(mux)
-	RegisterBMTypesRoute(mux, app) // /_internal/types.d.ts - per-app TS defs
-	RegisterUploadRoute(mux, app)  // POST /api/_upload - generic file upload (v2.7.20)
-	RegisterWebRTCRoute(mux, app)  // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
+	RegisterBMTypesRoute(mux, app)    // /_internal/types.d.ts - per-app TS defs
+	RegisterUploadRoute(mux, app)     // POST /api/_upload - generic file upload (v2.7.20)
+	RegisterWebRTCRoute(mux, app)     // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
 	RegisterBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
 	RegisterPWARoutes(mux, app)
 

@@ -14,7 +14,16 @@ import (
 )
 
 // EnsureJobsTable creates the background jobs table.
+//
+// Guards against a nil handle: callers in normal flows have an
+// initialized DB (the scheduler/worker only run after OpenDB), but a
+// nil db would otherwise panic on the first Exec. Treat nil as a no-op
+// so a half-initialized App reaching here degrades gracefully instead
+// of crashing (review finding #5).
 func EnsureJobsTable(db *sql.DB) {
+	if db == nil {
+		return
+	}
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_jobs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_type TEXT NOT NULL DEFAULT 'flow',
@@ -71,29 +80,57 @@ type jobEnqueueExecer interface {
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
 // every job to id-enumeration.
 func EnqueueJob(db *sql.DB, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueTypedJob(db, "flow", "", flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", "", flowName, payload, runAt, jobEnqueueOpts{})
 }
 
 func EnqueueJobUnique(db *sql.DB, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueTypedJob(db, "flow", uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{})
 }
 
 func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueTypedJob(tx, "flow", "", flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", "", flowName, payload, runAt, jobEnqueueOpts{})
 }
 
 func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueTypedJob(tx, "flow", uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{})
 }
 
-func EnqueueCronJob(db *sql.DB, cronID, uniqueKey string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueTypedJob(db, "cron", uniqueKey, cronID, payload, runAt)
+// EnqueueCronJob enqueues a durable cron run.
+//
+// maxAttempts is the per-cron retry budget; pass 1 to preserve the
+// historical at-most-once behavior (a failing step is NOT retried), or
+// >1 to opt into at-least-once retries. See cron.go cronMaxAttempts for
+// how a cron definition selects this (review finding #2).
+//
+// dedupAnyStatus closes the same-minute duplicate-fire window (review
+// finding #1): the cron unique_key is minute-specific
+// (cron:<id>:<minute>), so the existence of ANY prior row with that key
+// - including a `completed` one - means that minute already fired. The
+// generic active-only dedup would let a completed row be re-enqueued
+// after a restart inside the same minute; for cron we additionally
+// collapse against completed/failed rows so a lost last_fire can never
+// cause a double fire.
+func EnqueueCronJob(db *sql.DB, cronID, uniqueKey string, payload map[string]any, runAt *time.Time, maxAttempts int) (int64, string, error) {
+	return enqueueTypedJob(db, "cron", uniqueKey, cronID, payload, runAt, jobEnqueueOpts{
+		maxAttempts:    maxAttempts,
+		dedupAnyStatus: true,
+	})
 }
 
-func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+// jobEnqueueOpts carries optional, type-specific enqueue behavior so the
+// generic enqueue path stays a single code path.
+type jobEnqueueOpts struct {
+	// maxAttempts overrides the column DEFAULT (3) when > 0.
+	maxAttempts int
+	// dedupAnyStatus, when set, treats a matching unique_key in ANY status
+	// (including completed/failed) as a duplicate to collapse against.
+	dedupAnyStatus bool
+}
+
+func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string, payload map[string]any, runAt *time.Time, opts jobEnqueueOpts) (int64, string, error) {
 	uniqueKey = strings.TrimSpace(uniqueKey)
 	if uniqueKey != "" {
-		if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+		if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 			return id, token, nil
 		}
 	}
@@ -103,13 +140,24 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 		ra = *runAt
 	}
 	token := generateToken(18)
-	result, err := exec.Exec(
-		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES (?, ?, ?, ?, ?, ?)",
-		jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
+	var (
+		result sql.Result
+		err    error
 	)
+	if opts.maxAttempts > 0 {
+		result, err = exec.Exec(
+			"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey), opts.maxAttempts,
+		)
+	} else {
+		result, err = exec.Exec(
+			"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES (?, ?, ?, ?, ?, ?)",
+			jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
+		)
+	}
 	if err != nil {
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
-			if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+			if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 				return id, token, nil
 			}
 		}
@@ -120,16 +168,36 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 }
 
 func findActiveJobByUniqueKey(q jobEnqueueExecer, uniqueKey string) (int64, string, bool) {
+	return findJobByUniqueKey(q, uniqueKey, false)
+}
+
+// findJobByUniqueKey looks up an existing job by unique_key. When
+// anyStatus is false it only matches active (pending/running) rows - the
+// partial-index semantics that let a key be reused once the prior job
+// finished. When anyStatus is true it matches a row in any status, used
+// by cron's minute-specific keys so a completed run can never be
+// re-enqueued for the same minute (review finding #1).
+func findJobByUniqueKey(q jobEnqueueExecer, uniqueKey string, anyStatus bool) (int64, string, bool) {
 	var id int64
 	var token string
-	err := q.QueryRow(`
+	query := `
 		SELECT id, COALESCE(status_token, '')
 		FROM _benmore_jobs
 		WHERE unique_key = ?
 		  AND status IN ('pending', 'running')
 		ORDER BY id DESC
 		LIMIT 1
-	`, uniqueKey).Scan(&id, &token)
+	`
+	if anyStatus {
+		query = `
+		SELECT id, COALESCE(status_token, '')
+		FROM _benmore_jobs
+		WHERE unique_key = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	}
+	err := q.QueryRow(query, uniqueKey).Scan(&id, &token)
 	return id, token, err == nil
 }
 
