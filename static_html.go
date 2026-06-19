@@ -200,7 +200,12 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 // injectDevReloadClient inserts the browser-side hot reload listener
 // before </body>. It is gated by the caller to dev/testing surfaces.
 func injectDevReloadClient(html []byte) []byte {
-	if bytes.Contains(html, []byte(`id="bm-dev-reload-client"`)) {
+	// Guard on both the static-path element id and the runtime flag token
+	// emitted by the template path (layout.go writes DevReloadClientScript
+	// inline without the id). Either marker means a reload client is already
+	// present, so injection stays idempotent across both surfaces.
+	if bytes.Contains(html, []byte(`id="bm-dev-reload-client"`)) ||
+		bytes.Contains(html, []byte("window.__bmDevReloadClient")) {
 		return html
 	}
 	chunk := []byte("\n<script id=\"bm-dev-reload-client\">" + DevReloadClientScript + "</script>\n")
