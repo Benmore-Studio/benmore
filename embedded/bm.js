@@ -658,18 +658,20 @@ export const aggregates = {
 // =================================================================
 
 function makeJob(jobId, statusUrl) {
+  const statusPath = statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`;
   return {
     job_id: jobId,
     status_url: statusUrl,
-    status: () => api.get(`/api/_jobs/${encodeURIComponent(jobId)}/status`),
-    wait: (opts = {}) => waitForJob(jobId, opts),
+    status: () => api.get(statusPath),
+    wait: (opts = {}) => waitForJob(jobId, { ...opts, statusUrl }),
   };
 }
 
-async function waitForJob(jobId, { intervalMs = 1000, timeoutMs = 5 * 60 * 1000 } = {}) {
+async function waitForJob(jobId, { intervalMs = 1000, timeoutMs = 5 * 60 * 1000, statusUrl = '' } = {}) {
+  const statusPath = statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const status = await api.get(`/api/_jobs/${encodeURIComponent(jobId)}/status`);
+    const status = await api.get(statusPath);
     if (status.status === 'completed') return status.result;
     if (status.status === 'failed') {
       const err = new Error(status.error || `job ${jobId} failed`);

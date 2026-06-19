@@ -1697,7 +1697,16 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 			runAt = &t
 		}
 	}
-	id, jobToken, err := EnqueueJob(ctx.App.DB, flowName, payload, runAt)
+	var (
+		id       int64
+		jobToken string
+		err      error
+	)
+	if ctx.Tx != nil {
+		id, jobToken, err = EnqueueJobTx(ctx.Tx, flowName, payload, runAt)
+	} else {
+		id, jobToken, err = EnqueueJob(ctx.App.DB, flowName, payload, runAt)
+	}
 	if err != nil {
 		return fmt.Errorf("enqueue %s: %w", flowName, err)
 	}

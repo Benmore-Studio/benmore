@@ -50,18 +50,30 @@ func EnsureJobsTable(db *sql.DB) {
 // `datetime('now')` directly) ran fine.
 const sqliteDateTimeLayout = "2006-01-02 15:04:05"
 
+type jobEnqueueExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 // EnqueueJob returns (id, statusToken, error). statusToken is the unguessable
 // capability the caller embeds in the status_url so the submitter (authed OR
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
 // every job to id-enumeration.
 func EnqueueJob(db *sql.DB, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	return enqueueJob(db, flowName, payload, runAt)
+}
+
+func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	return enqueueJob(tx, flowName, payload, runAt)
+}
+
+func enqueueJob(exec jobEnqueueExecer, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
 	data, _ := json.Marshal(payload)
 	ra := time.Now()
 	if runAt != nil {
 		ra = *runAt
 	}
 	token := generateToken(18)
-	result, err := db.Exec(
+	result, err := exec.Exec(
 		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token) VALUES ('flow', ?, ?, ?, ?)",
 		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token,
 	)
@@ -240,7 +252,24 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 			}
 		}
 	}
+	if targetFlow.Transaction {
+		tx, err := app.DB.Begin()
+		if err != nil {
+			return fmt.Errorf("begin transaction: %w", err)
+		}
+		ctx.Tx = tx
+	}
+
 	executeSteps(ctx, targetFlow.Steps)
+	if ctx.Tx != nil {
+		if ctx.Error != nil {
+			_ = ctx.Tx.Rollback()
+			return ctx.Error
+		}
+		if err := ctx.Tx.Commit(); err != nil {
+			return fmt.Errorf("commit transaction: %w", err)
+		}
+	}
 	return ctx.Error
 }
 
