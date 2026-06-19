@@ -6,11 +6,17 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 // EnsureJobsTable creates the background jobs table.
@@ -55,6 +61,17 @@ func EnsureJobsTable(db *sql.DB) {
 	// collapse to the existing job instead of duplicating work.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN unique_key TEXT")
 	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')")
+	// Lease owner token. A worker stamps a fresh random token when it claims a
+	// job and renews (heartbeats) the lease while the job runs. Recovery only
+	// reclaims a lease once it is *expired* (the owner stopped heartbeating),
+	// so a slow-but-alive worker can never have its in-flight job reclaimed and
+	// double-executed by an overlapping worker - the lease being expired is now
+	// proof the owner is gone, not merely that the job is long-running.
+	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN lease_owner TEXT")
+	// One-time backfill: jobs left `running` by pre-lease code have a NULL
+	// lease and would otherwise be stuck forever. Give them a lease anchored at
+	// started_at so the normal recovery sweep can pick them up. Best-effort.
+	db.Exec("UPDATE _benmore_jobs SET lease_expires_at = datetime(COALESCE(started_at, created_at, datetime('now')), '+5 minutes') WHERE status = 'running' AND lease_expires_at IS NULL")
 }
 
 // EnqueueJob adds a flow job to the background queue.
@@ -68,7 +85,53 @@ func EnsureJobsTable(db *sql.DB) {
 // `datetime('now')` directly) ran fine.
 const sqliteDateTimeLayout = "2006-01-02 15:04:05"
 
+// jobLeaseDuration is how long a claimed job's lease is valid before a
+// recovery sweep may reclaim it. It is a *renewal window*, NOT a maximum job
+// runtime: a running worker heartbeats its lease forward every
+// jobLeaseHeartbeat (see runWithLeaseHeartbeat), so a job may legitimately run
+// far longer than this without becoming reclaimable. The lease only expires
+// when the owning worker stops heartbeating - i.e. the process actually died.
+//
+// Overridable per-app via the BENMORE_JOB_LEASE_SECONDS env var (see
+// jobLeaseDurationFor); finding #6 - this is the most load-bearing tuning knob
+// for crash-recovery latency, so it should not be a hard-coded constant.
 const jobLeaseDuration = 5 * time.Minute
+
+// jobLeaseHeartbeatFor is how often a running worker renews its lease, derived
+// from the effective lease window. It must be comfortably shorter than the
+// window so a brief stall (GC pause, slow DB write) does not let the lease
+// lapse while the worker is still alive; one third gives two renewal chances
+// before expiry. A floor of 1s keeps it sane for very short test windows.
+func jobLeaseHeartbeatFor(leaseDur time.Duration) time.Duration {
+	hb := leaseDur / 3
+	if hb < time.Second {
+		hb = time.Second
+	}
+	return hb
+}
+
+// jobLeaseDurationFor resolves the effective lease window, allowing a
+// per-deployment override via BENMORE_JOB_LEASE_SECONDS. Invalid or absent
+// values fall back to the jobLeaseDuration default.
+func jobLeaseDurationFor() time.Duration {
+	if v := os.Getenv("BENMORE_JOB_LEASE_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return jobLeaseDuration
+}
+
+// recoveryBackoff mirrors the normal failure-path backoff (jobs.go retry
+// branch) so a job that reliably kills its worker (panic, OOM, segfault) is
+// re-queued with the same exponential delay rather than hot-looping on
+// immediate re-pickup. attempts is the row's current attempt count.
+func recoveryBackoff(attempts int) time.Duration {
+	if attempts < 0 {
+		attempts = 0
+	}
+	return time.Duration(1<<uint(attempts)) * 30 * time.Second
+}
 
 type jobEnqueueExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -134,7 +197,13 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 			return id, token, nil
 		}
 	}
-	data, _ := json.Marshal(payload)
+	// Surface marshal failures rather than silently enqueuing an
+	// empty/partial body: a payload that fails to marshal (e.g. a
+	// non-serializable value) would otherwise run the flow with no input.
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", fmt.Errorf("marshal job payload: %w", err)
+	}
 	ra := time.Now()
 	if runAt != nil {
 		ra = *runAt
@@ -159,6 +228,19 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
 			if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 				return id, token, nil
+			}
+			// On the Tx path (*sql.Tx), go-sqlite3 takes a read snapshot at
+			// the transaction's first read, so a row committed by a competing
+			// transaction AFTER that snapshot is invisible to the recovery
+			// SELECT above. We still know the key is held by an active job
+			// (the UNIQUE index just rejected our INSERT), so treat this as a
+			// successful idempotent no-op rather than surfacing the raw
+			// constraint error and failing the whole flow transaction. The id
+			// is unknown from inside the stale snapshot, so return 0 / no token;
+			// the caller's enqueue is a dedup no-op against the winner. (Tx
+			// callers needing the winner's id/token should re-read after commit.)
+			if _, isTx := exec.(*sql.Tx); isTx {
+				return 0, "", nil
 			}
 		}
 		return 0, "", err
@@ -205,13 +287,28 @@ func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}
-	return s
+	// Guard against legacy pre-status_token active rows carrying the same key:
+	// returning an empty token would make the caller build a status_url the
+	// status endpoint rejects. Treat a tokenless active row as "no usable dedup
+	// hit" so a fresh row (with a token) is inserted instead of handing back a
+	// broken status URL.
+	if token == "" {
+		return 0, "", false
+	}
+	return id, token, true
 }
 
+// isUniqueJobConstraintErr reports whether err is the UNIQUE-constraint
+// violation from idx_jobs_unique_active. It matches the typed go-sqlite3 error
+// (ErrConstraint + ErrConstraintUnique extended code) rather than scraping the
+// error string, which is fragile across driver/SQLite versions and locales.
 func isUniqueJobConstraintErr(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "unique") &&
-		(strings.Contains(msg, "idx_jobs_unique_active") || strings.Contains(msg, "unique_key"))
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code == sqlite3.ErrConstraint &&
+			sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique
+	}
+	return false
 }
 
 // EnqueueHookJob adds a hook execution job to the background queue.
@@ -305,14 +402,23 @@ func processNextJob(app *App) (worked bool) {
 	// goroutines can SELECT the same id; the AND status='pending' guard +
 	// RowsAffected check ensures exactly one runs it, preventing duplicate
 	// emails / webhook deliveries / double-executed SQL hooks.
-	leaseUntil := time.Now().Add(jobLeaseDuration).UTC().Format(sqliteDateTimeLayout)
-	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1, lease_expires_at = ? WHERE id = ? AND status = 'pending'", leaseUntil, id)
+	leaseDur := jobLeaseDurationFor()
+	leaseOwner := generateToken(18)
+	leaseUntil := time.Now().Add(leaseDur).UTC().Format(sqliteDateTimeLayout)
+	res, claimErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1, lease_expires_at = ?, lease_owner = ? WHERE id = ? AND status = 'pending'", leaseUntil, leaseOwner, id)
 	if claimErr != nil {
 		return false
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return true // another worker claimed it first; keep draining
 	}
+
+	// Keep the lease fresh for as long as this worker is alive and running the
+	// job. Without renewal a job that legitimately runs longer than the lease
+	// window would be reclaimed by a recovery sweep and double-executed (the
+	// finding #1 hole). The heartbeat only matches `lease_owner = ?`, so a
+	// reclaimed/re-leased job is not stomped by the previous owner.
+	stopHeartbeat := startLeaseHeartbeat(app, id, leaseOwner, leaseDur)
 
 	// Parse payload
 	var data map[string]any
@@ -334,48 +440,133 @@ func processNextJob(app *App) (worked bool) {
 		jobErr = executeFlowJob(app, flowName, data)
 	}
 
+	// Stop heartbeating before finalizing so a renewal can't race the terminal
+	// write. All terminal writes are guarded by `lease_owner = ?`: if recovery
+	// already reclaimed this job (our lease lapsed and a new owner picked it
+	// up), we must not stomp the new owner's run with our stale result.
+	stopHeartbeat()
+
 	if jobErr != nil {
 		if attempts+1 >= maxAttempts {
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?",
-				jobErr.Error(), id)
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?",
+				jobErr.Error(), id, leaseOwner)
 			log.Printf("JOB FAILED [%s/%s] #%d: %s (no more retries)", jobType, flowName, id, jobErr)
 		} else {
-			backoff := time.Duration(1<<uint(attempts)) * 30 * time.Second
+			backoff := recoveryBackoff(attempts)
 			nextRun := time.Now().Add(backoff)
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ?, lease_expires_at = NULL WHERE id = ?",
-				jobErr.Error(), nextRun.UTC().Format(sqliteDateTimeLayout), id)
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ?, lease_expires_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?",
+				jobErr.Error(), nextRun.UTC().Format(sqliteDateTimeLayout), id, leaseOwner)
 			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, next at %s)", jobType, flowName, id, jobErr, attempts+1, nextRun.Format("15:04:05"))
 		}
 	} else {
-		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?", id)
+		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?", id, leaseOwner)
 	}
 	return true
 }
 
+// startLeaseHeartbeat renews the lease for job id (owned by leaseOwner) every
+// jobLeaseHeartbeat until the returned stop func is called. The renewal is
+// scoped to `lease_owner = ?` so once a recovery sweep reclaims an expired
+// lease (and a new owner stamps its own token), the old worker's heartbeat
+// becomes a no-op and cannot resurrect the lease. The stop func is idempotent.
+func startLeaseHeartbeat(app *App, id int64, leaseOwner string, leaseDur time.Duration) func() {
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() { once.Do(func() { close(done) }) }
+	safeGo("jobs.lease-heartbeat", func() {
+		ticker := time.NewTicker(jobLeaseHeartbeatFor(leaseDur))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-app.Stop:
+				return
+			case <-ticker.C:
+				leaseUntil := time.Now().Add(leaseDur).UTC().Format(sqliteDateTimeLayout)
+				app.DB.Exec(
+					"UPDATE _benmore_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running' AND lease_owner = ?",
+					leaseUntil, id, leaseOwner,
+				)
+			}
+		}
+	})
+	return stop
+}
+
+// recoverStaleRunningJobs sweeps `running` jobs whose lease has actually
+// expired (the owning worker stopped heartbeating, i.e. its process died) and
+// either re-queues them for retry or fails them at max attempts. The
+// `lease_expires_at IS NOT NULL` guard means a freshly-claimed row that has not
+// yet stamped a lease is never touched.
+// jobRerunSafeTypes is the allowlist of job types whose side effects are
+// idempotent enough to safely re-run after a worker crashes mid-execution.
+// Lease recovery re-queues ONLY these types; every other orphaned job is
+// failed closed instead of being re-run.
+//
+// C-1 (at-least-once vs duplicate side effects): a job body runs OUTSIDE the
+// claim transaction, so when a worker dies mid-flight we cannot know whether
+// its email/webhook/SQL side effects already fired. Re-queuing a non-idempotent
+// job (e.g. a "send email" flow) would deliver it a second time. "flow" and
+// hook jobs are therefore intentionally NOT listed here. Add a type only once
+// its handler is proven idempotent (e.g. guarded by a per-job completion
+// marker that makes a second run a no-op).
+var jobRerunSafeTypes = map[string]bool{
+	// (none today)
+}
+
 func recoverStaleRunningJobs(db *sql.DB, now time.Time) {
 	nowStr := now.UTC().Format(sqliteDateTimeLayout)
-	db.Exec(`
-		UPDATE _benmore_jobs
-		SET status = 'pending',
-		    error = 'worker lease expired; retrying',
-		    run_at = ?,
-		    lease_expires_at = NULL
-		WHERE status = 'running'
-		  AND lease_expires_at IS NOT NULL
-		  AND lease_expires_at <= ?
-		  AND attempts < max_attempts
-	`, nowStr, nowStr)
-	db.Exec(`
+
+	// Recovery is FAIL-CLOSED (C-1). Step 1: re-queue ONLY the job types proven
+	// idempotent (jobRerunSafeTypes) that are below max attempts, applying the
+	// same exponential backoff as the normal failure path (finding #2) so a job
+	// that reliably kills its worker doesn't hot-loop. The prior `error` is
+	// preserved (appended to) rather than overwritten (nit).
+	for jobType := range jobRerunSafeTypes {
+		retryRes, retryErr := db.Exec(`
+			UPDATE _benmore_jobs
+			SET status = 'pending',
+			    error = TRIM(COALESCE(error || '; ', '') || 'worker lease expired; retrying (idempotent type)'),
+			    run_at = datetime(?, '+' || ((1 << attempts) * 30) || ' seconds'),
+			    lease_expires_at = NULL,
+			    lease_owner = NULL
+			WHERE status = 'running'
+			  AND lease_expires_at IS NOT NULL
+			  AND lease_expires_at <= ?
+			  AND job_type = ?
+			  AND attempts < max_attempts
+		`, nowStr, nowStr, jobType)
+		if retryErr != nil {
+			log.Printf("JOB RECOVERY: re-queue sweep failed for %q: %v", jobType, retryErr)
+		} else if n, _ := retryRes.RowsAffected(); n > 0 {
+			log.Printf("JOB RECOVERY: re-queued %d stale idempotent %q job(s) for retry", n, jobType)
+		}
+	}
+
+	// Step 2: fail CLOSED every orphan still stuck - i.e. every 'running' job
+	// whose lease expired that was NOT re-queued above (a non-idempotent type,
+	// or an idempotent type already at max attempts). The orphan no longer
+	// sticks in 'running' forever, but it is marked 'failed' and NEVER re-run,
+	// because re-running a crashed non-idempotent job risks a duplicate side
+	// effect (double-sent email, double webhook, double SQL mutation). An
+	// operator can inspect the failed row and re-trigger deliberately if safe.
+	failRes, failErr := db.Exec(`
 		UPDATE _benmore_jobs
 		SET status = 'failed',
-		    error = 'worker lease expired after max attempts',
+		    error = TRIM(COALESCE(error || '; ', '') || 'worker died mid-execution; not re-run to avoid duplicate side effects (C-1)'),
 		    completed_at = ?,
-		    lease_expires_at = NULL
+		    lease_expires_at = NULL,
+		    lease_owner = NULL
 		WHERE status = 'running'
 		  AND lease_expires_at IS NOT NULL
 		  AND lease_expires_at <= ?
-		  AND attempts >= max_attempts
 	`, nowStr, nowStr)
+	if failErr != nil {
+		log.Printf("JOB RECOVERY: fail sweep failed: %v", failErr)
+	} else if n, _ := failRes.RowsAffected(); n > 0 {
+		log.Printf("JOB RECOVERY: failed %d orphaned job(s) (worker crash; not re-run to avoid duplicate side effects)", n)
+	}
 }
 
 func executeFlowJob(app *App, flowName string, data map[string]any) error {

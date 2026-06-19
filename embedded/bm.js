@@ -683,7 +683,13 @@ async function waitForJob(jobId, { intervalMs = 1000, timeoutMs = 5 * 60 * 1000,
 }
 
 export const jobs = {
-  status: (jobId) => api.get(`/api/_jobs/${encodeURIComponent(jobId)}/status`),
+  // statusUrl is the tokenized URL returned by an async flow's submit
+  // response. Without it, the bare /api/_jobs/{id}/status path 404s for any
+  // non-admin caller (the status endpoint requires the capability token), so
+  // always pass through the server-issued status_url when polling outside an
+  // admin session.
+  status: (jobId, statusUrl) =>
+    api.get(statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`),
   wait: waitForJob,
 };
 

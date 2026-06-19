@@ -16,26 +16,26 @@ import (
 	"log"
 	"net/http"
 	neturl "net/url"
-	"sort"
-	"sync"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Flow represents a named workflow triggered by HTTP, cron, or data events.
 type Flow struct {
-	Name string
-	Trigger     FlowTrigger
+	Name    string
+	Trigger FlowTrigger
 	// Verify is the legacy string-shaped verifier: a named provider
 	// ("stripe", "github", "slack", "shopify") or a custom header name
 	// for HMAC-SHA256 fallback. Kept for back-compat. New flows should
 	// prefer VerifyConfig (the recipe form) for richer control -
 	// timestamp/replay protection, explicit signature prefixes, etc.
-	Verify      string
-	Secret      string
+	Verify       string
+	Secret       string
 	VerifyConfig *FlowVerify
 	Transaction  bool   // wrap all SQL steps in BEGIN/COMMIT
 	Auth         string // "required" to require login
@@ -70,9 +70,9 @@ type FlowTrigger struct {
 
 // FlowStep represents a single step in a flow pipeline.
 type FlowStep struct {
-	Name        string
-	Type        string // "sql", "api", "email", "webhook", "ws", "redirect", "respond", "if", "for_each", "set", "parse"
-	SQL         string
+	Name string
+	Type string // "sql", "api", "email", "webhook", "ws", "redirect", "respond", "if", "for_each", "set", "parse"
+	SQL  string
 	// SQLParams binds named values to `:name` placeholders in SQL,
 	// resolved per-step via interpolateCtx (env + step outputs + path
 	// params + session) before the query runs. Complex values
@@ -89,7 +89,7 @@ type FlowStep struct {
 	Email       *FlowEmail
 	Webhook     string
 	WebhookBody string
-	WS          *FlowWS // ws broadcast step
+	WS          *FlowWS      // ws broadcast step
 	Enqueue     *FlowEnqueue // enqueue a job for background processing
 	Redirect    string
 	Respond     *FlowRespond
@@ -118,11 +118,11 @@ type FlowStep struct {
 
 // FlowServeFile is the payload for a `run: serve_file` step.
 //
-//	- run: serve_file
-//	  with:
-//	    path: ${{ steps.item.outputs.file_url }}  # /uploads/private/x.pdf
-//	    disposition: inline                        # inline (default) | attachment
-//	    filename: "Q4 report.pdf"                  # optional download name
+//   - run: serve_file
+//     with:
+//     path: ${{ steps.item.outputs.file_url }}  # /uploads/private/x.pdf
+//     disposition: inline                        # inline (default) | attachment
+//     filename: "Q4 report.pdf"                  # optional download name
 type FlowServeFile struct {
 	Path        string
 	Disposition string // "inline" (default) or "attachment"
@@ -131,12 +131,12 @@ type FlowServeFile struct {
 
 // FlowCompute is the payload for a `run: compute` step.
 //
-//	- id: irr
-//	  run: compute
-//	  module: par-engine        # static/par-engine.ts (auto-resolved)
-//	  function: irrForInputs    # named export
-//	  args: ${{ steps.forecast.outputs.first }}
-//	  timeout: 10s              # optional, default 5s
+//   - id: irr
+//     run: compute
+//     module: par-engine        # static/par-engine.ts (auto-resolved)
+//     function: irrForInputs    # named export
+//     args: ${{ steps.forecast.outputs.first }}
+//     timeout: 10s              # optional, default 5s
 //
 // Args is interpolated through the flow's template engine before
 // the JS call, so any `${{ steps.X.outputs.Y }}` reference resolves
@@ -155,11 +155,11 @@ type FlowCompute struct {
 // trigger) runs out-of-band with no request timeout.
 //
 //   - enqueue:
-//       flow: generate_report
-//       with:
-//         user_id: "{{user.id}}"
-//         date_range: "30d"
-//       run_at: "{{now + 1h}}"   # optional scheduled delivery
+//     flow: generate_report
+//     with:
+//     user_id: "{{user.id}}"
+//     date_range: "30d"
+//     run_at: "{{now + 1h}}"   # optional scheduled delivery
 type FlowEnqueue struct {
 	Flow      string
 	With      map[string]string
@@ -173,8 +173,8 @@ type FlowEnqueue struct {
 //
 //   - id: notify
 //     ws:
-//       room: "order-{{order_id}}"
-//       payload: {"status": "shipped", "tracking": "{{tracking_no}}"}
+//     room: "order-{{order_id}}"
+//     payload: {"status": "shipped", "tracking": "{{tracking_no}}"}
 type FlowWS struct {
 	Room    string
 	Payload string
@@ -192,15 +192,15 @@ type FlowAPICall struct {
 	// outbound carrier API by `customer_id` (or anything else) sent
 	// no filter. Values are GHA-ref-normalized at parse time + final
 	// ctx interpolation happens in execStepAPI before URL escape.
-	Query   map[string]string
-	JSON    map[string]string
-	Form    map[string]string
-	Body    string
+	Query map[string]string
+	JSON  map[string]string
+	Form  map[string]string
+	Body  string
 	// Sign, if set, runs a recipe-based signer over the built request
 	// before it ships. The recipe (named built-in or inline) declares
 	// optional token exchange + ordered compute bindings + headers/query
 	// to set. See signers.go + signer_recipe*.go.
-	Sign    *FlowAPISign
+	Sign *FlowAPISign
 	// Paginate, if set, makes the step loop the request and accumulate
 	// items across pages. Eliminates the `?limit=500` footgun where a
 	// hardcoded cap silently drops data as the upstream grows. See
@@ -260,7 +260,7 @@ type FlowEmail struct {
 type FlowRespond struct {
 	Status    int
 	JSON      map[string]any
-	JSONArray []any  // for `body: [...]` / `json: [...]` forms
+	JSONArray []any // for `body: [...]` / `json: [...]` forms
 	Body      string
 }
 
@@ -269,7 +269,7 @@ type FlowContext struct {
 	App     *App
 	Request *http.Request
 	Writer  http.ResponseWriter
-	Data    map[string]any   // named step results
+	Data    map[string]any    // named step results
 	Params  map[string]string // path and query params
 	// NullParams records which keys in Params should bind as SQL NULL
 	// (not the empty string). ctx.Params is map[string]string for
@@ -278,12 +278,21 @@ type FlowContext struct {
 	// reads this sidecar to decide. Set by resolveSQLParamValue when
 	// the source expression resolves to Go `nil`.
 	NullParams map[string]bool
-	Stopped bool             // set by redirect/respond to halt pipeline
-	Error   error
-	FailedStep string        // name (or type) of the step that set Error - used by flow_no_response diagnostic
-	FailedType string        // step.Type of the failure (sql / api / parse / respond / etc) - drives step-type-specific hints
-	StepsRun   int           // count of steps actually executed before stopped/errored
-	Tx      *sql.Tx          // active transaction (nil if not transactional)
+	Stopped    bool // set by redirect/respond to halt pipeline
+	Error      error
+	FailedStep string  // name (or type) of the step that set Error - used by flow_no_response diagnostic
+	FailedType string  // step.Type of the failure (sql / api / parse / respond / etc) - drives step-type-specific hints
+	StepsRun   int     // count of steps actually executed before stopped/errored
+	Tx         *sql.Tx // active transaction (nil if not transactional)
+	// TxMu serializes access to Tx. database/sql's *sql.Tx is NOT safe for
+	// concurrent use, but a flow that is both `transaction: true` and
+	// contains a `parallel:` block fans SQL steps out across goroutines
+	// that all resolve the same ctx.Tx via flowDB. Without serialization
+	// those concurrent Query/Exec calls race and error at runtime. When no
+	// transaction is active (ctx.Tx == nil) the underlying *sql.DB pool is
+	// already concurrency-safe, so this lock is only taken on the
+	// transactional path.
+	TxMu sync.Mutex
 	// DataMu protects Data + Params + StepsRun + Error + FailedStep +
 	// Stopped from concurrent step writes. Only the `parallel:` step
 	// fans out goroutines today; sequential paths take Lock+Unlock as
@@ -1106,6 +1115,15 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 	startsWithRowProducer := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "WITH")
 	hasReturning := !startsWithRowProducer && hasReturningClause(upper)
+	// Serialize the actual DB call when running inside a transaction:
+	// *sql.Tx is not safe for concurrent use, so a `parallel:` block of
+	// SQL steps inside a `transaction: true` flow would otherwise race.
+	// The DB pool (ctx.Tx == nil path) is already concurrency-safe, so we
+	// only pay the lock on the transactional path.
+	if ctx.Tx != nil {
+		ctx.TxMu.Lock()
+		defer ctx.TxMu.Unlock()
+	}
 	if startsWithRowProducer || hasReturning {
 		sqlRows, err := db.Query(query, args...)
 		if err != nil {
@@ -1433,9 +1451,9 @@ func execStepAPI(ctx *FlowContext, step *FlowStep) error {
 //   - status  (int):     HTTP status code
 //   - body    (string):  raw response body
 //   - headers (map):     response headers, single-value headers flattened
-//                        to a scalar, multi-value headers stay as []string
+//     to a scalar, multi-value headers stay as []string
 //   - json    (any):     parsed body when the response is valid JSON;
-//                        omitted otherwise
+//     omitted otherwise
 //
 // Back-compat: when the body parses to a JSON object, its top-level
 // fields are aliased onto the envelope directly so legacy flows that
@@ -1708,7 +1726,12 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 		err      error
 	)
 	if ctx.Tx != nil {
+		// Serialize Tx access: a `parallel:` block inside a transactional
+		// flow may enqueue concurrently, and *sql.Tx is not safe for
+		// concurrent use. See FlowContext.TxMu.
+		ctx.TxMu.Lock()
 		id, jobToken, err = EnqueueJobTxUnique(ctx.Tx, uniqueKey, flowName, payload, runAt)
+		ctx.TxMu.Unlock()
 	} else {
 		id, jobToken, err = EnqueueJobUnique(ctx.App.DB, uniqueKey, flowName, payload, runAt)
 	}
@@ -2322,16 +2345,16 @@ func execStepParse(ctx *FlowContext, step *FlowStep) error {
 // JS execution of a function in a static/ TS/JS module via goja. See
 // compute.go for the runtime + sandbox details. The pattern:
 //
-//	- id: forecast
-//	  run: sql
-//	  with: SELECT * FROM forecasts WHERE id = :id
+//   - id: forecast
+//     run: sql
+//     with: SELECT * FROM forecasts WHERE id = :id
 //
-//	- id: irr
-//	  run: compute
-//	  module: par-engine
-//	  function: irrForInputs
-//	  args: ${{ steps.forecast.outputs.first }}
-//	  timeout: 10s
+//   - id: irr
+//     run: compute
+//     module: par-engine
+//     function: irrForInputs
+//     args: ${{ steps.forecast.outputs.first }}
+//     timeout: 10s
 //
 // The function's return value lands at ctx.Data[step.Name] (and a
 // `.outputs` alias under the same name) so downstream steps reference
@@ -2528,7 +2551,7 @@ func resolveFallbackOperand(s string, flatData map[string]any) (any, bool) {
 	return s, true
 }
 
-// splitPipeNameArg splits a pipe expression like `default:''` into
+// splitPipeNameArg splits a pipe expression like `default:”` into
 // ("default", "", true) or `length` into ("length", "", false). The
 // arg can be quoted with single or double quotes; quotes are stripped.
 // Used by resolveBindExpr to detect `default:` short-circuits.
@@ -2794,14 +2817,15 @@ func interpolateCtx(template string, ctx *FlowContext) string {
 // flattenData walks ctx.Data and produces a flat key→value map keyed
 // by dotted paths. Supports nested maps AND slices uniformly:
 //
-//   ctx.Data = { "stories": [{"id":1,"title":"X"}, {"id":2,"title":"Y"}] }
+//	ctx.Data = { "stories": [{"id":1,"title":"X"}, {"id":2,"title":"Y"}] }
 //
 // produces (among others):
-//   "stories"             → the whole slice
-//   "stories.0"           → the first row (map)
-//   "stories.0.title"     → "X"
-//   "stories.0.id"        → 1
-//   "stories.1.title"     → "Y"
+//
+//	"stories"             → the whole slice
+//	"stories.0"           → the first row (map)
+//	"stories.0.title"     → "X"
+//	"stories.0.id"        → 1
+//	"stories.1.title"     → "Y"
 //
 // AND a single-element-slice promotes its element to the slice key
 // itself, so `{{user}}` resolves to `{...}` when the SQL returned
