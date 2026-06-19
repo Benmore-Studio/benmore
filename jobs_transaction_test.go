@@ -166,6 +166,219 @@ func TestRecoverStaleRunningJobsFailsAtMaxAttempts(t *testing.T) {
 	}
 }
 
+// A future (non-expired) lease is the core guard: recovery must leave such a
+// running job completely untouched.
+func TestRecoverStaleRunningJobsLeavesNonExpiredLeaseUntouched(t *testing.T) {
+	app := newJobsTestApp(t)
+	future := time.Now().Add(time.Minute).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at, lease_owner)
+		VALUES ('flow', 'live', '{}', 'running', 1, 3, ?, 'owner-A')
+	`, future); err != nil {
+		t.Fatalf("insert live running job: %v", err)
+	}
+
+	recoverStaleRunningJobs(app.DB, time.Now())
+
+	var status string
+	var owner sql.NullString
+	if err := app.DB.QueryRow("SELECT status, lease_owner FROM _benmore_jobs").Scan(&status, &owner); err != nil {
+		t.Fatalf("query job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running (non-expired lease must not be recovered)", status)
+	}
+	if !owner.Valid || owner.String != "owner-A" {
+		t.Fatalf("lease_owner = %v, want owner-A (untouched)", owner)
+	}
+}
+
+// A NULL-lease running row (old schema / fresh claim mid-flight) must not be
+// recovered: the IS NOT NULL guard protects it.
+func TestRecoverStaleRunningJobsLeavesNullLeaseUntouched(t *testing.T) {
+	app := newJobsTestApp(t)
+	// The migration backfill in EnsureJobsTable only runs at table-creation
+	// time, so insert the NULL-lease row afterwards to model a fresh mid-flight
+	// claim that hasn't stamped a lease yet.
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at)
+		VALUES ('flow', 'fresh', '{}', 'running', 1, 3, NULL)
+	`); err != nil {
+		t.Fatalf("insert null-lease running job: %v", err)
+	}
+
+	recoverStaleRunningJobs(app.DB, time.Now())
+
+	var status string
+	if err := app.DB.QueryRow("SELECT status FROM _benmore_jobs").Scan(&status); err != nil {
+		t.Fatalf("query job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running (NULL lease must not be recovered)", status)
+	}
+}
+
+// The recovery retry path must apply the same exponential backoff as a normal
+// failure (finding #2), so a crash-looping job is not re-queued for immediate
+// pickup. attempts=1 -> backoff = 1<<1 * 30s = 60s.
+func TestRecoverStaleRunningJobsAppliesBackoff(t *testing.T) {
+	app := newJobsTestApp(t)
+	expired := time.Now().Add(-time.Minute).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at, lease_owner)
+		VALUES ('flow', 'crashloop', '{}', 'running', 1, 3, ?, 'owner-A')
+	`, expired); err != nil {
+		t.Fatalf("insert stale job: %v", err)
+	}
+
+	now := time.Now()
+	recoverStaleRunningJobs(app.DB, now)
+
+	// The go-sqlite3 driver auto-parses DATETIME columns into time.Time, so
+	// scan directly into a time value rather than the raw text.
+	var runAt time.Time
+	if err := app.DB.QueryRow("SELECT run_at FROM _benmore_jobs").Scan(&runAt); err != nil {
+		t.Fatalf("query run_at: %v", err)
+	}
+	// Expected: now + recoveryBackoff(1) = now + 60s. Allow a few seconds of
+	// slack for the now->SQL round-trip (both truncated to whole seconds).
+	wantDelay := recoveryBackoff(1)
+	gotDelay := runAt.UTC().Sub(now.UTC().Truncate(time.Second))
+	if gotDelay < wantDelay-2*time.Second || gotDelay > wantDelay+2*time.Second {
+		t.Fatalf("recovery run_at delay = %v, want ~%v (no backoff applied?)", gotDelay, wantDelay)
+	}
+}
+
+// The claim path in processNextJob must stamp lease_expires_at and lease_owner
+// while the job runs. A `sql` step executes *during* the job, so it can snapshot
+// the job's own row mid-flight into a side table for a deterministic assertion
+// (no blocking/goroutine racing needed). On completion the lease is cleared.
+func TestProcessNextJobSetsLease(t *testing.T) {
+	app := newJobsTestApp(t)
+	if _, err := app.DB.Exec("CREATE TABLE lease_probe (lease TEXT, owner TEXT, status TEXT)"); err != nil {
+		t.Fatalf("create probe: %v", err)
+	}
+	app.Flows = []Flow{{
+		Name: "probe_lease",
+		Steps: []FlowStep{{
+			Type: "sql",
+			SQL:  "INSERT INTO lease_probe (lease, owner, status) SELECT COALESCE(lease_expires_at,''), COALESCE(lease_owner,''), status FROM _benmore_jobs WHERE flow_name = 'probe_lease'",
+		}},
+	}}
+	if _, _, err := EnqueueJob(app.DB, "probe_lease", map[string]any{}, nil); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	if !processNextJob(app) {
+		t.Fatal("processNextJob returned false for a claimed job")
+	}
+
+	// Mid-flight snapshot: the job was 'running' with a lease + owner stamped.
+	var lease, owner, status string
+	if err := app.DB.QueryRow("SELECT lease, owner, status FROM lease_probe").Scan(&lease, &owner, &status); err != nil {
+		t.Fatalf("query probe: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("mid-flight status = %q, want running", status)
+	}
+	if lease == "" {
+		t.Fatal("lease_expires_at was not set on claim")
+	}
+	if owner == "" {
+		t.Fatal("lease_owner was not set on claim")
+	}
+
+	// On completion the lease + owner are cleared.
+	var finalStatus string
+	var leaseAfter, ownerAfter sql.NullString
+	if err := app.DB.QueryRow("SELECT status, lease_expires_at, lease_owner FROM _benmore_jobs WHERE flow_name = 'probe_lease'").Scan(&finalStatus, &leaseAfter, &ownerAfter); err != nil {
+		t.Fatalf("query completed job: %v", err)
+	}
+	if finalStatus != "completed" {
+		t.Fatalf("status = %q, want completed", finalStatus)
+	}
+	if leaseAfter.Valid || ownerAfter.Valid {
+		t.Fatalf("lease/owner should be cleared after completion, got lease=%v owner=%v", leaseAfter, ownerAfter)
+	}
+}
+
+// Finding #1: a live long-running worker must not have its job reclaimed. The
+// protection is the heartbeat pushing the lease forward. This test drives the
+// real startLeaseHeartbeat against a near-expired lease and asserts (a) the
+// lease is renewed into the future and (b) a concurrent recovery sweep is then
+// a no-op, leaving the job 'running'. Uses a short lease window via the env
+// override so the heartbeat (window/3) fires quickly and the test stays fast.
+func TestLeaseHeartbeatPreventsReclaim(t *testing.T) {
+	app := newJobsTestApp(t)
+	t.Setenv("BENMORE_JOB_LEASE_SECONDS", "6") // heartbeat every 2s
+
+	// A job claimed by owner-A whose lease expires in 4s. The first heartbeat
+	// (at ~2s) renews it to ~now+6s, comfortably past the original 4s expiry, so
+	// a recovery sweep after t=4s must still see a live (future) lease. The
+	// generous margins keep the second-granularity SQLite datetime comparison
+	// from making this flaky.
+	nearExpiry := time.Now().Add(4 * time.Second).UTC().Format(sqliteDateTimeLayout)
+	if _, err := app.DB.Exec(`
+		INSERT INTO _benmore_jobs (job_type, flow_name, payload, status, attempts, max_attempts, lease_expires_at, lease_owner)
+		VALUES ('flow', 'longrun', '{}', 'running', 1, 3, ?, 'owner-A')
+	`, nearExpiry); err != nil {
+		t.Fatalf("insert running job: %v", err)
+	}
+	var id int64
+	if err := app.DB.QueryRow("SELECT id FROM _benmore_jobs").Scan(&id); err != nil {
+		t.Fatalf("scan id: %v", err)
+	}
+
+	stop := startLeaseHeartbeat(app, id, "owner-A", jobLeaseDurationFor())
+	defer stop()
+
+	// Run sweeps until comfortably past the original 5s expiry; the heartbeat
+	// must have renewed the lease for the job to survive.
+	origExpiry, _ := time.Parse(sqliteDateTimeLayout, nearExpiry)
+	deadline := time.Now().Add(6 * time.Second)
+	var renewed bool
+	for time.Now().Before(deadline) {
+		recoverStaleRunningJobs(app.DB, time.Now())
+		var status string
+		var lease time.Time
+		if err := app.DB.QueryRow("SELECT status, lease_expires_at FROM _benmore_jobs").Scan(&status, &lease); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if status != "running" {
+			t.Fatalf("live job reclaimed despite active heartbeat: status=%q", status)
+		}
+		// Renewal is proven by the lease moving strictly past its original
+		// expiry - something only the heartbeat does.
+		if lease.UTC().After(origExpiry.Add(time.Second)) {
+			renewed = true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !renewed {
+		t.Fatal("heartbeat never renewed the lease past its original expiry")
+	}
+
+	// Once the owner stops heartbeating, the lease eventually lapses and
+	// recovery reclaims the job - proving recovery still works when the owner
+	// is genuinely gone.
+	stop()
+	// The last heartbeat pushed the lease to ~now+9s (the window), so allow a
+	// little over a full window for it to lapse and recovery to reclaim.
+	reclaimDeadline := time.Now().Add(9 * time.Second)
+	for time.Now().Before(reclaimDeadline) {
+		recoverStaleRunningJobs(app.DB, time.Now())
+		var status string
+		if err := app.DB.QueryRow("SELECT status FROM _benmore_jobs").Scan(&status); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if status == "pending" {
+			return // reclaimed as expected
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("job was never reclaimed after the owner stopped heartbeating")
+}
+
 func newJobsTestApp(t *testing.T) *App {
 	t.Helper()
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "jobs.db"))
