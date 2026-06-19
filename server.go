@@ -118,6 +118,9 @@ func hotReloadApp(app *App, dev bool) error {
 	mux := buildAppMux(app, dev, baseURL)
 	handler := wrapMiddleware(mux, app, dev)
 	hostedHotHandler.swap(handler)
+	if dev || devReloadClientEnabled(app) {
+		BroadcastReload("hot-reload")
+	}
 	return nil
 }
 
@@ -305,7 +308,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// API routes
 	RegisterQueryAPI(mux, app)      // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
 	RegisterSchedulingAPI(mux, app) // /api/_scheduled + /api/_approvals - per-record deferred tasks + approvals
-	RegisterLockRoutes(mux, app) // must register before CRUD so /api/{table}/{id}/lock is more specific
+	RegisterLockRoutes(mux, app)    // must register before CRUD so /api/{table}/{id}/lock is more specific
 	RegisterCRUD(mux, app)
 	RegisterFileUploadRoute(mux, app)
 	if NeedsAuth(app) {
@@ -477,9 +480,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Embedded libraries + PWA + dev tools
 	RegisterTailwindRoute(mux)
 	RegisterLibRoutes(mux)
-	RegisterBMTypesRoute(mux, app) // /_internal/types.d.ts - per-app TS defs
-	RegisterUploadRoute(mux, app)  // POST /api/_upload - generic file upload (v2.7.20)
-	RegisterWebRTCRoute(mux, app)  // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
+	RegisterBMTypesRoute(mux, app)    // /_internal/types.d.ts - per-app TS defs
+	RegisterUploadRoute(mux, app)     // POST /api/_upload - generic file upload (v2.7.20)
+	RegisterWebRTCRoute(mux, app)     // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
 	RegisterBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
 	RegisterPWARoutes(mux, app)
 

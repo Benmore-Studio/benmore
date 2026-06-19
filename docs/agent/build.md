@@ -21,7 +21,8 @@ go build -tags sqlite_fts5 -o benmore .
 
 `benmore new` writes a complete starter app (see the tree below). `benmore
 serve` loads it, applies migrations, compiles your TSX on the fly, and serves
-the whole thing. Edit a file, refresh the browser - that's the loop.
+the whole thing. In dev/testing mode, served pages listen for hot reload events
+and refresh themselves after a successful in-process app reload.
 
 ## The agentic build loop (how to work)
 

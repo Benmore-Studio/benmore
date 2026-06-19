@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -66,7 +67,14 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		// because broadcastToSSE filters anonymous clients out - only
 		// framework-level reload events deliver to them.
 		var client sseClient
-		if needsAuth && !app.DevMode && !wsAnonymous {
+		// Allow anonymous SSE wherever the dev reload client is injected so
+		// the injected EventSource is never rejected with 401. This must
+		// track devReloadClientEnabled (DevMode || testing) exactly - the
+		// injection gate and the auth gate cannot be allowed to drift, or
+		// testing-mode pages would connect but get rejected and the reload
+		// would never fire.
+		reloadAllowedAnonymous := devReloadClientEnabled(app)
+		if needsAuth && !reloadAllowedAnonymous && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
 				http.Error(w, "authentication required", http.StatusUnauthorized)
@@ -75,7 +83,7 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 			client.userID = session.UserID
 			client.groupID = session.GroupID
 			client.isAdmin = session.IsAdmin()
-		} else if needsAuth && (app.DevMode || wsAnonymous) {
+		} else if needsAuth && (reloadAllowedAnonymous || wsAnonymous) {
 			// Try to attach session metadata if present so the dev
 			// connection still receives scoped data events when the
 			// user is logged in.
@@ -197,7 +205,8 @@ func BroadcastReload(reason string) {
 	if reason == "" {
 		reason = "src-changed"
 	}
-	payload := `reload|{"reason":"` + reason + `"}`
+	data, _ := json.Marshal(map[string]string{"reason": reason})
+	payload := `reload|` + string(data)
 	sseHub.mu.RLock()
 	n := len(sseHub.clients)
 	for c := range sseHub.clients {
@@ -251,7 +260,10 @@ func BroadcastChangeScoped(table, action string, groupID string, userID int64) {
 const SSEClientScript = `
 (function() {
   if (!document.querySelector('[data-live]') && !document.querySelector('[data-live-table]')) return;
-  var source = new EventSource('/sse/events');
+  // Reuse a single shared EventSource so a page that also injects the dev
+  // reload client does not open two connections (two sseClient entries) per
+  // tab. The dev reload script attaches its own listener to the same source.
+  var source = window.__bmSSE || (window.__bmSSE = new EventSource('/sse/events'));
   source.addEventListener('change', function(e) {
     try {
       var data = JSON.parse(e.data);
@@ -263,3 +275,33 @@ const SSEClientScript = `
   source.onerror = function() { source.close(); };
 })();
 `
+
+// DevReloadClientScript listens for framework-level hot reload events.
+// It is injected only in dev/testing pages, independent of live data
+// components, so a plain static HTML page reloads after a SIGHUP swap.
+const DevReloadClientScript = `
+(function() {
+  if (window.__bmDevReloadClient) return;
+  window.__bmDevReloadClient = true;
+  // Reuse the shared EventSource if SSEClientScript already opened one (live
+  // page), otherwise open our own. Either way only a single connection per
+  // tab is created.
+  var source = window.__bmSSE || (window.__bmSSE = new EventSource('/sse/events'));
+  source.addEventListener('reload', function() {
+    if (window.__bmDevReloading) return;
+    window.__bmDevReloading = true;
+    // Defer briefly so the server can flush the SSE write and any rapidly
+    // coalesced reload events settle before we navigate away.
+    setTimeout(function() { window.location.reload(); }, 25);
+  });
+  // Without this, a 401 (auth app outside DevMode/testing) or a disabled
+  // sse feature makes EventSource reconnect roughly every 3s forever,
+  // flooding the server with failing requests. Close on error to match
+  // SSEClientScript.
+  source.onerror = function() { source.close(); };
+})();
+`
+
+func devReloadClientEnabled(app *App) bool {
+	return app != nil && (app.DevMode || app.FeatureEnabled("testing"))
+}

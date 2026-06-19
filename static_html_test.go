@@ -3,6 +3,7 @@
 package main
 
 import (
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -212,5 +213,100 @@ func TestVersionStaticAssetsIsIdempotentOnTwoPasses(t *testing.T) {
 
 	if string(once) != string(twice) {
 		t.Errorf("second pass changed output:\n  once : %s\n  twice: %s", once, twice)
+	}
+}
+
+func TestTryServeHTMLFileInjectsDevReloadClientInDevMode(t *testing.T) {
+	app := &App{Dir: t.TempDir(), DevMode: true, Design: featuresForStaticHTMLTest(false, false)}
+	staticDir := filepath.Join(app.Dir, "static")
+	if err := os.MkdirAll(staticDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(staticDir, "index.html")
+	if err := os.WriteFile(indexPath, []byte(`<!doctype html><html><body><h1>Dev</h1></body></html>`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	if !tryServeHTMLFile(rr, httptest.NewRequest("GET", "/", nil), app, indexPath) {
+		t.Fatal("expected HTML file to be served")
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `id="bm-dev-reload-client"`) {
+		t.Fatalf("dev reload script not injected: %s", body)
+	}
+	if !strings.Contains(body, `new EventSource('/sse/events')`) {
+		t.Fatalf("dev reload script missing SSE client: %s", body)
+	}
+}
+
+func TestTryServeHTMLFileSkipsDevReloadClientInProduction(t *testing.T) {
+	app := &App{Dir: t.TempDir(), Design: featuresForStaticHTMLTest(false, false)}
+	staticDir := filepath.Join(app.Dir, "static")
+	if err := os.MkdirAll(staticDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(staticDir, "index.html")
+	if err := os.WriteFile(indexPath, []byte(`<!doctype html><html><body><h1>Prod</h1></body></html>`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	if !tryServeHTMLFile(rr, httptest.NewRequest("GET", "/", nil), app, indexPath) {
+		t.Fatal("expected HTML file to be served")
+	}
+	if strings.Contains(rr.Body.String(), `bm-dev-reload-client`) {
+		t.Fatalf("production page should not include dev reload client: %s", rr.Body.String())
+	}
+}
+
+func TestTryServeHTMLFileInjectsDevReloadClientInTestingMode(t *testing.T) {
+	app := &App{Dir: t.TempDir(), Design: featuresForStaticHTMLTest(true, false)}
+	staticDir := filepath.Join(app.Dir, "static")
+	if err := os.MkdirAll(staticDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(staticDir, "index.html")
+	if err := os.WriteFile(indexPath, []byte(`<!doctype html><html><body><h1>Testing</h1></body></html>`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	if !tryServeHTMLFile(rr, httptest.NewRequest("GET", "/", nil), app, indexPath) {
+		t.Fatal("expected HTML file to be served")
+	}
+	if !strings.Contains(rr.Body.String(), `id="bm-dev-reload-client"`) {
+		t.Fatalf("testing page should include dev reload client: %s", rr.Body.String())
+	}
+}
+
+func TestWrapLayoutInjectsDevReloadClientForTemplatePages(t *testing.T) {
+	devApp := &App{Dir: t.TempDir(), DevMode: true, Design: featuresForStaticHTMLTest(false, false)}
+	if body := WrapLayout("<main>Dev</main>", "Dev", devApp, nil); !strings.Contains(body, `__bmDevReloadClient`) {
+		t.Fatalf("template dev page should include reload client: %s", body)
+	}
+
+	prodApp := &App{Dir: t.TempDir(), Design: featuresForStaticHTMLTest(false, false)}
+	if body := WrapLayout("<main>Prod</main>", "Prod", prodApp, nil); strings.Contains(body, `__bmDevReloadClient`) {
+		t.Fatalf("template production page should not include reload client: %s", body)
+	}
+}
+
+func TestInjectDevReloadClientIsIdempotent(t *testing.T) {
+	html := []byte(`<!doctype html><html><body></body></html>`)
+	once := injectDevReloadClient(html)
+	twice := injectDevReloadClient(once)
+
+	if string(once) != string(twice) {
+		t.Fatalf("second injection changed output:\nonce: %s\ntwice: %s", once, twice)
+	}
+}
+
+func featuresForStaticHTMLTest(testingEnabled, analyticsEnabled bool) *DesignConfig {
+	return &DesignConfig{
+		Features: &FeaturesConfig{
+			Testing:   &testingEnabled,
+			Analytics: &analyticsEnabled,
+		},
 	}
 }
