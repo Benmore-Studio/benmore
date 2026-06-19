@@ -6,11 +6,14 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 // EnsureJobsTable creates the background jobs table.
@@ -86,6 +89,13 @@ func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[stri
 	return enqueueJob(tx, uniqueKey, flowName, payload, runAt)
 }
 
+// Idempotency semantics: the FIRST active enqueue for a given unique_key wins.
+// When an active (pending/running) job already exists for the key, enqueue
+// returns that job's id + status token and does NOT reconcile a newer payload
+// or an earlier/later run_at - the later enqueue is treated as a no-op against
+// the in-flight job. Callers that need a different schedule must wait for the
+// in-flight job to finish (which releases the key) before re-enqueuing. This is
+// documented in docs/agent/durable-jobs.md.
 func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
 	uniqueKey = strings.TrimSpace(uniqueKey)
 	if uniqueKey != "" {
@@ -99,14 +109,36 @@ func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[s
 		ra = *runAt
 	}
 	token := generateToken(18)
+	// uniqueKey is already TrimSpace'd above, so a single empty check here
+	// suffices: store NULL for the no-key case (keeps it out of the partial
+	// UNIQUE index) and the trimmed key otherwise.
+	var uniqueKeyArg any
+	if uniqueKey != "" {
+		uniqueKeyArg = uniqueKey
+	}
 	result, err := exec.Exec(
 		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES ('flow', ?, ?, ?, ?, ?)",
-		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
+		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, uniqueKeyArg,
 	)
 	if err != nil {
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
+			// A concurrent enqueue won the race on idx_jobs_unique_active.
+			// Re-read the winning row so we can return it idempotently.
 			if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
 				return id, token, nil
+			}
+			// On the Tx path (*sql.Tx), go-sqlite3 takes a read snapshot at
+			// the transaction's first read, so a row committed by a competing
+			// transaction AFTER that snapshot is invisible to the recovery
+			// SELECT above. We still know the key is held by an active job
+			// (the UNIQUE index just rejected our INSERT), so treat this as a
+			// successful idempotent no-op rather than surfacing the raw
+			// constraint error and failing the whole flow transaction. The id
+			// is unknown from inside the stale snapshot, so return 0 / no token;
+			// the caller's enqueue is a dedup no-op against the winner. (Tx
+			// callers needing the winner's id/token should re-read after commit.)
+			if _, isTx := exec.(*sql.Tx); isTx {
+				return 0, "", nil
 			}
 		}
 		return 0, "", err
@@ -126,20 +158,31 @@ func findActiveJobByUniqueKey(q jobEnqueueExecer, uniqueKey string) (int64, stri
 		ORDER BY id DESC
 		LIMIT 1
 	`, uniqueKey).Scan(&id, &token)
-	return id, token, err == nil
-}
-
-func nullIfEmpty(s string) any {
-	if s == "" {
-		return nil
+	if err != nil {
+		return 0, "", false
 	}
-	return s
+	// Guard against legacy pre-status_token active rows carrying the same key:
+	// returning an empty token would make the caller build a status_url the
+	// status endpoint rejects. Treat a tokenless active row as "no usable dedup
+	// hit" so a fresh row (with a token) is inserted instead of handing back a
+	// broken status URL.
+	if token == "" {
+		return 0, "", false
+	}
+	return id, token, true
 }
 
+// isUniqueJobConstraintErr reports whether err is the UNIQUE-constraint
+// violation from idx_jobs_unique_active. It matches the typed go-sqlite3 error
+// (ErrConstraint + ErrConstraintUnique extended code) rather than scraping the
+// error string, which is fragile across driver/SQLite versions and locales.
 func isUniqueJobConstraintErr(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "unique") &&
-		(strings.Contains(msg, "idx_jobs_unique_active") || strings.Contains(msg, "unique_key"))
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code == sqlite3.ErrConstraint &&
+			sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique
+	}
+	return false
 }
 
 // EnqueueHookJob adds a hook execution job to the background queue.

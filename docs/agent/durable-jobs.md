@@ -44,6 +44,24 @@ This prevents jobs from staying in `running` forever after a crash.
 status token instead of inserting another row. Once the earlier job completes or
 fails, the same key can enqueue fresh work again.
 
+**First active enqueue wins.** When an active job already holds the key, the
+later enqueue is a no-op against the in-flight job: its `run_at` and `payload`
+are *ignored* and not reconciled. A re-enqueue with an earlier `run_at` (e.g.
+"run now" after an earlier "run in 1h") does **not** reschedule the in-flight
+job - the original schedule stands. If you need a different schedule or payload,
+wait for the in-flight job to finish (which releases the key) before
+re-enqueuing.
+
+**Transactional enqueue (`EnqueueJobTx`/`EnqueueJobTxUnique`).** Inside a
+`*sql.Tx`, go-sqlite3 reads from the transaction's snapshot, so a row committed
+by a *competing* transaction after the snapshot is invisible to the in-Tx dedup
+SELECT. If two transactions race the same key, the loser's INSERT trips the
+partial UNIQUE index; rather than failing the whole flow transaction, the loser
+treats the collision as a successful idempotent no-op (returns id `0` / empty
+token because the winner's id is unreadable from the stale snapshot). Tx callers
+that need the winning job's id or status token should re-read by `unique_key`
+after the transaction commits.
+
 Flow enqueue steps can set it with:
 
 ```yaml
