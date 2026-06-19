@@ -89,6 +89,8 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 		if action == "" {
 			action = "heartbeat"
 		}
+		// Tenant-namespaced storage key (cross-tenant presence isolation).
+		key := presenceKey(app, session, slug)
 		switch action {
 		case "join":
 			// INSERT … ON CONFLICT bumps last_seen if already present.
@@ -96,7 +98,7 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 				`INSERT INTO _benmore_presence (slug, user_id, joined_at, last_seen_at)
 				 VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 				 ON CONFLICT(slug, user_id) DO UPDATE SET last_seen_at = CURRENT_TIMESTAMP`,
-				slug, session.UserID,
+				key, session.UserID,
 			)
 			if err != nil {
 				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
@@ -106,14 +108,14 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 		case "heartbeat":
 			_, err := app.DB.Exec(
 				`UPDATE _benmore_presence SET last_seen_at = CURRENT_TIMESTAMP WHERE slug = ? AND user_id = ?`,
-				slug, session.UserID,
+				key, session.UserID,
 			)
 			if err != nil {
 				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
 				return
 			}
 		case "leave":
-			_, err := app.DB.Exec(`DELETE FROM _benmore_presence WHERE slug = ? AND user_id = ?`, slug, session.UserID)
+			_, err := app.DB.Exec(`DELETE FROM _benmore_presence WHERE slug = ? AND user_id = ?`, key, session.UserID)
 			if err != nil {
 				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
 				return
@@ -123,7 +125,7 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "action must be join | heartbeat | leave"})
 			return
 		}
-		count := presenceMemberCount(app.DB, slug)
+		count := presenceMemberCount(app.DB, key)
 		httpJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
 			"members":      count,
@@ -143,13 +145,24 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug query param required"})
 			return
 		}
-		members := presenceMembers(app.DB, slug)
+		members := presenceMembers(app.DB, presenceKey(app, session, slug))
 		httpJSON(w, http.StatusOK, map[string]any{
 			"slug":    slug,
 			"count":   len(members),
 			"members": members,
 		})
 	})
+}
+
+// presenceKey namespaces a slug by the caller's tenant group so a user in one
+// group can't read or write another group's presence (the table has no tenant
+// column, and slugs like "huddle:42" are guessable across tenants). The NUL
+// separator can't appear in a validated slug. No-op for non-multi-tenant apps.
+func presenceKey(app *App, session *Session, slug string) string {
+	if app.Group != nil && app.Group.Key != "" && session != nil && session.GroupID != "" {
+		return session.GroupID + "\x00" + slug
+	}
+	return slug
 }
 
 // presenceMemberCount returns the live count for a slug, honoring the

@@ -391,12 +391,25 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 			rooms:         make(map[string]bool),
 		}
 
-		// H-16: re-check the global ceiling under the write lock before
-		// inserting. The pre-upgrade RLock count above is racy (many
-		// handshakes can pass it concurrently); this authoritative check
-		// guarantees the hub size never exceeds realtimeWSMaxConnsGlobal.
+		// Re-check ALL THREE caps under the write lock before inserting. The
+		// pre-upgrade RLock counts are racy (many handshakes pass them
+		// concurrently), so without recomputing here a single user / anon IP
+		// could blow past its per-class cap up to the global ceiling. One
+		// authoritative pass: global + per-user + per-anon-IP.
 		wsHub.mu.Lock()
-		if len(wsHub.clients) >= realtimeWSMaxConnsGlobal {
+		lockedGlobal := len(wsHub.clients)
+		lockedUser, lockedAnonIP := 0, 0
+		for c := range wsHub.clients {
+			if needsAuth && !isAdmin && userID != 0 && c.userID == userID {
+				lockedUser++
+			}
+			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
+				lockedAnonIP++
+			}
+		}
+		overUser := needsAuth && !isAdmin && userID != 0 && lockedUser >= wsMaxConnsPerUser
+		overAnon := isAnon && lockedAnonIP >= realtimeWSMaxConnsPerAnonIP
+		if lockedGlobal >= realtimeWSMaxConnsGlobal || overUser || overAnon {
 			wsHub.mu.Unlock()
 			ws.writeClose(1013, "server overloaded") // 1013 = Try Again Later
 			return

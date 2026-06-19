@@ -65,7 +65,45 @@ func checkSMSRateLimit(phone string) error {
 //
 // The webhook mode POSTs JSON: {"to": "+1...", "body": "message", "from": "+1..."}
 // This lets developers use Vonage, MessageBird, AWS SNS, or any HTTP-based SMS API.
+// smsNormalizePhone strips spaces, dashes, parens and dots, keeping a single
+// optional leading '+', so format variants collapse to one canonical key.
+func smsNormalizePhone(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for i, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		} else if r == '+' && i == 0 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// smsValidE164 reports whether s is a plausible E.164 number: optional '+'
+// then 8-15 digits, first digit non-zero.
+func smsValidE164(s string) bool {
+	d := strings.TrimPrefix(s, "+")
+	if len(d) < 8 || len(d) > 15 || d[0] == '0' {
+		return false
+	}
+	for _, r := range d {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func SendSMS(appDir, to, body string) error {
+	// Normalize + validate to E.164 BEFORE the rate-limit check, so format
+	// variants ("+1 555…", "1-555…") collapse to one bucket (each variant was
+	// previously a distinct key, bypassing the cap) and garbage / bad-length
+	// numbers are rejected before we bill the provider.
+	to = smsNormalizePhone(to)
+	if !smsValidE164(to) {
+		return fmt.Errorf("invalid recipient phone number (expected E.164, e.g. +14155551234)")
+	}
 	// Rate limit: max 5 SMS per phone per 10 minutes
 	if err := checkSMSRateLimit(to); err != nil {
 		log.Printf("SMS BLOCKED: %s", err)

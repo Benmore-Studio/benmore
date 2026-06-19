@@ -70,6 +70,10 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	opts.UnsubscribeURL = clean(opts.UnsubscribeURL)
 	opts.ConfigurationSet = clean(opts.ConfigurationSet)
 	opts.ReplyTo = clean(opts.ReplyTo)
+	// From is a caller-settable field written straight into the SMTP header
+	// block; strip CR/LF so a "send as" / reply-routing caller passing
+	// user-derived data can't inject extra headers (Bcc, a second To, etc.).
+	opts.From = clean(opts.From)
 
 	// Provider priority: Resend > Postmark > AWS SES (via SMTP creds)
 	// > generic SMTP. Each is detected by env var presence so apps can

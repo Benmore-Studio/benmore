@@ -74,7 +74,10 @@ func buildSheet(headers []string, rows [][]string) string {
 			if isNumeric(val) {
 				sb.WriteString(fmt.Sprintf(`<c r="%s"><v>%s</v></c>`, ref, val))
 			} else {
-				sb.WriteString(fmt.Sprintf(`<c r="%s" t="inlineStr"><is><t>%s</t></is></c>`, ref, xmlEscape(val)))
+				// csvSafeCell neutralizes formula injection (a cell starting
+				// with = + - @ becomes a live formula in Excel); xmlEscape then
+				// keeps the XML well-formed. Mirrors the CSV export path.
+				sb.WriteString(fmt.Sprintf(`<c r="%s" t="inlineStr"><is><t>%s</t></is></c>`, ref, xmlEscape(csvSafeCell(val))))
 			}
 		}
 		sb.WriteString(`</row>`)
