@@ -3,8 +3,8 @@
 package main
 
 import (
-	cryptorand "crypto/rand"
 	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -38,6 +38,12 @@ var (
 	signedURLKey     []byte
 	signedURLKeyOnce sync.Once
 )
+
+// oauthMaxSignedURLTTL is the hard ceiling on how long any minted signed URL
+// (local-disk HMAC or CloudFront RSA-SHA1) stays valid. Signed URLs are bearer
+// links with no per-request authz, so the TTL is the replay window if the link
+// leaks - kept deliberately short. Tightened from the prior 24h.
+const oauthMaxSignedURLTTL = 6 * time.Hour
 
 // GenerateSignedURL creates a time-limited signed URL for a file path.
 func GenerateSignedURL(host, filePath string, expiresIn time.Duration) string {
@@ -137,9 +143,18 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 			}
 		}
 
-		// Max expiry: 24 hours
-		if expiresIn > 24*time.Hour {
-			expiresIn = 24 * time.Hour
+		// Clamp the lifetime to a safer ceiling. A signed URL is a BEARER
+		// credential: once minted it grants access to the private object for its
+		// whole TTL to anyone who holds the link (it lands in logs, referrers,
+		// browser history, shared screenshots). The CloudFront variant is
+		// canned-policy RSA-SHA1 (CloudFront's only supported signing alg - see
+		// media_cdn.go signCloudFrontURL) and cannot be IP- or path-narrowed
+		// here, so a leaked link is fully replayable until expiry. The previous
+		// 24h ceiling is an unnecessarily wide replay window; 6h keeps legitimate
+		// share/download flows working while shrinking exposure. Callers that
+		// need shorter pass expires_in; nothing can exceed this cap.
+		if expiresIn > oauthMaxSignedURLTTL {
+			expiresIn = oauthMaxSignedURLTTL
 		}
 
 		// CDN-aware (v2.7.142): when the platform media CDN is configured and

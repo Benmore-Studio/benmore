@@ -21,7 +21,8 @@ go build -tags sqlite_fts5 -o benmore .
 
 `benmore new` writes a complete starter app (see the tree below). `benmore
 serve` loads it, applies migrations, compiles your TSX on the fly, and serves
-the whole thing. Edit a file, refresh the browser - that's the loop.
+the whole thing. In dev/testing mode, served pages listen for hot reload events
+and refresh themselves after a successful in-process app reload.
 
 ## The agentic build loop (how to work)
 
@@ -175,6 +176,12 @@ async function boot() {
   // feature flags drive conditional methods (.list({q}) on @@fulltext tables,
   // .restore() on soft-delete tables, .versions() on versioned tables).
   const posts: Post[] = await bm.table('posts').list({ limit: 50 });
+  const ui = bm.createStore({ filter: 'all' });
+  const grouped = await bm.query.read({
+    table: 'posts',
+    group_by: ['status'],
+    aggregates: [{ fn: 'count', as: 'n' }],
+  });
 
   // SSE invalidation. ChangeEvent<T> narrows ev.row by ev.action.
   // SSE is opportunistic - always refetch after your OWN mutations too.
@@ -224,6 +231,8 @@ Core SDK surface:
 | `bm.notifications.{list, markRead, markAllRead, onNew}` | In-app inbox |
 | `bm.upload(file, opts)` | Multipart upload → `{path}` |
 | `bm.api.optimistic({apply, request, snapshot, revert})` | Optimistic mutation + reconcile |
+| `bm.createStore(initial, {persist?})` | Selector subscriptions, reset, unsubscribe, optional versioned cache persistence |
+| `bm.query.{fetch, read, table, subscribe, invalidate, mutate}` | Keyed read cache, dedupe, stale time, table live invalidation, optimistic rollback |
 | `bm.presence(slug)` | Heartbeat + cleanup + server sweep |
 | `bm.cache.namespaced(n, v)` / `.persistent(n, v)` | Self-busting client cache |
 | `bm.markdown(text)` | Tiny safe Markdown → HTML |

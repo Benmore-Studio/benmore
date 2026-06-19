@@ -410,12 +410,25 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	mimeType := http.DetectContentType(buf[:n])
 	file.Seek(0, io.SeekStart)
 
-	// Block dangerous MIME types
-	dangerousMimes := []string{"application/x-executable", "application/x-sharedlib", "text/html", "application/javascript"}
+	// Block dangerous MIME types. SVG and XML are included because they
+	// can carry inline <script>/external entities and, if ever served
+	// inline in the app origin, become stored XSS. Match on both the
+	// sniffed content type and the declared extension - http.DetectContentType
+	// classifies SVG as "text/xml" or "text/plain", so the extension
+	// check is the reliable gate for the SVG case.
+	dangerousMimes := []string{
+		"application/x-executable", "application/x-sharedlib",
+		"text/html", "application/javascript",
+		"image/svg+xml", "application/xml", "text/xml",
+	}
 	for _, d := range dangerousMimes {
 		if strings.HasPrefix(mimeType, d) {
 			return "", fmt.Errorf("file type not allowed: %s", mimeType)
 		}
+	}
+	switch ext {
+	case "svg", "svgz", "xml", "xhtml", "html", "htm", "js", "mjs":
+		return "", fmt.Errorf("file type not allowed: .%s", ext)
 	}
 
 	// Generate safe filename: uuid.ext
@@ -629,17 +642,59 @@ func ParseUploadDirective(html string) (folder string, maxSize int64, types []st
 func applyUploadDispositionHeaders(w http.ResponseWriter, fullPath string) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	ext := strings.ToLower(filepath.Ext(fullPath))
+	inlineOK := false
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".ico",
 		".mp4", ".webm", ".mov", ".m4a", ".mp3", ".wav", ".ogg",
 		".pdf", ".txt", ".csv", ".json":
 		// Inline OK - these can't carry script in the app's origin.
+		inlineOK = true
+	}
+	// Defense in depth: base the decision on the SNIFFED content type, not
+	// just the extension. A file renamed to a safe extension (e.g. a
+	// polyglot SVG saved as "logo.png") can still sniff to an
+	// active/scriptable type; force attachment whenever the bytes look
+	// like HTML/XML/SVG/script regardless of the extension allowlist.
+	if inlineOK && uploadsSniffActive(fullPath) {
+		inlineOK = false
+	}
+	if inlineOK {
 		return
 	}
 	// Everything else (.html, .svg, .xml, .js, .wasm, .htm, anything
-	// unknown) downloads instead of renders.
+	// unknown or sniffed-active) downloads instead of renders.
 	base := filepath.Base(fullPath)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+base+`"`)
+}
+
+// uploadsSniffActive reports whether the file's leading bytes sniff to an
+// active/scriptable content type (HTML, XML, SVG) that must never be
+// served inline in the app origin. Best-effort: an unreadable file is
+// treated as non-active (the extension allowlist already vetted it).
+func uploadsSniffActive(fullPath string) bool {
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	sniff := strings.ToLower(http.DetectContentType(buf[:n]))
+	if strings.HasPrefix(sniff, "text/html") ||
+		strings.HasPrefix(sniff, "text/xml") ||
+		strings.HasPrefix(sniff, "application/xml") ||
+		strings.HasPrefix(sniff, "image/svg") {
+		return true
+	}
+	// http.DetectContentType never returns image/svg+xml; catch a leading
+	// "<svg" / "<?xml" prefix directly (after an optional UTF-8 BOM and
+	// surrounding whitespace).
+	head := strings.TrimPrefix(string(buf[:n]), "\uFEFF") // strip UTF-8 BOM
+	head = strings.ToLower(strings.TrimSpace(head))
+	if strings.HasPrefix(head, "<?xml") || strings.HasPrefix(head, "<svg") {
+		return true
+	}
+	return false
 }
 
 // ===== Credential resolution =====

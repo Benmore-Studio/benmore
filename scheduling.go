@@ -279,7 +279,11 @@ func StartSchedulerSweeper(app *App) {
 	if app == nil || app.DB == nil {
 		return
 	}
-	go func() {
+	// H-14: launch via safeGo (panic-recovering) instead of a raw `go`, so a
+	// panic inside the sweep logs + dies in isolation instead of crashing the
+	// whole process and taking down every hosted app. Lifecycle is already
+	// bound to app.Stop below.
+	safeGo("scheduling.sweeper", func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -290,7 +294,7 @@ func StartSchedulerSweeper(app *App) {
 				sweepScheduledTasks(app)
 			}
 		}
-	}()
+	})
 }
 
 func sweepScheduledTasks(app *App) {
@@ -302,6 +306,19 @@ func sweepScheduledTasks(app *App) {
 	}
 	for _, t := range rows {
 		id := t["id"]
+		// H-15: atomically claim this task before doing any work. Mirrors
+		// processNextJob's claim - flip pending->running only if WE win the
+		// race (RowsAffected == 1). Without this guard two overlapping sweepers
+		// (e.g. a transient overlap across a hot reload) both SELECT the same
+		// pending row and double-fire its notification / scheduled flow.
+		claim, claimErr := app.DB.Exec(
+			"UPDATE _benmore_scheduled_tasks SET status='running' WHERE id = ? AND status='pending'", id)
+		if claimErr != nil {
+			continue
+		}
+		if n, _ := claim.RowsAffected(); n != 1 {
+			continue // another sweeper claimed it first
+		}
 		uid := toInt64(t["user_id"])
 		title, _ := t["title"].(string)
 		msg, _ := t["message"].(string)

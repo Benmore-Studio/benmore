@@ -194,11 +194,17 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 		sb.WriteString(`<script>`)
 		sb.WriteString(DefaultJS)
 		sb.WriteString(SSEClientScript)
+		if devReloadClientEnabled(app) {
+			sb.WriteString(DevReloadClientScript)
+		}
 		sb.WriteString(`</script>`)
 	} else {
 		// In "none" mode, still inject SSE for live updates but skip DefaultJS (switchTab, toggleAccordion, etc.)
 		sb.WriteString(`<script>`)
 		sb.WriteString(SSEClientScript)
+		if devReloadClientEnabled(app) {
+			sb.WriteString(DevReloadClientScript)
+		}
 		sb.WriteString(`</script>`)
 	}
 	if app != nil {
@@ -322,10 +328,16 @@ func wrapHTMLShell(content, title string, app *App, session *Session, page *Page
 		sb.WriteString(`<script>`)
 		sb.WriteString(DefaultJS)
 		sb.WriteString(SSEClientScript)
+		if devReloadClientEnabled(app) {
+			sb.WriteString(DevReloadClientScript)
+		}
 		sb.WriteString(`</script>`)
 	} else {
 		sb.WriteString(`<script>`)
 		sb.WriteString(SSEClientScript)
+		if devReloadClientEnabled(app) {
+			sb.WriteString(DevReloadClientScript)
+		}
 		sb.WriteString(`</script>`)
 	}
 	if app != nil {

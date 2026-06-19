@@ -1404,12 +1404,340 @@ const cache = {
   },
 };
 
+// =================================================================
+//  store - small app-state primitive (Zustand-shaped, no dependency)
+// =================================================================
+
+function shallowEqualObject(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const ak = Object.keys(a), bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) if (!Object.is(a[k], b[k])) return false;
+  return true;
+}
+
+function resolveStoreCache(persist) {
+  if (!persist || !persist.name) return null;
+  const kind = persist.storage === 'persistent' ? 'persistent' : 'namespaced';
+  return cache[kind](persist.name, persist.version || 'v0');
+}
+
+export function createStore(initialState = {}, opts = {}) {
+  const base = (initialState && typeof initialState === 'object') ? initialState : {};
+  const persist = opts.persist || opts.cache;
+  const storage = resolveStoreCache(persist);
+  let state = base;
+  if (storage) {
+    try {
+      const raw = storage.get();
+      if (raw) {
+        // Persisted blobs live in localStorage/sessionStorage and are therefore
+        // attacker-controllable on the client. We only accept a plain object and
+        // merge it over base; this is not a trust boundary (the server remains
+        // authoritative), but it prevents a malformed/non-object blob from
+        // replacing state wholesale or injecting a non-object root.
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          state = { ...base, ...parsed };
+        }
+      }
+    } catch {}
+  }
+  const initial = { ...state };
+  const subs = new Set();
+
+  // Each subscriber's listener receives (nextSlice, oldSlice). The previous
+  // value passed to listeners is the subscriber's own previously-observed slice
+  // (which, for the default whole-state selector, IS the prior whole state), so
+  // notify() needs no separate `prev` argument.
+  const notify = () => {
+    subs.forEach((sub) => {
+      let nextSlice;
+      try { nextSlice = sub.selector(state); } catch (e) { console.warn('[bm.store] selector threw:', e); return; }
+      if (!sub.equal(nextSlice, sub.slice)) {
+        const oldSlice = sub.slice;
+        sub.slice = nextSlice;
+        try { sub.listener(nextSlice, oldSlice); } catch (e) { console.warn('[bm.store] listener threw:', e); }
+      }
+    });
+  };
+
+  const persistState = () => {
+    if (!storage) return;
+    try { storage.set(JSON.stringify(state)); } catch {}
+  };
+
+  return {
+    get: () => state,
+    set(patch) {
+      let next = (typeof patch === 'function') ? patch(state) : patch;
+      if (next == null) return state;
+      // State is contractually a Record<string, any>; object patches merge
+      // shallowly. A patch (including a function result) that is an array or
+      // other non-object would replace the whole state and break that contract,
+      // so we reject it with a warning instead of silently clobbering state.
+      if (typeof next !== 'object' || Array.isArray(next)) {
+        console.warn('[bm.store] set() ignored a non-object patch; state must be a plain object');
+        return state;
+      }
+      next = { ...state, ...next };
+      if (Object.is(next, state) || shallowEqualObject(next, state)) return state;
+      state = next;
+      persistState();
+      notify();
+      return state;
+    },
+    subscribe(selector, listener, equal = Object.is) {
+      if (typeof listener !== 'function') {
+        listener = selector;
+        selector = (s) => s;
+      }
+      if (typeof selector !== 'function' || typeof listener !== 'function') {
+        throw new Error('bm.createStore().subscribe(selector, listener) requires a listener');
+      }
+      const sub = { selector, listener, equal, slice: selector(state) };
+      subs.add(sub);
+      return () => subs.delete(sub);
+    },
+    reset(nextState) {
+      state = nextState && typeof nextState === 'object' ? { ...nextState } : { ...initial };
+      persistState();
+      notify();
+      return state;
+    },
+  };
+}
+
+// =================================================================
+//  query - key-based fetch/mutation cache for app data
+// =================================================================
+
+function stableStringify(value) {
+  if (value == null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function queryKey(key) {
+  return typeof key === 'string' ? key : stableStringify(key);
+}
+
+const _queryCache = new Map();
+const _queryTableKeys = new Map();
+let _queryLiveStop = null;
+// Live-invalidation tuning. The '*' SSE subscription fires for every CRUD event
+// on every table the app has read, including the client's own writes, so we
+// coalesce invalidations per-table over a short window to avoid a refetch
+// storm under chatty fan-out. Refetch-on-live is opt-out via _queryLiveConfig.
+const _queryLiveConfig = { refetch: true, debounceMs: 50 };
+const _queryLiveTimers = new Map();
+
+function queryEntry(key) {
+  const k = queryKey(key);
+  if (!_queryCache.has(k)) {
+    _queryCache.set(k, { key: k, rawKey: key, data: undefined, error: null, updatedAt: 0, promise: null, fetcher: null, staleTime: 0, subs: new Set() });
+  }
+  return _queryCache.get(k);
+}
+
+function notifyQuery(e) {
+  e.subs.forEach((fn) => { try { fn({ data: e.data, error: e.error, updatedAt: e.updatedAt, pending: !!e.promise }); } catch (err) { console.warn('[bm.query] subscriber threw:', err); } });
+}
+
+function rememberTableKey(tableName, key) {
+  if (!tableName) return;
+  const k = queryKey(key);
+  if (!_queryTableKeys.has(tableName)) _queryTableKeys.set(tableName, new Set());
+  _queryTableKeys.get(tableName).add(k);
+}
+
+function ensureQueryLiveInvalidation() {
+  if (_queryLiveStop || typeof live !== 'function' || typeof EventSource === 'undefined') return;
+  const stop = live('*', (ev) => {
+    if (!ev || !ev.table) return;
+    const table = ev.table;
+    // Coalesce bursts of events for the same table into a single invalidation.
+    if (_queryLiveTimers.has(table)) return;
+    const t = setTimeout(() => {
+      _queryLiveTimers.delete(table);
+      query.invalidateTable(table, { refetch: _queryLiveConfig.refetch });
+    }, _queryLiveConfig.debounceMs);
+    if (typeof t.unref === 'function') t.unref();
+    _queryLiveTimers.set(table, t);
+  });
+  // Expose a teardown so callers/tests can stop the page-lifetime subscription.
+  _queryLiveStop = () => {
+    try { if (typeof stop === 'function') stop(); } catch {}
+    for (const t of _queryLiveTimers.values()) clearTimeout(t);
+    _queryLiveTimers.clear();
+    _queryLiveStop = null;
+  };
+}
+
+export const query = {
+  key: queryKey,
+  stableStringify,
+  get(key) {
+    return queryEntry(key).data;
+  },
+  set(key, data) {
+    const e = queryEntry(key);
+    e.data = data;
+    e.error = null;
+    e.updatedAt = Date.now();
+    notifyQuery(e);
+    return data;
+  },
+  subscribe(key, fn) {
+    if (typeof fn !== 'function') throw new Error('bm.query.subscribe(key, fn) requires a function');
+    const e = queryEntry(key);
+    e.subs.add(fn);
+    fn({ data: e.data, error: e.error, updatedAt: e.updatedAt, pending: !!e.promise });
+    return () => e.subs.delete(fn);
+  },
+  async fetch(key, fetcher, opts = {}) {
+    if (typeof fetcher !== 'function') throw new Error('bm.query.fetch(key, fetcher) requires a fetcher');
+    const e = queryEntry(key);
+    const staleTime = Number(opts.staleTime || opts.staleMs || 0);
+    if (!opts.force && e.data !== undefined && staleTime > 0 && Date.now() - e.updatedAt < staleTime) return e.data;
+    // If a fetch is already in flight, return it without clobbering e.fetcher/
+    // e.staleTime: a concurrent caller with a different fetcher must not have
+    // its fetcher attached to data it didn't produce, or a later refetch(key)
+    // would run the wrong fetcher.
+    if (e.promise) return e.promise;
+    e.fetcher = fetcher;
+    e.staleTime = staleTime;
+    e.promise = Promise.resolve()
+      .then(fetcher)
+      .then((data) => {
+        e.data = data;
+        e.error = null;
+        e.updatedAt = Date.now();
+        return data;
+      })
+      .catch((err) => {
+        e.error = err;
+        throw err;
+      })
+      .finally(() => {
+        e.promise = null;
+        notifyQuery(e);
+      });
+    notifyQuery(e);
+    return e.promise;
+  },
+  async refetch(key) {
+    const e = queryEntry(key);
+    if (!e.fetcher) return e.data;
+    return query.fetch(e.rawKey, e.fetcher, { force: true, staleTime: e.staleTime });
+  },
+  invalidate(match, opts = {}) {
+    const keys = [];
+    // For a non-function match we support exact-key matching plus structural
+    // array-prefix matching: ['user'] matches ['user', 1] but NOT ['users'].
+    // We deliberately avoid raw string startsWith on the stable-stringified key
+    // because that produced false positives (e.g. {a:1} matching {a:1,b:2}, or
+    // ['user'] matching ['username']). Array-prefix is predictable for the
+    // common ['table', name, spec] / ['query', spec] key shapes used here.
+    const matchExact = typeof match !== 'function' ? queryKey(match) : null;
+    const matchPrefix = (typeof match !== 'function' && Array.isArray(match)) ? match : null;
+    const isArrayPrefix = (prefix, raw) => {
+      if (!Array.isArray(raw) || raw.length < prefix.length) return false;
+      for (let i = 0; i < prefix.length; i++) {
+        if (stableStringify(prefix[i]) !== stableStringify(raw[i])) return false;
+      }
+      return true;
+    };
+    const predicate = typeof match === 'function'
+      ? match
+      : (raw, stable) => stable === matchExact || (matchPrefix !== null && isArrayPrefix(matchPrefix, raw));
+    for (const [stable, e] of _queryCache.entries()) {
+      if (!predicate(e.rawKey, stable)) continue;
+      e.updatedAt = 0;
+      keys.push(stable);
+      notifyQuery(e);
+      if (opts.refetch && e.fetcher) query.refetch(e.rawKey).catch(() => {});
+    }
+    return keys;
+  },
+  tableKey(tableName, spec = {}) {
+    return ['table', tableName, spec];
+  },
+  async read(spec, opts = {}) {
+    if (!spec || !spec.table) throw new Error('bm.query.read({ table, ... }) requires table');
+    const key = opts.key || ['query', spec];
+    if (opts.live !== false) {
+      rememberTableKey(spec.table, key);
+      ensureQueryLiveInvalidation();
+    }
+    return query.fetch(key, async () => {
+      const r = await api.post('/api/_query', spec);
+      return Array.isArray(r) ? r : (r.rows || []);
+    }, opts);
+  },
+  table(tableName, opts = {}) {
+    // Separate client control options (which never affect the server result)
+    // from the server-affecting query spec. Only the spec may influence the
+    // cache key, otherwise two identical reads that differ only in staleTime/
+    // force/live would fragment into distinct cache entries and defeat dedupe.
+    const { staleTime, staleMs, force, live, key, ...serverOpts } = opts;
+    const spec = { ...serverOpts, table: tableName };
+    // Route through read() with the same ['query', spec] key shape so that a
+    // bm.query.table('posts') and bm.query.read({ table: 'posts' }) targeting
+    // identical rows collapse onto one shared cache entry. Forward every client
+    // control option (staleTime/staleMs/force/live) so none are silently dropped.
+    return query.read(spec, { key: key, staleTime, staleMs, force, live });
+  },
+  invalidateTable(tableName, opts = {}) {
+    const keys = _queryTableKeys.get(tableName);
+    if (!keys) return [];
+    return query.invalidate((_raw, stable) => keys.has(stable), opts);
+  },
+  async mutate(opts = {}) {
+    if (typeof opts.request !== 'function') throw new Error('bm.query.mutate({ request }) requires request');
+    const keys = Array.isArray(opts.keys) ? opts.keys : (opts.key ? [opts.key] : []);
+    // Snapshot the full prior entry (data + updatedAt + error), not just data,
+    // so a failed mutation can be restored exactly without stamping a fresh
+    // updatedAt or clearing a pre-existing error the way set() would.
+    const snapshots = keys.map((key) => {
+      const e = queryEntry(key);
+      return { key, data: e.data, updatedAt: e.updatedAt, error: e.error };
+    });
+    try {
+      if (typeof opts.apply === 'function') {
+        for (const snap of snapshots) query.set(snap.key, opts.apply(snap.data, snap.key));
+      }
+      const result = await opts.request();
+      if (opts.invalidate) query.invalidate(opts.invalidate, { refetch: opts.refetch !== false });
+      return result;
+    } catch (err) {
+      if (typeof opts.rollback === 'function') {
+        for (const snap of snapshots) query.set(snap.key, opts.rollback(snap.data, err, snap.key));
+      } else {
+        // Restore the exact prior snapshot (data + updatedAt + error) rather
+        // than routing through set(), which would overwrite updatedAt and clear
+        // error, making restored data look freshly fetched to subscribers.
+        for (const snap of snapshots) {
+          const e = queryEntry(snap.key);
+          e.data = snap.data;
+          e.updatedAt = snap.updatedAt;
+          e.error = snap.error;
+          notifyQuery(e);
+        }
+      }
+      throw err;
+    }
+  },
+};
+
 const bm = {
   api, auth, users, table, live, room,
   flows, workflow, aggregate, aggregates, jobs,
   notifications, upload, audit, permissions, signedUrl,
   t, mfa, webrtc, broadcast, markdown, presence, cache,
-  html, raw,
+  createStore, query, html, raw,
 };
 export default bm;
 

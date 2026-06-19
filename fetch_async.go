@@ -24,6 +24,16 @@ var fetchTemplateStore = struct {
 // RegisterFetchRoutes adds the internal async fetch endpoint.
 func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
 	mux.HandleFunc("GET /_internal/fetch", func(w http.ResponseWriter, r *http.Request) {
+		// Auth/CSRF gate. This endpoint makes outbound requests on the
+		// server's behalf, so it must not be drivable cross-site. A valid
+		// CSRF token (same-origin proof) OR a bearer-authenticated caller
+		// is required; otherwise an attacker page could trigger fetches
+		// using the victim's ambient session. Fail closed.
+		if !validateCSRF(r) && !isBearerAuth(r) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
 		fetchURL := r.URL.Query().Get("url")
 		as := r.URL.Query().Get("as")
 		templateHash := r.URL.Query().Get("t")
@@ -35,15 +45,34 @@ func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 
-		// Resolve relative URLs to absolute using the request's host
-		isLocal := false
+		// Resolve relative URLs against the app's CONFIGURED canonical
+		// origin, never r.Host. r.Host is attacker-influenceable (Host
+		// header / forwarding) so resolving against it let a relative URL
+		// be redirected at an internal endpoint while we replayed the
+		// victim's cookies - a confused-deputy SSRF. The canonical origin
+		// is operator-set and trusted.
+		canonicalOrigin := uploadsCanonicalOrigin(app)
+		// trustedLocal is true only when the destination is the configured
+		// canonical origin. Cookies are forwarded ONLY to trustedLocal
+		// destinations - never to an r.Host-derived or remote host.
+		trustedLocal := false
 		if strings.HasPrefix(fetchURL, "/") {
-			fetchURL = protoOf(r) + "://" + r.Host + fetchURL
-			isLocal = true
+			if canonicalOrigin == "" {
+				// No configured origin → we cannot prove the relative URL
+				// resolves to a trusted host. Fail closed rather than fall
+				// back to r.Host.
+				http.Error(w, "Relative fetch URLs require a configured BENMORE_PUBLIC_URL", http.StatusBadGateway)
+				return
+			}
+			fetchURL = strings.TrimRight(canonicalOrigin, "/") + fetchURL
+			trustedLocal = true
 		}
 
-		// SSRF check (skip for local/same-origin URLs)
-		if !isLocal && isPrivateURL(fetchURL) {
+		// Always run the SSRF check - including for canonical-origin-derived
+		// URLs. The canonical origin itself could be misconfigured to a
+		// private host, and a relative path can still target a private
+		// internal route, so this gate must never be skipped.
+		if isPrivateURL(fetchURL) {
 			http.Error(w, "Blocked", http.StatusForbidden)
 			return
 		}
@@ -71,15 +100,21 @@ func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "Benmore/1.0")
 
-		// Forward cookies for local/same-origin URLs only.
-		// isLocal is already true for relative URLs resolved above.
-		// Also match if the parsed URL host exactly equals the request host.
-		if !isLocal {
-			if parsed, parseErr := url.Parse(fetchURL); parseErr == nil && parsed.Host == r.Host {
-				isLocal = true
+		// Forward cookies ONLY to the configured canonical origin. We must
+		// never forward the caller's cookies to a host derived from r.Host
+		// or to a remote/absolute destination - that is exactly the
+		// confused-deputy replay this fix closes. Match the parsed
+		// destination host against the canonical origin host; equality is
+		// the sole condition under which cookies are trusted to leave.
+		if !trustedLocal && canonicalOrigin != "" {
+			if parsed, parseErr := url.Parse(fetchURL); parseErr == nil {
+				if co, coErr := url.Parse(canonicalOrigin); coErr == nil &&
+					parsed.Host != "" && parsed.Host == co.Host {
+					trustedLocal = true
+				}
 			}
 		}
-		if isLocal {
+		if trustedLocal {
 			for _, cookie := range r.Cookies() {
 				req.AddCookie(cookie)
 			}
@@ -125,6 +160,40 @@ func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
 
 		renderFetchResponse(w, data, as, templateHash)
 	})
+}
+
+// uploadsCanonicalOrigin returns the app's operator-configured public
+// origin (scheme://host[:port]) used to resolve relative /_internal/fetch
+// URLs and to decide whether cookies may be forwarded. Prefers
+// BENMORE_PUBLIC_URL, falling back to the existing CORS_ORIGIN convention.
+// Returns "" when unset - callers MUST fail closed rather than fall back to
+// the attacker-influenceable r.Host. Only the scheme+host are kept.
+func uploadsCanonicalOrigin(app *App) string {
+	if app == nil {
+		return ""
+	}
+	raw := GetEnv(app.Dir, "BENMORE_PUBLIC_URL")
+	if raw == "" {
+		raw = GetEnv(app.Dir, "CORS_ORIGIN")
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// CORS_ORIGIN may be a comma-separated list or "*"; take the first
+	// concrete origin and ignore wildcards (a wildcard is not a resolvable
+	// host we can safely forward cookies to).
+	if i := strings.IndexByte(raw, ','); i >= 0 {
+		raw = strings.TrimSpace(raw[:i])
+	}
+	if raw == "" || raw == "*" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func renderFetchResponse(w http.ResponseWriter, data any, as, templateHash string) {

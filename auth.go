@@ -93,6 +93,12 @@ func EnsureSessionsTable(db *sql.DB) {
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN scopes TEXT DEFAULT ''")
 	// Add is_impersonation column if missing (marks admin-impersonated sessions)
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN is_impersonation INTEGER DEFAULT 0")
+	// H-13: bind each impersonation session to the EXACT admin session that
+	// started it. end-impersonation requires the supplied admin_token to
+	// resolve to this originating session id - so a leaked impersonation
+	// response (which echoes admin_token) plus any other valid admin token
+	// can no longer pivot into the original admin's session.
+	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN impersonator_session_id TEXT DEFAULT ''")
 	// Add ip + user_agent columns so the Sessions tab on /profile can
 	// show a real device label instead of "unknown ip". Captured by
 	// AttachSessionContext right after CreateSession.
@@ -313,14 +319,65 @@ func CleanExpiredSessions(db *sql.DB) {
 
 // generateCSRFToken creates a CSRF token derived from HMAC(secret, random_nonce + timestamp).
 // No storage needed - validation recomputes the HMAC.
+//
+// This is the session-LESS variant kept for backward compatibility:
+// pre-authentication pages (login / signup), the auto-injected <meta>
+// tag rendered before a session exists, and every existing caller that
+// has no *http.Request in scope still mint an unbound token here. Such
+// tokens validate for any request (see authCSRFSign with sid="").
 func generateCSRFToken() string {
+	return authMintCSRFToken("")
+}
+
+// authMintCSRFToken mints a CSRF token, optionally bound to a session id.
+// H-11: when sid != "" the session id is folded into the HMAC input (but
+// NOT into the visible payload, so the wire format stays the legacy
+// 3-part "nonce|ts|sig" and every existing parser/length check keeps
+// working). A session-bound token only validates for requests carrying
+// that same session (validateCSRF re-derives with the live session id),
+// so a token minted for one user can no longer be replayed by another -
+// the /api/_csrf endpoint is unauthenticated, so without binding one
+// fetched token authenticated every user's mutations.
+func authMintCSRFToken(sid string) string {
 	nonce := generateToken(16)
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	payload := nonce + "|" + ts
+	sig := authCSRFSign(payload, sid)
+	return payload + "|" + sig
+}
+
+// authCSRFSign computes the HMAC over the token payload, binding it to a
+// session id when provided. sid=="" reproduces the legacy unbound MAC so
+// session-less tokens (and tokens minted before a session existed) stay
+// valid - that's the back-compat path validateCSRF falls back to.
+func authCSRFSign(payload, sid string) string {
 	mac := hmac.New(sha256.New, []byte(serverSecret))
 	mac.Write([]byte(payload))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	return payload + "|" + sig
+	if sid != "" {
+		// Domain-separate the session component so a "|"-bearing payload
+		// can't be confused with the binding boundary.
+		mac.Write([]byte("\x00sid\x00"))
+		mac.Write([]byte(sid))
+	}
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// authRawSessionID returns the raw session id the request is authenticating
+// with (cookie first, then a non-prefixed Bearer session token), or "" when
+// the request carries no session. Used to bind/validate CSRF tokens against
+// the originating session. Persistent API tokens (bmr_ prefix) are exempt -
+// those callers go through the isBearerAuth CSRF exemption anyway.
+func authRawSessionID(r *http.Request) string {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		tok := strings.TrimPrefix(auth, "Bearer ")
+		if !strings.HasPrefix(tok, "bmr_") {
+			return tok
+		}
+	}
+	return ""
 }
 
 // isBearerAuth returns true if the request is authenticated by a Bearer
@@ -439,13 +496,29 @@ func validateCSRFReason(r *http.Request) (string, bool) {
 
 	nonce, tsStr, providedSig := parts[0], parts[1], parts[2]
 
-	// Verify HMAC
-	payload := nonce + "|" + tsStr
-	mac := hmac.New(sha256.New, []byte(serverSecret))
-	mac.Write([]byte(payload))
-	expectedSig := hex.EncodeToString(mac.Sum(nil))
+	// H-11: defense-in-depth Origin check. When the browser sends an
+	// Origin header it MUST match our own Host; a cross-site form post
+	// carries the attacker's Origin and is rejected here before the HMAC
+	// is even considered. Requests with no Origin (same-origin navigations,
+	// CLI/native clients) fall through to the token check, so this never
+	// breaks legitimate non-browser callers.
+	if !isSameOriginRequest(r) {
+		return "origin_mismatch", false
+	}
 
-	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
+	// Verify HMAC. H-11: prefer the session-bound MAC (token tied to the
+	// request's originating session id) and fall back to the legacy
+	// unbound MAC so tokens minted before a session existed (login/signup
+	// pages, the pre-auth <meta> tag, and every session-less caller) keep
+	// validating. A token bound to session A therefore can NOT be replayed
+	// on session B - B's id won't reproduce A's signature, and the unbound
+	// fallback won't match a bound signature either.
+	payload := nonce + "|" + tsStr
+	sid := authRawSessionID(r)
+	boundSig := authCSRFSign(payload, sid)
+	unboundSig := authCSRFSign(payload, "")
+	if !hmac.Equal([]byte(providedSig), []byte(boundSig)) &&
+		!hmac.Equal([]byte(providedSig), []byte(unboundSig)) {
 		return "hmac_mismatch", false
 	}
 
@@ -508,6 +581,45 @@ func isAccountLocked(db *sql.DB, email string) bool {
 	).Scan(&count)
 	return count >= 5
 }
+
+// authIPLockKey namespaces a client IP into the shared
+// _benmore_login_attempts table so per-IP throttling reuses the same
+// rolling-window machinery as the per-account lockout without a second
+// table. The "ip:" prefix can never collide with a normalized email
+// (emails always contain "@" and never a leading "ip:").
+func authIPLockKey(ip string) string {
+	return "ip:" + strings.ToLower(strings.TrimSpace(ip))
+}
+
+// authIsIPLocked reports whether a single source IP has accumulated too
+// many failed login attempts in the rolling 15-minute window. This sits
+// ALONGSIDE the per-account lockout (isAccountLocked): the account lock
+// stops a focused attack on one victim, while this per-IP cap blunts a
+// spray attack that rotates the username to dodge the per-account
+// counter. The IP threshold is deliberately higher than the per-account
+// one so shared-NAT / office-egress users aren't locked out by a few
+// unrelated typos. Empty/unknown IPs are never locked (fail open - we
+// must not wedge a whole deployment on a missing RemoteAddr).
+func authIsIPLocked(db *sql.DB, ip string) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
+	}
+	key := authIPLockKey(ip)
+	var count int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM _benmore_login_attempts
+		 WHERE email = ? AND success = 0
+		 AND attempted_at > datetime('now', '-15 minutes')`,
+		key,
+	).Scan(&count)
+	return count >= authIPLoginLimit
+}
+
+// authIPLoginLimit is the per-IP failed-login ceiling in the 15-minute
+// window. Higher than the per-account limit (5) so shared egress IPs
+// tolerate a handful of unrelated bad logins before throttling.
+const authIPLoginLimit = 25
 
 // ===== Auth Middleware =====
 
@@ -587,7 +699,12 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 	// stateless HMACs so this endpoint is read-only and side-effect-free.
 	mux.HandleFunc("GET /api/_csrf", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		httpJSON(w, http.StatusOK, map[string]any{"token": generateCSRFToken()})
+		// H-11: bind the issued token to THIS request's session id when
+		// one is present, so a token fetched from this unauthenticated
+		// endpoint only validates mutations from the same session. A
+		// session-less caller (pre-login) still gets a back-compat
+		// unbound token (sid="").
+		httpJSON(w, http.StatusOK, map[string]any{"token": authMintCSRFToken(authRawSessionID(r))})
 	})
 
 	// Token auth: native/API clients exchange email+password for a Bearer token
@@ -709,6 +826,14 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 
+		// Save admin's original session ID so it can be restored later AND
+		// bound to the impersonation record (H-13). Read it from the cookie
+		// before we mint the new session.
+		adminSessionID := ""
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			adminSessionID = cookie.Value
+		}
+
 		// Create impersonation session with 1-hour TTL (shorter than normal sessions)
 		groupID := ResolveGroupID(app.DB, app.Group, email)
 		impersonationDuration := 1 * time.Hour
@@ -716,14 +841,11 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 
 		AttachSessionContext(app.DB, impersonatedSessionID, r)
 
-		// Mark session as impersonation
-		app.DB.Exec("UPDATE _benmore_sessions SET is_impersonation = 1 WHERE id = ?", impersonatedSessionID)
-
-		// Save admin's original session ID so it can be restored later
-		adminSessionID := ""
-		if cookie, err := r.Cookie(sessionCookieName); err == nil {
-			adminSessionID = cookie.Value
-		}
+		// Mark session as impersonation AND record the originating admin
+		// session id (H-13). end-impersonation will require the presented
+		// admin_token to equal this exact session - not merely "some valid
+		// admin token".
+		app.DB.Exec("UPDATE _benmore_sessions SET is_impersonation = 1, impersonator_session_id = ? WHERE id = ?", adminSessionID, impersonatedSessionID)
 
 		// Audit: log who impersonated whom
 		LogAudit(app, "impersonate", "_benmore_users", fmt.Sprintf("%d", body.UserID),
@@ -774,18 +896,36 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid admin session"})
 			return
 		}
-		// Verify current session IS an impersonation (prevent abuse)
+		// Verify current session IS an impersonation AND that the supplied
+		// admin_token is the EXACT session that started THIS impersonation
+		// (H-13). Previously any valid admin token was accepted, so a
+		// leaked impersonate response (which echoes admin_token) combined
+		// with any admin's token let an attacker restore into that admin's
+		// session. Binding to impersonator_session_id closes that pivot:
+		// the token must equal the originating admin session id recorded
+		// at start time.
 		var isImpersonation int
-		if cookie, err := r.Cookie(sessionCookieName); err == nil {
-			app.DB.QueryRow("SELECT COALESCE(is_impersonation, 0) FROM _benmore_sessions WHERE id = ?", cookie.Value).Scan(&isImpersonation)
-			if isImpersonation == 1 {
-				app.DB.Exec("DELETE FROM _benmore_sessions WHERE id = ?", cookie.Value)
-			}
+		var impersonatorSessionID string
+		cookie, cookieErr := r.Cookie(sessionCookieName)
+		if cookieErr == nil {
+			app.DB.QueryRow(
+				"SELECT COALESCE(is_impersonation, 0), COALESCE(impersonator_session_id, '') FROM _benmore_sessions WHERE id = ?",
+				cookie.Value,
+			).Scan(&isImpersonation, &impersonatorSessionID)
 		}
 		if isImpersonation != 1 {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
 			return
 		}
+		// The presented admin_token MUST resolve to the session that
+		// originated this impersonation. constant-time compare avoids
+		// leaking the bound id via timing.
+		if impersonatorSessionID == "" || subtle.ConstantTimeCompare([]byte(body.AdminToken), []byte(impersonatorSessionID)) != 1 {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin_token does not match the originating admin session"})
+			return
+		}
+		// Authorized: tear down the impersonation session before restoring.
+		app.DB.Exec("DELETE FROM _benmore_sessions WHERE id = ?", cookie.Value)
 		// Restore admin session cookie (see #18 - protoOf for proxy-correct Secure flag).
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookieName,
@@ -1038,9 +1178,18 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 		}
 	}
 
-	// Brute force check
+	// Brute force check (per-account). Stops a focused attack on one user.
 	if isAccountLocked(app.DB, loginValue) {
 		authRedirect(w, r, app.Paths.Login, "Too many failed attempts. Try again in 15 minutes.")
+		return
+	}
+	// Per-IP cap (LOWER): the per-account lock above is trivially evaded by
+	// a spray attack that rotates the username every request. Throttle the
+	// source IP too. clientIP honors trusted forwarded headers only when
+	// configured (see platform_shims.clientIP).
+	loginIP := clientIP(r)
+	if authIsIPLocked(app.DB, loginIP) {
+		authRedirect(w, r, app.Paths.Login, "Too many failed attempts from this network. Try again in 15 minutes.")
 		return
 	}
 
@@ -1057,12 +1206,14 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email)
 	if err != nil {
 		recordLoginAttempt(app.DB, loginValue, false)
+		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
 		recordLoginAttempt(app.DB, loginValue, false)
+		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
 		return
 	}
@@ -1164,8 +1315,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 			}
 		}
 
-		// Store user ID in a temp cookie for the OTP page
-		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s", id, email)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+		// Store user ID + the OTP lookup key in a temp cookie for the OTP
+		// page. H-12: the OTP row was INSERTed under loginValue (the
+		// normalized identifier - username/phone/email), but verify used
+		// to look it up by email, so non-email identifiers never matched
+		// and those users were locked out. Carry the exact send-time key
+		// (loginValue) through the signed cookie so verify keys on the
+		// SAME value. Format is id|email|otpkey; the 2-part legacy form
+		// still parses (verify falls back to email as the key).
+		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s|%s", id, email, loginValue)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 		sendOTPChallenge(w, r, app)
 		return
 	}
@@ -1249,36 +1407,46 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 		authRedirect(w, r, otpPath, "Invalid session. Please log in again.")
 		return
 	}
-	parts := strings.SplitN(verified, "|", 2)
-	if len(parts) != 2 {
+	// Cookie payload is id|email|otpkey (H-12). The 3rd field is the exact
+	// key the OTP row was stored under at send time (the normalized
+	// identifier - which for username/phone identifiers is NOT the email).
+	// Older cookies are 2-part (id|email); for those we fall back to email
+	// as the lookup key, matching the pre-fix behavior for email apps.
+	parts := strings.SplitN(verified, "|", 3)
+	if len(parts) < 2 {
 		authRedirect(w, r, otpPath, "Invalid session. Please log in again.")
 		return
 	}
 	uidStr, email := parts[0], parts[1]
+	otpKey := email
+	if len(parts) == 3 && parts[2] != "" {
+		otpKey = parts[2]
+	}
 
-	// Verify OTP with attempt limiting
+	// Verify OTP with attempt limiting. Keyed on otpKey so it matches the
+	// value the row was INSERTed under on send (H-12).
 	var storedCode string
 	var attempts int
-	err = app.DB.QueryRow("SELECT code, attempts FROM _benmore_otp WHERE email = ? AND expires_at > datetime('now')", email).Scan(&storedCode, &attempts)
+	err = app.DB.QueryRow("SELECT code, attempts FROM _benmore_otp WHERE email = ? AND expires_at > datetime('now')", otpKey).Scan(&storedCode, &attempts)
 	if err != nil {
 		authRedirect(w, r, otpPath, "Code expired. Please log in again.")
 		return
 	}
 
 	if attempts >= 5 {
-		app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", email)
+		app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", otpKey)
 		authRedirect(w, r, otpPath, "Too many attempts. Please log in again.")
 		return
 	}
 
 	if !SecureCompare(code, storedCode) {
-		app.DB.Exec("UPDATE _benmore_otp SET attempts = attempts + 1 WHERE email = ?", email)
+		app.DB.Exec("UPDATE _benmore_otp SET attempts = attempts + 1 WHERE email = ?", otpKey)
 		authRedirect(w, r, otpPath, fmt.Sprintf("Invalid code. %d attempts remaining.", 4-attempts))
 		return
 	}
 
 	// OTP valid - clean up and create session
-	app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", email)
+	app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", otpKey)
 	http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Path: "/", MaxAge: -1})
 
 	var id int64
@@ -1495,7 +1663,23 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// Activate any pending invites for this email (app-level user_roles table)
 	app.DB.Exec("UPDATE user_roles SET user_id = ?, is_active = 1, invite_accepted_at = datetime('now') WHERE email = ? AND user_id IS NULL AND is_active = 0", id, email)
 
-	// Email verification (opt-in via auth.verify_email in app.yaml)
+	// Email verification (opt-in via auth.verify_email in app.yaml).
+	//
+	// SECURITY NOTE (LOWER): sending the verification email is DECORATIVE
+	// on its own. This handler proceeds to mint a full session below even
+	// when verify_email is set - the unverified user is logged in
+	// immediately. Actual ENFORCEMENT is gated by a SEPARATE config key,
+	// auth.require_verified: when that is "true", getSession() refuses to
+	// resolve any session whose user row is not verified (see getSession,
+	// "require_verified" branch), so the session minted here is inert until
+	// the user clicks the link. So:
+	//   - verify_email=true alone  → email sent, but login works unverified
+	//   - require_verified=true    → unverified sessions are rejected at
+	//                                every request until verified
+	// Apps that need a hard gate MUST set require_verified. We intentionally
+	// keep issuing the session here (back-compat: many apps rely on
+	// immediate login + a soft "please verify" banner) and rely on the
+	// request-time check rather than withholding the session at signup.
 	needsVerification := app.Design != nil && app.Design.Auth["verify_email"] == "true"
 	if needsVerification {
 		token := generateToken(32)
@@ -1540,7 +1724,10 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		if err := SendEmail(app.Dir, email, "Your verification code · "+brand.SiteName, body); err != nil {
 			log.Printf("auth: signup OTP email failed (to=%s): %v", email, err)
 		}
-		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s", id, email)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+		// H-12: signup keys the OTP row on email, so the cookie's OTP key
+		// is email too. Carry it explicitly (id|email|otpkey) so the
+		// verify handler uses the identical key on lookup.
+		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s|%s", id, email, email)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 		sendOTPChallenge(w, r, app)
 		return
 	}

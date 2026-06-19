@@ -88,8 +88,8 @@ func GetOAuthToken(db *sql.DB, appDir string, userID int64, provider string) str
 				tokenURL = p.TokenURL
 			}
 			if tokenURL != "" {
-				clientID := GetEnv(appDir, strings.ToUpper(provider) + "_CLIENT_ID")
-				clientSecret := GetEnv(appDir, strings.ToUpper(provider) + "_CLIENT_SECRET")
+				clientID := GetEnv(appDir, strings.ToUpper(provider)+"_CLIENT_ID")
+				clientSecret := GetEnv(appDir, strings.ToUpper(provider)+"_CLIENT_SECRET")
 				newToken := refreshOAuthToken(tokenURL, clientID, clientSecret, refreshToken)
 				if newToken != "" {
 					return newToken
@@ -114,7 +114,21 @@ func refreshOAuthToken(tokenURL, clientID, clientSecret, refreshToken string) st
 		"client_secret": {clientSecret},
 	}
 
-	resp, err := http.PostForm(tokenURL, data)
+	// Route the refresh through the SSRF-safe strict client rather than
+	// http.PostForm (the default client follows redirects with no private-IP
+	// guard and re-resolves DNS at dial time). isPrivateURL above blocks the
+	// host up front; safeHTTPClientStrict additionally validates the ACTUAL
+	// resolved dial IP, closing the DNS-rebinding TOCTOU so a hostile token
+	// endpoint can't redirect/rebind these long-lived OAuth credentials to an
+	// internal address (e.g. IMDS).
+	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		log.Printf("OAUTH REFRESH: build request failed: %s", err)
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := safeHTTPClientStrict(10 * time.Second).Do(req)
 	if err != nil {
 		log.Printf("OAUTH REFRESH: request failed: %s", err)
 		return ""

@@ -49,18 +49,28 @@ func PublishEvent(db *sql.DB, table, action string, groupID string, userID int64
 
 // eventPoller tracks the last-seen event ID and polls for new events.
 type eventPoller struct {
-	db     *sql.DB
-	lastID int64
-	stopCh chan struct{}
-	once   sync.Once
+	db      *sql.DB
+	lastID  int64
+	stopCh  chan struct{}
+	appStop chan struct{} // H-14: tied to app.Stop so a hot reload tears the poller down
+	once    sync.Once
 }
 
 // StartEventPoller launches a background goroutine that polls _benmore_events
 // for new entries and pushes them into the local SSE hub.
+//
+// H-14: the returned *eventPoller is discarded by the caller (server.go), so
+// nothing ever closes ep.stopCh. Pre-fix that meant every hot reload spawned a
+// fresh pair of poller goroutines that lived forever (goroutine + DB-handle
+// leak) and a panic in one crashed the whole process (raw `go`). We now (a)
+// bind the goroutines' lifecycle to app.Stop in addition to ep.stopCh, so a
+// reload/shutdown reaps them even though the handle is dropped, and (b) launch
+// them via safeGo so a panic is recovered + logged instead of fatal.
 func StartEventPoller(app *App) *eventPoller {
 	ep := &eventPoller{
-		db:     app.DB,
-		stopCh: make(chan struct{}),
+		db:      app.DB,
+		stopCh:  make(chan struct{}),
+		appStop: app.Stop,
 	}
 
 	// Initialize lastID to current max so we don't replay old events on startup
@@ -70,8 +80,8 @@ func StartEventPoller(app *App) *eventPoller {
 		ep.lastID = maxID.Int64
 	}
 
-	go ep.run()
-	go ep.cleanup()
+	safeGo("pubsub.poller", ep.run)
+	safeGo("pubsub.cleanup", ep.cleanup)
 
 	log.Printf("  pubsub: event poller started (cluster mode)")
 	return ep
@@ -84,6 +94,8 @@ func (ep *eventPoller) run() {
 	for {
 		select {
 		case <-ep.stopCh:
+			return
+		case <-ep.appStop:
 			return
 		case <-ticker.C:
 			ep.poll()
@@ -123,6 +135,8 @@ func (ep *eventPoller) cleanup() {
 	for {
 		select {
 		case <-ep.stopCh:
+			return
+		case <-ep.appStop:
 			return
 		case <-ticker.C:
 			cutoff := time.Now().Add(-5 * time.Minute).UTC().Format("2006-01-02 15:04:05")
