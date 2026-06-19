@@ -39,6 +39,22 @@ import (
 	"golang.org/x/image/draw"
 )
 
+// uploadsMaxImagePixels caps the decoded dimensions of a transform source.
+// image.Decode allocates ~W*H*4 bytes for an RGBA buffer, so a tiny
+// compressed file declaring huge dimensions (a "decompression bomb") can
+// OOM the process. We reject anything above ~40 megapixels (160MB RGBA)
+// using DecodeConfig - which reads only the header - BEFORE the full
+// Decode. Invariant: we never allocate a decode buffer for an image whose
+// declared pixel count we have not bounded.
+const uploadsMaxImagePixels = 40 * 1000 * 1000 // ~40 MP
+
+// uploadsTransformSem bounds simultaneous image decodes. Each decode holds
+// a multi-hundred-MB buffer; without a ceiling a burst of concurrent
+// transform requests multiplies that and exhausts memory. Sized small on
+// purpose - transforms are cached after the first hit, so steady-state
+// concurrency is low.
+var uploadsTransformSem = make(chan struct{}, 4)
+
 // RegisterImageTransformRoute mounts /api/_images/transform. No auth
 // gate - transforms are public by design (the source URL is itself
 // the access control surface; if the user can fetch the original,
@@ -82,6 +98,19 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 			return
 		}
 
+		// Auth gate consistent with the static /uploads/ handler in
+		// server.go: public media is open (the source URL is itself the
+		// access-control surface), but private-tier sources
+		// (uploads/private/...) must carry a valid signed URL. Without
+		// this, the transform endpoint would be an unauthenticated read
+		// primitive for files that are otherwise gated behind signed URLs.
+		if isPrivateUploadPath(src) {
+			if !ValidateSignedURL(strings.TrimPrefix(src, "/uploads/"), r) {
+				httpError(w, "forbidden - invalid or expired signed URL", http.StatusForbidden)
+				return
+			}
+		}
+
 		// Cache miss - load the source. filepath.Clean normalizes any
 		// `..` segments so `src=/uploads/../app.yaml` resolves to a
 		// path that fails the HasPrefix gate below. Without the Clean
@@ -98,7 +127,32 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 			return
 		}
 		defer f.Close()
+
+		// Decompression-bomb guard: read ONLY the header via DecodeConfig
+		// and reject before allocating any decode buffer when the declared
+		// pixel count exceeds the cap. A 10KB file can declare 50000x50000
+		// dimensions; image.Decode would then try to allocate ~10GB.
+		cfg, _, cfgErr := image.DecodeConfig(f)
+		if cfgErr != nil {
+			httpError(w, "decode failed: "+cfgErr.Error(), http.StatusUnsupportedMediaType)
+			return
+		}
+		if cfg.Width <= 0 || cfg.Height <= 0 ||
+			int64(cfg.Width)*int64(cfg.Height) > uploadsMaxImagePixels {
+			httpError(w, "source image too large to transform", http.StatusUnsupportedMediaType)
+			return
+		}
+		// Rewind: DecodeConfig consumed the header bytes.
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			httpError(w, "source not seekable", http.StatusInternalServerError)
+			return
+		}
+
+		// Bound concurrent decodes - each holds a large RGBA buffer, so a
+		// burst of cache-miss requests must not multiply memory unbounded.
+		uploadsTransformSem <- struct{}{}
 		img, _, err := image.Decode(f)
+		<-uploadsTransformSem
 		if err != nil {
 			httpError(w, "decode failed: "+err.Error(), http.StatusUnsupportedMediaType)
 			return
