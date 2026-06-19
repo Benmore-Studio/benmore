@@ -102,32 +102,57 @@ type jobEnqueueExecer interface {
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
 // every job to id-enumeration.
 func EnqueueJob(db *sql.DB, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(db, "", flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", "", flowName, payload, runAt, jobEnqueueOpts{})
 }
 
-// EnqueueJobUnique is EnqueueJob with active-job idempotency (PR #10): if a
-// pending/running job already carries uniqueKey, its id + status token are
-// returned and no new job is enqueued.
 func EnqueueJobUnique(db *sql.DB, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(db, uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{})
 }
 
 func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(tx, "", flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", "", flowName, payload, runAt, jobEnqueueOpts{})
 }
 
 func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(tx, uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{})
 }
 
-// Idempotency semantics: the FIRST active enqueue for a given unique_key wins.
-// When an active (pending/running) job already exists for the key, enqueue
-// returns that job's id + status token and does NOT reconcile a newer payload
-// or run_at - the later enqueue is a no-op against the in-flight job.
-func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+// EnqueueCronJob enqueues a durable cron run.
+//
+// maxAttempts is the per-cron retry budget; pass 1 to preserve the
+// historical at-most-once behavior (a failing step is NOT retried), or
+// >1 to opt into at-least-once retries. See cron.go cronMaxAttempts for
+// how a cron definition selects this (review finding #2).
+//
+// dedupAnyStatus closes the same-minute duplicate-fire window (review
+// finding #1): the cron unique_key is minute-specific
+// (cron:<id>:<minute>), so the existence of ANY prior row with that key
+// - including a `completed` one - means that minute already fired. The
+// generic active-only dedup would let a completed row be re-enqueued
+// after a restart inside the same minute; for cron we additionally
+// collapse against completed/failed rows so a lost last_fire can never
+// cause a double fire.
+func EnqueueCronJob(db *sql.DB, cronID, uniqueKey string, payload map[string]any, runAt *time.Time, maxAttempts int) (int64, string, error) {
+	return enqueueTypedJob(db, "cron", uniqueKey, cronID, payload, runAt, jobEnqueueOpts{
+		maxAttempts:    maxAttempts,
+		dedupAnyStatus: true,
+	})
+}
+
+// jobEnqueueOpts carries optional, type-specific enqueue behavior so the
+// generic enqueue path stays a single code path.
+type jobEnqueueOpts struct {
+	// maxAttempts overrides the column DEFAULT (3) when > 0.
+	maxAttempts int
+	// dedupAnyStatus, when set, treats a matching unique_key in ANY status
+	// (including completed/failed) as a duplicate to collapse against.
+	dedupAnyStatus bool
+}
+
+func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string, payload map[string]any, runAt *time.Time, opts jobEnqueueOpts) (int64, string, error) {
 	uniqueKey = strings.TrimSpace(uniqueKey)
 	if uniqueKey != "" {
-		if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+		if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 			return id, token, nil
 		}
 	}
@@ -143,29 +168,34 @@ func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[s
 		ra = *runAt
 	}
 	token := generateToken(18)
-	// Store NULL for the no-key case (keeps it out of the partial UNIQUE index)
-	// and the trimmed key otherwise.
-	var uniqueKeyArg any
-	if uniqueKey != "" {
-		uniqueKeyArg = uniqueKey
+	// err is already declared by the json.Marshal above; only result is new.
+	var result sql.Result
+	if opts.maxAttempts > 0 {
+		result, err = exec.Exec(
+			"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey), opts.maxAttempts,
+		)
+	} else {
+		result, err = exec.Exec(
+			"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES (?, ?, ?, ?, ?, ?)",
+			jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
+		)
 	}
-	result, err := exec.Exec(
-		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES ('flow', ?, ?, ?, ?, ?)",
-		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, uniqueKeyArg,
-	)
 	if err != nil {
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
-			// A concurrent enqueue won the race on idx_jobs_unique_active.
-			// Re-read the winning row so we can return it idempotently.
-			if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
+			if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 				return id, token, nil
 			}
-			// On the Tx path, go-sqlite3 takes a read snapshot at the
-			// transaction's first read, so a row committed by a competing
-			// transaction after that snapshot is invisible to the SELECT above.
-			// We still know the key is held by an active job (the UNIQUE index
-			// just rejected our INSERT), so treat this as a successful
-			// idempotent no-op rather than failing the whole flow transaction.
+			// On the Tx path (*sql.Tx), go-sqlite3 takes a read snapshot at
+			// the transaction's first read, so a row committed by a competing
+			// transaction AFTER that snapshot is invisible to the recovery
+			// SELECT above. We still know the key is held by an active job
+			// (the UNIQUE index just rejected our INSERT), so treat this as a
+			// successful idempotent no-op rather than surfacing the raw
+			// constraint error and failing the whole flow transaction. The id
+			// is unknown from inside the stale snapshot, so return 0 / no token;
+			// the caller's enqueue is a dedup no-op against the winner. (Tx
+			// callers needing the winner's id/token should re-read after commit.)
 			if _, isTx := exec.(*sql.Tx); isTx {
 				return 0, "", nil
 			}
@@ -176,31 +206,61 @@ func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[s
 	return id, token, err
 }
 
-// findActiveJobByUniqueKey returns the active (pending/running) job carrying
-// uniqueKey, if any, for idempotent enqueue dedup.
 func findActiveJobByUniqueKey(q jobEnqueueExecer, uniqueKey string) (int64, string, bool) {
+	return findJobByUniqueKey(q, uniqueKey, false)
+}
+
+// findJobByUniqueKey looks up an existing job by unique_key. When
+// anyStatus is false it only matches active (pending/running) rows - the
+// partial-index semantics that let a key be reused once the prior job
+// finished. When anyStatus is true it matches a row in any status, used
+// by cron's minute-specific keys so a completed run can never be
+// re-enqueued for the same minute (review finding #1).
+func findJobByUniqueKey(q jobEnqueueExecer, uniqueKey string, anyStatus bool) (int64, string, bool) {
 	var id int64
 	var token string
-	err := q.QueryRow(`
+	query := `
 		SELECT id, COALESCE(status_token, '')
 		FROM _benmore_jobs
 		WHERE unique_key = ?
 		  AND status IN ('pending', 'running')
 		ORDER BY id DESC
 		LIMIT 1
-	`, uniqueKey).Scan(&id, &token)
-	if err != nil {
+	`
+	if anyStatus {
+		query = `
+		SELECT id, COALESCE(status_token, '')
+		FROM _benmore_jobs
+		WHERE unique_key = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	}
+	if err := q.QueryRow(query, uniqueKey).Scan(&id, &token); err != nil {
 		return 0, "", false
 	}
-	// A tokenless active row (legacy) would yield a status_url the status
-	// endpoint rejects; treat it as no usable dedup hit so a fresh row is
-	// inserted instead of handing back a broken status URL.
+	// Guard against legacy pre-status_token rows carrying the same key:
+	// returning an empty token would make the caller build a status_url the
+	// status endpoint rejects. Treat a tokenless row as "no usable dedup hit"
+	// so a fresh row (with a token) is inserted instead of handing back a
+	// broken status URL.
 	if token == "" {
 		return 0, "", false
 	}
 	return id, token, true
 }
 
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// isUniqueJobConstraintErr reports whether err is the UNIQUE-constraint
+// violation from idx_jobs_unique_active. It matches the typed go-sqlite3 error
+// (ErrConstraint + ErrConstraintUnique extended code) rather than scraping the
+// error string, which is fragile across driver/SQLite versions and locales.
 func isUniqueJobConstraintErr(err error) bool {
 	var sqliteErr sqlite3.Error
 	if errors.As(err, &sqliteErr) {
@@ -378,6 +438,8 @@ func processNextJob(app *App) (worked bool) {
 	switch jobType {
 	case "hook":
 		jobErr = executeHookJob(app, data)
+	case "cron":
+		jobErr = executeCronJob(app, flowName, data)
 	case "webhook_subscription":
 		jobErr = executeWebhookSubscriptionJob(data, app.Dir)
 	default: // "flow"
