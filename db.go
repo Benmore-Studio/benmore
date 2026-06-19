@@ -25,9 +25,10 @@ func init() {
 // OpenDB opens the app database. Uses DATABASE_URL env var if set (for remote SQLite/Turso),
 // otherwise creates a local data.db in the app directory.
 func OpenDB(dir string) (*sql.DB, error) {
-	cfg := buildDBOpenConfig(dir, resolveDatabaseURL(dir))
+	dbURL := resolveDatabaseURL(dir)
+	cfg := buildDBOpenConfig(dir, dbURL)
 	if cfg.Backend == DatabaseBackendPostgres {
-		return nil, unsupportedPostgresRuntimeError()
+		return nil, unsupportedPostgresRuntimeError(detectedPostgresScheme(dbURL))
 	}
 
 	db, err := sql.Open(cfg.DriverName, cfg.DSN)

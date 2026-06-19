@@ -45,8 +45,36 @@ func TestBuildDBOpenConfigRecognizesPostgres(t *testing.T) {
 		if cfg.Backend != DatabaseBackendPostgres {
 			t.Fatalf("%s backend = %s, want postgres", raw, cfg.Backend)
 		}
-		if cfg.DriverName != "pgx" {
-			t.Fatalf("%s driver = %s, want pgx", raw, cfg.DriverName)
+		// DriverName must stay empty until a pgx driver is actually registered;
+		// advertising "pgx" before that would be a "sql: unknown driver" trap.
+		if cfg.DriverName != "" {
+			t.Fatalf("%s driver = %q, want empty until pgx is registered", raw, cfg.DriverName)
+		}
+	}
+}
+
+func TestBuildDBOpenConfigRecognizesLibpqKeywordDSN(t *testing.T) {
+	for _, raw := range []string{
+		"host=localhost dbname=app user=x",
+		"dbname=app sslmode=require",
+		"  host=db.internal port=5432 user=svc ",
+	} {
+		cfg := buildDBOpenConfig("/tmp/example-app", raw)
+		if cfg.Backend != DatabaseBackendPostgres {
+			t.Fatalf("%q backend = %s, want postgres (libpq keyword form)", raw, cfg.Backend)
+		}
+	}
+}
+
+func TestBuildDBOpenConfigSQLiteNotMistakenForPostgres(t *testing.T) {
+	for _, raw := range []string{
+		"file:remote.db?cache=shared",
+		"file:/var/data/app.db",
+		"./data.db",
+	} {
+		cfg := buildDBOpenConfig("/tmp/example-app", raw)
+		if cfg.Backend != DatabaseBackendSQLite {
+			t.Fatalf("%q backend = %s, want sqlite", raw, cfg.Backend)
 		}
 	}
 }
@@ -61,6 +89,47 @@ func TestRewritePlaceholdersForPostgres(t *testing.T) {
 
 	if sqlite := rewritePlaceholders(in, DatabaseBackendSQLite); sqlite != in {
 		t.Fatalf("sqlite placeholders should be unchanged: %s", sqlite)
+	}
+}
+
+func TestRewritePlaceholdersEdgeCases(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "line comment does not consume a parameter",
+			in:   "SELECT ? -- trailing ? comment\n , ?",
+			want: "SELECT $1 -- trailing ? comment\n , $2",
+		},
+		{
+			name: "block comment does not consume a parameter",
+			in:   "SELECT ? /* mid ? comment */, ?",
+			want: "SELECT $1 /* mid ? comment */, $2",
+		},
+		{
+			name: "dollar-quoted body untouched",
+			in:   "INSERT INTO t VALUES ($$ has ? inside $$, ?)",
+			want: "INSERT INTO t VALUES ($$ has ? inside $$, $1)",
+		},
+		{
+			name: "tagged dollar quote untouched",
+			in:   "SELECT $tag$ a ? b $tag$, ?",
+			want: "SELECT $tag$ a ? b $tag$, $1",
+		},
+		{
+			name: "E-string with backslash-escaped quote",
+			in:   `SELECT E'\'?', ?`,
+			want: `SELECT E'\'?', $1`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rewritePlaceholders(tc.in, DatabaseBackendPostgres); got != tc.want {
+				t.Fatalf("rewrite mismatch:\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
 	}
 }
 

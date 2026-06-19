@@ -15,7 +15,12 @@ flowchart TD
   Closed --> Dialect[placeholder + introspection frontier]
 ```
 
-The first slice recognizes Postgres DSNs, centralizes local SQLite DSN tuning,
-and adds placeholder rewriting helpers for later `$1`/`$2` Postgres queries.
-It does not enable app runtime Postgres yet.
+The first slice recognizes Postgres DSNs in both the URL form
+(`postgres://` / `postgresql://`) and the libpq keyword form
+(`host=... dbname=... user=...`), centralizes local SQLite DSN tuning, and adds
+an experimental placeholder-rewriting helper for later `$1`/`$2` Postgres
+queries. The helper is unit-tested but not yet wired into any runtime CRUD path.
+It does not enable app runtime Postgres yet, and the Postgres `DBOpenConfig`
+deliberately leaves `DriverName` empty until a pgx driver is actually
+registered.
 
