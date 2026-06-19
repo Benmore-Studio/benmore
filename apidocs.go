@@ -24,7 +24,7 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 		requireAuth = true
 	}
 
-	// JSON: OpenAPI-style schema
+	// JSON: legacy Benmore docs shape ({endpoints,pages,features}).
 	mux.HandleFunc("GET /api/_docs", func(w http.ResponseWriter, r *http.Request) {
 		if requireAuth {
 			session := getSession(app, r)
@@ -35,6 +35,20 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(generateAPIDocs(app))
+	})
+
+	// JSON: real OpenAPI 3.1 contract for the app runtime CRUD surface.
+	mux.HandleFunc("GET /api/_openapi", func(w http.ResponseWriter, r *http.Request) {
+		if requireAuth {
+			session := getSession(app, r)
+			if session == nil {
+				http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(generateRuntimeOpenAPI(app))
 	})
 
 	// Rich, per-user schema descriptor - the source the schema-driven
@@ -165,16 +179,256 @@ func generateAPIDocs(app *App) map[string]any {
 		"endpoints": endpoints,
 		"pages":     pages,
 		"features": map[string]any{
-			"auth":          "cookie + Bearer token",
-			"scoping":       "owner (user_id) + org (configurable key)",
-			"soft_delete":   "auto if deleted_at column exists",
-			"audit_trail":   "GET /api/_audit",
-			"export":        "Export table rows as CSV, JSON, or XLSX",
-			"pagination":    "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)",
-			"idempotency":   "X-Idempotency-Key header on POST",
-			"concurrency":   "_expected_updated_at field for optimistic locking",
-			"cache":         "<query cache=\"5m\"> for query result caching",
+			"auth":        "cookie + Bearer token",
+			"scoping":     "owner (user_id) + org (configurable key)",
+			"soft_delete": "auto if deleted_at column exists",
+			"audit_trail": "GET /api/_audit",
+			"export":      "Export table rows as CSV, JSON, or XLSX",
+			"pagination":  "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)",
+			"idempotency": "X-Idempotency-Key header on POST",
+			"concurrency": "_expected_updated_at field for optimistic locking",
+			"cache":       "<query cache=\"5m\"> for query result caching",
 		},
+	}
+}
+
+func generateRuntimeOpenAPI(app *App) map[string]any {
+	paths := map[string]any{}
+	schemas := map[string]any{
+		"Problem": map[string]any{
+			"type":     "object",
+			"required": []string{"error"},
+			"properties": map[string]any{
+				"error":   map[string]any{"type": "string"},
+				"message": map[string]any{"type": "string"},
+				"hint":    map[string]any{"type": "string"},
+				"fields":  map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+			},
+		},
+	}
+
+	for _, table := range sortedTables(app) {
+		if strings.HasPrefix(table.Name, "_benmore_") {
+			continue
+		}
+		schemaName := pascalCase(singularize(table.Name))
+		schemas[schemaName] = openAPISchemaForTable(table)
+		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(table, "create")
+		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(table, "update")
+		paths["/api/"+table.Name] = map[string]any{
+			"get": map[string]any{
+				"operationId": "list" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "List " + table.Name,
+				"parameters": []map[string]any{
+					{"name": "limit", "in": "query", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000}},
+					{"name": "offset", "in": "query", "schema": map[string]any{"type": "integer", "minimum": 0}},
+					{"name": "q", "in": "query", "schema": map[string]any{"type": "string"}},
+				},
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Rows", map[string]any{
+						"oneOf": []any{
+							map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + schemaName}},
+							map[string]any{"type": "object", "properties": map[string]any{"rows": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + schemaName}}, "count": map[string]any{"type": "integer"}}},
+						},
+					}),
+				}),
+			},
+			"post": map[string]any{
+				"operationId": "create" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Create " + singularize(table.Name),
+				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Create" + schemaName}),
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Created row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+				}),
+			},
+		}
+		paths["/api/"+table.Name+"/{id}"] = map[string]any{
+			"get": map[string]any{
+				"operationId": "get" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Get " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam()},
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+				}),
+			},
+			"patch": map[string]any{
+				"operationId": "update" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Update " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam(), openAPIConcurrencyHeader()},
+				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Update" + schemaName}),
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Updated row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+					"409": openAPIProblemResponse("Concurrency conflict"),
+				}),
+			},
+			"delete": map[string]any{
+				"operationId": "delete" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Delete " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam()},
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Delete status", map[string]any{"type": "object", "properties": map[string]any{"status": map[string]any{"type": "string"}}}),
+				}),
+			},
+		}
+	}
+
+	return map[string]any{
+		"openapi": "3.1.0",
+		"info": map[string]any{
+			"title":   appOpenAPITitle(app),
+			"version": "1.0.0",
+		},
+		"paths": paths,
+		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"cookieSession": map[string]any{"type": "apiKey", "in": "cookie", "name": "benmore_session"},
+				"bearerAuth":    map[string]any{"type": "http", "scheme": "bearer"},
+			},
+			"schemas": schemas,
+		},
+		"security": []map[string][]string{{"cookieSession": []string{}}, {"bearerAuth": []string{}}},
+	}
+}
+
+func appOpenAPITitle(app *App) string {
+	if app.Design != nil && app.Design.SEO != nil && app.Design.SEO["site_name"] != "" {
+		return app.Design.SEO["site_name"] + " API"
+	}
+	return "Benmore App API"
+}
+
+func openAPISchemaForTable(table Table) map[string]any {
+	props := map[string]any{}
+	required := []string{}
+	for _, col := range table.Columns {
+		if isSensitiveUserColumn(col.Name) {
+			continue
+		}
+		props[col.Name] = openAPISchemaForColumn(col)
+		if col.NotNull && col.Default == "" && !col.PK {
+			required = append(required, col.Name)
+		}
+	}
+	out := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           props,
+	}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
+func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
+	props := map[string]any{}
+	required := []string{}
+	for _, col := range table.Columns {
+		if col.PK || isManagedColumn(col.Name) || isSensitiveUserColumn(col.Name) {
+			continue
+		}
+		props[col.Name] = openAPISchemaForColumn(col)
+		if mode == "create" && col.NotNull && col.Default == "" {
+			required = append(required, col.Name)
+		}
+	}
+	out := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           props,
+	}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
+func openAPISchemaForColumn(col Column) map[string]any {
+	t := strings.ToUpper(col.Type)
+	schema := map[string]any{}
+	switch {
+	case strings.Contains(t, "INT"):
+		schema["type"] = "integer"
+	case strings.Contains(t, "REAL"), strings.Contains(t, "FLOAT"), strings.Contains(t, "DOUBLE"), strings.Contains(t, "DECIMAL"):
+		schema["type"] = "number"
+	case strings.Contains(t, "BOOL"):
+		schema["type"] = "boolean"
+	case strings.Contains(t, "DATE"), strings.Contains(t, "TIME"):
+		schema["type"] = "string"
+		schema["format"] = "date-time"
+	case strings.Contains(t, "JSON"):
+		schema["type"] = []string{"object", "array", "string", "number", "boolean", "null"}
+	default:
+		schema["type"] = "string"
+	}
+	if !col.NotNull {
+		if typ, ok := schema["type"].(string); ok {
+			schema["type"] = []string{typ, "null"}
+		}
+	}
+	if col.PK {
+		schema["readOnly"] = true
+	}
+	return schema
+}
+
+func openAPIResponses(extra map[string]any) map[string]any {
+	out := map[string]any{
+		"400": openAPIProblemResponse("Bad request"),
+		"401": openAPIProblemResponse("Authentication required"),
+		"403": openAPIProblemResponse("Forbidden"),
+		"404": openAPIProblemResponse("Not found"),
+		"422": openAPIProblemResponse("Validation failed"),
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+func openAPIJSONResponse(description string, schema map[string]any) map[string]any {
+	return map[string]any{
+		"description": description,
+		"content": map[string]any{
+			"application/json": map[string]any{"schema": schema},
+		},
+	}
+}
+
+func openAPIProblemResponse(description string) map[string]any {
+	return openAPIJSONResponse(description, map[string]any{"$ref": "#/components/schemas/Problem"})
+}
+
+func openAPIJSONRequest(schema map[string]any) map[string]any {
+	return map[string]any{
+		"required": true,
+		"content": map[string]any{
+			"application/json": map[string]any{"schema": schema},
+		},
+	}
+}
+
+func openAPIIDParam() map[string]any {
+	return map[string]any{
+		"name":     "id",
+		"in":       "path",
+		"required": true,
+		"schema":   map[string]any{"type": "string"},
+	}
+}
+
+func openAPIConcurrencyHeader() map[string]any {
+	return map[string]any{
+		"name":        "X-Expected-Updated-At",
+		"in":          "header",
+		"required":    false,
+		"description": "Optimistic concurrency token. Equivalent to _expected_updated_at in request bodies.",
+		"schema":      map[string]any{"type": "string"},
 	}
 }
 
