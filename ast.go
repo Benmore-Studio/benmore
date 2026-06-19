@@ -12,16 +12,16 @@ import (
 
 // ASTNode represents a universal UI primitive in the abstract syntax tree.
 type ASTNode struct {
-	Type     string            `json:"type"`                        // box, text, image, input, scroll, list, pressable, form, table, chart, select
-	Class    string            `json:"class,omitempty"`             // Tailwind / custom CSS classes
-	Style    map[string]string `json:"style,omitempty"`             // inline styles
-	Value    string            `json:"value,omitempty"`             // static text content
-	Bind     string            `json:"bind,omitempty"`              // mustache binding (e.g. "name", "st_spend.total | currency")
-	Attrs    map[string]string `json:"attrs,omitempty"`             // other attributes (name, placeholder, type, href, src, etc.)
-	Children []*ASTNode        `json:"children,omitempty"`          // child nodes
-	Events   []*ASTEvent       `json:"events,omitempty"`            // event handlers
-	Each     string            `json:"each,omitempty"`              // loop variable (from {{#list}}...{{/list}})
-	Empty    []*ASTNode        `json:"empty,omitempty"`             // empty state (from {{^list}}...{{/list}})
+	Type     string            `json:"type"`               // box, text, image, input, scroll, list, pressable, form, table, chart, select
+	Class    string            `json:"class,omitempty"`    // Tailwind / custom CSS classes
+	Style    map[string]string `json:"style,omitempty"`    // inline styles
+	Value    string            `json:"value,omitempty"`    // static text content
+	Bind     string            `json:"bind,omitempty"`     // mustache binding (e.g. "name", "st_spend.total | currency")
+	Attrs    map[string]string `json:"attrs,omitempty"`    // other attributes (name, placeholder, type, href, src, etc.)
+	Children []*ASTNode        `json:"children,omitempty"` // child nodes
+	Events   []*ASTEvent       `json:"events,omitempty"`   // event handlers
+	Each     string            `json:"each,omitempty"`     // loop variable (from {{#list}}...{{/list}})
+	Empty    []*ASTNode        `json:"empty,omitempty"`    // empty state (from {{^list}}...{{/list}})
 }
 
 // ASTEvent represents a user interaction binding.
@@ -34,22 +34,22 @@ type ASTEvent struct {
 
 // ASTQuery represents a data dependency extracted from <query> tags.
 type ASTQuery struct {
-	Name  string `json:"name"`           // variable name (as="...")
-	SQL   string `json:"sql"`            // SQL query text
-	From  string `json:"from,omitempty"` // shorthand table name
+	Name string `json:"name"`           // variable name (as="...")
+	SQL  string `json:"sql"`            // SQL query text
+	From string `json:"from,omitempty"` // shorthand table name
 }
 
 // ASTPage represents the full AST for a single page/screen.
 type ASTPage struct {
-	Route   string            `json:"route"`
-	Title   string            `json:"title,omitempty"`
-	Auth    string            `json:"auth,omitempty"`
-	Scope   string            `json:"scope,omitempty"`
-	Role    string            `json:"role,omitempty"`
-	Layout  string            `json:"layout,omitempty"`
-	Data    []ASTQuery        `json:"data"`
-	Tree    *ASTNode          `json:"tree"`
-	Scripts []string          `json:"scripts,omitempty"`
+	Route   string     `json:"route"`
+	Title   string     `json:"title,omitempty"`
+	Auth    string     `json:"auth,omitempty"`
+	Scope   string     `json:"scope,omitempty"`
+	Role    string     `json:"role,omitempty"`
+	Layout  string     `json:"layout,omitempty"`
+	Data    []ASTQuery `json:"data"`
+	Tree    *ASTNode   `json:"tree"`
+	Scripts []string   `json:"scripts,omitempty"`
 }
 
 // BuildPageAST parses a raw page HTML into a platform-independent AST.
@@ -787,4 +787,3 @@ func parseInlineStyle(style string) map[string]string {
 	}
 	return m
 }
-

@@ -722,6 +722,7 @@ func BuiltWithBadgeHTML(app *App) string {
 func BuiltWithBenmorePill(ref string) string {
 	return fmt.Sprintf(`<a href="https://benmore.ai/?ref=%s" target="_blank" rel="noopener" aria-label="Built with Benmore" style="position:fixed;bottom:16px;right:16px;z-index:99996;display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 6px;border-radius:9999px;background:#fff;border:1px solid #e4e4e7;box-shadow:0 2px 8px rgba(0,0,0,0.10);text-decoration:none;color:#18181b;font-family:system-ui,-apple-system,sans-serif;font-size:12px;font-weight:500;line-height:1;white-space:nowrap;"><img src="%s" alt="" width="20" height="20" style="display:block;width:20px;height:20px;max-width:none;min-width:0;margin:0;padding:0;border:0;border-radius:5px;flex-shrink:0;"/><span style="color:#52525b;font:500 12px/1 system-ui,-apple-system,sans-serif;">Built with Benmore</span></a>`, ref, benmoreLogoDataURI)
 }
+
 // buildInfoSection renders the "Currently on" + "Testing mode"
 // metadata blocks for the badge popover. When testing mode is off,
 // returns just the site identity row; when on, adds a "Testing

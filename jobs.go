@@ -331,12 +331,13 @@ func StartJobWorker(app *App) {
 	EnsureJobsTable(app.DB)
 
 	safeGo("jobs.worker", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		recoverCheck := time.NewTicker(jobsHeartbeatInterval())
 		defer recoverCheck.Stop()
 		jobsRecoverOrphanedJobs(app) // sweep stale leases left by a previous crash on startup
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			default:
 			}
@@ -344,7 +345,7 @@ func StartJobWorker(app *App) {
 				continue // a job ran - more may be queued, drain without sleeping
 			}
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-recoverCheck.C:
 				// Periodically reclaim jobs whose worker died mid-flight.
@@ -433,13 +434,14 @@ func processNextJob(app *App) (worked bool) {
 	hbDone := make(chan struct{})
 	defer close(hbDone)
 	go func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(jobsHeartbeatInterval())
 		defer ticker.Stop()
 		for {
 			select {
 			case <-hbDone:
 				return
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				next := time.Now().Add(jobsLeaseTTL()).UTC().Format(sqliteDateTimeLayout)
@@ -497,7 +499,13 @@ func processNextJob(app *App) (worked bool) {
 
 func executeFlowJob(app *App, flowName string, data map[string]any) error {
 	var targetFlow *Flow
-	for _, flow := range app.Flows {
+	// Snapshot app.Flows under the lock: reloadAppConfig reassigns it on hot
+	// reload, and this is the busiest reader (every flow job + the scheduler
+	// sweeper). Reading the field while it's reassigned is a data race.
+	app.mu.RLock()
+	flows := app.Flows
+	app.mu.RUnlock()
+	for _, flow := range flows {
 		if flow.Name == flowName {
 			f := flow
 			targetFlow = &f
@@ -622,11 +630,12 @@ func FlushJobs(app *App) {
 // so it isn't re-spawned-without-end on every hot reload.
 func CleanOldJobs(app *App) {
 	safeGo("jobs.cleanup", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				app.DB.Exec("DELETE FROM _benmore_jobs WHERE status = 'completed' AND completed_at < datetime('now', '-7 days')")

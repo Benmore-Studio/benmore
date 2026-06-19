@@ -87,8 +87,8 @@ var (
 		`<timeline\s`, `<toggle\s`, `<copy\s`, `<search[\s>]`, `<accordion[\s>]`,
 		`<sheet[\s>]`, `<tooltip[\s>]`, `<hover-card[\s>]`, `<switch\s`, `<kbd\s`, `<meter\s`,
 	}
-	queryTagPattern     = regexp.MustCompile(`<query\s`)
-	directivePattern    = regexp.MustCompile(`:(create|delete|patch|validate)=`)
+	queryTagPattern  = regexp.MustCompile(`<query\s`)
+	directivePattern = regexp.MustCompile(`:(create|delete|patch|validate)=`)
 )
 
 // BuildGraph analyzes an app and generates the dependency graph.
@@ -181,10 +181,10 @@ func BuildGraph(app *App) AppGraph {
 	// Hooks
 	if app.Hooks != nil {
 		hooksNode := GraphNode{
-			File:     "hooks.yaml",
-			Type:     "hooks",
+			File:      "hooks.yaml",
+			Type:      "hooks",
 			DependsOn: []string{"schema.sql"},
-			Provides: []string{},
+			Provides:  []string{},
 		}
 		for table := range app.Hooks.OnInsert {
 			hooksNode.TablesWrite = append(hooksNode.TablesWrite, table)
@@ -203,10 +203,10 @@ func BuildGraph(app *App) AppGraph {
 	// Flows
 	if len(app.Flows) > 0 {
 		flowsNode := GraphNode{
-			File:     "flows.yaml",
-			Type:     "flows",
+			File:      "flows.yaml",
+			Type:      "flows",
 			DependsOn: []string{"schema.sql"},
-			Provides: []string{},
+			Provides:  []string{},
 		}
 		for _, flow := range app.Flows {
 			if flow.Trigger.Path != "" {
@@ -441,10 +441,10 @@ func generateAgentPlan(graph *AppGraph) []AgentTask {
 	// Task 0: Schema (must be done first)
 	schemaTokens := nodeTokens["schema.sql"]
 	schemaTask := AgentTask{
-		ID:            fmt.Sprintf("task-%d", taskID),
-		Files:         []string{"schema.sql"},
-		Description:   "Define or modify the data model",
-		TokenEstimate: schemaTokens,
+		ID:             fmt.Sprintf("task-%d", taskID),
+		Files:          []string{"schema.sql"},
+		Description:    "Define or modify the data model",
+		TokenEstimate:  schemaTokens,
 		SuggestedTests: []string{"test all tables created", "test migrations run cleanly"},
 	}
 	tasks = append(tasks, schemaTask)
@@ -522,8 +522,12 @@ func generateAgentPlan(graph *AppGraph) []AgentTask {
 						inI := false
 						inJ := false
 						for _, cf := range cz.Files {
-							if cf == f1 { inI = true }
-							if cf == f2 { inJ = true }
+							if cf == f1 {
+								inI = true
+							}
+							if cf == f2 {
+								inJ = true
+							}
 						}
 						if inI && inJ {
 							conflicts = true
@@ -541,8 +545,12 @@ func generateAgentPlan(graph *AppGraph) []AgentTask {
 	hasHooks := false
 	hasFlows := false
 	for _, n := range graph.Nodes {
-		if n.Type == "hooks" { hasHooks = true }
-		if n.Type == "flows" { hasFlows = true }
+		if n.Type == "hooks" {
+			hasHooks = true
+		}
+		if n.Type == "flows" {
+			hasFlows = true
+		}
 	}
 	if hasHooks || hasFlows {
 		files := []string{}
@@ -557,7 +565,9 @@ func generateAgentPlan(graph *AppGraph) []AgentTask {
 		}
 		if hasFlows {
 			files = append(files, "flows.yaml")
-			if hasHooks { desc += " + " }
+			if hasHooks {
+				desc += " + "
+			}
 			desc += "flows"
 			tokens += nodeTokens["flows.yaml"]
 			tests = append(tests, nodeTests["flows.yaml"]...)

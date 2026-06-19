@@ -32,6 +32,10 @@ func EnsureSchedulingTables(db *sql.DB) {
 		fired_at DATETIME
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sched_due ON _benmore_scheduled_tasks(status, run_at)`)
+	// claimed_at records when a sweeper flipped a task to 'running' so an
+	// orphan left behind by a crashed worker can be recovered (the table has
+	// no lease otherwise). Best-effort ALTER covers fresh + upgraded tables.
+	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN claimed_at DATETIME`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_approvals (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		table_name TEXT NOT NULL,
@@ -284,11 +288,12 @@ func StartSchedulerSweeper(app *App) {
 	// whole process and taking down every hosted app. Lifecycle is already
 	// bound to app.Stop below.
 	safeGo("scheduling.sweeper", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				sweepScheduledTasks(app)
@@ -297,10 +302,23 @@ func StartSchedulerSweeper(app *App) {
 	})
 }
 
+// schedTaskRecoveryTTL bounds how long a task may sit 'running' before it's
+// treated as orphaned by a crashed worker and re-queued. Sweeps complete tasks
+// synchronously, so a live process never legitimately holds one this long.
+const schedTaskRecoveryTTL = 5 * time.Minute
+
 func sweepScheduledTasks(app *App) {
+	now := time.Now().UTC()
+	// Recover orphans: a task stuck 'running' past the TTL belongs to a worker
+	// that died mid-fire (the sweeper would otherwise have set it done/failed).
+	// Reset to pending so it fires again instead of being stranded forever.
+	app.DB.Exec(
+		"UPDATE _benmore_scheduled_tasks SET status='pending', claimed_at=NULL WHERE status='running' AND claimed_at IS NOT NULL AND claimed_at <= ?",
+		now.Add(-schedTaskRecoveryTTL).Format(time.RFC3339))
+
 	rows, err := QueryRows(app.DB,
 		"SELECT id, user_id, kind, title, message, flow, body FROM _benmore_scheduled_tasks WHERE status='pending' AND run_at <= ? ORDER BY run_at ASC LIMIT 50",
-		time.Now().UTC().Format(time.RFC3339))
+		now.Format(time.RFC3339))
 	if err != nil {
 		return
 	}
@@ -312,7 +330,8 @@ func sweepScheduledTasks(app *App) {
 		// (e.g. a transient overlap across a hot reload) both SELECT the same
 		// pending row and double-fire its notification / scheduled flow.
 		claim, claimErr := app.DB.Exec(
-			"UPDATE _benmore_scheduled_tasks SET status='running' WHERE id = ? AND status='pending'", id)
+			"UPDATE _benmore_scheduled_tasks SET status='running', claimed_at=? WHERE id = ? AND status='pending'",
+			now.Format(time.RFC3339), id)
 		if claimErr != nil {
 			continue
 		}

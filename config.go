@@ -6,9 +6,9 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log"
-	"sort"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,18 +17,18 @@ import (
 
 // AppYAML represents the top-level app.yaml config.
 type AppYAML struct {
-	Name     string                       `yaml:"name"`
-	Theme    string                       `yaml:"theme"`
-	Mode     string                       `yaml:"mode"`
-	Font     string                       `yaml:"font"`
-	Brand    string                       `yaml:"brand"`
-	CSS      string                       `yaml:"css"`
-	Auth     map[string]string            `yaml:"auth"`
-	Database DatabaseConfig               `yaml:"database"`
-	SEO      map[string]string            `yaml:"seo"`
-	CSP      map[string]string            `yaml:"csp"`
-	Models   map[string][]string          `yaml:"models"`
-	Pages    map[string]string            `yaml:"pages"`
+	Name     string              `yaml:"name"`
+	Theme    string              `yaml:"theme"`
+	Mode     string              `yaml:"mode"`
+	Font     string              `yaml:"font"`
+	Brand    string              `yaml:"brand"`
+	CSS      string              `yaml:"css"`
+	Auth     map[string]string   `yaml:"auth"`
+	Database DatabaseConfig      `yaml:"database"`
+	SEO      map[string]string   `yaml:"seo"`
+	CSP      map[string]string   `yaml:"csp"`
+	Models   map[string][]string `yaml:"models"`
+	Pages    map[string]string   `yaml:"pages"`
 }
 
 // DatabaseConfig holds database settings.
@@ -120,14 +120,14 @@ type FlowWSYAML struct {
 
 // FlowAPIYAML represents an API call step.
 type FlowAPIYAML struct {
-	Method   string                 `yaml:"method"`
-	URL      string                 `yaml:"url"`
-	Auth     string                 `yaml:"auth"`
-	Headers  map[string]string      `yaml:"headers"`
-	JSON     map[string]string      `yaml:"json"`
-	Form     map[string]string      `yaml:"form"`
-	Body     string                 `yaml:"body"`
-	Paginate *FlowAPIPaginateYAML   `yaml:"paginate"`
+	Method   string               `yaml:"method"`
+	URL      string               `yaml:"url"`
+	Auth     string               `yaml:"auth"`
+	Headers  map[string]string    `yaml:"headers"`
+	JSON     map[string]string    `yaml:"json"`
+	Form     map[string]string    `yaml:"form"`
+	Body     string               `yaml:"body"`
+	Paginate *FlowAPIPaginateYAML `yaml:"paginate"`
 }
 
 // FlowAPIPaginateYAML mirrors FlowAPIPaginate for YAML parsing.
@@ -253,28 +253,52 @@ func LoadAppConfigYAML(dir string) *DesignConfig {
 		Recording:  make(map[string]string),
 	}
 
-	if v, ok := raw["theme"].(string); ok { config.Colors["_theme"] = v }
-	if v, ok := raw["mode"].(string); ok { config.Colors["_mode"] = v }
-	if v, ok := raw["font"].(string); ok { config.Colors["_font"] = v }
-	if v, ok := raw["brand"].(string); ok { config.Colors["_brand"] = v }
-	if v, ok := raw["css"].(string); ok { config.CSS = v }
-	if v, ok := raw["radius"].(string); ok { config.Radius = v }
-	if v, ok := raw["shadow"].(string); ok { config.Shadow = v }
+	if v, ok := raw["theme"].(string); ok {
+		config.Colors["_theme"] = v
+	}
+	if v, ok := raw["mode"].(string); ok {
+		config.Colors["_mode"] = v
+	}
+	if v, ok := raw["font"].(string); ok {
+		config.Colors["_font"] = v
+	}
+	if v, ok := raw["brand"].(string); ok {
+		config.Colors["_brand"] = v
+	}
+	if v, ok := raw["css"].(string); ok {
+		config.CSS = v
+	}
+	if v, ok := raw["radius"].(string); ok {
+		config.Radius = v
+	}
+	if v, ok := raw["shadow"].(string); ok {
+		config.Shadow = v
+	}
 
 	if m, ok := raw["colors"].(map[string]any); ok {
-		for k, v := range m { config.Colors[k] = anyToString(v) }
+		for k, v := range m {
+			config.Colors[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["typography"].(map[string]any); ok {
-		for k, v := range m { config.Typography[k] = anyToString(v) }
+		for k, v := range m {
+			config.Typography[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["spacing"].(map[string]any); ok {
-		for k, v := range m { config.Spacing[k] = anyToString(v) }
+		for k, v := range m {
+			config.Spacing[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["nav"].(map[string]any); ok {
-		for k, v := range m { config.Nav[k] = anyToString(v) }
+		for k, v := range m {
+			config.Nav[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["seo"].(map[string]any); ok {
-		for k, v := range m { config.SEO[k] = anyToString(v) }
+		for k, v := range m {
+			config.SEO[k] = anyToString(v)
+		}
 	}
 	// Top-level `csp:` block - per-directive allowlist extensions.
 	// Only the recognised directives are stored; unknown keys are
@@ -297,13 +321,19 @@ func LoadAppConfigYAML(dir string) *DesignConfig {
 		config.SEO["external_id"] = v
 	}
 	if m, ok := raw["auth"].(map[string]any); ok {
-		for k, v := range m { config.Auth[k] = anyToString(v) }
+		for k, v := range m {
+			config.Auth[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["pwa"].(map[string]any); ok {
-		for k, v := range m { config.PWA[k] = anyToString(v) }
+		for k, v := range m {
+			config.PWA[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["recording"].(map[string]any); ok {
-		for k, v := range m { config.Recording[k] = anyToString(v) }
+		for k, v := range m {
+			config.Recording[k] = anyToString(v)
+		}
 	}
 	if m, ok := raw["table"].(map[string]any); ok {
 		config.Table = m
@@ -478,9 +508,10 @@ func LoadWSRooms(dir string) []WSRoomRule {
 // missing or empty so apps without overrides pay zero cost.
 //
 // Shape:
-//   scopes:
-//     stories:
-//       public_read_when: "status = 'published'"
+//
+//	scopes:
+//	  stories:
+//	    public_read_when: "status = 'published'"
 func LoadScopes(dir string) map[string]ScopeConfig {
 	path := filepath.Join(dir, "app.yaml")
 	data, err := os.ReadFile(path)
@@ -748,12 +779,12 @@ func anyToString(v any) string {
 
 // WorkflowYAML is the raw YAML representation of a workflow.
 type WorkflowYAML struct {
-	Table        string                                `yaml:"table"`
-	Field        string                                `yaml:"field"`
-	Initial      string                                `yaml:"initial"`
-	Transitions  map[string]map[string]TransitionYAML  `yaml:"transitions"`
-	OnTransition map[string][]HookEntryYAML            `yaml:"on_transition"`
-	Timeout      map[string]TimeoutYAML                `yaml:"timeout"`
+	Table        string                               `yaml:"table"`
+	Field        string                               `yaml:"field"`
+	Initial      string                               `yaml:"initial"`
+	Transitions  map[string]map[string]TransitionYAML `yaml:"transitions"`
+	OnTransition map[string][]HookEntryYAML           `yaml:"on_transition"`
+	Timeout      map[string]TimeoutYAML               `yaml:"timeout"`
 }
 
 // TransitionYAML is the raw YAML for a single transition rule.
@@ -856,9 +887,9 @@ func parseWorkflowDuration(s string) time.Duration {
 
 // ComputedFieldYAML is a single computed field in YAML.
 type ComputedFieldYAML struct {
-	Expr     string                    `yaml:"expr"`
-	SQL      string                    `yaml:"sql"`
-	Triggers []ComputedTriggerDefYAML  `yaml:"triggers"`
+	Expr     string                   `yaml:"expr"`
+	SQL      string                   `yaml:"sql"`
+	Triggers []ComputedTriggerDefYAML `yaml:"triggers"`
 }
 
 // ComputedTriggerDefYAML is a trigger definition in YAML.
@@ -877,13 +908,13 @@ type ComputedTriggerDefYAML struct {
 //	  total:
 //	    expr: "quantity * price"
 //
-// 2. Flat list under `fields:` (used by most client apps - clearer to
-//    read top-to-bottom when an app has many computed fields):
+//  2. Flat list under `fields:` (used by most client apps - clearer to
+//     read top-to-bottom when an app has many computed fields):
 //
-//	fields:
-//	  - table: orders
-//	    column: total
-//	    expr: "quantity * price"
+//     fields:
+//     - table: orders
+//     column: total
+//     expr: "quantity * price"
 func LoadComputedFieldsYAML(dir string) *ComputedFieldConfig {
 	path := filepath.Join(dir, "computed.yaml")
 	data, err := os.ReadFile(path)

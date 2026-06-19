@@ -1209,15 +1209,16 @@ func truncate(s string, n int) string {
 // Issue #1.
 func StartAppWALMaintenance(app *App) {
 	safeGo("db.walMaintenance", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				select {
-				case <-app.Stop:
+				case <-stop:
 					return
 				default:
 				}

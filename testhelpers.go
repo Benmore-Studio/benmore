@@ -21,7 +21,7 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // newTestClient returns an HTTP client that authenticates with Bearer token.
 func newTestClient(token string) *http.Client {
 	return &http.Client{
-		Timeout: 5 * 1e9,
+		Timeout:   5 * 1e9,
 		Transport: &bearerTransport{token: token, base: http.DefaultTransport},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse

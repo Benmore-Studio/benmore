@@ -144,9 +144,9 @@ func TestOpenAPIListResponseMatchesRuntime(t *testing.T) {
 		t.Fatal("list 200 oneOf missing the bare-array variant")
 	}
 	for _, want := range []string{
-		"data,total,page,per_page,",   // offset page envelope
-		"data,next_cursor,limit,",     // cursor envelope
-		"count,",                      // count-only
+		"data,total,page,per_page,", // offset page envelope
+		"data,next_cursor,limit,",   // cursor envelope
+		"count,",                    // count-only
 	} {
 		if !keySets[want] {
 			t.Fatalf("list 200 oneOf missing variant with keys %q; got %v", want, keySets)

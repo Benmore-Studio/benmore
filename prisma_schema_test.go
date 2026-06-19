@@ -21,7 +21,7 @@ func TestCamelToSnake(t *testing.T) {
 		"firstName":   "first_name",
 		"createdAt":   "created_at",
 		"HTTPHeaders": "http_headers", // uppercase run + lowercase: word boundary at the last upper
-		"userID":      "user_id",       // single trailing upper run still snakes correctly
+		"userID":      "user_id",      // single trailing upper run still snakes correctly
 		"APIKey":      "api_key",
 		"":            "",
 	}
@@ -40,7 +40,7 @@ func TestPluralizeSnake(t *testing.T) {
 		"Box":         "boxes",
 		"Class":       "classes",
 		"UserSession": "user_sessions",
-		"Day":         "days",     // vowel + y, keeps y → days
+		"Day":         "days", // vowel + y, keeps y → days
 		"Toy":         "toys",
 		"OrderItem":   "order_items",
 	}

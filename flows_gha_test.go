@@ -35,11 +35,11 @@ func TestNormalizeGHARefs(t *testing.T) {
 		// keep working, AND so do `user.plan` / `user.first_name` /
 		// `user.<anything>`. We pass the expression through unchanged
 		// so the runtime's dotted-path lookup handles them uniformly.
-		`${{ user.email }}`:    `{{user.email}}`,
-		`${{ user.id }}`:       `{{user.id}}`,
-		`${{ user.role }}`:     `{{user.role}}`,
+		`${{ user.email }}`:      `{{user.email}}`,
+		`${{ user.id }}`:         `{{user.id}}`,
+		`${{ user.role }}`:       `{{user.role}}`,
 		`${{ user.first_name }}`: `{{user.first_name}}`,
-		`${{ user.plan }}`:     `{{user.plan}}`,
+		`${{ user.plan }}`:       `{{user.plan}}`,
 		// org_id / group_id is still a flat session key because the
 		// session row carries it (not the user row), so the legacy
 		// alias stays.
@@ -431,12 +431,12 @@ func TestResolveComputeArgsNative(t *testing.T) {
 func TestTranslateGHAExpr_FirstAlias(t *testing.T) {
 	cases := map[string]string{
 		"steps.q.outputs.first.group_id": "q.0.group_id", // the bug: now resolves to row 0
-		"steps.q.outputs.first":          "q.0",           // bare .first → row 0
-		"steps.q.outputs.rows[0].id":     "q.0.id",        // the workaround still works
-		"steps.q.outputs.firstname":      "q.firstname",   // word-boundary: real column, NOT mangled
-		"steps.q.outputs.email":          "q.email",       // generic single-row sugar unaffected
-		"steps.q.outputs.rows":           "q",             // result set unaffected
-		"params.invite_token":            "invite_token",  // unrelated branch unaffected
+		"steps.q.outputs.first":          "q.0",          // bare .first → row 0
+		"steps.q.outputs.rows[0].id":     "q.0.id",       // the workaround still works
+		"steps.q.outputs.firstname":      "q.firstname",  // word-boundary: real column, NOT mangled
+		"steps.q.outputs.email":          "q.email",      // generic single-row sugar unaffected
+		"steps.q.outputs.rows":           "q",            // result set unaffected
+		"params.invite_token":            "invite_token", // unrelated branch unaffected
 	}
 	for in, want := range cases {
 		if got := translateGHAExpr(in); got != want {

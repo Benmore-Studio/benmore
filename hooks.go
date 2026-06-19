@@ -33,11 +33,11 @@ type Hook struct {
 // and any case where a server-side data change should immediately
 // reach the UI without polling.
 //
-//   on_update:
-//     orders:
-//       - ws:
-//           room: "order-{{id}}"
-//           payload: {"status": "{{status}}", "by": "{{user_email}}"}
+//	on_update:
+//	  orders:
+//	    - ws:
+//	        room: "order-{{id}}"
+//	        payload: {"status": "{{status}}", "by": "{{user_email}}"}
 //
 // Room IDs are scoped server-side by the connected user's group/user
 // so messages can't leak across tenants - same model as bm.useLive
@@ -81,7 +81,7 @@ func LoadHooks(dir string) *HookConfig {
 		BeforeDelete: make(map[string][]Hook),
 	}
 
-	section := ""       // "on_insert", "on_update", "on_delete"
+	section := "" // "on_insert", "on_update", "on_delete"
 	currentTable := ""
 	var currentHook *Hook
 

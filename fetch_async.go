@@ -283,9 +283,9 @@ func ExpandFetchTagsAsync(content string, app *App, ctx *RenderContext) string {
 
 		// Build the internal fetch URL
 		params := url.Values{
-			"url":   {rawURL},
-			"as":    {as},
-			"t":     {templateHash},
+			"url": {rawURL},
+			"as":  {as},
+			"t":   {templateHash},
 		}
 		if cache != "" {
 			params.Set("cache", cache)

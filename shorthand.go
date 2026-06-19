@@ -29,14 +29,15 @@ func BuildJoinMap(db *sql.DB) JoinMap {
 // Used by <query from="..."> tags and all :model components.
 //
 // Attributes:
-//   table  - the base table name (from "from" or ":model")
-//   pick   - comma-separated columns, supports dot notation for joins (contact.name)
-//   hide   - comma-separated columns to exclude (inverse of pick)
-//   where  - WHERE condition (raw SQL expression)
-//   owned  - "true" for user_id scoping, or a column name like "assigned_to"
-//   sort   - "column [asc|desc]" (default: id DESC)
-//   limit  - max rows (default: 100)
-//   offset - skip rows
+//
+//	table  - the base table name (from "from" or ":model")
+//	pick   - comma-separated columns, supports dot notation for joins (contact.name)
+//	hide   - comma-separated columns to exclude (inverse of pick)
+//	where  - WHERE condition (raw SQL expression)
+//	owned  - "true" for user_id scoping, or a column name like "assigned_to"
+//	sort   - "column [asc|desc]" (default: id DESC)
+//	limit  - max rows (default: 100)
+//	offset - skip rows
 func ExpandShorthand(app *App, table string, attrs map[string]string, userID int64) (string, []any) {
 	if table == "" {
 		return "", nil

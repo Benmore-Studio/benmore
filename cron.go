@@ -273,6 +273,7 @@ func StartCronScheduler(app *App) {
 	stop := make(chan struct{})
 	app.CronStop = stop
 	go func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
 		// First tick: run any job that was scheduled in the last minute
@@ -289,7 +290,7 @@ func StartCronScheduler(app *App) {
 				// Hot reload retired this scheduler instance - a fresh
 				// one is already running with the latest cron.yaml.
 				return
-			case <-app.Stop:
+			case <-stop:
 				// Process shutdown.
 				return
 			}

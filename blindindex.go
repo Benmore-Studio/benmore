@@ -412,7 +412,8 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error
 // RegisterBlindIndexRoutes wires the per-app backfill endpoint.
 //
 // POST /api/_internal/blind/backfill
-//   body: {table: "users", column: "email", confirm: true}
+//
+//	body: {table: "users", column: "email", confirm: true}
 //
 // Admin-only, audit-logged. Symmetric with the encryption backfill +
 // rotation endpoints (item 4 + item 7 in the enterprise-hardening

@@ -329,9 +329,9 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 
 	// Build the payload
 	body := map[string]any{
-		"event": event,
-		"table": table,
-		"data":  rowData,
+		"event":     event,
+		"table":     table,
+		"data":      rowData,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}
 	if userEmail, ok := whData["user_email"]; ok {

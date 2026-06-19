@@ -1267,16 +1267,16 @@ func pascalCase(s string) string {
 // the irregular list; everything else just drops trailing `s`.
 func singularize(s string) string {
 	irregular := map[string]string{
-		"stories":     "story",
-		"categories":  "category",
-		"companies":   "company",
-		"countries":   "country",
-		"properties":  "property",
-		"libraries":   "library",
-		"queries":     "query",
-		"replies":     "reply",
-		"activities":  "activity",
-		"strategies":  "strategy",
+		"stories":    "story",
+		"categories": "category",
+		"companies":  "company",
+		"countries":  "country",
+		"properties": "property",
+		"libraries":  "library",
+		"queries":    "query",
+		"replies":    "reply",
+		"activities": "activity",
+		"strategies": "strategy",
 	}
 	if v, ok := irregular[s]; ok {
 		return v

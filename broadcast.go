@@ -111,12 +111,12 @@ func resolveSFUConfig(app *App) sfuConfig {
 
 // broadcastPublish - server proxy for the WebRTC publish flow.
 //
-//   1. Validate session (publisher MUST be authed).
-//   2. Validate slug shape; check no live publisher already on this slug
-//      (with TTL GC for stale rows).
-//   3. Create a CF Realtime SFU session.
-//   4. Forward the client's SDP offer with the session's local tracks.
-//   5. Store slug → sessionId, return CF's answer to the client.
+//  1. Validate session (publisher MUST be authed).
+//  2. Validate slug shape; check no live publisher already on this slug
+//     (with TTL GC for stale rows).
+//  3. Create a CF Realtime SFU session.
+//  4. Forward the client's SDP offer with the session's local tracks.
+//  5. Store slug → sessionId, return CF's answer to the client.
 //
 // On any CF API failure we return a 502 with the upstream error so
 // the agent sees what went wrong (vs. a 200 with broken SDP that
@@ -378,8 +378,8 @@ type cfTracksReq struct {
 }
 
 type cfTrack struct {
-	Location  string `json:"location"`           // "local" (publish) | "remote" (pull)
-	Mid       string `json:"mid,omitempty"`      // local: SDP m-line index
+	Location  string `json:"location"`      // "local" (publish) | "remote" (pull)
+	Mid       string `json:"mid,omitempty"` // local: SDP m-line index
 	TrackName string `json:"trackName"`
 	SessionID string `json:"sessionId,omitempty"` // remote: source publisher's session
 }

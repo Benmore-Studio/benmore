@@ -125,10 +125,10 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 		}
 		count := presenceMemberCount(app.DB, slug)
 		httpJSON(w, http.StatusOK, map[string]any{
-			"ok":             true,
-			"members":        count,
-			"expires_in_s":   int(presenceExpiryWindow.Seconds()),
-			"heartbeat_s":    presenceHeartbeatS,
+			"ok":           true,
+			"members":      count,
+			"expires_in_s": int(presenceExpiryWindow.Seconds()),
+			"heartbeat_s":  presenceHeartbeatS,
 		})
 	})
 
@@ -203,11 +203,12 @@ func presenceMembers(db *sql.DB, slug string) []map[string]any {
 // Stops when app.Stop closes (matches the cron + jobs worker pattern).
 func StartPresenceSweeper(app *App) {
 	safeGo("presence.sweep", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(presenceSweepEvery)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				res, err := app.DB.Exec(

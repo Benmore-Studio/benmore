@@ -298,7 +298,7 @@ func generateLifecycleTests(app *App) AppTestFile {
 			},
 			// Step 2: Verify via SQL (since we don't have the ID in JSON path yet)
 			{
-				SQL: fmt.Sprintf("SELECT * FROM %s WHERE %s = '%s' AND deleted_at IS NULL", table, identCol, identVal),
+				SQL:    fmt.Sprintf("SELECT * FROM %s WHERE %s = '%s' AND deleted_at IS NULL", table, identCol, identVal),
 				Expect: AppTestExpect{Rows: 1},
 			},
 		}
@@ -310,7 +310,7 @@ func generateLifecycleTests(app *App) AppTestFile {
 			})
 			// Step 4: Verify update
 			steps = append(steps, AppTestStep{
-				SQL: fmt.Sprintf("SELECT * FROM %s WHERE %s = '%s' AND %s = 'lifecycle_updated'", table, identCol, identVal, updateCol),
+				SQL:    fmt.Sprintf("SELECT * FROM %s WHERE %s = '%s' AND %s = 'lifecycle_updated'", table, identCol, identVal, updateCol),
 				Expect: AppTestExpect{Rows: 1},
 			})
 		}
@@ -870,7 +870,6 @@ func generateWorkflowTests(app *App) AppTestFile {
 
 	return AppTestFile{Name: "_framework_workflows", Tests: tests}
 }
-
 
 // pageExists reports whether the app has a registered page at the
 // given route. Used by the auth test generator to differentiate SPA

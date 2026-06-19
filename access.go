@@ -553,16 +553,16 @@ func implicitDefault(tableHasUserID, tableHasGroupKey bool) string {
 //
 // Accepted shapes (both work, mixable per table):
 //
-//   access:
-//     posts:                 # per-op map
-//       read: public
-//       write: self
-//     messages:              # shorthand: same mode for all ops
-//       all: everyone
-//     comments: admin        # tightest shorthand - string-as-mode → all
-//     default:               # global per-op fallback
-//       read: admin
-//       write: admin
+//	access:
+//	  posts:                 # per-op map
+//	    read: public
+//	    write: self
+//	  messages:              # shorthand: same mode for all ops
+//	    all: everyone
+//	  comments: admin        # tightest shorthand - string-as-mode → all
+//	  default:               # global per-op fallback
+//	    read: admin
+//	    write: admin
 //
 // Unrecognized modes are kept verbatim - `Allowed` rejects them at
 // request time and logs a fail-closed warning, so a typo halts traffic

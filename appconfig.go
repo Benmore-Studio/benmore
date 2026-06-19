@@ -27,7 +27,7 @@ func LoadAppConfig(dir string) *DesignConfig {
 		SEO:        make(map[string]string),
 		CSP:        make(map[string]string),
 		Auth:       make(map[string]string),
-PWA:        make(map[string]string),	}
+		PWA:        make(map[string]string)}
 
 	section := ""
 	for _, line := range strings.Split(string(data), "\n") {

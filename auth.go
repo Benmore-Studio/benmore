@@ -866,13 +866,13 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 		})
 
 		httpJSON(w, http.StatusOK, map[string]any{
-			"token":         impersonatedSessionID,
-			"admin_token":   adminSessionID,
-			"user_id":       body.UserID,
-			"email":         email,
-			"role":          role,
-			"expires_in":    "1h",
-			"admin_note":    "Impersonated session - 1h TTL, all actions audited",
+			"token":       impersonatedSessionID,
+			"admin_token": adminSessionID,
+			"user_id":     body.UserID,
+			"email":       email,
+			"role":        role,
+			"expires_in":  "1h",
+			"admin_note":  "Impersonated session - 1h TTL, all actions audited",
 		})
 	})
 
@@ -1382,8 +1382,6 @@ func sendOTPChallenge(w http.ResponseWriter, r *http.Request, app *App) {
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
-
-
 func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 	mergeJSONBodyIntoForm(r)
 	code := strings.TrimSpace(r.FormValue("code"))
@@ -1836,7 +1834,6 @@ func verifyTempCookie(signed string) string {
 // Auto-generated auth pages removed. Developer creates their own pages
 // with type="login", type="signup", etc. Errors via ?error= query param.
 
-
 // authRedirect redirects to an auth page path with an optional error message.
 // Error is passed as a query param so the developer's template can show it
 // via {{param_error}}. This replaces all auto-generated page rendering.
@@ -2219,7 +2216,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	var body struct {
-		Email    string `json:"email"`    // also accepts username/phone depending on auth.identifier
+		Email    string `json:"email"` // also accepts username/phone depending on auth.identifier
 		Password string `json:"password"`
 		Scopes   string `json:"scopes"`   // optional: "contacts:read deals:write"
 		MFACode  string `json:"mfa_code"` // required if user has MFA enabled

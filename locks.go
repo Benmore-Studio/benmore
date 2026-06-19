@@ -297,16 +297,17 @@ func CheckLock(db *sql.DB, table, rowID string, userID int64) (bool, string) {
 // doesn't leak and spam errors against a closed DB handle.
 func StartLockCleanupWorker(app *App) {
 	safeGo("locks.cleanup", func() {
+		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-app.Stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				// Re-check Stop in case it was closed while we were blocked on the tick
 				select {
-				case <-app.Stop:
+				case <-stop:
 					return
 				default:
 				}

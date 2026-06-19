@@ -130,7 +130,7 @@ func TestLoadEnv_UnsetVarRemovedFromStore(t *testing.T) {
 // it, hit the main scanner, found nothing in flatData (env vars
 // weren't surfaced there), and triggered the v2.7.6 default-pipe
 // short-circuit. The result: every agent who wrote
-// `${{ env.STRIPE_KEY | default:'' }}` got the empty default
+// `${{ env.STRIPE_KEY | default:” }}` got the empty default
 // instead of the actual key - silently misconfiguring outbound
 // auth.
 func TestFlatDataForCtx_EnvOverlay_ResolvesPipeForm(t *testing.T) {

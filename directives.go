@@ -55,9 +55,9 @@ func compileCreateDirectives(content string) string {
 			return match
 		}
 
-		prefix := m[1]   // <form ...
-		table := m[2]    // table name
-		suffix := m[3]   // remaining attrs
+		prefix := m[1] // <form ...
+		table := m[2]  // table name
+		suffix := m[3] // remaining attrs
 
 		// Build HTMX form attributes
 		hxAttrs := fmt.Sprintf(
@@ -82,10 +82,10 @@ func compileDeleteDirectives(content string) string {
 			return match
 		}
 
-		prefix := m[1]  // <button ...
-		table := m[2]   // table name
-		id := m[3]      // ID expression (may contain mustache)
-		suffix := m[4]  // remaining attrs
+		prefix := m[1] // <button ...
+		table := m[2]  // table name
+		id := m[3]     // ID expression (may contain mustache)
+		suffix := m[4] // remaining attrs
 
 		// Build HTMX delete attributes
 		// hx-target uses a single `closest` keyword with a comma-separated
@@ -161,10 +161,10 @@ func compilePatchDirectives(content string) string {
 			return match
 		}
 
-		prefix := m[1]  // <element ...
-		url := m[2]     // /api/table/:id
-		set := m[3]     // field=value
-		suffix := m[4]  // remaining attrs
+		prefix := m[1] // <element ...
+		url := m[2]    // /api/table/:id
+		set := m[3]    // field=value
+		suffix := m[4] // remaining attrs
 
 		// Emit hx-vals as a DOUBLE-quoted attribute with " escaped to &quot;.
 		// Single-quoted was fragile: if a user value (or a mustache block that

@@ -283,20 +283,19 @@ func gotmplHelpers(app *App, ctx *RenderContext) template.FuncMap {
 	return fm
 }
 
-
 // isSingleRowQuery returns true when a frontmatter query is shaped to
 // produce at most one row. Two triggers:
 //
-//   1. Trailing `LIMIT 1` (case-insensitive, whitespace-tolerant, may
-//      have a trailing semicolon). Covers per-user profile, app config,
-//      latest thing.
-//   2. Pure-aggregate SELECT with no GROUP BY - every projected column
-//      is wrapped in an aggregate function (COUNT/SUM/AVG/MAX/MIN/TOTAL)
-//      or is a constant. SQL guarantees this returns exactly one row.
-//      Covers the stat-card / dashboard query shape:
-//          SELECT COUNT(*) AS total, SUM(amount) AS revenue FROM orders
-//      The agent shouldn't have to remember LIMIT 1 to make `.stats.total`
-//      work - the query shape already promises it.
+//  1. Trailing `LIMIT 1` (case-insensitive, whitespace-tolerant, may
+//     have a trailing semicolon). Covers per-user profile, app config,
+//     latest thing.
+//  2. Pure-aggregate SELECT with no GROUP BY - every projected column
+//     is wrapped in an aggregate function (COUNT/SUM/AVG/MAX/MIN/TOTAL)
+//     or is a constant. SQL guarantees this returns exactly one row.
+//     Covers the stat-card / dashboard query shape:
+//     SELECT COUNT(*) AS total, SUM(amount) AS revenue FROM orders
+//     The agent shouldn't have to remember LIMIT 1 to make `.stats.total`
+//     work - the query shape already promises it.
 //
 // When true, the renderer stores the row as a map directly. Templates
 // write `.stats.total` and missing/zero-row cases resolve cleanly via
@@ -305,7 +304,9 @@ var singleRowQueryRe = regexp.MustCompile(`(?i)\blimit\s+1\s*;?\s*$`)
 
 // aggregateSelectRe matches a SELECT statement whose every output column
 // is an aggregate (or constant) AND has no GROUP BY. The shape we recognize:
-//   SELECT <aggregate-expr>[, <aggregate-expr>]* FROM ... [WHERE ...] [;]
+//
+//	SELECT <aggregate-expr>[, <aggregate-expr>]* FROM ... [WHERE ...] [;]
+//
 // where each aggregate-expr starts with COUNT|SUM|AVG|MIN|MAX|TOTAL.
 // We can't fully parse SQL with a regex, so we accept false negatives
 // (complex projections) but want zero false positives (no GROUP BY).
@@ -478,4 +479,3 @@ func EnvLookup(appDir, key string) string {
 	}
 	return ""
 }
-

@@ -32,19 +32,19 @@ import (
 //
 // Two equivalent forms supported in YAML:
 //
-//   1. Named built-in recipe + bindings:
-//        sign:
-//          recipe: aws_sigv4
-//          region: us-east-1
-//          service: athena
+//  1. Named built-in recipe + bindings:
+//     sign:
+//     recipe: aws_sigv4
+//     region: us-east-1
+//     service: athena
 //
-//   2. Inline recipe (compute / headers / before / query):
-//        sign:
-//          compute:
-//            ts:  "{{ now | unix }}"
-//            sig: "{{ env.STRIPE_SECRET | hmac_sha256:'{{ts}}.{{body}}' | hex }}"
-//          headers:
-//            Stripe-Signature: "t={{ts}},v1={{sig}}"
+//  2. Inline recipe (compute / headers / before / query):
+//     sign:
+//     compute:
+//     ts:  "{{ now | unix }}"
+//     sig: "{{ env.STRIPE_SECRET | hmac_sha256:'{{ts}}.{{body}}' | hex }}"
+//     headers:
+//     Stripe-Signature: "t={{ts}},v1={{sig}}"
 //
 // If Recipe is non-empty, the named built-in is looked up and its
 // definition is used (Inline is ignored). Bindings is passed in

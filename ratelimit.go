@@ -27,7 +27,7 @@ type RateLimiter struct {
 	rate     int           // requests per window
 	window   time.Duration // time window
 	// Shared mode fields (cluster)
-	db     *sql.DB // non-nil = shared mode via SQLite
+	db *sql.DB // non-nil = shared mode via SQLite
 }
 
 type visitor struct {
@@ -75,8 +75,11 @@ func newRateLimiter(rate int, window time.Duration, stop <-chan struct{}) *RateL
 }
 
 // NewSharedRateLimiter creates a SQLite-backed rate limiter for cluster mode.
-// Uses the _benmore_rate_limits table for cross-instance consistency.
-func NewSharedRateLimiter(db *sql.DB, rate int, window time.Duration) *RateLimiter {
+// Uses the _benmore_rate_limits table for cross-instance consistency. `stop`
+// (typically app.Stop) reclaims the cleanup goroutine on hot reload - without
+// it, wrapMiddleware leaked one cleanup goroutine per reload. Pass nil for a
+// process-lifetime limiter.
+func NewSharedRateLimiter(db *sql.DB, rate int, window time.Duration, stop <-chan struct{}) *RateLimiter {
 	EnsureRateLimitsTable(db)
 	rl := &RateLimiter{
 		visitors: make(map[string]*visitor),
@@ -84,11 +87,17 @@ func NewSharedRateLimiter(db *sql.DB, rate int, window time.Duration) *RateLimit
 		window:   window,
 		db:       db,
 	}
-	// Cleanup stale entries every 5 minutes
+	// Cleanup stale entries every 5 minutes, until stop is closed.
 	safeGo("rateLimit.cleanup2", func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
 		for {
-			time.Sleep(5 * time.Minute)
-			rl.cleanupShared()
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				rl.cleanupShared()
+			}
 		}
 	})
 	return rl
@@ -191,19 +200,32 @@ func (rl *RateLimiter) cleanup() {
 // Caller MUST hold rl.mu. Used as the overflow valve when the map hits
 // realtimeMaxVisitors (H-17): O(n) but only runs at the cap, which a
 // healthy instance never reaches.
+// evictStalestLocked frees headroom when the visitor map hits the cap. It
+// evicts a BATCH (~10%) per call rather than a single stalest entry, so it does
+// not run a full O(n) scan on EVERY insert during a distinct-key flood - which
+// would turn the H-17 memory-DoS defense into a CPU/lock-contention DoS (the
+// scan runs under rl.mu, serializing all Allow callers). Batching amortizes the
+// scan to ~O(1) per insert: one pass frees room for the next ~N/10 inserts.
 func (rl *RateLimiter) evictStalestLocked() {
-	var oldestKey string
-	var oldest time.Time
-	first := true
+	target := len(rl.visitors)/10 + 1 // free ~10% so the next ~N/10 inserts skip this
+	cutoff := time.Now().Add(-rl.window)
+	removed := 0
+	// First pass: drop genuinely stale entries (expired windows = real garbage).
 	for k, v := range rl.visitors {
-		if first || v.lastReset.Before(oldest) {
-			oldestKey = k
-			oldest = v.lastReset
-			first = false
+		if v.lastReset.Before(cutoff) {
+			delete(rl.visitors, k)
+			removed++
 		}
 	}
-	if !first {
-		delete(rl.visitors, oldestKey)
+	// If stale entries didn't free enough (e.g. a burst of all-fresh keys),
+	// drop arbitrary entries until the target is met. Map iteration order is
+	// randomized, so this is an unbiased sample - fine for flood garbage.
+	for k := range rl.visitors {
+		if removed >= target {
+			break
+		}
+		delete(rl.visitors, k)
+		removed++
 	}
 }
 
@@ -276,6 +298,7 @@ func AuthRateLimiter() *RateLimiter {
 }
 
 // SharedAuthRateLimiter creates a SQLite-backed auth rate limiter for cluster mode.
+// nil stop = process-lifetime cleanup (callers that live for the whole process).
 func SharedAuthRateLimiter(db *sql.DB) *RateLimiter {
-	return NewSharedRateLimiter(db, 5, time.Minute)
+	return NewSharedRateLimiter(db, 5, time.Minute, nil)
 }
