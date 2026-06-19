@@ -1396,12 +1396,258 @@ const cache = {
   },
 };
 
+// =================================================================
+//  store - small app-state primitive (Zustand-shaped, no dependency)
+// =================================================================
+
+function shallowEqualObject(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const ak = Object.keys(a), bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) if (!Object.is(a[k], b[k])) return false;
+  return true;
+}
+
+function resolveStoreCache(persist) {
+  if (!persist || !persist.name) return null;
+  const kind = persist.storage === 'persistent' ? 'persistent' : 'namespaced';
+  return cache[kind](persist.name, persist.version || 'v0');
+}
+
+export function createStore(initialState = {}, opts = {}) {
+  const base = (initialState && typeof initialState === 'object') ? initialState : {};
+  const persist = opts.persist || opts.cache;
+  const storage = resolveStoreCache(persist);
+  let state = base;
+  if (storage) {
+    try {
+      const raw = storage.get();
+      if (raw) state = { ...base, ...JSON.parse(raw) };
+    } catch {}
+  }
+  const initial = { ...state };
+  const subs = new Set();
+
+  const notify = (prev) => {
+    subs.forEach((sub) => {
+      let nextSlice;
+      try { nextSlice = sub.selector(state); } catch (e) { console.warn('[bm.store] selector threw:', e); return; }
+      if (!sub.equal(nextSlice, sub.slice)) {
+        const oldSlice = sub.slice;
+        sub.slice = nextSlice;
+        try { sub.listener(nextSlice, oldSlice); } catch (e) { console.warn('[bm.store] listener threw:', e); }
+      }
+    });
+    void prev;
+  };
+
+  const persistState = () => {
+    if (!storage) return;
+    try { storage.set(JSON.stringify(state)); } catch {}
+  };
+
+  return {
+    get: () => state,
+    set(patch) {
+      const prev = state;
+      let next = (typeof patch === 'function') ? patch(state) : patch;
+      if (next == null) return state;
+      if (typeof next === 'object' && !Array.isArray(next)) next = { ...state, ...next };
+      if (Object.is(next, state) || shallowEqualObject(next, state)) return state;
+      state = next;
+      persistState();
+      notify(prev);
+      return state;
+    },
+    subscribe(selector, listener, equal = Object.is) {
+      if (typeof listener !== 'function') {
+        listener = selector;
+        selector = (s) => s;
+      }
+      if (typeof selector !== 'function' || typeof listener !== 'function') {
+        throw new Error('bm.createStore().subscribe(selector, listener) requires a listener');
+      }
+      const sub = { selector, listener, equal, slice: selector(state) };
+      subs.add(sub);
+      return () => subs.delete(sub);
+    },
+    reset(nextState) {
+      const prev = state;
+      state = nextState && typeof nextState === 'object' ? { ...nextState } : { ...initial };
+      persistState();
+      notify(prev);
+      return state;
+    },
+  };
+}
+
+// =================================================================
+//  query - key-based fetch/mutation cache for app data
+// =================================================================
+
+function stableStringify(value) {
+  if (value == null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function queryKey(key) {
+  return typeof key === 'string' ? key : stableStringify(key);
+}
+
+const _queryCache = new Map();
+const _queryTableKeys = new Map();
+let _queryLiveStop = null;
+
+function queryEntry(key) {
+  const k = queryKey(key);
+  if (!_queryCache.has(k)) {
+    _queryCache.set(k, { key: k, rawKey: key, data: undefined, error: null, updatedAt: 0, promise: null, fetcher: null, staleTime: 0, subs: new Set() });
+  }
+  return _queryCache.get(k);
+}
+
+function notifyQuery(e) {
+  e.subs.forEach((fn) => { try { fn({ data: e.data, error: e.error, updatedAt: e.updatedAt, pending: !!e.promise }); } catch (err) { console.warn('[bm.query] subscriber threw:', err); } });
+}
+
+function rememberTableKey(tableName, key) {
+  if (!tableName) return;
+  const k = queryKey(key);
+  if (!_queryTableKeys.has(tableName)) _queryTableKeys.set(tableName, new Set());
+  _queryTableKeys.get(tableName).add(k);
+}
+
+function ensureQueryLiveInvalidation() {
+  if (_queryLiveStop || typeof live !== 'function' || typeof EventSource === 'undefined') return;
+  _queryLiveStop = live('*', (ev) => {
+    if (!ev || !ev.table) return;
+    query.invalidateTable(ev.table, { refetch: true });
+  });
+}
+
+export const query = {
+  key: queryKey,
+  stableStringify,
+  get(key) {
+    return queryEntry(key).data;
+  },
+  set(key, data) {
+    const e = queryEntry(key);
+    e.data = data;
+    e.error = null;
+    e.updatedAt = Date.now();
+    notifyQuery(e);
+    return data;
+  },
+  subscribe(key, fn) {
+    if (typeof fn !== 'function') throw new Error('bm.query.subscribe(key, fn) requires a function');
+    const e = queryEntry(key);
+    e.subs.add(fn);
+    fn({ data: e.data, error: e.error, updatedAt: e.updatedAt, pending: !!e.promise });
+    return () => e.subs.delete(fn);
+  },
+  async fetch(key, fetcher, opts = {}) {
+    if (typeof fetcher !== 'function') throw new Error('bm.query.fetch(key, fetcher) requires a fetcher');
+    const e = queryEntry(key);
+    const staleTime = Number(opts.staleTime || opts.staleMs || 0);
+    e.fetcher = fetcher;
+    e.staleTime = staleTime;
+    if (!opts.force && e.data !== undefined && staleTime > 0 && Date.now() - e.updatedAt < staleTime) return e.data;
+    if (e.promise) return e.promise;
+    e.promise = Promise.resolve()
+      .then(fetcher)
+      .then((data) => {
+        e.data = data;
+        e.error = null;
+        e.updatedAt = Date.now();
+        return data;
+      })
+      .catch((err) => {
+        e.error = err;
+        throw err;
+      })
+      .finally(() => {
+        e.promise = null;
+        notifyQuery(e);
+      });
+    notifyQuery(e);
+    return e.promise;
+  },
+  async refetch(key) {
+    const e = queryEntry(key);
+    if (!e.fetcher) return e.data;
+    return query.fetch(e.rawKey, e.fetcher, { force: true, staleTime: e.staleTime });
+  },
+  invalidate(match, opts = {}) {
+    const keys = [];
+    const predicate = typeof match === 'function'
+      ? match
+      : (raw, stable) => stable === queryKey(match) || stable.startsWith(queryKey(match));
+    for (const [stable, e] of _queryCache.entries()) {
+      if (!predicate(e.rawKey, stable)) continue;
+      e.updatedAt = 0;
+      keys.push(stable);
+      notifyQuery(e);
+      if (opts.refetch && e.fetcher) query.refetch(e.rawKey).catch(() => {});
+    }
+    return keys;
+  },
+  tableKey(tableName, spec = {}) {
+    return ['table', tableName, spec];
+  },
+  async read(spec, opts = {}) {
+    if (!spec || !spec.table) throw new Error('bm.query.read({ table, ... }) requires table');
+    const key = opts.key || ['query', spec];
+    if (opts.live !== false) {
+      rememberTableKey(spec.table, key);
+      ensureQueryLiveInvalidation();
+    }
+    return query.fetch(key, async () => {
+      const r = await api.post('/api/_query', spec);
+      return Array.isArray(r) ? r : (r.rows || []);
+    }, opts);
+  },
+  table(tableName, opts = {}) {
+    const { staleTime, staleMs, force, live, key, ...serverOpts } = opts;
+    const spec = { ...serverOpts, table: tableName };
+    return query.read(spec, { key: query.tableKey(tableName, opts), staleTime: opts.staleTime, live: opts.live });
+  },
+  invalidateTable(tableName, opts = {}) {
+    const keys = _queryTableKeys.get(tableName);
+    if (!keys) return [];
+    return query.invalidate((_raw, stable) => keys.has(stable), opts);
+  },
+  async mutate(opts = {}) {
+    if (typeof opts.request !== 'function') throw new Error('bm.query.mutate({ request }) requires request');
+    const keys = Array.isArray(opts.keys) ? opts.keys : (opts.key ? [opts.key] : []);
+    const snapshots = keys.map((key) => ({ key, data: query.get(key) }));
+    try {
+      if (typeof opts.apply === 'function') {
+        for (const snap of snapshots) query.set(snap.key, opts.apply(snap.data, snap.key));
+      }
+      const result = await opts.request();
+      if (opts.invalidate) query.invalidate(opts.invalidate, { refetch: opts.refetch !== false });
+      return result;
+    } catch (err) {
+      if (typeof opts.rollback === 'function') {
+        for (const snap of snapshots) query.set(snap.key, opts.rollback(snap.data, err, snap.key));
+      } else {
+        for (const snap of snapshots) query.set(snap.key, snap.data);
+      }
+      throw err;
+    }
+  },
+};
+
 const bm = {
   api, auth, users, table, live, room,
   flows, workflow, aggregate, aggregates, jobs,
   notifications, upload, audit, permissions, signedUrl,
   t, mfa, webrtc, broadcast, markdown, presence, cache,
-  html, raw,
+  createStore, query, html, raw,
 };
 export default bm;
 
