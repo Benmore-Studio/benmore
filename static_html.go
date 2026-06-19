@@ -72,26 +72,30 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 		filepath.Join(staticRoot, rel),
 	}
 	for _, candidate := range candidates {
-		// Defense-in-depth: verify the resolved path stays inside static/.
-		// filepath.Clean has already removed `..`, but an absolute symlink
-		// could still escape - Stat follows symlinks, so a check on the
-		// resolved path catches that case.
-		if !strings.HasPrefix(candidate, staticRoot+string(filepath.Separator)) &&
-			candidate != staticRoot {
-			continue
-		}
-		st, err := os.Stat(candidate)
-		if err != nil || st.IsDir() {
+		// Verify the symlink-RESOLVED path stays inside static/. filepath.Clean
+		// has already removed `..`, but Stat/ServeFile follow symlinks, so a
+		// link escaping static/ needs EvalSymlinks-based containment
+		// (resolveServableFile, see static_file_security.go).
+		resolved, ok := resolveServableFile(staticRoot, candidate)
+		if !ok {
+			// A candidate that exists on disk (even as a symlink) but is
+			// rejected by the resolver is a containment block, not a plain
+			// miss: stop rather than fall through to the SPA index for an
+			// escaping symlink. Mark no-store so the 404 isn't cached.
+			if _, lerr := os.Lstat(candidate); lerr == nil {
+				w.Header().Set("Cache-Control", "no-store")
+				return false
+			}
 			continue
 		}
 		// Only inject CSRF on actual .html files. Other extensions
 		// (.js, .css, .png) fall through to the /static/ handler
 		// when the agent uses absolute paths - but if someone serves
 		// them via clean URL routing too, just stream them as-is.
-		if strings.HasSuffix(strings.ToLower(candidate), ".html") {
-			return tryServeHTMLFile(w, r, app, candidate)
+		if strings.HasSuffix(strings.ToLower(resolved), ".html") {
+			return tryServeHTMLFile(w, r, app, resolved)
 		}
-		http.ServeFile(w, r, candidate)
+		http.ServeFile(w, r, resolved)
 		return true
 	}
 
@@ -124,6 +128,16 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 // the read failed (in which case the caller falls through to 404 - no
 // response has been written yet).
 func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path string) bool {
+	// Confirm the symlink-resolved path stays within static/ before reading
+	// (callers may pass a path that escapes via symlink).
+	if app != nil {
+		staticRoot := filepath.Join(app.Dir, "static")
+		resolved, ok := resolveServableFile(staticRoot, path)
+		if !ok {
+			return false
+		}
+		path = resolved
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false

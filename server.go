@@ -611,64 +611,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// SECURITY: all file paths sanitized to prevent directory traversal
 	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
 		requested := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/static/"))
-		// v2.7.21+: TSX-by-default. When the agent writes static/index.tsx,
-		// the HTML still references /static/index.js - we look for a .tsx
-		// counterpart, transpile via embedded esbuild (Go API; no Node),
-		// serve the JS. Cached in-memory by file mtime.
-		if serveTSXIfPresent(w, r, app, requested) {
-			return
-		}
-		if !dev {
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		}
-		fullPath := filepath.Join(app.Dir, "static", requested)
-		// Verify path stays within static directory. Separator-terminated
-		// prefix check (not bare HasPrefix) so a sibling like `static-old/`
-		// can't be reached via `/static/../static-old/x` - same containment
-		// bug class as the platform deploy extractor. ServeMux normalizes
-		// `..` before routing, so this is defense-in-depth, but it must be
-		// correct regardless of the front proxy.
-		staticRoot := filepath.Join(app.Dir, "static")
-		if fullPath != staticRoot && !strings.HasPrefix(fullPath, staticRoot+string(filepath.Separator)) {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, fullPath)
+		serveStaticAsset(w, r, app, dev, requested)
 	})
 	mux.HandleFunc("GET /uploads/", func(w http.ResponseWriter, r *http.Request) {
 		relativePath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/uploads/"))
-		fullPath := filepath.Join(app.Dir, "uploads", relativePath)
-		// Verify path stays within uploads directory (separator-terminated
-		// prefix - see the /static/ handler above for the rationale).
-		uploadsRoot := filepath.Join(app.Dir, "uploads")
-		if fullPath != uploadsRoot && !strings.HasPrefix(fullPath, uploadsRoot+string(filepath.Separator)) {
-			http.NotFound(w, r)
-			return
-		}
-		// Private files require signed URLs. Gate with the SAME predicate the
-		// signer uses so the serve side and sign side agree on what "private"
-		// means. relativePath here is the path under uploads/ (the signer's
-		// isPrivateUploadPath keys off the full logical "uploads/..." path), so
-		// re-prefix "uploads/" before the check. This catches BOTH a top-level
-		// private/ file and a nested */private/* segment (e.g.
-		// userdocs/private/ssn.pdf), which the old top-level-only prefix check
-		// served with no signature. Fail closed: any private/ segment must
-		// require a valid signature.
-		if isPrivateUploadPath("uploads/" + filepath.ToSlash(relativePath)) {
-			if !ValidateSignedURL(relativePath, r) {
-				http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
-				return
-			}
-		}
-		if !dev {
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-		}
-		// Force download for active-content types so a user-uploaded
-		// .html / .svg / .xml can't execute JS in the app's origin.
-		// Extension allowlist for inline render covers the common safe
-		// media types; everything else gets attachment disposition.
-		applyUploadDispositionHeaders(w, fullPath)
-		http.ServeFile(w, r, fullPath)
+		serveUploadAsset(w, r, app, dev, relativePath)
 	})
 	RegisterSignedURLRoutes(mux, app)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -737,6 +684,91 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	})
 
 	return mux
+}
+
+// serveStaticAsset serves a file from the app's static/ directory with
+// symlink-escape containment (see static_file_security.go).
+func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool, requested string) {
+	// v2.7.21+: TSX-by-default. When the agent writes static/index.tsx,
+	// the HTML still references /static/index.js - we look for a .tsx
+	// counterpart, transpile via embedded esbuild (Go API; no Node),
+	// serve the JS. Cached in-memory by file mtime.
+	if serveTSXIfPresent(w, r, app, requested) {
+		return
+	}
+	fullPath := filepath.Join(app.Dir, "static", requested)
+	// Verify path stays within static directory, resolving symlinks so a
+	// link inside static/ can't point outside it (containment on the
+	// EvalSymlinks-resolved real path - see static_file_security.go).
+	// ServeMux normalizes `..` before routing, so the lexical part is
+	// defense-in-depth, but symlink-escape is not caught by filepath.Clean.
+	staticRoot := filepath.Join(app.Dir, "static")
+	resolved, ok := resolveServableFile(staticRoot, fullPath)
+	if !ok {
+		// no-store so browsers/CDNs don't pin a deploy-race miss.
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if !dev {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	http.ServeFile(w, r, resolved)
+}
+
+// serveUploadAsset serves a file from the app's uploads/ directory, enforcing
+// signed-URL access for private files (both URL-spelled and symlink-resolved)
+// and symlink-escape containment.
+func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool, relativePath string) {
+	fullPath := filepath.Join(app.Dir, "uploads", relativePath)
+	uploadsRoot := filepath.Join(app.Dir, "uploads")
+	// Private files require signed URLs. Gate with the SAME predicate the
+	// signer uses so the serve side and sign side agree on what "private"
+	// means. relativePath is the path under uploads/ (the signer's
+	// isPrivateUploadPath keys off the full logical "uploads/..." path), so
+	// re-prefix "uploads/" before the check. This catches BOTH a top-level
+	// private/ file and a nested */private/* segment (e.g.
+	// userdocs/private/ssn.pdf). Keep this BEFORE file resolution so
+	// unsigned callers can't distinguish missing from existing private files.
+	if isPrivateUploadPath("uploads/" + filepath.ToSlash(relativePath)) {
+		if !ValidateSignedURL(relativePath, r) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
+			return
+		}
+	}
+	// Resolve symlinks and confirm containment within uploads/ (filepath.Clean
+	// alone does not catch a symlink inside uploads/ pointing elsewhere).
+	resolved, ok := resolveServableFile(uploadsRoot, fullPath)
+	if !ok {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	// Re-check the private gate against the symlink-RESOLVED target: a
+	// non-private URL (e.g. uploads/public.png) that is a symlink into
+	// private/ would pass the URL-based check above yet resolve to a private
+	// file. EvalSymlinks both sides so e.g. macOS /var -> /private/var
+	// normalizes consistently.
+	privateBase := uploadsRoot
+	if realUploads, err := filepath.EvalSymlinks(uploadsRoot); err == nil {
+		privateBase = realUploads
+	}
+	if rel, err := filepath.Rel(privateBase, resolved); err != nil ||
+		rel == "private" || strings.HasPrefix(rel, "private"+string(filepath.Separator)) {
+		if err != nil || !ValidateSignedURL(relativePath, r) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
+			return
+		}
+	}
+	if !dev {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	}
+	// Force download for active-content types so a user-uploaded
+	// .html / .svg / .xml can't execute JS in the app's origin.
+	applyUploadDispositionHeaders(w, resolved)
+	http.ServeFile(w, r, resolved)
 }
 
 // wrapMiddleware applies the standard middleware chain to a handler.
