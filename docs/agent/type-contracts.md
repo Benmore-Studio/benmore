@@ -5,6 +5,8 @@ column types, flow signatures, and SDK methods in their editor. A compile
 fixture is the fastest way to catch drift: valid SDK usage must compile, while
 wrong table names and wrong field shapes must fail.
 
+<!-- This flow mirrors the diagram in PR #7's description. If the flow changes,
+keep the node names below and in the PR body in sync. -->
 ```mermaid
 flowchart LR
   Schema[App tables] --> Generate[GenerateBMTypes]
