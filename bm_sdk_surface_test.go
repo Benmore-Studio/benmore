@@ -19,7 +19,7 @@ func TestEmbeddedBMSDKStoreAndQuerySurface(t *testing.T) {
 		"async fetch(key, fetcher",
 		"async read(spec",
 		"async mutate(opts",
-		"query.invalidateTable(ev.table",
+		"query.invalidateTable(table,",
 		"createStore, query, html, raw",
 	}
 	for _, s := range mustContain {

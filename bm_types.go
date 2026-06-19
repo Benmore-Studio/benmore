@@ -490,7 +490,9 @@ export interface RoomClient {
   }
   export interface QueryFetchOpts {
     key?: unknown;
+    /** Canonical name for the stale window in milliseconds. */
     staleTime?: number;
+    /** @deprecated Alias for staleTime; prefer staleTime. */
     staleMs?: number;
     force?: boolean;
     live?: boolean;
