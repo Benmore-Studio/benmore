@@ -25,23 +25,51 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 )
 
 // ---- generic helpers (mirrors of the platform-build originals) ----
 
-// clientIP extracts the originating client IP, honoring Cloudflare and the
-// app proxy's forwarded headers. (Mirror of host.go.)
-func clientIP(r *http.Request) string {
-	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-		return cf
-	}
+// authTrustProxyHeaders reports whether forwarded client-IP headers
+// (CF-Connecting-IP / X-Forwarded-For / X-Real-IP) may be trusted.
+// LOWER finding: these headers are attacker-controlled on a direct
+// connection, so blindly honoring them lets a client spoof its source IP
+// and dodge per-IP lockouts / audit attribution. We trust them ONLY when
+// the deployment explicitly opts in via BENMORE_TRUST_PROXY (the operator
+// asserting "I sit behind a proxy that sets these"), OR when the request
+// carries the X-Benmore-App marker injected by the in-fabric app proxy
+// (a request that reached us with that header necessarily traversed the
+// trusted router). Otherwise we fall back to RemoteAddr.
+func authTrustProxyHeaders(r *http.Request) bool {
 	if r.Header.Get("X-Benmore-App") != "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BENMORE_TRUST_PROXY"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// clientIP extracts the originating client IP. Forwarded headers
+// (CF-Connecting-IP / X-Forwarded-For / X-Real-IP) are honored ONLY when
+// the request is from a trusted proxy (authTrustProxyHeaders); otherwise
+// the transport-level RemoteAddr is used so a direct client cannot spoof
+// its IP. (Mirror of host.go.)
+func clientIP(r *http.Request) string {
+	if authTrustProxyHeaders(r) {
+		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+			return strings.TrimSpace(cf)
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if i := strings.Index(xff, ","); i >= 0 {
 				return strings.TrimSpace(xff[:i])
 			}
 			return strings.TrimSpace(xff)
+		}
+		if xr := r.Header.Get("X-Real-IP"); xr != "" {
+			return strings.TrimSpace(xr)
 		}
 	}
 	addr := r.RemoteAddr

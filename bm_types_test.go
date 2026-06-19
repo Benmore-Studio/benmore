@@ -59,7 +59,7 @@ func TestGenerateBMTypes_BasicShape(t *testing.T) {
 		"created_at: string;", // datetimes → string
 		"export interface User {",
 		"export type TableName = 'admin_logs' | 'messages';", // sorted
-		"declare const bm:", // post-2.7.18: flat top-level layout (no `declare module 'bm' {}` wrapper - broke `export default bm` with TS2666)
+		"declare const bm:",                                  // post-2.7.18: flat top-level layout (no `declare module 'bm' {}` wrapper - broke `export default bm` with TS2666)
 		"export function table<T extends keyof TableTypeMap>(",
 		"): TableClient<TableTypeMap[T], TableFeatures[T]>;",
 		// New v2.7.16 sections - every type the agent might land on:
@@ -87,6 +87,12 @@ func TestGenerateBMTypes_BasicShape(t *testing.T) {
 		// post-2.7.18: two-overload live() (typed per table + '*' wildcard)
 		"export function live<T extends keyof TableTypeMap>(",
 		"export function room(name: string): RoomClient;",
+		"export function createStore<S extends Record<string, any>>(",
+		"export const query:",
+		"read<T = any>(spec: QuerySpec, opts?: QueryFetchOpts): Promise<T[]>;",
+		"mutate<T = any>(opts: QueryMutateOpts<T>): Promise<T>;",
+		"createStore: typeof createStore;",
+		"query: typeof query;",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(out, s) {
@@ -95,9 +101,9 @@ func TestGenerateBMTypes_BasicShape(t *testing.T) {
 	}
 
 	mustNotContain := []string{
-		"password_hash",         // sensitive - must not leak
-		"mfa_last_totp",         // sensitive - must not leak
-		"_benmore_sessions",     // framework-internal - hidden
+		"password_hash",     // sensitive - must not leak
+		"mfa_last_totp",     // sensitive - must not leak
+		"_benmore_sessions", // framework-internal - hidden
 		"export interface BenmoreSessions",
 	}
 	for _, s := range mustNotContain {

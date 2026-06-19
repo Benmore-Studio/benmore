@@ -118,6 +118,9 @@ func hotReloadApp(app *App, dev bool) error {
 	mux := buildAppMux(app, dev, baseURL)
 	handler := wrapMiddleware(mux, app, dev)
 	hostedHotHandler.swap(handler)
+	if dev || devReloadClientEnabled(app) {
+		BroadcastReload("hot-reload")
+	}
 	return nil
 }
 
@@ -305,7 +308,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// API routes
 	RegisterQueryAPI(mux, app)      // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
 	RegisterSchedulingAPI(mux, app) // /api/_scheduled + /api/_approvals - per-record deferred tasks + approvals
-	RegisterLockRoutes(mux, app) // must register before CRUD so /api/{table}/{id}/lock is more specific
+	RegisterLockRoutes(mux, app)    // must register before CRUD so /api/{table}/{id}/lock is more specific
 	RegisterCRUD(mux, app)
 	RegisterFileUploadRoute(mux, app)
 	if NeedsAuth(app) {
@@ -477,9 +480,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Embedded libraries + PWA + dev tools
 	RegisterTailwindRoute(mux)
 	RegisterLibRoutes(mux)
-	RegisterBMTypesRoute(mux, app) // /_internal/types.d.ts - per-app TS defs
-	RegisterUploadRoute(mux, app)  // POST /api/_upload - generic file upload (v2.7.20)
-	RegisterWebRTCRoute(mux, app)  // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
+	RegisterBMTypesRoute(mux, app)    // /_internal/types.d.ts - per-app TS defs
+	RegisterUploadRoute(mux, app)     // POST /api/_upload - generic file upload (v2.7.20)
+	RegisterWebRTCRoute(mux, app)     // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
 	RegisterBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
 	RegisterPWARoutes(mux, app)
 
@@ -642,8 +645,16 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 			http.NotFound(w, r)
 			return
 		}
-		// Private files require signed URLs
-		if strings.HasPrefix(relativePath, "private/") || strings.HasPrefix(relativePath, "private\\") {
+		// Private files require signed URLs. Gate with the SAME predicate the
+		// signer uses so the serve side and sign side agree on what "private"
+		// means. relativePath here is the path under uploads/ (the signer's
+		// isPrivateUploadPath keys off the full logical "uploads/..." path), so
+		// re-prefix "uploads/" before the check. This catches BOTH a top-level
+		// private/ file and a nested */private/* segment (e.g.
+		// userdocs/private/ssn.pdf), which the old top-level-only prefix check
+		// served with no signature. Fail closed: any private/ segment must
+		// require a valid signature.
+		if isPrivateUploadPath("uploads/" + filepath.ToSlash(relativePath)) {
 			if !ValidateSignedURL(relativePath, r) {
 				http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
 				return
@@ -760,6 +771,13 @@ func wrapMiddleware(handler http.Handler, app *App, dev bool) http.Handler {
 		handler = RateLimitMiddleware(limiter, handler)
 	}
 	handler = securityHeaders(handler, dev, app)
+	// Global request-body size cap. Handlers json.Decode(r.Body) directly, so
+	// without this an attacker can stream an unbounded body and exhaust memory
+	// (memory-exhaustion DoS). Applied early in the chain. Multipart uploads
+	// are exempt here because the upload path installs its OWN, larger
+	// MaxBytesReader (see HandleFileUpload); double-capping would truncate
+	// legitimate large uploads.
+	handler = serverBodyLimitMiddleware(handler, app)
 	handler = corsMiddleware(handler, app)
 	if !dev {
 		handler = gzipMiddleware(handler)
@@ -785,6 +803,48 @@ func wrapMiddleware(handler http.Handler, app *App, dev bool) http.Handler {
 	}
 
 	return handler
+}
+
+// serverDefaultMaxBodyBytes is the default global request-body cap for the
+// non-upload surface (JSON APIs, form posts). 10MB is generous for any
+// JSON/form payload while preventing an unbounded-body memory-exhaustion DoS.
+// Override per-app with MAX_REQUEST_BODY_BYTES (<=0 disables the cap).
+const serverDefaultMaxBodyBytes int64 = 10 << 20 // 10MB
+
+// serverResolveMaxBodyBytes reads the configured global body cap for an app.
+func serverResolveMaxBodyBytes(app *App) int64 {
+	max := serverDefaultMaxBodyBytes
+	if app != nil {
+		if v := strings.TrimSpace(GetAppEnv(app.Dir, "MAX_REQUEST_BODY_BYTES")); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				max = n
+			}
+		}
+	}
+	return max
+}
+
+// serverBodyLimitMiddleware caps the request body size for the non-upload
+// surface. Multipart requests are skipped so the upload path's own (larger)
+// http.MaxBytesReader governs them instead - capping twice would truncate
+// legitimate large uploads. A configured cap of <=0 disables the limit.
+func serverBodyLimitMiddleware(next http.Handler, app *App) http.Handler {
+	maxBytes := serverResolveMaxBodyBytes(app)
+	if maxBytes <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bodyless methods carry nothing to cap; skip the wrap.
+		if r.Body != nil && r.ContentLength != 0 {
+			ct := r.Header.Get("Content-Type")
+			// Uploads (multipart/form-data) are capped by HandleFileUpload's
+			// own MaxBytesReader; don't double-cap and truncate them.
+			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/") {
+				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // StartServer initializes and starts the HTTP server for an app.
@@ -822,11 +882,19 @@ func StartServer(app *App, port int, dev bool) error {
 		addr = fmt.Sprintf("127.0.0.1:%d", port)
 	}
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      hh,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:    addr,
+		Handler: hh,
+		// ReadHeaderTimeout bounds how long a client may take to send request
+		// headers, closing the Slowloris hole where a peer dribbles headers
+		// to pin a connection open indefinitely (ReadTimeout alone doesn't
+		// cover the header phase on keep-alive conns).
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		// Bound total header size (default is 1MB) so a flood of oversized
+		// headers can't exhaust memory before the body limit even applies.
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	if dev {
@@ -987,6 +1055,14 @@ func applySecurityHeaders(w http.ResponseWriter, dev bool, app *App) {
 		"font-src " + fontSrc,
 		"connect-src " + connectSrc,
 		"frame-src " + frameSrc,
+		// Zero-risk hardening: no app loads plugins/Flash/Java, so block all
+		// <object>/<embed> content; and lock <base href> to same-origin so
+		// injected markup can't rebase relative URLs onto an attacker origin.
+		"object-src 'none'",
+		"base-uri 'self'",
+		// TODO(csp-strict): drop 'unsafe-inline' from script-src once nonces
+		// are threaded through every inline-script emit site (see the
+		// security.csp_strict punch list above). Tracked in MEMORY.md.
 		framePolicy,
 	}, "; ")
 	w.Header().Set("Content-Security-Policy", csp)

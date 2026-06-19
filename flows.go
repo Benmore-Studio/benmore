@@ -114,6 +114,16 @@ type FlowStep struct {
 	// a private file (uploads/private/...) can be served to an anon
 	// caller the flow has already gated, without minting a signed URL.
 	ServeFile *FlowServeFile
+	// Trusted opts a `run: sql_dynamic` step into consuming
+	// request-sourced references as raw SQL text. sql_dynamic interpolates
+	// `{{ }}` / `:param` refs directly into the query string (no param
+	// binding), so a request-controlled value reaching it is a SQL
+	// injection sink. By default flowDynamicGuardRequestRefs rejects any
+	// sql_dynamic step that references request-sourced data; authors who
+	// genuinely assemble SQL from trusted-internal callers must set
+	// `trusted: true` to acknowledge the risk. Authored as `trusted: true`
+	// on the step (parsed in flows_gha.go).
+	Trusted bool
 }
 
 // FlowServeFile is the payload for a `run: serve_file` step.
@@ -270,6 +280,14 @@ type FlowContext struct {
 	Writer  http.ResponseWriter
 	Data    map[string]any   // named step results
 	Params  map[string]string // path and query params
+	// RequestKeys records which Params/Data keys were sourced directly
+	// from the inbound HTTP request (path params, query string, form
+	// fields, JSON body). It is the taint set used by
+	// flowDynamicGuardRequestRefs to forbid request-controlled values
+	// from being interpolated as raw SQL text in `run: sql_dynamic`
+	// steps (M-1). Only executeFlowHTTP populates it; internal/job
+	// invocations leave it nil (those params originate server-side).
+	RequestKeys map[string]bool
 	// NullParams records which keys in Params should bind as SQL NULL
 	// (not the empty string). ctx.Params is map[string]string for
 	// historical HTTP-path-param reasons - empty string and NULL are
@@ -372,6 +390,60 @@ func LoadFlows(dir string) []Flow {
 	return parseFlows(string(data))
 }
 
+// flowParallelHasSQL reports whether a `parallel` step has any SQL
+// (sql / sql_dynamic) step nested anywhere beneath it. Used to reject
+// SQL inside a parallel-in-transaction block, where the children would
+// otherwise share one non-concurrency-safe *sql.Tx.
+func flowParallelHasSQL(parallel *FlowStep) bool {
+	var walk func(steps []FlowStep) bool
+	walk = func(steps []FlowStep) bool {
+		for i := range steps {
+			s := &steps[i]
+			if s.Type == "sql" || s.Type == "sql_dynamic" {
+				return true
+			}
+			if walk(s.Steps) || walk(s.ElseSteps) || walk(s.OnError) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(parallel.Steps)
+}
+
+// flowValidateParallelTx implements H-4: in a transaction:true flow,
+// parallel children all run against the same ctx.Tx, but database/sql's
+// *sql.Tx is explicitly NOT safe for concurrent use. Reject any
+// sql/sql_dynamic step nested inside a parallel block of a transactional
+// flow at validation time so the author fixes it before it ships,
+// instead of hitting a nondeterministic data race at runtime. Returns a
+// descriptive error naming the flow, or nil when the flow is safe.
+func flowValidateParallelTx(flow *Flow) error {
+	if flow == nil || !flow.Transaction {
+		return nil
+	}
+	var walk func(steps []FlowStep) error
+	walk = func(steps []FlowStep) error {
+		for i := range steps {
+			s := &steps[i]
+			if s.Type == "parallel" && flowParallelHasSQL(s) {
+				return fmt.Errorf("flow %q: a parallel block contains SQL steps but the flow is transaction:true - a *sql.Tx cannot be shared across the parallel goroutines (data race). Move the SQL out of the parallel block, or remove transaction:true", flow.Name)
+			}
+			if err := walk(s.Steps); err != nil {
+				return err
+			}
+			if err := walk(s.ElseSteps); err != nil {
+				return err
+			}
+			if err := walk(s.OnError); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walk(flow.Steps)
+}
+
 // RegisterFlows sets up HTTP handlers and cron jobs for all flows.
 //
 // HTTP-flow patterns may collide with auto-CRUD routes (RegisterCRUD
@@ -386,6 +458,14 @@ func LoadFlows(dir string) []Flow {
 func RegisterFlows(mux *http.ServeMux, app *App, flows []Flow) {
 	for _, flow := range flows {
 		f := flow
+		// H-4: reject SQL-in-parallel-in-transaction at registration time.
+		// Skip registering the offending flow (rather than crash the app)
+		// and log loudly so the author fixes the unsafe shared-*sql.Tx
+		// pattern before it can race.
+		if err := flowValidateParallelTx(&f); err != nil {
+			log.Printf("ERROR: %s - skipping flow registration", err)
+			continue
+		}
 		switch f.Trigger.Type {
 		case "http":
 			// Convert :param to {param} for Go 1.22 ServeMux pattern matching
@@ -479,6 +559,10 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		Writer:  w,
 		Data:    make(map[string]any),
 		Params:  make(map[string]string),
+		// Taint set: every key written below originates from the inbound
+		// request, so sql_dynamic must treat it as untrusted (see M-1 /
+		// flowDynamicGuardRequestRefs).
+		RequestKeys: make(map[string]bool),
 	}
 
 	// Extract path params from the original :param definitions
@@ -489,6 +573,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			paramName := strings.TrimPrefix(part, ":")
 			ctx.Params[paramName] = reqParts[i]
 			ctx.Data[paramName] = reqParts[i]
+			ctx.RequestKeys[paramName] = true
 		}
 	}
 	// Also try Go 1.22 PathValue for {param} patterns
@@ -498,6 +583,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			if val := r.PathValue(paramName); val != "" {
 				ctx.Params[paramName] = val
 				ctx.Data[paramName] = val
+				ctx.RequestKeys[paramName] = true
 			}
 		}
 	}
@@ -507,6 +593,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		if len(v) > 0 {
 			ctx.Params[k] = v[0]
 			ctx.Data[k] = v[0]
+			ctx.RequestKeys[k] = true
 		}
 	}
 
@@ -517,6 +604,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			if len(v) > 0 && k != "csrf_token" {
 				ctx.Params[k] = v[0]
 				ctx.Data[k] = v[0]
+				ctx.RequestKeys[k] = true
 			}
 		}
 	}
@@ -549,6 +637,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 						}
 						ctx.NullParams[k] = true
 						ctx.Data[k] = nil
+						ctx.RequestKeys[k] = true
 						continue
 					}
 					switch val := v.(type) {
@@ -564,8 +653,29 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 						}
 					}
 					ctx.Data[k] = v
+					ctx.RequestKeys[k] = true
 				}
 			}
+		}
+	}
+
+	// CSRF + Bearer gate for state-changing HTTP-triggered flows. Mirrors
+	// the CRUD/workflow/webhook handlers: a cookie-authenticated, mutating
+	// request must carry a valid CSRF token; Bearer-token (API) callers are
+	// exempt because they don't ride on ambient cookies. Without this,
+	// HTTP flows were the one mutation surface a cross-site form could
+	// drive using the victim's session cookie.
+	//
+	// The check is scoped to requests that actually carry the session
+	// cookie: CSRF is an ambient-credential attack, so a request with no
+	// `_benmore_session` cookie has no victim session to ride and is not a
+	// CSRF vector (this also preserves cookieless API/webhook callers).
+	// GET/HEAD/OPTIONS are nullipotent by convention and skip the check.
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		if c, _ := r.Cookie(sessionCookieName); c != nil && !isBearerAuth(r) && !validateCSRF(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return
 		}
 	}
 
@@ -576,7 +686,12 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if flow.Role != "" && session.Role != flow.Role && !session.IsAdmin() {
+		// Use the shared multi-role resolver (session.Roles via
+		// HasAnyRole) instead of a single-field session.Role compare. The
+		// old check ignored grants in _benmore_user_roles, so a user
+		// holding the required role only via the join table was wrongly
+		// denied (and an admin grant via the join table didn't bypass).
+		if flow.Role != "" && !HasAnyRole(session, []string{flow.Role}) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -605,6 +720,20 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 				"email": session.Email,
 				"role":  session.Role,
 			}
+		}
+
+		// Tenant row-scoping affordance for flow SQL. When this app is
+		// multi-tenant (groups configured) and the session is bound to a
+		// tenant (and is not an admin bypassing scope), expose the
+		// server-resolved effective tenant key so authored SQL can scope
+		// rows with a TRUSTED value (e.g. `WHERE <group_key> = :_group_id`)
+		// instead of trusting a request-supplied group id. This is bound,
+		// never request-tainted, so it stays usable even from sql_dynamic.
+		if app.Group != nil && app.Group.Key != "" && session.EffectiveHasGroup() && !session.IsAdminBypass() {
+			gid := session.EffectiveGroupID()
+			ctx.Params["_group_id"] = gid
+			ctx.Data["_group_id"] = gid
+			ctx.Data["_group_key"] = app.Group.Key
 		}
 	}
 
@@ -707,13 +836,16 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			"steps_run":      ctx.StepsRun,
 		}
 		if ctx.Error != nil {
-			// A step errored out - surface which one + the error so the
-			// agent jumps straight to the failing step. This is the
-			// vastly more common case for "no response" in practice.
+			// A step errored out. Log the granular detail (failing step,
+			// type, raw error, hint) server-side, but DO NOT leak the raw
+			// SQL/step error text to the client - it can expose schema,
+			// query shape, and internal paths. The client gets only a
+			// generic marker; operators correlate via the server log.
+			log.Printf("FLOW ERROR DETAIL [%s] failed_step=%q failed_type=%q error=%s hint=%s",
+				flow.Name, ctx.FailedStep, ctx.FailedType, ctx.Error.Error(),
+				stepFailureHint(ctx.FailedStep, ctx.FailedType, ctx.Error.Error()))
 			resp["failed_step"] = ctx.FailedStep
 			resp["failed_type"] = ctx.FailedType
-			resp["step_error"] = ctx.Error.Error()
-			resp["hint"] = stepFailureHint(ctx.FailedStep, ctx.FailedType, ctx.Error.Error())
 		} else {
 			resp["hint"] = "every step ran without erroring, but no step was a `run: respond` (or `run: redirect`). Add a `- run: respond` step at the end of the job, with `with: { status: 200, body: { ok: true } }`."
 		}
@@ -988,6 +1120,15 @@ func execStepParallel(ctx *FlowContext, step *FlowStep) error {
 	if len(step.Steps) == 0 {
 		return nil
 	}
+	// H-4 runtime backstop: a *sql.Tx is NOT safe for concurrent use, so
+	// parallel children must never share ctx.Tx. flowValidateParallelTx
+	// rejects this at registration time; this guard catches any flow that
+	// bypassed validation (legacy on-disk file, hot-reload race) before it
+	// can corrupt the shared transaction. Fail closed rather than risk a
+	// data race on the connection.
+	if ctx.Tx != nil && flowParallelHasSQL(step) {
+		return fmt.Errorf("parallel: SQL steps are not allowed inside a parallel block of a transaction:true flow (a *sql.Tx cannot be shared across goroutines); move the SQL out of the parallel block or drop transaction:true")
+	}
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(step.Steps))
 	for i := range step.Steps {
@@ -1252,6 +1393,15 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 		defer restoreParams()
 	}
 
+	// M-1: sql_dynamic substitutes refs as raw SQL TEXT (no param bind),
+	// so a request-controlled value reaching the query is an injection
+	// sink. Forbid request-sourced refs unless the author explicitly set
+	// `trusted: true`. The comment in the template "never funnel user
+	// input here" is now enforced, not just advisory.
+	if err := flowDynamicGuardRequestRefs(step, ctx); err != nil {
+		return err
+	}
+
 	query := interpolateCtx(step.SQL, ctx)
 	db := flowDB(ctx)
 
@@ -1284,6 +1434,100 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 		}
 	}
 	return nil
+}
+
+// flowDynamicGuardRequestRefs enforces M-1: a `run: sql_dynamic` step
+// interpolates references as RAW SQL TEXT, so any request-sourced value
+// reaching the query string is a SQL-injection sink. Reject the step at
+// run time when its query template references a request-tainted key
+// (path/query/form/JSON-body param) unless the author has explicitly
+// opted in with `trusted: true`.
+//
+// Invariant: request-controlled data MUST NOT be funnelled into a
+// sql_dynamic query body without an explicit trusted acknowledgement.
+// The previous behavior relied on a code comment ("never funnel user
+// input here") that nothing enforced.
+//
+// trusted:true preserves the documented escape hatch (AI-agent /
+// admin-tooling flows that assemble SQL from server-side values) for
+// backward compatibility - it just makes the dangerous case opt-in
+// instead of the default.
+func flowDynamicGuardRequestRefs(step *FlowStep, ctx *FlowContext) error {
+	if step == nil || ctx == nil || len(ctx.RequestKeys) == 0 {
+		return nil
+	}
+	if step.Trusted {
+		return nil // author explicitly accepted raw-text interpolation risk
+	}
+	for key := range ctx.RequestKeys {
+		if key == "" {
+			continue
+		}
+		if flowSQLReferencesKey(step.SQL, key) {
+			return fmt.Errorf("sql_dynamic: step %q references request-sourced value %q as raw SQL text (injection risk); use a `run: sql` step with `:%s` param binding, or set `trusted: true` if this SQL is assembled only from trusted internal callers", step.Name, key, key)
+		}
+		// Also guard any `with.params:` overlay feeding the same key,
+		// since those values are written into ctx.Data/ctx.Params and may
+		// be derived from request input before reaching the query.
+		if _, ok := step.SQLParams[key]; ok {
+			return fmt.Errorf("sql_dynamic: step %q binds request-sourced value %q via with.params into raw SQL text (injection risk); set `trusted: true` only if assembled from trusted internal callers", step.Name, key)
+		}
+	}
+	return nil
+}
+
+// flowSQLReferencesKey reports whether a sql_dynamic template references
+// `key` either as a `:key` placeholder (substituted as text by
+// interpolateCtx) or inside a `{{ ... }}` expression (including dotted
+// `{{key.sub}}` and piped `{{ key | ... }}` forms). Match boundaries are
+// checked so `:user` doesn't spuriously match `:user_id`.
+func flowSQLReferencesKey(sql, key string) bool {
+	// `:key` form - require a non-identifier char (or end) after the key.
+	for idx := 0; ; {
+		at := strings.Index(sql[idx:], ":"+key)
+		if at < 0 {
+			break
+		}
+		pos := idx + at
+		after := pos + 1 + len(key)
+		if after >= len(sql) || !flowIsIdentChar(sql[after]) {
+			return true
+		}
+		idx = after
+	}
+	// `{{ ... key ... }}` form.
+	for i := 0; i+1 < len(sql); i++ {
+		if sql[i] != '{' || sql[i+1] != '{' {
+			continue
+		}
+		end := strings.Index(sql[i+2:], "}}")
+		if end < 0 {
+			break
+		}
+		expr := strings.TrimSpace(sql[i+2 : i+2+end])
+		// Leading identifier of the expression (before a pipe / dot /
+		// space) is the bound name.
+		head := expr
+		for _, sep := range []string{"|", ".", " ", "["} {
+			if j := strings.Index(head, sep); j >= 0 {
+				head = head[:j]
+			}
+		}
+		if strings.TrimSpace(head) == key {
+			return true
+		}
+		i = i + 2 + end + 1
+	}
+	return false
+}
+
+// flowIsIdentChar reports whether b can appear inside a `:param` name
+// (used to enforce a word boundary when matching `:key`).
+func flowIsIdentChar(b byte) bool {
+	return b == '_' ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
 }
 
 func execStepAPI(ctx *FlowContext, step *FlowStep) error {
@@ -3140,7 +3384,14 @@ func compareLiteralCondition(actual, op, expected string) bool {
 func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
 	secret := InterpolateEnv(flow.Secret, appDir)
 	if secret == "" {
-		return true
+		// fail closed: an empty resolved secret must never authenticate a
+		// webhook. When verification is requested (flow.Verify set) but the
+		// secret resolves empty (e.g. missing/typo'd env var), rejecting is
+		// the only safe outcome - accepting would treat ANY payload as
+		// authentic. Mirrors runVerifyRecipe (verify_recipe.go) which errors
+		// on an empty secret rather than passing.
+		log.Printf("SECURITY: webhook verify %q requested but resolved secret is empty (check env.yaml / flow.secret) - rejecting request as unauthenticated", flow.Verify)
+		return false
 	}
 
 	// Named provider shortcuts - use canonical signature formats.

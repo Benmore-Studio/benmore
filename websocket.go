@@ -38,6 +38,18 @@ const (
 	wsMaxConnsPerUser    = 10
 	wsSendBufferSize     = 64
 	wsMagicGUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // RFC 6455 §4.2.2
+
+	// H-16: the per-user cap keys on userID, so every anonymous client
+	// shares userID==0 and - when the app has no auth, or ws_anonymous is
+	// on - the cap was either skipped entirely or pooled all anon clients
+	// into one bucket. These two caps close that hole:
+	//   - realtimeWSMaxConnsGlobal bounds total concurrent WS connections
+	//     across the whole hub (a hard ceiling no client class can exceed).
+	//   - realtimeWSMaxConnsPerAnonIP bounds concurrent connections from a
+	//     single source IP for clients that have NO authenticated user
+	//     (userID==0), so one anonymous host can't exhaust the global pool.
+	realtimeWSMaxConnsGlobal    = 5000
+	realtimeWSMaxConnsPerAnonIP = 30
 )
 
 // Frame opcodes (RFC 6455 §5.2)
@@ -64,6 +76,9 @@ type wsClient struct {
 	email         string // session email - ws_rooms membership checks against email-shaped user columns
 	groupID       string
 	isAdmin       bool
+	// remoteIP is the connecting client's source host (no port), captured
+	// at connect time for the H-16 per-anonymous-IP connection cap.
+	remoteIP      string
 	// wsAnonShared signals that this app has features.ws_anonymous: true
 	// AND no groups: scoping - i.e. the developer explicitly opted in to
 	// "let anon viewers participate in the same rooms as authed users."
@@ -304,20 +319,49 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 			}
 		}
 
-		// Per-user connection limit
-		if needsAuth && !isAdmin {
-			wsHub.mu.RLock()
-			count := 0
-			for c := range wsHub.clients {
-				if c.userID == userID {
-					count++
-				}
+		// Source host for the H-16 per-anonymous-IP cap. Use RemoteAddr
+		// (not X-Forwarded-For, which is spoofable) so an attacker can't
+		// evade the per-IP ceiling by forging a header. Drop the ephemeral
+		// port so reconnects from the same host count together.
+		remoteIP := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			remoteIP = h
+		}
+
+		// Connection caps. H-16: the per-user cap below keys on userID,
+		// which is 0 for every anonymous client - so without a global cap
+		// and a per-anon-IP cap, an app with no auth (or ws_anonymous on)
+		// had effectively no WS connection limit. We take a single RLock
+		// and tally all three counts at once.
+		isAnon := userID == 0
+		wsHub.mu.RLock()
+		globalCount := len(wsHub.clients)
+		var userCount, anonIPCount int
+		for c := range wsHub.clients {
+			if needsAuth && !isAdmin && userID != 0 && c.userID == userID {
+				userCount++
 			}
-			wsHub.mu.RUnlock()
-			if count >= wsMaxConnsPerUser {
-				http.Error(w, "too many connections", http.StatusTooManyRequests)
-				return
+			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
+				anonIPCount++
 			}
+		}
+		wsHub.mu.RUnlock()
+
+		// Global ceiling: a hard cap no client class can exceed (admins
+		// included - this protects the process, not a tenant).
+		if globalCount >= realtimeWSMaxConnsGlobal {
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
+		// Per-anonymous-IP cap: closes the userID==0 pooling bypass.
+		if isAnon && anonIPCount >= realtimeWSMaxConnsPerAnonIP {
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
+		}
+		// Per-user connection limit (authenticated, non-admin clients).
+		if needsAuth && !isAdmin && userID != 0 && userCount >= wsMaxConnsPerUser {
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
 		}
 
 		// Upgrade - reject non-WebSocket requests with proper HTTP error
@@ -341,12 +385,22 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 			email:         email,
 			groupID:       groupID,
 			isAdmin:       isAdmin,
+			remoteIP:      remoteIP,
 			wsAnonShared:  anonShared,
 			subscriptions: make(map[string]bool),
 			rooms:         make(map[string]bool),
 		}
 
+		// H-16: re-check the global ceiling under the write lock before
+		// inserting. The pre-upgrade RLock count above is racy (many
+		// handshakes can pass it concurrently); this authoritative check
+		// guarantees the hub size never exceeds realtimeWSMaxConnsGlobal.
 		wsHub.mu.Lock()
+		if len(wsHub.clients) >= realtimeWSMaxConnsGlobal {
+			wsHub.mu.Unlock()
+			ws.writeClose(1013, "server overloaded") // 1013 = Try Again Later
+			return
+		}
 		wsHub.clients[client] = true
 		wsHub.mu.Unlock()
 
