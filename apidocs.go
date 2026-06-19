@@ -207,11 +207,25 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 		},
 	}
 
+	// seenSchema guards against two distinct tables whose singularized,
+	// PascalCased names collide (e.g. `note` and `notes`), which would
+	// otherwise silently overwrite each other's schema keys and produce
+	// duplicate operationIds. On collision we fall back to the raw table
+	// name so each table keeps a distinct, stable contract entry.
+	seenSchema := map[string]bool{}
 	for _, table := range sortedTables(app) {
+		// Belt-and-suspenders: sortedTables already strips every
+		// _benmore_* table, so this guard is normally dead code. Keep it
+		// so a future change to sortedTables can't leak an internal table
+		// into the public contract.
 		if strings.HasPrefix(table.Name, "_benmore_") {
 			continue
 		}
 		schemaName := pascalCase(singularize(table.Name))
+		if seenSchema[schemaName] {
+			schemaName = pascalCase(table.Name)
+		}
+		seenSchema[schemaName] = true
 		schemas[schemaName] = openAPISchemaForTable(table)
 		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(table, "create")
 		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(table, "update")
@@ -220,18 +234,18 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				"operationId": "list" + schemaName,
 				"tags":        []string{table.Name},
 				"summary":     "List " + table.Name,
-				"parameters": []map[string]any{
-					{"name": "limit", "in": "query", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000}},
-					{"name": "offset", "in": "query", "schema": map[string]any{"type": "integer", "minimum": 0}},
-					{"name": "q", "in": "query", "schema": map[string]any{"type": "string"}},
-				},
+				// Parameters mirror the auto-CRUD list handler (crud.go):
+				// offset paging is ?page=&per_page=, keyset paging is
+				// ?cursor=&limit= (limit is cursor-scoped only), ?count
+				// returns just the total, ?q is full-text, ?include expands
+				// relations. There is no ?offset param.
+				"parameters": openAPIListParams(schemaName),
 				"responses": openAPIResponses(map[string]any{
-					"200": openAPIJSONResponse("Rows", map[string]any{
-						"oneOf": []any{
-							map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + schemaName}},
-							map[string]any{"type": "object", "properties": map[string]any{"rows": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + schemaName}}, "count": map[string]any{"type": "integer"}}},
-						},
-					}),
+					// The runtime returns one of: a bare array (default),
+					// {data,total,page,per_page} when ?page= is set,
+					// {data,next_cursor,limit} when ?cursor= is set, or
+					// {count} when ?count is set (crud.go list handler).
+					"200": openAPIJSONResponse("Rows", openAPIListResponseSchema(schemaName)),
 				}),
 			},
 			"post": map[string]any{
@@ -240,7 +254,9 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				"summary":     "Create " + singularize(table.Name),
 				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Create" + schemaName}),
 				"responses": openAPIResponses(map[string]any{
-					"200": openAPIJSONResponse("Created row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+					// Create echoes the inserted row plus a status envelope:
+					// {id, status:"created", ...row} (crud.go handleCreate).
+					"200": openAPIJSONResponse("Created row", openAPICreateResponseSchema(schemaName)),
 				}),
 			},
 		}
@@ -258,10 +274,13 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				"operationId": "update" + schemaName,
 				"tags":        []string{table.Name},
 				"summary":     "Update " + singularize(table.Name),
-				"parameters":  []map[string]any{openAPIIDParam(), openAPIConcurrencyHeader()},
+				"parameters":  []map[string]any{openAPIIDParam()},
 				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Update" + schemaName}),
 				"responses": openAPIResponses(map[string]any{
-					"200": openAPIJSONResponse("Updated row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+					// Update does NOT echo the row; it returns {status:"updated"}
+					// only (crud.go handleUpdate). On an optimistic-concurrency
+					// mismatch (_expected_updated_at in the body) it returns 409.
+					"200": openAPIJSONResponse("Update status", openAPIWriteStatusSchema("updated")),
 					"409": openAPIProblemResponse("Concurrency conflict"),
 				}),
 			},
@@ -271,7 +290,8 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				"summary":     "Delete " + singularize(table.Name),
 				"parameters":  []map[string]any{openAPIIDParam()},
 				"responses": openAPIResponses(map[string]any{
-					"200": openAPIJSONResponse("Delete status", map[string]any{"type": "object", "properties": map[string]any{"status": map[string]any{"type": "string"}}}),
+					// Delete returns {status:"deleted"} (crud.go handleDelete).
+					"200": openAPIJSONResponse("Delete status", openAPIWriteStatusSchema("deleted")),
 				}),
 			},
 		}
@@ -280,8 +300,11 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 	return map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
-			"title":   appOpenAPITitle(app),
-			"version": "1.0.0",
+			"title": appOpenAPITitle(app),
+			// Derive the version from the schema fingerprint so the contract
+			// version moves whenever the tables/columns change, letting
+			// consumers detect drift instead of seeing a frozen 1.0.0.
+			"version": "1.0.0+" + tablesFingerprint(app),
 		},
 		"paths": paths,
 		"components": map[string]any{
@@ -315,8 +338,13 @@ func openAPISchemaForTable(table Table) map[string]any {
 		}
 	}
 	out := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
+		"type": "object",
+		// Read responses allow extra keys: the list/read handlers inject
+		// related rows under ?include=<rel> keys (crud.go ResolveIncludes),
+		// which are not part of the table's own columns. A strict
+		// additionalProperties:false would reject those otherwise-valid
+		// responses, so reads are open while write schemas stay strict.
+		"additionalProperties": true,
 		"properties":           props,
 	}
 	if len(required) > 0 {
@@ -337,6 +365,16 @@ func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
 			required = append(required, col.Name)
 		}
 	}
+	// Optimistic concurrency on update is driven by an _expected_updated_at
+	// field in the request body (crud.go handleUpdate reads r.FormValue), NOT
+	// by any header. Model it on the Update schema only, and only when the
+	// table actually has an updated_at column for the check to compare against.
+	if mode == "update" && tableHasColumn(table, "updated_at") {
+		props["_expected_updated_at"] = map[string]any{
+			"type":        "string",
+			"description": "Optimistic concurrency token: the row's current updated_at. If it no longer matches, the update fails with 409.",
+		}
+	}
 	out := map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
@@ -346,6 +384,18 @@ func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
 		out["required"] = required
 	}
 	return out
+}
+
+// tableHasColumn reports whether the (already-loaded) table definition has a
+// column with the given name. Unlike hasColumn it works off the in-memory
+// Table value without touching the DB.
+func tableHasColumn(table Table, name string) bool {
+	for _, c := range table.Columns {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func openAPISchemaForColumn(col Column) map[string]any {
@@ -422,13 +472,89 @@ func openAPIIDParam() map[string]any {
 	}
 }
 
-func openAPIConcurrencyHeader() map[string]any {
+// openAPIListParams describes the query parameters the auto-CRUD list
+// handler actually honors (crud.go). Offset paging is page/per_page; keyset
+// paging is cursor/limit (limit is cursor-scoped only). There is no ?offset.
+func openAPIListParams(schemaName string) []map[string]any {
+	return []map[string]any{
+		{"name": "page", "in": "query", "description": "Offset-paging page number (1-based). Triggers the {data,total,page,per_page} response shape.", "schema": map[string]any{"type": "integer", "minimum": 1}},
+		{"name": "per_page", "in": "query", "description": "Rows per page for offset paging (default 20).", "schema": map[string]any{"type": "integer", "minimum": 1}},
+		{"name": "cursor", "in": "query", "description": "Keyset-paging cursor (an id). Triggers the {data,next_cursor,limit} response shape.", "schema": map[string]any{"type": "string"}},
+		{"name": "limit", "in": "query", "description": "Page size for keyset (cursor) paging only; capped at 500. Ignored for offset paging.", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 500}},
+		{"name": "count", "in": "query", "description": "When truthy, return only {count: N} (the filtered total, ignoring paging).", "schema": map[string]any{"type": "boolean"}},
+		{"name": "include", "in": "query", "description": "Comma-separated relation names to expand inline (e.g. include=contact,tasks). Adds extra keys to each row.", "schema": map[string]any{"type": "string"}},
+		{"name": "q", "in": "query", "description": "Full-text search query applied across the table's searchable text columns.", "schema": map[string]any{"type": "string"}},
+	}
+}
+
+// openAPIListResponseSchema models the four real list response shapes the
+// auto-CRUD handler emits (crud.go): a bare array (default), a page envelope
+// ({data,total,page,per_page}), a cursor envelope ({data,next_cursor,limit}),
+// and the count-only shape ({count}).
+func openAPIListResponseSchema(schemaName string) map[string]any {
+	ref := map[string]any{"$ref": "#/components/schemas/" + schemaName}
+	rowArray := map[string]any{"type": "array", "items": ref}
 	return map[string]any{
-		"name":        "X-Expected-Updated-At",
-		"in":          "header",
-		"required":    false,
-		"description": "Optimistic concurrency token. Equivalent to _expected_updated_at in request bodies.",
-		"schema":      map[string]any{"type": "string"},
+		"oneOf": []any{
+			rowArray,
+			map[string]any{
+				"type":     "object",
+				"required": []string{"data", "total", "page", "per_page"},
+				"properties": map[string]any{
+					"data":     rowArray,
+					"total":    map[string]any{"type": "integer"},
+					"page":     map[string]any{"type": "integer"},
+					"per_page": map[string]any{"type": "integer"},
+				},
+			},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"data", "limit"},
+				"properties": map[string]any{
+					"data":        rowArray,
+					"next_cursor": map[string]any{"type": []string{"string", "integer", "null"}},
+					"limit":       map[string]any{"type": "integer"},
+				},
+			},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"count"},
+				"properties": map[string]any{
+					"count": map[string]any{"type": "integer"},
+				},
+			},
+		},
+	}
+}
+
+// openAPICreateResponseSchema models the create envelope: the inserted row
+// plus {id, status:"created"} (crud.go handleCreate). additionalProperties is
+// open because the full row's columns are merged in alongside the envelope.
+func openAPICreateResponseSchema(schemaName string) map[string]any {
+	return map[string]any{
+		"allOf": []any{
+			map[string]any{"$ref": "#/components/schemas/" + schemaName},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"id", "status"},
+				"properties": map[string]any{
+					"id":     map[string]any{"type": []string{"string", "integer"}},
+					"status": map[string]any{"type": "string", "const": "created"},
+				},
+			},
+		},
+	}
+}
+
+// openAPIWriteStatusSchema models the {status:"<verb>"} envelope returned by
+// update and delete (crud.go handleUpdate/handleDelete).
+func openAPIWriteStatusSchema(status string) map[string]any {
+	return map[string]any{
+		"type":     "object",
+		"required": []string{"status"},
+		"properties": map[string]any{
+			"status": map[string]any{"type": "string", "const": status},
+		},
 	}
 }
 
