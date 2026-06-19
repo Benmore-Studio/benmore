@@ -24,7 +24,7 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 		requireAuth = true
 	}
 
-	// JSON: OpenAPI-style schema
+	// JSON: legacy Benmore docs shape ({endpoints,pages,features}).
 	mux.HandleFunc("GET /api/_docs", func(w http.ResponseWriter, r *http.Request) {
 		if requireAuth {
 			session := getSession(app, r)
@@ -35,6 +35,20 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(generateAPIDocs(app))
+	})
+
+	// JSON: real OpenAPI 3.1 contract for the app runtime CRUD surface.
+	mux.HandleFunc("GET /api/_openapi", func(w http.ResponseWriter, r *http.Request) {
+		if requireAuth {
+			session := getSession(app, r)
+			if session == nil {
+				http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(generateRuntimeOpenAPI(app))
 	})
 
 	// Rich, per-user schema descriptor - the source the schema-driven
@@ -165,15 +179,381 @@ func generateAPIDocs(app *App) map[string]any {
 		"endpoints": endpoints,
 		"pages":     pages,
 		"features": map[string]any{
-			"auth":          "cookie + Bearer token",
-			"scoping":       "owner (user_id) + org (configurable key)",
-			"soft_delete":   "auto if deleted_at column exists",
-			"audit_trail":   "GET /api/_audit",
-			"export":        "Export table rows as CSV, JSON, or XLSX",
-			"pagination":    "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)",
-			"idempotency":   "X-Idempotency-Key header on POST",
-			"concurrency":   "_expected_updated_at field for optimistic locking",
-			"cache":         "<query cache=\"5m\"> for query result caching",
+			"auth":        "cookie + Bearer token",
+			"scoping":     "owner (user_id) + org (configurable key)",
+			"soft_delete": "auto if deleted_at column exists",
+			"audit_trail": "GET /api/_audit",
+			"export":      "Export table rows as CSV, JSON, or XLSX",
+			"pagination":  "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)",
+			"idempotency": "X-Idempotency-Key header on POST",
+			"concurrency": "_expected_updated_at field for optimistic locking",
+			"cache":       "<query cache=\"5m\"> for query result caching",
+		},
+	}
+}
+
+func generateRuntimeOpenAPI(app *App) map[string]any {
+	paths := map[string]any{}
+	schemas := map[string]any{
+		"Problem": map[string]any{
+			"type":     "object",
+			"required": []string{"error"},
+			"properties": map[string]any{
+				"error":   map[string]any{"type": "string"},
+				"message": map[string]any{"type": "string"},
+				"hint":    map[string]any{"type": "string"},
+				"fields":  map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+			},
+		},
+	}
+
+	// seenSchema guards against two distinct tables whose singularized,
+	// PascalCased names collide (e.g. `note` and `notes`), which would
+	// otherwise silently overwrite each other's schema keys and produce
+	// duplicate operationIds. On collision we fall back to the raw table
+	// name so each table keeps a distinct, stable contract entry.
+	seenSchema := map[string]bool{}
+	for _, table := range sortedTables(app) {
+		// Belt-and-suspenders: sortedTables already strips every
+		// _benmore_* table, so this guard is normally dead code. Keep it
+		// so a future change to sortedTables can't leak an internal table
+		// into the public contract.
+		if strings.HasPrefix(table.Name, "_benmore_") {
+			continue
+		}
+		schemaName := pascalCase(singularize(table.Name))
+		if seenSchema[schemaName] {
+			schemaName = pascalCase(table.Name)
+		}
+		seenSchema[schemaName] = true
+		schemas[schemaName] = openAPISchemaForTable(table)
+		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(table, "create")
+		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(table, "update")
+		paths["/api/"+table.Name] = map[string]any{
+			"get": map[string]any{
+				"operationId": "list" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "List " + table.Name,
+				// Parameters mirror the auto-CRUD list handler (crud.go):
+				// offset paging is ?page=&per_page=, keyset paging is
+				// ?cursor=&limit= (limit is cursor-scoped only), ?count
+				// returns just the total, ?q is full-text, ?include expands
+				// relations. There is no ?offset param.
+				"parameters": openAPIListParams(schemaName),
+				"responses": openAPIResponses(map[string]any{
+					// The runtime returns one of: a bare array (default),
+					// {data,total,page,per_page} when ?page= is set,
+					// {data,next_cursor,limit} when ?cursor= is set, or
+					// {count} when ?count is set (crud.go list handler).
+					"200": openAPIJSONResponse("Rows", openAPIListResponseSchema(schemaName)),
+				}),
+			},
+			"post": map[string]any{
+				"operationId": "create" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Create " + singularize(table.Name),
+				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Create" + schemaName}),
+				"responses": openAPIResponses(map[string]any{
+					// Create echoes the inserted row plus a status envelope:
+					// {id, status:"created", ...row} (crud.go handleCreate).
+					"200": openAPIJSONResponse("Created row", openAPICreateResponseSchema(schemaName)),
+				}),
+			},
+		}
+		paths["/api/"+table.Name+"/{id}"] = map[string]any{
+			"get": map[string]any{
+				"operationId": "get" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Get " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam()},
+				"responses": openAPIResponses(map[string]any{
+					"200": openAPIJSONResponse("Row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+				}),
+			},
+			"patch": map[string]any{
+				"operationId": "update" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Update " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam()},
+				"requestBody": openAPIJSONRequest(map[string]any{"$ref": "#/components/schemas/Update" + schemaName}),
+				"responses": openAPIResponses(map[string]any{
+					// Update does NOT echo the row; it returns {status:"updated"}
+					// only (crud.go handleUpdate). On an optimistic-concurrency
+					// mismatch (_expected_updated_at in the body) it returns 409.
+					"200": openAPIJSONResponse("Update status", openAPIWriteStatusSchema("updated")),
+					"409": openAPIProblemResponse("Concurrency conflict"),
+				}),
+			},
+			"delete": map[string]any{
+				"operationId": "delete" + schemaName,
+				"tags":        []string{table.Name},
+				"summary":     "Delete " + singularize(table.Name),
+				"parameters":  []map[string]any{openAPIIDParam()},
+				"responses": openAPIResponses(map[string]any{
+					// Delete returns {status:"deleted"} (crud.go handleDelete).
+					"200": openAPIJSONResponse("Delete status", openAPIWriteStatusSchema("deleted")),
+				}),
+			},
+		}
+	}
+
+	return map[string]any{
+		"openapi": "3.1.0",
+		"info": map[string]any{
+			"title": appOpenAPITitle(app),
+			// Derive the version from the schema fingerprint so the contract
+			// version moves whenever the tables/columns change, letting
+			// consumers detect drift instead of seeing a frozen 1.0.0.
+			"version": "1.0.0+" + tablesFingerprint(app),
+		},
+		"paths": paths,
+		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"cookieSession": map[string]any{"type": "apiKey", "in": "cookie", "name": "benmore_session"},
+				"bearerAuth":    map[string]any{"type": "http", "scheme": "bearer"},
+			},
+			"schemas": schemas,
+		},
+		"security": []map[string][]string{{"cookieSession": []string{}}, {"bearerAuth": []string{}}},
+	}
+}
+
+func appOpenAPITitle(app *App) string {
+	if app.Design != nil && app.Design.SEO != nil && app.Design.SEO["site_name"] != "" {
+		return app.Design.SEO["site_name"] + " API"
+	}
+	return "Benmore App API"
+}
+
+func openAPISchemaForTable(table Table) map[string]any {
+	props := map[string]any{}
+	required := []string{}
+	for _, col := range table.Columns {
+		if isSensitiveUserColumn(col.Name) {
+			continue
+		}
+		props[col.Name] = openAPISchemaForColumn(col)
+		if col.NotNull && col.Default == "" && !col.PK {
+			required = append(required, col.Name)
+		}
+	}
+	out := map[string]any{
+		"type": "object",
+		// Read responses allow extra keys: the list/read handlers inject
+		// related rows under ?include=<rel> keys (crud.go ResolveIncludes),
+		// which are not part of the table's own columns. A strict
+		// additionalProperties:false would reject those otherwise-valid
+		// responses, so reads are open while write schemas stay strict.
+		"additionalProperties": true,
+		"properties":           props,
+	}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
+func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
+	props := map[string]any{}
+	required := []string{}
+	for _, col := range table.Columns {
+		if col.PK || isManagedColumn(col.Name) || isSensitiveUserColumn(col.Name) {
+			continue
+		}
+		props[col.Name] = openAPISchemaForColumn(col)
+		if mode == "create" && col.NotNull && col.Default == "" {
+			required = append(required, col.Name)
+		}
+	}
+	// Optimistic concurrency on update is driven by an _expected_updated_at
+	// field in the request body (crud.go handleUpdate reads r.FormValue), NOT
+	// by any header. Model it on the Update schema only, and only when the
+	// table actually has an updated_at column for the check to compare against.
+	if mode == "update" && tableHasColumn(table, "updated_at") {
+		props["_expected_updated_at"] = map[string]any{
+			"type":        "string",
+			"description": "Optimistic concurrency token: the row's current updated_at. If it no longer matches, the update fails with 409.",
+		}
+	}
+	out := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           props,
+	}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
+// tableHasColumn reports whether the (already-loaded) table definition has a
+// column with the given name. Unlike hasColumn it works off the in-memory
+// Table value without touching the DB.
+func tableHasColumn(table Table, name string) bool {
+	for _, c := range table.Columns {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func openAPISchemaForColumn(col Column) map[string]any {
+	t := strings.ToUpper(col.Type)
+	schema := map[string]any{}
+	switch {
+	case strings.Contains(t, "INT"):
+		schema["type"] = "integer"
+	case strings.Contains(t, "REAL"), strings.Contains(t, "FLOAT"), strings.Contains(t, "DOUBLE"), strings.Contains(t, "DECIMAL"):
+		schema["type"] = "number"
+	case strings.Contains(t, "BOOL"):
+		schema["type"] = "boolean"
+	case strings.Contains(t, "DATE"), strings.Contains(t, "TIME"):
+		schema["type"] = "string"
+		schema["format"] = "date-time"
+	case strings.Contains(t, "JSON"):
+		schema["type"] = []string{"object", "array", "string", "number", "boolean", "null"}
+	default:
+		schema["type"] = "string"
+	}
+	if !col.NotNull {
+		if typ, ok := schema["type"].(string); ok {
+			schema["type"] = []string{typ, "null"}
+		}
+	}
+	if col.PK {
+		schema["readOnly"] = true
+	}
+	return schema
+}
+
+func openAPIResponses(extra map[string]any) map[string]any {
+	out := map[string]any{
+		"400": openAPIProblemResponse("Bad request"),
+		"401": openAPIProblemResponse("Authentication required"),
+		"403": openAPIProblemResponse("Forbidden"),
+		"404": openAPIProblemResponse("Not found"),
+		"422": openAPIProblemResponse("Validation failed"),
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+func openAPIJSONResponse(description string, schema map[string]any) map[string]any {
+	return map[string]any{
+		"description": description,
+		"content": map[string]any{
+			"application/json": map[string]any{"schema": schema},
+		},
+	}
+}
+
+func openAPIProblemResponse(description string) map[string]any {
+	return openAPIJSONResponse(description, map[string]any{"$ref": "#/components/schemas/Problem"})
+}
+
+func openAPIJSONRequest(schema map[string]any) map[string]any {
+	return map[string]any{
+		"required": true,
+		"content": map[string]any{
+			"application/json": map[string]any{"schema": schema},
+		},
+	}
+}
+
+func openAPIIDParam() map[string]any {
+	return map[string]any{
+		"name":     "id",
+		"in":       "path",
+		"required": true,
+		"schema":   map[string]any{"type": "string"},
+	}
+}
+
+// openAPIListParams describes the query parameters the auto-CRUD list
+// handler actually honors (crud.go). Offset paging is page/per_page; keyset
+// paging is cursor/limit (limit is cursor-scoped only). There is no ?offset.
+func openAPIListParams(schemaName string) []map[string]any {
+	return []map[string]any{
+		{"name": "page", "in": "query", "description": "Offset-paging page number (1-based). Triggers the {data,total,page,per_page} response shape.", "schema": map[string]any{"type": "integer", "minimum": 1}},
+		{"name": "per_page", "in": "query", "description": "Rows per page for offset paging (default 20).", "schema": map[string]any{"type": "integer", "minimum": 1}},
+		{"name": "cursor", "in": "query", "description": "Keyset-paging cursor (an id). Triggers the {data,next_cursor,limit} response shape.", "schema": map[string]any{"type": "string"}},
+		{"name": "limit", "in": "query", "description": "Page size for keyset (cursor) paging only; capped at 500. Ignored for offset paging.", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 500}},
+		{"name": "count", "in": "query", "description": "When truthy, return only {count: N} (the filtered total, ignoring paging).", "schema": map[string]any{"type": "boolean"}},
+		{"name": "include", "in": "query", "description": "Comma-separated relation names to expand inline (e.g. include=contact,tasks). Adds extra keys to each row.", "schema": map[string]any{"type": "string"}},
+		{"name": "q", "in": "query", "description": "Full-text search query applied across the table's searchable text columns.", "schema": map[string]any{"type": "string"}},
+	}
+}
+
+// openAPIListResponseSchema models the four real list response shapes the
+// auto-CRUD handler emits (crud.go): a bare array (default), a page envelope
+// ({data,total,page,per_page}), a cursor envelope ({data,next_cursor,limit}),
+// and the count-only shape ({count}).
+func openAPIListResponseSchema(schemaName string) map[string]any {
+	ref := map[string]any{"$ref": "#/components/schemas/" + schemaName}
+	rowArray := map[string]any{"type": "array", "items": ref}
+	return map[string]any{
+		"oneOf": []any{
+			rowArray,
+			map[string]any{
+				"type":     "object",
+				"required": []string{"data", "total", "page", "per_page"},
+				"properties": map[string]any{
+					"data":     rowArray,
+					"total":    map[string]any{"type": "integer"},
+					"page":     map[string]any{"type": "integer"},
+					"per_page": map[string]any{"type": "integer"},
+				},
+			},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"data", "limit"},
+				"properties": map[string]any{
+					"data":        rowArray,
+					"next_cursor": map[string]any{"type": []string{"string", "integer", "null"}},
+					"limit":       map[string]any{"type": "integer"},
+				},
+			},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"count"},
+				"properties": map[string]any{
+					"count": map[string]any{"type": "integer"},
+				},
+			},
+		},
+	}
+}
+
+// openAPICreateResponseSchema models the create envelope: the inserted row
+// plus {id, status:"created"} (crud.go handleCreate). additionalProperties is
+// open because the full row's columns are merged in alongside the envelope.
+func openAPICreateResponseSchema(schemaName string) map[string]any {
+	return map[string]any{
+		"allOf": []any{
+			map[string]any{"$ref": "#/components/schemas/" + schemaName},
+			map[string]any{
+				"type":     "object",
+				"required": []string{"id", "status"},
+				"properties": map[string]any{
+					"id":     map[string]any{"type": []string{"string", "integer"}},
+					"status": map[string]any{"type": "string", "const": "created"},
+				},
+			},
+		},
+	}
+}
+
+// openAPIWriteStatusSchema models the {status:"<verb>"} envelope returned by
+// update and delete (crud.go handleUpdate/handleDelete).
+func openAPIWriteStatusSchema(status string) map[string]any {
+	return map[string]any{
+		"type":     "object",
+		"required": []string{"status"},
+		"properties": map[string]any{
+			"status": map[string]any{"type": "string", "const": status},
 		},
 	}
 }
