@@ -71,22 +71,26 @@ type jobEnqueueExecer interface {
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
 // every job to id-enumeration.
 func EnqueueJob(db *sql.DB, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(db, "", flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", "", flowName, payload, runAt)
 }
 
 func EnqueueJobUnique(db *sql.DB, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(db, uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(db, "flow", uniqueKey, flowName, payload, runAt)
 }
 
 func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(tx, "", flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", "", flowName, payload, runAt)
 }
 
 func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
-	return enqueueJob(tx, uniqueKey, flowName, payload, runAt)
+	return enqueueTypedJob(tx, "flow", uniqueKey, flowName, payload, runAt)
 }
 
-func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+func EnqueueCronJob(db *sql.DB, cronID, uniqueKey string, payload map[string]any, runAt *time.Time) (int64, string, error) {
+	return enqueueTypedJob(db, "cron", uniqueKey, cronID, payload, runAt)
+}
+
+func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
 	uniqueKey = strings.TrimSpace(uniqueKey)
 	if uniqueKey != "" {
 		if id, token, ok := findActiveJobByUniqueKey(exec, uniqueKey); ok {
@@ -100,8 +104,8 @@ func enqueueJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[s
 	}
 	token := generateToken(18)
 	result, err := exec.Exec(
-		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES ('flow', ?, ?, ?, ?, ?)",
-		flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
+		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at, status_token, unique_key) VALUES (?, ?, ?, ?, ?, ?)",
+		jobType, flowName, string(data), ra.UTC().Format(sqliteDateTimeLayout), token, nullIfEmpty(uniqueKey),
 	)
 	if err != nil {
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
@@ -254,6 +258,8 @@ func processNextJob(app *App) (worked bool) {
 	switch jobType {
 	case "hook":
 		jobErr = executeHookJob(app, data)
+	case "cron":
+		jobErr = executeCronJob(app, flowName, data)
 	case "webhook_subscription":
 		jobErr = executeWebhookSubscriptionJob(data, app.Dir)
 	default: // "flow"

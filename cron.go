@@ -192,12 +192,13 @@ func LoadCron(dir string) *CronConfig {
 }
 
 // StartCronScheduler launches a single ticker that checks every job
-// every minute. Last-fire times are persisted to _benmore_cron_state
-// so process restarts don't re-fire jobs that already ran in the
-// current schedule window. Before persistence, restart loops would
-// re-fire every job whose schedule matched the current minute, on
-// EVERY restart - during a write-burst that meant the same `every 15m`
-// sync ran every 5 seconds, hammering upstream APIs.
+// every minute. Due fires are persisted to _benmore_jobs first, then
+// last-fire times are persisted to _benmore_cron_state so process
+// restarts don't re-fire jobs that already queued in the current
+// schedule window. Before persistence, restart loops would re-fire
+// every job whose schedule matched the current minute, on EVERY restart
+// - during a write-burst that meant the same `every 15m` sync ran every
+// 5 seconds, hammering upstream APIs.
 //
 // SIGHUP-safe (v2.7.40 fix): called from both first-boot AND every
 // hot reload (server.go reloadAppConfig). On reload, it closes the
@@ -245,6 +246,7 @@ func StartCronScheduler(app *App) {
 	if err := ensureCronStateTable(app); err != nil {
 		log.Printf("cron: state table init failed (%s) - falling back to in-memory last-fire", err)
 	}
+	EnsureJobsTable(app.DB)
 	state := newCronState(app)
 	stop := make(chan struct{})
 	app.CronStop = stop
@@ -384,21 +386,58 @@ func (s *cronState) tick(app *App, now time.Time) {
 			continue
 		}
 		stamp := now.Truncate(time.Minute)
+		if _, _, err := EnqueueCronJob(app.DB, j.ID, cronUniqueKey(j.ID, stamp), cronPayload(j, stamp), &stamp); err != nil {
+			log.Printf("cron: enqueue %s failed: %s", j.ID, err)
+			continue
+		}
+		// Persist AFTER the queue row exists. If the process dies after
+		// this point, the job worker lease/retry path owns execution; if
+		// it dies before this point, the stable unique key de-dupes a
+		// repeated enqueue for the same schedule minute.
+		persistCronFire(app, j.ID, stamp)
 		s.mu.Lock()
 		s.lastFire[j.ID] = stamp
 		s.mu.Unlock()
-		// Persist BEFORE the goroutine launches so a crash mid-run still
-		// records "we fired at this minute" - at-most-once semantics
-		// matter more than at-least-once for `every 15m` carrier syncs.
-		persistCronFire(app, j.ID, stamp)
-		go runCronJob(app, j)
 	}
 }
 
-func runCronJob(app *App, j CronJob) {
+func cronUniqueKey(jobID string, firedAt time.Time) string {
+	return "cron:" + jobID + ":" + firedAt.UTC().Format("20060102T1504")
+}
+
+func cronPayload(j CronJob, firedAt time.Time) map[string]any {
+	return map[string]any{
+		"job_id":   j.ID,
+		"fired_at": firedAt.UTC().Format(time.RFC3339),
+		"schedule": j.Schedule,
+	}
+}
+
+func executeCronJob(app *App, cronID string, data map[string]any) error {
+	j, ok := findCronJob(app, cronID)
+	if !ok {
+		return fmt.Errorf("cron job not found: %s", cronID)
+	}
+	return runCronJob(app, j, data)
+}
+
+func findCronJob(app *App, cronID string) (CronJob, bool) {
+	if app == nil || app.Cron == nil {
+		return CronJob{}, false
+	}
+	for _, j := range app.Cron.Jobs {
+		if j.ID == cronID {
+			return j, true
+		}
+	}
+	return CronJob{}, false
+}
+
+func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("CRON [%s] panic: %v", j.ID, r)
+			err = fmt.Errorf("cron %s panic: %v", j.ID, r)
 		}
 	}()
 
@@ -418,11 +457,11 @@ func runCronJob(app *App, j CronJob) {
 		}
 		if found == nil {
 			log.Printf("CRON [%s] flow %q not found in flows.yaml - skipping fire", j.ID, j.Flow)
-			return
+			return fmt.Errorf("flow not found: %s", j.Flow)
 		}
 		if len(found.Steps) == 0 {
 			log.Printf("CRON [%s] flow %q has zero steps - skipping fire", j.ID, j.Flow)
-			return
+			return fmt.Errorf("flow %s has zero steps", j.Flow)
 		}
 		steps = found.Steps
 	}
@@ -431,17 +470,22 @@ func runCronJob(app *App, j CronJob) {
 	// Initialize both maps - flow steps freely assign to ctx.Params (path
 	// param binding) AND ctx.Data (step outputs), and a nil Params from
 	// an HTTP-less cron path panics on first assignment.
+	ctxData := map[string]any{"job_id": j.ID, "fired_at": time.Now().UTC().Format(time.RFC3339)}
+	for k, v := range data {
+		ctxData[k] = v
+	}
 	ctx := &FlowContext{
 		App:    app,
-		Data:   map[string]any{"job_id": j.ID, "fired_at": time.Now().UTC().Format(time.RFC3339)},
+		Data:   ctxData,
 		Params: map[string]string{},
 	}
 	for i := range steps {
 		if err := executeStep(ctx, &steps[i]); err != nil {
 			log.Printf("CRON [%s] step %d failed: %s", j.ID, i, err)
-			return
+			return err
 		}
 	}
+	return nil
 }
 
 // cronShouldFire evaluates the schedule expression against `now`.

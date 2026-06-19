@@ -1,15 +1,16 @@
 # Durable Jobs Frontier
 
-Benmore already has a lightweight durable queue in `_benmore_jobs`: delayed
-run times, attempts, retries, worker claiming, and a status endpoint. The first
-River-like hardening slice is transaction correctness: jobs created inside a
-transactional flow should commit or roll back with that flow, and worker-run
-flows should honor their own `transaction: true` flag.
+Benmore has a lightweight durable queue in `_benmore_jobs`: delayed run times,
+attempts, retries, worker claiming, leases, idempotency keys, cron execution,
+and a status endpoint. These River-like slices keep the embedded queue simple
+while making production retries and crash recovery predictable.
 
 ```mermaid
 flowchart LR
   HTTP[async HTTP flow] --> Jobs[_benmore_jobs]
   Enqueue[run: enqueue] --> Jobs
+  Cron[cron.yaml and trigger.cron] --> CronState[_benmore_cron_state]
+  CronState --> Jobs
   Hooks[hooks] --> Jobs
   Unique[unique_key] --> Jobs
   Jobs --> Worker[StartJobWorker]
@@ -23,8 +24,8 @@ flowchart LR
 ```
 
 This does not import River. It keeps the existing embedded queue and makes the
-transaction boundary and worker leases reliable before adding uniqueness or
-cron-to-jobs conversion.
+transaction boundary, worker leases, uniqueness, and cron durability reliable
+before adding larger queue primitives.
 
 ## Leases
 
@@ -51,4 +52,25 @@ Flow enqueue steps can set it with:
   enqueue:
     flow: generate_report
     unique_key: "report:${{ user_id }}:${{ params.month }}"
+```
+
+## Cron Jobs
+
+Cron no longer launches best-effort goroutines. Each due schedule enqueues a
+`job_type = 'cron'` row with a stable per-minute `unique_key`, then the normal
+job worker executes it. That gives scheduled work the same lease recovery,
+retry, status, and idempotency behavior as async flows.
+
+```mermaid
+sequenceDiagram
+  participant S as Cron scheduler
+  participant Q as _benmore_jobs
+  participant W as Job worker
+  participant C as Cron steps
+  S->>Q: enqueue cron job with unique_key
+  S->>S: persist last_fire after enqueue
+  W->>Q: claim pending job + lease
+  W->>C: run current cron/flow definition
+  C-->>W: success or error
+  W->>Q: complete, retry, or fail
 ```
