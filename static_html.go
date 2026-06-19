@@ -176,6 +176,9 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 			injected = injectCookieBanner(injected)
 			injected = injectAnalyticsBeacon(injected)
 		}
+		if devReloadClientEnabled(app) {
+			injected = injectDevReloadClient(injected)
+		}
 	}
 	injected = versionStaticAssets(injected, app)
 	// Guarantee the bm import map exists BEFORE versioning/sdui run (they only
@@ -192,6 +195,24 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 	w.Header().Set("Cache-Control", "no-store")
 	w.Write(injected)
 	return true
+}
+
+// injectDevReloadClient inserts the browser-side hot reload listener
+// before </body>. It is gated by the caller to dev/testing surfaces.
+func injectDevReloadClient(html []byte) []byte {
+	if bytes.Contains(html, []byte(`id="bm-dev-reload-client"`)) {
+		return html
+	}
+	chunk := []byte("\n<script id=\"bm-dev-reload-client\">" + DevReloadClientScript + "</script>\n")
+	lower := bytes.ToLower(html)
+	if i := bytes.LastIndex(lower, []byte("</body>")); i >= 0 {
+		out := make([]byte, 0, len(html)+len(chunk))
+		out = append(out, html[:i]...)
+		out = append(out, chunk...)
+		out = append(out, html[i:]...)
+		return out
+	}
+	return append(html, chunk...)
 }
 
 // injectAnalyticsBeacon adds the framework's per-page-view beacon
@@ -331,10 +352,11 @@ func injectCookieBanner(html []byte) []byte {
 // `?v=<mtime>` rewrite to every cacheable shape.
 //
 // Covered now:
-//   css   js   mjs   cjs           - stylesheets + scripts
-//   png   jpg  jpeg  gif  webp     - raster images
-//   svg   avif ico                 - vector / modern raster / favicons
-//   woff  woff2 ttf  otf  eot      - web fonts
+//
+//	css   js   mjs   cjs           - stylesheets + scripts
+//	png   jpg  jpeg  gif  webp     - raster images
+//	svg   avif ico                 - vector / modern raster / favicons
+//	woff  woff2 ttf  otf  eot      - web fonts
 //
 // Not covered (deliberate): URLs in CSS `background-image: url(...)`
 // or `<source srcset="...">`. Those don't appear in href/src so the
@@ -447,7 +469,9 @@ func versionBmInternal(html []byte) []byte {
 // injectBmImportmap guarantees the bm import map is present on any served HTML
 // that uses ES modules. The bm SDK is imported as the bare specifier
 // `import bm from 'bm'`, which ONLY resolves if the document carries
-//   <script type="importmap">{"imports":{"bm":"/_internal/bm.js"}}</script>
+//
+//	<script type="importmap">{"imports":{"bm":"/_internal/bm.js"}}</script>
+//
 // The scaffold ships it, but agents (the in-browser builder AND MCP clients
 // like Claude Code) routinely rewrite a page - login/signup, extra pages - and
 // drop it. The browser then throws "Failed to resolve module specifier bm" and
@@ -579,9 +603,9 @@ func maxStaticSourceMtime(staticRoot string) (time.Time, bool) {
 // the meta tag's name without actually declaring it.
 //
 // Insertion points, in order of preference:
-//   1. Immediately before `</head>`
-//   2. Immediately after `<head>` (or `<head ...>`) when no closing tag
-//   3. At the very top of the document
+//  1. Immediately before `</head>`
+//  2. Immediately after `<head>` (or `<head ...>`) when no closing tag
+//  3. At the very top of the document
 func injectCSRFMeta(html []byte) []byte {
 	if indexFoldBytes(html, []byte(`<meta name="csrf-token"`)) >= 0 ||
 		indexFoldBytes(html, []byte(`<meta name='csrf-token'`)) >= 0 {
