@@ -67,6 +67,15 @@ type CronJob struct {
 	Schedule string
 	Steps    []FlowStep
 	Flow     string // optional: name of a flow from flows.yaml to run instead of Steps
+	// MaxAttempts is the per-cron retry budget on the durable queue.
+	// Zero means "use the default" (see cronMaxAttempts), which is 1 -
+	// at-most-once, matching the pre-durable-queue behavior where a cron
+	// fire ran once and was never retried. Authors opt into at-least-once
+	// retries by setting `max_attempts: N` (N>1) in cron.yaml. This keeps
+	// non-idempotent schedules (carrier syncs, outbound email, billing)
+	// safe by default while letting idempotent work request retries
+	// (review finding #2).
+	MaxAttempts int
 }
 
 // CronConfig holds an app's parsed cron.yaml. Stored on App so the
@@ -85,11 +94,12 @@ type CronConfig struct {
 // When BOTH keys are present the file is rejected at write time by
 // the cross-file validator.
 type cronJobYAML struct {
-	ID       string         `yaml:"id"`
-	Schedule string         `yaml:"schedule"`
-	Run      []FlowStepYAML `yaml:"run"`
-	Steps    []FlowStepYAML `yaml:"steps"`
-	Flow     string         `yaml:"flow"` // optional: reference a named flow from flows.yaml
+	ID          string         `yaml:"id"`
+	Schedule    string         `yaml:"schedule"`
+	Run         []FlowStepYAML `yaml:"run"`
+	Steps       []FlowStepYAML `yaml:"steps"`
+	Flow        string         `yaml:"flow"`         // optional: reference a named flow from flows.yaml
+	MaxAttempts int            `yaml:"max_attempts"` // optional: opt into at-least-once retries (>1); default 1 = at-most-once
 }
 
 type cronConfigYAML struct {
@@ -104,11 +114,12 @@ type cronConfigYAML struct {
 //   - sql:   one-liner SQL string - sugar for run: [{sql: "..."}]
 //   - run:   inline step list (or `steps:` as an alias)
 type cronMapEntry struct {
-	Schedule string         `yaml:"schedule"`
-	Run      []FlowStepYAML `yaml:"run"`
-	Steps    []FlowStepYAML `yaml:"steps"`
-	Flow     string         `yaml:"flow"`
-	SQL      string         `yaml:"sql"` // one-liner shortcut
+	Schedule    string         `yaml:"schedule"`
+	Run         []FlowStepYAML `yaml:"run"`
+	Steps       []FlowStepYAML `yaml:"steps"`
+	Flow        string         `yaml:"flow"`
+	SQL         string         `yaml:"sql"`          // one-liner shortcut
+	MaxAttempts int            `yaml:"max_attempts"` // optional: opt into at-least-once retries (>1); default 1 = at-most-once
 }
 
 // LoadCron parses cron.yaml. Accepts both the array shape (`jobs: [...]`)
@@ -150,10 +161,11 @@ func LoadCron(dir string) *CronConfig {
 					steps = []FlowStepYAML{{SQL: entry.SQL}}
 				}
 				jobs = append(jobs, cronJobYAML{
-					ID:       name,
-					Schedule: entry.Schedule,
-					Run:      steps,
-					Flow:     entry.Flow,
+					ID:          name,
+					Schedule:    entry.Schedule,
+					Run:         steps,
+					Flow:        entry.Flow,
+					MaxAttempts: entry.MaxAttempts,
 				})
 			}
 		}
@@ -178,10 +190,11 @@ func LoadCron(dir string) *CronConfig {
 			stepsYAML = j.Steps
 		}
 		out.Jobs = append(out.Jobs, CronJob{
-			ID:       j.ID,
-			Schedule: j.Schedule,
-			Steps:    convertSteps(stepsYAML),
-			Flow:     j.Flow,
+			ID:          j.ID,
+			Schedule:    j.Schedule,
+			Steps:       convertSteps(stepsYAML),
+			Flow:        j.Flow,
+			MaxAttempts: j.MaxAttempts,
 		})
 	}
 	if len(out.Jobs) == 0 {
@@ -192,12 +205,13 @@ func LoadCron(dir string) *CronConfig {
 }
 
 // StartCronScheduler launches a single ticker that checks every job
-// every minute. Last-fire times are persisted to _benmore_cron_state
-// so process restarts don't re-fire jobs that already ran in the
-// current schedule window. Before persistence, restart loops would
-// re-fire every job whose schedule matched the current minute, on
-// EVERY restart - during a write-burst that meant the same `every 15m`
-// sync ran every 5 seconds, hammering upstream APIs.
+// every minute. Due fires are persisted to _benmore_jobs first, then
+// last-fire times are persisted to _benmore_cron_state so process
+// restarts don't re-fire jobs that already queued in the current
+// schedule window. Before persistence, restart loops would re-fire
+// every job whose schedule matched the current minute, on EVERY restart
+// - during a write-burst that meant the same `every 15m` sync ran every
+// 5 seconds, hammering upstream APIs.
 //
 // SIGHUP-safe (v2.7.40 fix): called from both first-boot AND every
 // hot reload (server.go reloadAppConfig). On reload, it closes the
@@ -245,7 +259,17 @@ func StartCronScheduler(app *App) {
 	if err := ensureCronStateTable(app); err != nil {
 		log.Printf("cron: state table init failed (%s) - falling back to in-memory last-fire", err)
 	}
+	EnsureJobsTable(app.DB)
 	state := newCronState(app)
+	// Surface a hydration failure loudly. last_fire is the authoritative
+	// same-minute dedup guard (review finding #1): if we could not read
+	// _benmore_cron_state, an empty in-memory map can let a just-completed
+	// schedule minute re-fire after a restart. We do not hard-fail (cron
+	// still ticks), and the durable unique_key dedup (which now also
+	// matches completed rows) remains as the backstop.
+	if state.hydrateErr != nil {
+		log.Printf("cron: WARN last_fire hydration failed (%s) - relying on durable unique_key dedup to prevent same-minute double fires", state.hydrateErr)
+	}
 	stop := make(chan struct{})
 	app.CronStop = stop
 	go func() {
@@ -275,10 +299,11 @@ func StartCronScheduler(app *App) {
 }
 
 type cronState struct {
-	mu       sync.Mutex
-	lastFire map[string]time.Time
-	jobs     []CronJob
-	app      *App
+	mu         sync.Mutex
+	lastFire   map[string]time.Time
+	jobs       []CronJob
+	app        *App
+	hydrateErr error // non-nil if last_fire could not be read at startup
 }
 
 func newCronState(app *App) *cronState {
@@ -288,18 +313,25 @@ func newCronState(app *App) *cronState {
 		app:      app,
 	}
 	// Hydrate from persisted table on startup so restart-loops can't
-	// re-fire `every 15m` jobs every 5 seconds.
+	// re-fire `every 15m` jobs every 5 seconds. A hydration failure is
+	// recorded (not swallowed) so the caller can warn - an empty map
+	// would otherwise silently weaken the same-minute dedup guard.
 	rows, err := app.DB.Query(`SELECT job_id, last_fire FROM _benmore_cron_state`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var id, ts string
-			if rows.Scan(&id, &ts) == nil {
-				if t, perr := time.Parse(time.RFC3339, ts); perr == nil {
-					s.lastFire[id] = t
-				}
+	if err != nil {
+		s.hydrateErr = err
+		return s
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, ts string
+		if rows.Scan(&id, &ts) == nil {
+			if t, perr := time.Parse(time.RFC3339, ts); perr == nil {
+				s.lastFire[id] = t
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		s.hydrateErr = err
 	}
 	return s
 }
@@ -315,7 +347,15 @@ func newCronState(app *App) *cronState {
 // flows.yaml AND cron.yaml, or this is the second call from a hot
 // reload), the existing entry wins.
 func mergeFlowCronsIntoConfig(app *App) {
-	if app == nil || len(app.Flows) == 0 {
+	if app == nil {
+		return
+	}
+	// Mutates app.Cron.Jobs (append) and reads app.Flows; both are read
+	// concurrently by the job worker, so do the whole merge under app.mu
+	// to avoid a data race with a hot reload (review finding #4).
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if len(app.Flows) == 0 {
 		return
 	}
 	if app.Cron == nil {
@@ -384,21 +424,99 @@ func (s *cronState) tick(app *App, now time.Time) {
 			continue
 		}
 		stamp := now.Truncate(time.Minute)
+		if _, _, err := EnqueueCronJob(app.DB, j.ID, cronUniqueKey(j.ID, stamp), cronPayload(j, stamp), &stamp, cronMaxAttempts(j)); err != nil {
+			log.Printf("cron: enqueue %s failed: %s", j.ID, err)
+			continue
+		}
+		// Persist AFTER the queue row exists. If the process dies after
+		// this point, the job worker lease/retry path owns execution; if
+		// it dies before this point, the stable unique key de-dupes a
+		// repeated enqueue for the same schedule minute.
+		persistCronFire(app, j.ID, stamp)
 		s.mu.Lock()
 		s.lastFire[j.ID] = stamp
 		s.mu.Unlock()
-		// Persist BEFORE the goroutine launches so a crash mid-run still
-		// records "we fired at this minute" - at-most-once semantics
-		// matter more than at-least-once for `every 15m` carrier syncs.
-		persistCronFire(app, j.ID, stamp)
-		go runCronJob(app, j)
 	}
 }
 
-func runCronJob(app *App, j CronJob) {
+// cronMaxAttempts resolves a cron job's retry budget. Default is 1 -
+// at-most-once, preserving the pre-durable-queue semantics where
+// non-idempotent schedules (carrier syncs, outbound email, billing) ran
+// exactly once and were never retried on failure. A job opts into
+// at-least-once retries by setting `max_attempts: N` (N>1) in cron.yaml
+// (review finding #2: routing onto the worker would otherwise silently
+// retry every cron up to the queue default of 3, duplicating side
+// effects for non-idempotent work).
+func cronMaxAttempts(j CronJob) int {
+	if j.MaxAttempts > 0 {
+		return j.MaxAttempts
+	}
+	return 1
+}
+
+// cronUniqueKey is intentionally UTC-normalized (firedAt.UTC()), so the
+// same wall-clock minute maps to one stable key regardless of the
+// scheduler's local timezone or a DST shift, and a reload/restart within
+// that minute collapses to the same key. The string omits an explicit
+// `Z`; the UTC() call is what makes it timezone-stable, not a format
+// marker (review finding #7).
+func cronUniqueKey(jobID string, firedAt time.Time) string {
+	return "cron:" + jobID + ":" + firedAt.UTC().Format("20060102T1504")
+}
+
+func cronPayload(j CronJob, firedAt time.Time) map[string]any {
+	return map[string]any{
+		"job_id":   j.ID,
+		"fired_at": firedAt.UTC().Format(time.RFC3339),
+		// schedule is informational only (review finding #6):
+		// executeCronJob/runCronJob always re-resolve steps from the live
+		// definition (so an edited schedule or flow takes effect), never
+		// from this payload field.
+		"schedule": j.Schedule,
+	}
+}
+
+func executeCronJob(app *App, cronID string, data map[string]any) error {
+	j, ok := findCronJob(app, cronID)
+	if !ok {
+		// The cron definition was removed/renamed (config edit or hot
+		// reload) after this row was enqueued. Treat as a terminal no-op:
+		// log and complete the job rather than returning an error, which
+		// would retry max_attempts times and leave a spurious `failed` row
+		// for work that simply no longer exists - mirroring the original
+		// goroutine path's log-and-skip intent (review finding #3).
+		log.Printf("CRON [%s] definition not found (removed/renamed) - completing as no-op", cronID)
+		return nil
+	}
+	return runCronJob(app, j, data)
+}
+
+// findCronJob snapshots the cron definition under app.mu so a concurrent
+// hot reload reassigning app.Cron (server.go reloadAppConfig) doesn't
+// race the worker reading app.Cron.Jobs (review finding #4).
+func findCronJob(app *App, cronID string) (CronJob, bool) {
+	if app == nil {
+		return CronJob{}, false
+	}
+	app.mu.RLock()
+	cron := app.Cron
+	app.mu.RUnlock()
+	if cron == nil {
+		return CronJob{}, false
+	}
+	for _, j := range cron.Jobs {
+		if j.ID == cronID {
+			return j, true
+		}
+	}
+	return CronJob{}, false
+}
+
+func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("CRON [%s] panic: %v", j.ID, r)
+			err = fmt.Errorf("cron %s panic: %v", j.ID, r)
 		}
 	}()
 
@@ -409,20 +527,26 @@ func runCronJob(app *App, j CronJob) {
 	// if the cron entry had inlined them.
 	steps := j.Steps
 	if j.Flow != "" {
+		// Snapshot app.Flows under app.mu so a concurrent hot reload
+		// reassigning the slice (server.go reloadAppConfig) doesn't race
+		// the worker resolving the flow (review finding #4).
+		app.mu.RLock()
+		flows := app.Flows
+		app.mu.RUnlock()
 		var found *Flow
-		for i := range app.Flows {
-			if app.Flows[i].Name == j.Flow {
-				found = &app.Flows[i]
+		for i := range flows {
+			if flows[i].Name == j.Flow {
+				found = &flows[i]
 				break
 			}
 		}
 		if found == nil {
 			log.Printf("CRON [%s] flow %q not found in flows.yaml - skipping fire", j.ID, j.Flow)
-			return
+			return fmt.Errorf("flow not found: %s", j.Flow)
 		}
 		if len(found.Steps) == 0 {
 			log.Printf("CRON [%s] flow %q has zero steps - skipping fire", j.ID, j.Flow)
-			return
+			return fmt.Errorf("flow %s has zero steps", j.Flow)
 		}
 		steps = found.Steps
 	}
@@ -431,17 +555,22 @@ func runCronJob(app *App, j CronJob) {
 	// Initialize both maps - flow steps freely assign to ctx.Params (path
 	// param binding) AND ctx.Data (step outputs), and a nil Params from
 	// an HTTP-less cron path panics on first assignment.
+	ctxData := map[string]any{"job_id": j.ID, "fired_at": time.Now().UTC().Format(time.RFC3339)}
+	for k, v := range data {
+		ctxData[k] = v
+	}
 	ctx := &FlowContext{
 		App:    app,
-		Data:   map[string]any{"job_id": j.ID, "fired_at": time.Now().UTC().Format(time.RFC3339)},
+		Data:   ctxData,
 		Params: map[string]string{},
 	}
 	for i := range steps {
 		if err := executeStep(ctx, &steps[i]); err != nil {
 			log.Printf("CRON [%s] step %d failed: %s", j.ID, i, err)
-			return
+			return err
 		}
 	}
+	return nil
 }
 
 // cronShouldFire evaluates the schedule expression against `now`.
