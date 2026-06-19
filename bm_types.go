@@ -472,7 +472,7 @@ export interface RoomClient {
 
   // ── jobs (async-flow status + wait) ──────────────────────────────────
   export const jobs: {
-    status<T = unknown>(jobId: string): Promise<JobStatus<T>>;
+    status<T = unknown>(jobId: string, statusUrl?: string): Promise<JobStatus<T>>;
     wait<T = unknown>(jobId: string, opts?: { intervalMs?: number; timeoutMs?: number; statusUrl?: string }): Promise<T>;
   };
 
