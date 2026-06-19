@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 )
@@ -289,4 +290,45 @@ func TestProcessNextJobRunsFlowBackedCron(t *testing.T) {
 	if status != "completed" {
 		t.Fatalf("status = %q, want completed", status)
 	}
+}
+
+// TestReloadCronConcurrentAccessRace guards the hot-reload data race fix:
+// findCronJob reads app.Cron under app.mu.RLock, so reloadAppConfig must
+// publish app.Cron under app.mu.Lock (not a bare assignment). This test drives
+// concurrent lock-guarded writes (mirroring reloadAppConfig) against concurrent
+// findCronJob reads; run under `-race` it fails if either side drops the lock.
+func TestReloadCronConcurrentAccessRace(t *testing.T) {
+	app := &App{mu: sync.RWMutex{}, Cron: &CronConfig{Jobs: []CronJob{{ID: "a", Schedule: "* * * * *"}}}}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Readers: concurrent findCronJob (takes app.mu.RLock).
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					findCronJob(app, "a")
+				}
+			}
+		}()
+	}
+	// Writer: mirror reloadAppConfig's lock-guarded publish of app.Cron.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			cron := &CronConfig{Jobs: []CronJob{{ID: "a", Schedule: "* * * * *"}}}
+			app.mu.Lock()
+			app.Cron = cron
+			app.mu.Unlock()
+		}
+		close(done)
+	}()
+
+	wg.Wait()
 }
