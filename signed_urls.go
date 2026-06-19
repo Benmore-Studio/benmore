@@ -35,8 +35,8 @@ func cryptoRandRead(b []byte) { _, _ = cryptorand.Read(b) }
 // previous hardcoded fallback (which would let anyone with source
 // access forge signed URLs and edge tokens).
 var (
-	signedURLKey     []byte
-	signedURLKeyOnce sync.Once
+	signedURLKey   []byte
+	signedURLKeyMu sync.Mutex
 )
 
 // oauthMaxSignedURLTTL is the hard ceiling on how long any minted signed URL
@@ -62,28 +62,25 @@ func computeURLSignature(path string, expires int64) string {
 // edge_auth tokens. Both must be unguessable to attackers, so we
 // derive from serverSecret rather than ever returning a static literal.
 func csrfKeyBytes() []byte {
-	signedURLKeyOnce.Do(func() {
-		// If RegisterSignedURLRoutes already populated the key, leave it.
-		if signedURLKey != nil {
-			return
-		}
-		secret := serverSecret
-		if secret == "" {
-			// serverSecret hasn't been initialized yet - derive an
-			// ephemeral random key. This is per-process and won't
-			// match across instances; callers that hit this path
-			// are in pre-init code and should not be signing
-			// long-lived artifacts. Better to fail validation than
-			// to use a predictable seed.
-			b := make([]byte, 32)
-			cryptoRandRead(b)
-			signedURLKey = b
-			return
-		}
-		h := hmac.New(sha256.New, []byte(secret))
-		h.Write([]byte("signed-url-key"))
-		signedURLKey = h.Sum(nil)
-	})
+	signedURLKeyMu.Lock()
+	defer signedURLKeyMu.Unlock()
+	if signedURLKey != nil {
+		return signedURLKey
+	}
+	if serverSecret == "" {
+		// serverSecret isn't initialized yet. Return an ephemeral key but DO
+		// NOT cache it: a later call (once serverSecret is set) must derive and
+		// cache the REAL key. Caching the ephemeral one (the old sync.Once bug)
+		// permanently diverged signing from the real secret, breaking signed-URL
+		// validation across instances and after restart. Anything signed in this
+		// pre-init window won't validate later - by design (don't sign here).
+		b := make([]byte, 32)
+		cryptoRandRead(b)
+		return b
+	}
+	h := hmac.New(sha256.New, []byte(serverSecret))
+	h.Write([]byte("signed-url-key"))
+	signedURLKey = h.Sum(nil)
 	return signedURLKey
 }
 
@@ -120,7 +117,9 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 	// regardless of route registration order.
 	h := hmac.New(sha256.New, []byte(serverSecret))
 	h.Write([]byte("signed-url-key"))
+	signedURLKeyMu.Lock()
 	signedURLKey = h.Sum(nil)
+	signedURLKeyMu.Unlock()
 
 	// GET /api/_signed_url - generate a signed URL for a private file
 	mux.HandleFunc("GET /api/_signed_url", func(w http.ResponseWriter, r *http.Request) {

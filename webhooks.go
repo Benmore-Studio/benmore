@@ -357,13 +357,13 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 	mac.Write(bodyBytes)
 	v1Sig := hex.EncodeToString(mac.Sum(nil))
 
-	// Legacy body-only signature retained as v0 so receivers that
-	// hard-coded HMAC(secret, body) keep working through one
-	// transition cycle. Drop v0 emission once known integrations
-	// are confirmed migrated.
-	macLegacy := hmac.New(sha256.New, []byte(secret))
-	macLegacy.Write(bodyBytes)
-	v0Sig := hex.EncodeToString(macLegacy.Sum(nil))
+	// Legacy body-only v0 signature has NO timestamp binding, so a receiver
+	// that honors it is replayable indefinitely. It is now OFF by default
+	// (round-2): operators mid-migration can re-enable it for one transition
+	// window via BENMORE_WEBHOOK_LEGACY_V0=1. New receivers should verify v1
+	// (t.body) only.
+	emitV0 := strings.EqualFold(strings.TrimSpace(GetEnv(appDir, "BENMORE_WEBHOOK_LEGACY_V0")), "1") ||
+		strings.EqualFold(strings.TrimSpace(GetEnv(appDir, "BENMORE_WEBHOOK_LEGACY_V0")), "true")
 
 	// Send the webhook
 	req, err := http.NewRequest("POST", whURL, strings.NewReader(string(bodyBytes)))
@@ -374,7 +374,13 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 	req.Header.Set("Content-Type", "application/json")
 	// Stripe-style combined header so receivers can pick the version they
 	// trust without parsing two separate signature headers.
-	req.Header.Set("X-Webhook-Signature", fmt.Sprintf("t=%s,v0=%s,v1=%s", ts, v0Sig, v1Sig))
+	sigHeader := fmt.Sprintf("t=%s,v1=%s", ts, v1Sig)
+	if emitV0 {
+		macLegacy := hmac.New(sha256.New, []byte(secret))
+		macLegacy.Write(bodyBytes)
+		sigHeader = fmt.Sprintf("t=%s,v0=%s,v1=%s", ts, hex.EncodeToString(macLegacy.Sum(nil)), v1Sig)
+	}
+	req.Header.Set("X-Webhook-Signature", sigHeader)
 	req.Header.Set("X-Webhook-Timestamp", ts)
 	req.Header.Set("X-Webhook-Event", event)
 	req.Header.Set("X-Webhook-Table", table)
