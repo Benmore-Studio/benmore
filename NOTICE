@@ -1,0 +1,22 @@
+Benmore framework
+Copyright (c) 2026 Incognito Productions LLC dba Benmore Technologies
+
+This product includes third-party open-source software. Each dependency is the
+property of its respective authors and is used under its own license. All are
+permissive (MIT / BSD / Apache-2.0):
+
+  github.com/Masterminds/sprig/v3        MIT
+  github.com/dop251/goja                 MIT
+  github.com/evanw/esbuild               MIT
+  github.com/mattn/go-sqlite3            MIT
+  github.com/microcosm-cc/bluemonday     BSD-3-Clause
+  github.com/skip2/go-qrcode             MIT
+  golang.org/x/crypto                    BSD-3-Clause
+  golang.org/x/image                     BSD-3-Clause
+  golang.org/x/net                       BSD-3-Clause
+  gopkg.in/yaml.v3                       MIT and Apache-2.0
+
+Transitive dependencies (e.g. dlclark/regexp2, go-sourcemap/sourcemap,
+google/pprof, google/uuid, gorilla/css, shopspring/decimal) are likewise
+permissively licensed. Run `go mod download` and consult each module's LICENSE
+file for the authoritative text.
