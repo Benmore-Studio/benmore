@@ -38,6 +38,9 @@ func serverDispatch(cmd string) bool {
 	case "test":
 		runServerTest()
 		return true
+	case "git-init":
+		runServerGitInit()
+		return true
 	}
 	// host / router / migrate-media are platform (fleet) commands; they
 	// live behind the `platform` build tag. In the open-source framework
@@ -152,7 +155,114 @@ func runServerNew() {
 	if err := WriteHTMLScaffoldFiles(dir, ""); err != nil {
 		log.Fatalf("scaffold failed: %s", err)
 	}
+	// Deploy-on-merge automation, written BEFORE the repo is created so
+	// both files land in the initial commit and the tree starts clean.
+	if _, err := writeDeployAutomation(dir); err != nil {
+		log.Printf("git: deploy automation not written: %s", err)
+	}
+	// Per-app git history from the first second. gitEnsureRepo writes the
+	// protective .gitignore (env.yaml, data.db*, uploads/, .benmore/) and
+	// makes the initial commit - so a scaffolded app is a real repo before
+	// the user's first edit, and their first `git add .` can't sweep up
+	// secrets or the SQLite file. Best-effort: a host without git in PATH
+	// still gets a working app, just no history.
+	if err := gitEnsureRepo(dir, filepath.Base(dir)); err != nil {
+		log.Printf("git: per-app history unavailable: %s", err)
+	} else if err := gitUseTrackedHooks(dir); err != nil {
+		// Non-fatal: the repo and its history exist either way, only the
+		// deploy-on-merge convenience would be missing.
+		log.Printf("git: tracked hooks not enabled: %s", err)
+	}
 	fmt.Printf("Created %s\n\nNext:\n  benmore serve %s --port 8080\n  open http://localhost:8080\n", dir, dir)
+}
+
+// runServerGitInit retrofits an EXISTING app directory with the same git
+// setup `benmore new` now creates: a repo, the protective .gitignore, the
+// deploy-on-merge automation, and core.hooksPath.
+//
+//	benmore git-init [dir]
+//
+// This exists because `benmore new` is the rarest way an app reaches a
+// developer's machine. Apps that arrive via `benmore pull` / `benmore
+// sync` get a .benmore/ manifest but no repo at all, which is exactly the
+// case this command fixes.
+//
+// Every step is idempotent and additive: an existing repo keeps its
+// history, an existing .gitignore or hook keeps the user's version, and
+// re-running is a no-op that reports "already set up". Nothing here can
+// lose work, which is what makes it safe to point at a directory that
+// already has months of it.
+func runServerGitInit() {
+	dir := getAppDir(2)
+
+	// Refuse anything that isn't an app. Running this against a home dir
+	// or a folder that merely CONTAINS apps would create a repo spanning
+	// all of them - tedious to unpick, and the sort of thing that only
+	// gets noticed after the first commit. Same markers `deploy` checks.
+	hasYAML := fileExists(filepath.Join(dir, "app.yaml"))
+	hasSchema := fileExists(filepath.Join(dir, "schema.prisma"))
+	if !hasYAML && !hasSchema {
+		fmt.Fprintf(os.Stderr, "git-init: %s doesn't look like a Benmore app (no app.yaml / schema.prisma).\nPass the app directory: benmore git-init <dir>\n", dir)
+		os.Exit(1)
+	}
+
+	hadRepo := gitHasRepo(dir)
+
+	wroteIgnore, err := gitEnsureIgnoreFile(dir)
+	if err != nil {
+		log.Fatalf("git-init: %s", err)
+	}
+	wroteFiles, err := writeDeployAutomation(dir)
+	if err != nil {
+		log.Fatalf("git-init: %s", err)
+	}
+	// Runs after the files above so a brand-new repo's initial commit
+	// contains them instead of leaving the tree dirty on first use.
+	if err := gitEnsureRepo(dir, filepath.Base(dir)); err != nil {
+		log.Fatalf("git-init: %s", err)
+	}
+	hadHooksPath := gitHooksPathSet(dir)
+	if err := gitUseTrackedHooks(dir); err != nil {
+		log.Fatalf("git-init: %s", err)
+	}
+
+	// Report only what actually changed - a re-run that claims credit for
+	// work it didn't do trains you to stop reading the output.
+	var did []string
+	if !hadRepo {
+		did = append(did, "initialised a git repo (+ initial commit)")
+	}
+	if wroteIgnore {
+		did = append(did, "wrote .gitignore (env.yaml, data.db*, uploads/, .benmore/)")
+	}
+	for _, f := range wroteFiles {
+		did = append(did, "wrote "+f)
+	}
+	if !hadHooksPath {
+		did = append(did, "set core.hooksPath to .githooks")
+	}
+
+	fmt.Println(filepath.Base(dir))
+	if len(did) == 0 {
+		fmt.Println("  already set up - nothing to do")
+		return
+	}
+	for _, d := range did {
+		fmt.Printf("  ✓ %s\n", d)
+	}
+	// New files in a repo that already had history are uncommitted right
+	// now. Say so here rather than letting them surface in some later,
+	// unrelated `git status`.
+	if hadRepo && (wroteIgnore || len(wroteFiles) > 0) {
+		fmt.Printf("\nExisting repo kept. Review and commit the new files:\n  git -C %s status\n", dir)
+	}
+	fmt.Printf("\nMerging to the default branch deploys to benmore dev.\nProduction stays manual: benmore promote <app>\n")
+}
+
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 // runServerServe boots a single app on a single port.

@@ -13,6 +13,7 @@ SDK, all served from a single process.
 
 | Feature | Canonical reference |
 |---|---|
+| Every app is a git repo: `benmore new` initialises git + a protective `.gitignore` + deploy-on-merge hooks; merging to the default branch deploys to dev (prod stays manual via `benmore promote`); `benmore git-init` retrofits an existing app (v2.7.204) | - |
 | GitHub sync: one-way mirror of the app's git history to a user-owned GitHub repo/org - OAuth connect in dashboard → Version Control, auto-push on every commit (Live → main, Sandbox → dev) (v2.7.202) | `api(at:"github")` |
 | `benmore deploy <dir>`: first-deploy uses a bare scaffold (no Notes demo merged into your app) + per-file push failures are reported while the rest still ship (v2.7.201) | - |
 | Managed social login (zero-setup Google/Microsoft), Stripe Connect (per-env keys), managed DNS zones (v2.7.200) | `api(at:"oauth")`, `api(at:"payments")`, `api(at:"dns")` |

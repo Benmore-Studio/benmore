@@ -101,6 +101,42 @@ env.yaml
 /Benmore/
 `
 
+// gitEnsureIgnoreFile writes the framework .gitignore when the app has
+// none, and reports whether it created one. An app that already has a
+// .gitignore keeps it untouched - the user's entries win, and re-running
+// must never stomp them.
+//
+// This matters most on the retrofit path (`benmore git-init`): an app
+// pulled down with `benmore pull` has no .gitignore at all, so the first
+// `git add .` would otherwise sweep up env.yaml and a binary data.db.
+func gitEnsureIgnoreFile(dir string) (bool, error) {
+	path := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte(gitignoreContents), 0644); err != nil {
+		return false, fmt.Errorf("write .gitignore: %w", err)
+	}
+	return true, nil
+}
+
+// gitHooksPathSet reports whether core.hooksPath already points at the
+// tracked .githooks directory, so a retrofit can stay quiet about work it
+// isn't doing.
+func gitHooksPathSet(dir string) bool {
+	if !gitAvailable() || !gitHasRepo(dir) {
+		return false
+	}
+	out, err := gitRun(dir, "config", "--get", "core.hooksPath")
+	return err == nil && strings.TrimSpace(out) == ".githooks"
+}
+
+// gitHasRepo reports whether dir is already a git repository.
+func gitHasRepo(dir string) bool {
+	st, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil && st.IsDir()
+}
+
 // gitEnsureRepo initializes the app dir as a git repo if it isn't
 // already one, writes .gitignore, and creates the initial commit.
 // Idempotent - safe to call on every write.
@@ -122,11 +158,8 @@ func gitEnsureRepo(dir, displayName string) error {
 	// Quiet commit signing if the host has commit.gpgsign=true globally.
 	gitRun(dir, "config", "commit.gpgsign", "false")
 
-	gitignorePath := filepath.Join(dir, ".gitignore")
-	if _, err := os.Stat(gitignorePath); err != nil {
-		if err := os.WriteFile(gitignorePath, []byte(gitignoreContents), 0644); err != nil {
-			return fmt.Errorf("write .gitignore: %w", err)
-		}
+	if _, err := gitEnsureIgnoreFile(dir); err != nil {
+		return err
 	}
 	if _, err := gitRun(dir, "add", "."); err != nil {
 		return fmt.Errorf("git add: %w", err)
@@ -137,6 +170,150 @@ func gitEnsureRepo(dir, displayName string) error {
 	}
 	if _, err := gitRun(dir, "commit", "-q", "--allow-empty", "-m", msg); err != nil {
 		return fmt.Errorf("git commit (initial): %w", err)
+	}
+	return nil
+}
+
+// deployHookScript is the post-merge hook: merging into the default
+// branch ships to the benmore DEV instance. Every other branch is
+// ignored, so feature work stays local until it lands.
+//
+// Production is deliberately NOT automated. `benmore promote` remains the
+// only path to prod - a human decision, made after dev has been seen
+// working. An auto-deploy to prod on merge would make the riskiest
+// deployment the one requiring the least intent.
+//
+// The hook never fails the merge. A missing CLI, a framework-only build
+// without the deployed-app commands, or a failed deploy all warn and exit
+// 0 - the merge already happened and is correct regardless of whether the
+// deploy that followed it succeeded.
+const deployHookScript = `#!/bin/sh
+# Benmore deploy-on-merge. Managed by "benmore new"; edit freely.
+#
+# main  -> deploys to the benmore DEV instance
+# prod  -> not automated; run "benmore promote <app>" when dev looks good
+#
+# Tracked in .githooks/ and activated via core.hooksPath so it survives a
+# fresh clone - a hook dropped in .git/hooks/ would not, since .git is
+# never cloned.
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
+
+# Only the default branch deploys. Compare against the repo's own idea of
+# it (origin/HEAD when a remote exists) so a repo whose default is named
+# something other than "main" still works, falling back to "main".
+default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+default=${default#origin/}
+[ -n "$default" ] || default=main
+
+[ "$branch" = "$default" ] || exit 0
+
+command -v benmore >/dev/null 2>&1 || exit 0
+
+# The open-source framework build has no deployed-app commands; only the
+# cloud/platform CLI does. Detect rather than assume.
+benmore help 2>/dev/null | grep -q "DEPLOYED APPS" || {
+  echo "benmore: this build has no deploy commands - skipping dev deploy" >&2
+  exit 0
+}
+
+echo "benmore: $branch merged - deploying to dev"
+if benmore deploy . --env dev; then
+  echo "benmore: dev updated - run 'benmore promote <app>' to ship it to prod"
+else
+  echo "benmore: dev deploy failed (the merge itself is committed)" >&2
+fi
+exit 0
+`
+
+// deployWorkflow covers the path the local hook cannot: a pull request
+// merged on github.com never touches a working copy, so no client-side
+// hook fires. Branch mapping matches deployHookScript and the GitHub
+// mirror's own convention (main = live, dev = sandbox).
+const deployWorkflow = `# Benmore deploy-on-merge (GitHub side).
+#
+# The .githooks/post-merge hook only fires for merges performed LOCALLY.
+# A pull request merged on github.com never touches your working copy,
+# so this workflow covers that path.
+#
+# Merging to main deploys to the benmore DEV instance. Production is not
+# automated: run "benmore promote <app>" once dev looks right.
+#
+# Setup: add a BENMORE_TOKEN repository secret
+# (Settings -> Secrets and variables -> Actions).
+name: Deploy to Benmore dev
+
+on:
+  push:
+    branches: [main]
+
+# One deploy at a time; a newer push supersedes an in-flight one.
+concurrency:
+  group: benmore-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Benmore CLI
+        run: curl -fsSL https://raw.githubusercontent.com/Benmore-Studio/benmore/main/install.sh | sh
+
+      - name: Deploy to dev
+        env:
+          BENMORE_TOKEN: ${{ secrets.BENMORE_TOKEN }}
+        run: benmore deploy . --env dev
+`
+
+// writeDeployAutomation drops the merge-triggered deploy files into dir.
+// Called before gitEnsureRepo so both land in the initial commit and a
+// freshly scaffolded app has a clean working tree.
+//
+// Existing files are left alone - re-scaffolding over a project the user
+// has customised must not clobber their edits.
+// Returns the paths it created (relative to dir) so the retrofit command
+// can report what actually changed rather than claiming credit for files
+// that were already there.
+func writeDeployAutomation(dir string) ([]string, error) {
+	files := []struct {
+		rel  string
+		body string
+		mode os.FileMode
+	}{
+		{filepath.Join(".githooks", "post-merge"), deployHookScript, 0o755},
+		{filepath.Join(".github", "workflows", "benmore-deploy.yml"), deployWorkflow, 0o644},
+	}
+	var written []string
+	for _, f := range files {
+		full := filepath.Join(dir, f.rel)
+		if _, err := os.Stat(full); err == nil {
+			continue // never overwrite a user's version
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return written, fmt.Errorf("mkdir %s: %w", filepath.Dir(f.rel), err)
+		}
+		if err := os.WriteFile(full, []byte(f.body), f.mode); err != nil {
+			return written, fmt.Errorf("write %s: %w", f.rel, err)
+		}
+		written = append(written, f.rel)
+	}
+	return written, nil
+}
+
+// gitUseTrackedHooks points the repo at the tracked .githooks/ directory.
+// Git ignores the executable bit question here - core.hooksPath honours
+// the file mode we already set. Call after gitEnsureRepo (needs .git).
+func gitUseTrackedHooks(dir string) error {
+	if !gitAvailable() || dir == "" {
+		return nil
+	}
+	mu := gitDirLock(dir)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := gitRun(dir, "config", "core.hooksPath", ".githooks"); err != nil {
+		return fmt.Errorf("git config core.hooksPath: %w", err)
 	}
 	return nil
 }
