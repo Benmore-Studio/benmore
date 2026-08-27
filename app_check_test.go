@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -217,14 +218,28 @@ func TestAgentDocs_TopicsList(t *testing.T) {
 	// After consolidation: `build` (the one app-building guide) plus
 	// `deploy` (the cloud-edition ship guide, added with the open-core
 	// split). A new topic is a deliberate act - update this list.
+	//
+	// `deploy` ships only in the cloud/platform editions; the export
+	// script strips docs/agent/deploy.md from the open-source tree. So
+	// assert the invariants that hold in EVERY edition - build is always
+	// present, and no topic appears that isn't a deliberate addition -
+	// rather than a fixed count that only the platform build satisfies.
+	known := map[string]bool{"build": true, "deploy": true}
 	topics := AgentDocsTopics()
-	want := []string{"build", "deploy"}
-	if len(topics) != len(want) {
-		t.Fatalf("expected topics %v, got %v", want, topics)
-	}
-	for i := range want {
-		if topics[i] != want[i] {
-			t.Fatalf("expected topics %v, got %v", want, topics)
+
+	var haveBuild bool
+	for _, topic := range topics {
+		if !known[topic] {
+			t.Errorf("undeclared docs topic %q - adding a topic is a deliberate act; add it to this test", topic)
 		}
+		if topic == "build" {
+			haveBuild = true
+		}
+	}
+	if !haveBuild {
+		t.Fatalf("the `build` guide must ship in every edition, got %v", topics)
+	}
+	if !sort.StringsAreSorted(topics) {
+		t.Errorf("AgentDocsTopics must return sorted names, got %v", topics)
 	}
 }
