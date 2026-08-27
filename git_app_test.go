@@ -180,3 +180,108 @@ func TestGitLog_EmptyForUninitialized(t *testing.T) {
 		t.Errorf("expected empty log for uninitialized dir, got %d commits", len(commits))
 	}
 }
+
+// gitEnsureIgnoreFile writes the protective .gitignore only when the app
+// has none - a user's own file must survive untouched, since the retrofit
+// path (`benmore git-init`) runs against directories that already have
+// months of work in them.
+func TestGitEnsureIgnoreFile_WritesOnceAndPreservesUserFile(t *testing.T) {
+	dir := t.TempDir()
+
+	wrote, err := gitEnsureIgnoreFile(dir)
+	if err != nil {
+		t.Fatalf("gitEnsureIgnoreFile: %s", err)
+	}
+	if !wrote {
+		t.Fatal("expected a .gitignore to be written into an empty dir")
+	}
+	// The secret-bearing paths are the whole point of the file.
+	body, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	for _, want := range []string{"env.yaml", "data.db", "uploads/", ".benmore/"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf(".gitignore missing %q - secrets/state could be committed", want)
+		}
+	}
+
+	// Second call must not clobber: overwrite with a user's version first.
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("# mine\n"), 0644)
+	wrote, err = gitEnsureIgnoreFile(dir)
+	if err != nil {
+		t.Fatalf("gitEnsureIgnoreFile (second): %s", err)
+	}
+	if wrote {
+		t.Error("reported writing over an existing .gitignore")
+	}
+	if body, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(body) != "# mine\n" {
+		t.Error("user's .gitignore was overwritten")
+	}
+}
+
+// writeDeployAutomation drops the post-merge hook + GitHub workflow, and
+// reports only the paths it actually created so a re-run stays quiet.
+func TestWriteDeployAutomation_ReportsOnlyNewFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	written, err := writeDeployAutomation(dir)
+	if err != nil {
+		t.Fatalf("writeDeployAutomation: %s", err)
+	}
+	if len(written) != 2 {
+		t.Fatalf("expected 2 files written, got %d (%v)", len(written), written)
+	}
+
+	hook := filepath.Join(dir, ".githooks", "post-merge")
+	st, err := os.Stat(hook)
+	if err != nil {
+		t.Fatalf("hook not written: %s", err)
+	}
+	// A non-executable hook is silently ignored by git - the whole feature
+	// would no-op with no error anywhere.
+	if st.Mode().Perm()&0o111 == 0 {
+		t.Errorf("post-merge hook is not executable (mode %v)", st.Mode().Perm())
+	}
+
+	// Merging to the default branch must target dev, never prod: prod is
+	// reserved for an explicit `benmore promote`.
+	body, _ := os.ReadFile(hook)
+	if !strings.Contains(string(body), "--env dev") {
+		t.Error("hook does not deploy to dev")
+	}
+	if strings.Contains(string(body), "--env prod") {
+		t.Error("hook auto-deploys to prod - promote must stay manual")
+	}
+
+	// Idempotent: nothing new on a second run.
+	written, err = writeDeployAutomation(dir)
+	if err != nil {
+		t.Fatalf("writeDeployAutomation (second): %s", err)
+	}
+	if len(written) != 0 {
+		t.Errorf("re-run rewrote files: %v", written)
+	}
+}
+
+// gitUseTrackedHooks points core.hooksPath at the committed .githooks dir
+// so the hook survives a clone; gitHooksPathSet reports the same state.
+func TestGitUseTrackedHooks_SetsAndDetectsHooksPath(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "app.yaml"), []byte("name: test"), 0644)
+
+	if gitHooksPathSet(dir) {
+		t.Error("reported hooksPath set before the repo exists")
+	}
+	if err := gitEnsureRepo(dir, "hooks-test"); err != nil {
+		t.Fatalf("gitEnsureRepo: %s", err)
+	}
+	if err := gitUseTrackedHooks(dir); err != nil {
+		t.Fatalf("gitUseTrackedHooks: %s", err)
+	}
+	if !gitHooksPathSet(dir) {
+		t.Error("hooksPath not detected after being set")
+	}
+	out, err := gitRun(dir, "config", "--get", "core.hooksPath")
+	if err != nil || strings.TrimSpace(out) != ".githooks" {
+		t.Errorf("core.hooksPath = %q (err %v), want .githooks", strings.TrimSpace(out), err)
+	}
+}

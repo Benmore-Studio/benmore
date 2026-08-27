@@ -15,6 +15,46 @@ the failure mode it closed, not just *what* changed.
 
 ---
 
+## v2.7.204 — local git for every app + deploy on merge (Aug 27, 2026)
+
+- **Every app is a git repo.** `benmore new` now initialises the app
+  directory as a real repo: framework `.gitignore`, an initial commit, and
+  `core.hooksPath` wired to a tracked `.githooks/`. Previously the per-app
+  git machinery in `git_app.go` was reachable only from the MCP write path,
+  so a locally scaffolded app had no history at all and the scaffold
+  shipped no `.gitignore` - meaning a user's first `git init && git add .`
+  swept up `env.yaml` and a binary `data.db`. That footgun is closed by
+  construction.
+- **Deploy on merge.** Two tracked files are scaffolded:
+  `.githooks/post-merge` (local merges) and
+  `.github/workflows/benmore-deploy.yml` (pull requests merged on GitHub).
+  Merging into the default branch deploys to the **dev** instance; every
+  other branch is ignored, so feature work stays local until it lands.
+  Production is deliberately NOT automated - `benmore promote <app>` stays
+  a human decision made after dev has been seen working. Deploys route
+  through `benmore deploy`, so the server-side write-time validators still
+  gate every file; a router-side pull would have bypassed them.
+  - The hook never fails a merge: a missing CLI, a framework-only build
+    without the deployed-app commands, or a failed deploy all warn and
+    exit 0. The merge already happened and is correct either way.
+  - Hooks live in a **tracked** `.githooks/` rather than `.git/hooks/`,
+    which is never cloned - so the behaviour travels with the repo instead
+    of living on one machine.
+- **`benmore git-init [dir]`** retrofits an existing app. `benmore new` is
+  the rarest way an app reaches a developer's machine; apps arriving via
+  `benmore pull` / `benmore sync` get a `.benmore/` manifest but no repo.
+  Every step is additive and idempotent - an existing repo keeps its
+  history and branch name, an existing `.gitignore` or hook keeps the
+  user's version, and a re-run reports "already set up" rather than
+  claiming credit for work it didn't do. Refuses any directory without
+  `app.yaml` / `schema.prisma`, so it can't span a folder of apps.
+- Local git and the `.benmore/` manifest coexist: `pull` neither creates
+  nor clobbers a repo, and its drift guard still blocks an overwrite when
+  local files diverge from the deployed manifest.
+  (git_app.go, main_server.go, main.go)
+
+---
+
 ## v2.7.202 — GitHub sync (one-way mirror) + CLI update warning (Jul 2, 2026)
 
 - **GitHub sync.** Every app can mirror its per-app git history to a

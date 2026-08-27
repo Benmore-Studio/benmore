@@ -10,7 +10,7 @@ import (
 // version is the release version. It defaults to the value baked here and is
 // overridden at release time via -ldflags "-X main.version=<tag>" (see the
 // public edition's .goreleaser.yaml).
-var version = "2.7.203"
+var version = "2.7.204"
 
 // Full release history lives in the private development repo and git log.
 func main() {
@@ -84,6 +84,7 @@ func printUsage() {
   benmore new <dir>                 Scaffold a new app (runnable immediately)
   benmore serve [dir] [--port N]    Run an app from a directory on one port
   benmore test [dir] [--app|--framework] [--json]
+  benmore git-init [dir]            Add git + deploy-on-merge to an existing app
   benmore docs [topic]              Built-in framework docs
   benmore version [--json]
   benmore help`)
