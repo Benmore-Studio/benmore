@@ -27,11 +27,21 @@ func TestNoBareGoFuncInWorkers(t *testing.T) {
 		},
 	}
 
+	var scanned int
 	for _, file := range workerFiles {
 		data, err := os.ReadFile(file)
+		if os.IsNotExist(err) {
+			// Several worker files are platform-edition only and are
+			// stripped from the open-source export. The invariant is
+			// "no bare go func in a worker file", not "every file in
+			// this list exists" - scan what's here and skip the rest,
+			// so the guard still runs in every edition.
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
+		scanned++
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if !strings.Contains(line, "go func(") {
@@ -43,6 +53,11 @@ func TestNoBareGoFuncInWorkers(t *testing.T) {
 			}
 			t.Fatalf("%s:%d contains bare go func; use safeGo or add a justified allowlist entry", file, i+1)
 		}
+	}
+	// Guard the guard: if the list ever drifts so far that nothing is
+	// scanned, the test would pass vacuously while checking nothing.
+	if scanned == 0 {
+		t.Fatal("no worker files found to scan - workerFiles list has drifted")
 	}
 }
 
