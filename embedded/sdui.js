@@ -2047,10 +2047,39 @@ export function DatePicker(target, opts = {}) {
   inp.addEventListener('change', () => opts.onChange && opts.onChange(inp.value));
   return { get value() { return inp.value; }, destroy: () => { el.innerHTML = ''; } };
 }
-// Markdown(target, { text }) → { destroy } - renders via bm.markdown (safe).
+// Markdown theming + hydration helpers. bm.markdown returns sanitized HTML
+// from the server-side benmark engine; we wrap it in the .benmark theme class,
+// make sure the theme stylesheet is present, and run the hydration pass so
+// ```mermaid``` blocks render (needs window.mermaid loaded by the app).
+let _benmarkCSSInjected = false;
+function ensureMarkdownCSS() {
+  if (_benmarkCSSInjected || typeof document === 'undefined') return;
+  if (!document.querySelector('link[data-benmark-css]')) {
+    const l = document.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = '/_internal/markdown.css';
+    l.setAttribute('data-benmark-css', '');
+    document.head.appendChild(l);
+  }
+  _benmarkCSSInjected = true;
+}
+async function hydrateMarkdown(el) {
+  try { const m = await import('/_internal/markdown-hydrate.js'); await (m.hydrate || m.default)(el); } catch (_) { /* mermaid absent → leave source */ }
+}
+// renderMarkdownInto renders text into el with theme + hydration. Falls back
+// to plain text on any failure so the caller never shows raw markup.
+export async function renderMarkdownInto(el, text) {
+  ensureMarkdownCSS();
+  try {
+    el.innerHTML = `<div class="benmark" data-bm-markdown>${await bm.markdown(text || '')}</div>`;
+    await hydrateMarkdown(el);
+  } catch (_) { el.textContent = text || ''; }
+}
+// Markdown(target, { text }) → { destroy } - renders via bm.markdown (safe),
+// themed, with mermaid/media hydration.
 export async function Markdown(target, opts) {
   const el = resolveEl(target);
-  try { el.innerHTML = `<div data-bm-markdown>${await bm.markdown(opts.text || '')}</div>`; } catch (_) { el.textContent = opts.text || ''; }
+  await renderMarkdownInto(el, (opts && opts.text) || '');
   return { destroy: () => { el.innerHTML = ''; } };
 }
 // RichText(target, { value?, onChange? }) → { html, destroy } - minimal toolbar.
@@ -2926,7 +2955,7 @@ export async function KnowledgeBase(target, opts) {
   const rows = await listRows(opts.table, { limit: 500 });
   el.innerHTML = `<div data-bm-kb><input type="search" data-q placeholder="Search articles…" class="${inputCls}" style="margin-bottom:12px"><div data-list class="space-y-1"></div></div>`;
   const list = el.querySelector('[data-list]'), q = el.querySelector('[data-q]');
-  const open = async (r) => { const m = Modal({ title: r[tf], size: 'lg' }); try { m.el.innerHTML = await bm.markdown(r[bf] || ''); } catch (_) { m.el.textContent = r[bf] || ''; } };
+  const open = async (r) => { const m = Modal({ title: r[tf], size: 'lg' }); await renderMarkdownInto(m.el, r[bf] || ''); };
   const draw = () => { const needle = q.value.toLowerCase(); const hits = rows.filter((r) => (String(r[tf] ?? '') + ' ' + String(r[bf] ?? '')).toLowerCase().includes(needle)); list.innerHTML = hits.length ? hits.map((r, i) => `<button data-i="${rows.indexOf(r)}" style="display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid rgba(128,128,128,.2);border-radius:8px;background:var(--card,#fff);cursor:pointer"><div style="font-weight:600;font-size:14px">${esc(r[tf] ?? '')}</div><div style="font-size:12px;opacity:.55;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(r[bf] ?? '').replace(/[#*`]/g, '').slice(0, 120))}</div></button>`).join('') : skin.emptyState('No articles found.'); list.querySelectorAll('[data-i]').forEach((b) => b.addEventListener('click', () => open(rows[+b.getAttribute('data-i')]))); };
   q.addEventListener('input', draw); draw();
   return { destroy: () => { el.innerHTML = ''; } };

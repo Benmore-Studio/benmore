@@ -47,8 +47,20 @@ var htmxJS []byte
 //go:embed embedded/lucide.min.js
 var lucideJS []byte
 
+// PROVENANCE: vis-network@9.1.6 (standalone/umd/vis-network.min.js), the
+// UMD standalone build - it bundles vis-data, so the page needs one script
+// tag and no import map. Exposes the `vis` global (vis.Network, vis.DataSet).
+//
+// Embedded rather than CDN-linked for the reason at the top of this file:
+// the default CSP does allowlist unpkg, so a CDN tag would work - but an
+// external runtime dependency means a page that renders only while unpkg is
+// reachable, and a third-party origin that sees every viewer's request.
+//
+//go:embed embedded/vis-network.min.js
+var visNetworkJS []byte
+
 // rrweb (record) is injected into the headless browser during browser_check to
-// capture an agent-test session; rrweb-player replays it in the builder UI.
+// capture an agent-test session; rrweb-player replays it from the workspace.
 //
 //go:embed embedded/rrweb.min.js
 var rrwebJS []byte
@@ -116,11 +128,20 @@ func RegisterLibRoutes(mux *http.ServeMux) {
 	serve("/_internal/htmx.js", htmxJS)
 	serve("/_internal/lucide.js", lucideJS)
 	serve("/_internal/libavoid.js", libavoidJS)
+	// vis-network: force-directed graph rendering. libavoid.js above does
+	// orthogonal edge ROUTING for fixed-position diagrams; this is the
+	// physics/layout engine for exploratory graphs. Different jobs.
+	serve("/_internal/vis-network.js", visNetworkJS)
 	// markdown.js - tiny safe-by-default Markdown→HTML renderer. Pulled
 	// out as a shared lib after an earlier app build hand-rolled the same
 	// regex twice in different modules. See bm.markdown() in bm.js for
 	// the SDK wrapper.
 	serve("/_internal/markdown.js", markdownJS)
+	// Server-side Markdown engine (github.com/benmore-studio/benmark):
+	// POST /_internal/markdown renders the robust CommonMark+GFM+mermaid/
+	// media set; bm.markdown() fetches it. Also serves the theme CSS +
+	// client hydration. markdown.js above stays as the offline fallback.
+	registerMarkdownRoutes(mux)
 	// rrweb session-replay player (builder "watch the agent test" view).
 	serve("/_internal/rrweb-player.js", rrwebPlayerJS)
 	mux.HandleFunc("GET /_internal/rrweb-player.css", func(w http.ResponseWriter, r *http.Request) {

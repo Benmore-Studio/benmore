@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeGHARefs(t *testing.T) {
@@ -559,5 +560,90 @@ jobs:
 	einID, _ := meta["ein_id"].(string)
 	if einID != "{{user.ein_id}}" {
 		t.Errorf("metadata.ein_id ref not normalized: got %q, want {{user.ein_id}}", einID)
+	}
+}
+
+// TestLoadFlowsGHA_APITimeout pins the two parser gaps from issue #221
+// (blitz-meter flows/messages.yaml): (1) `timeout:` under `with:` on a
+// `run: api` step was never mapped into FlowStep.Timeout, so execStepAPI
+// silently kept its 30s default in both directions (570s didn't extend
+// it, 3s didn't cut it); (2) a step carrying an `if:` gate was wrapped
+// and `continue`d BEFORE the generic retry/timeout/expect_rows mapping,
+// so even step-level `timeout:` was dropped from gated steps.
+func TestLoadFlowsGHA_APITimeout(t *testing.T) {
+	dir := t.TempDir()
+	yamlBody := `
+on:
+  request:
+    method: POST
+    path: /t/:token/v1/messages
+    mode: async
+
+jobs:
+  messages:
+    steps:
+      # if-gated api step with with.timeout (the blitz-meter shape)
+      - id: call
+        if: ${{ params.xbeta }} == ''
+        run: api
+        retry: 2
+        with:
+          url: https://api.anthropic.com/v1/messages
+          method: POST
+          timeout: 570s
+
+      # bare-number with.timeout (seconds)
+      - id: call2
+        run: api
+        with:
+          url: https://example.com/slow
+          method: GET
+          timeout: 570
+
+      # step-level timeout wins over with.timeout
+      - id: call3
+        run: api
+        timeout: 1m
+        with:
+          url: https://example.com/other
+          method: GET
+          timeout: 10s
+`
+	if err := os.WriteFile(filepath.Join(dir, "flows.yaml"), []byte(yamlBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+	flows := LoadFlowsGHA(dir)
+	if len(flows) != 1 {
+		t.Fatalf("expected 1 flow, got %d", len(flows))
+	}
+	steps := flows[0].Steps
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 steps, got %d", len(steps))
+	}
+
+	// Step 1: wrapped in an if gate; timeout + retry must survive the wrap.
+	gate := steps[0]
+	if gate.Type != "if" || len(gate.Steps) != 1 {
+		t.Fatalf("step 0: type=%q steps=%d, want if wrapper with 1 inner", gate.Type, len(gate.Steps))
+	}
+	call := gate.Steps[0]
+	if call.Type != "api" || call.Name != "call" {
+		t.Fatalf("inner step: type=%q name=%q", call.Type, call.Name)
+	}
+	if call.Timeout != 570*time.Second {
+		t.Errorf("gated api with.timeout = %v, want 570s", call.Timeout)
+	}
+	if call.Retry != 2 {
+		t.Errorf("gated api retry = %d, want 2 (dropped by the if-wrap)", call.Retry)
+	}
+
+	// Step 2: bare number means seconds.
+	if steps[1].Timeout != 570*time.Second {
+		t.Errorf("bare-number with.timeout = %v, want 570s", steps[1].Timeout)
+	}
+
+	// Step 3: step-level timeout takes precedence over with.timeout.
+	if steps[2].Timeout != time.Minute {
+		t.Errorf("step-level timeout = %v, want 1m (must win over with.timeout)", steps[2].Timeout)
 	}
 }

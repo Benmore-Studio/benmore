@@ -4,11 +4,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -237,35 +240,29 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// exceeds a configured size cap. No cap is enforced unless one is
 	// configured (checkStorageCap is a no-op by default), so a self-hosted
 	// app is never silently capped.
-	if reason, blocked := checkStorageCap(app); blocked {
+	if reason, blocked := checkStorageCap(app, 0); blocked {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInsufficientStorage)
 		fmt.Fprintf(w, `{"error":"storage cap reached","detail":%q}`, reason)
 		return
 	}
 
-	// Idempotency: if X-Idempotency-Key header present, check for
-	// duplicate. Scope by user_id so two callers with the same key
-	// don't accidentally read each other's cached response.
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
-	var idempUserID int64
-	if s := getSession(app, r); s != nil {
-		idempUserID = s.UserID
-	}
-	if cached, status, found := CheckIdempotency(app.DB, idempotencyKey, idempUserID); found {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		w.Write([]byte(cached))
+	if len(idempotencyKey) > 256 || idempotencyKey != "" && strings.Contains(r.Header.Get("Content-Type"), "multipart") {
+		httpJSON(w, 400, map[string]any{"error": "idempotency requires a key of at most 256 bytes and a non-multipart body"})
 		return
 	}
 
 	// Parse request body: multipart (file uploads), JSON, or form-encoded
 	if strings.Contains(r.Header.Get("Content-Type"), "multipart") {
 		r.ParseMultipartForm(maxUploadSize)
-	} else if r.Header.Get("Content-Type") == "application/json" {
+	} else if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		// JSON body → parse into r.Form so the rest of the handler works uniformly
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+			httpJSON(w, 400, map[string]any{"error": "expected a JSON object"})
+			return
+		} else {
 			r.Form = make(map[string][]string)
 			for k, v := range body {
 				r.Form.Set(k, jsonToFormValue(v))
@@ -273,24 +270,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		}
 	} else {
 		r.ParseForm()
-	}
-
-	// Handle file uploads - check for file inputs and save them
-	if r.MultipartForm != nil {
-		for fieldName, fileHeaders := range r.MultipartForm.File {
-			if len(fileHeaders) > 0 {
-				// Save the uploaded file
-				path, err := HandleFileUpload(app, r, fieldName, table, 0, nil)
-				if err != nil {
-					httpError(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				if path != "" {
-					// Store the file path as a form value so it gets saved to DB
-					r.Form.Set(fieldName, path)
-				}
-			}
-		}
 	}
 
 	// Validate CSRF
@@ -326,6 +305,28 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		if err := checkScope(session, table, "write"); err != nil {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
 			return
+		}
+	}
+
+	if idempotencyKey != "" && session == nil {
+		httpJSON(w, 401, map[string]any{"error": "idempotency requires authentication"})
+		return
+	}
+	// Handle file uploads - check for file inputs and save them
+	if r.MultipartForm != nil {
+		for fieldName, fileHeaders := range r.MultipartForm.File {
+			if len(fileHeaders) > 0 {
+				// Save the uploaded file
+				path, err := HandleFileUpload(app, r, fieldName, table, 0, nil)
+				if err != nil {
+					httpError(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if path != "" {
+					// Store the file path as a form value so it gets saved to DB
+					r.Form.Set(fieldName, path)
+				}
+			}
 		}
 	}
 
@@ -477,6 +478,55 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		return
 	}
 
+	tx, err := app.DB.Begin()
+	if err != nil {
+		httpJSON(w, 500, map[string]any{"error": "transaction start failed"})
+		return
+	}
+	defer tx.Rollback()
+	var idempKey, fingerprint string
+	if idempotencyKey != "" {
+		idempKey, fingerprint = createIdempotencyIdentity(r, table, session, idempotencyKey)
+		if _, err := tx.Exec("DELETE FROM _benmore_idempotency WHERE key=? AND user_id=? AND created_at < datetime('now', '-1 day')", idempKey, session.UserID); err != nil {
+			httpJSON(w, 500, map[string]any{"error": "idempotency unavailable"})
+			return
+		}
+		var cached, previous string
+		var status int
+		err := tx.QueryRow("SELECT response, status_code, fingerprint FROM _benmore_idempotency WHERE key=? AND user_id=?", idempKey, session.UserID).Scan(&cached, &status, &previous)
+		if err == nil {
+			if !hmac.Equal([]byte(previous), []byte(fingerprint)) {
+				httpJSON(w, 409, map[string]any{"error": "idempotency key already used with different input or authorization"})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if isHTMX(r) {
+				w.Header().Set("HX-Refresh", "true")
+			}
+			w.WriteHeader(status)
+			w.Write([]byte(cached))
+			return
+		}
+		if err != sql.ErrNoRows {
+			httpJSON(w, 500, map[string]any{"error": "idempotency unavailable"})
+			return
+		}
+		var legacy bool
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM _benmore_idempotency WHERE key=? AND user_id IN (?,0) AND fingerprint='' AND created_at >= datetime('now', '-1 day'))", idempotencyKey, session.UserID).Scan(&legacy); err != nil {
+			httpJSON(w, 500, map[string]any{"error": "idempotency unavailable"})
+			return
+		}
+		if legacy {
+			httpJSON(w, 409, map[string]any{"error": "legacy idempotency key: verify the original operation before retrying"})
+			return
+		}
+
+	}
+	if d := memberOfCreateDenialWith(tx, app, table, session, r.FormValue); d != nil {
+		writeMemberOfDenial(w, r, d)
+		return
+	}
+
 	// Fire before-hooks (can abort the operation)
 	beforeRow := make(map[string]any)
 	for i, f := range fields {
@@ -488,18 +538,19 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := FireBeforeHooks(app, "insert", table, beforeRow); err != nil {
+	if err := fireBeforeHooksWith(tx, app, "insert", table, beforeRow); err != nil {
 		httpError(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 
-	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		table,
 		strings.Join(fields, ", "),
 		strings.Join(placeholders, ", "),
 	)
 
-	result, err := app.DB.Exec(sql, values...)
+	var id any
+	err = tx.QueryRow(insertSQL+" RETURNING id", values...).Scan(&id)
 	if err != nil {
 		// Guided error for the multi-tenant founding moment: the group
 		// key is stripped from client bodies and auto-injected from the
@@ -518,23 +569,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		return
 	}
 
-	// Retrieve the new row's ID - for UUID tables, fetch the TEXT PK via rowid
-	var id any
-	var idStr string
-	if app.IsUUIDTable(table) {
-		var uuidID string
-		err := app.DB.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE rowid = last_insert_rowid()", table)).Scan(&uuidID)
-		if err != nil {
-			httpError(w, "Insert succeeded but failed to retrieve UUID", http.StatusInternalServerError)
-			return
-		}
-		id = uuidID
-		idStr = uuidID
-	} else {
-		intID, _ := result.LastInsertId()
-		id = intID
-		idStr = fmt.Sprintf("%d", intID)
-	}
+	idStr := fmt.Sprint(id)
 
 	// Founder auto-join (v2.7.164): when this table's READ mode is
 	// member-of and the membership join targets this table's own id
@@ -546,31 +581,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// without defaults) never fails the create - it's logged and
 	// surfaced in a response header so the developer sees it.
 	if rule := memberOfFor(app, table, OpRead); rule != nil && session != nil && rule.localJoinCol(app, table) == "id" {
-		if err := memberOfAutoJoin(app, rule, id, session); err != nil {
+		if err := memberOfAutoJoinWith(tx, app, rule, id, session); err != nil {
 			log.Printf("member-of auto-join into %s failed for %s id=%v: %v", rule.Table, table, id, err)
 			w.Header().Set("X-Member-Of-AutoJoin", "failed: "+err.Error())
 		}
-	}
-
-	// Fire insert hooks
-	row := make(map[string]any)
-	for i, f := range fields {
-		row[f] = values[i]
-	}
-	row["id"] = id
-	injectSessionContext(row, session)
-	FireHooks(app, "insert", table, row)
-	FireFlowsForEvent(app, "on_insert", table, row)
-	FireWebhookSubscriptions(app, "insert", table, row, session)
-	Broadcast(app, table, "insert", session)
-	LogAudit(app, "insert", table, idStr, session, nil, row)
-	appendHXTrigger(w, "benmore:changed")
-
-	// If HTMX request, return empty (triggers page refresh)
-	if isHTMX(r) {
-		w.Header().Set("HX-Refresh", "true")
-		w.WriteHeader(http.StatusOK)
-		return
 	}
 
 	// JSON response. Pre-2.7.33 we returned just {id, status:"created"} -
@@ -586,7 +600,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// shape so a transient query failure can't turn a successful insert
 	// into a 500.
 	resp := map[string]any{"id": id, "status": "created"}
-	if full, ok := loadInsertedRow(app, table, idStr); ok {
+	if full, ok := loadInsertedRowWith(tx, table, idStr); ok {
 		for k, v := range full {
 			if _, exists := resp[k]; !exists {
 				resp[k] = v
@@ -605,10 +619,45 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// Apply the same role-based masking the GET path uses, so an unauthorized
 	// caller never gets plaintext back in the create response (the row's owner
 	// and admins see plaintext via self/role unmask; everyone else sees masked).
-	MaskEncryptedFields(app.Encrypted, table, []map[string]any{resp}, getSession(app, r))
+	MaskEncryptedFields(app.Encrypted, table, []map[string]any{resp}, session)
+	body, err := json.Marshal(resp)
+	if err != nil {
+		httpJSON(w, 500, map[string]any{"error": "response encoding failed"})
+		return
+	}
+	if isHTMX(r) {
+		body = nil
+	}
+	if idempotencyKey != "" {
+		if _, err := tx.Exec("INSERT INTO _benmore_idempotency (key,user_id,response,status_code,fingerprint) VALUES (?,?,?,?,?)", idempKey, session.UserID, string(body), http.StatusOK, fingerprint); err != nil {
+			httpJSON(w, 500, map[string]any{"error": "idempotency save failed"})
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		httpJSON(w, 500, map[string]any{"error": "commit failed"})
+		return
+	}
+	// Fire insert hooks
+	row := make(map[string]any)
+	for i, f := range fields {
+		row[f] = values[i]
+	}
+	row["id"] = id
+	injectSessionContext(row, session)
+	FireHooks(app, "insert", table, row)
+	FireFlowsForEvent(app, "on_insert", table, row)
+	FireWebhookSubscriptions(app, "insert", table, row, session)
+	Broadcast(app, table, "insert", session)
+	LogAudit(app, "insert", table, idStr, session, nil, row)
+	appendHXTrigger(w, "benmore:changed")
+
+	if isHTMX(r) {
+		w.Header().Set("HX-Refresh", "true")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	body, _ := json.Marshal(resp)
-	SaveIdempotency(app.DB, idempotencyKey, idempUserID, string(body), http.StatusOK)
 	w.Write(body)
 }
 
@@ -644,8 +693,11 @@ func isTruthyQuery(r *http.Request, key string) bool {
 // declared by the framework's user-table denylist are filtered out so
 // a POST to _benmore_users-shaped tables can't leak password_hash.
 func loadInsertedRow(app *App, table, idStr string) (map[string]any, bool) {
+	return loadInsertedRowWith(app.DB, table, idStr)
+}
+func loadInsertedRowWith(db mutationQuerier, table, idStr string) (map[string]any, bool) {
 	q := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
-	rows, err := app.DB.Query(q, idStr)
+	rows, err := db.Query(q, idStr)
 	if err != nil {
 		return nil, false
 	}
@@ -903,18 +955,31 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Cursor pagination: ?cursor=X&limit=N (keyset, fast for large datasets)
 	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		colAllowlist := make(map[string]bool)
+		if cols, err := GetTableColumns(app.DB, table); err == nil {
+			for _, col := range cols {
+				colAllowlist[col.Name] = true
+			}
+		}
+		// Apply the same filters as offset/count before adding the keyset.
+		cursorSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, colAllowlist)
+		cursorArgs := append(append([]any{}, scopeArgs...), whereArgs...)
+		hiddenID := fields != "*" && !slices.Contains(strings.Split(fields, ", "), "id")
+		if hiddenID {
+			cursorSQL = strings.Replace(cursorSQL, "SELECT "+fields+" FROM ", "SELECT "+fields+", id FROM ", 1)
+		}
 		limit := queryInt(r, "limit", 20)
 		if limit > 500 {
 			limit = 500
 		}
-		if hasWhere {
-			baseSQL += " AND id > ?"
+		if strings.Contains(cursorSQL, " WHERE ") {
+			cursorSQL += " AND id > ?"
 		} else {
-			baseSQL += " WHERE id > ?"
+			cursorSQL += " WHERE id > ?"
 		}
-		baseSQL += fmt.Sprintf(" ORDER BY id ASC LIMIT %d", limit)
-		cursorArgs := append(scopeArgs, cursor)
-		rows, err := QueryRows(app.DB, baseSQL, cursorArgs...)
+		cursorSQL += fmt.Sprintf(" ORDER BY id ASC LIMIT %d", limit)
+		cursorArgs = append(cursorArgs, cursor)
+		rows, err := QueryRows(app.DB, cursorSQL, cursorArgs...)
 		if err != nil {
 			httpError(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -923,9 +988,19 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		if inc := r.URL.Query().Get("include"); inc != "" {
 			ResolveIncludes(app, table, rows, inc, session)
 		}
+		// Mask encrypted columns on the PRIMARY rows, same as the offset-
+		// pagination path below. The keyset (cursor) branch returns early with
+		// its own encode, so without this a non-unmask-role caller recovers the
+		// plaintext just by paging with ?cursor= instead of ?page=.
+		MaskEncryptedFields(app.Encrypted, table, rows, session)
 		var nextCursor any
 		if len(rows) == limit {
 			nextCursor = rows[len(rows)-1]["id"]
+		}
+		if hiddenID {
+			for _, row := range rows {
+				delete(row, "id")
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -991,10 +1066,22 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Pagination metadata: if ?page= is used, wrap in {data, total, page, per_page}
 	if r.URL.Query().Get("page") != "" {
-		// Count total rows (same base query without LIMIT/OFFSET) - pass scope args for parameterized WHERE
-		countSQL := "SELECT COUNT(*) FROM (" + baseSQL + ")"
+		// Count total rows through the SAME where filters the rows went
+		// through — applyAPIWhereWithApp is the filter half of
+		// applyAPIFiltersWithApp, without LIMIT/OFFSET. Counting bare
+		// baseSQL here (scope only) made `total` the whole group's row
+		// count on any filtered request: `?where[project_id]=44&page=1`
+		// against a project with zero documents in a group holding 38
+		// answered `{data: [], total: 38}`. A paged consumer that trusts
+		// total for completeness then either loops chasing phantom rows
+		// or fails closed — a client app's Roadmap tab died on exactly
+		// this on 2026-08-05. The `?count=true` branch above always
+		// filtered correctly; the two branches now agree.
+		countWhereSQL, countWhereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, colAllowlist)
+		countSQL := "SELECT COUNT(*) FROM (" + countWhereSQL + ")"
+		countArgs := append(append([]any{}, scopeArgs...), countWhereArgs...)
 		var total int
-		app.DB.QueryRow(countSQL, scopeArgs...).Scan(&total)
+		app.DB.QueryRow(countSQL, countArgs...).Scan(&total)
 		page := queryInt(r, "page", 1)
 		perPage := queryInt(r, "per_page", 20)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -1045,6 +1132,12 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 			httpError(w, err.Error(), http.StatusNotFound)
 			return
 		}
+		// Mask encrypted columns exactly as the live read path below does
+		// (v2.7 parity). The point-in-time row is either a decrypted history
+		// snapshot or the decrypted current row; without this a caller who can
+		// READ the row but is NOT in the column's unmask_roles would get the
+		// plaintext through `?as_of=` that a plain GET masks.
+		MaskEncryptedFields(app.Encrypted, table, []map[string]any{row}, session)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(row)
 		return
@@ -2514,6 +2607,8 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 	defer tx.Rollback()
 
 	results := make([]transactionResult, len(body.Operations))
+	oldRows := make([]map[string]any, len(body.Operations))
+	newRows := make([]map[string]any, len(body.Operations))
 
 	for i, op := range body.Operations {
 		// Resolve forward reference
@@ -2527,33 +2622,27 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 			}
 		}
 
-		// member-of pre-write check (M5), mirroring the single-row paths.
-		// Carve-out: when the join column is ref-fed from a PRIOR op in
-		// this same transaction (op.Ref names the column), the parent was
-		// just created by this caller inside the uncommitted tx -
-		// memberOfHas queries app.DB and can't see it, and creator-of-
-		// parent-in-same-tx is authorized by construction (matches the
-		// founder auto-join semantics on the single-row create path).
 		memberOfVal := func(col string) string {
-			if op.Ref == col {
-				return ""
-			}
 			if v, ok := op.Data[col]; ok && v != nil {
-				return fmt.Sprintf("%v", v)
+				return fmt.Sprint(v)
 			}
 			return ""
 		}
-		joinColRefFed := func(accessOp AccessOp) bool {
-			if op.Ref == "" {
-				return false
+		if op.Action != "insert" {
+			action := "edit"
+			if op.Action == "delete" {
+				action = "delete"
 			}
-			rule := memberOfFor(app, op.Table, accessOp)
-			return rule != nil && rule.localJoinCol(app, op.Table) == op.Ref
+			oldRows[i], err = txAuthorizedRow(tx, app, op.Table, fmt.Sprint(op.ID), session, action)
+			if err != nil {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not found or not authorized"})
+				return
+			}
 		}
 
 		switch op.Action {
 		case "insert":
-			if d := memberOfCreateDenial(app, op.Table, session, memberOfVal); d != nil && !joinColRefFed(OpWrite) {
+			if d := memberOfCreateDenialWith(tx, app, op.Table, session, memberOfVal); d != nil {
 				writeMemberOfDenial(w, r, d)
 				return
 			}
@@ -2567,7 +2656,7 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 			results[i] = transactionResult{Table: op.Table, Action: "insert", ID: id}
 
 		case "update":
-			if d := memberOfRepointDenial(app, op.Table, session, memberOfVal); d != nil {
+			if d := memberOfRepointDenialWith(tx, app, op.Table, session, memberOfVal); d != nil {
 				writeMemberOfDenial(w, r, d)
 				return
 			}
@@ -2588,7 +2677,17 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 				})
 				return
 			}
+			results[i] = transactionResult{Table: op.Table, Action: "delete", ID: op.ID}
 		}
+		if op.Action != "delete" {
+			rows, readErr := queryRowsWith(tx, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", op.Table), results[i].ID)
+			if readErr != nil || len(rows) != 1 {
+				httpJSON(w, 500, map[string]any{"error": "could not read mutated row"})
+				return
+			}
+			newRows[i] = rows[0]
+		}
+
 	}
 
 	// Commit
@@ -2598,11 +2697,27 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Post-commit: fire hooks, audit, SSE for each operation
-	for _, res := range results {
-		if res.ID != nil {
-			LogAudit(app, res.Action, res.Table, fmt.Sprintf("%v", res.ID), session, nil, nil)
-			Broadcast(app, res.Table, res.Action, session)
+	for i, res := range results {
+		row := newRows[i]
+		if res.Action == "delete" {
+			row = oldRows[i]
 		}
+		eventRow := make(map[string]any)
+		for k, v := range row {
+			eventRow[k] = v
+		}
+		if res.Action == "update" {
+			for k, v := range oldRows[i] {
+				eventRow["old_"+k] = v
+			}
+		}
+
+		injectSessionContext(eventRow, session)
+		FireHooks(app, res.Action, res.Table, eventRow)
+		FireFlowsForEvent(app, "on_"+res.Action, res.Table, eventRow)
+		FireWebhookSubscriptions(app, res.Action, res.Table, eventRow, session)
+		LogAudit(app, res.Action, res.Table, fmt.Sprint(res.ID), session, oldRows[i], newRows[i])
+		Broadcast(app, res.Table, res.Action, session)
 	}
 	appendHXTrigger(w, "benmore:changed")
 
@@ -2617,13 +2732,13 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 // Enforces protected fields and auto-injects user_id/org_id.
 // Returns the new row's ID (int64 for INTEGER PK, string for UUID PK).
 func txInsert(tx *sql.Tx, app *App, table string, data map[string]any, session *Session) (any, error) {
-	cols, err := GetTableColumns(app.DB, table)
+	cols, err := tableColumnsWith(tx, table)
 	if err != nil {
 		return nil, err
 	}
 
 	protected := map[string]bool{
-		"user_id": true, "created_at": true, "updated_at": true,
+		"id": true, "user_id": true, "created_at": true, "updated_at": true,
 		"password_hash": true, "role": true,
 	}
 	if app.Group != nil && app.Group.Key != "" {
@@ -2674,30 +2789,33 @@ func txInsert(tx *sql.Tx, app *App, table string, data map[string]any, session *
 		return nil, fmt.Errorf("no valid fields")
 	}
 
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		table, strings.Join(fields, ", "), strings.Join(placeholders, ", "))
-
-	result, err := tx.Exec(sqlStr, values...)
-	if err != nil {
+	before := make(map[string]any)
+	for i, f := range fields {
+		before[f] = values[i]
+	}
+	if err := validateTxMutation(tx, app, "insert", table, before, session); err != nil {
 		return nil, err
 	}
 
-	if app.IsUUIDTable(table) {
-		var uuidID string
-		err := tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE rowid = last_insert_rowid()", table)).Scan(&uuidID)
-		if err != nil {
-			return nil, fmt.Errorf("insert succeeded but failed to retrieve UUID: %w", err)
-		}
-		return uuidID, nil
+	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		table, strings.Join(fields, ", "), strings.Join(placeholders, ", "))
+
+	var id any
+	if err := tx.QueryRow(sqlStr+" RETURNING id", values...).Scan(&id); err != nil {
+		return nil, err
 	}
-	id, err := result.LastInsertId()
-	return id, err
+	if rule := memberOfFor(app, table, OpRead); rule != nil && session != nil && rule.localJoinCol(app, table) == "id" {
+		if err := memberOfAutoJoinWith(tx, app, rule, id, session); err != nil {
+			return nil, fmt.Errorf("founder membership: %w", err)
+		}
+	}
+	return id, nil
 }
 
 // txUpdate performs a single UPDATE within a transaction.
 // Enforces protected fields and scoping.
 func txUpdate(tx *sql.Tx, app *App, table string, id string, data map[string]any, session *Session) error {
-	cols, err := GetTableColumns(app.DB, table)
+	cols, err := tableColumnsWith(tx, table)
 	if err != nil {
 		return err
 	}
@@ -2736,6 +2854,19 @@ func txUpdate(tx *sql.Tx, app *App, table string, id string, data map[string]any
 		return fmt.Errorf("no valid fields")
 	}
 
+	before, err := txAuthorizedRow(tx, app, table, id, session, "edit")
+	if err != nil {
+		return err
+	}
+	for k, v := range data {
+		if !protected[k] && validCols[k] {
+			before[k] = v
+		}
+	}
+	if err := validateTxMutation(tx, app, "update", table, before, session); err != nil {
+		return err
+	}
+
 	// Auto-set updated_at
 	if validCols["updated_at"] {
 		sets = append(sets, "updated_at = datetime('now')")
@@ -2764,6 +2895,14 @@ func txUpdate(tx *sql.Tx, app *App, table string, id string, data map[string]any
 // txDelete performs a single DELETE (or soft delete) within a transaction.
 // Enforces scoping.
 func txDelete(tx *sql.Tx, app *App, table string, id string, session *Session) error {
+	before, err := txAuthorizedRow(tx, app, table, id, session, "delete")
+	if err != nil {
+		return err
+	}
+	if err := validateTxMutation(tx, app, "delete", table, before, session); err != nil {
+		return err
+	}
+
 	var sqlStr string
 	var values []any
 
@@ -2789,4 +2928,43 @@ func txDelete(tx *sql.Tx, app *App, table string, id string, session *Session) e
 		return fmt.Errorf("not found or not authorized")
 	}
 	return nil
+}
+
+// The transaction path shares validators and hook evaluation with ordinary CRUD,
+// using the transaction connection so policies see earlier operations atomically.
+func validateTxMutation(tx *sql.Tx, app *App, event, table string, row map[string]any, session *Session) error {
+	injectSessionContext(row, session)
+	if event != "delete" {
+		r := &http.Request{Form: make(url.Values)}
+		for k, v := range row {
+			r.Form.Set(k, jsonToFormValue(v))
+		}
+		if errs := ValidateFields(r, ExtractValidationRules(app, table)); len(errs) > 0 {
+			return fmt.Errorf("field validation failed: %v", errs)
+		}
+		if err := ValidateCrossField(app.Validators, table, row); err != nil {
+			return err
+		}
+	}
+	return fireBeforeHooksWith(tx, app, event, table, row)
+}
+
+func txAuthorizedRow(tx *sql.Tx, app *App, table, id string, session *Session, action string) (map[string]any, error) {
+	q := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
+	args := []any{id}
+	if hasColumn(app, table, "deleted_at") {
+		q += " AND deleted_at IS NULL"
+	}
+	if pred, pargs, bypass := rowScopeClause(app, table, session, action); !bypass && pred != "" {
+		q += " AND " + pred
+		args = append(args, pargs...)
+	}
+	rows, err := queryRowsWith(tx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("not found or not authorized")
+	}
+	return rows[0], nil
 }

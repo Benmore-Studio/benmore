@@ -214,11 +214,15 @@ func TestAgentDocs_LegacyTopicsRedirectToBuild(t *testing.T) {
 }
 
 func TestAgentDocs_TopicsList(t *testing.T) {
-	// After consolidation: `build` (the one app-building guide) plus
-	// `deploy` (the cloud-edition ship guide, added with the open-core
-	// split). A new topic is a deliberate act - update this list.
+	// The public framework export ships `build` only; the private monorepo also
+	// carries the cloud-only `deploy` guide. A new topic is a deliberate act.
 	topics := AgentDocsTopics()
-	want := []string{"build", "deploy"}
+	want := []string{"build"}
+	if _, err := os.Stat("docs/agent/deploy.md"); err == nil {
+		want = append(want, "deploy")
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 	if len(topics) != len(want) {
 		t.Fatalf("expected topics %v, got %v", want, topics)
 	}

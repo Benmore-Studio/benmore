@@ -231,6 +231,14 @@ func batchFetchByIDs(app *App, table string, ids map[string]bool, session *Sessi
 	if err != nil {
 		return nil
 	}
+	// Mask encrypted columns on the INCLUDED (parent) rows with the
+	// requesting session's role - identical to the primary read path
+	// (crud.go handleList/handleRead). QueryRows returns DB-trigger-
+	// DECRYPTED values; without this, `?include=parent` on a table whose
+	// parent has an `encrypted:` column with `unmask_roles:` would hand the
+	// caller plaintext the direct GET on that table would have masked. The
+	// include must not be a back door around field-level encryption.
+	MaskEncryptedFields(app.Encrypted, table, rows, session)
 	return rows
 }
 
@@ -269,5 +277,11 @@ func batchFetchByFK(app *App, table string, fkCol string, fkValues map[string]bo
 	if err != nil {
 		return nil
 	}
+	// Mask encrypted columns on the INCLUDED (child) rows with the requesting
+	// session's role - identical to the primary read path (crud.go). Without
+	// this, `?include=children` on a table whose child rows carry an
+	// `encrypted:` column with `unmask_roles:` would return plaintext the
+	// direct GET on that child table masks. See batchFetchByIDs.
+	MaskEncryptedFields(app.Encrypted, table, rows, session)
 	return rows
 }

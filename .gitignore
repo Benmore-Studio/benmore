@@ -6,4 +6,5 @@
 **/uploads/
 **/env.yaml
 **/.benmore/
+/.benmore-public-export
 .DS_Store

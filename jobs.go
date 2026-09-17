@@ -18,6 +18,56 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
+// txCommitGuard wraps an in-flight *sql.Tx so it is finalized (rolled back)
+// exactly once, even if the caller's stack unwinds via a PANIC between
+// Begin() and the caller's own explicit commit/rollback logic.
+//
+// The pattern: `defer guard.rollbackUnlessHandled()` immediately after
+// Begin() - before running any step/flow logic - then call
+// guard.MarkHandled() right alongside every explicit Commit()/Rollback()
+// call on the normal paths. If a panic unwinds the stack before reaching
+// those explicit calls, MarkHandled was never called, so the deferred
+// rollbackUnlessHandled fires and finalizes the tx; on the normal
+// success/error paths it becomes a no-op.
+//
+// This closes the gap that both runCronJob (cron.go) and executeFlowJob
+// (below) had: a panic inside executeSteps unwound straight past the
+// commit/rollback logic to an OUTER recover() (runCronJob's own, or
+// processNextJob's top-level one), which only logs the panic - the
+// *sql.Tx itself was never finalized. Its connection was never returned to
+// the pool, and under SQLite WAL an unreturned write-tx holds the app's
+// write lock until restart (review finding). See TestJobTxCommitGuard* in
+// jobs_transaction_test.go for a direct regression test of this exact
+// panic path.
+type txCommitGuard struct {
+	tx      *sql.Tx
+	handled bool
+}
+
+// rollbackUnlessHandled is the function to `defer`. No-op if MarkHandled
+// was already called (the normal commit/rollback path ran to completion)
+// or if the guard wraps no tx (non-transactional run).
+func (g *txCommitGuard) rollbackUnlessHandled() {
+	if g == nil || g.tx == nil || g.handled {
+		return
+	}
+	if err := g.tx.Rollback(); err != nil && err != sql.ErrTxDone {
+		log.Printf("txCommitGuard: panic-path rollback error: %s", err)
+	}
+}
+
+// MarkHandled tells the guard the tx has already been explicitly committed
+// or rolled back by the normal code path, so the deferred
+// rollbackUnlessHandled becomes a no-op. Call it right next to EVERY
+// explicit Commit()/Rollback() - including when Commit() itself returns an
+// error, since database/sql treats the Tx as done either way and a second
+// Rollback attempt would just be a harmless (but confusing) sql.ErrTxDone.
+func (g *txCommitGuard) MarkHandled() {
+	if g != nil {
+		g.handled = true
+	}
+}
+
 // EnsureJobsTable creates the background jobs table.
 func EnsureJobsTable(db *sql.DB) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_jobs (
@@ -30,6 +80,7 @@ func EnsureJobsTable(db *sql.DB) {
 		max_attempts INTEGER DEFAULT 3,
 		error TEXT,
 		run_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		not_before DATETIME,
 		started_at DATETIME,
 		completed_at DATETIME,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -56,6 +107,25 @@ func EnsureJobsTable(db *sql.DB) {
 	// release the key. Best-effort ALTER covers fresh + upgraded tables.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN unique_key TEXT")
 	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')")
+	// Retry gate that preserves ordering (review finding #11). The strictly
+	// ordered reconcile chains (sync_project / release_window) guarantee order
+	// purely via strictly-increasing PAST run_at on the single serial worker.
+	// The old retry path rewrote run_at = now + backoff - a FUTURE time later
+	// than every queued `-1 days` stamp - so a transient blip on an early stage
+	// let its retry land AFTER the whole chain, running reveal/reconcile on a
+	// board missing that source's facts. A failed attempt now keeps its
+	// original run_at and instead sets not_before to the backoff time; the
+	// claim query treats not_before as a head-of-line gate so the retry stays
+	// in its original position and never jumps behind later stages. Best-effort
+	// ALTER covers fresh + upgraded tables.
+	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN not_before DATETIME")
+	// Partial index over ONLY the pending, backing-off rows (not_before set).
+	// processNextJob's scoped ordering gate runs a correlated NOT EXISTS looking
+	// for an earlier same-project predecessor that is currently in backoff; that
+	// set is normally tiny (backoff happens only on real failures), and this
+	// index keeps the subquery from scanning the whole pending backlog to find
+	// it. Idempotent; the not_before column exists by now (CREATE + ALTER above).
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_jobs_backoff ON _benmore_jobs(run_at) WHERE status = 'pending' AND not_before IS NOT NULL")
 }
 
 // defaultJobsLeaseTTL bounds how long a claimed job may run before its lease is
@@ -242,10 +312,6 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 	return id, token, err
 }
 
-func findActiveJobByUniqueKey(q jobEnqueueExecer, uniqueKey string) (int64, string, bool) {
-	return findJobByUniqueKey(q, uniqueKey, false)
-}
-
 // findJobByUniqueKey looks up an existing job by unique_key. When
 // anyStatus is false it only matches active (pending/running) rows - the
 // partial-index semantics that let a key be reused once the prior job
@@ -310,27 +376,40 @@ func isUniqueJobConstraintErr(err error) bool {
 // Hooks are enqueued instead of executed in goroutines - this provides
 // durability (survives crashes), retry on failure, and visibility.
 func EnqueueHookJob(db *sql.DB, hook Hook, row map[string]any) {
-	payload := map[string]any{
-		"_hook": map[string]any{
-			"sql":     hook.SQL,
-			"webhook": hook.Webhook,
-			"body":    hook.Body,
-		},
-		"_row": row,
-	}
-	if hook.Email != nil {
-		payload["_hook"].(map[string]any)["email_to"] = hook.Email.To
-		payload["_hook"].(map[string]any)["email_subject"] = hook.Email.Subject
-		payload["_hook"].(map[string]any)["email_template"] = hook.Email.Template
-	}
-	if hook.Notify != nil {
-		payload["_hook"].(map[string]any)["notify"] = marshalNotifyHook(hook.Notify)
-	}
-	data, _ := json.Marshal(payload)
+	data, _ := json.Marshal(hookJobPayload(hook, row))
 	db.Exec(
 		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at) VALUES ('hook', 'hook', ?, datetime('now'))",
 		string(data),
 	)
+}
+
+// hookJobPayload serializes a Hook + its row into the durable job payload the
+// worker later reconstructs via hookFromJobPayload. Every action the Hook can
+// carry MUST be represented here or it is silently dropped crossing the queue
+// (review finding #1: `sms:` and `ws:` were absent, so those hooks fired,
+// reported job success, and did nothing). Keep this in lockstep with
+// hookFromJobPayload.
+func hookJobPayload(hook Hook, row map[string]any) map[string]any {
+	h := map[string]any{
+		"sql":     hook.SQL,
+		"webhook": hook.Webhook,
+		"body":    hook.Body,
+	}
+	if hook.Email != nil {
+		h["email_to"] = hook.Email.To
+		h["email_subject"] = hook.Email.Subject
+		h["email_template"] = hook.Email.Template
+	}
+	if hook.Notify != nil {
+		h["notify"] = marshalNotifyHook(hook.Notify)
+	}
+	if hook.SMS != nil {
+		h["sms"] = map[string]any{"to": hook.SMS.To, "body": hook.SMS.Body}
+	}
+	if hook.WS != nil {
+		h["ws"] = map[string]any{"room": hook.WS.Room, "payload": hook.WS.Payload}
+	}
+	return map[string]any{"_hook": h, "_row": row}
 }
 
 // StartJobWorker runs a background goroutine that processes pending jobs.
@@ -443,20 +522,73 @@ func processNextJob(app *App) (worked bool) {
 		}
 	}()
 
-	// Claim the next pending job
+	// Claim the next CLAIMABLE pending job. A job is claimable when it is due
+	// (run_at has arrived), it is not itself still in retry backoff (not_before
+	// has passed), and no earlier-ordered predecessor IN ITS OWN ordering group
+	// is still backing off. ORDER BY run_at ASC picks the head of line among the
+	// claimable set.
 	var id int64
 	var jobType, flowName, payload string
 	var attempts, maxAttempts int
 
+	// Ordering gate (review finding #11), SCOPED to the ordering group (fix for
+	// the #186 head-of-line stall). #186's strict retry ordering is only
+	// required WITHIN a single reconcile chain, never across the whole shared
+	// `_benmore_jobs` queue. Every genuinely-ordered reconcile chain is stamped
+	// with its project_id in the payload - sync_project / release_window /
+	// enqueue_extraction / sync_all_projects / blueprint_sync all enqueue via
+	// `json_object('project_id', …)` (verified) - so the ordering GROUP is that
+	// project_id, extracted from the payload JSON.
+	//
+	// A NULL project_id means "not part of any ordered chain", and such a job
+	// can NEITHER gate NOR be gated:
+	//   - `k.project_id IS NOT NULL` in the predecessor filter means a
+	//     group-less job (hook, transcribe-brief async flow, webhook_subscription
+	//     delivery, cron) NEVER forms an ordering gate, so a backing-off one of
+	//     those can't freeze hook/notification/email delivery sharing the NULL
+	//     bucket. This was the real residual: transcribe-brief (payload
+	//     {submission_id,user_id}, ~90s terminal backoff when whisper/ffmpeg is
+	//     absent) and webhook_subscription (max_attempts=3, backs off on a dead
+	//     5xx subscriber) both sit in the NULL bucket with hooks.
+	//   - `j.project_id IS NOT NULL` inside the NOT EXISTS short-circuits the
+	//     whole gate for a group-less CANDIDATE, so it is always claimable
+	//     (subject only to its own not_before) and never blocked by anyone.
+	// The two together mean the gate applies ONLY among jobs sharing the SAME
+	// NON-NULL project_id. Groups are matched with SQLite's `IS` (not `=`) so a
+	// robustly-typed compare of two identical project_ids holds regardless of
+	// json_extract's storage class.
+	//
+	// Effect: a backing-off job gates ONLY the later-ordered jobs of its OWN
+	// project. A hook, a transcribe-brief/webhook job, a DIFFERENT project's
+	// chain, or any group-less flow stays claimable instead of stalling behind a
+	// poison job for the whole backoff window (~90s/attempt, worse during an
+	// upstream outage). Pre-fix the gate keyed off the GLOBAL head-of-line, so
+	// one backing-off pipeline job - perpetually the smallest run_at, stamped
+	// `-1 day` - froze chat/notification hooks, emails, and every other job.
 	err := app.DB.QueryRow(`
-		SELECT id, job_type, flow_name, payload, attempts, max_attempts
-		FROM _benmore_jobs
-		WHERE status = 'pending' AND run_at <= datetime('now')
-		ORDER BY run_at ASC LIMIT 1
+		SELECT j.id, j.job_type, j.flow_name, j.payload, j.attempts, j.max_attempts
+		FROM _benmore_jobs j
+		WHERE j.status = 'pending'
+		  AND j.run_at <= datetime('now')
+		  AND (j.not_before IS NULL OR j.not_before <= datetime('now'))
+		  AND NOT EXISTS (
+		        SELECT 1 FROM _benmore_jobs k
+		         WHERE k.status = 'pending'
+		           AND k.run_at <= datetime('now')
+		           AND k.not_before IS NOT NULL AND k.not_before > datetime('now')
+		           AND json_extract(j.payload, '$.project_id') IS NOT NULL
+		           AND json_extract(k.payload, '$.project_id') IS NOT NULL
+		           AND json_extract(k.payload, '$.project_id')
+		               IS json_extract(j.payload, '$.project_id')
+		           AND (k.run_at < j.run_at
+		                OR (k.run_at = j.run_at AND k.id < j.id))
+		  )
+		ORDER BY j.run_at ASC, j.id ASC
+		LIMIT 1
 	`).Scan(&id, &jobType, &flowName, &payload, &attempts, &maxAttempts)
 
 	if err != nil {
-		return false // no jobs
+		return false // nothing claimable: no due jobs, or all due jobs are gated
 	}
 
 	// Atomically claim: only transition pending->running, and only if WE win
@@ -531,10 +663,16 @@ func processNextJob(app *App) (worked bool) {
 				shift = 16
 			}
 			backoff := time.Duration(1<<shift) * 30 * time.Second
-			nextRun := time.Now().Add(backoff)
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, run_at = ?, lease_expires_at = NULL WHERE id = ?",
-				jobErr.Error(), nextRun.UTC().Format(sqliteDateTimeLayout), id)
-			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, next at %s)", jobType, flowName, id, jobErr, attempts+1, nextRun.Format("15:04:05"))
+			// Preserve run_at (review finding #11): the strictly-ordered
+			// reconcile chains order jobs by run_at on the single serial
+			// worker, so re-stamping run_at to a future time would let this
+			// retry land AFTER the whole chain. Keep the original run_at and
+			// gate the re-claim with not_before instead - the head-of-line
+			// check in the claim query keeps the retry in its original slot.
+			notBefore := time.Now().Add(backoff)
+			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, not_before = ?, lease_expires_at = NULL WHERE id = ?",
+				jobErr.Error(), notBefore.UTC().Format(sqliteDateTimeLayout), id)
+			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, not_before %s)", jobType, flowName, id, jobErr, attempts+1, notBefore.Format("15:04:05"))
 		}
 	} else {
 		app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ?", id)
@@ -583,22 +721,40 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 			}
 		}
 	}
+	// guard guarantees the *sql.Tx is finalized exactly once on every path -
+	// success (commit), step failure (rollback), AND a panic inside
+	// executeSteps. See the txCommitGuard doc comment above for the full
+	// rationale; registered immediately after Begin(), before executeSteps,
+	// so it fires during panic unwinding before the panic reaches
+	// processNextJob's top-level recover().
+	var guard *txCommitGuard
 	if targetFlow.Transaction {
 		tx, err := app.DB.Begin()
 		if err != nil {
 			return fmt.Errorf("begin transaction: %w", err)
 		}
 		ctx.Tx = tx
+		guard = &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
 	}
 
 	executeSteps(ctx, targetFlow.Steps)
 	if ctx.Tx != nil {
 		if ctx.Error != nil {
-			_ = ctx.Tx.Rollback()
+			rbErr := ctx.Tx.Rollback()
+			guard.MarkHandled()
+			if rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Printf("job flow %s: tx rollback error: %s", flowName, rbErr)
+			}
 			return ctx.Error
 		}
-		if err := ctx.Tx.Commit(); err != nil {
-			return fmt.Errorf("commit transaction: %w", err)
+		commitErr := ctx.Tx.Commit()
+		// Whether Commit succeeded or failed, the tx is done from
+		// database/sql's perspective - mark handled either way so the
+		// deferred guard never double-calls Rollback/Commit.
+		guard.MarkHandled()
+		if commitErr != nil {
+			return fmt.Errorf("commit transaction: %w", commitErr)
 		}
 	}
 	return ctx.Error
@@ -614,34 +770,7 @@ func executeHookJob(app *App, data map[string]any) error {
 		rowData = make(map[string]any)
 	}
 
-	hook := Hook{
-		SQL:     fmt.Sprintf("%v", hookData["sql"]),
-		Webhook: fmt.Sprintf("%v", hookData["webhook"]),
-		Body:    fmt.Sprintf("%v", hookData["body"]),
-	}
-	if hook.SQL == "<nil>" {
-		hook.SQL = ""
-	}
-	if hook.Webhook == "<nil>" {
-		hook.Webhook = ""
-	}
-	if hook.Body == "<nil>" {
-		hook.Body = ""
-	}
-
-	if to, ok := hookData["email_to"]; ok && to != nil {
-		hook.Email = &EmailHook{
-			To:       fmt.Sprintf("%v", to),
-			Subject:  fmt.Sprintf("%v", hookData["email_subject"]),
-			Template: fmt.Sprintf("%v", hookData["email_template"]),
-		}
-	}
-
-	if notifyRaw, ok := hookData["notify"]; ok && notifyRaw != nil {
-		if notifyMap, ok := notifyRaw.(map[string]any); ok {
-			hook.Notify = unmarshalNotifyHook(notifyMap)
-		}
-	}
+	hook := hookFromJobPayload(hookData)
 
 	executeHook(app.DB, hook, rowData, app.Dir)
 	// Fire an SSE refresh broadcast if the hook's SQL was a mutating
@@ -658,8 +787,86 @@ func executeHookJob(app *App, data map[string]any) error {
 	return nil
 }
 
+// hookFromJobPayload reconstructs a Hook from the serialized `_hook` map a hook
+// job carries. Keep in lockstep with hookJobPayload: every action serialized
+// there MUST be rebuilt here, or the worker silently drops it (review finding
+// #1 - the missing `sms`/`ws` branches meant those hooks fired and sent
+// nothing).
+func hookFromJobPayload(hookData map[string]any) Hook {
+	hook := Hook{
+		SQL:     hookPayloadStr(hookData["sql"]),
+		Webhook: hookPayloadStr(hookData["webhook"]),
+		Body:    hookPayloadStr(hookData["body"]),
+	}
+
+	if to, ok := hookData["email_to"]; ok && to != nil {
+		hook.Email = &EmailHook{
+			To:       fmt.Sprintf("%v", to),
+			Subject:  fmt.Sprintf("%v", hookData["email_subject"]),
+			Template: fmt.Sprintf("%v", hookData["email_template"]),
+		}
+	}
+
+	if notifyRaw, ok := hookData["notify"]; ok && notifyRaw != nil {
+		if notifyMap, ok := notifyRaw.(map[string]any); ok {
+			hook.Notify = unmarshalNotifyHook(notifyMap)
+		}
+	}
+
+	if smsRaw, ok := hookData["sms"]; ok && smsRaw != nil {
+		if m, ok := smsRaw.(map[string]any); ok {
+			hook.SMS = &SMSHook{
+				To:   hookPayloadStr(m["to"]),
+				Body: hookPayloadStr(m["body"]),
+			}
+		}
+	}
+
+	if wsRaw, ok := hookData["ws"]; ok && wsRaw != nil {
+		if m, ok := wsRaw.(map[string]any); ok {
+			hook.WS = &WSHook{
+				Room:    hookPayloadStr(m["room"]),
+				Payload: hookPayloadStr(m["payload"]),
+			}
+		}
+	}
+
+	return hook
+}
+
+// hookPayloadStr coerces a JSON-decoded payload value to a string, mapping both
+// a missing key and an explicit null to "" (not Go's "<nil>", which would leak
+// into interpolated SQL / message bodies).
+func hookPayloadStr(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 // FlushJobs processes all pending jobs synchronously. Used in tests to
 // drain the job queue before assertions on async hook side effects.
+//
+// DELIBERATE TEST-ONLY DIVERGENCE FROM THE PRODUCTION CLAIM PATH: `flush:
+// "jobs"` means "run everything that is DUE NOW". The production worker
+// (processNextJob) honours the review-finding-#11 ordering gate - it refuses to
+// claim a job while an earlier-ordered predecessor in the SAME ordering group
+// (project_id) is still in its retry backoff (not_before in the future) - and
+// WAITS for not_before to elapse. A synchronous test cannot wait (backoff
+// starts at 30s and grows), so once processNextJob can claim NOTHING (every due
+// job is gated by its own group) we FAST-FORWARD the earliest gated job's
+// not_before to now and re-drain instead of stopping. This keeps the drain
+// deterministic: any unrelated job that failed once and is sitting in backoff
+// (e.g. an async transcribe job with no whisper model in CI) can no longer
+// wedge the queue and silently swallow a later test's hook side effects.
+//
+// Ordering is still preserved WITHIN a drain. We fast-forward ONLY the earliest
+// gated due job (smallest run_at among the due, gated rows) - never the whole
+// set - and processNextJob's claim query always picks the smallest run_at first
+// within a group, so a gated head still executes BEFORE any later-run_at job in
+// its group once it is unblocked (the strict-chain guarantee
+// TestRetryDoesNotReorderStrictChain pins). The worker's production claim path
+// is untouched.
 func FlushJobs(app *App) {
 	for {
 		var count int64
@@ -667,7 +874,31 @@ func FlushJobs(app *App) {
 		if count == 0 {
 			return
 		}
-		processNextJob(app)
+		if processNextJob(app) {
+			continue
+		}
+		// processNextJob claimed nothing while jobs are due (count > 0): every due
+		// job is gated by an earlier-ordered same-group predecessor in retry
+		// backoff. Fast-forward the single earliest-run_at gated job so `flush`
+		// can proceed. Targeting the earliest gated row (ORDER BY run_at ASC LIMIT
+		// 1) - not every gated row - is what keeps strict-chain ordering intact
+		// across the drain.
+		res, err := app.DB.Exec(`
+			UPDATE _benmore_jobs SET not_before = NULL
+			WHERE id = (
+				SELECT id FROM _benmore_jobs
+				WHERE status = 'pending' AND run_at <= datetime('now')
+				  AND not_before IS NOT NULL AND not_before > datetime('now')
+				ORDER BY run_at ASC LIMIT 1
+			)`)
+		if err != nil {
+			return
+		}
+		// Nothing was gated to fast-forward yet processNextJob still claimed
+		// nothing (e.g. a transient claim error): stop rather than spin.
+		if n, _ := res.RowsAffected(); n == 0 {
+			return
+		}
 	}
 }
 
@@ -808,7 +1039,9 @@ func RegisterJobsAPI(mux *http.ServeMux, app *App) {
 
 		id := r.PathValue("id")
 		result, err := app.DB.Exec(
-			"UPDATE _benmore_jobs SET status = 'pending', run_at = datetime('now'), error = NULL WHERE id = ? AND status = 'failed'",
+			// Clear not_before so an admin-triggered retry runs immediately
+			// rather than inheriting a stale backoff gate (review finding #11).
+			"UPDATE _benmore_jobs SET status = 'pending', run_at = datetime('now'), not_before = NULL, error = NULL WHERE id = ? AND status = 'failed'",
 			id,
 		)
 		if err != nil {

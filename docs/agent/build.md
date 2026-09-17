@@ -13,12 +13,36 @@ SDK, all served from a single process.
 
 | Feature | Canonical reference |
 |---|---|
+| Durable scheduled-flow delegation and automatic legacy-task authorization; blocked tasks expose a reason | `api(at:"scheduling")` |
+| Framework security hardening: credential limits, tenant/query isolation, transactional hooks, safe fetch caching, scheduled-flow authorization and atomic retries | `api(at:"auth")`, `query`, `batch`, `cache`, `scheduling`, `idempotency` |
+| Raw-body inbound verification: Autodesk-compatible HMAC-SHA1 with current/previous-secret rotation, plus path-bound HMAC-SHA256 bearer credentials | `api(at:"verify")` |
+| Identity-bound account erasure: app-specific disposition followed by server-only `run: purge_current_user`, with session-only targeting and commit-before-success semantics | `api(at:"auth")` (`account_erasure`) |
+| Bulk import: chunked, resumable, all-or-nothing loading of CSV/NDJSON into a table (or an owner-only SQL restore) | `api(at:"import")` |
+| Api steps honor `with.timeout` (`570s` or bare seconds, default 30s; step-level `timeout:` wins), and `if:`-gated steps keep timeout/retry/expect_rows/on_error (v2.7.212) | `api(at:"flows")` |
+| Agent usage: local Claude/Codex token and provider-reported prompt-cache counters, explicit sync, account opt-out, and strict no-transcript/no-path upload boundary. Uploads send only the tail since the last clean sync; a deleted app is skipped with a warning instead of failing the sync, and a session spanning several apps is coalesced (v2.7.212) | `api(at:"agent-usage")` |
+| Stable API reference context: descriptive `benmore api` responses use ETags and replay exact cached bytes on 304; execution calls are never cached | `api(at:"api-reference-cache")` |
+| Existing frontends: build Vite/Next static export/CRA externally, copy only generated output into `static/`, and deploy without a Benmore localhost or Node workflow | `api(at:"existing-frontends")` |
+| Native CLI install: Homebrew on macOS; checksum-verifying curl installer on Linux/CI; `@benmore/cli` is only a deprecated correction | `api(at:"cli-install")` |
+| Scriptable CLI semantics: workspace `.` resolution, dev-aware `open`, and stable usage/auth/not-found/transport exits | `api(at:"cli-contracts")` |
+| Empty declarative queries return `{rows: [], count: 0}`, never `rows: null` | `api(at:"query")` |
+| Machine discovery: authenticated OpenAPI 3.1 is identical at `/api/_openapi`, `/openapi.json`, and `/api/openapi.json`; public docs are identical at `/llms.txt` and `/.well-known/llms.txt` | `api(at:"machine-discovery")` |
+| Browser SDK distribution: native apps keep `import 'bm'`; external frontends import zero-dependency ESM `@benmore/bm`; `benmore types [app] --out PATH` refreshes generated schema declarations | `api(at:"sdk")` |
+| Headless CLI auth: `login`/`signup`/`bootstrap` accept token or email/password flags and `BENMORE_*` env vars; env tokens stay ephemeral and non-TTY credential gaps fail immediately | `api(at:"cli-auth")` |
+| Reliable agent delivery loop: `benmore hooks` merges Claude Edit/Write validation + push hooks without replacing existing settings; `benmore sync-status --all` checks every pulled app and must be clean before completion. Codex/other agents push explicitly (no claimed automatic Codex hooks). | `api(at:"sync-status")` |
+| Server-only `run: delete_upload` removes only this app's private stored references, rejects foreign/public/traversing URLs, and fails loud so active SQLite work rolls back (external bytes are not transactional) | `api(at:"uploads")` |
+| Support operators can clear a reviewed email circuit-breaker pause with `benmore email <app-subdomain> resume`; reputation history and suppressions remain intact | `api(at:"email")` |
+| `run: sms` flow step + `sms:` hook: text from a flow (`with: { to, body }` → `steps.<id>.outputs.to`) or on a data event (`sms: { to, body }` + `when:`). Both were documented but unimplemented, so apps silently sent nothing; hooks.yaml keys are now allowlisted at write time so an unrecognized key can't be dropped in silence | `api(at:"sms")` |
+| `run: transcribe` flow step: local audio→text (ffmpeg + whisper.cpp on the host, no vendor/API key, every edition); `with: { file, model?, language? }` → `steps.<id>.outputs.text`; local-file-first, loud degrade when binaries/model missing | `api(at:"transcribe")` |
+| Multiple custom domains per app: `benmore domain <app> <domain>` ADDS a domain (up to 10 per app, e.g. ceo.example.com + vc.example.com on one app); `--verify`/`--remove` target one domain, omit the domain to act on all (v2.7.205) | CLI skill → "Custom domains" |
+| Robust Markdown: `bm.markdown(text)` now server-renders via the benmark engine (CommonMark + GFM + syntax highlighting + mermaid + media embeds + wikilinks + front matter), sanitized; `bm.markdownBatch()` + `{{ body \| markdown }}` pipe + `<Markdown>` component | `api(at:"markdown")` |
+| Local/remote source safety (`benmore sync-status`, `.benmore/remote.json`, guarded push/pull/deploy/delete) + reusable `feature.yaml` packs including kanban, notify-hub, and foundry starters | `api(at:"sync-status")`, `api(at:"feature-packs")` |
 | GitHub sync: one-way mirror of the app's git history to a user-owned GitHub repo/org - OAuth connect in dashboard → Version Control, auto-push on every commit (Live → main, Sandbox → dev) (v2.7.202) | `api(at:"github")` |
 | `benmore deploy <dir>`: first-deploy uses a bare scaffold (no Notes demo merged into your app) + per-file push failures are reported while the rest still ship (v2.7.201) | - |
 | Managed social login (zero-setup Google/Microsoft), Stripe Connect (per-env keys), managed DNS zones (v2.7.200) | `api(at:"oauth")`, `api(at:"payments")`, `api(at:"dns")` |
 | Platform SMS service: zero-config transactional SMS + dedicated per-app numbers (v2.7.199) | `api(at:"sms")` |
 | Platform email service: zero-config sending for every hosted app + BYO domain (DKIM), quotas, suppression, auto-pause (v2.7.197) | `api(at:"email")` |
 | browser_check: viewport `width`/`height` args, overlay-proof trusted clicks (chrome hidden + targets centered), `deadline_exceeded` flag + no share links for incomplete runs (v2.7.195) | - |
+| browser_check: native `fill`/`select` setters dispatch + verify `input`/`change`, empty values are valid, and all actions preflight before any mutation; see `api(at:"browser_check")` | - |
 | Env-safe encryption: platform `sql` reads/writes use the tenant's own key, ENCRYPTION_KEY auto-pinned at provision, decrypt failures masked (never raw ciphertext); promote backup-preflight + `delete-file --env` + 48KB probe bodies (v2.7.194) | `api(at:"encryption")` |
 | Tiered row access `read: owner_or_role:<roles>` (owner OR role-holder sees the row) | `api(at:"access")` |
 | Per-flow `rate_limit: "5/hour per ip"` (429 + Retry-After) + `expect_rows:`/`rows_affected` (fail loud on guarded 0-row writes) | `api(at:"flows")` |
@@ -28,18 +52,37 @@ SDK, all served from a single process.
 
 ## Quickstart
 
-```bash
-go build -tags sqlite_fts5 -o benmore .
+Install the hosted CLI with Homebrew on macOS:
 
-./benmore new myapp              # scaffold a runnable TSX app
-./benmore serve myapp --port 8080
-# open http://localhost:8080
+```bash
+brew install Benmore-Studio/benmore/benmore-cli
 ```
 
-`benmore new` writes a complete starter app (see the tree below). `benmore
-serve` loads it, applies migrations, compiles your TSX on the fly, and serves
-the whole thing. In dev/testing mode, served pages listen for hot reload events
-and refresh themselves after a successful in-process app reload.
+On Linux or CI, use the checksum-verifying installer instead:
+
+```bash
+curl -fsSL https://benmore.ai/install-cli.sh | sh
+```
+
+Then create a live app:
+
+```bash
+benmore login
+# Headless alternative:
+# benmore login --email "$BENMORE_EMAIL" --password "$BENMORE_PASSWORD"
+
+cd ~/Benmore
+benmore new crm          # creates ./crm and prints its resolved directory
+cd ./crm
+benmore deploy
+benmore open .           # prints the provisioned development URL
+```
+
+Open the printed HTTPS URL. A reachable live page is the quickstart success
+criterion. `benmore new crm` always creates `./crm`; it never silently moves the
+project into another directory. The cloud workflow does not use a localhost
+development server: edits ship with `benmore push` (normally through the save
+hook) and are verified through deployed app routes.
 
 ## The agentic build loop (how to work)
 
@@ -252,14 +295,19 @@ Core SDK surface:
 | `bm.query.{fetch, read, table, subscribe, invalidate, mutate}` | Keyed read cache, dedupe, stale time, table live invalidation, optimistic rollback |
 | `bm.presence(slug)` | Heartbeat + cleanup + server sweep |
 | `bm.cache.namespaced(n, v)` / `.persistent(n, v)` | Self-busting client cache |
-| `bm.markdown(text)` | Tiny safe Markdown → HTML |
+| `bm.markdown(text)` / `bm.markdownBatch(items)` | Server-rendered, sanitized CommonMark + GFM via benmark; batch rendering avoids one request per item |
 | `bm.permissions.{share, revoke, list}` | Per-row ACLs |
 | `bm.signedUrl(path, ttl)` · `bm.audit.list(f)` · `bm.t(key, vars)` · `bm.mfa.{enroll,verify,disable}` | Signed URLs · audit · i18n · TOTP |
 | `bm.api.{get, post, patch, delete}` | Raw escape hatch |
 
 `src/bm.d.ts` is generated from your schema/config. The running app serves the
 live types at `/_internal/bm.d.ts` - refresh your local copy any time with
-`curl http://localhost:8080/_internal/bm.d.ts > src/bm.d.ts`.
+`benmore types [app] --out src/bm.d.ts --env dev`. Inside the app workspace,
+omit `[app]`; the `.benmore/app` marker selects the deployment.
+
+Native apps keep `import bm from 'bm'` so the import map and generated local
+types work offline. Frontends built outside Benmore import the same runtime from
+the zero-dependency ESM package: `import bm from '@benmore/bm'`.
 
 Auto-served libraries (drop-in `<script>` tags, served from the binary, no CDN):
 Tailwind, HTMX, Alpine, Chart.js, Mermaid, Lucide at `/_internal/*`.
@@ -282,6 +330,38 @@ the `Input`/`Field` primitives in `components/ui.tsx`.
 base colors + `dark:` overrides looks broken (white-on-white) on a light OS. Pick
 one theme and set its colors as the BASE classes (a dark app uses `bg-zinc-950
 text-zinc-100` directly, not `dark:`), so everyone sees the intended design.
+
+## Deploy an existing frontend
+
+Keep the framework build in its original project. Run its normal production build
+there, then copy **only the generated browser files** into the Benmore app's
+`static/` directory:
+
+```bash
+# Vite: set `base: "/"` in vite.config, then build externally.
+cp -R /path/to/vite-project/dist/. ~/Benmore/crm/static/
+
+# Next.js: set `output: "export"` (and `images: {unoptimized: true}` when needed).
+cp -R /path/to/next-project/out/. ~/Benmore/crm/static/
+
+# Create React App
+cp -R /path/to/cra-project/build/. ~/Benmore/crm/static/
+
+cd ~/Benmore/crm
+benmore deploy
+benmore open .
+```
+
+Never copy `node_modules`, `package.json`, lockfiles, or framework source/config
+into the Benmore app. There is no Benmore localhost development mode and no Node
+build inside the hosted app.
+
+The contents of `static/` are also served from the URL root, so generated
+root-relative paths such as `/assets/app.js` resolve to
+`static/assets/app.js`. Unknown browser navigation routes fall back to
+`static/index.html`, which preserves client-side routing. Asset-looking misses
+such as `/assets/missing.js`, `.css`, or `.png` return real 404s instead of the SPA
+shell. Full contract: `api(at:"existing-frontends")`.
 
 ## Auto-CRUD - what you get for free
 
@@ -345,15 +425,17 @@ Run `benmore docs <topic>` for any of the above in more depth.
 
 ## The dev loop
 
-1. `benmore serve myapp --port 8080` - boots the app (migrations applied,
-   schema/types regenerated).
-2. Edit `static/*.tsx`, `schema.prisma`, `app.yaml`, `flows/*` - refresh the
-   browser (TSX recompiles on request; restart `serve` after schema/config
-   changes so migrations + type regen run).
-3. Exercise the API directly: `curl http://localhost:8080/api/<table>`.
-4. The framework captures client JS errors and logs server activity to stdout.
+1. Edit `static/*.tsx`, `schema.prisma`, `app.yaml`, or `flows/*` in the local
+   workspace cache; the save hook normally sends each change with
+   `benmore push`.
+2. Exercise the deployed development app with `benmore probe`,
+   `benmore tool browser_check`, or its HTTPS URL.
+3. Run `benmore verify --quick` while iterating, then `benmore verify --release`
+   before publishing.
+4. Inspect remote behavior with `benmore logs`, `benmore tail`, and
+   `benmore sync-status`; do not infer success from a push exit code alone.
 
-That's the whole loop: scaffold, serve, edit, refresh.
+There is no localhost development server in the hosted v2.7+ workflow.
 
 ## Dev/prod environments (hosted)
 
@@ -364,3 +446,69 @@ data/secrets/uploads) and publishes at `<sub>.benmore.ai`. An existing prod app
 gets a dev instance with `benmore seed-dev <app>` (prod, incl. any custom
 domain, keeps serving). Target prod explicitly with `--env prod` on
 `logs`/`sql`/`tail`/`restart`. Full reference: `api(at:"environments")`.
+
+## Source sync and feature packs (hosted)
+
+Hosted workspaces are local caches of deployed source. `benmore pull <app>`
+writes `.benmore/remote.json`, a last-known deployed manifest. Before pushing
+or deleting code, run:
+
+```bash
+benmore sync-status [dir] [--app NAME] [--env dev|prod] [--json]
+```
+
+Exit codes are part of the contract: `0` clean, `1` non-conflicting drift, `2`
+conflict, `3` setup/auth/remote error. `push`, `delete-file`, `deploy`, `pull`,
+and `sync` block stale/conflicting overwrites by default; `--force` is the
+explicit bypass. Manifests exclude data, uploads, env values, `.git`,
+`.benmore`, logs, and generated `src/bm.d.ts`.
+
+Feature packs are the clone mechanism for reusable app pieces:
+
+```bash
+benmore feature list
+benmore clone notify-hub --app target-app --env dev --dry-run
+benmore clone notify-hub --app target-app --env dev --apply
+benmore feature clone foundry --app target-app --env dev --dry-run
+
+# Clone selected components straight from another app or app directory.
+benmore clone source-app target-app \
+  --paths static/page.tsx,flows/send.yaml \
+  --models Notification,NotificationPreference \
+  --flows send_notification \
+  --env dev --dry-run
+
+# Avoid route/model collisions when installing into a mature target app.
+benmore clone notify-hub --app target-app --env dev \
+  --route-prefix ops --model-prefix Ops --dry-run
+benmore clone notify-hub --app target-app --env dev \
+  --route-map /notify-hub=/alerts \
+  --model-map Notification=AlertNotification --dry-run
+
+# Clone a whole app over a target. Dry-run first; apply is explicit.
+benmore clone source-app target-app --env dev --replace --delete-missing --dry-run
+benmore clone source-app target-app --env dev --replace --delete-missing --apply
+```
+
+Curated packs include `kanban`, `notify-hub`, and `foundry`. Export lets you
+pick specific files, models, and flows from an existing Benmore app, and
+`benmore clone` can do that export+install in one dry-run. Install is dry-run by
+default for remote apps, additive-only for schema, blocks file/model collisions
+unless `--replace` is supplied, reports env var names without copying values, and
+snapshots the destination git history before apply. Use `--delete-missing` only
+with `--replace` when intentionally cloning a whole app over the target source.
+Use `--route-prefix` and `--model-prefix` for broad component installs into apps
+that already have matching route files or Prisma model names; use
+`--route-map FROM=TO` and `--model-map Old=New` for exact collision rewrites when
+a global prefix is too broad. Transformed installs are not allowed with
+`--delete-missing`. Route prefixes move static files, rename `flows/*.yaml`
+files, and rewrite known custom API route strings; exact route maps rewrite
+static route files, single-route flow files, and route strings. Model prefixes
+and exact model maps rewrite Prisma model names plus inferred table-name tokens
+in text files/flows. Installed `static/*.tsx` files are feature modules: import
+or link them from the existing app shell, or add a host `static/*.html` page, when
+you want a clean navigable route. Feature install does not rewrite the target
+app's nav automatically.
+Pack installs are bounded before apply: decoded archive max 64 MiB,
+uncompressed source max 128 MiB, per-entry max 64 MiB, `feature.yaml` max
+1 MiB, and max 2000 archive entries.

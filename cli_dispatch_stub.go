@@ -10,6 +10,7 @@ package main
 // is a no-op (there is no hosted MCP to ping).
 
 func dispatchPlatformCLI(cmd string) bool { return false }
+func preflightPlatformCLIAuth(cmd string) {}
 
 // maybeAutoInstallSkill is a no-op in the pure framework build - the bundled
 // skill teaches the cloud workflow (deploy/push), which this edition lacks.

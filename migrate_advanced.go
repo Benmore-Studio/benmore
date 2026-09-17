@@ -260,7 +260,78 @@ func isBenignMigrationError(err error) bool {
 		strings.Contains(msg, "already exists")
 }
 
-func RunMigrationFile(db *sql.DB, path string) error {
+// sqlQuerier is the read surface shared by *sql.DB and *sql.Tx, so schema
+// checks can run against whichever handle the caller is inside.
+type sqlQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// dbColumnExists reports whether a live table has a given column.
+func dbColumnExists(q sqlQuerier, table, col string) bool {
+	rows, err := q.Query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, col)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	return rows.Next()
+}
+
+// dbTableExists reports whether a table exists.
+func dbTableExists(q sqlQuerier, table string) bool {
+	rows, err := q.Query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	return rows.Next()
+}
+
+// renameColumnStmtRe captures `ALTER TABLE <t> RENAME [COLUMN] <src> TO <tgt>`.
+// The optional COLUMN keyword covers SQLite's legacy rename-column form; a
+// table rename (`RENAME TO <x>`) cannot match because it has no <src> token
+// before TO.
+var renameColumnStmtRe = regexp.MustCompile(
+	`(?is)^\s*ALTER\s+TABLE\s+["'\[]?(\w+)["'\]]?\s+RENAME\s+(?:COLUMN\s+)?["'\[]?(\w+)["'\]]?\s+TO\s+["'\[]?(\w+)["'\]]?\s*;?\s*$`,
+)
+
+// renameTableStmtRe captures `ALTER TABLE <src> RENAME TO <tgt>`.
+var renameTableStmtRe = regexp.MustCompile(
+	`(?is)^\s*ALTER\s+TABLE\s+["'\[]?(\w+)["'\]]?\s+RENAME\s+TO\s+["'\[]?(\w+)["'\]]?\s*;?\s*$`,
+)
+
+// isRenameAlreadyApplied reports whether a failed RENAME statement's desired
+// end state is ALREADY in place: the rename source is gone but the target
+// exists. This happens on fresh databases - the schema sync creates the
+// TARGET column/table directly, so a handwritten `ALTER TABLE x RENAME COLUMN
+// old TO new` fails with `no such column: old` even though the schema is
+// exactly what the migration wanted. Deliberately narrow: the statement must
+// be a pure RENAME, the error must name the missing source, and the target's
+// existence (and the source's absence) is verified against the live schema
+// via q - never inferred from the error text alone. Anything else still
+// fails the migration.
+func isRenameAlreadyApplied(q sqlQuerier, stmt string, err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if m := renameColumnStmtRe.FindStringSubmatch(stmt); m != nil {
+		table, src, tgt := m[1], m[2], m[3]
+		return strings.Contains(msg, "no such column") &&
+			strings.Contains(msg, strings.ToLower(src)) &&
+			!dbColumnExists(q, table, src) &&
+			dbColumnExists(q, table, tgt)
+	}
+	if m := renameTableStmtRe.FindStringSubmatch(stmt); m != nil {
+		src, tgt := m[1], m[2]
+		return strings.Contains(msg, "no such table") &&
+			strings.Contains(msg, strings.ToLower(src)) &&
+			!dbTableExists(q, src) &&
+			dbTableExists(q, tgt)
+	}
+	return false
+}
+
+func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
 	data, err := readFileBytes(path)
 	if err != nil {
 		return err
@@ -326,8 +397,24 @@ func RunMigrationFile(db *sql.DB, path string) error {
 				log.Printf("  migration: skipping already-applied statement (%v)", err)
 				continue
 			}
+			// Same idempotency for RENAMEs: a fresh DB gets the TARGET
+			// column/table straight from the schema sync, so the rename's
+			// source is missing but the end state is already correct
+			// (e.g. `RENAME COLUMN role TO solar_role` in a user migration
+			// on a DB born with solar_role). Without this the file rolled back,
+			// never recorded, and warned on every boot. Checked against the
+			// tx so it sees renames from earlier statements in this file.
+			if isRenameAlreadyApplied(tx, stmt, err) {
+				log.Printf("  migration: skipping already-applied rename (%v)", err)
+				continue
+			}
 			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)
 		}
+	}
+	// Record inside the SAME tx: apply + record are atomic, so a crash between
+	// them can no longer leave an applied-but-unrecorded file that re-runs.
+	if _, err := tx.Exec(recordSQL, name); err != nil {
+		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration: %w", err)
@@ -345,36 +432,88 @@ func RunMigrations(db *sql.DB, dir string) error {
 		return nil // no migrations directory, that's fine
 	}
 
-	// Ensure tracking table
+	// Legacy (schema.sql-only) apps: ensure a tracking table. On schema.prisma
+	// apps ApplyPrismaMigration already created a richer 5-column table
+	// (source/source_hash NOT NULL), so this IF NOT EXISTS is a no-op there.
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_migrations (
 		name TEXT PRIMARY KEY,
 		applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 
+	// The table has two possible shapes; satisfy whichever exists.
+	recordSQL := "INSERT INTO _benmore_migrations (name) VALUES (?)"
+	if dbColumnExists(db, "_benmore_migrations", "source") {
+		recordSQL = "INSERT INTO _benmore_migrations (name, source, source_hash) VALUES (?, '', '')"
+	}
+
 	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".sql") {
+		n := entry.Name()
+		if !strings.HasSuffix(n, ".sql") || strings.HasSuffix(n, ".failed.sql") {
 			continue
 		}
 
 		// Check if already applied
 		var count int
-		db.QueryRow("SELECT COUNT(*) FROM _benmore_migrations WHERE name = ?", entry.Name()).Scan(&count)
+		if err := db.QueryRow("SELECT COUNT(*) FROM _benmore_migrations WHERE name = ?", n).Scan(&count); err != nil {
+			return fmt.Errorf("migration dedupe check %s: %w", n, err)
+		}
 		if count > 0 {
 			continue
 		}
 
-		// Run migration
-		path := filepath.Join(migrationsDir, entry.Name())
-		if err := RunMigrationFile(db, path); err != nil {
-			return fmt.Errorf("migration %s: %w", entry.Name(), err)
+		if err := RunMigrationFile(db, filepath.Join(migrationsDir, n), n, recordSQL); err != nil {
+			// Rename so a persistently-failing file does not re-attempt every
+			// reload/boot (mirrors ApplyPrismaMigration's .failed handling).
+			// Fixing = the user renames it back.
+			failed := filepath.Join(migrationsDir, n+".failed.sql")
+			if rnErr := os.Rename(filepath.Join(migrationsDir, n), failed); rnErr != nil {
+				log.Printf("  migration: could not rename failed file %s: %v", n, rnErr)
+			}
+			return fmt.Errorf("migration %s: %w", n, err)
 		}
-
-		// Record as applied
-		db.Exec("INSERT INTO _benmore_migrations (name) VALUES (?)", entry.Name())
-		log.Printf("  migration: applied %s", entry.Name())
+		log.Printf("  migration: applied %s", n)
 	}
 
 	return nil
+}
+
+// runUserMigrationsWithBackup snapshots the DB, then applies pending
+// migrations/*.sql. Used on both cold boot and the SIGHUP reload path so a
+// deploy-triggered reload applies newly shipped migrations with a safety net.
+func runUserMigrationsWithBackup(db *sql.DB, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, "migrations")); err != nil {
+		return nil // nothing to do
+	}
+	if _, err := preparePreMigrationBackup(dir, true); err != nil {
+		log.Printf("  migration: pre-migration backup failed (continuing): %v", err)
+	}
+	return RunMigrations(db, dir)
+}
+
+// pendingUserMigrations reports migrations/*.sql not yet recorded as applied
+// (pending) and any *.failed.sql (failed), for CLI surfacing so a deploy never
+// silently leaves a migration unapplied.
+func pendingUserMigrations(db *sql.DB, dir string) (pending, failed []string) {
+	entries, err := os.ReadDir(filepath.Join(dir, "migrations"))
+	if err != nil {
+		return nil, nil
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasSuffix(n, ".failed.sql") {
+			failed = append(failed, n)
+			continue
+		}
+		if !strings.HasSuffix(n, ".sql") {
+			continue
+		}
+		var c int
+		db.QueryRow("SELECT COUNT(*) FROM _benmore_migrations WHERE name = ?", n).Scan(&c)
+		if c == 0 {
+			pending = append(pending, n)
+		}
+	}
+	return pending, failed
 }
 
 func readFileBytes(path string) ([]byte, error) {

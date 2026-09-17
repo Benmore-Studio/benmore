@@ -24,6 +24,13 @@ func TestBuildDBOpenConfigLocalSQLite(t *testing.T) {
 	if !strings.Contains(cfg.DSN, "_synchronous=NORMAL") {
 		t.Fatalf("local DSN should default to synchronous NORMAL: %s", cfg.DSN)
 	}
+	// Guards the "database is locked" storm fix: without _txlock=immediate,
+	// database/sql opens txns DEFERRED and the read→write upgrade deadlocks
+	// under WAL (SQLITE_BUSY_SNAPSHOT that _busy_timeout cannot retry). Do not
+	// remove without reading the comment in sqliteAppDSN.
+	if !strings.Contains(cfg.DSN, "_txlock=immediate") {
+		t.Fatalf("local DSN must open txns IMMEDIATE (_txlock=immediate): %s", cfg.DSN)
+	}
 }
 
 func TestBuildDBOpenConfigDBSynchronousFull(t *testing.T) {

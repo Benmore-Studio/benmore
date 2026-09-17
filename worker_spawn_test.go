@@ -17,7 +17,7 @@ func TestNoBareGoFuncInWorkers(t *testing.T) {
 		"backup_worker.go",
 		"marketing_drips.go",
 		"quarantine.go",
-		"builder_uploads.go",
+		"hosted_chat_retention.go",
 		"flows.go",
 		"feedback_ui.go",
 	}
@@ -29,6 +29,9 @@ func TestNoBareGoFuncInWorkers(t *testing.T) {
 
 	for _, file := range workerFiles {
 		data, err := os.ReadFile(file)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -106,9 +106,12 @@ func flowLimiterFor(app *App, flow *Flow) *RateLimiter {
 // identity (an anon caller hitting a per-user limit is bucketed by IP, so the
 // limit still applies rather than being silently skipped).
 func rateLimitKey(app *App, scope string, r *http.Request) string {
+	return rateLimitKeyForSession(getSession(app, r), scope, r)
+}
+func rateLimitKeyForSession(s *Session, scope string, r *http.Request) string {
 	switch scope {
 	case "user", "email", "group":
-		if s := getSession(app, r); s != nil {
+		if s != nil {
 			switch scope {
 			case "user":
 				if s.UserID != 0 {

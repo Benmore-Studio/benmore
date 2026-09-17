@@ -280,10 +280,14 @@ func FormatDriftReport(drifts []SchemaDrift) string {
 // into the model shape the drift detector compares against. Exported
 // so the CLI command can call it without duplicating the load logic.
 func LoadSchemaModelsForDrift(dir string) ([]PrismaModel, error) {
-	if data, err := os.ReadFile(filepath.Join(dir, "schema.prisma")); err == nil {
+	prismaPath := filepath.Join(dir, "schema.prisma")
+	if data, err := os.ReadFile(prismaPath); err == nil {
 		return ParsePrismaSchema(string(data))
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read %s: %w", prismaPath, err)
 	}
-	if data, err := os.ReadFile(filepath.Join(dir, "schema.sql")); err == nil {
+	sqlPath := filepath.Join(dir, "schema.sql")
+	if data, err := os.ReadFile(sqlPath); err == nil {
 		// For schema.sql, we don't have Prisma models per se - but we
 		// can parse the CREATE TABLE statements into Table structs
 		// and convert. For drift detection what matters is table
@@ -304,6 +308,8 @@ func LoadSchemaModelsForDrift(dir string) ([]PrismaModel, error) {
 			}
 		}
 		return models, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read %s: %w", sqlPath, err)
 	}
 	return nil, nil
 }

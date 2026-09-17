@@ -345,8 +345,41 @@ const (
 	backupDirName    = ".benmore/backups"
 	backupPrefix     = "pre-migrate-"
 	maxBackups       = 10
-	backupPermission = 0600
+	backupPermission = 0640
+	backupDirMode    = os.ModeSetgid | 0770
 )
+
+func prepareBackupDir(backupDir string) error {
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		return fmt.Errorf("create backup dir: %w", err)
+	}
+	// RestrictSUIDSGID=yes blocks even a no-op chmod carrying the setgid bit.
+	// Avoid that syscall when the parent already supplied the desired mode,
+	// but keep a real permission mismatch boot-fatal: a backup the router
+	// cannot verify is not a usable recovery point.
+	st, err := os.Stat(backupDir)
+	if err != nil {
+		return fmt.Errorf("stat backup dir: %w", err)
+	}
+	if st.Mode().Perm()|(st.Mode()&os.ModeSetgid) != backupDirMode {
+		if err := os.Chmod(backupDir, backupDirMode); err != nil {
+			return fmt.Errorf("set backup dir permissions: %w", err)
+		}
+	}
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return fmt.Errorf("list backups for permission repair: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+			continue
+		}
+		if err := os.Chmod(filepath.Join(backupDir, entry.Name()), backupPermission); err != nil {
+			return fmt.Errorf("repair backup permissions for %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
 
 // backupDatabase writes a consistent snapshot of data.db to
 // .benmore/backups/pre-migrate-{timestamp}.db before schema migrations
@@ -376,8 +409,8 @@ func backupDatabase(dir string) (string, error) {
 	}
 
 	backupDir := filepath.Join(dir, backupDirName)
-	if err := os.MkdirAll(backupDir, 0700); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+	if err := prepareBackupDir(backupDir); err != nil {
+		return "", err
 	}
 
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -414,9 +447,12 @@ func backupDatabase(dir string) (string, error) {
 		return "", fmt.Errorf("vacuum into backup: %w", err)
 	}
 	// VACUUM INTO honors the source's encryption settings but writes
-	// with the default mode (0644 minus umask). Tighten to match the
-	// rest of the backup-dir contract.
-	_ = os.Chmod(backupPath, backupPermission)
+	// with the default mode (0644 minus umask). Keep backups owner-writable
+	// and group-readable so the trusted router can verify/restore them;
+	// sibling tenants cannot traverse one another's app directories.
+	if err := os.Chmod(backupPath, backupPermission); err != nil {
+		return "", fmt.Errorf("set backup permissions: %w", err)
+	}
 
 	log.Printf("  backup: %s", backupPath)
 	return backupPath, nil
@@ -725,6 +761,10 @@ func swapInBackup(dir, backupPath string, cause error) (string, error) {
 	// Align ownership with the app dir (no-op when already correct).
 	chownToDirOwner(dbPath, dir)
 
+	// A brand-new file now sits at dbPath (the old inode was renamed aside), so
+	// any cached router handle is pointing at the wrong file. Rollback paths
+	// rename the ORIGINAL inode back and are therefore unaffected.
+	notifyDBFileReplaced(dbPath)
 	return corruptDest, nil
 }
 
@@ -879,6 +919,10 @@ func restoreDatabase(dir string, backupPath string) error {
 		}
 	}
 
+	// The bytes under any cached router connection just changed; that cache
+	// must drop its handle or every later read through it reports the file as
+	// malformed. No-op in builds without the platform router.
+	notifyDBFileReplaced(filepath.Join(dir, "data.db"))
 	return nil
 }
 
@@ -895,8 +939,8 @@ func scheduledBackup(dir string) (string, error) {
 	}
 
 	backupDir := filepath.Join(dir, backupDirName)
-	if err := os.MkdirAll(backupDir, 0700); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+	if err := prepareBackupDir(backupDir); err != nil {
+		return "", err
 	}
 
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -912,7 +956,9 @@ func scheduledBackup(dir string) (string, error) {
 		_ = os.Remove(backupPath)
 		return "", fmt.Errorf("vacuum into scheduled backup: %w", err)
 	}
-	_ = os.Chmod(backupPath, backupPermission)
+	if err := os.Chmod(backupPath, backupPermission); err != nil {
+		return "", fmt.Errorf("set scheduled backup permissions: %w", err)
+	}
 
 	return backupPath, nil
 }

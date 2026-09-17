@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -98,6 +99,7 @@ type FlowStep struct {
 	ExpectRows  string
 	API         *FlowAPICall
 	Email       *FlowEmail
+	SMS         *FlowSMS
 	Webhook     string
 	WebhookBody string
 	WS          *FlowWS      // ws broadcast step
@@ -125,6 +127,18 @@ type FlowStep struct {
 	// a private file (uploads/private/...) can be served to an anon
 	// caller the flow has already gated, without minting a signed URL.
 	ServeFile *FlowServeFile
+	// DeleteUpload is an interpolated stored private-upload reference for the
+	// server-only run: delete_upload step.
+	DeleteUpload string
+	// PurgeCurrentUserConfirm is the request-bound confirmation for the
+	// identity-bound run: purge_current_user step. The executor never accepts a
+	// target id: it purges only the immutable authenticated Session on the flow
+	// context. See account_purge.go.
+	PurgeCurrentUserConfirm string
+	// Transcribe carries the (file, model, language) tuple for a
+	// `run: transcribe` step - local audio→text via host ffmpeg +
+	// whisper-cli. See transcribe.go.
+	Transcribe *FlowTranscribe
 	// Trusted opts a `run: sql_dynamic` step into consuming
 	// request-sourced references as raw SQL text. sql_dynamic interpolates
 	// `{{ }}` / `:param` refs directly into the query string (no param
@@ -148,6 +162,24 @@ type FlowServeFile struct {
 	Path        string
 	Disposition string // "inline" (default) or "attachment"
 	Filename    string // optional Content-Disposition filename
+}
+
+// FlowTranscribe is the payload for a `run: transcribe` step - local
+// Whisper transcription via host binaries (no vendor, no API key).
+//
+//   - id: t
+//     run: transcribe
+//     with:
+//     file: uploads/brief.webm   # app-relative path (primary) or public https:// URL
+//     model: base.en             # optional, default WHISPER_MODEL (small.en)
+//     language: en               # optional, passed to whisper as -l
+//
+// Outputs: steps.<id>.outputs.text (transcript) and
+// steps.<id>.outputs.audio_path. Engine + env knobs: transcribe.go.
+type FlowTranscribe struct {
+	File     string
+	Model    string
+	Language string
 }
 
 // FlowCompute is the payload for a `run: compute` step.
@@ -273,14 +305,42 @@ type FlowAPIPaginate struct {
 	MaxPages   int    // safety cap (default 50, hard max 500)
 }
 
+// FlowSMS is a `run: sms` step. Delivery goes through SendSMS, so an
+// explicitly configured provider (Twilio via SMS_ACCOUNT_SID, or
+// SMS_WEBHOOK_URL) wins and the hosted platform's shared number is the
+// fallback - the flow YAML is identical either way.
+//
+//	steps:
+//	  - id: notify
+//	    run: sms
+//	    with:
+//	      to: "${{ steps.u.outputs.phone }}"
+//	      body: "Your code is ${{ steps.otp.outputs.code }}"
+//
+// `text:` is accepted as an alias for `body:`, mirroring run: email.
+type FlowSMS struct {
+	To   string
+	Body string // inline message text (accepted keys: body, text)
+}
+
 // FlowEmail represents an email step.
 type FlowEmail struct {
-	To       string
-	Subject  string
-	Template string            // emails/<name>.html (or literal path) rendered as the HTML body
-	Html     string            // inline HTML body (accepted keys: html, body)
-	Text     string            // inline plain-text body / multipart alt
-	Data     map[string]string // extra template vars, overlaid on the flow context (alias: vars)
+	To          string
+	Subject     string
+	Template    string            // emails/<name>.html (or literal path) rendered as the HTML body
+	Html        string            // inline HTML body (accepted keys: html, body)
+	Text        string            // inline plain-text body / multipart alt
+	Data        map[string]string // extra template vars, overlaid on the flow context (alias: vars)
+	Attachments []FlowAttachment  // files attached to the send (base64 content)
+}
+
+// FlowAttachment is one attachment on a `run: email` step. Content is base64;
+// filename and content are interpolated at exec time so a flow can pass bytes
+// produced by an earlier step (e.g. content: "${{ steps.pdf.outputs.b64 }}").
+type FlowAttachment struct {
+	Filename    string
+	ContentType string
+	Content     string // base64-encoded file bytes
 }
 
 // FlowRespond represents a custom HTTP response.
@@ -296,6 +356,10 @@ type FlowContext struct {
 	App     *App
 	Request *http.Request
 	Writer  http.ResponseWriter
+	// Session is the immutable authenticated actor captured by the HTTP entry
+	// point. Destructive server-only steps must authorize from this value, never
+	// from ctx.Data/Params, which are mutable and may be request-controlled.
+	Session *Session
 	Data    map[string]any    // named step results
 	Params  map[string]string // path and query params
 	// RequestKeys records which Params/Data keys were sourced directly
@@ -587,13 +651,28 @@ func runFlowEvent(app *App, f Flow, row map[string]any) {
 	}
 }
 
-func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Request) {
+// The returned error lets internal dispatchers observe failures after a respond
+// step (in particular a failed transaction commit), even if headers were sent.
+func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Request) error {
+	return executeFlowHTTPAs(app, flow, w, r, nil)
+}
+
+// scheduledActor is supplied only by the scheduler after owner/permission checks.
+// It never comes from an HTTP header or body and cannot mint a login session.
+func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Request, scheduledActor *Session) (executionErr error) {
 	// Declarative rate limiting (opt-in via `rate_limit:` on on.request).
 	// Reject over-limit requests with 429 + Retry-After BEFORE any work runs.
 	if flow.RateLimit != nil {
-		if !flowLimiterFor(app, flow).Allow(rateLimitKey(app, flow.RateLimit.Scope, r)) {
+		key := rateLimitKey(app, flow.RateLimit.Scope, r)
+		if scheduledActor != nil {
+			key = rateLimitKeyForSession(scheduledActor, flow.RateLimit.Scope, r)
+		}
+		if !flowLimiterFor(app, flow).Allow(key) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(flow.RateLimit.Window.Seconds())))
 			http.Error(w, "rate limit exceeded - retry after "+flow.RateLimit.Window.String(), http.StatusTooManyRequests)
+			if scheduledActor != nil {
+				return errScheduledFlowRateLimited
+			}
 			return
 		}
 	}
@@ -607,6 +686,17 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		// request, so sql_dynamic must treat it as untrusted (see M-1 /
 		// flowDynamicGuardRequestRefs).
 		RequestKeys: make(map[string]bool),
+	}
+	defer func() { executionErr = ctx.Error }()
+
+	// A purge flow must not send its irreversible-looking success response
+	// before SQLite has actually committed. Ordinary transactional flows retain
+	// their existing streaming behavior; the identity-erasure primitive uses a
+	// small response buffer and flushes it only after a successful commit.
+	var purgeResponse *flowResponseBuffer
+	if flowHasPurgeCurrentUser(flow.Steps) {
+		purgeResponse = newFlowResponseBuffer()
+		ctx.Writer = purgeResponse
 	}
 
 	// Extract path params from the original :param definitions
@@ -641,6 +731,29 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Verify inbound webhooks against the untouched request body. This must
+	// stay before ParseForm and JSON binding: both consume r.Body, and an HMAC
+	// over reconstructed or truncated bytes is not the provider's signature.
+	// Path params are already available above for path-bound bearer recipes.
+	// Rich recipe form takes precedence over the legacy string form so flows
+	// can migrate without an ambiguous verification order.
+	if flow.VerifyConfig != nil {
+		if err := runVerifyRecipe(flow.VerifyConfig, r, app.Dir); err != nil {
+			log.Printf("FLOW VERIFY REJECT [%s]: %s", flow.Name, err)
+			if errors.Is(err, errVerifyBodyTooLarge) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "Invalid signature", http.StatusUnauthorized)
+			}
+			return
+		}
+	} else if flow.Verify != "" {
+		if !verifyWebhookSignature(flow, r, app.Dir) {
+			http.Error(w, "Invalid signature", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	// Extract POST form data (application/x-www-form-urlencoded or multipart)
 	if r.Method == "POST" {
 		r.ParseForm()
@@ -660,10 +773,10 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 	// SQL steps. Now any object-shaped JSON body lands the same way as
 	// a form body. Body is restored on r.Body so downstream `parse:`
 	// steps still see it.
-	if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+	if scheduledActor != nil || r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
 		ct := strings.ToLower(r.Header.Get("Content-Type"))
 		if strings.Contains(ct, "application/json") && r.Body != nil {
-			rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			rawBody, _ := io.ReadAll(io.LimitReader(r.Body, flowVerifyBodyMaxBytes))
 			r.Body = io.NopCloser(bytes.NewReader(rawBody))
 			var data map[string]any
 			if err := json.Unmarshal(rawBody, &data); err == nil {
@@ -724,8 +837,11 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 	}
 
 	// Auth enforcement for HTTP-triggered flows
-	if flow.Auth == "required" || flow.Role != "" {
-		session := getSession(app, r)
+	if scheduledActor != nil || flow.Auth == "required" || flow.Role != "" {
+		session := scheduledActor
+		if session == nil {
+			session = getSession(app, r)
+		}
 		if session == nil {
 			// RFC 9728 pointer so MCP clients hitting an auth-required
 			// flow discover the app's OAuth provider and start the flow.
@@ -752,10 +868,23 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		// scope only carried id/email/role and any other reference
 		// silently left literal `{{first_name}}` in flow output -
 		// the same trap an earlier app build hit.
+		for key := range ctx.Data {
+			if strings.HasPrefix(key, "user.") {
+				delete(ctx.Data, key)
+				delete(ctx.Params, key)
+				delete(ctx.RequestKeys, key)
+				delete(ctx.NullParams, key)
+			}
+		}
+
 		ctx.Data["user_id"] = session.UserID
 		ctx.Data["user_email"] = session.Email
 		ctx.Data["user_role"] = session.Role
+		ctx.Session = session
 		if userRow := LoadUserFields(app.DB, session.UserID); userRow != nil {
+			if scheduledActor != nil {
+				userRow["role"] = session.Role
+			}
 			ctx.Data["user"] = userRow
 		} else {
 			// Fall back to the session-only fields so `${{ user.id }}` /
@@ -769,6 +898,19 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			}
 		}
 
+		for _, key := range []string{"user", "user_id", "user_email", "user_role", "_group_id", "_group_key"} {
+			delete(ctx.Params, key)
+			delete(ctx.NullParams, key)
+			delete(ctx.RequestKeys, key)
+		}
+		ctx.Params["user_id"] = fmt.Sprint(session.UserID)
+		ctx.Params["user_email"] = session.Email
+		ctx.Params["user_role"] = session.Role
+		ctx.Data["_group_id"] = ""
+		ctx.Data["_group_key"] = ""
+		ctx.Params["_group_id"] = ""
+		ctx.Params["_group_key"] = ""
+
 		// Tenant row-scoping affordance for flow SQL. When this app is
 		// multi-tenant (groups configured) and the session is bound to a
 		// tenant (and is not an admin bypassing scope), expose the
@@ -781,25 +923,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			ctx.Params["_group_id"] = gid
 			ctx.Data["_group_id"] = gid
 			ctx.Data["_group_key"] = app.Group.Key
-		}
-	}
-
-	// Webhook signature verification - rich recipe form takes precedence
-	// over the legacy string form so flows that declare both (during a
-	// migration) get the precise behavior they configured. The recipe
-	// form returns a granular error logged server-side; clients still
-	// only see "Invalid signature" / 401 so check-which-check-failed
-	// isn't an oracle for attackers.
-	if flow.VerifyConfig != nil {
-		if err := runVerifyRecipe(flow.VerifyConfig, r, app.Dir); err != nil {
-			log.Printf("FLOW VERIFY REJECT [%s]: %s", flow.Name, err)
-			http.Error(w, "Invalid signature", http.StatusUnauthorized)
-			return
-		}
-	} else if flow.Verify != "" {
-		if !verifyWebhookSignature(flow, r, app.Dir) {
-			http.Error(w, "Invalid signature", http.StatusUnauthorized)
-			return
+			ctx.Params["_group_key"] = app.Group.Key
 		}
 	}
 
@@ -835,6 +959,7 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 	}
 
 	// Start transaction if flow requires it
+	var guard *txCommitGuard
 	if flow.Transaction {
 		tx, err := app.DB.Begin()
 		if err != nil {
@@ -843,6 +968,17 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 			return
 		}
 		ctx.Tx = tx
+		// guard (txCommitGuard, jobs.go) finalizes the *sql.Tx exactly once even
+		// if executeSteps PANICS. recoverMiddleware (host.go/router.go/server.go)
+		// is the OUTERMOST defer and swallows the panic, so without this the stack
+		// unwinds straight past the commit/rollback below and the *sql.Tx is never
+		// finalized: its connection never returns to the pool, and under SQLite WAL
+		// an unreturned write-tx holds the app's write lock UNTIL RESTART - the
+		// sustained "[locks] cleanup error: database is locked" storm. cron.go and
+		// jobs.go already guard their tx paths; this is the HTTP flow route (every
+		// browser request), and it was the one holding-lock path they missed.
+		guard = &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
 	}
 
 	executeSteps(ctx, flow.Steps)
@@ -857,6 +993,17 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 				ctx.Error = err
 			}
 		}
+		guard.MarkHandled()
+	}
+	if purgeResponse != nil {
+		if ctx.Error == nil {
+			purgeResponse.flushTo(w)
+		} else {
+			// Discard any success body/status produced before a rollback or failed
+			// commit and let the normal error path write to the real response.
+			ctx.Writer = w
+			ctx.Stopped = false
+		}
 	}
 
 	if ctx.Error != nil {
@@ -864,6 +1011,12 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		if !ctx.Stopped {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 		}
+	}
+
+	// Scheduled jobs historically did not need an HTTP respond step. Preserve
+	// that contract while retaining HTTP input taint, identity and policy gates.
+	if scheduledActor != nil && ctx.Error == nil && !ctx.Stopped {
+		return
 	}
 
 	// Default response if nothing responded. Pre-v2.3.1 this was a
@@ -898,6 +1051,8 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 		}
 		json.NewEncoder(w).Encode(resp)
 	}
+	return
+
 }
 
 // quoteForHint returns `"name"` for non-empty names, or `(unnamed)` so
@@ -940,7 +1095,7 @@ func stepFailureHint(name, stepType, errMsg string) string {
 		case strings.Contains(em, "returned 4"), strings.Contains(em, "returned 5"):
 			return prefix + "Upstream returned an error status. Check the `sign:` recipe (auth) and the URL. If this is OAuth, verify the credentials are set in env.yaml."
 		case strings.Contains(em, "context deadline exceeded"), strings.Contains(em, "timeout"):
-			return prefix + "Upstream timed out. Default HTTP timeout is 30s. If the call legitimately takes longer, add `mode: async` on the route's `on.request` block so the flow runs in the background and the HTTP handler returns 202 immediately."
+			return prefix + "Upstream timed out. Default HTTP timeout is 30s; raise it with `timeout: 570s` under the api step's `with:` (or at step level). If the call legitimately takes longer than 30s, also add `mode: async` on the route's `on.request` block so the flow runs in the background and the HTTP handler returns 202 immediately."
 		}
 		return prefix + "Read step_error above for the network-layer cause (timeout, DNS, TLS, status code). For auth failures: check the `sign:` recipe and env vars via `describe_auth`."
 	case "parse":
@@ -950,7 +1105,9 @@ func stepFailureHint(name, stepType, errMsg string) string {
 	case "redirect":
 		return prefix + "`run: redirect` couldn't compute the `to:` URL. Check that any `${{ ... }}` refs in `to:` resolve."
 	case "email":
-		return prefix + "Email send failed. Verify EMAIL_FROM is set and the configured provider (Resend / SMTP) has working credentials. `describe_auth` shows the email config."
+		return prefix + "Email send failed. Verify EMAIL_FROM is a verified sending domain (platform SES) or, off-platform, that SMTP credentials work. `describe_auth` shows the email config."
+	case "sms":
+		return prefix + "SMS send failed. On the hosted platform every app can text via the shared number - check `benmore sms <app>` for quota/pause state, that `to:` is E.164 (+1...) and within the allowed calling prefixes, and that the per-recipient velocity cap (5 / 10 min) isn't tripped. Self-hosted: set SMS_ACCOUNT_SID/SMS_AUTH_TOKEN (Twilio) or SMS_WEBHOOK_URL."
 	case "webhook":
 		return prefix + "Webhook delivery failed. Same diagnostics as `run: api` (network, status code, SSRF guard). If the receiver requires HMAC, use `run: api` with a `sign:` recipe instead - `run: webhook` is the legacy unsigned path."
 	case "enqueue":
@@ -1055,7 +1212,7 @@ func executeSteps(ctx *FlowContext, steps []FlowStep) {
 			// Run on_error steps
 			if len(step.OnError) > 0 {
 				ctx.Data["error"] = err.Error()
-				errCtx := &FlowContext{App: ctx.App, Data: ctx.Data, Params: ctx.Params}
+				errCtx := &FlowContext{App: ctx.App, Session: ctx.Session, Data: ctx.Data, Params: ctx.Params}
 				executeSteps(errCtx, step.OnError)
 			}
 			return
@@ -1094,12 +1251,20 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 		err = execStepEnqueue(ctx, step)
 	case "email":
 		err = execStepEmail(ctx, step)
+	case "sms":
+		err = execStepSMS(ctx, step)
 	case "redirect":
 		err = execStepRedirect(ctx, step)
 	case "respond":
 		err = execStepRespond(ctx, step)
 	case "serve_file":
 		err = execStepServeFile(ctx, step)
+	case "delete_upload":
+		err = execStepDeleteUpload(ctx, step)
+	case "purge_current_user":
+		err = execStepPurgeCurrentUser(ctx, step)
+	case "transcribe":
+		err = execStepTranscribe(ctx, step)
 	case "if":
 		err = execStepIf(ctx, step)
 	case "for_each":
@@ -2133,7 +2298,21 @@ func execStepEmail(ctx *FlowContext, step *FlowStep) error {
 	if ctx.App != nil {
 		appDir = ctx.App.Dir
 	}
-	return SendEmailOpts(appDir, EmailOpts{To: to, Subject: subject, BodyHTML: html, BodyText: text})
+
+	var atts []EmailAttachment
+	for _, a := range step.Email.Attachments {
+		content := strings.TrimSpace(interpolateCtx(a.Content, ctx))
+		if content == "" {
+			continue
+		}
+		atts = append(atts, EmailAttachment{
+			Filename:    interpolateCtx(a.Filename, ctx),
+			ContentType: a.ContentType,
+			Content:     content,
+		})
+	}
+
+	return SendEmailOpts(appDir, EmailOpts{To: to, Subject: subject, BodyHTML: html, BodyText: text, Attachments: atts})
 }
 
 // emailTemplateCandidates returns the relative paths tried for an email
@@ -2306,6 +2485,13 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 	http.ServeFile(ctx.Writer, ctx.Request, fullPath)
 	ctx.Stopped = true
 	return nil
+}
+
+func execStepDeleteUpload(ctx *FlowContext, step *FlowStep) error {
+	if step.DeleteUpload == "" {
+		return fmt.Errorf("delete_upload step missing `path:`")
+	}
+	return deletePrivateUpload(ctx.App, interpolateCtx(step.DeleteUpload, ctx))
 }
 
 func execStepRespond(ctx *FlowContext, step *FlowStep) error {
@@ -2648,7 +2834,7 @@ func execStepParse(ctx *FlowContext, step *FlowStep) error {
 		}
 
 		// Fall back to JSON
-		body, err := io.ReadAll(io.LimitReader(ctx.Request.Body, 1<<20))
+		body, err := io.ReadAll(io.LimitReader(ctx.Request.Body, flowVerifyBodyMaxBytes))
 		if err != nil {
 			return err
 		}

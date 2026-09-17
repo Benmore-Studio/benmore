@@ -328,7 +328,19 @@ func LoadSeeds(db *sql.DB, dir string) error {
 }
 
 // QueryRows executes a SQL query and returns results as a slice of maps.
+type mutationQuerier interface {
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
+}
+type sqlExecutor interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
 func QueryRows(db *sql.DB, query string, args ...any) ([]map[string]any, error) {
+	return queryRowsWith(db, query, args...)
+}
+
+func queryRowsWith(db mutationQuerier, query string, args ...any) ([]map[string]any, error) {
 	start := time.Now()
 	rows, err := db.Query(query, args...)
 	incDBQuery()
@@ -398,7 +410,7 @@ func scanRows(rows *sql.Rows) ([]map[string]any, error) {
 		}
 	}
 
-	var results []map[string]any
+	results := make([]map[string]any, 0)
 	for rows.Next() {
 		values := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -545,6 +557,9 @@ func GetAllTableNames(db *sql.DB) ([]string, error) {
 
 // GetTableColumns returns column info for a table from the live database.
 func GetTableColumns(db *sql.DB, table string) ([]Column, error) {
+	return tableColumnsWith(db, table)
+}
+func tableColumnsWith(db mutationQuerier, table string) ([]Column, error) {
 	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return nil, err
@@ -566,7 +581,7 @@ func GetTableColumns(db *sql.DB, table string) ([]Column, error) {
 			Type:    colType,
 			NotNull: notNull == 1,
 			Default: dflt.String,
-			PK:      pk == 1,
+			PK:      pk > 0,
 		})
 	}
 	return cols, rows.Err()
@@ -1042,35 +1057,13 @@ func EnsureIdempotencyTable(db *sql.DB) {
 	)`)
 	// One-shot migration for older deployments where the table had key
 	// as the sole PK. Add user_id if missing - ALTER on the PK is a no-op
-	// on legacy rows; the new compound PK is enforced going forward.
+	// on legacy rows; v2 keys include identity so either PK shape is safe.
 	db.Exec("ALTER TABLE _benmore_idempotency ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+	// v2 keys include route and credential identity; legacy cache entries are
+	// intentionally unreachable because they have no request fingerprint.
+	db.Exec("ALTER TABLE _benmore_idempotency ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''")
 	// Cleanup old entries (24h)
 	db.Exec("DELETE FROM _benmore_idempotency WHERE created_at < datetime('now', '-1 day')")
-}
-
-// CheckIdempotency checks if this request was already processed.
-// Returns (cached_response, status_code, true) if duplicate, or ("", 0, false) if new.
-// Scoped per user - userID=0 for anonymous requests.
-func CheckIdempotency(db *sql.DB, key string, userID int64) (string, int, bool) {
-	if key == "" {
-		return "", 0, false
-	}
-	var response string
-	var status int
-	err := db.QueryRow("SELECT response, status_code FROM _benmore_idempotency WHERE key = ? AND user_id = ?", key, userID).Scan(&response, &status)
-	if err != nil {
-		return "", 0, false
-	}
-	return response, status, true
-}
-
-// SaveIdempotency stores the response for a processed request.
-func SaveIdempotency(db *sql.DB, key string, userID int64, response string, status int) {
-	if key == "" {
-		return
-	}
-	db.Exec("INSERT OR IGNORE INTO _benmore_idempotency (key, user_id, response, status_code) VALUES (?, ?, ?, ?)",
-		key, userID, response, status)
 }
 
 // ParseCreateTables extracts table definitions from SQL.

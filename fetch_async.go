@@ -3,162 +3,92 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
-// fetchTemplateStore holds inner templates for async fetch, keyed by hash.
-var fetchTemplateStore = struct {
-	sync.RWMutex
-	templates map[string]string
-}{templates: make(map[string]string)}
-
-// RegisterFetchRoutes adds the internal async fetch endpoint.
+// RegisterFetchRoutes accepts only descriptors emitted by the server's renderer.
 func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
+	registerFetchRoutes(mux, app, fetchHTTPClient(2*time.Second))
+}
+
+func registerFetchRoutes(mux *http.ServeMux, app *App, client *http.Client) {
 	mux.HandleFunc("GET /_internal/fetch", func(w http.ResponseWriter, r *http.Request) {
-		// Auth/CSRF gate. This endpoint makes outbound requests on the
-		// server's behalf, so it must not be drivable cross-site. A valid
-		// CSRF token (same-origin proof) OR a bearer-authenticated caller
-		// is required; otherwise an attacker page could trigger fetches
-		// using the victim's ambient session. Fail closed.
-		if !validateCSRF(r) && !isBearerAuth(r) {
+		w.Header().Set("Cache-Control", "no-store")
+		session := getSession(app, r)
+		if isBearerAuth(r) && session == nil || !isBearerAuth(r) && !validateCSRF(r) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-
-		fetchURL := r.URL.Query().Get("url")
-		as := r.URL.Query().Get("as")
-		templateHash := r.URL.Query().Get("t")
-		headersParam := r.URL.Query().Get("headers")
-		cacheParam := r.URL.Query().Get("cache")
-
-		if fetchURL == "" {
-			http.Error(w, "Missing url", http.StatusBadRequest)
-			return
-		}
-
-		// Resolve relative URLs against the app's CONFIGURED canonical
-		// origin, never r.Host. r.Host is attacker-influenceable (Host
-		// header / forwarding) so resolving against it let a relative URL
-		// be redirected at an internal endpoint while we replayed the
-		// victim's cookies - a confused-deputy SSRF. The canonical origin
-		// is operator-set and trusted.
-		canonicalOrigin := uploadsCanonicalOrigin(app)
-		// trustedLocal is true only when the destination is the configured
-		// canonical origin. Cookies are forwarded ONLY to trustedLocal
-		// destinations - never to an r.Host-derived or remote host.
-		trustedLocal := false
-		if strings.HasPrefix(fetchURL, "/") {
-			if canonicalOrigin == "" {
-				// No configured origin → we cannot prove the relative URL
-				// resolves to a trusted host. Fail closed rather than fall
-				// back to r.Host.
-				http.Error(w, "Relative fetch URLs require a configured BENMORE_PUBLIC_URL", http.StatusBadGateway)
-				return
+		desc, err := openFetchDescriptor(app, r.URL.Query().Get("d"), session)
+		if err != nil {
+			// An already-open page may contain the previous release's raw URL,
+			// or an expired descriptor. HTMX processes this header before its
+			// error response handling, obtaining fresh server-authored markup.
+			if r.Header.Get("HX-Request") == "true" {
+				w.Header().Set("HX-Refresh", "true")
 			}
-			fetchURL = strings.TrimRight(canonicalOrigin, "/") + fetchURL
-			trustedLocal = true
-		}
-
-		// Always run the SSRF check - including for canonical-origin-derived
-		// URLs. The canonical origin itself could be misconfigured to a
-		// private host, and a relative path can still target a private
-		// internal route, so this gate must never be skipped.
-		if isPrivateURL(fetchURL) {
-			http.Error(w, "Blocked", http.StatusForbidden)
+			http.Error(w, "Invalid fetch descriptor", http.StatusForbidden)
 			return
 		}
-
-		// Check cache
-		cacheDuration := parseDuration(cacheParam)
-		cacheKey := fetchURL
+		fetchURL, trustedLocal, err := resolveFetchURL(app, desc.URL)
+		if err != nil {
+			http.Error(w, "Blocked fetch URL", http.StatusForbidden)
+			return
+		}
+		cacheDuration := parseDuration(desc.Cache)
+		if session != nil || desc.Headers != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Authorization") != "" {
+			cacheDuration = 0
+		}
+		cacheKey := fetchCacheKey(app, fetchURL)
 		if cacheDuration > 0 {
 			fetchCache.RLock()
 			entry, ok := fetchCache.entries[cacheKey]
 			fetchCache.RUnlock()
 			if ok && time.Now().Before(entry.expiresAt) {
-				renderFetchResponse(w, entry.data, as, templateHash)
+				renderFetchResponse(w, entry.data, desc.As, desc.Inner)
 				return
 			}
 		}
-
-		// Make the HTTP request (2s timeout - fast fail is better than blocking)
-		client := safeHTTPClientStrict(2 * time.Second)
-		req, err := http.NewRequest("GET", fetchURL, nil)
+		req, err := http.NewRequestWithContext(r.Context(), "GET", fetchURL, nil)
 		if err != nil {
 			http.Error(w, "Request error", http.StatusBadGateway)
 			return
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "Benmore/1.0")
-
-		// Forward cookies ONLY to the configured canonical origin. We must
-		// never forward the caller's cookies to a host derived from r.Host
-		// or to a remote/absolute destination - that is exactly the
-		// confused-deputy replay this fix closes. Match the parsed
-		// destination host against the canonical origin host; equality is
-		// the sole condition under which cookies are trusted to leave.
-		if !trustedLocal && canonicalOrigin != "" {
-			if parsed, parseErr := url.Parse(fetchURL); parseErr == nil {
-				if co, coErr := url.Parse(canonicalOrigin); coErr == nil &&
-					parsed.Host != "" && parsed.Host == co.Host {
-					trustedLocal = true
-				}
-			}
-		}
 		if trustedLocal {
 			for _, cookie := range r.Cookies() {
 				req.AddCookie(cookie)
 			}
 		}
-
-		if headersParam != "" {
-			headersParam = InterpolateEnv(headersParam, app.Dir)
-			for _, h := range strings.Split(headersParam, ",") {
-				parts := strings.SplitN(strings.TrimSpace(h), ":", 2)
-				if len(parts) == 2 {
-					req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-				}
-			}
-		}
-
+		setFetchHeaders(req, desc.Headers)
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("FETCH ASYNC error: %s → %s", fetchURL, err)
-			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<div style="color:var(--text-muted);font-size:0.8rem;padding:0.5rem;">Failed to load data</div>`))
+			http.Error(w, "Failed to load data", http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
-
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if resp.StatusCode >= 400 {
-			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<div style="color:var(--text-muted);font-size:0.8rem;padding:0.5rem;">Data unavailable</div>`))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+		if err != nil || len(body) > 1<<20 || resp.StatusCode >= 400 {
+			http.Error(w, "Data unavailable", http.StatusBadGateway)
 			return
 		}
-
 		var data any
-		if err := json.Unmarshal(body, &data); err != nil {
+		if json.Unmarshal(body, &data) != nil {
 			data = string(body)
 		}
-
-		// Cache
-		if cacheDuration > 0 {
+		if cacheDuration > 0 && cacheableFetchResponse(resp) {
 			fetchCache.Lock()
 			fetchCache.entries[cacheKey] = &cacheEntry{data: data, expiresAt: time.Now().Add(cacheDuration)}
 			fetchCache.Unlock()
 		}
-
-		renderFetchResponse(w, data, as, templateHash)
+		renderFetchResponse(w, data, desc.As, desc.Inner)
 	})
 }
 
@@ -196,13 +126,8 @@ func uploadsCanonicalOrigin(app *App) string {
 	return u.Scheme + "://" + u.Host
 }
 
-func renderFetchResponse(w http.ResponseWriter, data any, as, templateHash string) {
-	// Get the inner template
-	fetchTemplateStore.RLock()
-	inner, ok := fetchTemplateStore.templates[templateHash]
-	fetchTemplateStore.RUnlock()
-
-	if !ok || inner == "" {
+func renderFetchResponse(w http.ResponseWriter, data any, as, inner string) {
+	if inner == "" {
 		// No template - return raw JSON
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(data)
@@ -275,25 +200,18 @@ func ExpandFetchTagsAsync(content string, app *App, ctx *RenderContext) string {
 			headers = InterpolateEnv(headers, app.Dir)
 		}
 
-		// Store the inner template for the async endpoint to use
-		templateHash := fmt.Sprintf("%x", sha256.Sum256([]byte(inner)))[:12]
-		fetchTemplateStore.Lock()
-		fetchTemplateStore.templates[templateHash] = inner
-		fetchTemplateStore.Unlock()
-
-		// Build the internal fetch URL
-		params := url.Values{
-			"url": {rawURL},
-			"as":  {as},
-			"t":   {templateHash},
+		if _, _, err := resolveFetchURL(app, rawURL); err != nil {
+			return renderFetchError(app, err.Error())
 		}
-		if cache != "" {
-			params.Set("cache", cache)
+		session := ctx.User
+		if ctx.Request != nil {
+			session = getSession(app, ctx.Request)
 		}
-		if headers != "" {
-			params.Set("headers", headers)
+		token, err := sealFetchDescriptor(app, fetchDescriptor{URL: rawURL, Headers: headers, As: as, Inner: inner, Cache: cache, Audience: sessionSecurityFingerprint(session), Expires: time.Now().Add(fetchDescriptorTTL).Unix()})
+		if err != nil {
+			return renderFetchError(app, "fetch: descriptor unavailable")
 		}
-		internalURL := "/_internal/fetch?" + params.Encode()
+		internalURL := "/_internal/fetch?d=" + url.QueryEscape(token)
 
 		// Determine loading state
 		if loading == "" {

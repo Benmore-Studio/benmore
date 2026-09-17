@@ -402,10 +402,13 @@ func memberOfPredicate(app *App, table string, rule *memberOfRule, session *Sess
 // parent row identified by joinVal (used for create/update-time checks
 // where the row doesn't exist yet, so the EXISTS predicate can't run).
 func memberOfHas(app *App, rule *memberOfRule, joinVal any, session *Session) bool {
+	return memberOfHasWith(app.DB, rule, joinVal, session)
+}
+func memberOfHasWith(db mutationQuerier, rule *memberOfRule, joinVal any, session *Session) bool {
 	q := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? AND %s = ? LIMIT 1",
 		rule.Table, rule.JoinCol, rule.UserCol)
 	var x int
-	return app.DB.QueryRow(q, joinVal, rule.userValue(session)).Scan(&x) == nil
+	return db.QueryRow(q, joinVal, rule.userValue(session)).Scan(&x) == nil
 }
 
 // memberOfDenial is the outcome of a pre-write membership check.
@@ -426,6 +429,9 @@ type memberOfDenial struct {
 // paths skipping this check is exactly the drift the 2026-06-11 audit
 // flagged (M5). Returns nil when the write may proceed.
 func memberOfCreateDenial(app *App, table string, session *Session, val func(string) string) *memberOfDenial {
+	return memberOfCreateDenialWith(app.DB, app, table, session, val)
+}
+func memberOfCreateDenialWith(db mutationQuerier, app *App, table string, session *Session, val func(string) string) *memberOfDenial {
 	rule := memberOfFor(app, table, OpWrite)
 	if rule == nil || session == nil || session.IsAdminBypass() {
 		return nil
@@ -441,7 +447,7 @@ func memberOfCreateDenial(app *App, table string, session *Session, val func(str
 			msg:    fmt.Sprintf("%s is required: %s is membership-scoped (member-of:%s)", local, table, rule.Table),
 		}
 	}
-	if !memberOfHas(app, rule, joinVal, session) {
+	if !memberOfHasWith(db, rule, joinVal, session) {
 		return &memberOfDenial{status: http.StatusNotFound}
 	}
 	return nil
@@ -453,6 +459,9 @@ func memberOfCreateDenial(app *App, table string, session *Session, val func(str
 // row's CURRENT parent. newVal is the submitted value for a column (""
 // when not being updated). Returns nil when the update may proceed.
 func memberOfRepointDenial(app *App, table string, session *Session, newVal func(string) string) *memberOfDenial {
+	return memberOfRepointDenialWith(app.DB, app, table, session, newVal)
+}
+func memberOfRepointDenialWith(db mutationQuerier, app *App, table string, session *Session, newVal func(string) string) *memberOfDenial {
 	rule := memberOfFor(app, table, OpUpdate)
 	if rule == nil || session == nil || session.IsAdminBypass() {
 		return nil
@@ -465,7 +474,7 @@ func memberOfRepointDenial(app *App, table string, session *Session, newVal func
 	if v == "" {
 		return nil
 	}
-	if !memberOfHas(app, rule, v, session) {
+	if !memberOfHasWith(db, rule, v, session) {
 		return &memberOfDenial{status: http.StatusNotFound}
 	}
 	return nil
@@ -525,6 +534,9 @@ func matchWSRoomPattern(pattern, room string) (val string, ok bool) {
 // apps actually declare. Membership tables with additional NOT NULL
 // columns lacking defaults will error; the caller logs + surfaces it.
 func memberOfAutoJoin(app *App, rule *memberOfRule, rowID any, session *Session) error {
+	return memberOfAutoJoinWith(app.DB, app, rule, rowID, session)
+}
+func memberOfAutoJoinWith(db sqlExecutor, app *App, rule *memberOfRule, rowID any, session *Session) error {
 	cols := []string{rule.JoinCol, rule.UserCol}
 	vals := []any{rowID, rule.userValue(session)}
 	if app.Group != nil && app.Group.Key != "" && hasColumn(app, rule.Table, app.Group.Key) && session.EffectiveHasGroup() {
@@ -536,7 +548,7 @@ func memberOfAutoJoin(app *App, rule *memberOfRule, rowID any, session *Session)
 		vals = append(vals, session.UserID)
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", ")
-	_, err := app.DB.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING",
+	_, err := db.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING",
 		rule.Table, strings.Join(cols, ", "), placeholders), vals...)
 	return err
 }
@@ -599,10 +611,15 @@ func implicitDefault(tableHasUserID, tableHasGroupKey bool) string {
 // request time and logs a fail-closed warning, so a typo halts traffic
 // rather than silently flapping to a broader policy.
 func LoadAccess(dir string) *AccessConfig {
+	config, _ := loadAccessChecked(dir)
+	return config
+}
+
+func loadAccessChecked(dir string) (*AccessConfig, error) {
 	path := filepath.Join(dir, "app.yaml")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	// We parse loosely so the per-table value can be EITHER a string
 	// ("admin") OR a map ({read: x, write: y}). yaml.Node lets us
@@ -611,10 +628,10 @@ func LoadAccess(dir string) *AccessConfig {
 		Access yaml.Node `yaml:"access"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil
+		return nil, err
 	}
 	if raw.Access.Kind == 0 || raw.Access.Kind != yaml.MappingNode {
-		return nil
+		return nil, nil
 	}
 	rules := make(map[string]map[AccessOp]string)
 	for i := 0; i < len(raw.Access.Content); i += 2 {
@@ -650,9 +667,9 @@ func LoadAccess(dir string) *AccessConfig {
 		}
 	}
 	if len(rules) == 0 {
-		return nil
+		return nil, nil
 	}
-	return &AccessConfig{rules: rules}
+	return &AccessConfig{rules: rules}, nil
 }
 
 // EnforceCRUDAccess is the coarse gate every auto-CRUD handler calls
@@ -821,6 +838,12 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 		aclSQL, aclArgs := aclFilter(table, session.Email, aclAction)
 		return fmt.Sprintf("(user_id = ? OR %s)", aclSQL),
 			append([]any{session.UserID}, aclArgs...), false
+	}
+	if app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key) {
+		// A group-keyed table is still scoped when the caller has no group.
+		// Only an explicit ACL grant can authorize a row in that case.
+		pred, args := aclFilter(table, session.Email, aclAction)
+		return pred, args, false
 	}
 	return "", nil, false
 }

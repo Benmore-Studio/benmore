@@ -10,8 +10,8 @@ import (
 )
 
 // loadApp initializes the full app from a directory.
-func loadApp(dir string) (*App, error) {
-	app := &App{
+func loadApp(dir string) (app *App, err error) {
+	app = &App{
 		Dir:      dir,
 		Sessions: NewSessionStore(),
 		Stop:     make(chan struct{}),
@@ -33,6 +33,17 @@ func loadApp(dir string) (*App, error) {
 		return nil, fmt.Errorf("database: %w", err)
 	}
 	app.DB = db
+	// Every error return below abandons this pool. In the ROUTER process that
+	// is a permanent leak: MCP write_file/edit_file runs RunCompleteCheck ->
+	// tryLoadApp -> loadApp on every edit, and the app DSN carries
+	// _cache_size=-64000 (64MB page cache per connection) + a 256MB mmap
+	// window, so a repeatedly-failing load grew the router by hundreds of MB
+	// and fed the 2026-08-01 MemoryHigh throttling outage.
+	defer func() {
+		if err != nil {
+			db.Close()
+		}
+	}()
 
 	// Load schema
 	tables, deferredDDL, err := LoadSchema(db, dir)
@@ -182,8 +193,8 @@ func loadApp(dir string) (*App, error) {
 	// Load i18n translations
 	LoadI18n(dir)
 
-	// Run migration files (migrations/ directory)
-	if err := RunMigrations(db, dir); err != nil {
+	// Run migration files (migrations/ directory), with a pre-migration backup.
+	if err := runUserMigrationsWithBackup(db, dir); err != nil {
 		log.Printf("  migration warning: %s", err)
 	}
 

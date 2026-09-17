@@ -497,8 +497,8 @@ func versionBmInternal(html []byte) []byte {
 //
 //	<script type="importmap">{"imports":{"bm":"/_internal/bm.js"}}</script>
 //
-// The scaffold ships it, but agents (the in-browser builder AND MCP clients
-// like Claude Code) routinely rewrite a page - login/signup, extra pages - and
+// The scaffold ships it, but external MCP/CLI clients such as Claude Code
+// routinely rewrite a page - login/signup, extra pages - and
 // drop it. The browser then throws "Failed to resolve module specifier bm" and
 // the entire module fails to evaluate, so auth forms / app bootstraps silently
 // do nothing. Injecting it in the framework's serve path makes

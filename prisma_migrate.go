@@ -715,6 +715,11 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	if err := os.MkdirAll(migDir, 0755); err != nil {
 		return "", fmt.Errorf("create migrations/: %w", err)
 	}
+	// UMask 0077 in the per-app unit degrades 0755 to 0700. The router process
+	// (user benmore, shared group) must be able to write shipped migrations/*.sql
+	// into this dir, so widen it to group-writable — mirroring the 0664 chmod
+	// write_file applies to files (mcp_tools.go).
+	_ = os.Chmod(migDir, 0o775)
 	next := nextMigrationNumber(migDir)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 	slug := describeDiff(diff)

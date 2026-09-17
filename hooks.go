@@ -25,7 +25,29 @@ type Hook struct {
 	Email   *EmailHook
 	Notify  *NotifyHook // notification to create
 	WS      *WSHook     // broadcast over WebSocket to a room
+	SMS     *SMSHook    // text message via the configured SMS provider
 	When    string      // conditional: "stage = 'won'"
+}
+
+// SMSHook sends a text message when a data event fires. Delivery goes
+// through SendSMS, so an explicitly configured provider (Twilio via
+// SMS_ACCOUNT_SID, or SMS_WEBHOOK_URL) wins and the hosted platform's
+// shared number is the fallback - the app writes the same YAML either way.
+//
+//	on_insert:
+//	  messages:
+//	    - sms:
+//	        to: "{{recipient}}"
+//	        body: "{{sms_body}}"
+//	      when: "channel = 'sms'"
+//
+// Every send costs real money and lands on someone's phone, so a `when:`
+// guard is usually load-bearing rather than decorative. Recipients must be
+// E.164; the platform path additionally enforces a calling-prefix
+// allowlist, per-recipient velocity, and a daily quota.
+type SMSHook struct {
+	To   string // E.164 recipient (templates supported, e.g. "{{recipient}}")
+	Body string // message text (templates supported)
 }
 
 // WSHook fires a WebSocket broadcast to every client currently
@@ -238,6 +260,9 @@ func FireUserHooks(app *App, event string, userID int64) {
 // If any hook SQL returns a row with an "error" column, the operation is aborted.
 // Returns nil if all hooks pass, or an error message to return to the client.
 func FireBeforeHooks(app *App, event string, table string, row map[string]any) error {
+	return fireBeforeHooksWith(app.DB, app, event, table, row)
+}
+func fireBeforeHooksWith(db mutationQuerier, app *App, event string, table string, row map[string]any) error {
 	if app.Hooks == nil {
 		return nil
 	}
@@ -268,7 +293,7 @@ func FireBeforeHooks(app *App, event string, table string, row map[string]any) e
 			// which returns the abort row exactly when <cond> holds.
 			raw := translateRaiseAbort(hook.SQL)
 			sql, args := interpolateRowSafe(raw, row, app.Dir)
-			rows, err := QueryRows(app.DB, sql, args...)
+			rows, err := queryRowsWith(db, sql, args...)
 			if err != nil {
 				// FAIL CLOSED. A before-hook is a gate (auth / business-rule
 				// enforcement). If it can't be evaluated - typo, bad column,
@@ -411,7 +436,7 @@ func executeHook(db *sql.DB, hook Hook, row map[string]any, appDir string) {
 		log.Printf("HOOK [sql] executed: %s", truncate(sql, 60))
 	}
 
-	// Email - actually send via SMTP (or Resend HTTP if configured).
+	// Email - send via SendEmailOpts (platform SES gateway, or SMTP off-platform).
 	// Template is loaded from emails/<name>.html if specified; row
 	// values are mustache-interpolated into both subject + body.
 	if hook.Email != nil {
@@ -431,6 +456,27 @@ func executeHook(db *sql.DB, hook Hook, row map[string]any, appDir string) {
 			log.Printf("HOOK [email] send failed: %s", err)
 		} else {
 			log.Printf("HOOK [email] sent to=%s subject=%s", to, subject)
+		}
+	}
+
+	// SMS - send via SendSMS (explicit provider if configured, else the
+	// platform's shared number). An empty recipient or body after
+	// interpolation means the template referenced a column that isn't on
+	// the row: say so instead of handing an empty string to the provider.
+	if hook.SMS != nil {
+		to := interpolateRow(hook.SMS.To, row, appDir)
+		body := interpolateRow(hook.SMS.Body, row, appDir)
+		switch {
+		case to == "":
+			log.Printf("HOOK [sms] skipped: `to` resolved empty from template %q - check the column exists on the row", hook.SMS.To)
+		case body == "":
+			log.Printf("HOOK [sms] skipped: `body` resolved empty from template %q - check the column exists on the row", hook.SMS.Body)
+		default:
+			if err := SendSMS(appDir, to, body); err != nil {
+				log.Printf("HOOK [sms] send failed to=%s: %s", to, err)
+			} else {
+				log.Printf("HOOK [sms] sent to=%s", to)
+			}
 		}
 	}
 

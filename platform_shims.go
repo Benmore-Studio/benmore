@@ -271,7 +271,7 @@ func StartWALShipper(app *App) {}
 // checkStorageCap enforces a per-app storage quota. Quotas are a hosting/
 // platform concern; the framework never caps a self-hosted app's storage, so
 // this is a no-op (never blocked).
-func checkStorageCap(app *App) (string, bool) { return "", false }
+func checkStorageCap(app *App, projectedBytes int64) (string, bool) { return "", false }
 
 // oauthMintCLIToken issues a hosted-platform CLI api_token after OAuth. There
 // is no platform here, so it never issues a token - OAuth just creates the

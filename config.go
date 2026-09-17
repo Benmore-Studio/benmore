@@ -67,6 +67,10 @@ type HookEntryYAML struct {
 		Room    string `yaml:"room"`
 		Payload string `yaml:"payload"` // JSON-stringifiable template
 	} `yaml:"ws"`
+	SMS *struct {
+		To   string `yaml:"to"`
+		Body string `yaml:"body"`
+	} `yaml:"sms"`
 }
 
 // FlowYAML represents a flow in flows.yaml.
@@ -559,7 +563,10 @@ func LoadHooksYAML(dir string) *HookConfig {
 
 	var raw HooksYAML
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return LoadHooks(dir) // fallback
+		// The fallback is a weaker line parser. Downgrading silently is the
+		// same class of bug this file guards against, so say it out loud.
+		log.Printf("HOOKS: %s is not valid YAML (%v) - falling back to the legacy line parser, which supports fewer actions. Fix the YAML.", path, err)
+		return LoadHooks(dir)
 	}
 
 	config := &HookConfig{
@@ -571,36 +578,23 @@ func LoadHooksYAML(dir string) *HookConfig {
 		BeforeDelete: make(map[string][]Hook),
 	}
 
-	for table, entries := range raw.OnInsert {
-		for _, e := range entries {
-			config.OnInsert[table] = append(config.OnInsert[table], hookFromYAML(e))
+	load := func(dst map[string][]Hook, section string, src map[string][]HookEntryYAML) {
+		for table, entries := range src {
+			for i, e := range entries {
+				h := hookFromYAML(e)
+				if !hookHasAction(h) {
+					log.Printf("HOOKS: %s.%s[%d] has no recognized action (sql / webhook / email / notify / ws / sms) - it will fire and do nothing. Check the key spelling in %s.", section, table, i, path)
+				}
+				dst[table] = append(dst[table], h)
+			}
 		}
 	}
-	for table, entries := range raw.OnUpdate {
-		for _, e := range entries {
-			config.OnUpdate[table] = append(config.OnUpdate[table], hookFromYAML(e))
-		}
-	}
-	for table, entries := range raw.OnDelete {
-		for _, e := range entries {
-			config.OnDelete[table] = append(config.OnDelete[table], hookFromYAML(e))
-		}
-	}
-	for table, entries := range raw.BeforeInsert {
-		for _, e := range entries {
-			config.BeforeInsert[table] = append(config.BeforeInsert[table], hookFromYAML(e))
-		}
-	}
-	for table, entries := range raw.BeforeUpdate {
-		for _, e := range entries {
-			config.BeforeUpdate[table] = append(config.BeforeUpdate[table], hookFromYAML(e))
-		}
-	}
-	for table, entries := range raw.BeforeDelete {
-		for _, e := range entries {
-			config.BeforeDelete[table] = append(config.BeforeDelete[table], hookFromYAML(e))
-		}
-	}
+	load(config.OnInsert, "on_insert", raw.OnInsert)
+	load(config.OnUpdate, "on_update", raw.OnUpdate)
+	load(config.OnDelete, "on_delete", raw.OnDelete)
+	load(config.BeforeInsert, "before_insert", raw.BeforeInsert)
+	load(config.BeforeUpdate, "before_update", raw.BeforeUpdate)
+	load(config.BeforeDelete, "before_delete", raw.BeforeDelete)
 
 	return config
 }
@@ -634,7 +628,28 @@ func hookFromYAML(e HookEntryYAML) Hook {
 			Payload: e.WS.Payload,
 		}
 	}
+	if e.SMS != nil && e.SMS.To != "" {
+		h.SMS = &SMSHook{
+			To:   e.SMS.To,
+			Body: e.SMS.Body,
+		}
+	}
 	return h
+}
+
+// hookHasAction reports whether a parsed hook will actually do something.
+//
+// yaml.v3 silently drops keys that don't exist on the target struct, so a
+// typo (or a key the framework doesn't support yet) yields a hook that
+// parses cleanly, fires on every matching row, and does nothing at all -
+// indistinguishable from success. That exact shape shipped: an `sms:` hook
+// authored against docs that promised it, against a struct that had no SMS
+// field, produced Hook{When: ...} and silently sent nothing for months.
+// The write-time validator is the real gate; this is the boot-time net for
+// files that were written before it existed.
+func hookHasAction(h Hook) bool {
+	return h.SQL != "" || h.Webhook != "" || h.Email != nil ||
+		h.Notify != nil || h.WS != nil || h.SMS != nil
 }
 
 // LoadFlowsYAML reads flows.yaml with the real YAML parser. We try

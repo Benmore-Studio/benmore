@@ -22,7 +22,7 @@ func TestWriteBareScaffoldFilesInfraOnly(t *testing.T) {
 		t.Fatalf("WriteBareScaffoldFiles: %v", err)
 	}
 
-	for _, want := range []string{"app.yaml", "tsconfig.json", "src/bm.d.ts", "CLAUDE.md"} {
+	for _, want := range []string{"app.yaml", "tsconfig.json", "src/bm.d.ts", "CLAUDE.md", "AGENTS.md"} {
 		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
 			t.Errorf("bare scaffold missing infra file %s: %v", want, err)
 		}
@@ -53,5 +53,19 @@ func TestWriteBareScaffoldFilesInfraOnly(t *testing.T) {
 	}
 	if !strings.Contains(string(appYAML), "stack: html") {
 		t.Errorf("bare app.yaml missing frontend.stack, got:\n%s", appYAML)
+	}
+}
+
+func TestBareScaffoldBMTypesDoesNotSuggestLocalhost(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteBareScaffoldFiles(dir, "Test"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "src", "bm.d.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "localhost") || strings.Contains(string(b), "benmore serve") {
+		t.Fatalf("scaffolded bm.d.ts contains removed local-dev guidance:\n%s", b)
 	}
 }

@@ -76,7 +76,40 @@ func (ls *LocalStorage) Save(path string, data io.Reader) (string, error) {
 }
 
 func (ls *LocalStorage) Delete(path string) error {
-	return os.Remove(filepath.Join(ls.Dir, path))
+	base, err := filepath.Abs(ls.Dir)
+	if err != nil {
+		return err
+	}
+	full, err := filepath.Abs(filepath.Join(base, path))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(base, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("delete upload: path escapes storage root")
+	}
+	current := base
+	for _, part := range strings.Split(filepath.Dir(rel), string(os.PathSeparator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("delete upload: storage path has non-directory parent")
+		}
+	}
+	err = os.Remove(full)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // S3Storage saves files to an S3-compatible bucket (AWS, Cloudflare R2, MinIO, etc.).
@@ -86,6 +119,14 @@ type S3Storage struct {
 	Endpoint string // custom endpoint for R2/MinIO
 	Key      string
 	Secret   string
+}
+
+func (s3 *S3Storage) objectURL(path string) string {
+	endpoint := s3.Endpoint
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s3.Region)
+	}
+	return fmt.Sprintf("%s/%s/%s", endpoint, s3.Bucket, path)
 }
 
 func (s3 *S3Storage) Save(path string, data io.Reader) (string, error) {
@@ -102,12 +143,8 @@ func (s3 *S3Storage) SaveWithMeta(path string, data io.Reader, contentType, disp
 		return "", err
 	}
 
-	endpoint := s3.Endpoint
-	awsNative := endpoint == "" || strings.Contains(endpoint, "amazonaws.com")
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s3.Region)
-	}
-	url := fmt.Sprintf("%s/%s/%s", endpoint, s3.Bucket, path)
+	awsNative := s3.Endpoint == "" || strings.Contains(s3.Endpoint, "amazonaws.com")
+	url := s3.objectURL(path)
 
 	req, err := http.NewRequest("PUT", url, bytes.NewReader(body))
 	if err != nil {
@@ -227,12 +264,8 @@ func hmacSHA256(key []byte, data string) []byte {
 }
 
 func (s3 *S3Storage) Delete(path string) error {
-	endpoint := s3.Endpoint
-	awsNative := endpoint == "" || strings.Contains(endpoint, "amazonaws.com")
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s3.Region)
-	}
-	url := fmt.Sprintf("%s/%s/%s", endpoint, s3.Bucket, path)
+	awsNative := s3.Endpoint == "" || strings.Contains(s3.Endpoint, "amazonaws.com")
+	url := s3.objectURL(path)
 
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
@@ -255,8 +288,12 @@ func (s3 *S3Storage) Delete(path string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if (resp.StatusCode >= 200 && resp.StatusCode < 300) || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return fmt.Errorf("S3 delete failed: %d: %s", resp.StatusCode, string(body))
 }
 
 // S3Object is one entry returned by S3Storage.List.
@@ -363,6 +400,100 @@ func (s3 *S3Storage) Fetch(path string) (*http.Response, error) {
 	return resp, nil
 }
 
+// storageBackendForApp is the single backend precedence used by upload and
+// delete: explicit per-app S3, managed CDN, then local disk. Nil preserves the
+// global single-app fallback used by legacy callers.
+func storageBackendForApp(app *App) StorageBackend {
+	if app == nil {
+		return storageBackend
+	}
+	if bucket := GetEnv(app.Dir, "S3_BUCKET"); bucket != "" {
+		return &S3Storage{
+			Bucket:   bucket,
+			Region:   GetEnv(app.Dir, "S3_REGION"),
+			Endpoint: GetEnv(app.Dir, "S3_ENDPOINT"),
+			Key:      GetEnv(app.Dir, "S3_KEY"),
+			Secret:   GetEnv(app.Dir, "S3_SECRET"),
+		}
+	}
+	if cdn := newCDNStorage(app); cdn != nil {
+		return cdn
+	}
+	return &LocalStorage{Dir: app.Dir}
+}
+
+func privateLogicalUploadPath(raw string) (string, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(raw, "\\\x00?#%") {
+		return "", fmt.Errorf("delete upload: invalid private upload reference")
+	}
+	if strings.HasPrefix(raw, "/") {
+		raw = raw[1:]
+	}
+	if !strings.HasPrefix(raw, "uploads/private/") {
+		return "", fmt.Errorf("delete upload: only uploads/private files may be deleted")
+	}
+	parts := strings.Split(strings.TrimPrefix(raw, "uploads/private/"), "/")
+	if len(parts) == 0 {
+		return "", fmt.Errorf("delete upload: empty private upload path")
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("delete upload: invalid private upload path")
+		}
+	}
+	return raw, nil
+}
+
+// privateUploadPath proves a stored reference belongs to the selected backend
+// and returns the logical uploads/private/... key passed to StorageBackend.
+func privateUploadPath(app *App, backend StorageBackend, raw string) (string, error) {
+	logical, logicalErr := privateLogicalUploadPath(raw)
+	if logicalErr == nil {
+		return logical, nil
+	}
+	if !strings.Contains(raw, "://") {
+		return "", logicalErr
+	}
+	if strings.ContainsAny(raw, "\\\x00?#%") {
+		return "", fmt.Errorf("delete upload: invalid private upload URL")
+	}
+	switch store := backend.(type) {
+	case *CDNStorage:
+		u, err := neturl.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host != store.CDNDomain || u.User != nil {
+			return "", fmt.Errorf("delete upload: URL is not this app's configured CDN")
+		}
+		prefix := "/private/" + appMediaPrefix(app) + "/"
+		if !strings.HasPrefix(u.Path, prefix) {
+			return "", fmt.Errorf("delete upload: CDN URL is outside this app's private prefix")
+		}
+		return privateLogicalUploadPath(strings.TrimPrefix(u.Path, prefix))
+	case *S3Storage:
+		prefix := store.objectURL("")
+		if !strings.HasPrefix(raw, prefix) {
+			return "", fmt.Errorf("delete upload: URL is not this app's configured S3 bucket")
+		}
+		return privateLogicalUploadPath(strings.TrimPrefix(raw, prefix))
+	default:
+		return "", fmt.Errorf("delete upload: URL references are unsupported by the selected backend")
+	}
+}
+
+func deletePrivateUpload(app *App, raw string) error {
+	backend := storageBackendForApp(app)
+	if backend == nil {
+		return fmt.Errorf("delete upload: storage backend unavailable")
+	}
+	path, err := privateUploadPath(app, backend, raw)
+	if err != nil {
+		return err
+	}
+	if err := backend.Delete(path); err != nil {
+		return fmt.Errorf("delete upload %q: %w", path, err)
+	}
+	return nil
+}
+
 // HandleFileUpload processes file uploads from multipart forms.
 // Returns the saved file path (relative to uploads/) or empty string.
 // Accepts *App so storage resolves per-app in multi-tenant host mode
@@ -445,27 +576,7 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	// block above + the CDN's script-killing CSP).
 	contentType, disposition := uploadContentMeta(ext, mimeType, safeName)
 
-	// Backend precedence: explicit per-app S3 (S3_BUCKET) > platform CDN
-	// media (deployment-wide, isolated origin) > local disk. Per-app avoids the
-	// global-state race in host mode.
-	var backend StorageBackend
-	if app != nil {
-		if bucket := GetEnv(app.Dir, "S3_BUCKET"); bucket != "" {
-			backend = &S3Storage{
-				Bucket:   bucket,
-				Region:   GetEnv(app.Dir, "S3_REGION"),
-				Endpoint: GetEnv(app.Dir, "S3_ENDPOINT"),
-				Key:      GetEnv(app.Dir, "S3_KEY"),
-				Secret:   GetEnv(app.Dir, "S3_SECRET"),
-			}
-		} else if cdn := newCDNStorage(app); cdn != nil {
-			backend = cdn
-		} else {
-			backend = &LocalStorage{Dir: app.Dir}
-		}
-	} else if storageBackend != nil {
-		backend = storageBackend
-	}
+	backend := storageBackendForApp(app)
 
 	if backend != nil {
 		if ms, ok := backend.(metaSaver); ok {

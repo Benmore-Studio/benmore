@@ -183,17 +183,34 @@ func generateCRUDTests(app *App) AppTestFile {
 // excluded so malformed-data and server bugs still fail the test.
 var crudWriteAcceptable = []int{200, 201, 401, 403, 404, 422}
 
-// crudReadClosed reports whether generic reads of the table are disabled
-// (access read: off). The framework returns 404 for these (the only read
-// path is a secure flow), so the auto-CRUD read tests assert closure rather
-// than a 200 list.
+// crudReadClosed reports whether the plain synthetic framework user is denied
+// at the coarse read gate. The generator must assert the configured 404 for
+// admin/role/permission/off modes instead of misreporting secure apps as
+// broken. Row-scoped modes reach the list handler and return a scoped or empty
+// 200 response for that authenticated user.
 func crudReadClosed(app *App, table string) bool {
 	if app == nil {
 		return false
 	}
 	hasUID := hasColumn(app, table, "user_id")
 	hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-	return app.Access.ModeFor(table, OpRead, hasUID, hasGroupKey) == "off"
+	mode := app.Access.ModeFor(table, OpRead, hasUID, hasGroupKey)
+	switch mode {
+	case "anon", "everyone", "self", "group":
+		return false
+	case "off", "admin":
+		return true
+	}
+	if strings.HasPrefix(mode, "role:") || strings.HasPrefix(mode, "perm:") {
+		return true
+	}
+	if strings.HasPrefix(mode, "member-of:") {
+		return parseMemberOf(mode) == nil
+	}
+	if strings.HasPrefix(mode, "owner_or_role:") {
+		return strings.TrimSpace(strings.TrimPrefix(mode, "owner_or_role:")) == ""
+	}
+	return true
 }
 
 // crudWriteGuaranteed reports whether the synthetic framework test user can
@@ -535,25 +552,27 @@ func generateDocsTests(app *App) AppTestFile {
 		}},
 	}
 
-	tests["api_docs_html"] = AppTestCase{
-		AsUser: frameworkTestUser,
-		Steps: []AppTestStep{{
-			Get:    "/docs",
-			Expect: AppTestExpect{Status: 200, Contains: []string{"API Documentation", "Copy for LLM"}},
-		}},
-	}
+	if _, appOwnsDocs := app.Pages["/docs"]; !appOwnsDocs {
+		tests["api_docs_html"] = AppTestCase{
+			AsUser: frameworkTestUser,
+			Steps: []AppTestStep{{
+				Get:    "/docs",
+				Expect: AppTestExpect{Status: 200, Contains: []string{"API Documentation", "Copy for LLM"}},
+			}},
+		}
 
-	// Markdown export (Copy-for-LLM): non-empty and carries the top-level
-	// section headings drawn from the same docs model.
-	tests["api_docs_markdown"] = AppTestCase{
-		AsUser: frameworkTestUser,
-		Steps: []AppTestStep{{
-			Get: "/docs?format=md",
-			Expect: AppTestExpect{
-				Status:   200,
-				Contains: []string{"# API Documentation", "## Authentication", "## Platform features"},
-			},
-		}},
+		// Markdown export (Copy-for-LLM): non-empty and carries the top-level
+		// section headings drawn from the same docs model.
+		tests["api_docs_markdown"] = AppTestCase{
+			AsUser: frameworkTestUser,
+			Steps: []AppTestStep{{
+				Get: "/docs?format=md",
+				Expect: AppTestExpect{
+					Status:   200,
+					Contains: []string{"# API Documentation", "## Authentication", "## Platform features"},
+				},
+			}},
+		}
 	}
 
 	return AppTestFile{Name: "_framework_docs", Tests: tests}

@@ -184,6 +184,13 @@ func reloadAppConfig(app *App) error {
 	}
 	// Indexes/views/triggers go in AFTER columns exist (see LoadSchema).
 	ApplyDeferredDDL(app.DB, deferredDDL)
+	// Apply user migrations/*.sql shipped by this deploy. This runs in the
+	// per-app process (never router-side); the schema-diff migrate above only
+	// handles column adds, not arbitrary SQL. Non-fatal so a bad migration
+	// file can't wedge serving.
+	if err := runUserMigrationsWithBackup(app.DB, app.Dir); err != nil {
+		log.Printf("  hot reload migration warning: %s", err)
+	}
 	// flows / hooks / workflows / cron. Same loader-preference as
 	// app_loader.loadApp: prefer the real YAML parser (handles GHA shape
 	// + flows/*.yaml multi-file layout), fall back to the legacy line-
@@ -296,6 +303,12 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	EnsureNotificationsTable(app.DB)
 	EnsureContextGraphTables(app.DB)
 	EnsureRequestLogTable(app.DB)
+
+	// Bulk import - chunked, resumable, all-or-nothing data loading.
+	// Registered on the per-app mux so it exists in `benmore serve` and
+	// `benmore host` alike; the framework edition gets it without the
+	// platform. RegisterImportRoutes calls EnsureImportsTable itself.
+	RegisterImportRoutes(mux, app)
 
 	// Analytics - auto-enabled by default, disable with features.analytics: false
 	RegisterAnalyticsRoutes(mux, app)
@@ -681,7 +694,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte(GenerateRobots(baseURL)))
 	})
-	mux.HandleFunc("GET /llms.txt", func(w http.ResponseWriter, r *http.Request) {
+	llmsTxtHandler := func(w http.ResponseWriter, r *http.Request) {
 		// Respect features.docs visibility for LLM discoverability endpoints
 		if app.Design != nil && app.Design.Features != nil && app.Design.Features.DocsRequireAuth() {
 			session := getSession(app, r)
@@ -698,7 +711,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 			return
 		}
 		w.Write([]byte(GenerateLLMsTxt(app, baseURL)))
-	})
+	}
+	mux.HandleFunc("GET /llms.txt", llmsTxtHandler)
+	mux.HandleFunc("GET /.well-known/llms.txt", llmsTxtHandler)
 	mux.HandleFunc("GET /llms-full.txt", func(w http.ResponseWriter, r *http.Request) {
 		// llmstxt.org companion file - served at the root only when the app
 		// ships one (static/llms-full.txt). Same visibility gate as /llms.txt.
@@ -917,13 +932,34 @@ func serverBodyLimitMiddleware(next http.Handler, app *App) http.Handler {
 		if r.Body != nil && r.ContentLength != 0 {
 			ct := r.Header.Get("Content-Type")
 			// Uploads (multipart/form-data) are capped by HandleFileUpload's
-			// own MaxBytesReader; don't double-cap and truncate them.
-			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/") {
+			// own MaxBytesReader; don't double-cap and truncate them. Bulk
+			// import chunk PUTs (import_http.go) are the same shape: their
+			// OWN http.MaxBytesReader is sized to maxImportChunkBytes
+			// (32MB) - double-capping with the global default (10MB,
+			// serverDefaultMaxBodyBytes) truncated EVERY chunk at the
+			// feature's own designed chunk size, making `benmore import`
+			// fail on any file needing a full-size chunk. Found via a real
+			// `benmore serve` smoke test - the existing import test suite
+			// only ever exercises RegisterImportRoutes on a bare mux, which
+			// never goes through this middleware, so no test had caught it.
+			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/") && !isImportChunkUploadPath(r) {
 				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isImportChunkUploadPath reports whether r targets the bulk-import chunk
+// PUT endpoint (PUT /api/_import/{id}/chunk/{n}). Matched by path shape
+// rather than through the mux (this middleware runs before routing, so
+// r.PathValue isn't populated yet) - precise enough to avoid matching the
+// create/status/commit/cancel endpoints on the same /api/_import/ prefix,
+// which are small JSON bodies that SHOULD stay under the global cap.
+func isImportChunkUploadPath(r *http.Request) bool {
+	return r.Method == http.MethodPut &&
+		strings.HasPrefix(r.URL.Path, "/api/_import/") &&
+		strings.Contains(r.URL.Path, "/chunk/")
 }
 
 // StartServer initializes and starts the HTTP server for an app.
@@ -998,13 +1034,13 @@ func applySecurityHeaders(w http.ResponseWriter, dev bool, app *App) {
 	// from them - so this doesn't open clickjacking surface.
 	desktopFrameAncestors := "tauri://localhost https://tauri.localhost http://localhost:1420"
 
-	// Allow the platform apex (e.g. benmore.ai) to frame apps so the hosted
-	// builder's live preview pane can iframe the app. The router knows the
+	// Allow the platform apex (e.g. benmore.ai) to frame apps so the
+	// workspace's live preview pane can iframe the app. The router knows the
 	// domain via platformDomain; per-app processes learn it from
 	// BENMORE_PLATFORM_DOMAIN (platform.env). Plus the desktop webview origins.
 	// `frame-ancestors 'none'` can't be combined with explicit origins, so we
 	// list the allowed origins instead - same protection against open-web
-	// framing while permitting the builder + desktop iframes.
+	// framing while permitting the workspace + desktop iframes.
 	pd := platformDomain
 	if pd == "" {
 		pd = os.Getenv("BENMORE_PLATFORM_DOMAIN")

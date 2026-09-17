@@ -255,9 +255,25 @@ func ApplyPipe(value any, pipe string) string {
 			s = strings.ReplaceAll(s, "--", "-")
 		}
 		return strings.Trim(s, "-")
+
+	case "markdown":
+		// Render Markdown → sanitized HTML via benmark. The result is
+		// already sanitized, so RenderMustache emits it raw (see the
+		// isRawHTMLPipe branch) instead of HTML-escaping it.
+		return renderMarkdownSafe(s, false)
+	case "markdown_inline":
+		// Single-line "chat" subset (no wrapping <p>).
+		return renderMarkdownSafe(s, true)
 	}
 
 	return s
+}
+
+// isRawHTMLPipe reports whether a pipe returns HTML that is already sanitized
+// and must be emitted without HTML-escaping (the markdown pipes).
+func isRawHTMLPipe(pipe string) bool {
+	name := strings.TrimSpace(strings.SplitN(pipe, ":", 2)[0])
+	return name == "markdown" || name == "markdown_inline"
 }
 
 func toFloat(v any) float64 {

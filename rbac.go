@@ -262,42 +262,11 @@ func HasAnyRole(s *Session, wanted []string) bool {
 // `posts:publish` before calling this). `*` and `<resource>:*` and
 // the OAuth2 "write implies read" rule from hasScope are honored.
 func HasPermission(s *Session, perm string) bool {
-	if s == nil {
+	if s == nil || perm == "" {
 		return false
 	}
-	if s.IsAdmin() {
-		return true
-	}
-	if perm == "" {
-		return false
-	}
-	// Empty Scopes = no restriction (legacy cookie sessions).
-	if s.Scopes == "" {
-		return true
-	}
-	wantRes, wantAct := parseScope(perm)
-	if wantRes == "" {
-		return false
-	}
-	for _, tok := range strings.Fields(s.Scopes) {
-		gotRes, gotAct := parseScope(tok)
-		if gotRes == "" {
-			continue
-		}
-		if gotRes == "*" {
-			return true
-		}
-		if gotRes != wantRes {
-			continue
-		}
-		if gotAct == "*" || gotAct == wantAct {
-			return true
-		}
-		if wantAct == "read" && gotAct == "write" {
-			return true
-		}
-	}
-	return false
+	resource, action := parseScope(perm)
+	return resource != "" && hasScope(s, resource, action)
 }
 
 // StartRoleExpirySweeper runs a per-app background goroutine that

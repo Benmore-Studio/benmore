@@ -4,13 +4,17 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/smtp"
+	"net/textproto"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -49,6 +53,16 @@ func SendEmail(appDir, to, subject, body string) error {
 	return SendEmailOpts(appDir, EmailOpts{To: to, Subject: subject, BodyHTML: body})
 }
 
+// EmailAttachment is one file attached to a send. Content is the raw file
+// bytes encoded as standard base64 (the wire-friendly shape carried over the
+// gateway socket and provider JSON). ContentType defaults to
+// application/octet-stream when empty.
+type EmailAttachment struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type,omitempty"`
+	Content     string `json:"content"` // base64-encoded file bytes
+}
+
 // EmailOpts is the full sending shape. Use SendEmail for the common
 // transactional path; use SendEmailOpts when you need List-Unsubscribe
 // headers (marketing) or a specific SES configuration set.
@@ -61,6 +75,7 @@ type EmailOpts struct {
 	ConfigurationSet string // optional SES config set (e.g., "my-config-set")
 	From             string // override SMTP_FROM
 	ReplyTo          string
+	Attachments      []EmailAttachment // when set: multipart/mixed with base64 file parts
 }
 
 func SendEmailOpts(appDir string, opts EmailOpts) error {
@@ -76,33 +91,18 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	// user-derived data can't inject extra headers (Bcc, a second To, etc.).
 	opts.From = clean(opts.From)
 
-	// Provider priority: Resend > Postmark > AWS SES (via SMTP creds)
-	// > generic SMTP. Each is detected by env var presence so apps can
-	// switch providers by changing env without code edits.
+	// Provider priority: platform SES gateway (hosted platform - ALWAYS
+	// wins when reachable) > SMTP (AWS SES SMTP creds or generic).
+	// On the hosted platform every send routes through the router's
+	// SES broker regardless of per-app provider env vars, so delivery,
+	// suppression, quotas and reputation are managed in ONE place.
+	// Off-platform the gateway socket doesn't exist and SMTP applies.
 	from := opts.From
 	if from == "" {
 		from = firstNonEmptyStr(GetEnv(appDir, "EMAIL_FROM"), GetEnv(appDir, "SMTP_FROM"))
 	}
 
-	if key := GetEnv(appDir, "RESEND_API_KEY"); key != "" {
-		return sendViaResend(key, from, opts)
-	}
-	if key := GetEnv(appDir, "POSTMARK_SERVER_TOKEN"); key != "" {
-		return sendViaPostmark(key, from, opts)
-	}
-
-	host := GetEnv(appDir, "SMTP_HOST")
-	port := GetEnv(appDir, "SMTP_PORT")
-	user := GetEnv(appDir, "SMTP_USER")
-	pass := GetEnv(appDir, "SMTP_PASS")
-
-	// Platform email gateway (v2.7.197): on the hosted platform, apps with
-	// NO explicit provider send through the router's SES broker - zero
-	// config, from <app>@<platform mail domain> by default, or from the
-	// app's own verified domain (dashboard -> Email / `benmore
-	// email-domain`). Explicitly-configured providers above always win.
-	// Off-platform the socket doesn't exist and this branch is skipped.
-	if host == "" && emailGatewayReachable() {
+	if emailGatewayReachable() {
 		var to []string
 		for _, t := range strings.Split(opts.To, ",") {
 			if t = strings.TrimSpace(t); t != "" {
@@ -117,6 +117,7 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 			HTML:           stripEmailFrontmatter(opts.BodyHTML),
 			Text:           opts.BodyText,
 			UnsubscribeURL: opts.UnsubscribeURL,
+			Attachments:    opts.Attachments,
 			App:            os.Getenv("BENMORE_APP_NAME"),
 		})
 		if gerr != nil {
@@ -129,6 +130,11 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 		return nil
 	}
 
+	host := GetEnv(appDir, "SMTP_HOST")
+	port := GetEnv(appDir, "SMTP_PORT")
+	user := GetEnv(appDir, "SMTP_USER")
+	pass := GetEnv(appDir, "SMTP_PASS")
+
 	if host == "" {
 		// Return an explicit error rather than logging + nil. Pre-fix
 		// behavior made `hooks.yaml` welcome-email steps look like they
@@ -138,12 +144,11 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 		// via the get_recent_activity MCP tool.
 		log.Printf("EMAIL [not sent - no provider configured] to=%s subject=%s", opts.To, opts.Subject)
 		return fmt.Errorf("email not delivered: no provider configured. " +
-			"Set RESEND_API_KEY (preferred - free tier 3k/month at https://resend.com, no card required) " +
-			"or POSTMARK_SERVER_TOKEN or SMTP_HOST+SMTP_USER+SMTP_PASS in env.yaml or your " +
-			"environment. For production-quality " +
-			"from-addresses you'll also need a custom domain verified with the provider - without one, " +
-			"emails go from a generic sender (e.g. onboarding@resend.dev) that Gmail and Outlook treat " +
-			"as untrusted, lowering inbox-placement rates. The hook step that called this is marked failed.")
+			"On the hosted platform sends route through the platform SES service automatically (zero config). " +
+			"Off-platform, set SMTP_HOST+SMTP_PORT+SMTP_USER+SMTP_PASS (AWS SES SMTP credentials work directly) " +
+			"in env.yaml or your environment. For production-quality from-addresses verify your sending " +
+			"domain (DKIM) with SES first - without one, mailbox providers treat the sender as untrusted, " +
+			"lowering inbox-placement rates. The hook step that called this is marked failed.")
 	}
 	if port == "" {
 		port = "587"
@@ -176,6 +181,27 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	if opts.UnsubscribeURL != "" {
 		headers = append(headers, "List-Unsubscribe: <"+opts.UnsubscribeURL+">")
 		headers = append(headers, "List-Unsubscribe-Post: List-Unsubscribe=One-Click")
+	}
+
+	// Attachments require a multipart/mixed envelope, which the shared raw-MIME
+	// builder assembles (headers included) — bypass the simple-body branches.
+	if len(opts.Attachments) > 0 {
+		raw, berr := buildRawMIMEMessage(from, opts.To, opts.Subject, opts.ReplyTo,
+			opts.UnsubscribeURL, opts.ConfigurationSet, opts.BodyHTML, opts.BodyText, opts.Attachments)
+		if berr != nil {
+			return fmt.Errorf("build attachment message: %w", berr)
+		}
+		addr := host + ":" + port
+		auth := smtp.PlainAuth("", user, pass, host)
+		recipients := strings.Split(opts.To, ",")
+		for i := range recipients {
+			recipients[i] = strings.TrimSpace(recipients[i])
+		}
+		if err := smtp.SendMail(addr, auth, from, recipients, raw); err != nil {
+			return fmt.Errorf("send email to %s: %w", opts.To, err)
+		}
+		log.Printf("EMAIL sent (smtp) to=%s subject=%s attachments=%d", opts.To, opts.Subject, len(opts.Attachments))
+		return nil
 	}
 
 	var body string
@@ -225,93 +251,113 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	return nil
 }
 
-// sendViaResend POSTs to api.resend.com/emails. Resend's free tier
-// gives 100/day with no SMTP setup - the right default for "I just
-// want email to work."
-func sendViaResend(apiKey, from string, opts EmailOpts) error {
-	if from == "" {
-		return fmt.Errorf("resend: EMAIL_FROM env var is required")
+// emailAttachmentType returns the attachment's declared content type,
+// inferring from the filename extension and finally defaulting to
+// application/octet-stream.
+func emailAttachmentType(a EmailAttachment) string {
+	if a.ContentType != "" {
+		return a.ContentType
 	}
-	body := map[string]any{
-		"from":    from,
-		"to":      []string{opts.To},
-		"subject": opts.Subject,
+	if ct := mime.TypeByExtension(filepath.Ext(a.Filename)); ct != "" {
+		return ct
 	}
-	// Only send the fields that exist - Resend 422s on an empty/missing
-	// html when no text is present, so a text-only send must omit html
-	// entirely rather than ship "".
-	if opts.BodyHTML != "" {
-		body["html"] = opts.BodyHTML
-	}
-	if opts.BodyText != "" {
-		body["text"] = opts.BodyText
-	}
-	if opts.ReplyTo != "" {
-		body["reply_to"] = opts.ReplyTo
-	}
-	return postProviderJSON("https://api.resend.com/emails", apiKey, "Bearer", body, opts)
+	return "application/octet-stream"
 }
 
-// sendViaPostmark POSTs to api.postmarkapp.com. Same shape as
-// Resend, different auth header. Postmark's selling point is
-// transactional reliability + analytics; same code path either way.
-func sendViaPostmark(token, from string, opts EmailOpts) error {
-	if from == "" {
-		return fmt.Errorf("postmark: EMAIL_FROM env var is required")
-	}
-	body := map[string]any{
-		"From":    from,
-		"To":      opts.To,
-		"Subject": opts.Subject,
-	}
-	if opts.BodyHTML != "" {
-		body["HtmlBody"] = opts.BodyHTML
-	}
-	if opts.BodyText != "" {
-		body["TextBody"] = opts.BodyText
-	}
-	if opts.ReplyTo != "" {
-		body["ReplyTo"] = opts.ReplyTo
-	}
-	return postProviderJSON("https://api.postmarkapp.com/email", token, "X-Postmark-Server-Token", body, opts)
-}
+// buildRawMIMEMessage assembles a complete RFC 5322 message with a
+// multipart/mixed envelope: an (optional) text+html multipart/alternative
+// sub-part, then one base64 part per attachment. This is the only shape that
+// can carry binary files — used by the SMTP path directly and, base64-wrapped,
+// by the SESv2 raw-content path (Simple/JSON content can't attach files).
+func buildRawMIMEMessage(from, to, subject, replyTo, unsubscribeURL, configSet, html, text string, attachments []EmailAttachment) ([]byte, error) {
+	clean := strings.NewReplacer("\r", "", "\n", "").Replace
 
-func postProviderJSON(url, key, scheme string, body map[string]any, opts EmailOpts) error {
-	data, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if scheme == "Bearer" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	// Build the body first so the mixed boundary is known for the header.
+	var bodyBuf bytes.Buffer
+	mixed := multipart.NewWriter(&bodyBuf)
+
+	if text != "" && html != "" {
+		var altBuf bytes.Buffer
+		alt := multipart.NewWriter(&altBuf)
+		if pw, err := alt.CreatePart(textproto.MIMEHeader{"Content-Type": {"text/plain; charset=UTF-8"}}); err == nil {
+			io.WriteString(pw, text)
+		}
+		if pw, err := alt.CreatePart(textproto.MIMEHeader{"Content-Type": {"text/html; charset=UTF-8"}}); err == nil {
+			io.WriteString(pw, html)
+		}
+		alt.Close()
+		pw, err := mixed.CreatePart(textproto.MIMEHeader{
+			"Content-Type": {"multipart/alternative; boundary=\"" + alt.Boundary() + "\""},
+		})
+		if err != nil {
+			return nil, err
+		}
+		pw.Write(altBuf.Bytes())
 	} else {
-		req.Header.Set(scheme, key)
+		ctype, content := "text/html; charset=UTF-8", html
+		if html == "" {
+			ctype, content = "text/plain; charset=UTF-8", text
+		}
+		pw, err := mixed.CreatePart(textproto.MIMEHeader{"Content-Type": {ctype}})
+		if err != nil {
+			return nil, err
+		}
+		io.WriteString(pw, content)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("email provider request failed: %w", err)
+
+	for _, a := range attachments {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(a.Content))
+		if err != nil {
+			return nil, fmt.Errorf("attachment %q: invalid base64 content: %w", a.Filename, err)
+		}
+		fn := clean(a.Filename)
+		if fn == "" {
+			fn = "attachment"
+		}
+		pw, err := mixed.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {emailAttachmentType(a) + "; name=\"" + fn + "\""},
+			"Content-Transfer-Encoding": {"base64"},
+			"Content-Disposition":       {"attachment; filename=\"" + fn + "\""},
+		})
+		if err != nil {
+			return nil, err
+		}
+		writeBase64Wrapped(pw, raw)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("email provider returned %d: %s", resp.StatusCode, string(buf))
+	mixed.Close()
+
+	var msg bytes.Buffer
+	wh := func(k, v string) { msg.WriteString(k + ": " + v + "\r\n") }
+	wh("From", clean(from))
+	wh("To", clean(to))
+	wh("Subject", mime.QEncoding.Encode("UTF-8", subject))
+	if replyTo != "" {
+		wh("Reply-To", clean(replyTo))
 	}
-	log.Printf("EMAIL sent (%s) to=%s subject=%s",
-		hostOf(url), opts.To, opts.Subject)
-	return nil
+	wh("MIME-Version", "1.0")
+	if configSet != "" {
+		wh("X-SES-CONFIGURATION-SET", clean(configSet))
+	}
+	if unsubscribeURL != "" {
+		wh("List-Unsubscribe", "<"+clean(unsubscribeURL)+">")
+		wh("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+	}
+	msg.WriteString("Content-Type: multipart/mixed; boundary=\"" + mixed.Boundary() + "\"\r\n\r\n")
+	msg.Write(bodyBuf.Bytes())
+	return msg.Bytes(), nil
 }
 
-func hostOf(url string) string {
-	if i := strings.Index(url, "://"); i >= 0 {
-		url = url[i+3:]
+// writeBase64Wrapped writes raw as standard base64, wrapped at 76 columns
+// (RFC 2045).
+func writeBase64Wrapped(w io.Writer, raw []byte) {
+	enc := base64.StdEncoding.EncodeToString(raw)
+	for len(enc) > 76 {
+		io.WriteString(w, enc[:76]+"\r\n")
+		enc = enc[76:]
 	}
-	if j := strings.Index(url, "/"); j >= 0 {
-		return url[:j]
+	if len(enc) > 0 {
+		io.WriteString(w, enc+"\r\n")
 	}
-	return url
 }
 
 // firstNonEmptyStr is local to email.go because validators_cross.go
@@ -326,69 +372,6 @@ func firstNonEmptyStr(values ...string) string {
 	return ""
 }
 
-// AddResendContact best-effort-adds a new signup to a Resend audience
-// (contacts list) for marketing blasts. Reads from app env:
-//
-//	RESEND_API_KEY      - required (already used by SendEmail)
-//	RESEND_AUDIENCE_ID  - required (the audience to add to)
-//	RESEND_CONTACT_TAG  - optional. When set, the value is appended
-//	                      to last_name as " [<tag>]" so contacts can
-//	                      be filtered by source in the Resend dashboard.
-//	                      Useful when multiple sites populate the same
-//	                      audience: Resend's contacts API has no custom
-//	                      fields, so embedding the source in last_name
-//	                      is the only Resend-native way to differentiate.
-//
-// Silently no-ops if RESEND_API_KEY or RESEND_AUDIENCE_ID is missing.
-// Runs synchronously so callers can fire-and-forget with `go`.
-func AddResendContact(appDir, email, firstName, lastName string) {
-	apiKey := GetEnv(appDir, "RESEND_API_KEY")
-	audienceID := GetEnv(appDir, "RESEND_AUDIENCE_ID")
-	if apiKey == "" || audienceID == "" {
-		return
-	}
-	if tag := strings.TrimSpace(GetEnv(appDir, "RESEND_CONTACT_TAG")); tag != "" {
-		suffix := " [" + tag + "]"
-		if lastName == "" {
-			lastName = "[" + tag + "]"
-		} else if !strings.Contains(lastName, suffix) {
-			lastName += suffix
-		}
-	}
-	body := map[string]any{
-		"email":        email,
-		"unsubscribed": false,
-	}
-	if firstName != "" {
-		body["first_name"] = firstName
-	}
-	if lastName != "" {
-		body["last_name"] = lastName
-	}
-	url := "https://api.resend.com/audiences/" + audienceID + "/contacts"
-	data, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		log.Printf("resend-contact: build request failed: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("resend-contact: POST failed (email=%s): %v", email, err)
-		return
-	}
-	defer resp.Body.Close()
-	// 201 created / 409 already exists - both fine
-	if resp.StatusCode >= 400 && resp.StatusCode != 409 {
-		buf, _ := io.ReadAll(resp.Body)
-		log.Printf("resend-contact: %d for %s - %s", resp.StatusCode, email, string(buf))
-		return
-	}
-	log.Printf("resend-contact: added %s to audience %s", email, audienceID[:8])
-}
 
 // EmailBrand describes the per-app branding pulled into RenderBrandedEmail.
 // Callers populate this from app.Design (site_name, brand color, base

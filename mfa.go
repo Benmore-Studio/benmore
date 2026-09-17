@@ -64,6 +64,9 @@ func mintMFASetupToken(userID int64, email string) string {
 // mint a real session on success.
 func mfaCallerIdentity(app *App, r *http.Request) (userID int64, email string, fromSetupToken bool, err error) {
 	if s := getSession(app, r); s != nil {
+		if !credentialManagementSession(app, s) {
+			return 0, "", false, fmt.Errorf("MFA enrollment requires a login session outside act-as mode")
+		}
 		return s.UserID, s.Email, false, nil
 	}
 	raw := strings.TrimSpace(r.Header.Get("X-MFA-Setup-Token"))
@@ -131,13 +134,14 @@ func RegisterMFARoutes(mux *http.ServeMux, app *App) {
 		// Setup tokens are for FIRST enrollment only. If MFA is already
 		// active for the user, a stolen token can't be used to reset it -
 		// the user must disable from a real session first.
-		if fromSetup {
-			var existing string
-			app.DB.QueryRow("SELECT COALESCE(totp_secret, '') FROM _benmore_users WHERE id = ?", userID).Scan(&existing)
-			if existing != "" && !strings.HasPrefix(existing, "pending:") {
-				httpJSON(w, http.StatusForbidden, map[string]any{"error": "MFA already enabled - sign in and disable first"})
-				return
-			}
+		var existing string
+		if err := app.DB.QueryRow("SELECT COALESCE(totp_secret, '') FROM _benmore_users WHERE id = ? AND deactivated_at IS NULL", userID).Scan(&existing); err != nil {
+			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "account unavailable"})
+			return
+		}
+		if existing != "" && !strings.HasPrefix(existing, "pending:") {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "MFA already enabled - verify the current factor to disable it first"})
+			return
 		}
 
 		// Generate 20-byte secret (160 bits, standard for TOTP)
@@ -155,8 +159,16 @@ func RegisterMFARoutes(mux *http.ServeMux, app *App) {
 		codesJSON, _ := json.Marshal(hashedCodes)
 
 		// Store secret + hashed backup codes (not yet enabled - user must verify first)
-		app.DB.Exec("UPDATE _benmore_users SET totp_secret = ?, backup_codes = ? WHERE id = ?",
-			"pending:"+secretB32, string(codesJSON), userID)
+		res, err := app.DB.Exec("UPDATE _benmore_users SET totp_secret = ?, backup_codes = ? WHERE id = ? AND COALESCE(totp_secret, '') = ? AND deactivated_at IS NULL",
+			"pending:"+secretB32, string(codesJSON), userID, existing)
+		if err != nil {
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "MFA setup could not be saved"})
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "MFA enrollment changed; reload and try again"})
+			return
+		}
 
 		// Build otpauth URI for QR code generation (client-side concern)
 		issuer := "App"
@@ -215,7 +227,15 @@ func RegisterMFARoutes(mux *http.ServeMux, app *App) {
 		}
 
 		// Enable MFA - remove "pending:" prefix
-		app.DB.Exec("UPDATE _benmore_users SET totp_secret = ? WHERE id = ?", secretB32, userID)
+		res, err := app.DB.Exec("UPDATE _benmore_users SET totp_secret = ? WHERE id = ? AND totp_secret = ? AND deactivated_at IS NULL", secretB32, userID, secretRaw)
+		if err != nil {
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "MFA verification could not be saved"})
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "MFA enrollment changed; reload and try again"})
+			return
+		}
 		log.Printf("MFA: enabled for user %d (%s)", userID, email)
 
 		if fromSetup {
@@ -249,6 +269,10 @@ func RegisterMFARoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
+		if !credentialManagementSession(app, session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "MFA changes require a login session outside act-as mode"})
+			return
+		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
@@ -271,7 +295,15 @@ func RegisterMFARoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 
-		app.DB.Exec("UPDATE _benmore_users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?", session.UserID)
+		res, err := app.DB.Exec("UPDATE _benmore_users SET totp_secret = NULL, backup_codes = NULL WHERE id = ? AND totp_secret = ?", session.UserID, secretB32)
+		if err != nil {
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "MFA change could not be saved"})
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "MFA enrollment changed; reload and try again"})
+			return
+		}
 		log.Printf("MFA: disabled for user %d (%s)", session.UserID, session.Email)
 
 		httpJSON(w, http.StatusOK, map[string]any{"status": "mfa_disabled"})

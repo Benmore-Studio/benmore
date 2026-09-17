@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -99,6 +100,75 @@ func TestPreparePreMigrationBackupProdFailureRefusesDevWarns(t *testing.T) {
 	}
 	if _, err := preparePreMigrationBackup(devDir, true); err != nil {
 		t.Fatalf("dev backup failure should warn and continue, got %v", err)
+	}
+}
+
+func TestBackupPermissionsAllowRouterVerification(t *testing.T) {
+	dir := t.TempDir()
+	db := openMigrationTestDB(t, dir)
+	execMigrationTestSQL(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY)`)
+	db.Close()
+	backupDir := filepath.Join(dir, backupDirName)
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(backupDir, "pre-migrate-legacy.db")
+	if err := os.WriteFile(legacyPath, []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	backupPath, err := backupDatabase(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0770 {
+		t.Errorf("backups permissions = %04o, want 0770", got)
+	}
+	// Production is Linux. Darwin clears/rejects setgid on temporary
+	// directories for an unprivileged process even when chmod returns after
+	// applying the ordinary permission bits, so only assert the production
+	// inheritance bit on Linux.
+	if runtime.GOOS == "linux" && info.Mode()&os.ModeSetgid == 0 {
+		t.Error("backups directory must keep setgid so new files inherit the trusted router group")
+	}
+	for _, path := range []string{legacyPath, backupPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0640 {
+			t.Errorf("%s permissions = %04o, want 0640", filepath.Base(path), got)
+		}
+	}
+}
+
+func TestScheduledBackupPermissionsAllowRouterVerification(t *testing.T) {
+	dir := t.TempDir()
+	db := openMigrationTestDB(t, dir)
+	execMigrationTestSQL(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY)`)
+	db.Close()
+
+	backupPath, err := scheduledBackup(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(backupPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "linux" && dirInfo.Mode()&os.ModeSetgid == 0 {
+		t.Error("scheduled backup directory must keep setgid")
+	}
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0640 {
+		t.Errorf("scheduled backup permissions = %04o, want 0640", got)
 	}
 }
 

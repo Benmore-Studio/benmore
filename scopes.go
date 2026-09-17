@@ -37,11 +37,8 @@ func hasScope(session *Session, table string, action string) bool {
 		if resource == "" {
 			continue // malformed, skip
 		}
-		// Wildcard resource = full access
-		if resource == "*" {
-			return true
-		}
-		if resource != table {
+		// A wildcard resource still constrains the action (e.g. *:read).
+		if resource != "*" && resource != table {
 			continue
 		}
 		// Exact table match - check action
@@ -59,6 +56,75 @@ func hasScope(session *Session, table string, action string) bool {
 		// Delete does NOT imply read or write - it's a separate destructive action
 	}
 	return false
+}
+
+// scopesWithin reports whether every requested permission is covered by the
+// caller. A wildcard in the request must itself be covered by a wildcard;
+// enumerating today's tables/actions cannot authorize future ones.
+func scopesWithin(granted, requested string) bool {
+	if granted == "" || granted == "*" || granted == "*:*" {
+		return true
+	}
+	if requested == "" || requested == "*" {
+		return false
+	}
+	s := &Session{Scopes: granted}
+	for _, scope := range strings.Fields(requested) {
+		resource, action := parseScope(scope)
+		if resource == "" || !hasScope(s, resource, action) {
+			return false
+		}
+	}
+	return len(strings.Fields(requested)) > 0
+}
+
+// intersectScopes constrains a credential by the user's current role grants.
+// Empty means unrestricted, so an empty intersection uses the deny sentinel.
+func intersectScopes(a, b string) string {
+	if a == "" || a == "*" {
+		return b
+	}
+	if b == "" || b == "*" {
+		return a
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, left := range strings.Fields(a) {
+		lr, la := parseScope(left)
+		if lr == "" {
+			continue
+		}
+		for _, right := range strings.Fields(b) {
+			rr, ra := parseScope(right)
+			if rr == "" || (lr != rr && lr != "*" && rr != "*") {
+				continue
+			}
+			resource := lr
+			if resource == "*" {
+				resource = rr
+			}
+			action := la
+			switch {
+			case la == ra:
+			case la == "*":
+				action = ra
+			case ra == "*":
+			case (la == "write" && ra == "read") || (la == "read" && ra == "write"):
+				action = "read"
+			default:
+				continue
+			}
+			scope := resource + ":" + action
+			if !seen[scope] {
+				seen[scope] = true
+				out = append(out, scope)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return "_none_:read"
+	}
+	return strings.Join(out, " ")
 }
 
 // parseScope splits "resource:action" into its components.

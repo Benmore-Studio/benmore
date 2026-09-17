@@ -216,7 +216,7 @@ func CrossFileWarnings(appDir, writtenPath string) []string {
 
 	// External provider gaps - auth.verify_email, auth.otp, or
 	// auth.billing_provider features declared in app.yaml that depend
-	// on an env-var-driven external integration (Resend / Postmark /
+	// on an env-var-driven external integration (SMTP /
 	// SMTP / Twilio / Stripe) which isn't wired. The features still
 	// "compile" (app loads, framework registers routes) but the
 	// runtime calls into SendEmail/SendSMS/Stripe fail. Surface here

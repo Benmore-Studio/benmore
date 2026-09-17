@@ -66,7 +66,27 @@ func sqliteAppDSN(dbPath, dir string) string {
 	synchronous := sqliteSynchronousMode(dir)
 	return dbPath + "?_journal_mode=WAL" +
 		"&_foreign_keys=on" +
-		"&_busy_timeout=5000" +
+		// 10s (was 5s): under _txlock=immediate writers QUEUE on the write lock
+		// instead of failing fast, so a txn that legitimately runs a few seconds
+		// (goja compute in recompute-forecast/forecast-command, seed-default-template's
+		// ~150 writes, a streaming ingest) must not make queued writers give up
+		// prematurely. 10s stays well under the 100s Cloudflare cutoff / 300s
+		// WriteTimeout; platform.go and embed_dashboard.go already use 10000.
+		"&_busy_timeout=10000" +
+		// _txlock=immediate: begin every transaction with BEGIN IMMEDIATE so the
+		// write lock is acquired up front. WITHOUT this, database/sql opens txns
+		// DEFERRED: a txn takes a read lock, then tries to upgrade to write on its
+		// first write. If any other connection holds a read lock at that moment the
+		// upgrade returns SQLITE_BUSY *immediately* — and _busy_timeout CANNOT retry
+		// it, because the retry can never succeed while the other read lock is held.
+		// That is the classic mattn/go-sqlite3 "database is locked" deadlock, and
+		// with SetMaxOpenConns(25) contending for SQLite's single writer it turns
+		// into a storm that blocks every HTTP goroutine (the [locks] cleanup worker
+		// in locks.go is a visible victim). IMMEDIATE makes writers queue cleanly on
+		// _busy_timeout instead of deadlocking. Safe here: every per-app *sql.DB txn
+		// site (crud/flows/jobs/cron/admin/groups_bootstrap) is a WRITE; read paths
+		// use plain Query (WAL, no txn). Read-only opens (mode=ro) must NOT set this.
+		"&_txlock=immediate" +
 		"&_synchronous=" + synchronous +
 		"&_cache_size=-64000" +
 		"&_mmap_size=268435456" +

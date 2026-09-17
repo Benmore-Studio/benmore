@@ -213,9 +213,25 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 
 		// Local-disk fallback: HMAC-signed app-host URL (SignedUploadMiddleware
 		// validates it). Used off-platform / for files still on local disk.
-		// PRIVATE local files get the SAME record-authorization as CDN ones -
-		// a bare session must not be able to sign any /uploads/private/ path.
-		if isPrivateUploadPath(path) {
+		//
+		// Normalize `path` to the logical form UNDER uploads/ ("private/x.pdf")
+		// ONCE, up front. The same file is spelled three ways by callers -
+		// "private/x.pdf" (the canonical form GenerateSignedURL re-prefixes with
+		// /uploads/), "/uploads/private/x.pdf" (exactly what /api/_upload returns
+		// and bm.signedUrl forwards as file_url), and "uploads/private/x.pdf" -
+		// and all three must (a) hit the private-file authorization gate and
+		// (b) mint a URL that actually validates at serve time. PRE-FIX the gate
+		// ran isPrivateUploadPath on the RAW query value: the canonical
+		// "private/x.pdf" spelling FAILED the predicate (it only matches
+		// "uploads/private/…" or a "/private/" segment), so a bare logged-in
+		// session slipped straight past record authorization and could sign ANY
+		// private file - while the "/uploads/…" spelling both tripped authz AND
+		// produced a double-"/uploads/" URL that 404s. Either the authz was
+		// bypassed or the URL was broken; there was no spelling that both
+		// enforced authz and worked. Normalizing first closes the bypass and
+		// makes every spelling mint a valid, authorized URL. (signed_urls_authz_test.go)
+		localRel := uploadRelPath(path)
+		if isPrivateUploadPath("uploads/" + localRel) {
 			rt := strings.TrimSpace(r.URL.Query().Get("record_table"))
 			rid := strings.TrimSpace(r.URL.Query().Get("record_id"))
 			if rt == "" || rid == "" {
@@ -228,12 +244,12 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 				httpJSON(w, http.StatusForbidden, map[string]any{"error": "not authorized to read the record that owns this file"})
 				return
 			}
-			if !recordReferencesLocalFile(app, rt, rid, path) {
+			if !recordReferencesLocalFile(app, rt, rid, localRel) {
 				httpJSON(w, http.StatusForbidden, map[string]any{"error": "record_table/record_id does not reference this file"})
 				return
 			}
 		}
-		signedURL := GenerateSignedURL(r.Host, path, expiresIn)
+		signedURL := GenerateSignedURL(r.Host, localRel, expiresIn)
 		fullURL := fmt.Sprintf("%s://%s%s", protoOf(r), r.Host, signedURL)
 
 		httpJSON(w, http.StatusOK, map[string]any{
@@ -308,16 +324,35 @@ func recordReferencesFile(app *App, table, id, path string, cfg *PlatformMediaCo
 	return false
 }
 
+// uploadRelPath normalizes a signed-URL `path` argument to the logical path
+// UNDER uploads/ - stripping an optional leading "/" and a leading "uploads/"
+// segment - so "private/x.pdf", "/uploads/private/x.pdf" and
+// "uploads/private/x.pdf" all collapse to "private/x.pdf". Used so the
+// private-file authorization gate (isPrivateUploadPath), the record-reference
+// check, and the minted HMAC signature all agree regardless of how the caller
+// spelled the path. Without this the canonical spelling bypassed authz - see
+// RegisterSignedURLRoutes' local-disk branch.
+func uploadRelPath(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	p = strings.TrimPrefix(p, "uploads/")
+	return strings.TrimPrefix(p, "/")
+}
+
 // recordReferencesLocalFile is recordReferencesFile for local-disk paths:
-// confirms the row references `path` (modulo a leading slash) in some column.
+// confirms the row references `path` in some column. Both the target and each
+// stored column value are normalized via uploadRelPath so a record that stored
+// the file as "/uploads/private/x.pdf" (what /api/_upload returns) still
+// matches a caller-supplied "private/x.pdf" (and vice-versa) - the two spelled
+// the same logical file differently before normalization, which would have
+// failed a legitimate authorized sign.
 func recordReferencesLocalFile(app *App, table, id, path string) bool {
-	want := strings.TrimPrefix(path, "/")
+	want := uploadRelPath(path)
 	rows, err := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
 	if err != nil || len(rows) == 0 {
 		return false
 	}
 	for _, v := range rows[0] {
-		if s, ok := v.(string); ok && s != "" && strings.TrimPrefix(s, "/") == want {
+		if s, ok := v.(string); ok && s != "" && uploadRelPath(s) == want {
 			return true
 		}
 	}

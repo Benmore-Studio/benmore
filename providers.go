@@ -38,17 +38,13 @@ import (
 	"strings"
 )
 
-// EmailProviderConfigured returns "resend", "postmark", "smtp", or ""
-// when no email provider env vars are set for this app. The order
-// matches SendEmail's preference: Resend first, then Postmark, then
-// generic SMTP. Used so callers can include the provider name in
-// messages - "send via Resend" reads better than a bool.
+// EmailProviderConfigured returns "platform", "smtp", or "" when no
+// email path exists for this app. The order matches SendEmailOpts's
+// preference: the platform SES gateway always wins when reachable;
+// SMTP (AWS SES SMTP creds or generic) is the off-platform path.
 func EmailProviderConfigured(appDir string) string {
-	if GetEnv(appDir, "RESEND_API_KEY") != "" {
-		return "resend"
-	}
-	if GetEnv(appDir, "POSTMARK_SERVER_TOKEN") != "" {
-		return "postmark"
+	if emailGatewayReachable() {
+		return "platform"
 	}
 	if GetEnv(appDir, "SMTP_HOST") != "" {
 		return "smtp"
@@ -140,12 +136,11 @@ func ProviderGapWarnings(app *App) []string {
 	if len(needsEmail) > 0 && EmailProviderConfigured(app.Dir) == "" {
 		warns = append(warns, fmt.Sprintf(
 			"%s requires an email provider, but none is configured. "+
-				"Set RESEND_API_KEY (free tier: 3k/month at https://resend.com, no card required) "+
-				"or POSTMARK_SERVER_TOKEN or SMTP_HOST+SMTP_USER+SMTP_PASS in env.yaml "+
-				"or your environment. "+
-				"For production you'll also need a custom domain verified with the provider - "+
-				"without one, emails go from a generic sender (e.g. onboarding@resend.dev) "+
-				"that Gmail and Outlook treat as untrusted, lowering inbox-placement rates.",
+				"On the hosted platform email works with zero config (platform SES service). "+
+				"Off-platform, set SMTP_HOST+SMTP_PORT+SMTP_USER+SMTP_PASS in env.yaml or your "+
+				"environment (AWS SES SMTP credentials work directly). For production "+
+				"from-addresses, verify your sending domain (DKIM) with SES first - an "+
+				"unverified sender lowers inbox-placement rates.",
 			strings.Join(needsEmail, " + "),
 		))
 	}

@@ -70,11 +70,13 @@ var knownAuthKeys = map[string]bool{
 	"session_duration":      true,
 	"signup_fields":         true,
 	"otp":                   true,
-	"domain":                true,
+	"domain":                true,       // comma-separated allowed email domains (domain-lock)
+	"allow_emails":          true,       // comma-separated EXACT allowed addresses (closed allowlist; auth.go emailMatchesGate)
 	"redirect":              true,
 	"require_verified":      true,
 	"verify_email":          true,
 	"oauth":                 true,
+	"oauth_only":            true,       // social login is the ONLY path; password login+signup refused (auth.go oauthOnly)
 	"mfa":                   true,
 	"require_mfa_for_roles": true, // comma-separated roles that must enroll MFA before a session is issued
 	"mfa_setup_redirect":    true, // form-login redirect target when enrollment is required (default /mfa-setup)

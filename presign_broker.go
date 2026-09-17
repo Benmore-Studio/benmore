@@ -27,12 +27,12 @@ import (
 //
 // The broker keeps the ONE durable, least-privilege media key in the router
 // process only (the router runs no tenant code) and hands each per-app
-// process a short-lived, prefix-scoped presigned PUT URL over a unix socket.
+// process a short-lived, prefix-scoped presigned PUT URL or executes a scoped
+// delete over a unix socket.
 // The router authenticates the caller by the socket's peer-uid (SO_PEERCRED),
 // derives the app from that uid, and refuses to presign outside that app's
 // own <visibility>/<app>/ key prefix - so a fully-compromised per-app process
-// can at most write 60s-scoped objects into its own namespace, and a leaked
-// URL is a single PUT to one key. No root process, no IMDS exposure, no
+// can only mutate its own namespace. No root process, no IMDS exposure, no
 // durable credential in any tenant-executing process.
 
 // presignBrokerSocketPath returns the unix socket the router listens on and
@@ -48,6 +48,7 @@ func presignBrokerSocketPath() string {
 // prefix + the logical upload path; the broker derives visibility from the
 // path and validates the prefix against the connection's peer-uid.
 type presignReq struct {
+	Operation   string `json:"operation,omitempty"` // empty/put (back-compat) or delete
 	Prefix      string `json:"prefix"`
 	Path        string `json:"path"`
 	ContentType string `json:"content_type"`
@@ -138,53 +139,12 @@ func handlePresignConn(conn *net.UnixConn, cfg *PlatformMediaConfig) {
 	// first-party user (router / _platform, "benmore") is trusted to name its
 	// own prefix. Anything else is rejected.
 	allowedPrefix, firstParty := prefixForUID(uid)
-	prefix := req.Prefix
-	if !firstParty {
-		if allowedPrefix == "" {
-			writePresignErr(conn, "unmapped caller")
-			return
-		}
-		// Tenant process: ignore the client-supplied prefix entirely and use
-		// the uid-derived one, so a compromised app cannot target another's.
-		prefix = allowedPrefix
-	}
-	if prefix == "" {
-		writePresignErr(conn, "no prefix")
-		return
-	}
-
-	logical := strings.TrimPrefix(req.Path, "/")
-	if logical == "" || strings.Contains(logical, "..") {
-		writePresignErr(conn, "bad path")
-		return
-	}
-	vis := "public"
-	if isPrivateUploadPath(logical) {
-		vis = "private"
-	}
-	key := vis + "/" + prefix + "/" + logical
-
-	// Cache-Control, decided server-side by tier (not by the client):
-	//   public  → immutable, cache forever. Object names are content hashes,
-	//             so the URL never changes meaning. Without this, public media
-	//             ships with no Cache-Control → browsers revalidate every
-	//             navigation and CloudFront cold-fetches from S3 (~0.5-1s
-	//             "random slow image" spikes).
-	//   private → no-store. Never cache a signed/private object - caching it
-	//             by path could let an UNSIGNED request be served the cached
-	//             copy and bypass the signature. (Tightens private, never loosens.)
-	cacheControl := "public, max-age=31536000, immutable"
-	if vis == "private" {
-		cacheControl = "no-store"
-	}
-
 	s3 := &S3Storage{Bucket: cfg.Bucket, Region: cfg.Region, Key: cfg.S3Key, Secret: cfg.S3Secret}
-	url, headers, err := presignS3PutURL(s3, key, req.ContentType, req.Disposition, cacheControl, 90*time.Second)
+	resp, err := executePresignBrokerRequest(req, allowedPrefix, firstParty, s3)
 	if err != nil {
-		writePresignErr(conn, "presign failed")
+		writePresignErr(conn, err.Error())
 		return
 	}
-	resp := presignResp{URL: url, Headers: headers, Key: key}
 	b, _ := json.Marshal(resp)
 	conn.Write(b)
 }
@@ -211,11 +171,58 @@ func prefixForUID(uid int) (prefix string, firstParty bool) {
 	return "", false
 }
 
+func executePresignBrokerRequest(req presignReq, allowedPrefix string, firstParty bool, s3 *S3Storage) (*presignResp, error) {
+	prefix := req.Prefix
+	if !firstParty {
+		if allowedPrefix == "" {
+			return nil, fmt.Errorf("unmapped caller")
+		}
+		prefix = allowedPrefix
+	}
+	if prefix == "" {
+		return nil, fmt.Errorf("no prefix")
+	}
+
+	operation := strings.ToLower(strings.TrimSpace(req.Operation))
+	if operation == "delete" {
+		logical, err := privateLogicalUploadPath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		key := "private/" + prefix + "/" + logical
+		if err := s3.Delete(key); err != nil {
+			return nil, err
+		}
+		return &presignResp{Key: key}, nil
+	}
+	if operation != "" && operation != "put" {
+		return nil, fmt.Errorf("unsupported operation")
+	}
+
+	logical := strings.TrimPrefix(req.Path, "/")
+	if logical == "" || strings.Contains(logical, "..") {
+		return nil, fmt.Errorf("bad path")
+	}
+	vis := "public"
+	if isPrivateUploadPath(logical) {
+		vis = "private"
+	}
+	key := vis + "/" + prefix + "/" + logical
+	cacheControl := "public, max-age=31536000, immutable"
+	if vis == "private" {
+		cacheControl = "no-store"
+	}
+	url, headers, err := presignS3PutURL(s3, key, req.ContentType, req.Disposition, cacheControl, 90*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("presign failed")
+	}
+	return &presignResp{URL: url, Headers: headers, Key: key}, nil
+}
+
 // ─── Per-app client ─────────────────────────────────────────────────────────
 
-// requestPresignedPut dials the broker socket and returns the presigned URL +
-// the headers the caller must send verbatim on the PUT.
-func requestPresignedPut(sockPath string, req presignReq) (*presignResp, error) {
+// requestPresignBroker dials the broker for a presigned PUT or scoped delete.
+func requestPresignBroker(sockPath string, req presignReq) (*presignResp, error) {
 	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
 	if err != nil {
 		return nil, err
@@ -236,7 +243,7 @@ func requestPresignedPut(sockPath string, req presignReq) (*presignResp, error) 
 	if resp.Error != "" {
 		return nil, fmt.Errorf("presign broker: %s", resp.Error)
 	}
-	if resp.URL == "" {
+	if req.Operation != "delete" && resp.URL == "" {
 		return nil, fmt.Errorf("presign broker: empty url")
 	}
 	return &resp, nil
@@ -382,7 +389,7 @@ func (c *CDNStorage) saveViaBroker(sockPath, path string, data io.Reader, conten
 	if err != nil {
 		return "", err
 	}
-	resp, err := requestPresignedPut(sockPath, presignReq{
+	resp, err := requestPresignBroker(sockPath, presignReq{
 		Prefix:      c.Prefix,
 		Path:        strings.TrimPrefix(path, "/"),
 		ContentType: contentType,
@@ -409,4 +416,16 @@ func (c *CDNStorage) saveViaBroker(sockPath, path string, data io.Reader, conten
 		return "", fmt.Errorf("save upload: S3 PUT via presign failed: %d: %s", r.StatusCode, string(rb))
 	}
 	return "https://" + c.CDNDomain + "/" + resp.Key, nil
+}
+
+func (c *CDNStorage) deleteViaBroker(sockPath, path string) error {
+	_, err := requestPresignBroker(sockPath, presignReq{
+		Operation: "delete",
+		Prefix:    c.Prefix,
+		Path:      strings.TrimPrefix(path, "/"),
+	})
+	if err != nil {
+		return fmt.Errorf("delete upload: %w", err)
+	}
+	return nil
 }

@@ -3,7 +3,6 @@
 package main
 
 import (
-	"os"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,10 +10,54 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+// execStepSMS runs a `run: sms` flow step.
+//
+// It lives here rather than in flows.go for the same reason
+// execStepTranscribe lives in transcribe.go: the step is a thin adapter
+// over the channel's own send primitive, and keeping them together means
+// the provider-selection rules and the step that depends on them move as
+// one unit.
+//
+// Empty `to`/`body` after interpolation is an error, never a skip. A silent
+// skip here would reproduce exactly the failure this step was added to fix:
+// a flow that reports success while sending nothing.
+func execStepSMS(ctx *FlowContext, step *FlowStep) error {
+	if step.SMS == nil {
+		return fmt.Errorf("sms step has no config")
+	}
+	to := strings.TrimSpace(interpolateCtx(step.SMS.To, ctx))
+	body := interpolateCtx(step.SMS.Body, ctx)
+
+	if to == "" {
+		return fmt.Errorf("`run: sms` has an empty `to:` after interpolation (template %q) - check the ${{ }} ref resolves and the upstream step has an `id:`", step.SMS.To)
+	}
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("`run: sms` has an empty `body:` after interpolation (template %q) - check the ${{ }} ref resolves", step.SMS.Body)
+	}
+
+	appDir := ""
+	if ctx.App != nil {
+		appDir = ctx.App.Dir
+	}
+	if err := SendSMS(appDir, to, body); err != nil {
+		return err
+	}
+
+	if step.Name != "" {
+		out := map[string]any{"to": to}
+		ctx.DataMu.Lock()
+		ctx.Data[step.Name] = out
+		flattenIntoCtx(ctx.Data, step.Name, out)
+		ctx.DataMu.Unlock()
+	}
+	return nil
+}
 
 // smsRateLimit tracks per-phone send counts to prevent abuse.
 // Max 5 SMS per phone per 10 minutes.

@@ -110,12 +110,18 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 			tx, err := app.DB.Begin()
 			if err == nil {
 				ctx.Tx = tx
+				// See flows.go: a panic in executeSteps would otherwise leak this
+				// write-tx (recoverMiddleware swallows it), holding the WAL write
+				// lock until restart. txCommitGuard finalizes it exactly once.
+				guard := &txCommitGuard{tx: tx}
+				defer guard.rollbackUnlessHandled()
 				executeSteps(ctx, targetFlow.Steps)
 				if ctx.Error != nil {
 					tx.Rollback()
 				} else {
 					tx.Commit()
 				}
+				guard.MarkHandled()
 			}
 		} else {
 			executeSteps(ctx, targetFlow.Steps)

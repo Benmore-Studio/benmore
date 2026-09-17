@@ -952,6 +952,12 @@ func RenderMustache(template string, data map[string]any) string {
 					s := fmt.Sprintf("%v", val)
 					if pipe != "" {
 						s = ApplyPipe(val, pipe)
+						if isRawHTMLPipe(pipe) {
+							// benmark output is already sanitized; emit raw.
+							result.WriteString(neutralizeReparse(s))
+							i = nextI
+							continue
+						}
 					}
 					result.WriteString(neutralizeReparse(html.EscapeString(s)))
 					i = nextI

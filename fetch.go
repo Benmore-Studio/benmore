@@ -33,6 +33,10 @@ type cacheEntry struct {
 
 // ExpandFetchTags processes <fetch url="..." as="data" cache="1h"> tags.
 func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
+	return expandFetchTagsWithClient(content, app, ctx, fetchHTTPClient(3*time.Second))
+}
+
+func expandFetchTagsWithClient(content string, app *App, ctx *RenderContext, client *http.Client) string {
 	return fetchTagRe.ReplaceAllStringFunc(content, func(match string) string {
 		m := fetchTagRe.FindStringSubmatch(match)
 		if m == nil {
@@ -64,12 +68,17 @@ func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
 		}
 
 		// SSRF protection: block private IPs
-		if isPrivateURL(rawURL) {
-			return renderFetchError(app, "fetch: cannot request private/internal URLs")
+		var err error
+		rawURL, _, err = resolveFetchURL(app, rawURL)
+		if err != nil {
+			return renderFetchError(app, err.Error())
+		}
+		if headers != "" || ctx.User != nil || ctx.Request != nil && (ctx.Request.Header.Get("Cookie") != "" || ctx.Request.Header.Get("Authorization") != "") {
+			cacheDuration = 0
 		}
 
 		// Check cache
-		cacheKey := rawURL
+		cacheKey := fetchCacheKey(app, rawURL)
 		if cacheDuration > 0 {
 			fetchCache.RLock()
 			entry, ok := fetchCache.entries[cacheKey]
@@ -83,7 +92,6 @@ func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
 		}
 
 		// Make HTTP request (3s timeout to prevent page hangs)
-		client := safeHTTPClientStrict(3 * time.Second)
 		req, err := http.NewRequest("GET", rawURL, nil)
 		if err != nil {
 			return renderFetchError(app, fmt.Sprintf("fetch: %s", err))
@@ -91,24 +99,16 @@ func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "Benmore/1.0")
 
-		// Parse custom headers: "Authorization: Bearer xxx, X-Api-Key: yyy"
-		if headers != "" {
-			for _, h := range strings.Split(headers, ",") {
-				parts := strings.SplitN(strings.TrimSpace(h), ":", 2)
-				if len(parts) == 2 {
-					req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-				}
-			}
-		}
+		setFetchHeaders(req, headers)
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("FETCH timeout/error: %s → %s", rawURL, err)
+			log.Printf("FETCH request failed")
 			// On timeout, render inner with empty data instead of blocking the page
 			if inner != "" && as != "" {
 				return RenderMustache(inner, ctx.Data)
 			}
-			return renderFetchError(app, fmt.Sprintf("fetch %s: %s", rawURL, err))
+			return renderFetchError(app, "fetch request failed")
 		}
 		defer resp.Body.Close()
 
@@ -118,8 +118,8 @@ func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
 		}
 
 		if resp.StatusCode >= 400 {
-			log.Printf("FETCH error: %s → HTTP %d", rawURL, resp.StatusCode)
-			return renderFetchError(app, fmt.Sprintf("fetch %s: HTTP %d", rawURL, resp.StatusCode))
+			log.Printf("FETCH error: HTTP %d", resp.StatusCode)
+			return renderFetchError(app, fmt.Sprintf("fetch: HTTP %d", resp.StatusCode))
 		}
 
 		// Parse JSON response
@@ -129,8 +129,8 @@ func ExpandFetchTags(content string, app *App, ctx *RenderContext) string {
 			data = string(body)
 		}
 
-		// Cache the response
-		if cacheDuration > 0 {
+		// Cache only public responses without caller credentials.
+		if cacheDuration > 0 && cacheableFetchResponse(resp) {
 			fetchCache.Lock()
 			fetchCache.entries[cacheKey] = &cacheEntry{data: data, expiresAt: time.Now().Add(cacheDuration)}
 			fetchCache.Unlock()

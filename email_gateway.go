@@ -51,6 +51,9 @@ type emailGatewayReq struct {
 	HTML           string   `json:"html,omitempty"`
 	Text           string   `json:"text,omitempty"`
 	UnsubscribeURL string   `json:"unsubscribe_url,omitempty"`
+	// Attachments ride the socket as base64; the broker caps the total
+	// request size (see handleEmailConn) so a large payload can't wedge it.
+	Attachments []EmailAttachment `json:"attachments,omitempty"`
 	// App is honored ONLY for first-party (router/_platform) callers,
 	// which are trusted to name the app they send on behalf of.
 	App string `json:"app,omitempty"`

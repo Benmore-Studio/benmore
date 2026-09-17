@@ -2,8 +2,11 @@ module github.com/benmore-studio/benmore
 
 go 1.26.3
 
+toolchain go1.26.5
+
 require (
 	github.com/Masterminds/sprig/v3 v3.3.0
+	github.com/benmore-studio/benmark v0.1.1
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
 	github.com/evanw/esbuild v0.28.0
 	github.com/mattn/go-sqlite3 v1.14.37
@@ -16,12 +19,25 @@ require (
 )
 
 require (
+	github.com/BurntSushi/toml v1.5.0 // indirect
+	github.com/alecthomas/chroma/v2 v2.27.0 // indirect
+	github.com/dlclark/regexp2/v2 v2.2.1 // indirect
+	github.com/yuin/goldmark v1.8.2 // indirect
+	github.com/yuin/goldmark-emoji v1.0.6 // indirect
+	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc // indirect
+	go.abhg.dev/goldmark/anchor v0.2.0 // indirect
+	go.abhg.dev/goldmark/frontmatter v0.3.0 // indirect
+	go.abhg.dev/goldmark/mermaid v0.6.0 // indirect
+	go.abhg.dev/goldmark/wikilink v0.6.0 // indirect
+)
+
+require (
 	dario.cat/mergo v1.0.1 // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.3.0 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
-	github.com/chromedp/cdproto v0.0.0-20260321001828-e3e3800016bc // indirect
-	github.com/chromedp/chromedp v0.15.1 // indirect
+	github.com/chromedp/cdproto v0.0.0-20260321001828-e3e3800016bc
+	github.com/chromedp/chromedp v0.15.1
 	github.com/chromedp/sysutil v1.1.0 // indirect
 	github.com/dlclark/regexp2 v1.11.4 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect

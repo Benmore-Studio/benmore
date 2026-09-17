@@ -10,7 +10,7 @@ import (
 // version is the release version. It defaults to the value baked here and is
 // overridden at release time via -ldflags "-X main.version=<tag>" (see the
 // public edition's .goreleaser.yaml).
-var version = "2.7.203"
+var version = "2.7.220"
 
 // Full release history lives in the private development repo and git log.
 func main() {
@@ -36,15 +36,31 @@ func main() {
 	}
 
 	cmd := os.Args[1]
+	// Operator preflight must not log in, install skills, emit telemetry, or
+	// start an app. The implementation exists only in the platform edition.
+	if cmd == "upgrade-check" {
+		if serverDispatch(cmd) {
+			return
+		}
+		fmt.Fprintln(os.Stderr, "upgrade-check requires the platform edition")
+		os.Exit(2)
+	}
+	if cmd == "api" && len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") && dispatchPlatformCLI(cmd) {
+		return
+	}
+	preflightPlatformCLIAuth(cmd)
 
 	// One-line stderr hint when a newer CLI release exists (cloud
 	// edition only; interactive terminals only; cached 24h; never
 	// blocks or fails the command). See cli_update_check.go.
-	maybeWarnNewerCLI()
+	runCLIUpdateCheck(cmd, maybeWarnNewerCLI)
 
-	// First-run convenience: drop the Claude Code skill into ~/.claude if a
-	// Claude home exists. No-op in the framework build and for `skill`.
-	maybeAutoInstallSkill()
+	// Bootstrap must complete authentication before any setup writes and
+	// installs both skills itself after successful authentication.
+	if cmd != "bootstrap" && cmd != "login" && cmd != "signup" {
+		maybeAutoInstallSkill()
+	}
+	maybeSyncAgentUsageOnStartup(cmd)
 
 	switch cmd {
 	case "version", "--version", "-v", "-V":
@@ -78,12 +94,22 @@ func main() {
 	}
 }
 
+func runCLIUpdateCheck(cmd string, check func()) {
+	switch cmd {
+	case "bootstrap", "login", "signup":
+		return
+	default:
+		check()
+	}
+}
+
 func printUsage() {
 	fmt.Println(`benmore - turn Prisma + vanilla HTML/JS + YAML into web apps
 
   benmore new <dir>                 Scaffold a new app (runnable immediately)
   benmore serve [dir] [--port N]    Run an app from a directory on one port
   benmore test [dir] [--app|--framework] [--json]
+  benmore upgrade-check <app-dir> [<app-dir>...] | --apps-dir <dir>  (platform)
   benmore docs [topic]              Built-in framework docs
   benmore version [--json]
   benmore help`)

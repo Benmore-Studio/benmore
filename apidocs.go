@@ -39,7 +39,7 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 	})
 
 	// JSON: real OpenAPI 3.1 contract for the app runtime CRUD surface.
-	mux.HandleFunc("GET /api/_openapi", func(w http.ResponseWriter, r *http.Request) {
+	openAPIHandler := func(w http.ResponseWriter, r *http.Request) {
 		if requireAuth {
 			session := getSession(app, r)
 			if session == nil {
@@ -50,7 +50,10 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		json.NewEncoder(w).Encode(generateRuntimeOpenAPI(app))
-	})
+	}
+	for _, path := range []string{"/api/_openapi", "/openapi.json", "/api/openapi.json"} {
+		mux.HandleFunc("GET "+path, openAPIHandler)
+	}
 
 	// Rich, per-user schema descriptor - the source the schema-driven
 	// component layer renders from. ALWAYS auth-gated: the response

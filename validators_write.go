@@ -38,9 +38,13 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -413,6 +417,11 @@ func validateTSConfig(content string) string {
 	// new scaffold's own tsconfig - removed.
 	if strings.Contains(content, `"noEmit": false`) {
 		return "tsconfig.json: `\"noEmit\": false` is wrong for Benmore. esbuild - not tsc - produces the output bundle. tsc is editor-only here; set `\"noEmit\": true`."
+	}
+	// TypeScript 7 removed baseUrl (paths are relative to the project root).
+	// Keeping it is a hard error under tsc 7 / editor TS 7.
+	if strings.Contains(content, `"baseUrl"`) {
+		return "tsconfig.json: `\"baseUrl\"` was removed in TypeScript 7. Drop it and keep `paths` entries relative to the project root (e.g. `\"bm\": [\"./src/bm.d.ts\"]`)."
 	}
 	return ""
 }
@@ -941,12 +950,27 @@ func validateLegacyFlowSteps(flowName string, steps []FlowStepYAML) string {
 // runtime fell through to its "{\"status\":\"ok\"}" default response.
 // That made the flow look healthy when its steps were all no-ops.
 func validateGHAFlowsContents(file FlowFileGHA) string {
+	if msg := validatePurgeCurrentUserContract(file); msg != "" {
+		return msg
+	}
 	// Derive from flowRunTypes (flows_gha.go) - the SINGLE SOURCE the parser
 	// switch also uses, so this validator can never drift behind a new step
 	// type again. Empty `run:` is allowed (query:/if:/for_each: shorthand).
 	knownRun := map[string]bool{"": true}
 	for t := range flowRunTypes {
 		knownRun[t] = true
+	}
+	if file.On.Request != nil {
+		switch raw := file.On.Request.Verify.(type) {
+		case nil, string:
+			// Empty and legacy named/header verifiers retain their existing shape.
+		case map[string]any:
+			if err := validateFlowVerifyConfig(parseVerifyMap(raw), file.On.Request.Path); err != nil {
+				return "flows.yaml: invalid verify config: " + err.Error()
+			}
+		default:
+			return fmt.Sprintf("flows.yaml: verify must be a string or map, got %T", raw)
+		}
 	}
 	// rate_limit on on.request must parse - a typo would otherwise fail OPEN
 	// (no limit) at runtime, silently leaving a public endpoint unprotected.
@@ -985,6 +1009,88 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 			if msg := validateSQLDynamicSafety(jobName, i, s); msg != "" {
 				return msg
 			}
+		}
+	}
+	return ""
+}
+
+// validatePurgeCurrentUserContract makes the server-only identity purge a
+// deliberately small language inside the broader flow DSL. The action has no
+// target parameter: it operates only on the immutable authenticated session.
+// These shape checks prevent an app from accidentally exposing it to an
+// anonymous, async, non-transactional, nested, or retrying execution path.
+func validatePurgeCurrentUserContract(file FlowFileGHA) string {
+	type occurrence struct {
+		job    string
+		index  int
+		nested bool
+		step   FlowStepGHA
+	}
+	var found []occurrence
+	var walk func(string, []FlowStepGHA, bool)
+	walk = func(job string, steps []FlowStepGHA, nested bool) {
+		for i, step := range steps {
+			if strings.EqualFold(strings.TrimSpace(step.Run), "purge_current_user") {
+				found = append(found, occurrence{job: job, index: i, nested: nested, step: step})
+			}
+			walk(job, step.Steps, true)
+			walk(job, step.Else, true)
+			walk(job, step.OnError, true)
+		}
+	}
+	for job, cfg := range file.Jobs {
+		walk(job, cfg.Steps, false)
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	fail := func(reason string) string {
+		return "flows.yaml: run: purge_current_user " + reason + ". It is a server-only, identity-bound account-erasure primitive; use one direct top-level step with `with: { confirm: '${{ params.confirm }}' }` on an auth-required transactional POST/DELETE flow."
+	}
+	if len(found) != 1 || len(file.Jobs) != 1 {
+		return fail("must appear exactly once in a single-job flow")
+	}
+	if file.On.Request == nil {
+		return fail("is allowed only on an HTTP request trigger")
+	}
+	method := strings.ToUpper(strings.TrimSpace(file.On.Request.Method))
+	if method != http.MethodPost && method != http.MethodDelete {
+		return fail("requires method POST or DELETE")
+	}
+	if strings.TrimSpace(file.On.Request.Auth) != "required" {
+		return fail("requires `auth: required`")
+	}
+	if !file.On.Request.Transaction {
+		return fail("requires `transaction: true`")
+	}
+	if strings.EqualFold(strings.TrimSpace(file.On.Request.Mode), "async") {
+		return fail("cannot run in async mode because the live session identity must stay attached")
+	}
+	o := found[0]
+	if o.nested || strings.TrimSpace(o.step.If) != "" {
+		return fail("must be a direct top-level step, never nested or `if:`-gated")
+	}
+	if len(o.step.OnError) != 0 || len(o.step.Steps) != 0 || len(o.step.Else) != 0 || o.step.Retry != 0 {
+		return fail("cannot have retry, on_error, steps, or else branches")
+	}
+	if len(o.step.With) != 1 {
+		return fail("accepts exactly one `with:` key named `confirm`")
+	}
+	confirm, ok := o.step.With["confirm"].(string)
+	if !ok || strings.TrimSpace(confirm) != "${{ params.confirm }}" {
+		return fail("must bind confirmation directly from `${{ params.confirm }}`; a hardcoded confirmation is forbidden")
+	}
+	steps := file.Jobs[o.job].Steps
+	for _, step := range steps[o.index+1:] {
+		run := strings.ToLower(strings.TrimSpace(step.Run))
+		if run == "" && strings.TrimSpace(step.Query) != "" {
+			run = "sql"
+		}
+		if run != "sql" && run != "respond" {
+			return fail("may be followed only by an audit/readback SQL step and the final respond step")
+		}
+		if strings.TrimSpace(step.If) != "" || len(step.Steps) != 0 || len(step.Else) != 0 || len(step.OnError) != 0 {
+			return fail("may not be followed by conditional or nested cleanup")
 		}
 	}
 	return ""
@@ -1201,6 +1307,8 @@ var reservedPathPrefixes = []string{
 	"/sitemap.xml",
 	"/robots.txt",
 	"/llms.txt",
+	"/openapi.json",
+	"/api/openapi.json",
 	"/favicon.ico",
 	"/manifest.json",
 	"/sw.js",
@@ -1308,8 +1416,66 @@ func validateHooksYAML(content string) string {
 				k)
 		}
 	}
+
+	// Per-entry keys. yaml.v3 silently drops keys that don't exist on the
+	// target struct (same hazard validateGHAFlowsContents guards for flows),
+	// so an unrecognized action key parses clean, fires on every matching
+	// row, and does nothing - indistinguishable from success. That exact
+	// shape shipped: an `sms:` hook written against docs that promised it,
+	// against a HookEntryYAML that had no SMS field, silently sent nothing.
+	// Gate it at write time so the author hears about it immediately.
+	var shaped map[string]map[string][]map[string]any
+	if err := yaml.Unmarshal([]byte(content), &shaped); err != nil {
+		// A shape this doesn't fit (e.g. scalar shorthand) isn't necessarily
+		// invalid; the top-level check above already ran. Don't block.
+		return ""
+	}
+	for section, tables := range shaped {
+		for table, entries := range tables {
+			for i, e := range entries {
+				for k := range e {
+					if hookEntryKeys[k] {
+						continue
+					}
+					return fmt.Sprintf(
+						"hooks.yaml: unknown key %q in %s.%s[%d].\n\n"+
+							"Valid keys: %s.\n"+
+							"This matters more than a typo usually would: an unrecognized key is DROPPED silently, so the hook would fire and do nothing while the write still looked successful.\n"+
+							"Common fabrications: `sms_body:`/`text:` (SMS body goes under `sms:` as `body:`), `send_email:` (use `email:`), `url:` (use `webhook:`), `condition:` (use `when:`).",
+						k, section, table, i, strings.Join(hookEntryKeyList, ", "))
+				}
+			}
+		}
+	}
 	return ""
 }
+
+// hookEntryKeys is the set of YAML keys a single hooks.yaml entry may
+// carry, derived by reflection from HookEntryYAML's own struct tags.
+//
+// Deriving rather than hand-listing is the point: HookEntryYAML is what
+// yaml.Unmarshal binds against, so it is the only thing that decides which
+// keys survive. A hand-maintained list here would be a second source of
+// truth and would drift behind the struct - which is precisely how `sms:`
+// came to be documented but unparsed.
+var hookEntryKeys = func() map[string]bool {
+	keys := map[string]bool{}
+	t := reflect.TypeOf(HookEntryYAML{})
+	for i := range t.NumField() {
+		tag := t.Field(i).Tag.Get("yaml")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		keys[strings.Split(tag, ",")[0]] = true
+	}
+	return keys
+}()
+
+// hookEntryKeyList is hookEntryKeys sorted, for stable error messages.
+// (There is a sortedKeys helper in mcp_tools_semantic.go, but that file is
+// `!cli && platform` and this one is `!cli` - reusing it would break the
+// framework and cloud builds.)
+var hookEntryKeyList = slices.Sorted(maps.Keys(hookEntryKeys))
 
 // validateYAMLSyntax is the fallback for any .yaml file we don't have
 // specific knowledge of. It just runs yaml.Unmarshal and surfaces the

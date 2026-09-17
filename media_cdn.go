@@ -238,6 +238,12 @@ func (c *CDNStorage) SaveWithMeta(path string, data io.Reader, contentType, disp
 }
 
 func (c *CDNStorage) Delete(path string) error {
+	if c.s3.Key == "" {
+		if sock := presignBrokerSocketPath(); brokerSocketReachable(sock) {
+			return c.deleteViaBroker(sock, path)
+		}
+		return fmt.Errorf("delete upload: broker unavailable")
+	}
 	return c.s3.Delete(c.cdnKeyFor(path))
 }
 

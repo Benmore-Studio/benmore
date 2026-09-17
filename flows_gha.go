@@ -62,6 +62,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -259,6 +260,14 @@ func loadOneGHAFile(path string) []Flow {
 	if file.On.Request == nil && file.On.Schedule == nil && file.On.Event == nil {
 		return nil
 	}
+	// purge_current_user is intentionally narrower than ordinary flow steps.
+	// Validate it again at load time (not only in the write/check tooling) so a
+	// hand-edited or legacy on-disk file cannot bypass the identity-deletion
+	// contract and register an unsafe route.
+	if msg := validatePurgeCurrentUserContract(file); msg != "" {
+		log.Printf("flows: refusing unsafe purge_current_user flow %s: %s", path, msg)
+		return nil
+	}
 
 	// Build the FlowTrigger from whichever `on:` shape was set.
 	var trigger FlowTrigger
@@ -296,6 +305,12 @@ func loadOneGHAFile(path string) []Flow {
 		role = file.On.Request.Role
 		async = strings.EqualFold(strings.TrimSpace(file.On.Request.Mode), "async")
 		rateLimit = parseRateLimit(file.On.Request.RateLimit)
+		if verifyConfig != nil {
+			if err := validateFlowVerifyConfig(verifyConfig, trigger.Path); err != nil {
+				log.Printf("flows: invalid verify config in %s: %s - skipping file", path, err)
+				return nil
+			}
+		}
 	case file.On.Schedule != nil:
 		trigger = FlowTrigger{Type: "cron", Cron: file.On.Schedule.Cron}
 	case file.On.Event != nil:
@@ -342,10 +357,9 @@ func loadOneGHAFile(path string) []Flow {
 }
 
 // parseVerifyMap converts the YAML map shape of `verify:` into a
-// FlowVerify. Unknown keys are ignored (forward compat for new built-in
-// options). Missing required keys are NOT validated here - the runtime
-// reports a precise error from runVerifyRecipe so the agent gets the
-// failure message at request time with the actual values in scope.
+// FlowVerify. Unknown keys are ignored for forward compatibility; required
+// fields and recipe-specific invariants are validated by both the loader and
+// write-time validator through validateFlowVerifyConfig.
 func parseVerifyMap(raw map[string]any) *FlowVerify {
 	v := &FlowVerify{}
 	if s, ok := raw["recipe"].(string); ok {
@@ -364,10 +378,22 @@ func parseVerifyMap(raw map[string]any) *FlowVerify {
 		// work - agents shouldn't have to learn which fields go
 		// through which interpolator. The actual env lookup still
 		// happens at request time so secret rotation stays live.
-		v.Secret = normalizeGHARefs(s)
+		v.Secret = normVerifyEnv(s)
+	}
+	if previous, ok := raw["previous_secret"]; ok {
+		v.previousSet = true
+		if s, ok := previous.(string); ok {
+			v.PreviousSecret = normVerifyEnv(s)
+		}
 	}
 	if s, ok := raw["prefix"].(string); ok {
 		v.Prefix = s
+	}
+	if s, ok := raw["path_param"].(string); ok {
+		v.PathParam = s
+	}
+	if s, ok := raw["context"].(string); ok {
+		v.Context = s
 	}
 	switch n := raw["skew_seconds"].(type) {
 	case int:
@@ -378,6 +404,22 @@ func parseVerifyMap(raw map[string]any) *FlowVerify {
 		v.SkewSeconds = int(n)
 	}
 	return v
+}
+
+// normVerifyEnv accepts both documented env spellings:
+// `${{ env.NAME }}` and `{{ env.NAME }}`. InterpolateEnv consumes the compact
+// `{{env.NAME}}` representation, so canonicalize only a whole env reference;
+// literal secrets on legacy recipes remain byte-for-byte untouched.
+func normVerifyEnv(s string) string {
+	s = normalizeGHARefs(s)
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") {
+		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{{"), "}}"))
+		if strings.HasPrefix(inner, "env.") {
+			return "{{" + inner + "}}"
+		}
+	}
+	return s
 }
 
 // convertGHASteps walks the GHA step list and emits FlowSteps the
@@ -391,9 +433,10 @@ func parseVerifyMap(raw map[string]any) *FlowVerify {
 // `case` to the switch below, add the type here too (TestFlowRunTypesMatch
 // guards the pairing).
 var flowRunTypes = map[string]bool{
-	"sql": true, "sql_dynamic": true, "api": true, "email": true, "webhook": true,
-	"redirect": true, "respond": true, "parse": true, "set": true, "parallel": true,
-	"compute": true, "if": true, "for_each": true, "serve_file": true,
+	"sql": true, "sql_dynamic": true, "api": true, "email": true, "sms": true,
+	"webhook": true, "redirect": true, "respond": true, "parse": true, "set": true,
+	"parallel": true, "compute": true, "if": true, "for_each": true,
+	"serve_file": true, "delete_upload": true, "purge_current_user": true, "transcribe": true,
 }
 
 func convertGHASteps(steps []FlowStepGHA) []FlowStep {
@@ -460,9 +503,18 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 		case "api":
 			fs.Type = "api"
 			fs.API = withToAPI(s.With)
+			// `with.timeout:` caps the outbound HTTP call (execStepAPI
+			// defaults to 30s). Step-level `timeout:` (sibling of `run:`)
+			// is mapped after the switch and takes precedence.
+			if d := withDuration(s.With, "timeout"); d > 0 {
+				fs.Timeout = d
+			}
 		case "email":
 			fs.Type = "email"
 			fs.Email = withToEmail(s.With)
+		case "sms":
+			fs.Type = "sms"
+			fs.SMS = withToSMS(s.With)
 		case "webhook":
 			fs.Type = "webhook"
 			if u, ok := s.With["url"].(string); ok {
@@ -490,6 +542,33 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			}
 			if n, ok := s.With["filename"].(string); ok {
 				fs.ServeFile.Filename = normalizeGHARefs(n)
+			}
+		case "delete_upload":
+			fs.Type = "delete_upload"
+			if p, ok := s.With["path"].(string); ok {
+				fs.DeleteUpload = normalizeGHARefs(p)
+			}
+		case "purge_current_user":
+			fs.Type = "purge_current_user"
+			if confirm, ok := s.With["confirm"].(string); ok {
+				fs.PurgeCurrentUserConfirm = normalizeGHARefs(confirm)
+			}
+		case "transcribe":
+			// `run: transcribe` - local audio→text via host ffmpeg +
+			// whisper-cli (transcribe.go). `file:` is app-relative
+			// (uploads/…) or a public https:// URL; model/language
+			// optional. Values keep their `${{ }}` refs (normalized)
+			// so the executor interpolates them per-request.
+			fs.Type = "transcribe"
+			fs.Transcribe = &FlowTranscribe{}
+			if f, ok := s.With["file"].(string); ok {
+				fs.Transcribe.File = normalizeGHARefs(f)
+			}
+			if m, ok := s.With["model"].(string); ok {
+				fs.Transcribe.Model = normalizeGHARefs(m)
+			}
+			if l, ok := s.With["language"].(string); ok {
+				fs.Transcribe.Language = normalizeGHARefs(l)
 			}
 		case "parse":
 			fs.Type = "parse"
@@ -530,10 +609,8 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			if argsRaw, ok := s.With["args"]; ok {
 				fs.Compute.Args = argsRaw
 			}
-			if to, ok := s.With["timeout"].(string); ok {
-				if d, err := time.ParseDuration(to); err == nil {
-					fs.Compute.Timeout = d
-				}
+			if d := withDuration(s.With, "timeout"); d > 0 {
+				fs.Compute.Timeout = d
 			}
 		case "if":
 			fs.Type = "if"
@@ -591,6 +668,22 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			continue
 		}
 
+		// Per-step modifiers must be mapped BEFORE the `if:` gate wrap
+		// below - pre-v2.7.212 the wrap `continue`d past this block, so
+		// retry/timeout/expect_rows/on_error were silently dropped from
+		// any gated step.
+		fs.Retry = s.Retry
+		fs.ExpectRows = strings.TrimSpace(s.ExpectRows)
+		if s.RetryDelay != "" {
+			fs.RetryDelay, _ = time.ParseDuration(s.RetryDelay)
+		}
+		if d := parseFlexDuration(s.Timeout); d > 0 {
+			fs.Timeout = d
+		}
+		if len(s.OnError) > 0 {
+			fs.OnError = convertGHASteps(s.OnError)
+		}
+
 		// `if:` may also appear on non-conditional steps as a per-step
 		// gate. If we already classified the step as something other
 		// than "if" but it has an If expression, wrap it.
@@ -603,20 +696,41 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			continue
 		}
 
-		fs.Retry = s.Retry
-		fs.ExpectRows = strings.TrimSpace(s.ExpectRows)
-		if s.RetryDelay != "" {
-			fs.RetryDelay, _ = time.ParseDuration(s.RetryDelay)
-		}
-		if s.Timeout != "" {
-			fs.Timeout, _ = time.ParseDuration(s.Timeout)
-		}
-		if len(s.OnError) > 0 {
-			fs.OnError = convertGHASteps(s.OnError)
-		}
 		out = append(out, fs)
 	}
 	return out
+}
+
+// withDuration reads a duration off a `with:` block. Accepts Go
+// duration strings ("570s", "10m"), bare numeric strings ("570"), and
+// YAML numbers (570) - bare numbers are seconds, since that's what
+// agents reach for first (evidence: issue #221 tried `timeout: 570`).
+func withDuration(with map[string]any, key string) time.Duration {
+	switch v := with[key].(type) {
+	case string:
+		return parseFlexDuration(v)
+	case int:
+		return time.Duration(v) * time.Second
+	case float64:
+		return time.Duration(v * float64(time.Second))
+	}
+	return 0
+}
+
+// parseFlexDuration parses "570s" / "10m" via time.ParseDuration, and
+// falls back to treating a bare number ("570") as seconds.
+func parseFlexDuration(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
 }
 
 // withToAPI maps a `with:` block onto FlowAPICall fields, applying
@@ -792,7 +906,49 @@ func withToEmail(with map[string]any) *FlowEmail {
 	for k, v := range e.Data {
 		e.Data[k] = normalizeGHARefs(v)
 	}
+	// attachments: [{filename, content_type?, content}] — content is base64
+	// (or a ${{ }} ref resolving to base64). Non-object entries are skipped.
+	if raw, ok := with["attachments"].([]any); ok {
+		for _, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			att := FlowAttachment{}
+			if s, ok := m["filename"].(string); ok {
+				att.Filename = normalizeGHARefs(s)
+			}
+			if s, ok := m["content_type"].(string); ok {
+				att.ContentType = s
+			}
+			if s, ok := m["content"].(string); ok {
+				att.Content = normalizeGHARefs(s)
+			}
+			if att.Content != "" {
+				e.Attachments = append(e.Attachments, att)
+			}
+		}
+	}
 	return e
+}
+
+// withToSMS parses a `run: sms` step's `with:` block. `body:` is primary and
+// `text:` is an alias - agents reach for both, and mirroring withToEmail's
+// generosity here is cheaper than a support round-trip.
+func withToSMS(with map[string]any) *FlowSMS {
+	s := &FlowSMS{}
+	if v, ok := with["to"].(string); ok {
+		s.To = normalizeGHARefs(v)
+	}
+	if v, ok := with["body"].(string); ok {
+		s.Body = normalizeGHARefs(v)
+	}
+	if s.Body == "" {
+		if v, ok := with["text"].(string); ok {
+			s.Body = normalizeGHARefs(v)
+		}
+	}
+	return s
 }
 
 func withToRespond(with map[string]any) *FlowRespond {

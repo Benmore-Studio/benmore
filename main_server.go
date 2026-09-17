@@ -141,9 +141,9 @@ func resetServerTestDatabase(dir string) error {
 // typed bm SDK reference) so the directory is immediately runnable with
 // `benmore serve`.
 func runServerNew() {
-	if len(os.Args) < 3 || os.Args[2] == "" || os.Args[2][0] == '-' {
+	if len(os.Args) != 3 || os.Args[2] == "" || os.Args[2][0] == '-' {
 		fmt.Fprintln(os.Stderr, "Usage: benmore new <dir>")
-		os.Exit(1)
+		os.Exit(2)
 	}
 	dir := os.Args[2]
 	if _, err := os.Stat(dir); err == nil {
@@ -152,7 +152,18 @@ func runServerNew() {
 	if err := WriteHTMLScaffoldFiles(dir, ""); err != nil {
 		log.Fatalf("scaffold failed: %s", err)
 	}
-	fmt.Printf("Created %s\n\nNext:\n  benmore serve %s --port 8080\n  open http://localhost:8080\n", dir, dir)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		absDir = dir
+	}
+	fmt.Print(scaffoldNextSteps(absDir))
+}
+
+func scaffoldNextSteps(absDir string) string {
+	if editionName == "framework" {
+		return fmt.Sprintf("Created %s\n\nNext:\n  benmore serve %q --port 8080\n  open http://localhost:8080\n", absDir, absDir)
+	}
+	return fmt.Sprintf("Created %s\n\nNext:\n  cd %q\n  benmore deploy\n  benmore open .\n", absDir, absDir)
 }
 
 // runServerServe boots a single app on a single port.

@@ -268,6 +268,13 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 		return
 	}
 
+	// Mask encrypted columns with the caller's role, same as the live read
+	// path (crud.go handleRead). The history row mirrors the source table's
+	// columns and QueryRows decrypts the ciphertext-at-rest, so without this a
+	// caller who can read the row but is NOT in the column's unmask_roles would
+	// recover the plaintext through version history. The history table shares
+	// the source table's encrypted-field config (same column names).
+	MaskEncryptedFields(app.Encrypted, table, rows, session)
 	httpJSON(w, http.StatusOK, rows[0])
 }
 

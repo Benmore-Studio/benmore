@@ -383,7 +383,7 @@ func authRawSessionID(r *http.Request) string {
 	}
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		tok := strings.TrimPrefix(auth, "Bearer ")
-		if !strings.HasPrefix(tok, "bmr_") {
+		if !isPersistentAPIToken(tok) {
 			return tok
 		}
 	}
@@ -1669,11 +1669,6 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// No-op for every app other than _platform.
 	syncPlatformUserFromDashboard(app, email, string(hash))
 
-	// Best-effort: if RESEND_API_KEY + RESEND_AUDIENCE_ID are set in
-	// the app's env, add the new signup to that audience for marketing
-	// emails. Fire-and-forget - never blocks the signup.
-	go AddResendContact(app.Dir, email, r.FormValue("first_name"), r.FormValue("last_name"))
-
 	// Activate any pending invites for this email (app-level user_roles table)
 	app.DB.Exec("UPDATE user_roles SET user_id = ?, is_active = 1, invite_accepted_at = datetime('now') WHERE email = ? AND user_id IS NULL AND is_active = 0", id, email)
 
@@ -2247,6 +2242,14 @@ var tokenAuthIPLimiter = NewRateLimiter(30, time.Minute)
 var forgotPasswordLimiter = NewRateLimiter(3, 15*time.Minute)
 
 func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
+	// OAuth-only mode (app.yaml auth.oauth_only): the email+password →
+	// Bearer exchange is a password sign-in path, so it must be refused
+	// too - otherwise oauth_only would close the interactive login/signup
+	// but leave this API path open as a silent password bypass.
+	if oauthOnly(app) {
+		http.Error(w, `{"error":"password auth is disabled - this app uses social sign-in only"}`, http.StatusForbidden)
+		return
+	}
 	if !tokenAuthIPLimiter.Allow("token:" + clientIP(r)) {
 		http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
 		return
@@ -2403,6 +2406,14 @@ func handleVerifyEmail(w http.ResponseWriter, r *http.Request, app *App) {
 
 // ===== Session Helpers =====
 
+// isPersistentAPIToken reports whether a bearer value is a hash-stored
+// _benmore_api_tokens credential rather than a raw session id. Two mints
+// exist: user-created tokens ("bmr_", /api/_auth/api-tokens) and per-app
+// OAuth access tokens ("bma_", app_oauth.go token endpoint).
+func isPersistentAPIToken(tok string) bool {
+	return strings.HasPrefix(tok, "bmr_") || strings.HasPrefix(tok, "bma_")
+}
+
 func getSession(app *App, r *http.Request) *Session {
 	var session *Session
 
@@ -2415,7 +2426,7 @@ func getSession(app *App, r *http.Request) *Session {
 	if session == nil {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			token := strings.TrimPrefix(auth, "Bearer ")
-			if strings.HasPrefix(token, "bmr_") {
+			if isPersistentAPIToken(token) {
 				// Prefixed token → persistent API token (hash-based lookup)
 				session = GetSessionFromAPIToken(app.DB, token)
 			} else {
@@ -2469,6 +2480,11 @@ func getSession(app *App, r *http.Request) *Session {
 		}
 	}
 
+	return applySessionRoleScopes(app, session)
+}
+
+// Shared by interactive sessions and durable scheduled-task identities.
+func applySessionRoleScopes(app *App, session *Session) *Session {
 	// Tenant role from the membership table (v2.7.164): when the
 	// developer declares `groups.role_field`, the member's in-tenant
 	// role (e.g. member_role on company_members) joins session.Roles
@@ -2491,21 +2507,20 @@ func getSession(app *App, r *http.Request) *Session {
 		}
 	}
 
-	// Apply role-based scopes: if session has no explicit scopes (cookie session)
-	// and app has roles config, apply the UNION of every held role's scopes
-	// (after inheritance expansion).
+	// Intersect explicit credential scopes with the UNION of current role
+	// grants. A token may narrow a role, but must never bypass it.
 	//
 	// SECURITY: if roles are configured but NONE of the user's roles are
 	// defined, deny access (empty scopes that will be checked = denied on
 	// first API call). Undefined roles must NOT get full access.
-	if session.Scopes == "" && app.Roles != nil {
+	if app.Roles != nil {
 		held := session.Roles
 		if len(held) == 0 {
 			held = []string{session.Role}
 		}
 		roleScopes := app.Roles.ResolveScopesForRoles(held)
 		if roleScopes != "" {
-			session.Scopes = roleScopes
+			session.Scopes = intersectScopes(session.Scopes, roleScopes)
 		} else {
 			// No role defined in config matched - deny everything.
 			session.Scopes = "_none_:read"
@@ -2648,8 +2663,8 @@ func GetSessionFromAPIToken(db *sql.DB, rawToken string) *Session {
 	// Check expiry
 	if expiresAt.Valid && expiresAt.String != "" {
 		t, err := time.Parse(time.RFC3339, expiresAt.String)
-		if err == nil && t.Before(time.Now()) {
-			return nil // expired
+		if err != nil || !t.After(time.Now()) {
+			return nil // invalid or expired
 		}
 	}
 
@@ -2677,7 +2692,17 @@ func GetSessionFromAPIToken(db *sql.DB, rawToken string) *Session {
 		Scopes:      scopes,
 		Verified:    verified == 1,
 		GlobalAdmin: role == "admin" || UserHasGlobalAdminGrant(db, userID),
+		Roles:       LoadSessionRoles(db, userID, role, ""),
 	}
+}
+
+// Credential changes require an actual login, not delegated or support identity.
+func credentialManagementSession(app *App, session *Session) bool {
+	if session == nil || session.ActingAsGroup != "" || strings.HasPrefix(session.ID, "apitoken:") || strings.HasPrefix(session.ID, "edge:") {
+		return false
+	}
+	var valid int
+	return app.DB.QueryRow("SELECT 1 FROM _benmore_sessions WHERE id=? AND user_id=? AND COALESCE(is_impersonation,0)=0", session.ID, session.UserID).Scan(&valid) == nil
 }
 
 // handleCreateAPIToken creates a persistent API token.
@@ -2686,6 +2711,22 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 	session := getSession(app, r)
 	if session == nil {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return
+	}
+	// Persistent credentials cannot mint descendants that survive revocation
+	// or expiry of the original token. Mint from an interactive login session.
+	if !credentialManagementSession(app, session) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "create API tokens from a login session outside act-as mode"})
+		return
+	}
+	// CSRF: this mint is a cookie-session mutation like its siblings
+	// (settings/mfa/profile, and handleRevokeAPIToken below). Without it a
+	// logged-in victim could be navigated to /bmp-auth (or have this endpoint
+	// POSTed cross-site) and a full-scope bmr_ token minted on their behalf.
+	// requireCSRF exempts Bearer callers, so the CLI/MCP/SDK are unaffected;
+	// bmp-auth.html already sends X-CSRF-Token, so no legitimate browser
+	// client breaks. (Task 22 folded in.)
+	if !requireCSRF(w, r) {
 		return
 	}
 
@@ -2708,6 +2749,10 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	if err := validateScopes(body.Scopes); err != nil {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if !scopesWithin(session.Scopes, body.Scopes) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "requested scopes exceed your permissions"})
 		return
 	}
 

@@ -371,14 +371,26 @@ export interface RoomClient {
   // isolation applies - same-app cross-user broadcast works since v2.7.10.
   export function room(name: string): RoomClient;
 
-  // ── markdown - tiny safe renderer ────────────────────────────────────
-  /** Render a Markdown subset to safe HTML.
+  // ── markdown - robust safe renderer ──────────────────────────────────
+  /** Render Markdown to safe HTML via the server-side benmark engine.
    *
-   * Escapes user input first, allowlists http/https/mailto links,
-   * supports bold / italic / inline-code / fenced-code / links /
-   * lists / blockquotes. Lazy-loaded from /_internal/markdown.js on
-   * first call. Safe to assign the result to .innerHTML. */
-  export function markdown(text: string): Promise<string>;
+   * Full CommonMark + GFM (headings, tables, task lists, strikethrough,
+   * autolinks, nested lists), syntax highlighting, mermaid fenced diagrams,
+   * media embeds (video / audio / PDF / YouTube / Vimeo), heading anchors,
+   * wikilinks, and front matter. Sanitized by default - safe to assign to
+   * .innerHTML. POSTs /_internal/markdown (cached per text; offline
+   * fallback to the tiny renderer). Pass { inline: true } for the
+   * single-line "chat" subset (no wrapping <p>).
+   *
+   * For styling + live diagrams, add <link rel="stylesheet"
+   * href="/_internal/markdown.css"> (wrap output in class="benmark"),
+   * load /_internal/mermaid.js, and run hydrate() from
+   * /_internal/markdown-hydrate.js - or just use the <Markdown> bm/ui
+   * component, which does all of that. See api({ at: 'markdown' }). */
+  export function markdown(text: string, opts?: { inline?: boolean }): Promise<string>;
+  /** Render many strings in ONE round-trip (POST /_internal/markdown/batch).
+   *  items are strings or { text, inline }; returns HTML aligned by index. */
+  export function markdownBatch(items: Array<string | { text: string; inline?: boolean }>): Promise<string[]>;
 
   // ── bm.html - XSS-safe tagged template literal (v2.7.66+) ─────────────
   //
@@ -687,6 +699,7 @@ declare const bm: {
   webrtc: typeof webrtc;
   broadcast: typeof broadcast;
   markdown: typeof markdown;
+  markdownBatch: typeof markdownBatch;
   presence: typeof presence;
   cache: typeof cache;
   createStore: typeof createStore;

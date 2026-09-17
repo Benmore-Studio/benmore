@@ -211,6 +211,13 @@ func gitSnapshotHead(dir, msg string) (string, bool) {
 	if err != nil {
 		return "", false // no commits yet - nothing to restore to
 	}
+	// If gitAutoCommit's commit silently failed, the tree is still dirty and
+	// HEAD predates those changes; a later hard-reset to it would DISCARD
+	// them while reporting a clean rollback. Only vouch for the snapshot when
+	// the tree is actually clean.
+	if status, statusErr := gitRun(dir, "status", "--porcelain"); statusErr != nil || strings.TrimSpace(status) != "" {
+		return "", false
+	}
 	return strings.TrimSpace(out), true
 }
 

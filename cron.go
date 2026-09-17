@@ -46,6 +46,7 @@ package main
 // context from a previous step instead.
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -527,6 +528,16 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 	// wrapping - the cron tick runs the step bodies directly, same as
 	// if the cron entry had inlined them.
 	steps := j.Steps
+	// wantTx records whether the resolved flow declared `transaction: true`.
+	// The cron path previously ran the step loop in autocommit regardless
+	// (review finding #2): apply_facts is a `flow: apply_facts` cron whose
+	// flow is transactional, so on the HTTP/async paths its ~30 statements
+	// are atomic - but the cron applier (the primary steady-state path) ran
+	// them one-by-one, so a mid-run failure left add_tickets/add_deliverables
+	// /announce_* committed with facts unapplied, and the next tick re-posted
+	// the same client-visible rows. Honor the flag here, mirroring
+	// executeFlowJob (jobs.go).
+	wantTx := false
 	if j.Flow != "" {
 		// Snapshot app.Flows under app.mu so a concurrent hot reload
 		// reassigning the slice (server.go reloadAppConfig) doesn't race
@@ -550,9 +561,10 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 			return fmt.Errorf("flow %s has zero steps", j.Flow)
 		}
 		steps = found.Steps
+		wantTx = found.Transaction
 	}
 
-	log.Printf("CRON [%s] firing (steps=%d, flow=%q)", j.ID, len(steps), j.Flow)
+	log.Printf("CRON [%s] firing (steps=%d, flow=%q, tx=%v)", j.ID, len(steps), j.Flow, wantTx)
 	// Initialize both maps - flow steps freely assign to ctx.Params (path
 	// param binding) AND ctx.Data (step outputs), and a nil Params from
 	// an HTTP-less cron path panics on first assignment.
@@ -565,13 +577,62 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		Data:   ctxData,
 		Params: map[string]string{},
 	}
-	for i := range steps {
-		if err := executeStep(ctx, &steps[i]); err != nil {
-			log.Printf("CRON [%s] step %d failed: %s", j.ID, i, err)
-			return err
+
+	// Begin a transaction when the resolved flow asked for one, so SQL steps
+	// resolve ctx.Tx via flowDB and the whole run commits or rolls back
+	// atomically - identical to executeFlowJob's transaction handling.
+	//
+	// guard (txCommitGuard, defined in jobs.go) guarantees the *sql.Tx is
+	// finalized exactly once on every path - success (commit), step failure
+	// (rollback), AND a panic inside executeSteps. Pre-fix, a panic unwound
+	// straight past the commit/rollback logic below to the recover()
+	// deferred above (registered first, so it runs LAST), leaking the
+	// *sql.Tx: its connection was never returned to the pool, and under
+	// SQLite WAL an unreturned write-tx holds the app's write lock until
+	// restart (review finding). The guard's defer is registered here,
+	// immediately after Begin() and before executeSteps, so it unwinds (and
+	// rolls back) BEFORE the outer recover() defer runs.
+	var guard *txCommitGuard
+	if wantTx {
+		tx, txErr := app.DB.Begin()
+		if txErr != nil {
+			return fmt.Errorf("cron %s: begin transaction: %w", j.ID, txErr)
 		}
+		ctx.Tx = tx
+		guard = &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
 	}
-	return nil
+
+	// executeSteps (not a manual executeStep loop) so the cron path honors
+	// step.Retry, step.OnError, and ctx.Stopped exactly like every other
+	// step-running surface. ctx.Error carries the first step failure.
+	executeSteps(ctx, steps)
+
+	if ctx.Tx != nil {
+		if ctx.Error != nil {
+			rbErr := ctx.Tx.Rollback()
+			guard.MarkHandled()
+			if rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Printf("CRON [%s] tx rollback error: %s", j.ID, rbErr)
+			}
+			log.Printf("CRON [%s] rolled back (step %q failed): %s", j.ID, ctx.FailedStep, ctx.Error)
+			return ctx.Error
+		}
+		commitErr := ctx.Tx.Commit()
+		// Whether Commit succeeded or failed, the tx is done from
+		// database/sql's perspective - mark handled either way so the
+		// deferred guard never double-calls Rollback/Commit.
+		guard.MarkHandled()
+		if commitErr != nil {
+			return fmt.Errorf("cron %s: commit transaction: %w", j.ID, commitErr)
+		}
+		return nil
+	}
+
+	if ctx.Error != nil {
+		log.Printf("CRON [%s] step %q failed: %s", j.ID, ctx.FailedStep, ctx.Error)
+	}
+	return ctx.Error
 }
 
 // cronShouldFire evaluates the schedule expression against `now`.

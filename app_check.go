@@ -300,13 +300,18 @@ func protectedColumnWarnings(dir string) []CheckFinding {
 // payments or cuts payouts. Recommends integer cents. Warning, not error: the
 // column is legal, and some "rate"/"amount" columns are genuinely fractional.
 func moneyFloatWarnings(dir string) []CheckFinding {
+	findings, _ := moneyFloatWarningsChecked(dir)
+	return findings
+}
+
+func moneyFloatWarningsChecked(dir string) ([]CheckFinding, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "schema.prisma"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	models, err := ParsePrismaSchema(string(data))
 	if err != nil {
-		return nil // parse errors are Layer 1's job
+		return nil, err
 	}
 	moneyWord := map[string]bool{
 		"amount": true, "price": true, "total": true, "subtotal": true,
@@ -334,7 +339,7 @@ func moneyFloatWarnings(dir string) []CheckFinding {
 			})
 		}
 	}
-	return findings
+	return findings, nil
 }
 
 // piiExposureWarnings flags tables that are world- or anon-readable
@@ -343,17 +348,25 @@ func moneyFloatWarnings(dir string) []CheckFinding {
 // explicit broad read mode. Warning: the exposure may be intentional (a public
 // directory), but it should be a deliberate choice, not an accident.
 func piiExposureWarnings(dir string) []CheckFinding {
+	findings, _ := piiExposureWarningsChecked(dir)
+	return findings
+}
+
+func piiExposureWarningsChecked(dir string) ([]CheckFinding, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "schema.prisma"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	models, err := ParsePrismaSchema(string(data))
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	access := LoadAccess(dir)
+	access, err := loadAccessChecked(dir)
+	if err != nil {
+		return nil, err
+	}
 	if access == nil {
-		return nil
+		return nil, nil
 	}
 	var findings []CheckFinding
 	for _, m := range models {
@@ -388,7 +401,7 @@ func piiExposureWarnings(dir string) []CheckFinding {
 			})
 		}
 	}
-	return findings
+	return findings, nil
 }
 
 // asyncRespondWarnings flags `mode: async` flows that still carry a respond:/

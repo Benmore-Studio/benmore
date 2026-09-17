@@ -1246,13 +1246,67 @@ export function raw(htmlString) {
 //
 //   const html = await bm.markdown(messageText);
 //   messageEl.innerHTML = html;
-let _mdImpl = null;
-async function markdown(text) {
-  if (_mdImpl == null) {
-    const m = await import('/_internal/markdown.js');
-    _mdImpl = m.markdown || m.default;
+// markdown renders via the server-side benmark engine
+// (POST /_internal/markdown): robust CommonMark + GFM + syntax highlighting,
+// mermaid diagrams, and media embeds - one renderer shared with every other
+// framework surface. Results are cached per text. On network failure we fall
+// back to the tiny offline /_internal/markdown.js subset (and, failing that,
+// HTML-escaped plaintext), so a message NEVER renders as raw or unsanitized
+// HTML. Pass { inline: true } for the single-line chat subset.
+const _mdCache = new Map();
+let _mdFallback = null;
+async function _mdFallbackFn(text, inline) {
+  if (_mdFallback == null) {
+    try { const m = await import('/_internal/markdown.js'); _mdFallback = m.markdown || m.default; }
+    catch (_) {
+      _mdFallback = (t) => String(t == null ? '' : t).replace(
+        /[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
   }
-  return _mdImpl(text);
+  return _mdFallback(text, inline);
+}
+async function markdown(text, opts) {
+  if (text == null) return '';
+  const inline = !!(opts && opts.inline);
+  const key = (inline ? '1' : '0') + String(text);
+  if (_mdCache.has(key)) return _mdCache.get(key);
+  try {
+    const res = await fetch('/_internal/markdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: String(text), inline }),
+    });
+    if (!res.ok) throw new Error('markdown ' + res.status);
+    const html = await res.text();
+    if (_mdCache.size > 500) _mdCache.clear();
+    _mdCache.set(key, html);
+    return html;
+  } catch (_) {
+    return _mdFallbackFn(text, inline);
+  }
+}
+// markdownBatch renders many strings in ONE round-trip (POST
+// /_internal/markdown/batch) - use it to render a whole message/notes list at
+// once. items is an array of strings or { text, inline } objects; returns an
+// array of HTML strings aligned by index. Results are added to the cache.
+async function markdownBatch(items) {
+  const norm = (items || []).map((it) =>
+    typeof it === 'string' ? { text: it, inline: false }
+      : { text: String((it && it.text) || ''), inline: !!(it && it.inline) });
+  if (!norm.length) return [];
+  try {
+    const res = await fetch('/_internal/markdown/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: norm }),
+    });
+    if (!res.ok) throw new Error('markdown batch ' + res.status);
+    const out = (await res.json()).html || [];
+    norm.forEach((n, i) => { if (out[i] != null) _mdCache.set((n.inline ? '1' : '0') + n.text, out[i]); });
+    return out;
+  } catch (_) {
+    return Promise.all(norm.map((n) => markdown(n.text, { inline: n.inline })));
+  }
 }
 
 // =================================================================
@@ -1736,7 +1790,7 @@ const bm = {
   api, auth, users, table, live, room,
   flows, workflow, aggregate, aggregates, jobs,
   notifications, upload, audit, permissions, signedUrl,
-  t, mfa, webrtc, broadcast, markdown, presence, cache,
+  t, mfa, webrtc, broadcast, markdown, markdownBatch, presence, cache,
   createStore, query, html, raw,
 };
 export default bm;

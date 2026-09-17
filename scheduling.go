@@ -3,6 +3,9 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"time"
 )
@@ -36,6 +39,8 @@ func EnsureSchedulingTables(db *sql.DB) {
 	// orphan left behind by a crashed worker can be recovered (the table has
 	// no lease otherwise). Best-effort ALTER covers fresh + upgraded tables.
 	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN claimed_at DATETIME`)
+	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN authorization TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_approvals (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		table_name TEXT NOT NULL,
@@ -92,13 +97,36 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 		if kind != "flow" {
 			kind = "reminder"
 		}
+		authorization := ""
+		if kind == "flow" {
+			if !credentialManagementSession(app, session) {
+				httpJSON(w, http.StatusForbidden, map[string]any{"error": "schedule flows from a login session outside act-as/support mode"})
+				return
+			}
+			authorization = marshalScheduledAuthority(session)
+			flow, err := schedulableFlow(app, b.Flow, session)
+			if err != nil {
+				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				return
+			}
+			var body map[string]any
+			if len(b.Body) > 0 && (json.Unmarshal(b.Body, &body) != nil || body == nil) {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "body must be a JSON object"})
+				return
+			}
+			if _, err := scheduledFlowRequest(flow, string(b.Body)); err != nil {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+
 		title := b.Title
 		if title == "" {
 			title = "Reminder"
 		}
 		res, err := app.DB.Exec(
-			`INSERT INTO _benmore_scheduled_tasks (user_id, kind, title, message, flow, body, table_name, row_id, run_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-			session.UserID, kind, title, b.Message, b.Flow, string(b.Body), b.Table, b.RowID, when.UTC().Format(time.RFC3339),
+			`INSERT INTO _benmore_scheduled_tasks (user_id, kind, title, message, flow, body, table_name, row_id, run_at, authorization) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			session.UserID, kind, title, b.Message, b.Flow, string(b.Body), b.Table, b.RowID, when.UTC().Format(time.RFC3339), authorization,
 		)
 		if err != nil {
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "schedule failed"})
@@ -113,7 +141,7 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		q := "SELECT id, kind, title, message, flow, table_name, row_id, run_at, status, fired_at FROM _benmore_scheduled_tasks WHERE user_id = ?"
+		q := "SELECT id, kind, title, message, flow, table_name, row_id, run_at, status, fired_at, last_error FROM _benmore_scheduled_tasks WHERE user_id = ?"
 		args := []any{session.UserID}
 		if t := r.URL.Query().Get("table"); t != "" {
 			q += " AND table_name = ?"
@@ -141,7 +169,7 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
 		}
-		app.DB.Exec("UPDATE _benmore_scheduled_tasks SET status='cancelled' WHERE id = ? AND user_id = ? AND status='pending'", r.PathValue("id"), session.UserID)
+		app.DB.Exec("UPDATE _benmore_scheduled_tasks SET status='cancelled' WHERE id = ? AND user_id = ? AND status IN ('pending','blocked')", r.PathValue("id"), session.UserID)
 		httpJSON(w, http.StatusOK, map[string]any{"status": "cancelled"})
 	})
 
@@ -307,6 +335,8 @@ func StartSchedulerSweeper(app *App) {
 // synchronously, so a live process never legitimately holds one this long.
 const schedTaskRecoveryTTL = 5 * time.Minute
 
+var errScheduledFlowRateLimited = errors.New("flow rate limit reached; task will retry before executing any steps")
+
 func sweepScheduledTasks(app *App) {
 	now := time.Now().UTC()
 	// Recover orphans: a task stuck 'running' past the TTL belongs to a worker
@@ -317,21 +347,39 @@ func sweepScheduledTasks(app *App) {
 		now.Add(-schedTaskRecoveryTTL).Format(time.RFC3339))
 
 	rows, err := QueryRows(app.DB,
-		"SELECT id, user_id, kind, title, message, flow, body FROM _benmore_scheduled_tasks WHERE status='pending' AND run_at <= ? ORDER BY run_at ASC LIMIT 50",
+		"SELECT id, user_id, kind, title, message, flow, body, authorization, last_error FROM _benmore_scheduled_tasks WHERE status IN ('pending','blocked') AND run_at <= ? ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, COALESCE(claimed_at,''), run_at ASC LIMIT 50",
 		now.Format(time.RFC3339))
 	if err != nil {
 		return
 	}
 	for _, t := range rows {
 		id := t["id"]
+		kind, _ := t["kind"].(string)
+		authorization, _ := t["authorization"].(string)
+		if kind == "flow" {
+			_, _, migrated, err := prepareScheduledFlow(app, t)
+			if err != nil {
+				reason := err.Error()
+				if old, _ := t["last_error"].(string); old != reason {
+					log.Printf("SCHEDULE blocked task=%v: %s", id, reason)
+				}
+				app.DB.Exec("UPDATE _benmore_scheduled_tasks SET status='blocked', last_error=?, claimed_at=? WHERE id=? AND status IN ('pending','blocked')", reason, now.Format(time.RFC3339Nano), id)
+				continue
+			}
+			if authorization == "" {
+				authorization = migrated
+				t["authorization"] = migrated
+			}
+		}
+
 		// H-15: atomically claim this task before doing any work. Mirrors
 		// processNextJob's claim - flip pending->running only if WE win the
 		// race (RowsAffected == 1). Without this guard two overlapping sweepers
 		// (e.g. a transient overlap across a hot reload) both SELECT the same
 		// pending row and double-fire its notification / scheduled flow.
 		claim, claimErr := app.DB.Exec(
-			"UPDATE _benmore_scheduled_tasks SET status='running', claimed_at=? WHERE id = ? AND status='pending'",
-			now.Format(time.RFC3339), id)
+			"UPDATE _benmore_scheduled_tasks SET status='running', claimed_at=?, authorization=?, last_error='' WHERE id = ? AND status IN ('pending','blocked')",
+			now.Format(time.RFC3339), authorization, id)
 		if claimErr != nil {
 			continue
 		}
@@ -342,21 +390,100 @@ func sweepScheduledTasks(app *App) {
 		title, _ := t["title"].(string)
 		msg, _ := t["message"].(string)
 		status := "done"
+		lastError := ""
 		if kind, _ := t["kind"].(string); kind == "flow" {
-			if flow, _ := t["flow"].(string); flow != "" {
-				var data map[string]any
-				if bs, _ := t["body"].(string); bs != "" {
-					json.Unmarshal([]byte(bs), &data)
-				}
-				if err := executeFlowJob(app, flow, data); err != nil {
+			if err := executeScheduledFlow(app, t); err != nil {
+				if errors.Is(err, errScheduledFlowRateLimited) {
+					status, lastError = "blocked", err.Error()
+				} else {
 					status = "failed"
+					lastError = "flow execution failed; see server log"
+					log.Printf("SCHEDULE failed task=%v: %s", id, err)
 				}
 			}
 		}
+
 		if title == "" {
 			title = "Reminder"
 		}
-		CreateNotification(app.DB, uid, title, msg, "info", "")
-		app.DB.Exec("UPDATE _benmore_scheduled_tasks SET status=?, fired_at=? WHERE id=?", status, time.Now().UTC().Format(time.RFC3339), id)
+		if status == "done" {
+			CreateNotification(app.DB, uid, title, msg, "info", "")
+		}
+		var firedAt any
+		if status != "blocked" {
+			firedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		app.DB.Exec("UPDATE _benmore_scheduled_tasks SET status=?, fired_at=?, last_error=? WHERE id=?", status, firedAt, lastError, id)
 	}
+}
+
+// HTTP flows retain their ordinary authorization policy. Non-HTTP service
+// flows require a global administrator; scheduling cannot expose cron/event SQL
+// to ordinary users. Request-signature and account-erasure flows are not delegable.
+func schedulableFlow(app *App, name string, actor *Session) (*Flow, error) {
+	if actor == nil || actor.ActingAsGroup != "" {
+		return nil, fmt.Errorf("task owner is not authorized")
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	for _, flow := range app.Flows {
+		if flow.Name != name {
+			continue
+		}
+		if flow.Verify != "" || flow.VerifyConfig != nil || flowHasPurgeCurrentUser(flow.Steps) {
+			return nil, fmt.Errorf("flow requires a live signed request or account-erasure confirmation")
+		}
+		if flow.Trigger.Type != "http" && !actor.GlobalAdmin {
+			return nil, fmt.Errorf("internal flow requires a global administrator")
+		}
+		if flow.Role != "" && !HasAnyRole(actor, []string{flow.Role}) {
+			return nil, fmt.Errorf("task owner no longer has the flow's required role")
+		}
+		// The scheduler is already a durable worker. Execute async HTTP definitions
+		// inline here so request taint and actor permissions survive every step.
+		flow.Async = false
+		return &flow, nil
+	}
+	return nil, fmt.Errorf("scheduled flow no longer exists")
+}
+
+func executeScheduledFlow(app *App, task map[string]any) error {
+	actor, flow, _, err := prepareScheduledFlow(app, task)
+	if err != nil {
+		return err
+	}
+	body, _ := task["body"].(string)
+	if body == "" {
+		body = "{}"
+	}
+	r, err := scheduledFlowRequest(flow, body)
+	if err != nil {
+		return err
+	}
+	w := &scheduledFlowResponse{header: make(http.Header)}
+	if err := executeFlowHTTPAs(app, flow, w, r, actor); err != nil {
+		return err
+	}
+	if w.status >= 400 {
+		return fmt.Errorf("scheduled flow returned HTTP %d", w.status)
+	}
+	return nil
+}
+
+type scheduledFlowResponse struct {
+	header http.Header
+	status int
+}
+
+func (w *scheduledFlowResponse) Header() http.Header { return w.header }
+func (w *scheduledFlowResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *scheduledFlowResponse) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = 200
+	}
+	return len(b), nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -78,31 +79,19 @@ func columnSet(app *App, table string) map[string]bool {
 // group-key OR user_id OR ACL grant. Returns "" when the caller is admin
 // or the table has no scoping column (callers gate access separately).
 func queryScopeFilter(app *App, table string, session *Session) (string, []any) {
-	if session == nil {
+	mode := app.Access.ModeFor(table, OpRead, hasColumn(app, table, "user_id"),
+		app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key))
+	if session.IsAdminBypass() || app.Access.ReadAllowsBroaderRows(mode) {
 		return "", nil
 	}
-	// IsAdminBypass (NOT IsAdmin): an admin who is acting-as another group
-	// must stay scoped to that group - same invariant as rowScopeClause /
-	// crud.go / includes.go. Using IsAdmin() here would let an acting-as admin
-	// read every group's rows through POST /api/_query. The group/owner
-	// branches below use EffectiveGroupID, so the acted-as group is honored
-	// once we fall through.
-	if session.IsAdminBypass() {
-		return "", nil
+	pred, args, _ := rowScopeClause(app, table, session, "view")
+	if sc, ok := app.Scopes[table]; ok && sc.PublicReadWhen != "" {
+		if pred == "" {
+			return "(" + sc.PublicReadWhen + ")", args
+		}
+		pred = "(" + pred + " OR (" + sc.PublicReadWhen + "))"
 	}
-	if session.EffectiveHasGroup() && app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key) {
-		aclSQL, aclArgs := aclFilter(table, session.Email, "view")
-		args := []any{session.EffectiveGroupID()}
-		args = append(args, aclArgs...)
-		return fmt.Sprintf("(%s.%s = ? OR %s)", table, app.Group.Key, aclSQL), args
-	}
-	if hasColumn(app, table, "user_id") {
-		aclSQL, aclArgs := aclFilter(table, session.Email, "view")
-		args := []any{session.UserID}
-		args = append(args, aclArgs...)
-		return fmt.Sprintf("(%s.user_id = ? OR %s)", table, aclSQL), args
-	}
-	return "", nil
+	return pred, args
 }
 
 // RegisterQueryAPI wires POST /api/_query + the saved-views CRUD.
@@ -125,6 +114,19 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 			return
 		}
 		session := getSession(app, r)
+		if session != nil {
+			if err := checkScope(session, spec.Table, "read"); err != nil {
+				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+
+		// Owner-based unmasking needs user_id even when the caller projects
+		// only encrypted fields. Strip this internal projection after masking.
+		hiddenOwner := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && cols["user_id"] && !slices.Contains(spec.Select, "user_id")
+		if hiddenOwner {
+			spec.Select = append(spec.Select, "user_id")
+		}
 
 		sqlText, args, err := buildQuery(app, &spec, cols, session)
 		if err != nil {
@@ -135,6 +137,20 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 		if err != nil {
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed: " + err.Error()})
 			return
+		}
+		MaskEncryptedFields(app.Encrypted, spec.Table, rows, session)
+		for _, row := range rows {
+			if hiddenOwner {
+				delete(row, "user_id")
+			}
+			for col := range row {
+				if queryHiddenColumn(app, spec.Table, col) {
+					delete(row, col)
+				}
+			}
+		}
+		if IsReadAudited(app, spec.Table) {
+			LogReadAccess(spec.Table, "", "query", session)
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"rows": rows, "count": len(rows)})
 	})
@@ -197,6 +213,11 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 // buildQuery turns a validated spec into parameterized SQL.
 func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Session) (string, []any, error) {
 	t := spec.Table
+	// Filtering, sorting and aggregation can disclose protected values even
+	// when the final projection is masked. Reject those uses before SQL runs.
+	if err := validateQueryFieldAccess(app, spec, session); err != nil {
+		return "", nil, err
+	}
 	var selectParts []string
 	grouped := len(spec.GroupBy) > 0 || len(spec.Aggregates) > 0
 
@@ -339,6 +360,79 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	}
 	sqlText += fmt.Sprintf(" LIMIT %d", limit)
 	return sqlText, args, nil
+}
+
+func queryHiddenColumn(app *App, table, column string) bool {
+	if strings.HasSuffix(column, blindColSuffix) {
+		return true
+	}
+	// Explicit encryption config defines the visibility of an encrypted
+	// column, including intentionally named fields such as secret_note.
+	if app.Encrypted != nil {
+		for _, def := range app.Encrypted.Fields[table] {
+			if def.Column == column {
+				return false
+			}
+		}
+	}
+	return isSensitiveUserColumn(column)
+}
+
+func validateQueryFieldAccess(app *App, spec *querySpec, session *Session) error {
+	protected := func(column string) bool {
+		if queryHiddenColumn(app, spec.Table, column) {
+			return true
+		}
+		if app.Encrypted == nil {
+			return false
+		}
+		for _, def := range app.Encrypted.Fields[spec.Table] {
+			if def.Column != column || len(def.Roles) == 0 || session.IsAdmin() {
+				continue
+			}
+			if session != nil {
+				for _, role := range def.Roles {
+					if role == "self" || role == "owner" {
+						continue
+					}
+					if session.Role == role {
+						return false
+					}
+					for _, held := range session.Roles {
+						if held == role {
+							return false
+						}
+					}
+				}
+			}
+			return true
+		}
+		return false
+	}
+	for _, col := range spec.Select {
+		if queryHiddenColumn(app, spec.Table, col) {
+			return fmt.Errorf("column %s is not available", col)
+		}
+	}
+	var uses []string
+	uses = append(uses, spec.GroupBy...)
+	for col := range spec.Where {
+		uses = append(uses, col)
+	}
+	for _, order := range spec.OrderBy {
+		uses = append(uses, order.Col)
+	}
+	for _, agg := range spec.Aggregates {
+		if agg.Col != "" {
+			uses = append(uses, agg.Col)
+		}
+	}
+	for _, col := range uses {
+		if protected(col) {
+			return fmt.Errorf("column %s cannot be filtered, ordered or aggregated with your permissions", col)
+		}
+	}
+	return nil
 }
 
 // EnsureSavedViewsTable creates the saved-views table.

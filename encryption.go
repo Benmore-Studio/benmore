@@ -497,6 +497,42 @@ func RegisterEncryptedSQLiteDriver() {
 				return err
 			}
 
+			// benmore_totp_valid(secret, code) → 1/0.
+			//
+			// Exposes the framework's authenticator check (ValidateTOTP,
+			// mfa.go) to SQL so an app can build its own step-up gate -
+			// "prove it's really you before entering the admin portal" -
+			// against the user's ALREADY-ENABLED TOTP secret. The platform
+			// MFA endpoints can't serve that: /api/_auth/mfa/verify only
+			// validates the `pending:` enrollment secret and flips MFA on,
+			// so there was no way to re-check an enrolled factor mid-session.
+			//
+			// Why a SQL function rather than an endpoint: the flow layer
+			// (`run: sql`) is where app-authored gates live, and this keeps
+			// the secret inside the database engine. It is read by the
+			// comparison and never crosses into flow params, request bodies,
+			// compute steps, or logs - all places an app author could
+			// accidentally persist it.
+			//
+			// A `pending:` secret is deliberately refused: an enrollment
+			// that was started and abandoned is not a factor anyone has
+			// proven they hold.
+			//
+			// NOT pure (final arg false), unlike the crypto functions above:
+			// the result depends on the current 30-second time step, so
+			// SQLite must re-evaluate it per row and per statement rather
+			// than caching or hoisting a verdict that goes stale.
+			if err := conn.RegisterFunc("benmore_totp_valid", func(secret, code string) bool {
+				secret = strings.TrimSpace(secret)
+				code = strings.TrimSpace(code)
+				if secret == "" || code == "" || strings.HasPrefix(secret, "pending:") {
+					return false
+				}
+				return ValidateTOTP(secret, code)
+			}, false); err != nil {
+				return err
+			}
+
 			// SECURITY: block ATTACH DATABASE entirely. App-authored SQL
 			// (flows, hooks, sql_dynamic) runs on this connection. Per-app
 			// processes share a host, so without this a tenant could

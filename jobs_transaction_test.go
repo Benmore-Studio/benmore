@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -492,5 +493,184 @@ func TestJobsLeaseTTLEnvOverride(t *testing.T) {
 	t.Setenv("BENMORE_JOB_LEASE_SECONDS", "1")
 	if got := jobsHeartbeatInterval(); got != time.Second {
 		t.Fatalf("heartbeat = %v, want 1s floor", got)
+	}
+}
+
+// --- txCommitGuard panic-path regression -----------------------------------
+//
+// Review finding: runCronJob (cron.go) and executeFlowJob (above) begin a
+// *sql.Tx for `transaction: true` runs, then run the flow's steps via
+// executeSteps. Pre-fix, neither guaranteed the tx was finalized if a step
+// PANICKED: the panic unwound straight past the caller's own commit/rollback
+// logic to an outer recover() (runCronJob's own, or processNextJob's
+// top-level one in jobs.go), which only logs the panic - the *sql.Tx itself
+// was never Rollback()'d or Commit()'d. Its connection was never returned to
+// the pool, and under SQLite WAL an unreturned write-tx holds the app's write
+// lock until restart.
+//
+// A genuine panic reachable through the public runCronJob/executeFlowJob
+// entry points would require a step whose handler dereferences something
+// nil-able - flows.go's step handlers are, on inspection, defensively
+// nil-checked throughout (compute/email/etc. all explicit-nil-check their
+// config before dereferencing), and the two entry points never expose a way
+// to set ctx.Request (the one nil-interface panic surface found, in
+// execStepParse) from cron/job payloads. Rather than depend on a fragile,
+// implementation-specific panic path that could silently stop panicking
+// after an unrelated flows.go change (defeating the regression test without
+// a build failure), this test exercises the extracted txCommitGuard directly
+// - the exact mechanism both runCronJob and executeFlowJob rely on - with a
+// REAL panic/recover, registered in the same relative order as production
+// (recover() defer first, guard defer second, so the guard's rollback runs
+// BEFORE the recover swallows the panic, exactly as in cron.go/jobs.go).
+func TestJobTxCommitGuardRollsBackOnPanicBeforeRecover(t *testing.T) {
+	app := newJobsTestApp(t)
+	if _, err := app.DB.Exec("CREATE TABLE g (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	var recovered any
+	func() {
+		// Registered FIRST -> runs LAST, mirroring runCronJob's/
+		// processNextJob's outer recover() which is declared before the tx
+		// is even opened.
+		defer func() { recovered = recover() }()
+
+		tx, err := app.DB.Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		guard := &txCommitGuard{tx: tx}
+		// Registered SECOND -> runs FIRST, mirroring the guard defer in
+		// runCronJob/executeFlowJob which is registered immediately after
+		// Begin() and before executeSteps runs.
+		defer guard.rollbackUnlessHandled()
+
+		if _, err := tx.Exec("INSERT INTO g (name) VALUES ('leaked')"); err != nil {
+			t.Fatalf("insert inside tx: %v", err)
+		}
+
+		// Simulates a step panicking mid-executeSteps: control never
+		// reaches this function's own commit/rollback logic (there isn't
+		// any here, by design - that's the point), so guard.MarkHandled()
+		// is never called on this path.
+		panic("simulated step panic before any explicit commit/rollback")
+	}()
+
+	if recovered == nil {
+		t.Fatal("expected the outer recover() to observe the panic")
+	}
+
+	var count int
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM g").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("panic-path insert is visible (%d row(s)) - txCommitGuard did not roll back the leaked tx", count)
+	}
+}
+
+// TestJobTxCommitGuardPanicDoesNotLeakConnectionFromPool pins the DB to a single
+// connection (mirroring how one leaked, never-finalized write-tx can starve
+// the whole pool under SQLite WAL - the "holds the app's write lock until
+// restart" symptom from the review finding) and proves a post-panic write
+// still succeeds because txCommitGuard returned the connection to the pool.
+// Without the guard's rollback, this Exec would block until the context
+// timeout, since MaxOpenConns(1) means there is no second connection to hand
+// out.
+func TestJobTxCommitGuardPanicDoesNotLeakConnectionFromPool(t *testing.T) {
+	app := newWALJobsTestApp(t)
+	app.DB.SetMaxOpenConns(1)
+	if _, err := app.DB.Exec("CREATE TABLE g (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	func() {
+		defer func() { _ = recover() }() // mirrors the outer worker recover()
+
+		tx, err := app.DB.Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		guard := &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
+
+		if _, err := tx.Exec("INSERT INTO g (name) VALUES ('leaked')"); err != nil {
+			t.Fatalf("insert inside tx: %v", err)
+		}
+		panic("simulated step panic")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := app.DB.ExecContext(ctx, "INSERT INTO g (name) VALUES ('after-panic')"); err != nil {
+		t.Fatalf("connection unusable after panic (leaked tx never returned to the single-connection pool): %v", err)
+	}
+}
+
+// TestJobTxCommitGuardNoOpAfterMarkHandled proves the deferred safety net is
+// inert on the normal (non-panic) commit and rollback paths - i.e. it never
+// double-calls Rollback/Commit once the caller has explicitly finalized the
+// tx, matching how runCronJob/executeFlowJob call guard.MarkHandled()
+// immediately next to their own Commit()/Rollback() calls.
+func TestJobTxCommitGuardNoOpAfterMarkHandled(t *testing.T) {
+	app := newJobsTestApp(t)
+	if _, err := app.DB.Exec("CREATE TABLE g (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Commit path: MarkHandled before the deferred rollback runs means the
+	// deferred call is a no-op (Rollback after Commit is unreachable, but if
+	// it did fire it would surface sql.ErrTxDone which we explicitly ignore
+	// in production - here we assert it simply never corrupts the commit).
+	func() {
+		tx, err := app.DB.Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		guard := &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
+
+		if _, err := tx.Exec("INSERT INTO g (name) VALUES ('committed')"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		guard.MarkHandled()
+	}()
+
+	var count int
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM g").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("committed row not visible: count = %d, want 1", count)
+	}
+
+	// Rollback path: an explicit Rollback + MarkHandled must leave exactly
+	// the already-committed row - the deferred guard must not attempt (or
+	// error on) a second Rollback of an already-done tx.
+	func() {
+		tx, err := app.DB.Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		guard := &txCommitGuard{tx: tx}
+		defer guard.rollbackUnlessHandled()
+
+		if _, err := tx.Exec("INSERT INTO g (name) VALUES ('rolled back')"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		guard.MarkHandled()
+	}()
+
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM g").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count after rollback = %d, want 1 (only the earlier commit)", count)
 	}
 }
