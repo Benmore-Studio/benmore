@@ -134,7 +134,7 @@ func fireFeedbackWebhook(webhookURL, webhookToken, name string, payload map[stri
 		if webhookToken != "" {
 			req.Header.Set("Authorization", "Bearer "+webhookToken)
 		}
-		client := safeHTTPClient(10 * time.Second)
+		client := safeHTTPClientStrict(10 * time.Second)
 		if resp, err := client.Do(req); err == nil && resp != nil {
 			resp.Body.Close()
 		}

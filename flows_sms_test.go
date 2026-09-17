@@ -132,8 +132,7 @@ func TestSMSStepEmptyBodyErrors(t *testing.T) {
 }
 
 // End-to-end through the executor using the webhook provider as a fake.
-// SMS_WEBHOOK_URL is operator-configured and sendSMSWebhook does not run
-// the SSRF guard, so an httptest server on loopback is reachable here.
+// The injected transport captures delivery without weakening the SSRF guard.
 func TestSMSStepExecutesViaWebhookProvider(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
@@ -143,17 +142,16 @@ func TestSMSStepExecutesViaWebhookProvider(t *testing.T) {
 		Body string `json:"body"`
 	}
 	got := make(chan captured, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	providerURL := testSMSWebhook(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var c captured
 		_ = json.Unmarshal(raw, &c)
 		got <- c
 		w.WriteHeader(200)
 	}))
-	defer srv.Close()
 
-	t.Setenv("SMS_PROVIDER", "webhook")
-	t.Setenv("SMS_WEBHOOK_URL", srv.URL)
+	SetAppEnv(app.Dir, "SMS_PROVIDER", "webhook")
+	SetAppEnv(app.Dir, "SMS_WEBHOOK_URL", providerURL)
 
 	ctx := &FlowContext{
 		App:     app,
@@ -188,4 +186,16 @@ func TestSMSStepExecutesViaWebhookProvider(t *testing.T) {
 	if ctx.Data["msg.to"] != "+15551234567" {
 		t.Errorf("steps.msg.outputs.to not published, Data = %v", ctx.Data)
 	}
+}
+
+func testSMSWebhook(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	old := smsHTTPClient.Transport
+	t.Cleanup(func() { smsHTTPClient.Transport = old })
+	smsHTTPClient.Transport = auditRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w.Result(), nil
+	})
+	return "https://93.184.216.34/synthetic-sms"
 }

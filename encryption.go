@@ -241,13 +241,8 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 		config = &EncryptedFieldConfig{}
 	}
 
-	// 1. Check OS environment (production: set in env.yaml, the environment, or systemd)
-	keyStr := os.Getenv("ENCRYPTION_KEY")
-
-	// 2. Check env.yaml (local dev)
-	if keyStr == "" {
-		keyStr = GetEnv(dir, "ENCRYPTION_KEY")
-	}
+	// LoadEnv already resolved the owning process/files/vault before this call.
+	keyStr := GetEnv(dir, "ENCRYPTION_KEY")
 
 	// 3. Auto-generate. Persist to env.yaml ONLY when the app actually
 	// has encrypted fields configured - otherwise an ephemeral
@@ -290,19 +285,20 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 	if err != nil {
 		return fmt.Errorf("encryption key derivation: %w", err)
 	}
-	appEncryptionKey = derived
-	// Register in the per-DB registry too: in a multi-app process (host
-	// mode, router-side LoadApp) the LAST loaded app owns the global, so
-	// every crypto path that can know its DB file resolves through the
-	// registry instead.
+	if !isolateAppEnvironment.Load() {
+		appEncryptionKey = derived
+	}
+	// Shared processes use only the per-database registry.
 	RegisterDBEncryptionKey(filepath.Join(dir, "data.db"), derived)
 	// Blind-index key is HKDF-derived from the AES key so it has the
 	// same lifecycle (rotated with the encryption key) but is
 	// cryptographically distinct material. Failure to derive is fatal
 	// - the SQL function will refuse to compute HMACs without it, and
 	// then any insert into a blind-indexed column would error.
-	if err := SetBlindIndexKey(appEncryptionKey); err != nil {
-		return fmt.Errorf("blind-index key derivation: %w", err)
+	if !isolateAppEnvironment.Load() {
+		if err := SetBlindIndexKey(derived); err != nil {
+			return fmt.Errorf("blind-index key derivation: %w", err)
+		}
 	}
 	total := 0
 	for _, cols := range config.Fields {
@@ -391,6 +387,9 @@ func RegisterEncryptedSQLiteDriver() {
 			aesKeyForConn := func() []byte {
 				if k := cryptoKeysForDBPath(connDB); k != nil {
 					return k.aes
+				}
+				if isolateAppEnvironment.Load() {
+					return nil
 				}
 				return appEncryptionKey
 			}
@@ -492,6 +491,9 @@ func RegisterEncryptedSQLiteDriver() {
 				if k := cryptoKeysForDBPath(connDB); k != nil && len(k.blind) > 0 {
 					return BlindIndexHMACWithKey(k.blind, stringifyForCrypto(value)), nil
 				}
+				if isolateAppEnvironment.Load() {
+					return "", fmt.Errorf("database encryption key is not registered")
+				}
 				return BlindIndexHMAC(stringifyForCrypto(value))
 			}, true); err != nil {
 				return err
@@ -550,7 +552,7 @@ func RegisterEncryptedSQLiteDriver() {
 // InstallEncryptionTriggers creates SQLite triggers that auto-encrypt on INSERT/UPDATE.
 // Same pattern as computed field triggers - fires at the database level on every mutation.
 func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) {
-	if config == nil || appEncryptionKey == nil {
+	if config == nil || cryptoKeyForQuerier(db) == nil {
 		return
 	}
 
@@ -866,7 +868,7 @@ func maskValue(s string) string {
 // Also handles `old_<col>` keys - the framework includes a change-delta
 // inside newRow for hook templates, and those plaintext copies would
 // otherwise leak too.
-func encryptAuditFieldsCopy(config *EncryptedFieldConfig, table string, row map[string]any) map[string]any {
+func encryptAuditFieldsCopy(config *EncryptedFieldConfig, table string, row map[string]any, aesKey []byte) map[string]any {
 	if row == nil || config == nil {
 		return row
 	}
@@ -881,23 +883,18 @@ func encryptAuditFieldsCopy(config *EncryptedFieldConfig, table string, row map[
 		out[k] = v
 	}
 	for _, def := range defs {
-		encryptOneAuditField(out, def.Column)
-		encryptOneAuditField(out, "old_"+def.Column)
+		encryptOneAuditField(out, def.Column, aesKey)
+		encryptOneAuditField(out, "old_"+def.Column, aesKey)
 	}
 	return out
 }
 
-func encryptOneAuditField(row map[string]any, key string) {
+func encryptOneAuditField(row map[string]any, key string, aesKey []byte) {
 	v, ok := row[key]
 	if !ok || v == nil {
 		return
 	}
-	s, ok := v.(string)
-	if !ok {
-		// Non-string values can't go through fieldEncrypt today (string-
-		// only encryption, see integer-encryption TODO). Leave as-is.
-		return
-	}
+	s := stringifyForCrypto(v)
 	if s == "" || cryptoIsEncrypted(s) {
 		// Empty or already-encrypted (v1 or v2) - idempotent.
 		return
@@ -906,8 +903,10 @@ func encryptOneAuditField(row map[string]any, key string) {
 	// the source table, so there's no stable table/column to bind as AAD
 	// here - encrypt without context. The value is still confidential at
 	// rest; the M-3 column-move protection applies to the source columns.
-	if enc, err := fieldEncrypt(s); err == nil {
+	if enc, err := fieldEncryptWithKey(aesKey, s); err == nil && cryptoIsEncrypted(enc) {
 		row[key] = enc
+	} else {
+		row[key] = decryptFailMask
 	}
 }
 
@@ -919,7 +918,7 @@ func cryptoIsEncrypted(s string) bool {
 }
 
 // decryptFailMask replaces a value that LOOKS encrypted but could not be
-// decrypted under any known key. Returning the raw `enc:v1:…` ciphertext
+// decrypted under the owning database key. Returning the raw `enc:v1:…` ciphertext
 // to an API client is both a data leak (ciphertext is still confidential
 // material) and silent data corruption from the client's point of view -
 // nothing errors, nothing logs, the UI just renders gibberish. The mask
@@ -939,65 +938,55 @@ func logDecryptFailureThrottled(key string) {
 		return
 	}
 	if decryptFailLastLog.CompareAndSwap(last, now) {
-		log.Printf("ENCRYPTION: failed to decrypt value(s) in column %q under any known key - returning %q to callers. The active ENCRYPTION_KEY does not match the key that wrote this data (rotated env.yaml? seeded ciphertext from another environment?). Fix the key or re-encrypt the data. (throttled: at most one line per 30s)", key, decryptFailMask)
+		log.Printf("ENCRYPTION: failed to decrypt value(s) in column %q under the owning database key - returning %q to callers. The active ENCRYPTION_KEY does not match the key that wrote this data (rotated env.yaml? seeded ciphertext from another environment?). Fix the key or re-encrypt the data. (throttled: at most one line per 30s)", key, decryptFailMask)
 	}
 }
 
-// DecryptRowFields auto-decrypts any values in a row that have the enc: prefix.
-// Called from scanRows so ALL query paths get transparent decryption.
-func DecryptRowFields(row map[string]any) {
+// cryptoKeyForQuerier resolves only the database being queried. Resolve before
+// opening result rows, including on *sql.Tx, to avoid nested active cursors.
+func cryptoKeyForQuerier(db mutationQuerier) []byte {
+	var path string
+	if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&path); err == nil {
+		if keys := cryptoKeysForDBPath(path); keys != nil {
+			return keys.aes
+		}
+	}
+	if isolateAppEnvironment.Load() {
+		return nil
+	}
+	return appEncryptionKey
+}
+
+func fieldEncryptForDB(db mutationQuerier, value string) (string, error) {
+	key := cryptoKeyForQuerier(db)
+	if len(key) == 0 && isolateAppEnvironment.Load() {
+		return "", fmt.Errorf("database encryption key is not registered")
+	}
+	return fieldEncryptWithKey(key, value)
+}
+
+func fieldDecryptForDB(db mutationQuerier, value string) (string, error) {
+	return fieldDecryptCtx(cryptoKeyForQuerier(db), "", value)
+}
+
+// DecryptRowFields decrypts with the caller's database key only. Authenticated
+// ciphertext does not grant permission to try another tenant's key.
+func DecryptRowFields(row map[string]any, key []byte) {
 	for k, v := range row {
 		s, ok := v.(string)
 		if !ok || !cryptoIsEncrypted(s) {
 			continue
 		}
-		// Pass expectColumn="" here: a result-set key may be an alias
-		// or a JOINed column, so we can't reliably equate it with the
-		// AAD-bound source column without false rejections. The v2 AAD
-		// is still GCM-authenticated (tamper-evident); strict column-
-		// move enforcement happens in the benmore_decrypt SQL function
-		// where the true column is known.
-		if appEncryptionKey != nil {
-			if decrypted, err := fieldDecryptCtx(appEncryptionKey, "", s); err == nil {
-				row[k] = decrypted
+		// Result names may be aliases; SQL functions enforce column AAD when known.
+		if len(key) > 0 {
+			if plain, err := fieldDecryptCtx(key, "", s); err == nil {
+				row[k] = plain
 				continue
 			}
 		}
-		// Global key absent or wrong (multi-app process: the global is
-		// whichever app loaded last). Try every registered per-DB key -
-		// AES-GCM is authenticated, so only the key that actually wrote
-		// this value can succeed; a wrong key fails closed, never
-		// mis-decrypts.
-		if plain, ok := decryptWithAnyRegisteredKey(s); ok {
-			row[k] = plain
-			continue
-		}
-		// No key decrypts this value. NEVER pass raw ciphertext through
-		// to API consumers (pre-v2.7.194 behavior): mask + log loudly.
 		row[k] = decryptFailMask
 		logDecryptFailureThrottled(k)
 	}
-}
-
-// decryptWithAnyRegisteredKey tries each key in dbCryptoRegistry against
-// an encrypted value. Used by DecryptRowFields, which (unlike the SQL
-// functions) has no connection to resolve the DB path from. Safe because
-// GCM authentication rejects every wrong key.
-func decryptWithAnyRegisteredKey(s string) (string, bool) {
-	var out string
-	found := false
-	dbCryptoRegistry.Range(func(_, v any) bool {
-		k := v.(*dbCryptoKeys)
-		if len(k.aes) == 0 || subtle.ConstantTimeCompare(k.aes, appEncryptionKey) == 1 {
-			return true // skip empty + the already-tried global
-		}
-		if plain, err := fieldDecryptCtx(k.aes, "", s); err == nil {
-			out, found = plain, true
-			return false
-		}
-		return true
-	})
-	return out, found
 }
 
 // ===== Key derivation (M-4) =====
@@ -1315,7 +1304,8 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	if app.Encrypted == nil || len(app.Encrypted.Fields) == 0 {
 		return 0, fmt.Errorf("no encrypted fields configured in encrypted.yaml - nothing to rotate")
 	}
-	if appEncryptionKey == nil {
+	currentKey := cryptoKeyForQuerier(app.DB)
+	if currentKey == nil {
 		return 0, fmt.Errorf("no current encryption key loaded - set ENCRYPTION_KEY before rotating")
 	}
 
@@ -1345,12 +1335,12 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	// Refuse no-op rotation (would re-encrypt every row with the same
 	// key - pointless work + audit-log noise). Constant-time compare
 	// since this is a secret-key equality check.
-	if subtle.ConstantTimeCompare(newKey, appEncryptionKey) == 1 {
+	if subtle.ConstantTimeCompare(newKey, currentKey) == 1 {
 		return 0, fmt.Errorf("new key matches current key - refusing no-op rotation")
 	}
 
-	oldKey := make([]byte, len(appEncryptionKey))
-	copy(oldKey, appEncryptionKey)
+	oldKey := make([]byte, len(currentKey))
+	copy(oldKey, currentKey)
 
 	// Count rows that need rotating across all configured columns.
 	type plan struct {
@@ -1429,7 +1419,10 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	// agree on the new key. The next process restart loads OLD from
 	// env.yaml and fails to decrypt - but that's a recoverable state
 	// (operator manually edits env.yaml).
-	appEncryptionKey = newKey
+	RegisterDBEncryptionKey(filepath.Join(app.Dir, "data.db"), newKey)
+	if !isolateAppEnvironment.Load() {
+		appEncryptionKey = newKey
+	}
 	// Blind-index key is HKDF-derived from the AES key. Rotate it
 	// in-step so every blind index recomputed below uses the new HMAC
 	// material. If derivation fails, we abort BEFORE rebuilding (the

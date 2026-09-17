@@ -52,7 +52,7 @@ func hasPermission(db *sql.DB, resourceType string, resourceID string, email str
 		SELECT permission FROM _benmore_permissions
 		WHERE resource_type = ? AND resource_id = ?
 		AND grant_type = 'user' AND grantee_id = ?
-		AND (expires_at IS NULL OR expires_at > datetime('now'))
+		AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 		LIMIT 1
 	`, resourceType, resourceID, email).Scan(&permission)
 
@@ -108,7 +108,7 @@ func aclFilter(table string, email string, minPermission string) (string, []any)
 	}
 
 	sql := fmt.Sprintf(
-		`id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND %s AND (expires_at IS NULL OR expires_at > datetime('now')))`,
+		`id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND %s AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')))`,
 		permFilter,
 	)
 	return sql, []any{table, email}

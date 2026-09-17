@@ -89,7 +89,8 @@ func TestSSEEventsRejectsAnonymousInProduction(t *testing.T) {
 // BroadcastReload must frame its payload as `reload|<json>` with a JSON-safe
 // body so a reason containing quotes cannot corrupt the SSE data field.
 func TestBroadcastReloadPayloadIsJSON(t *testing.T) {
-	client := &sseClient{ch: make(chan string, 1)}
+	app := &App{Dir: t.TempDir()}
+	client := &sseClient{ch: make(chan string, 1), principal: realtimePrincipal{app: app}}
 	sseHub.mu.Lock()
 	sseHub.clients[client] = true
 	sseHub.mu.Unlock()
@@ -99,7 +100,7 @@ func TestBroadcastReloadPayloadIsJSON(t *testing.T) {
 		sseHub.mu.Unlock()
 	}()
 
-	BroadcastReload(`weird"reason`)
+	BroadcastReload(app, `weird"reason`)
 
 	select {
 	case payload := <-client.ch:

@@ -43,7 +43,7 @@ func resolveServableFile(root, target string) (string, bool) {
 		return "", false
 	}
 	st, err := os.Stat(realTargetAbs)
-	if err != nil || st.IsDir() {
+	if err != nil || !st.Mode().IsRegular() {
 		return "", false
 	}
 	return realTargetAbs, true

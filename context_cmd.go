@@ -146,7 +146,7 @@ func BuildContext(app *App) AppContext {
 	}
 
 	// Env vars (names only, not values)
-	for k := range EnvVars {
+	for k := range AppEnvSnapshot(app.Dir) {
 		ctx.EnvVars = append(ctx.EnvVars, k)
 	}
 

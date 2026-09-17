@@ -10,9 +10,9 @@ package main
 //
 // First request: server reads source, resizes via x/image/draw to
 // the requested width (height preserves aspect), encodes to the
-// requested format, writes to uploads/_transforms/<hash>.<fmt>, and
-// streams the bytes back. Subsequent requests hit the cached file
-// directly with a 1-year immutable Cache-Control.
+// requested format and returns the bytes. Public derivatives are cached under
+// .benmore/image-transforms after source authorization. Private derivatives
+// are never stored and return Cache-Control: private, no-store.
 //
 // Supported formats: jpeg, png, gif (decode); jpeg, png (encode).
 // webp encoding requires CGO so we transparently fall back to jpeg
@@ -32,9 +32,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/image/draw"
 )
@@ -55,16 +57,61 @@ const uploadsMaxImagePixels = 40 * 1000 * 1000 // ~40 MP
 // concurrency is low.
 var uploadsTransformSem = make(chan struct{}, 4)
 
-// RegisterImageTransformRoute mounts /api/_images/transform. No auth
-// gate - transforms are public by design (the source URL is itself
-// the access control surface; if the user can fetch the original,
-// they can fetch a variant). Apps with private images should serve
-// them via signed URLs (signed_urls.go) and gate the transform
-// endpoint accordingly via flows.yaml - out of scope here.
+const imageTransformCacheBytes = 64 << 20
+const imageTransformCacheEntries = 256
+
+var imageTransformCacheMu sync.Mutex
+
+// Transform parameters are visitor-controlled. Bound the cache independently
+// of upload quotas so public requests cannot fill an app's runtime directory.
+func cacheImageTransform(root *os.Root, name string, data []byte) {
+	if len(data) > imageTransformCacheBytes {
+		return
+	}
+	imageTransformCacheMu.Lock()
+	defer imageTransformCacheMu.Unlock()
+	if err := root.MkdirAll(filepath.Dir(name), 0700); err != nil {
+		return
+	}
+	dir, err := root.Open(filepath.Dir(name))
+	if err != nil {
+		return
+	}
+	entries, readErr := dir.Readdir(imageTransformCacheEntries + 1)
+	dir.Close()
+	if readErr != nil && readErr != io.EOF {
+		return
+	}
+	if len(entries) >= imageTransformCacheEntries {
+		return
+	}
+	total := int64(len(data))
+	for _, entry := range entries {
+		total += entry.Size()
+		if total > imageTransformCacheBytes {
+			return
+		}
+	}
+	tmp := name + "." + generateToken(12)
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return
+	}
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	defer root.Remove(tmp)
+	if writeErr == nil && closeErr == nil {
+		_ = root.Rename(tmp, name)
+	}
+}
+
+// RegisterImageTransformRoute applies source authorization before every cache
+// lookup. Private derivatives are never persisted or shared through HTTP caches.
 func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 	mux.HandleFunc("GET /api/_images/transform", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		src := r.URL.Query().Get("src")
-		if src == "" || !strings.HasPrefix(src, "/uploads/") {
+		if !strings.HasPrefix(src, "/uploads/") || path.Clean(src) != src || strings.ContainsAny(src, "\\\x00") {
 			httpError(w, "missing or invalid src (must be /uploads/...)", http.StatusBadRequest)
 			return
 		}
@@ -73,60 +120,101 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 		w_ := parseDim(r.URL.Query().Get("w"), 0, 2000)
 		h_ := parseDim(r.URL.Query().Get("h"), 0, 2000)
 		fmt_ := strings.ToLower(r.URL.Query().Get("fmt"))
+		ext := fmt_
+		if ext == "" {
+			ext = strings.ToLower(strings.TrimPrefix(path.Ext(src), "."))
+		}
+		switch ext {
+		case "", "jpg", "jpeg", "webp":
+			ext = "jpg" // webp requests use the JPEG fallback, including cache hits
+		case "png", "gif":
+		default:
+			httpError(w, "unsupported image format", http.StatusBadRequest)
+			return
+		}
 		quality := parseDim(r.URL.Query().Get("q"), 0, 100)
 		if quality == 0 {
 			quality = 82
 		}
 
-		// Build a deterministic cache key from src + transform params so
-		// identical requests dedupe to one cached file.
-		cacheKey := imageCacheKey(src, w_, h_, fmt_, quality)
-		ext := fmt_
-		if ext == "" {
-			ext = strings.TrimPrefix(filepath.Ext(src), ".")
-			if ext == "" {
-				ext = "jpg"
-			}
-		}
-		cachePath := filepath.Join(app.Dir, "uploads", "_transforms", cacheKey+"."+ext)
-
-		// Cache hit - stream the bytes.
-		if data, err := os.ReadFile(cachePath); err == nil {
-			w.Header().Set("Content-Type", contentTypeForExt(ext))
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			w.Write(data)
-			return
-		}
-
-		// Auth gate consistent with the static /uploads/ handler in
-		// server.go: public media is open (the source URL is itself the
-		// access-control surface), but private-tier sources
-		// (uploads/private/...) must carry a valid signed URL. Without
-		// this, the transform endpoint would be an unauthenticated read
-		// primitive for files that are otherwise gated behind signed URLs.
-		if isPrivateUploadPath(src) {
+		private := isPrivateUploadPath(src)
+		if private {
 			if !ValidateSignedURL(strings.TrimPrefix(src, "/uploads/"), r) {
 				httpError(w, "forbidden - invalid or expired signed URL", http.StatusForbidden)
 				return
 			}
 		}
 
-		// Cache miss - load the source. filepath.Clean normalizes any
-		// `..` segments so `src=/uploads/../app.yaml` resolves to a
-		// path that fails the HasPrefix gate below. Without the Clean
-		// step, a percent-encoded `..` chain could escape /uploads/.
-		sourcePath := filepath.Clean(filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
 		uploadsRoot := filepath.Join(app.Dir, "uploads")
-		if sourcePath != uploadsRoot && !strings.HasPrefix(sourcePath, uploadsRoot+string(filepath.Separator)) {
-			httpError(w, "source must live under /uploads/", http.StatusBadRequest)
+		sourcePath, ok := resolveServableFile(uploadsRoot, filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
+		if !ok || strings.HasPrefix(src, "/uploads/_transforms/") {
+			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
-		f, err := os.Open(sourcePath)
+		realRoot, err := filepath.EvalSymlinks(uploadsRoot)
+		if err != nil {
+			httpError(w, "source not found", http.StatusNotFound)
+			return
+		}
+		realRoot, err = filepath.Abs(realRoot)
+		if err != nil {
+			httpError(w, "source not found", http.StatusNotFound)
+			return
+		}
+		rel, err := filepath.Rel(realRoot, sourcePath)
+		if err != nil || strings.HasPrefix(filepath.ToSlash(rel), "_transforms/") {
+			httpError(w, "source not found", http.StatusNotFound)
+			return
+		}
+		if isPrivateUploadPath("uploads/" + filepath.ToSlash(rel)) {
+			private = true
+			if !ValidateSignedURL(strings.TrimPrefix(src, "/uploads/"), r) {
+				httpError(w, "forbidden - invalid or expired signed URL", http.StatusForbidden)
+				return
+			}
+		}
+		root, err := os.OpenRoot(realRoot)
+		if err != nil {
+			httpError(w, "source not found", http.StatusNotFound)
+			return
+		}
+		defer root.Close()
+		f, err := root.Open(rel)
 		if err != nil {
 			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
 		defer f.Close()
+		st, err := f.Stat()
+		if err != nil || !st.Mode().IsRegular() {
+			httpError(w, "source not found", http.StatusNotFound)
+			return
+		}
+
+		// Use a new non-public cache namespace: old uploads/_transforms files
+		// may contain private derivatives produced by older versions.
+		cacheKey := imageCacheKey(src+"|"+strconv.FormatInt(st.ModTime().UnixNano(), 10)+"|"+strconv.FormatInt(st.Size(), 10), w_, h_, ext, quality)
+		cachePath := filepath.Join(".benmore", "image-transforms", cacheKey+"."+ext)
+		appRoot, rootErr := os.OpenRoot(app.Dir)
+		if rootErr == nil {
+			defer appRoot.Close()
+		}
+		if !private && rootErr == nil {
+			if data, err := appRoot.ReadFile(cachePath); err == nil {
+				w.Header().Set("Content-Type", contentTypeForExt(ext))
+				w.Header().Set("Cache-Control", "public, max-age=86400")
+				w.Write(data)
+				return
+			}
+		}
+		// Hold the slot through resizing and encoding too: those stages still
+		// retain the decoded image. Cancellation must release a waiting request.
+		select {
+		case uploadsTransformSem <- struct{}{}:
+			defer func() { <-uploadsTransformSem }()
+		case <-r.Context().Done():
+			return
+		}
 
 		// Decompression-bomb guard: read ONLY the header via DecodeConfig
 		// and reject before allocating any decode buffer when the declared
@@ -138,7 +226,7 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 			return
 		}
 		if cfg.Width <= 0 || cfg.Height <= 0 ||
-			int64(cfg.Width)*int64(cfg.Height) > uploadsMaxImagePixels {
+			cfg.Width > uploadsMaxImagePixels/cfg.Height {
 			httpError(w, "source image too large to transform", http.StatusUnsupportedMediaType)
 			return
 		}
@@ -150,9 +238,7 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 
 		// Bound concurrent decodes - each holds a large RGBA buffer, so a
 		// burst of cache-miss requests must not multiply memory unbounded.
-		uploadsTransformSem <- struct{}{}
 		img, _, err := image.Decode(f)
-		<-uploadsTransformSem
 		if err != nil {
 			httpError(w, "decode failed: "+err.Error(), http.StatusUnsupportedMediaType)
 			return
@@ -185,11 +271,14 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 		}
 
 		// Best-effort cache write - failure doesn't fail the response.
-		_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
-		_ = os.WriteFile(cachePath, buf.Bytes(), 0o644)
+		if !private && rootErr == nil {
+			cacheImageTransform(appRoot, cachePath, buf.Bytes())
+		}
 
 		w.Header().Set("Content-Type", contentTypeForExt(ext))
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		if !private {
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		}
 		io.Copy(w, &buf)
 	})
 }
@@ -219,6 +308,8 @@ func resizeFit(src image.Image, maxW, maxH int) image.Image {
 	}
 	newW := int(float64(srcW) * scale)
 	newH := int(float64(srcH) * scale)
+	newW = max(1, newW)
+	newH = max(1, newH)
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
 	return dst

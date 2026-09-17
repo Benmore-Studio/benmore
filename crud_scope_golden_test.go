@@ -49,7 +49,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "records",
 			session:   groupUser,
 			action:    "edit",
-			predicate: "(org_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('edit','admin') AND (expires_at IS NULL OR expires_at > datetime('now'))))",
+			predicate: "(org_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('edit','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{"org-a", "records", "g@example.com"},
 		},
 		{
@@ -58,7 +58,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "notes",
 			session:   ownerUser,
 			action:    "delete",
-			predicate: "(user_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('delete','admin') AND (expires_at IS NULL OR expires_at > datetime('now'))))",
+			predicate: "(user_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{int64(20), "notes", "o@example.com"},
 		},
 		{
@@ -67,7 +67,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "rooms",
 			session:   groupUser,
 			action:    "view",
-			predicate: "(EXISTS (SELECT 1 FROM room_members WHERE room_members.room_id = rooms.id AND room_members.member_id = ?) OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR expires_at > datetime('now'))))",
+			predicate: "(EXISTS (SELECT 1 FROM room_members WHERE room_members.room_id = rooms.id AND room_members.member_id = ?) OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{int64(10), "rooms", "g@example.com"},
 		},
 	}
@@ -185,6 +185,9 @@ func newCrudScopeTestApp(t *testing.T) (*App, *http.ServeMux) {
 			{Name: "notes", Columns: []Column{{Name: "id"}, {Name: "user_id"}, {Name: "title"}}},
 		},
 	}
+	// buildAppMux starts background workers. Stop them before the database
+	// and temporary directory are removed, matching the real app lifecycle.
+	t.Cleanup(app.Shutdown)
 	return app, buildAppMux(app, true, "http://localhost")
 }
 

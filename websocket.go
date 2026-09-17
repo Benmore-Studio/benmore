@@ -14,10 +14,10 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // WebSocket support - zero external dependencies.
@@ -69,13 +69,14 @@ type wsConn struct {
 
 // wsClient represents a connected WebSocket client.
 type wsClient struct {
-	ws      *wsConn
-	send    chan []byte
-	appID   string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
-	userID  int64
-	email   string // session email - ws_rooms membership checks against email-shaped user columns
-	groupID string
-	isAdmin bool
+	principal realtimePrincipal
+	ws        *wsConn
+	send      chan []byte
+	appID     string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
+	userID    int64
+	email     string // session email - ws_rooms membership checks against email-shaped user columns
+	groupID   string
+	isAdmin   bool
 	// remoteIP is the connecting client's source host (no port), captured
 	// at connect time for the H-16 per-anonymous-IP connection cap.
 	remoteIP string
@@ -175,6 +176,16 @@ func (ws *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 	opcode = header[0] & 0x0F
 	masked := header[1]&0x80 != 0
 	length := uint64(header[1] & 0x7F)
+	// No extensions or fragmentation are negotiated by this text protocol.
+	if !masked || header[0]&0x70 != 0 || header[0]&0x80 == 0 {
+		return 0, nil, errors.New("invalid client frame flags")
+	}
+	if opcode != wsOpText && opcode != wsOpClose && opcode != wsOpPing && opcode != wsOpPong {
+		return 0, nil, errors.New("unsupported frame opcode")
+	}
+	if opcode >= 8 && length > 125 {
+		return 0, nil, errors.New("oversized control frame")
+	}
 
 	// Extended payload length
 	switch length {
@@ -184,12 +195,18 @@ func (ws *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 			return 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext))
+		if length < 126 {
+			return 0, nil, errors.New("noncanonical frame length")
+		}
 	case 127:
 		ext := make([]byte, 8)
 		if _, err := io.ReadFull(ws.br, ext); err != nil {
 			return 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext)
+		if length < 65536 {
+			return 0, nil, errors.New("noncanonical frame length")
+		}
 	}
 
 	if length > wsMaxMessageSize {
@@ -217,6 +234,12 @@ func (ws *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 		}
 	}
 
+	if opcode == wsOpText && !utf8.Valid(payload) {
+		return 0, nil, errors.New("invalid text encoding")
+	}
+	if opcode == wsOpClose && (len(payload) == 1 || (len(payload) > 2 && !utf8.Valid(payload[2:]))) {
+		return 0, nil, errors.New("invalid close payload")
+	}
 	return opcode, payload, nil
 }
 
@@ -298,6 +321,7 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		var email string
 		var groupID string
 		var isAdmin bool
+		principal := realtimePrincipal{app: app, request: r}
 		if needsAuth && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
@@ -306,16 +330,24 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 			}
 			userID = session.UserID
 			email = session.Email
-			groupID = session.GroupID
-			isAdmin = session.IsAdmin()
+			groupID = session.EffectiveGroupID()
+			isAdmin = session.IsAdminBypass()
+			principal.session = session
 		} else if needsAuth && wsAnonymous {
 			// Best-effort session attach so authed visitors still get
 			// their scoped fan-out, but unauthed visitors aren't blocked.
 			if session := getSession(app, r); session != nil {
 				userID = session.UserID
 				email = session.Email
-				groupID = session.GroupID
-				isAdmin = session.IsAdmin()
+				groupID = session.EffectiveGroupID()
+				isAdmin = session.IsAdminBypass()
+				principal.session = session
+			}
+		}
+		if principal.session == nil && app.DB != nil {
+			if session := getSession(app, r); session != nil {
+				principal.session = session
+				userID, email, groupID, isAdmin = session.UserID, session.Email, session.EffectiveGroupID(), session.IsAdminBypass()
 			}
 		}
 
@@ -338,7 +370,7 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		globalCount := len(wsHub.clients)
 		var userCount, anonIPCount int
 		for c := range wsHub.clients {
-			if needsAuth && !isAdmin && userID != 0 && c.userID == userID {
+			if needsAuth && !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
 				userCount++
 			}
 			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
@@ -379,8 +411,9 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 
 		client := &wsClient{
 			ws:            ws,
+			principal:     principal,
 			send:          make(chan []byte, wsSendBufferSize),
-			appID:         filepath.Base(app.Dir),
+			appID:         realtimeAppID(app.Dir),
 			userID:        userID,
 			email:         email,
 			groupID:       groupID,
@@ -400,7 +433,7 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		lockedGlobal := len(wsHub.clients)
 		lockedUser, lockedAnonIP := 0, 0
 		for c := range wsHub.clients {
-			if needsAuth && !isAdmin && userID != 0 && c.userID == userID {
+			if needsAuth && !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
 				lockedUser++
 			}
 			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
@@ -561,6 +594,10 @@ func wsReadLoop(client *wsClient, app *App) {
 // pattern - and apps with no ws_rooms block - are authorized as
 // before. Admins bypass, matching CRUD scoping.
 func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
+	session, valid := client.principal.current()
+	if !valid {
+		return false
+	}
 	if app == nil || len(app.WSRooms) == 0 || room == "" {
 		return true
 	}
@@ -572,7 +609,7 @@ func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
 		if client.userID == 0 {
 			return false // membership rooms require authentication
 		}
-		if client.isAdmin {
+		if session != nil && session.IsAdminBypass() {
 			return true
 		}
 		userVal := any(client.userID)
@@ -607,6 +644,10 @@ func wsWriteLoop(client *wsClient) {
 				return
 			}
 		case <-ticker.C:
+			if _, valid := client.principal.current(); !valid {
+				client.ws.close()
+				return
+			}
 			// Keepalive ping
 			if err := client.ws.writeFrame(wsOpPing, nil); err != nil {
 				return
@@ -617,7 +658,7 @@ func wsWriteLoop(client *wsClient) {
 
 // ===== Broadcasting =====
 
-func BroadcastWSChange(table, action string, groupID string, userID int64) {
+func BroadcastWSChange(app *App, table, action string, groupID string, userID int64) {
 	msg, _ := json.Marshal(wsServerMsg{Type: "change", Table: table, Action: action})
 	genericMsg, _ := json.Marshal(wsServerMsg{Type: "change", Action: "refresh"})
 
@@ -625,6 +666,9 @@ func BroadcastWSChange(table, action string, groupID string, userID int64) {
 	defer wsHub.mu.RUnlock()
 
 	for client := range wsHub.clients {
+		if !realtimeSameApp(app, client.principal.app) || !client.principal.canRead(table, userID) {
+			continue
+		}
 		// Same scoping rules as broadcastToSSE in pubsub.go - group-
 		// scoped events drop non-group clients, owner-scoped events
 		// send a generic refresh to non-owners, unscoped events go to
@@ -654,14 +698,14 @@ func BroadcastWSChange(table, action string, groupID string, userID int64) {
 	}
 }
 
-func BroadcastWSNotification(userID int64, title, body string) {
+func BroadcastWSNotification(app *App, userID int64, title, body string) {
 	msg, _ := json.Marshal(wsServerMsg{Type: "notification", Title: title, Body: body})
 
 	wsHub.mu.RLock()
 	defer wsHub.mu.RUnlock()
 
 	for client := range wsHub.clients {
-		if client.userID == userID || client.isAdmin {
+		if realtimeSameApp(app, client.principal.app) && client.principal.canRead(notificationsTable, userID) && client.userID == userID {
 			select {
 			case client.send <- msg:
 			default:
@@ -758,53 +802,41 @@ func scopedRoomID(c *wsClient, raw string) string {
 	}
 }
 
-// BroadcastWSToRoomGlobal is the server-originated counterpart to
-// the client-driven broadcastToRoom. It fans out a payload to every
-// connected WS client whose scope-prefixed room matches the supplied
-// raw room ID - meaning a hook firing room="order-42" reaches:
-//
-//   - every group-scoped client where "g<groupID>:order-42" is joined
-//   - every user-scoped client where "u<userID>:order-42" is joined
-//   - every anonymous client where "anon:order-42" is joined
-//
-// Sender is nil (this is a server broadcast, not a client one), so
-// every matching client receives the message - no echo-skip logic.
-// payload is sent verbatim; callers serialize their own JSON.
-//
-// Used by flows.yaml `ws:` steps and hooks.yaml `ws:` actions to
-// push real-time updates without polling.
-func BroadcastWSToRoomGlobal(rawRoom, payload string) {
-	if rawRoom == "" {
-		return
+// BroadcastWSToRoom delivers server messages only to this app and tenant.
+// An absent tenant is an error for grouped apps; it never means all tenants.
+func BroadcastWSToRoom(app *App, groupID, rawRoom, payload string) error {
+	if app == nil || app.Dir == "" || rawRoom == "" {
+		return errors.New("ws broadcast requires an app and room")
+	}
+	grouped := app.Group != nil && app.Group.Key != ""
+	if grouped && (groupID == "" || groupID == "0") {
+		return errors.New("ws broadcast requires a tenant in grouped apps")
+	}
+	msg, err := json.Marshal(wsServerMsg{Type: "message", Room: rawRoom, Payload: json.RawMessage(payload)})
+	if err != nil {
+		return err
 	}
 	wsHub.mu.RLock()
 	defer wsHub.mu.RUnlock()
 	for c := range wsHub.clients {
-		scoped := scopedRoomID(c, rawRoom)
-		if scoped == "" {
+		if c.appID != realtimeAppID(app.Dir) || (grouped && c.groupID != groupID) {
+			continue
+		}
+		if !wsRoomAuthorized(app, c, rawRoom) {
 			continue
 		}
 		c.subMu.RLock()
-		joined := c.rooms[scoped]
+		joined := c.rooms[scopedRoomID(c, rawRoom)]
 		c.subMu.RUnlock()
 		if !joined {
-			continue
-		}
-		msg, err := json.Marshal(wsServerMsg{
-			Type:    "message",
-			Room:    scoped,
-			From:    0, // 0 = server-originated
-			Payload: json.RawMessage(payload),
-		})
-		if err != nil {
 			continue
 		}
 		select {
 		case c.send <- msg:
 		default:
-			// drop on backpressure
 		}
 	}
+	return nil
 }
 
 // broadcastToRoom relays a typed message to every wsHub client that
@@ -825,6 +857,9 @@ func BroadcastWSToRoomGlobal(rawRoom, payload string) {
 //   - mismatches cross-tenant (different groupID → different key)
 //   - mismatches cross-app (different appID prefix → different key)
 func broadcastToRoom(sender *wsClient, rawRoom, msgType string, payload json.RawMessage) {
+	if !wsRoomAuthorized(sender.principal.app, sender, rawRoom) {
+		return
+	}
 	senderScoped := scopedRoomID(sender, rawRoom)
 	if senderScoped == "" {
 		return
@@ -841,7 +876,7 @@ func broadcastToRoom(sender *wsClient, rawRoom, msgType string, payload json.Raw
 	wsHub.mu.RLock()
 	defer wsHub.mu.RUnlock()
 	for c := range wsHub.clients {
-		if c == sender {
+		if c == sender || !wsRoomAuthorized(c.principal.app, c, rawRoom) {
 			continue
 		}
 		c.subMu.RLock()

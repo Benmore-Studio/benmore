@@ -213,7 +213,7 @@ func healthHandler(app *App) http.HandlerFunc {
 
 		// 5. Sessions: active count
 		var activeSessions int64
-		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE expires_at > datetime('now')").Scan(&activeSessions)
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&activeSessions)
 		checks["sessions"] = map[string]any{"active": activeSessions}
 
 		// Anonymous: basic status only. Admin: full details.
@@ -463,7 +463,7 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 		// hit the ciphertext, which deliberately fails to match.
 		if blindCols[col] {
 			if op == "=" {
-				h, err := BlindIndexHMAC(values[0])
+				h, err := blindIndexForApp(app, values[0])
 				if err == nil && h != "" {
 					col = col + blindColSuffix
 					values[0] = h
@@ -474,7 +474,7 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 				parts := strings.Split(values[0], ",")
 				hashed := make([]string, 0, len(parts))
 				for _, p := range parts {
-					h, err := BlindIndexHMAC(p)
+					h, err := blindIndexForApp(app, p)
 					if err != nil || h == "" {
 						continue
 					}

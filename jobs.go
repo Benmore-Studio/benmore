@@ -642,7 +642,7 @@ func processNextJob(app *App) (worked bool) {
 	case "cron":
 		jobErr = executeCronJob(app, flowName, data)
 	case "webhook_subscription":
-		jobErr = executeWebhookSubscriptionJob(data, app.Dir)
+		jobErr = executeWebhookSubscriptionJob(data, app)
 	default: // "flow"
 		jobErr = executeFlowJob(app, flowName, data)
 	}
@@ -772,7 +772,14 @@ func executeHookJob(app *App, data map[string]any) error {
 
 	hook := hookFromJobPayload(hookData)
 
-	executeHook(app.DB, hook, rowData, app.Dir)
+	// Refuse ambiguous tenant routing before running any hook effect.
+	if hook.WS != nil && app.Group != nil && app.Group.Key != "" {
+		group := rowData[app.Group.Key]
+		if group == nil || fmt.Sprint(group) == "" || fmt.Sprint(group) == "0" {
+			return fmt.Errorf("ws hook requires the row's tenant key %q", app.Group.Key)
+		}
+	}
+	executeHook(app, hook, rowData)
 	// Fire an SSE refresh broadcast if the hook's SQL was a mutating
 	// statement. An earlier app build: an on_insert messages hook bumped
 	// conversations.last_message_at via raw SQL but emitted no SSE,

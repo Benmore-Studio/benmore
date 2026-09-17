@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // contextKey is an unexported type for context keys to prevent collisions.
@@ -44,34 +45,13 @@ var appEnvStore = &AppEnvStore{
 	apps: make(map[string]map[string]string),
 }
 
-// Global fallback for single-app mode (benmore serve)
-var EnvVars = make(map[string]string)
+// Platform processes must never import their own credentials into tenant apps.
+// Set before loading any tenant by RegisterPlatformAPI.
+var isolateAppEnvironment atomic.Bool
 
-// LoadEnv refreshes the per-app env store from disk. Reads three
-// sources in priority order (later wins):
-//
-//  1. <dir>/env.yaml - app source file (legacy, mostly empty in
-//     cloud deployments; secrets aren't checked into git anyway).
-//  2. os.Environ() - set by systemd's EnvironmentFile= at process
-//     start. FROZEN once the process starts; systemd does not
-//     refresh it on SIGHUP, only on full restart. So this source
-//     is stale-but-not-wrong: it has the values the unit started
-//     with, never anything newer.
-//  3. <dir>/.benmore/env - the SAME file systemd reads as its
-//     EnvironmentFile, but we read it directly. THIS is what
-//     gets rewritten. Reading it here on every
-//     LoadEnv() call (i.e. every SIGHUP) means an env edit followed
-//     by hot reload picks up the new values without a real
-//     restart. Previously the process had to be restarted
-//     after env.yaml edits because SIGHUP
-//     alone was a no-op for env vars - the source-of-truth file
-//     just wasn't on LoadEnv's read path.
-//
-// Each source overrides earlier ones, so a `.benmore/env` write
-// wins over both a stale os.Environ() entry AND any env.yaml
-// value. That's the intent: tools that write env vars should
-// see their write reflected in the running process within one
-// SIGHUP cycle (a few hundred ms via the reload debouncer).
+// LoadEnv snapshots this app's env.yaml and authoritative .benmore/env.
+// Only dedicated app processes may import process env or systemd credentials.
+// Missing keys never fall back to another app or to stale process values.
 func LoadEnv(dir string) {
 	vars := make(map[string]string)
 
@@ -94,35 +74,8 @@ func LoadEnv(dir string) {
 		}
 	}
 
-	// Layer 2: .benmore/env when it exists - the live systemd
-	// EnvironmentFile, rewritten on env.yaml edits.
-	// When this file is present we treat it as the AUTHORITATIVE
-	// source for app-level env vars and SKIP the os.Environ() merge
-	// below.
-	//
-	// Why authoritative-not-merged (v2.7.7+): systemd reads
-	// .benmore/env once at unit start, snapshots into os.Environ(),
-	// and never re-reads it. So os.Environ() is forever frozen at
-	// the start-time snapshot. If the file later removes a key
-	// (because a var was removed from env.yaml), a naive layered merge would
-	// keep the stale os.Environ() value alive - defeating the whole
-	// point of hot-reloading env vars without a restart. By making
-	// the file authoritative when present, the per-app store
-	// reflects exactly the current file contents, including
-	// removals.
-	//
-	// Edge case: in dev mode (`benmore serve`) the file doesn't exist
-	// and we fall through to os.Environ() like the legacy path. The
-	// GetEnv function also has a final fallback to os.Getenv for any
-	// key not in the per-app store, so system vars (PATH, HOME, etc)
-	// that an agent might reference via `{{env.HOME}}` still resolve
-	// even though we don't merge them into the per-app store.
-	//
-	// Format mirrors writeAppEnvFile() in deploy_systemd.go: one
-	// `KEY="value"` per line, quotes optional, internal double-
-	// quotes escaped as `\"`. We parse permissively - strip
-	// optional surrounding double or single quotes, skip blank
-	// and `#`-commented lines.
+	// The live systemd EnvironmentFile overrides env.yaml and suppresses
+	// the stale process snapshot, including values removed during reload.
 	systemdEnvPath := filepath.Join(dir, ".benmore", "env")
 	systemdFilePresent := false
 	if data, err := os.ReadFile(systemdEnvPath); err == nil {
@@ -151,12 +104,7 @@ func LoadEnv(dir string) {
 		}
 	}
 
-	// Layer 3 (fallback only): os.Environ() - used in `benmore serve`
-	// where no .benmore/env file exists, OR to catch system vars
-	// (PATH/HOME/USER/etc.) for the host-mode single-process path.
-	// In router mode the per-app process should never reach this
-	// branch for app-level vars - they all come from the file.
-	if !systemdFilePresent {
+	if !systemdFilePresent && !isolateAppEnvironment.Load() {
 		for _, env := range os.Environ() {
 			parts := strings.SplitN(env, "=", 2)
 			if len(parts) == 2 {
@@ -164,15 +112,31 @@ func LoadEnv(dir string) {
 			}
 		}
 	}
+	// Dedicated app processes may receive systemd credentials. Snapshot them
+	// during load; a missing app key must never trigger a process-wide lookup.
+	if !isolateAppEnvironment.Load() {
+		if credDir := os.Getenv("CREDENTIALS_DIRECTORY"); credDir != "" {
+			if entries, err := os.ReadDir(credDir); err == nil {
+				for _, entry := range entries {
+					key := strings.ToUpper(entry.Name())
+					if !entry.IsDir() && validEnvCredentialName(key) && vars[key] == "" {
+						vars[key] = processCredential(key)
+					}
+				}
+			}
+		}
+	}
 
+	// Shared hosts must load the owning vault before encryption and other
+	// consumers initialize. A reload replaces the snapshot, including removals.
+	for key, value := range platformAppEnv(dir) {
+		vars[key] = value
+	}
 	// Store per-app
 	absDir, _ := filepath.Abs(dir)
 	appEnvStore.mu.Lock()
 	appEnvStore.apps[absDir] = vars
 	appEnvStore.mu.Unlock()
-
-	// Also set global for single-app mode (benmore serve)
-	EnvVars = vars
 }
 
 // SetAppEnv sets a single env var for a specific app.
@@ -186,41 +150,33 @@ func SetAppEnv(dir, key, value string) {
 	appEnvStore.apps[absDir][key] = value
 }
 
-// GetEnv returns an environment variable for a specific app.
-// appDir must be provided - no global state, no races.
-//
-// Lookup order:
-//  1. Per-app env store (app's env.yaml + InjectPlatformEnv)
-//  2. Global EnvVars map (single-app mode)
-//  3. Process env (os.Getenv) - what systemd's Environment= injects
-//  4. Systemd credentials directory ($CREDENTIALS_DIRECTORY/<key>) -
-//     where LoadCredential= drops secrets so they DON'T show up via
-//     `systemctl show --property=Environment`. The credentials file
-//     content is the secret value (single-line, no trailing newline).
-//
-// The credentials fallback is what makes Stripe/Resend/etc secrets
-// systemd-dbus-private. See the platform service unit for the
-// LoadCredential= declarations.
+// GetEnv resolves app keys only from that app's snapshot. An empty appDir
+// is reserved for platform/operator configuration in the process environment.
 func GetEnv(appDir, key string) string {
 	if appDir != "" {
-		absDir, _ := filepath.Abs(appDir)
-		appEnvStore.mu.RLock()
-		if vars, ok := appEnvStore.apps[absDir]; ok {
-			if val, ok := vars[key]; ok {
-				appEnvStore.mu.RUnlock()
-				return val
-			}
-		}
-		appEnvStore.mu.RUnlock()
+		return GetAppEnv(appDir, key)
 	}
-
-	// Fall back to global (single-app mode)
-	if val, ok := EnvVars[key]; ok {
-		return val
-	}
-
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return processCredential(key)
+}
+
+func validEnvCredentialName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, c := range key {
+		if c != '_' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func processCredential(key string) string {
+	if !validEnvCredentialName(key) {
+		return ""
 	}
 
 	// systemd LoadCredential fallback. CREDENTIALS_DIRECTORY is set by
@@ -228,12 +184,28 @@ func GetEnv(appDir, key string) string {
 	// each LoadCredential= entry. We use the lower-cased key as the
 	// credential name to match standard convention.
 	if credDir := os.Getenv("CREDENTIALS_DIRECTORY"); credDir != "" {
-		credPath := filepath.Join(credDir, strings.ToLower(key))
-		if data, err := os.ReadFile(credPath); err == nil {
+		root, err := os.OpenRoot(credDir)
+		if err != nil {
+			return ""
+		}
+		defer root.Close()
+		if data, err := root.ReadFile(strings.ToLower(key)); err == nil {
 			return strings.TrimRight(string(data), "\n")
 		}
 	}
 	return ""
+}
+
+// AppEnvSnapshot returns a copy so callers never iterate a concurrently edited map.
+func AppEnvSnapshot(dir string) map[string]string {
+	absDir, _ := filepath.Abs(dir)
+	appEnvStore.mu.RLock()
+	defer appEnvStore.mu.RUnlock()
+	vars := make(map[string]string, len(appEnvStore.apps[absDir]))
+	for k, v := range appEnvStore.apps[absDir] {
+		vars[k] = v
+	}
+	return vars
 }
 
 // GetAppEnv returns an env var for a specific app directory.
@@ -249,26 +221,9 @@ func GetAppEnv(dir, key string) string {
 	return ""
 }
 
-// InterpolateEnv replaces {{env.VAR}} in a string with env values for a specific app.
-// Per-app values take precedence; global values fill in anything still unresolved.
-// Previously this early-returned after consulting the per-app map, which meant keys
-// only present in the global map (e.g. platform_env injected via InjectPlatformEnv)
-// never got applied in multi-tenant host mode once the per-app map existed.
+// InterpolateEnv replaces compact env references using only the caller's app.
 func InterpolateEnv(s string, appDir string) string {
-	if appDir != "" {
-		absDir, _ := filepath.Abs(appDir)
-		appEnvStore.mu.RLock()
-		if vars, ok := appEnvStore.apps[absDir]; ok {
-			for key, val := range vars {
-				s = strings.ReplaceAll(s, "{{env."+key+"}}", val)
-			}
-		}
-		appEnvStore.mu.RUnlock()
-	}
-
-	// Fill in anything still unresolved from the global fallback. ReplaceAll is a
-	// no-op if per-app already replaced the token, so per-app wins on conflict.
-	for key, val := range EnvVars {
+	for key, val := range AppEnvSnapshot(appDir) {
 		s = strings.ReplaceAll(s, "{{env."+key+"}}", val)
 	}
 	return s

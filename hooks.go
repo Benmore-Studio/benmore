@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -372,7 +371,8 @@ func FireHooks(app *App, event string, table string, row map[string]any) {
 	}
 }
 
-func executeHook(db *sql.DB, hook Hook, row map[string]any, appDir string) {
+func executeHook(app *App, hook Hook, row map[string]any) {
+	db, appDir := app.DB, app.Dir
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("HOOK PANIC: %v", r)
@@ -495,14 +495,16 @@ func executeHook(db *sql.DB, hook Hook, row map[string]any, appDir string) {
 		} else {
 			payload = interpolateRow(payload, row, appDir)
 		}
-		// BroadcastWSToRoomGlobal scopes the room by the
-		// authenticated subscribers' own group/user (same logic as
-		// scopedRoomID on the inbound side) so an `on_update: orders`
-		// hook firing room="order-42" reaches every authenticated
-		// client whose scope produces the same scoped key. The hook
-		// itself is server-side and has no session; the global
-		// variant fans out to every scope-compatible client.
-		BroadcastWSToRoomGlobal(room, payload)
+		groupID := ""
+		if app.Group != nil && app.Group.Key != "" {
+			if v := row[app.Group.Key]; v != nil {
+				groupID = fmt.Sprint(v)
+			}
+		}
+		if err := BroadcastWSToRoom(app, groupID, room, payload); err != nil {
+			log.Printf("HOOK ERROR [ws]: %s", err)
+			return
+		}
 		log.Printf("HOOK [ws] broadcast to %s (%d bytes)", room, len(payload))
 	}
 }

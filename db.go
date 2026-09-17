@@ -341,6 +341,7 @@ func QueryRows(db *sql.DB, query string, args ...any) ([]map[string]any, error) 
 }
 
 func queryRowsWith(db mutationQuerier, query string, args ...any) ([]map[string]any, error) {
+	key := cryptoKeyForQuerier(db)
 	start := time.Now()
 	rows, err := db.Query(query, args...)
 	incDBQuery()
@@ -348,7 +349,7 @@ func queryRowsWith(db mutationQuerier, query string, args ...any) ([]map[string]
 	if err != nil {
 		return nil, err
 	}
-	return scanRows(rows)
+	return scanRows(rows, key)
 }
 
 // scanRows converts *sql.Rows into a slice of maps. Closes rows when done.
@@ -365,7 +366,7 @@ func queryRowsWith(db mutationQuerier, query string, args ...any) ([]map[string]
 //     gotcha where falsy SQLite booleans render "0")
 //
 // The column-type lookup happens once per result set (not per row).
-func scanRows(rows *sql.Rows) ([]map[string]any, error) {
+func scanRows(rows *sql.Rows, key []byte) ([]map[string]any, error) {
 	defer rows.Close()
 
 	cols, err := rows.Columns()
@@ -466,7 +467,7 @@ func scanRows(rows *sql.Rows) ([]map[string]any, error) {
 			}
 			row[col] = v
 		}
-		DecryptRowFields(row)
+		DecryptRowFields(row, key)
 		// Numeric coercion runs AFTER decryption - that's the whole
 		// point: the ciphertext lived as TEXT in a column declared
 		// INTEGER/REAL, and after decryption the plaintext is a
@@ -517,7 +518,15 @@ func QuerySingle(db *sql.DB, query string, args ...any) (any, error) {
 
 // GetTableNames returns all user table names from the database.
 func GetTableNames(db *sql.DB) ([]string, error) {
-	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_benmore_%' ORDER BY name")
+	// Generated history belongs to the source table's version API. Exposing
+	// it as an independent CRUD table loses the source's access and field gates.
+	// Match the actual version metadata, not arbitrary business *_history names.
+	rows, err := db.Query(`SELECT m.name FROM sqlite_master m
+		WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_benmore_%'
+		AND NOT (substr(m.name, -8) = '_history' AND
+			(SELECT COUNT(*) FROM pragma_table_info(m.name)
+			 WHERE name IN ('_version','_valid_from','_valid_to','_changed_by','_change_type')) = 5)
+		ORDER BY m.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -865,8 +874,12 @@ func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, n
 	if app != nil {
 		config = app.Encrypted
 	}
-	oldForAudit := encryptAuditFieldsCopy(config, table, oldRow)
-	newForAudit := encryptAuditFieldsCopy(config, table, newRow)
+	var auditKey []byte
+	if app != nil && config != nil {
+		auditKey = cryptoKeyForQuerier(app.DB)
+	}
+	oldForAudit := encryptAuditFieldsCopy(config, table, oldRow, auditKey)
+	newForAudit := encryptAuditFieldsCopy(config, table, newRow, auditKey)
 
 	var oldJSON, newJSON string
 	if oldForAudit != nil {

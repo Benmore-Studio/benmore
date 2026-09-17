@@ -241,6 +241,8 @@ type HostPlatform struct{}
 
 var hostPlatform *HostPlatform
 
+func platformAppEnv(dir string) map[string]string { return nil }
+
 // syncPlatformUserFromDashboard mirrors an app login into the platform users
 // table. No platform → no-op.
 func syncPlatformUserFromDashboard(app *App, email, passwordHash string) {}

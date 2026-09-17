@@ -124,7 +124,7 @@ func hotReloadApp(app *App, dev bool) error {
 	handler := wrapMiddleware(mux, app, dev)
 	hostedHotHandler.swap(handler)
 	if dev || devReloadClientEnabled(app) {
-		BroadcastReload("hot-reload")
+		BroadcastReload(app, "hot-reload")
 	}
 	return nil
 }
@@ -567,7 +567,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 
 	// Image transforms. /api/_images/transform?src=&w=&fmt= takes
 	// any /uploads/* image and returns a resized/re-encoded copy,
-	// cached to disk under uploads/_transforms/ keyed by params.
+	// public derivatives cached outside uploads, after source authorization.
 	RegisterImageTransformRoute(mux, app)
 	RegisterInstallRoute(mux, app)
 	RegisterInstallQRRoute(mux)
@@ -778,6 +778,13 @@ func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 // signed-URL access for private files (both URL-spelled and symlink-resolved)
 // and symlink-escape containment.
 func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool, relativePath string) {
+	// Legacy transform caches may contain derivatives of private sources.
+	// New caches live outside uploads and are served only after source checks.
+	if strings.HasPrefix(filepath.ToSlash(filepath.Clean(relativePath)), "_transforms/") {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
 	fullPath := filepath.Join(app.Dir, "uploads", relativePath)
 	uploadsRoot := filepath.Join(app.Dir, "uploads")
 	// Private files require signed URLs. Gate with the SAME predicate the
@@ -788,7 +795,8 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	// private/ file and a nested */private/* segment (e.g.
 	// userdocs/private/ssn.pdf). Keep this BEFORE file resolution so
 	// unsigned callers can't distinguish missing from existing private files.
-	if isPrivateUploadPath("uploads/" + filepath.ToSlash(relativePath)) {
+	private := isPrivateUploadPath("uploads/" + filepath.ToSlash(relativePath))
+	if private {
 		if !ValidateSignedURL(relativePath, r) {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
@@ -812,8 +820,14 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	if realUploads, err := filepath.EvalSymlinks(uploadsRoot); err == nil {
 		privateBase = realUploads
 	}
+	if rel, err := filepath.Rel(privateBase, resolved); err == nil && strings.HasPrefix(filepath.ToSlash(rel), "_transforms/") {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
 	if rel, err := filepath.Rel(privateBase, resolved); err != nil ||
 		isPrivateUploadPath("uploads/"+filepath.ToSlash(rel)) {
+		private = true
 		// Use the SAME predicate as the URL gate (matches any /private/
 		// segment, not just a top-level one) so a symlink resolving into a
 		// NESTED private dir (e.g. public.png -> x/private/secret) can't be
@@ -824,7 +838,9 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 			return
 		}
 	}
-	if !dev {
+	if private {
+		w.Header().Set("Cache-Control", "private, no-store")
+	} else if !dev {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 	}
 	// Force download for active-content types so a user-uploaded

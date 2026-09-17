@@ -28,10 +28,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -258,14 +261,44 @@ type cachedToken struct {
 }
 
 var (
-	tokenCacheMu sync.RWMutex
-	tokenCache   = map[string]cachedToken{}
+	tokenCacheMu       sync.RWMutex
+	tokenCache         = map[string]cachedToken{}
+	recipeBeforeClient = safeHTTPClientStrict(15 * time.Second)
 )
 
 func execRecipeBefore(env *recipeEnv, before *RecipeBefore) error {
 	cacheKey, err := evalTemplate(before.CacheKey, env)
 	if err != nil {
 		return fmt.Errorf("cache_key: %w", err)
+	}
+	req, err := buildRecipeBeforeRequest(env, before.Request)
+	if err != nil {
+		return err
+	}
+	if cacheKey != "" {
+		var body []byte
+		if req.GetBody != nil {
+			r, err := req.GetBody()
+			if err != nil {
+				return err
+			}
+			body, err = io.ReadAll(r)
+			r.Close()
+			if err != nil {
+				return err
+			}
+		}
+		appDir := ""
+		if env.app != nil {
+			appDir, _ = filepath.Abs(env.app.Dir)
+		}
+		// Include the concrete credentials, request and extraction shape. A
+		// public client ID or caller-chosen key alone is not a security boundary.
+		material, err := json.Marshal([]any{appDir, cacheKey, req.Method, req.URL.String(), req.Header, string(body), before.Extract})
+		if err != nil {
+			return err
+		}
+		cacheKey = fmt.Sprintf("%x", sha256.Sum256(material))
 	}
 
 	if cacheKey != "" {
@@ -281,7 +314,7 @@ func execRecipeBefore(env *recipeEnv, before *RecipeBefore) error {
 	}
 
 	// Build + send the exchange request.
-	resp, err := doRecipeBeforeRequest(env, before.Request)
+	resp, err := doRecipeBeforeRequest(req)
 	if err != nil {
 		return err
 	}
@@ -289,8 +322,8 @@ func execRecipeBefore(env *recipeEnv, before *RecipeBefore) error {
 	// Extract bindings via JSON-path expressions over the response body.
 	var responseJSON any
 	if err := json.Unmarshal(resp, &responseJSON); err != nil {
-		// not JSON - extracts will fail; surface what we got.
-		return fmt.Errorf("before: response not JSON: %s", truncString(string(resp), 200))
+		// Do not echo a credential-bearing response into a flow error.
+		return fmt.Errorf("before: token exchange response is not JSON")
 	}
 
 	newBindings := map[string]string{}
@@ -310,7 +343,10 @@ func execRecipeBefore(env *recipeEnv, before *RecipeBefore) error {
 		}
 	}
 
-	if cacheKey != "" {
+	if cacheKey != "" && ttlSeconds > 0 {
+		if ttlSeconds > 86400 {
+			ttlSeconds = 86400
+		}
 		// Reserve 30s buffer before claimed expiry to avoid using
 		// almost-expired tokens.
 		buffered := ttlSeconds - 30
@@ -318,16 +354,23 @@ func execRecipeBefore(env *recipeEnv, before *RecipeBefore) error {
 			buffered = ttlSeconds
 		}
 		tokenCacheMu.Lock()
-		tokenCache[cacheKey] = cachedToken{
-			bindings: newBindings,
-			expires:  time.Now().Add(time.Duration(buffered) * time.Second),
+		for key, entry := range tokenCache {
+			if !time.Now().Before(entry.expires) {
+				delete(tokenCache, key)
+			}
+		}
+		if len(tokenCache) < 1024 {
+			tokenCache[cacheKey] = cachedToken{
+				bindings: newBindings,
+				expires:  time.Now().Add(time.Duration(buffered) * time.Second),
+			}
 		}
 		tokenCacheMu.Unlock()
 	}
 	return nil
 }
 
-func doRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) ([]byte, error) {
+func buildRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) (*http.Request, error) {
 	if r == nil {
 		return nil, fmt.Errorf("before: missing request:")
 	}
@@ -336,10 +379,9 @@ func doRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("url: %w", err)
 	}
-	// Intentionally no isPrivateURL guard here: token-exchange URLs are
-	// developer-controlled in flows.yaml (not attacker input), and
-	// legitimate use cases include internal/on-prem OAuth servers on
-	// RFC1918 IPs. The outer `run: api` URL still gets SSRF-checked.
+	if isPrivateURL(urlStr) {
+		return nil, fmt.Errorf("before: private token exchange URL blocked")
+	}
 
 	method := r.Method
 	if method == "" {
@@ -350,15 +392,15 @@ func doRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) ([]byte, erro
 	contentType := ""
 	switch {
 	case r.Form != nil:
-		var parts []string
+		form := make(url.Values)
 		for k, v := range r.Form {
 			rendered, err := evalTemplate(v, env)
 			if err != nil {
 				return nil, fmt.Errorf("form %s: %w", k, err)
 			}
-			parts = append(parts, k+"="+urlEncode(rendered))
+			form.Set(k, rendered)
 		}
-		body = strings.NewReader(strings.Join(parts, "&"))
+		body = strings.NewReader(form.Encode())
 		contentType = "application/x-www-form-urlencoded"
 	case r.JSON != nil:
 		obj := map[string]string{}
@@ -395,16 +437,24 @@ func doRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) ([]byte, erro
 		req.Header.Set(k, rendered)
 	}
 
-	client := safeHTTPClient(15 * time.Second)
-	resp, err := client.Do(req)
+	return req, nil
+}
+
+func doRecipeBeforeRequest(req *http.Request) ([]byte, error) {
+	resp, err := recipeBeforeClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(respBody) > 1<<20 {
+		return nil, fmt.Errorf("before: token exchange response too large")
+	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("token exchange %s returned %d: %s", urlStr, resp.StatusCode,
-			truncString(string(respBody), 200))
+		return nil, fmt.Errorf("token exchange returned HTTP %d", resp.StatusCode)
 	}
 	return respBody, nil
 }

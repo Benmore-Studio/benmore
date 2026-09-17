@@ -195,6 +195,9 @@ func handleListVersions(w http.ResponseWriter, r *http.Request, app *App, table 
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 		return
 	}
+	if !EnforceCRUDAccess(w, r, app, table, OpRead, 0) {
+		return
+	}
 
 	id := r.PathValue("id")
 
@@ -230,6 +233,9 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	session := getSession(app, r)
 	if session == nil {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return
+	}
+	if !EnforceCRUDAccess(w, r, app, table, OpRead, 0) {
 		return
 	}
 
@@ -275,6 +281,11 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	// recover the plaintext through version history. The history table shares
 	// the source table's encrypted-field config (same column names).
 	MaskEncryptedFields(app.Encrypted, table, rows, session)
+	for key := range rows[0] {
+		if isSensitiveUserColumn(key) || strings.HasSuffix(key, blindColSuffix) {
+			delete(rows[0], key)
+		}
+	}
 	httpJSON(w, http.StatusOK, rows[0])
 }
 
@@ -327,30 +338,20 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 
 	versionRow := rows[0]
 
-	// Build UPDATE from the historical values
-	var sets []string
-	var values []any
-	for _, col := range colNames {
-		sets = append(sets, fmt.Sprintf("%s = ?", col))
-		values = append(values, versionRow[col])
-	}
-	values = append(values, id)
-
-	updateSQL := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", table, strings.Join(sets, ", "))
-	if _, err := app.DB.Exec(updateSQL, values...); err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("revert failed: %s", err)})
+	// Reverts are updates, including write policy, edit ACLs, locks, validators,
+	// protected columns, membership, before/after hooks, audit and broadcasts.
+	// Reuse the transaction pipeline rather than issuing a privileged raw UPDATE.
+	result := newFlowResponseBuffer()
+	executeCRUDTransaction(result, r, app, []transactionOp{{
+		Table: table, Action: "update", ID: id, Data: versionRow,
+	}})
+	if result.status != http.StatusOK {
+		result.flushTo(w)
 		return
 	}
-
-	// The UPDATE itself fires the versioning trigger, creating a new history entry
-	// for the pre-revert state. This is correct - the revert is itself a versioned change.
-
 	LogAudit(app, "revert", table, id, session,
-		map[string]any{"_reverted_to_version": version},
-		nil,
-	)
-
-	Broadcast(app, table, "update", session)
+		map[string]any{"_reverted_to_version": version}, nil)
+	appendHXTrigger(w, "benmore:changed")
 
 	httpJSON(w, http.StatusOK, map[string]any{
 		"status":              "reverted",

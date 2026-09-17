@@ -172,14 +172,14 @@ func LoadSessionRoles(db *sql.DB, userID int64, primaryRole, effectiveGroupID st
 		rows, err = db.Query(`
 			SELECT role FROM _benmore_user_roles
 			WHERE user_id = ?
-			  AND (expires_at IS NULL OR expires_at > datetime('now'))
+			  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 			  AND group_id IS NULL`,
 			userID)
 	} else {
 		rows, err = db.Query(`
 			SELECT role FROM _benmore_user_roles
 			WHERE user_id = ?
-			  AND (expires_at IS NULL OR expires_at > datetime('now'))
+			  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 			  AND (group_id IS NULL OR group_id = ?)`,
 			userID, effectiveGroupID)
 	}
@@ -216,7 +216,7 @@ func UserHasGlobalAdminGrant(db *sql.DB, userID int64) bool {
 	err := db.QueryRow(`
 		SELECT 1 FROM _benmore_user_roles
 		WHERE user_id = ? AND role = 'admin' AND group_id IS NULL
-		  AND (expires_at IS NULL OR expires_at > datetime('now'))
+		  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 		LIMIT 1`, userID).Scan(&n)
 	return err == nil
 }
@@ -298,7 +298,7 @@ func StartRoleExpirySweeper(app *App) {
 func sweepExpiredRoles(app *App) {
 	rows, err := app.DB.Query(`
 		SELECT user_id, role FROM _benmore_user_roles
-		WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')`)
+		WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`)
 	if err != nil {
 		return
 	}
@@ -318,7 +318,7 @@ func sweepExpiredRoles(app *App) {
 		res, err := app.DB.Exec(`
 			DELETE FROM _benmore_user_roles
 			WHERE user_id = ? AND role = ?
-			  AND expires_at IS NOT NULL AND expires_at <= datetime('now')`,
+			  AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`,
 			e.userID, e.role)
 		if err != nil {
 			continue
@@ -400,7 +400,7 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 		rows, err := app.DB.Query(`
 			SELECT role, granted_at, granted_by, expires_at, group_id
 			FROM _benmore_user_roles
-			WHERE user_id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))
+			WHERE user_id = ? AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 			ORDER BY role, IFNULL(group_id, '')`, uid)
 		if err == nil {
 			defer rows.Close()
@@ -688,7 +688,7 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 					+
 					(SELECT COUNT(*) FROM _benmore_user_roles
 						WHERE role = 'admin' AND user_id != ? AND group_id IS NULL
-						  AND (expires_at IS NULL OR expires_at > datetime('now')))
+						  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')))
 				)`,
 				session.UserID, session.UserID).Scan(&others)
 			if others == 0 {

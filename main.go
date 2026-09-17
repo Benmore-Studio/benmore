@@ -10,7 +10,7 @@ import (
 // version is the release version. It defaults to the value baked here and is
 // overridden at release time via -ldflags "-X main.version=<tag>" (see the
 // public edition's .goreleaser.yaml).
-var version = "2.7.220"
+var version = "2.7.221"
 
 // Full release history lives in the private development repo and git log.
 func main() {

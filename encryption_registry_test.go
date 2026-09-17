@@ -88,12 +88,8 @@ func TestSQLFunctionsUsePerDBRegistryKey(t *testing.T) {
 	}
 }
 
-// TestDecryptRowFieldsRegistryFallback: the process global is the wrong
-// key, but the value's true key is registered for SOME db path.
-// DecryptRowFields (which has no connection to resolve a path from) must
-// recover the plaintext by trying registered keys - AES-GCM authentication
-// guarantees only the correct key can succeed.
-func TestDecryptRowFieldsRegistryFallback(t *testing.T) {
+// Explicit database keys override process state without searching other tenants.
+func TestDecryptRowFieldsExplicitKey(t *testing.T) {
 	keyA := testKeyBytes(0xC3)
 	keyB := testKeyBytes(0xD4)
 
@@ -108,7 +104,7 @@ func TestDecryptRowFieldsRegistryFallback(t *testing.T) {
 		t.Fatalf("encrypt: %v", err)
 	}
 	row := map[string]any{"email": cipher, "name": "unencrypted"}
-	DecryptRowFields(row)
+	DecryptRowFields(row, keyA)
 	if row["email"] != "pii@example.com" {
 		t.Fatalf("registry fallback failed: email = %q", row["email"])
 	}
@@ -133,7 +129,7 @@ func TestDecryptRowFieldsMasksOnFailure(t *testing.T) {
 		t.Fatalf("encrypt: %v", err)
 	}
 	row := map[string]any{"notes": cipher}
-	DecryptRowFields(row)
+	DecryptRowFields(row, appEncryptionKey)
 	if row["notes"] == cipher {
 		t.Fatalf("raw ciphertext passed through to the caller - must be masked")
 	}

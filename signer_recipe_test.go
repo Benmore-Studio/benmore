@@ -139,29 +139,26 @@ func TestRecipe_OAuthClientCredentials_Cache(t *testing.T) {
 	t.Setenv("OAUTH_CLIENT_SECRET", "test_secret")
 
 	fetches := 0
-	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	oldTransport := recipeBeforeClient.Transport
+	t.Cleanup(func() { recipeBeforeClient.Transport = oldTransport })
+	recipeBeforeClient.Transport = auditRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		fetches++
 		_ = r.ParseForm()
-		if r.FormValue("grant_type") != "client_credentials" {
-			t.Errorf("bad grant_type: %s", r.FormValue("grant_type"))
+		if r.FormValue("grant_type") != "client_credentials" || r.FormValue("client_id") != "test_client" {
+			t.Error("invalid client credentials form")
 		}
-		if r.FormValue("client_id") != "test_client" {
-			t.Errorf("bad client_id: %s", r.FormValue("client_id"))
-		}
+		w := httptest.NewRecorder()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "tok_oauth_xyz",
-			"expires_in":   3600,
-		})
-	}))
-	defer tokenServer.Close()
+		json.NewEncoder(w).Encode(map[string]any{"access_token": "tok_oauth_xyz", "expires_in": 3600})
+		return w.Result(), nil
+	})
 
 	// First request → fetches token
 	req1, _ := http.NewRequest("GET", "https://api.example.com/v1/foo", nil)
 	sign := &FlowAPISign{
 		Recipe: "oauth_client_credentials",
 		Bindings: map[string]string{
-			"token_url": tokenServer.URL,
+			"token_url": "https://93.184.216.34/token",
 		},
 	}
 	// reset the cache so this test doesn't depend on test order

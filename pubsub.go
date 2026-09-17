@@ -50,6 +50,7 @@ func PublishEvent(db *sql.DB, table, action string, groupID string, userID int64
 // eventPoller tracks the last-seen event ID and polls for new events.
 type eventPoller struct {
 	db      *sql.DB
+	app     *App
 	lastID  int64
 	stopCh  chan struct{}
 	appStop chan struct{} // H-14: tied to app.Stop so a hot reload tears the poller down
@@ -69,6 +70,7 @@ type eventPoller struct {
 func StartEventPoller(app *App) *eventPoller {
 	ep := &eventPoller{
 		db:      app.DB,
+		app:     app,
 		stopCh:  make(chan struct{}),
 		appStop: app.Stop,
 	}
@@ -122,7 +124,7 @@ func (ep *eventPoller) poll() {
 			continue
 		}
 		// Distribute to local SSE + WS hubs - BroadcastChangeScoped handles both
-		BroadcastChangeScoped(table, action, groupID, userID)
+		BroadcastChangeScoped(ep.app, table, action, groupID, userID)
 		ep.lastID = id
 	}
 }
@@ -170,7 +172,7 @@ func Broadcast(app *App, table, action string, session *Session) {
 	var groupID string
 	var userID int64
 	if session != nil {
-		groupID = session.GroupID
+		groupID = session.EffectiveGroupID()
 		userID = session.UserID
 		// Meter the mutation
 		scope := meterScope(session)
@@ -200,8 +202,8 @@ func Broadcast(app *App, table, action string, session *Session) {
 		PublishEvent(app.DB, table, action, groupID, userID)
 	} else {
 		// Single instance: direct SSE + WS broadcast (no DB overhead)
-		broadcastToSSE(table, action, groupID, userID)
-		BroadcastWSChange(table, action, groupID, userID)
+		broadcastToSSE(app, table, action, groupID, userID)
+		BroadcastWSChange(app, table, action, groupID, userID)
 	}
 }
 
@@ -213,8 +215,8 @@ func BroadcastUnscoped(app *App, table, action string) {
 	if IsClusterMode() {
 		PublishEvent(app.DB, table, action, "", 0)
 	} else {
-		broadcastToSSE(table, action, "", 0)
-		BroadcastWSChange(table, action, "", 0)
+		broadcastToSSE(app, table, action, "", 0)
+		BroadcastWSChange(app, table, action, "", 0)
 	}
 }
 
@@ -226,21 +228,24 @@ func BroadcastScopedDirect(app *App, table, action string, groupID string, userI
 	if IsClusterMode() {
 		PublishEvent(app.DB, table, action, groupID, userID)
 	} else {
-		broadcastToSSE(table, action, groupID, userID)
-		BroadcastWSChange(table, action, groupID, userID)
+		broadcastToSSE(app, table, action, groupID, userID)
+		BroadcastWSChange(app, table, action, groupID, userID)
 	}
 }
 
 // broadcastToSSE pushes a change event directly to the local SSE hub.
 // This is the fast path for single-instance mode and the delivery path
 // for the cluster-mode poller.
-func broadcastToSSE(table, action string, groupID string, userID int64) {
+func broadcastToSSE(app *App, table, action string, groupID string, userID int64) {
 	msg := fmt.Sprintf(`{"table":"%s","action":"%s"}`, table, action)
 	genericMsg := `{"table":"","action":"refresh"}`
 
 	sseHub.mu.RLock()
 	defer sseHub.mu.RUnlock()
 	for client := range sseHub.clients {
+		if !realtimeSameApp(app, client.principal.app) || !client.principal.canRead(table, userID) {
+			continue
+		}
 		// Server-side scope filtering.
 		// Three cases:
 		//   1. group-scoped event (groupID is set + not "0"): only

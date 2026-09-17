@@ -403,7 +403,7 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error
 		if pt == "" {
 			continue
 		}
-		hash, err := BlindIndexHMAC(pt)
+		hash, err := blindIndexForApp(app, pt)
 		if err != nil {
 			return updated, err
 		}
@@ -511,7 +511,7 @@ func applyBlindIndexRewrite(app *App, table, col, plaintext string) (string, str
 	if !BlindIndexColumnsForTable(app.Encrypted, table)[col] {
 		return col, plaintext, false
 	}
-	hash, err := BlindIndexHMAC(plaintext)
+	hash, err := blindIndexForApp(app, plaintext)
 	if err != nil || hash == "" {
 		return col, plaintext, false
 	}
@@ -524,4 +524,22 @@ func applyBlindIndexRewrite(app *App, table, col, plaintext string) (string, str
 // accidentally creating a timing oracle if a test exposes the result.
 func blindKeyMatchesEncryptionKey(encKey, blindKey []byte) bool {
 	return subtle.ConstantTimeCompare(encKey, blindKey) == 1
+}
+
+// blindIndexForApp binds lookup/rebuild HMACs to the same key as SQL triggers.
+func blindIndexForApp(app *App, plaintext string) (string, error) {
+	if app != nil && app.DB != nil {
+		key := cryptoKeyForQuerier(app.DB)
+		if len(key) > 0 {
+			blind, err := DeriveBlindIndexKey(key)
+			if err != nil {
+				return "", err
+			}
+			return BlindIndexHMACWithKey(blind, plaintext), nil
+		}
+	}
+	if isolateAppEnvironment.Load() {
+		return "", fmt.Errorf("database encryption key is not registered")
+	}
+	return BlindIndexHMAC(plaintext)
 }

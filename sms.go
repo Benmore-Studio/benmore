@@ -233,8 +233,7 @@ func sendSMSTwilio(appDir, to, body, from string) error {
 	req.SetBasicAuth(sid, token)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := smsHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("twilio request failed: %w", err)
 	}
@@ -249,6 +248,8 @@ func sendSMSTwilio(appDir, to, body, from string) error {
 	return nil
 }
 
+var smsHTTPClient = safeHTTPClientStrict(10 * time.Second)
+
 // sendSMSWebhook sends via a generic webhook - works with any HTTP-based SMS API.
 // POSTs JSON: {"to": "+1...", "body": "Your code is 123456", "from": "+1..."}
 func sendSMSWebhook(appDir, to, body, from string) error {
@@ -257,13 +258,19 @@ func sendSMSWebhook(appDir, to, body, from string) error {
 		return fmt.Errorf("SMS_WEBHOOK_URL required for webhook SMS provider")
 	}
 
+	if isPrivateURL(webhookURL) {
+		return fmt.Errorf("SMS webhook URL must be public")
+	}
 	payload, _ := json.Marshal(map[string]string{
 		"to":   to,
 		"body": body,
 		"from": from,
 	})
 
-	req, _ := http.NewRequest("POST", webhookURL, bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("invalid SMS webhook URL")
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	// Optional auth header
@@ -271,8 +278,7 @@ func sendSMSWebhook(appDir, to, body, from string) error {
 		req.Header.Set("Authorization", auth)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := smsHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("SMS webhook failed: %w", err)
 	}

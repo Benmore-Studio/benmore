@@ -46,9 +46,17 @@ func StoreOAuthToken(db *sql.DB, userID int64, provider, accessToken, refreshTok
 	}
 
 	// Encrypt tokens at rest if ENCRYPTION_KEY is configured
-	encAccess, _ := fieldEncrypt(accessToken)
-	encRefresh, _ := fieldEncrypt(refreshToken)
+	encAccess, encErr := fieldEncryptForDB(db, accessToken)
+	if encErr != nil {
+		log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+		return
+	}
+	encRefresh, encErr := fieldEncryptForDB(db, refreshToken)
 
+	if encErr != nil {
+		log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+		return
+	}
 	_, err := db.Exec(`
 		INSERT INTO _benmore_oauth_tokens (user_id, provider, access_token, refresh_token, token_type, expires_at, scopes, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -75,8 +83,8 @@ func GetOAuthToken(db *sql.DB, appDir string, userID int64, provider string) str
 		return ""
 	}
 	// Decrypt if encrypted
-	accessToken, _ = fieldDecrypt(accessToken)
-	refreshToken, _ = fieldDecrypt(refreshToken)
+	accessToken, _ = fieldDecryptForDB(db, accessToken)
+	refreshToken, _ = fieldDecryptForDB(db, refreshToken)
 
 	// Check if expired
 	if expiresAt.Valid && expiresAt.String != "" {

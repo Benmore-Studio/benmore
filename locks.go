@@ -124,7 +124,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 
 	// Try to acquire the lock. If already locked by someone else and not expired, reject.
 	// First, delete any expired lock on this row.
-	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND expires_at < datetime('now')`,
+	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
 		table, id)
 
 	// Check if there's an active lock by another user
@@ -244,7 +244,7 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 	}
 
 	// Clean expired locks first
-	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND expires_at < datetime('now')`,
+	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
 		table, id)
 
 	var userEmail string
@@ -271,7 +271,7 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 // Returns (true, lockedByEmail) if locked by someone else, (false, "") otherwise.
 func CheckLock(db *sql.DB, table, rowID string, userID int64) (bool, string) {
 	// Clean expired lock for this specific row
-	db.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND expires_at < datetime('now')`,
+	db.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
 		table, rowID)
 
 	var lockUserID int64
@@ -311,7 +311,7 @@ func StartLockCleanupWorker(app *App) {
 					return
 				default:
 				}
-				if _, err := app.DB.Exec(`DELETE FROM _benmore_locks WHERE expires_at < datetime('now')`); err != nil {
+				if _, err := app.DB.Exec(`DELETE FROM _benmore_locks WHERE datetime(expires_at) < datetime('now')`); err != nil {
 					log.Printf("[locks] cleanup error: %v", err)
 				}
 			}

@@ -113,7 +113,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 		// material - storing it cleartext on disk is a direct compromise
 		// path if the DB file leaks. fieldEncrypt is a no-op when no
 		// ENCRYPTION_KEY is configured, so this stays backward-compatible.
-		encSecret, encErr := fieldEncrypt(req.Secret)
+		encSecret, encErr := fieldEncryptForDB(app.DB, req.Secret)
 		if encErr != nil {
 			log.Printf("WEBHOOK ERROR: failed to encrypt secret: %s", encErr)
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create webhook"})
@@ -163,7 +163,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 		// (no encPrefix), so pre-encryption rows keep working.
 		for _, row := range rows {
 			if secret, ok := row["secret"].(string); ok {
-				secret, _ = fieldDecrypt(secret)
+				secret, _ = fieldDecryptForDB(app.DB, secret)
 				if len(secret) > 4 {
 					row["secret"] = "****" + secret[len(secret)-4:]
 				} else {
@@ -294,7 +294,7 @@ func EnqueueWebhookSubscriptionJob(db *sql.DB, webhookID, webhookURL, secret, ev
 
 // executeWebhookSubscriptionJob delivers a webhook subscription payload.
 // Called from the job worker in jobs.go.
-func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
+func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	whData, ok := data["_webhook_subscription"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("missing _webhook_subscription in payload")
@@ -311,7 +311,10 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 	// at the only point it's actually needed (HMAC signing). fieldDecrypt
 	// is a pass-through for cleartext (pre-encryption) values, keeping
 	// in-flight jobs created before this change working.
-	secret, _ = fieldDecrypt(secret)
+	secret, decryptErr := fieldDecryptForDB(app.DB, secret)
+	if decryptErr != nil {
+		return fmt.Errorf("webhook secret decryption failed")
+	}
 	event := fmt.Sprintf("%v", whData["event"])
 	table := fmt.Sprintf("%v", whData["table"])
 
@@ -362,8 +365,8 @@ func executeWebhookSubscriptionJob(data map[string]any, appDir string) error {
 	// (round-2): operators mid-migration can re-enable it for one transition
 	// window via BENMORE_WEBHOOK_LEGACY_V0=1. New receivers should verify v1
 	// (t.body) only.
-	emitV0 := strings.EqualFold(strings.TrimSpace(GetEnv(appDir, "BENMORE_WEBHOOK_LEGACY_V0")), "1") ||
-		strings.EqualFold(strings.TrimSpace(GetEnv(appDir, "BENMORE_WEBHOOK_LEGACY_V0")), "true")
+	emitV0 := strings.EqualFold(strings.TrimSpace(GetEnv(app.Dir, "BENMORE_WEBHOOK_LEGACY_V0")), "1") ||
+		strings.EqualFold(strings.TrimSpace(GetEnv(app.Dir, "BENMORE_WEBHOOK_LEGACY_V0")), "true")
 
 	// Send the webhook
 	req, err := http.NewRequest("POST", whURL, strings.NewReader(string(bodyBytes)))

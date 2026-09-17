@@ -105,15 +105,7 @@ func TestLoadEnv_UnsetVarRemovedFromStore(t *testing.T) {
 
 	absDir, _ := filepath.Abs(dir)
 	if got := GetEnv(absDir, key); got != "" {
-		// Note: GetEnv has a final fallback to os.Getenv (line ~134 of env.go)
-		// so the os.Environ() value MIGHT still surface. The key test is the
-		// per-app store specifically - that should NOT have it.
-		appEnvStore.mu.RLock()
-		storeVal, present := appEnvStore.apps[absDir][key]
-		appEnvStore.mu.RUnlock()
-		if present {
-			t.Errorf("per-app store still has %s = %q after unset. The file is authoritative now; the os.Environ stale snapshot should not bleed into the store.", key, storeVal)
-		}
+		t.Error("removed secret resurfaced from stale process environment")
 	}
 
 	// Sanity: vars actually in the file are still in the store.

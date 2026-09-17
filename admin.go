@@ -214,7 +214,7 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 	// Gather stats
 	var userCount, sessionCount, auditCount int64
 	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE expires_at > datetime('now')").Scan(&sessionCount)
+	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
 	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log").Scan(&auditCount)
 
 	var sb strings.Builder
@@ -570,7 +570,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 	// --- Row 1: 4 stat cards ---
 	var userCount, sessionCount, pageViews, apiRequests int64
 	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE expires_at > datetime('now')").Scan(&sessionCount)
+	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
 	app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'page_views' AND period = ?", currentPeriod).Scan(&pageViews)
 	app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'api_requests' AND period = ?", currentPeriod).Scan(&apiRequests)
 

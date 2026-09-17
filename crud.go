@@ -696,6 +696,7 @@ func loadInsertedRow(app *App, table, idStr string) (map[string]any, bool) {
 	return loadInsertedRowWith(app.DB, table, idStr)
 }
 func loadInsertedRowWith(db mutationQuerier, table, idStr string) (map[string]any, bool) {
+	key := cryptoKeyForQuerier(db)
 	q := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
 	rows, err := db.Query(q, idStr)
 	if err != nil {
@@ -730,7 +731,7 @@ func loadInsertedRowWith(db mutationQuerier, table, idStr string) (map[string]an
 	// this read-back didn't decrypt - so clients saw ciphertext until a
 	// follow-up GET. (Role-based MASKING is applied by the caller via
 	// MaskEncryptedFields, since that needs the session.)
-	DecryptRowFields(out)
+	DecryptRowFields(out, key)
 	return out, true
 }
 
@@ -2541,7 +2542,24 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 		return
 	}
-	if len(body.Operations) == 0 {
+	executeCRUDTransaction(w, r, app, body.Operations)
+}
+
+// executeCRUDTransaction is the shared mutation pipeline for transactions and
+// version reverts. It preserves typed SQL values and every CRUD security gate.
+func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, operations []transactionOp) {
+	session := getSession(app, r)
+	if session == nil {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return
+	}
+
+	if !isBearerAuth(r) && !validateCSRF(r) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+		return
+	}
+
+	if len(operations) == 0 {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "no operations"})
 		return
 	}
@@ -2552,7 +2570,7 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 	for _, t := range tables {
 		validTables[t] = true
 	}
-	for i, op := range body.Operations {
+	for i, op := range operations {
 		if !validTables[op.Table] {
 			httpJSON(w, http.StatusBadRequest, map[string]any{
 				"error": fmt.Sprintf("operation %d: unknown table '%s'", i, op.Table),
@@ -2596,6 +2614,12 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 		if !EnforceCRUDAccess(w, r, app, op.Table, opAccess, 0) {
 			return
 		}
+		if op.Action != "insert" {
+			if locked, by := CheckLock(app.DB, op.Table, fmt.Sprint(op.ID), session.UserID); locked {
+				httpJSON(w, http.StatusConflict, lockErrorResponse(app.DevMode, by))
+				return
+			}
+		}
 	}
 
 	// Begin transaction
@@ -2606,11 +2630,11 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	defer tx.Rollback()
 
-	results := make([]transactionResult, len(body.Operations))
-	oldRows := make([]map[string]any, len(body.Operations))
-	newRows := make([]map[string]any, len(body.Operations))
+	results := make([]transactionResult, len(operations))
+	oldRows := make([]map[string]any, len(operations))
+	newRows := make([]map[string]any, len(operations))
 
-	for i, op := range body.Operations {
+	for i, op := range operations {
 		// Resolve forward reference
 		if op.Ref != "" && i > 0 {
 			refID := results[op.RefOp].ID

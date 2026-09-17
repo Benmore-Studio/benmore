@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,17 +129,16 @@ func TestSMSHookDeliversThroughJobQueue(t *testing.T) {
 	EnsureJobsTable(app.DB)
 
 	got := make(chan map[string]string, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	providerURL := testSMSWebhook(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var c map[string]string
 		_ = json.Unmarshal(raw, &c)
 		got <- c
 		w.WriteHeader(200)
 	}))
-	defer srv.Close()
 
-	t.Setenv("SMS_PROVIDER", "webhook")
-	t.Setenv("SMS_WEBHOOK_URL", srv.URL)
+	SetAppEnv(app.Dir, "SMS_PROVIDER", "webhook")
+	SetAppEnv(app.Dir, "SMS_WEBHOOK_URL", providerURL)
 
 	app.Hooks = &HookConfig{
 		OnInsert: map[string][]Hook{

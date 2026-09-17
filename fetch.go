@@ -271,10 +271,6 @@ func safeHTTPClient(timeout time.Duration) *http.Client {
 // Go layer, for every caller - including the router, which is NOT under the
 // per-app systemd IPAddressDeny. Defense-in-depth on top of the OS egress
 // firewall.
-//
-// NOT used by the signer token-exchange (safeHTTPClient): those URLs are
-// developer-authored and legitimately target internal/on-prem OAuth servers
-// on RFC1918 - see doRecipeBeforeRequest.
 func safeHTTPClientStrict(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{
 		Control: func(network, address string, c syscall.RawConn) error {

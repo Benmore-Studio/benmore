@@ -19,14 +19,18 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     container:
-      # Pin to the image whose bundled Go matches go.mod. Bump in lockstep with
-      # the `go` directive in go.mod.
+      # Keep the C cross-compilers pinned; select the patched Go from go.mod.
       image: ghcr.io/goreleaser/goreleaser-cross:v1.26.3
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history so the changelog can be built
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

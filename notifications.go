@@ -73,7 +73,7 @@ func CreateNotification(db *sql.DB, userID int64, title, body, notifType, link s
 	)
 
 	// Broadcast via SSE to the target user only
-	BroadcastChangeScoped(notificationsTable, "insert", "", userID)
+	BroadcastChangeScoped(&App{DB: db}, notificationsTable, "insert", "", userID)
 
 	log.Printf("NOTIFICATION [%s] user=%d title=%q", notifType, userID, truncateNotif(title, 60))
 

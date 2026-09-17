@@ -13,6 +13,7 @@ SDK, all served from a single process.
 
 | Feature | Canonical reference |
 |---|---|
+| Security isolation update: private images, record reverts, live events, credentials and per-app secrets | `api(at:"uploads")`, `versioning`, `realtime`, `auth`, `encryption`, `environments`, `sign` |
 | Durable scheduled-flow delegation and automatic legacy-task authorization; blocked tasks expose a reason | `api(at:"scheduling")` |
 | Framework security hardening: credential limits, tenant/query isolation, transactional hooks, safe fetch caching, scheduled-flow authorization and atomic retries | `api(at:"auth")`, `query`, `batch`, `cache`, `scheduling`, `idempotency` |
 | Raw-body inbound verification: Autodesk-compatible HMAC-SHA1 with current/previous-secret rotation, plus path-bound HMAC-SHA256 bearer credentials | `api(at:"verify")` |

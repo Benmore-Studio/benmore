@@ -109,7 +109,7 @@ func EnsureSessionsTable(db *sql.DB) {
 	// and IsAdminBypass). Cleared on POST /api/_auth/act_as with no body.
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN acting_as_group TEXT DEFAULT ''")
 	// Cleanup expired on startup
-	db.Exec("DELETE FROM _benmore_sessions WHERE expires_at < datetime('now')")
+	db.Exec("DELETE FROM _benmore_sessions WHERE datetime(expires_at) < datetime('now')")
 }
 
 // AttachSessionContext records the originating IP + user-agent on a
@@ -258,8 +258,8 @@ func GetSessionFromDB(db *sql.DB, id string) *Session {
 		       COALESCE(u.role, 'user'), u.deactivated_at, COALESCE(u.verified, 0),
 		       COALESCE(s.acting_as_group, '')
 		FROM _benmore_sessions s
-		LEFT JOIN _benmore_users u ON u.id = s.user_id
-		WHERE s.id = ? AND s.expires_at > datetime('now')`,
+		JOIN _benmore_users u ON u.id = s.user_id
+		WHERE s.id = ? AND datetime(s.expires_at) > datetime('now')`,
 		id,
 	).Scan(&userID, &email, &groupID, &scopes, &role, &deactivatedAt, &verified, &actingAs)
 	if err != nil {
@@ -318,8 +318,8 @@ func CleanExpiredSessions(app *App) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				app.DB.Exec("DELETE FROM _benmore_sessions WHERE expires_at < datetime('now')")
-				app.DB.Exec("DELETE FROM _benmore_api_tokens WHERE expires_at IS NOT NULL AND expires_at < datetime('now')")
+				app.DB.Exec("DELETE FROM _benmore_sessions WHERE datetime(expires_at) < datetime('now')")
+				app.DB.Exec("DELETE FROM _benmore_api_tokens WHERE expires_at IS NOT NULL AND datetime(expires_at) < datetime('now')")
 			}
 		}
 	})
@@ -349,10 +349,14 @@ func generateCSRFToken() string {
 // the /api/_csrf endpoint is unauthenticated, so without binding one
 // fetched token authenticated every user's mutations.
 func authMintCSRFToken(sid string) string {
+	return authMintCSRFTokenWithSecret(sid, serverSecret)
+}
+
+func authMintCSRFTokenWithSecret(sid, secret string) string {
 	nonce := generateToken(16)
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	payload := nonce + "|" + ts
-	sig := authCSRFSign(payload, sid)
+	sig := authCSRFSignWithSecret(payload, sid, secret)
 	return payload + "|" + sig
 }
 
@@ -361,7 +365,11 @@ func authMintCSRFToken(sid string) string {
 // session-less tokens (and tokens minted before a session existed) stay
 // valid - that's the back-compat path validateCSRF falls back to.
 func authCSRFSign(payload, sid string) string {
-	mac := hmac.New(sha256.New, []byte(serverSecret))
+	return authCSRFSignWithSecret(payload, sid, serverSecret)
+}
+
+func authCSRFSignWithSecret(payload, sid, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(payload))
 	if sid != "" {
 		// Domain-separate the session component so a "|"-bearing payload
@@ -752,7 +760,7 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 		rows, err := QueryRows(app.DB,
-			"SELECT id, created_at, expires_at, COALESCE(ip, '') AS ip, COALESCE(user_agent, '') AS user_agent FROM _benmore_sessions WHERE user_id = ? AND expires_at > datetime('now') ORDER BY created_at DESC",
+			"SELECT id, created_at, expires_at, COALESCE(ip, '') AS ip, COALESCE(user_agent, '') AS user_agent FROM _benmore_sessions WHERE user_id = ? AND datetime(expires_at) > datetime('now') ORDER BY created_at DESC",
 			session.UserID)
 		if err != nil {
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
@@ -782,7 +790,7 @@ func RegisterAuthRoutes(mux *http.ServeMux, app *App) {
 		targetHash := r.PathValue("id")
 		// Look up real session ID by matching the opaque hash against user's sessions
 		sessRows, err := QueryRows(app.DB,
-			"SELECT id FROM _benmore_sessions WHERE user_id = ? AND expires_at > datetime('now')",
+			"SELECT id FROM _benmore_sessions WHERE user_id = ? AND datetime(expires_at) > datetime('now')",
 			session.UserID)
 		if err != nil {
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "revoke failed"})
@@ -1433,7 +1441,7 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 	// value the row was INSERTed under on send (H-12).
 	var storedCode string
 	var attempts int
-	err = app.DB.QueryRow("SELECT code, attempts FROM _benmore_otp WHERE email = ? AND expires_at > datetime('now')", otpKey).Scan(&storedCode, &attempts)
+	err = app.DB.QueryRow("SELECT code, attempts FROM _benmore_otp WHERE email = ? AND datetime(expires_at) > datetime('now')", otpKey).Scan(&storedCode, &attempts)
 	if err != nil {
 		authRedirect(w, r, otpPath, "Code expired. Please log in again.")
 		return
@@ -2095,7 +2103,7 @@ func EnsurePasswordResetsTable(db *sql.DB) {
 	// Add type column to distinguish reset vs verify tokens (migration-safe)
 	db.Exec("ALTER TABLE _benmore_password_resets ADD COLUMN type TEXT DEFAULT 'reset'")
 	// Cleanup expired tokens
-	db.Exec("DELETE FROM _benmore_password_resets WHERE expires_at < datetime('now')")
+	db.Exec("DELETE FROM _benmore_password_resets WHERE datetime(expires_at) < datetime('now')")
 }
 
 // hashResetToken returns the SHA-256 hex of a password-reset / email-verify
@@ -2191,7 +2199,7 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 	// their 1h TTL - safe to collapse to `token = ?` next release.
 	var email string
 	err := app.DB.QueryRow(
-		"SELECT email FROM _benmore_password_resets WHERE token IN (?, ?) AND expires_at > datetime('now') AND used = 0 AND type = 'reset'",
+		"SELECT email FROM _benmore_password_resets WHERE token IN (?, ?) AND datetime(expires_at) > datetime('now') AND used = 0 AND type = 'reset'",
 		hashResetToken(token), token,
 	).Scan(&email)
 	if err != nil {
@@ -2383,7 +2391,7 @@ func handleVerifyEmail(w http.ResponseWriter, r *http.Request, app *App) {
 	// Stored hashed; IN(hash, raw) covers links issued pre-deploy (1h TTL).
 	var email string
 	err := app.DB.QueryRow(
-		"SELECT email FROM _benmore_password_resets WHERE token IN (?, ?) AND expires_at > datetime('now') AND used = 0 AND type = 'verify'",
+		"SELECT email FROM _benmore_password_resets WHERE token IN (?, ?) AND datetime(expires_at) > datetime('now') AND used = 0 AND type = 'verify'",
 		hashResetToken(token), token,
 	).Scan(&email)
 	if err != nil {
@@ -2445,6 +2453,9 @@ func getSession(app *App, r *http.Request) *Session {
 	if session == nil {
 		if uid := edgeBridgeUserID(r); uid > 0 {
 			session = sessionForEdgeBridge(app, uid)
+			if session != nil {
+				session.Scopes = r.Header.Get("X-Benmore-Edge-Scope")
+			}
 		}
 	}
 
@@ -2465,7 +2476,7 @@ func getSession(app *App, r *http.Request) *Session {
 		if resolved != "" {
 			session.GroupID = resolved
 			// Only persist for real sessions, not API tokens
-			if !strings.HasPrefix(session.ID, "apitoken:") {
+			if !strings.HasPrefix(session.ID, "apitoken:") && !strings.HasPrefix(session.ID, "edge:") {
 				app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", resolved, session.ID)
 			}
 			// CRITICAL (v2.7.59+): re-load session.Roles now that the
@@ -2681,7 +2692,7 @@ func GetSessionFromAPIToken(db *sql.DB, rawToken string) *Session {
 	}
 
 	// Update last_used_at (fire-and-forget)
-	go db.Exec("UPDATE _benmore_api_tokens SET last_used_at = datetime('now') WHERE token_hash = ?", tokenHash)
+	_, _ = db.Exec("UPDATE _benmore_api_tokens SET last_used_at = datetime('now') WHERE token_hash = ? AND (last_used_at IS NULL OR datetime(last_used_at) < datetime('now', '-5 minutes'))", tokenHash)
 
 	return &Session{
 		ID:          fmt.Sprintf("apitoken:%s", tokenHash[:16]),

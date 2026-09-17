@@ -1477,11 +1477,15 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 		defer ctx.TxMu.Unlock()
 	}
 	if startsWithRowProducer || hasReturning {
+		key := cryptoKeyForQuerier(db)
 		sqlRows, err := db.Query(query, args...)
 		if err != nil {
 			return fmt.Errorf("sql: %w", err)
 		}
-		rows, _ := scanRows(sqlRows)
+		rows, err := scanRows(sqlRows, key)
+		if err != nil {
+			return fmt.Errorf("sql scan: %w", err)
+		}
 		if step.Name != "" {
 			// Always store as a slice. Pre-v2.3.2 we collapsed a
 			// single-row result into a bare map at ctx.Data[step.Name]
@@ -1684,11 +1688,15 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 		strings.HasPrefix(upper, "WITH")
 	hasReturning := !startsWithRowProducer && hasReturningClause(upper)
 	if startsWithRowProducer || hasReturning {
+		key := cryptoKeyForQuerier(db)
 		sqlRows, err := db.Query(query)
 		if err != nil {
 			return fmt.Errorf("sql_dynamic: %w", err)
 		}
-		rows, _ := scanRows(sqlRows)
+		rows, err := scanRows(sqlRows, key)
+		if err != nil {
+			return fmt.Errorf("sql scan: %w", err)
+		}
 		if step.Name != "" {
 			ctx.DataMu.Lock()
 			ctx.Data[step.Name] = rows
@@ -2278,8 +2286,11 @@ func execStepWS(ctx *FlowContext, step *FlowStep) error {
 		data, _ := json.Marshal(ctx.Data)
 		payload = string(data)
 	}
-	BroadcastWSToRoomGlobal(room, payload)
-	return nil
+	groupID := ""
+	if ctx.Session != nil {
+		groupID = ctx.Session.EffectiveGroupID()
+	}
+	return BroadcastWSToRoom(ctx.App, groupID, room, payload)
 }
 
 func execStepEmail(ctx *FlowContext, step *FlowStep) error {
@@ -3384,19 +3395,8 @@ func flatDataForCtx(ctx *FlowContext) map[string]any {
 	if ctx == nil || ctx.App == nil {
 		return flat
 	}
-	absDir, _ := filepath.Abs(ctx.App.Dir)
-	appEnvStore.mu.RLock()
-	vars, ok := appEnvStore.apps[absDir]
-	appEnvStore.mu.RUnlock()
-	// Per-app store wins; fall back to global EnvVars for keys not in
-	// the per-app store. Matches InterpolateEnv's lookup order.
-	for k, v := range EnvVars {
+	for k, v := range AppEnvSnapshot(ctx.App.Dir) {
 		flat["env."+k] = v
-	}
-	if ok {
-		for k, v := range vars {
-			flat["env."+k] = v
-		}
 	}
 	return flat
 }

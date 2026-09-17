@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,13 +50,14 @@ const oauthMaxSignedURLTTL = 6 * time.Hour
 // GenerateSignedURL creates a time-limited signed URL for a file path.
 func GenerateSignedURL(host, filePath string, expiresIn time.Duration) string {
 	expires := time.Now().Add(expiresIn).Unix()
-	sig := computeURLSignature(filePath, expires)
-	return fmt.Sprintf("/uploads/%s?expires=%d&sig=%s", filePath, expires, sig)
+	sig := computeURLSignature(host, filePath, expires)
+	u := &url.URL{Path: "/uploads/" + filePath}
+	return fmt.Sprintf("%s?expires=%d&sig=%s", u.EscapedPath(), expires, sig)
 }
 
-func computeURLSignature(path string, expires int64) string {
+func computeURLSignature(host, path string, expires int64) string {
 	mac := hmac.New(sha256.New, csrfKeyBytes())
-	mac.Write([]byte(fmt.Sprintf("%s:%d", path, expires)))
+	mac.Write([]byte(fmt.Sprintf("upload:v2:%s\n%s\n%d", strings.ToLower(host), path, expires)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -104,7 +107,7 @@ func ValidateSignedURL(path string, r *http.Request) bool {
 	}
 
 	// Check signature
-	expected := computeURLSignature(path, expires)
+	expected := computeURLSignature(r.Host, path, expires)
 	return hmac.Equal([]byte(sig), []byte(expected))
 }
 
@@ -231,6 +234,25 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 		// enforced authz and worked. Normalizing first closes the bypass and
 		// makes every spelling mint a valid, authorized URL. (signed_urls_authz_test.go)
 		localRel := uploadRelPath(path)
+		if localRel == "" || !filepath.IsLocal(localRel) || filepath.ToSlash(filepath.Clean(localRel)) != localRel || strings.ContainsAny(localRel, "\\\x00") {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid upload path"})
+			return
+		}
+		// An alias must never obtain a less restrictive signature than its
+		// resolved source. Local signed paths are canonical, without symlinks.
+		root := filepath.Join(app.Dir, "uploads")
+		if resolved, ok := resolveServableFile(root, filepath.Join(root, localRel)); ok {
+			realRoot, err := filepath.EvalSymlinks(root)
+			if err != nil {
+				httpJSON(w, 400, map[string]any{"error": "invalid upload path"})
+				return
+			}
+			realRoot, err = filepath.Abs(realRoot)
+			if err != nil || filepath.Join(realRoot, localRel) != resolved {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "use the canonical upload path"})
+				return
+			}
+		}
 		if isPrivateUploadPath("uploads/" + localRel) {
 			rt := strings.TrimSpace(r.URL.Query().Get("record_table"))
 			rid := strings.TrimSpace(r.URL.Query().Get("record_id"))

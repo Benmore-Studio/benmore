@@ -126,7 +126,7 @@ func execStepPurgeCurrentUser(ctx *FlowContext, step *FlowStep) error {
 	// sessions, and support impersonation even if a caller hand-builds context.
 	liveSQL := `SELECT COUNT(*) FROM _benmore_sessions WHERE id=? AND user_id=?`
 	if sessionCols["expires_at"] {
-		liveSQL += ` AND expires_at > datetime('now')`
+		liveSQL += ` AND datetime(expires_at) > datetime('now')`
 	}
 	if sessionCols["is_impersonation"] {
 		liveSQL += ` AND COALESCE(is_impersonation,0)=0`

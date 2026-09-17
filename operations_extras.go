@@ -42,6 +42,11 @@ func RegisterDSARRoute(mux *http.ServeMux, app *App) {
 			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
+		if !credentialManagementSession(app, session) {
+			httpError(w, "data export requires an ordinary login session", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Cache-Control", "private, no-store")
 		out := map[string]any{
 			"exported_at": time.Now().UTC().Format(time.RFC3339),
 			"user_id":     session.UserID,
@@ -57,15 +62,29 @@ func RegisterDSARRoute(mux *http.ServeMux, app *App) {
 					break
 				}
 			}
-			if !hasUserID {
+			if !hasUserID || !safeIdent(t.Name) || strings.HasPrefix(t.Name, "_benmore_") ||
+				!SessionCanAccessTable(app, t.Name, OpRead, session) || checkScope(session, t.Name, "read") != nil {
 				continue
 			}
-			rows, err := app.DB.Query("SELECT * FROM "+sanitizeIdent(t.Name)+" WHERE user_id = ?", session.UserID)
+			query := "SELECT * FROM " + t.Name + " WHERE user_id = ?"
+			args := []any{session.UserID}
+			if pred, scopeArgs, bypass := rowScopeClause(app, t.Name, session, "view"); !bypass && pred != "" {
+				query += " AND (" + pred + ")"
+				args = append(args, scopeArgs...)
+			}
+			records, err := QueryRows(app.DB, query, args...)
 			if err != nil {
-				continue
+				httpError(w, "data export failed", http.StatusInternalServerError)
+				return
 			}
-			records, _ := scanRowsToMaps(rows)
-			rows.Close()
+			MaskEncryptedFields(app.Encrypted, t.Name, records, session)
+			for _, record := range records {
+				for col := range record {
+					if queryHiddenColumn(app, t.Name, col) {
+						delete(record, col)
+					}
+				}
+			}
 			tables[t.Name] = records
 		}
 		// Profile from _benmore_users.
@@ -86,10 +105,19 @@ func RegisterDSARRoute(mux *http.ServeMux, app *App) {
 			}
 		}
 		// Audit log entries for the user.
-		if rows, err := app.DB.Query("SELECT id, table_name, row_id, action, before_data, after_data, created_at FROM _benmore_audit_log WHERE user_id = ? ORDER BY id DESC LIMIT 1000", session.UserID); err == nil {
+		// Export event metadata, never historical snapshots of rows whose
+		// permissions may have changed since the event was recorded.
+		if rows, err := app.DB.Query("SELECT id, table_name, row_id, action, created_at FROM _benmore_audit_log WHERE user_id = ? ORDER BY id DESC LIMIT 1000", session.UserID); err == nil {
 			recs, _ := scanRowsToMaps(rows)
 			rows.Close()
-			out["audit_log"] = recs
+			visible := make([]map[string]any, 0, len(recs))
+			for _, rec := range recs {
+				table, _ := rec["table_name"].(string)
+				if SessionCanAccessTable(app, table, OpRead, session) && checkScope(session, table, "read") == nil {
+					visible = append(visible, rec)
+				}
+			}
+			out["audit_log"] = visible
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="my-data-%d-%s.json"`,
@@ -329,7 +357,7 @@ func sendToSentry(dsn string, body struct {
 	req, _ := http.NewRequest("POST", endpoint, strings.NewReader(string(data)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Sentry-Auth", fmt.Sprintf("Sentry sentry_version=7, sentry_key=%s, sentry_client=benmore/1", publicKey))
-	client := safeHTTPClient(5 * time.Second)
+	client := safeHTTPClientStrict(5 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("sentry: %s", err)
@@ -352,7 +380,7 @@ func sendErrorToSlack(webhook string, app *App, body struct {
 	text := fmt.Sprintf("*[%s] %s error*\n```%s```\nat %s:%d:%d\nIP %s",
 		subdomain, body.Kind, body.Message, body.Source, body.Line, body.Col, ip)
 	payload, _ := json.Marshal(map[string]any{"text": text})
-	resp, err := http.Post(webhook, "application/json", strings.NewReader(string(payload)))
+	resp, err := safeHTTPClientStrict(5*time.Second).Post(webhook, "application/json", strings.NewReader(string(payload)))
 	if err == nil {
 		resp.Body.Close()
 	}

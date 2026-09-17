@@ -21,10 +21,11 @@ import (
 
 // sseClient represents a connected SSE client with their auth scope.
 type sseClient struct {
-	ch      chan string
-	userID  int64
-	groupID string
-	isAdmin bool
+	principal realtimePrincipal
+	ch        chan string
+	userID    int64
+	groupID   string
+	isAdmin   bool
 }
 
 // LOWER (sse.go): SSE connections previously had no connection cap and no
@@ -67,6 +68,7 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		// because broadcastToSSE filters anonymous clients out - only
 		// framework-level reload events deliver to them.
 		var client sseClient
+		client.principal = realtimePrincipal{app: app, request: r}
 		// Allow anonymous SSE wherever the dev reload client is injected so
 		// the injected EventSource is never rejected with 401. This must
 		// track devReloadClientEnabled (DevMode || testing) exactly - the
@@ -81,16 +83,24 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 				return
 			}
 			client.userID = session.UserID
-			client.groupID = session.GroupID
-			client.isAdmin = session.IsAdmin()
+			client.groupID = session.EffectiveGroupID()
+			client.isAdmin = session.IsAdminBypass()
+			client.principal.session = session
 		} else if needsAuth && (reloadAllowedAnonymous || wsAnonymous) {
 			// Try to attach session metadata if present so the dev
 			// connection still receives scoped data events when the
 			// user is logged in.
 			if session := getSession(app, r); session != nil {
 				client.userID = session.UserID
-				client.groupID = session.GroupID
-				client.isAdmin = session.IsAdmin()
+				client.groupID = session.EffectiveGroupID()
+				client.isAdmin = session.IsAdminBypass()
+				client.principal.session = session
+			}
+		}
+		if client.principal.session == nil && app.DB != nil {
+			if session := getSession(app, r); session != nil {
+				client.principal.session = session
+				client.userID, client.groupID, client.isAdmin = session.UserID, session.EffectiveGroupID(), session.IsAdminBypass()
 			}
 		}
 
@@ -177,6 +187,9 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
 				flusher.Flush()
 			case <-ticker.C:
+				if _, valid := client.principal.current(); !valid {
+					return
+				}
 				fmt.Fprintf(w, ": keepalive\n\n")
 				flusher.Flush()
 			case <-r.Context().Done():
@@ -190,8 +203,8 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 
 // BroadcastChange notifies SSE clients that a table changed (unscoped).
 // Retained for backward compatibility - callers should prefer Broadcast/BroadcastUnscoped.
-func BroadcastChange(table, action string) {
-	BroadcastChangeScoped(table, action, "", 0)
+func BroadcastChange(app *App, table, action string) {
+	BroadcastChangeScoped(app, table, action, "", 0)
 }
 
 // BroadcastReload pushes an SSE "reload" event to every connected
@@ -201,7 +214,7 @@ func BroadcastChange(table, action string) {
 // auth scope - they are framework-level, not data-level, and a
 // reload signal carries no user data. No-op in production where
 // HotRecompileJSX is never called.
-func BroadcastReload(reason string) {
+func BroadcastReload(app *App, reason string) {
 	if reason == "" {
 		reason = "src-changed"
 	}
@@ -210,6 +223,9 @@ func BroadcastReload(reason string) {
 	sseHub.mu.RLock()
 	n := len(sseHub.clients)
 	for c := range sseHub.clients {
+		if !realtimeSameApp(app, c.principal.app) {
+			continue
+		}
 		select {
 		case c.ch <- payload:
 		default:
@@ -248,10 +264,10 @@ func isEventName(s string) bool {
 // In cluster mode, this is called by the event poller for events from other instances.
 // Callers outside the poller should prefer Broadcast/BroadcastScopedDirect which
 // handle cluster vs single-instance routing.
-func BroadcastChangeScoped(table, action string, groupID string, userID int64) {
+func BroadcastChangeScoped(app *App, table, action string, groupID string, userID int64) {
 	InvalidateQueryCacheForTable(table)
-	broadcastToSSE(table, action, groupID, userID)
-	BroadcastWSChange(table, action, groupID, userID)
+	broadcastToSSE(app, table, action, groupID, userID)
+	BroadcastWSChange(app, table, action, groupID, userID)
 }
 
 // SSEClientScript returns the JavaScript that auto-refreshes live components.
