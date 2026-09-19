@@ -1,0 +1,14 @@
+{
+  "name": "@benmore/bm",
+  "version": "2.7.225",
+  "description": "Zero-dependency browser SDK for external Benmore frontends",
+  "type": "module",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    "types": "./index.d.ts",
+    "import": "./index.js",
+    "default": "./index.js"
+  },
+  "license": "MIT"
+}
