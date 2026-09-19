@@ -1,0 +1,49 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Benmore",
+  "description": "Benmore framework app-builder documentation and browser SDK reference",
+  "folders": ["docs/agent", "embedded"],
+  "excludeFolders": [
+    ".claude",
+    ".superpowers",
+    "api",
+    "apps",
+    "docs/deployment",
+    "docs/handoffs",
+    "docs/superpowers",
+    "embedded/sqlite-wasm",
+    "infrastructure",
+    "scripts",
+    "skills"
+  ],
+  "excludeFiles": [
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "CLAUDE.md",
+    "CLAUDE.internal.md",
+    "CLAUDE.local.md",
+    "deploy.md",
+    "alpine.min.js",
+    "chart.min.js",
+    "design.html",
+    "htmx.min.js",
+    "bm_sdk_behavior_test.mjs",
+    "libavoid.js",
+    "libavoid.wasm",
+    "lucide.min.js",
+    "markdown.js",
+    "mermaid.min.js",
+    "rrweb-player.css",
+    "rrweb-player.js",
+    "rrweb.min.js",
+    "sdui.js",
+    "tailwind.min.js",
+    "vis-network.min.js",
+    "UI-REDESIGN-HANDOFF.md"
+  ],
+  "rules": [
+    "Use docs/agent/build.md as the canonical app-builder guide.",
+    "Use embedded/bm.js as the canonical browser SDK runtime."
+  ]
+}

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html class="h-full">
+<head>
+<meta charset="UTF-8">
+<title>Benmore Design</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={theme:{extend:{colors:{canvas:'#e8e8e8',panel:'#2c2c2c',pb:'#3a3a3a'}}}}</script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:false,theme:'dark',themeVariables:{primaryColor:'#1a1a2e',primaryTextColor:'#ccc',lineColor:'#4f7df5',secondaryColor:'#2a2a3e'}})</script>
+<style>
+.mermaid svg { min-width: 1200px !important; min-height: 800px !important; }
+.mermaid .node { cursor: pointer !important; }
+.mermaid .node:hover rect, .mermaid .node:hover polygon, .mermaid .node:hover circle { 
+  stroke-width: 3px !important; filter: brightness(1.2); }
+.mermaid .node.selected rect, .mermaid .node.selected polygon { 
+  stroke: #0d99ff !important; stroke-width: 3px !important; }
+/* Canvas drag */
+#cw { cursor: grab; }
+#cw.dragging { cursor: grabbing; }
+</style>
+</head>
+<body class="h-full bg-panel text-gray-300 text-sm font-sans overflow-hidden flex flex-col">
+
+<!-- Top bar -->
+<div class="h-10 bg-panel border-b border-pb flex items-center px-3 gap-2 shrink-0">
+  <span class="text-white font-bold text-xs mr-3">Benmore Design</span>
+  <button onclick="switchTab('design')" id="tab-design" class="tab h-7 px-3 rounded text-xs bg-white/10 text-white">Design</button>
+  <button onclick="switchTab('data')" id="tab-data" class="tab h-7 px-3 rounded text-xs text-gray-400 hover:text-white">Data</button>
+  <button onclick="switchTab('logic')" id="tab-logic" class="tab h-7 px-3 rounded text-xs text-gray-400 hover:text-white">Logic</button>
+  <button onclick="switchTab('flows')" id="tab-flows" class="tab h-7 px-3 rounded text-xs text-gray-400 hover:text-white">User Flows</button>
+  <button onclick="switchTab('graph')" id="tab-graph" class="tab h-7 px-3 rounded text-xs text-gray-400 hover:text-white">Dep Graph</button>
+  <div class="w-px h-4 bg-pb mx-1"></div>
+  <select id="vp" onchange="changeVP()" class="h-7 px-2 rounded bg-panel border border-pb text-xs text-gray-400">
+    <option value="1440">Desktop</option><option value="768">Tablet</option><option value="375">Mobile</option>
+  </select>
+  <div class="flex-1"></div>
+  <button onclick="copyLLM()" id="copy-btn" class="h-7 px-3 rounded border border-pb text-xs text-gray-400 hover:text-white">Copy for LLM</button>
+  <span class="text-[10px] text-gray-500" id="status"></span>
+</div>
+
+<div class="flex flex-1 overflow-hidden">
+  <!-- Left panel -->
+  <div class="w-48 bg-panel border-r border-pb overflow-y-auto shrink-0 text-[11px]" id="lp"></div>
+
+  <!-- Canvas -->
+  <div class="flex-1 overflow-auto bg-canvas relative" id="cw" style="background-image:radial-gradient(#d0d0d0 1px,transparent 1px);background-size:20px 20px">
+    <div class="relative" id="cv" style="min-width:6000px;min-height:4000px">
+      <svg class="absolute inset-0 w-full h-full pointer-events-none" style="z-index:10" id="svg"></svg>
+    </div>
+  </div>
+
+  <!-- Right panel -->
+  <div class="w-64 bg-panel border-l border-pb overflow-y-auto shrink-0 flex flex-col" id="rp">
+    <div class="p-3 border-b border-pb text-white font-semibold text-xs" id="rt">Details</div>
+    <div class="p-3 text-[11px] flex-1 overflow-y-auto" id="rb"><div class="text-gray-500">Click an item to see details</div></div>
+    <div class="p-3 border-t border-pb">
+      <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Item Comments</div>
+      <div id="rc" class="max-h-32 overflow-y-auto"></div>
+      <textarea id="ci" placeholder="Comment on selected item..." class="w-full mt-2 p-2 bg-gray-800 border border-pb rounded text-[11px] text-gray-300 resize-none h-8 focus:outline-none focus:border-blue-500"></textarea>
+    </div>
+    <!-- Sticky notepad -->
+    <div class="p-3 border-t border-pb">
+      <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Notepad</div>
+      <textarea id="notepad" placeholder="General notes about the app..." class="w-full p-2 bg-gray-800 border border-pb rounded text-[11px] text-gray-300 resize-none h-24 focus:outline-none focus:border-blue-500"></textarea>
+      <button onclick="saveNotepad()" class="mt-1 h-6 px-2 rounded bg-blue-600 text-white text-[10px]">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var D, PORT = {{PORT}}, tab = 'design', vpW = 1440, sc = 0.25, frames = {}, zoom = 1, selTab = '', selId = '', selData = null;
+
+fetch('/api/design').then(function(r){ return r.json() }).then(function(d){
+  D = d;
+  document.getElementById('status').textContent = (D.pages||[]).length + ' pages · ' + (D.tables||[]).length + ' tables';
+  // Load notepad
+  var np = (D.comments||[]).find(function(c){ return c.tab === 'notepad' });
+  if (np) document.getElementById('notepad').value = np.text;
+  render();
+});
+
+document.addEventListener('DOMContentLoaded', function(){
+  // Canvas panning
+  var cw = document.getElementById('cw');
+  var isPanning = false, panX, panY, startScrollX, startScrollY;
+  cw.addEventListener('mousedown', function(e){
+    if (e.target.closest('.frame') || e.target.closest('.mermaid') || e.target.closest('#rp')) return;
+    isPanning = true; cw.classList.add('dragging');
+    panX = e.clientX; panY = e.clientY;
+    startScrollX = cw.scrollLeft; startScrollY = cw.scrollTop;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e){
+    if (!isPanning) return;
+    cw.scrollLeft = startScrollX - (e.clientX - panX);
+    cw.scrollTop = startScrollY - (e.clientY - panY);
+  });
+  document.addEventListener('mouseup', function(){ isPanning = false; cw.classList.remove('dragging'); });
+
+  document.getElementById('cw').addEventListener('wheel', function(e){
+    if (!e.ctrlKey) return; e.preventDefault();
+    zoom = Math.max(0.15, Math.min(2, zoom + (e.deltaY > 0 ? -0.05 : 0.05)));
+    document.getElementById('cv').style.transform = 'scale(' + zoom + ')';
+    document.getElementById('cv').style.transformOrigin = '0 0';
+  }, {passive: false});
+});
+
+function switchTab(t){
+  tab = t;
+  document.querySelectorAll('.tab').forEach(function(b){ b.className = 'tab h-7 px-3 rounded text-xs text-gray-400 hover:text-white' });
+  document.getElementById('tab-' + t).className = 'tab h-7 px-3 rounded text-xs bg-white/10 text-white';
+  render();
+}
+
+function render(){
+  if (tab === 'design') renderDesign();
+  else if (tab === 'data') renderData();
+  else if (tab === 'logic') renderLogic();
+  else if (tab === 'flows') renderUserFlows();
+  else if (tab === 'graph') renderDepGraph();
+}
+
+function getVPLabel(){ return document.getElementById('vp').selectedOptions[0].text }
+
+// ==================== DESIGN TAB ====================
+function renderDesign(){
+  var lp = document.getElementById('lp');
+  lp.innerHTML = '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider">Pages</div>';
+  (D.pages||[]).forEach(function(p){
+    lp.innerHTML += '<a class="block px-3 py-1.5 text-gray-400 hover:text-white hover:bg-white/5 cursor-pointer" onclick="scrollToFrame(\'' + p.route + '\')">' + p.route + (p.auth ? ' <span class="text-blue-400">🔒</span>' : '') + '</a>';
+  });
+  var cv = document.getElementById('cv');
+  cv.innerHTML = '<svg class="absolute inset-0 w-full h-full pointer-events-none" style="z-index:10" id="svg"></svg>';
+  frames = {};
+  var w = Math.round(vpW * sc), h = Math.round(900 * sc), gap = 100;
+  // Layout: root top center, linked pages below
+  var placed = {}, positions = [], queue = [];
+  var root = (D.pages||[]).find(function(p){ return p.route === '/' });
+  if (!root && (D.pages||[]).length) root = (D.pages||[])[0];
+  if (root) { placed[root.route] = true; positions.push({page: root, x: 60 + w + gap, y: 60}); queue = (root.links_to||[]).slice(); }
+  var col = 0, row = 1, maxCols = 3;
+  queue.forEach(function(route){ var p = (D.pages||[]).find(function(pg){ return pg.route === route }); if (!p || placed[p.route]) return; placed[p.route] = true; positions.push({page: p, x: 60 + col * (w + gap), y: 60 + row * (h + gap)}); col++; if (col >= maxCols) { col = 0; row++; } });
+  (D.pages||[]).forEach(function(p){ if (placed[p.route]) return; placed[p.route] = true; positions.push({page: p, x: 60 + col * (w + gap), y: 60 + row * (h + gap)}); col++; if (col >= maxCols) { col = 0; row++; } });
+  positions.forEach(function(pos){
+    var p = pos.page, div = document.createElement('div');
+    div.className = 'frame absolute cursor-move'; div.style.left = pos.x + 'px'; div.style.top = pos.y + 'px';
+    var tags = (p.components||[]).map(function(c){ return '<span class="inline-block px-1.5 py-0.5 bg-gray-200 text-gray-600 rounded text-[9px]">' + c + '</span>' }).join(' ');
+    div.innerHTML = '<div class="text-xs font-semibold text-gray-700 mb-1.5">' + p.route + ' ' + (p.auth ? '<span class="px-1 py-0.5 bg-blue-100 text-blue-700 rounded text-[9px]">auth</span> ' : '') + tags + '</div><div class="bg-white rounded-lg shadow-lg overflow-hidden border-2 border-gray-200 hover:border-blue-400 transition-colors" style="width:' + w + 'px;height:' + h + 'px"><iframe src="http://localhost:' + PORT + p.route + '" style="width:' + vpW + 'px;height:900px;transform:scale(' + sc + ');transform-origin:0 0;display:block;pointer-events:none"></iframe></div>';
+    div.addEventListener('mousedown', function(e){ if (e.target.tagName === 'IFRAME') return; var sx = e.clientX, sy = e.clientY, ox = parseInt(div.style.left), oy = parseInt(div.style.top); function mv(e2){ div.style.left = (ox + e2.clientX - sx) + 'px'; div.style.top = (oy + e2.clientY - sy) + 'px'; frames[p.route].x = parseInt(div.style.left); frames[p.route].y = parseInt(div.style.top); drawArrows(); } function up(){ document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); } document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up); e.preventDefault(); });
+    div.addEventListener('click', function(e){ if (e.target.tagName !== 'IFRAME') sel('design', p.route, p); });
+    cv.appendChild(div); frames[p.route] = {el: div, x: pos.x, y: pos.y, w: w, h: h + 24, data: p};
+  });
+  drawArrows();
+}
+
+function drawArrows(){
+  var svg = document.getElementById('svg'); if (!svg) return;
+  var h = '<defs><marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#0d99ff"/></marker></defs>';
+  (D.pages||[]).forEach(function(p){ (p.links_to||[]).forEach(function(target){
+    var from = frames[p.route], to = frames[target]; if (!from || !to) return;
+    var x1 = from.x + from.w / 2, y1 = from.y + from.h, x2 = to.x + to.w / 2, y2 = to.y;
+    if (to.y < from.y) { y1 = from.y; y2 = to.y + to.h; }
+    if (Math.abs(from.y - to.y) < 50) { x1 = from.x + from.w; y1 = from.y + from.h / 2; x2 = to.x; y2 = to.y + to.h / 2; if (to.x < from.x) { x1 = from.x; x2 = to.x + to.w; } }
+    h += '<path d="M' + x1 + ' ' + y1 + ' C' + x1 + ' ' + ((y1+y2)/2) + ' ' + x2 + ' ' + ((y1+y2)/2) + ' ' + x2 + ' ' + y2 + '" fill="none" stroke="#0d99ff" stroke-width="2" opacity="0.5" marker-end="url(#arrow)"/>';
+  }); }); svg.innerHTML = h;
+}
+
+// ==================== DATA TAB ====================
+function renderData(){
+  var lp = document.getElementById('lp');
+  lp.innerHTML = '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider">Tables</div>';
+  (D.tables||[]).forEach(function(t){ lp.innerHTML += '<a class="block px-3 py-1.5 text-gray-400 hover:text-white hover:bg-white/5 cursor-pointer" onclick="selTable(\'' + t.name + '\')">' + t.name + ' <span class="text-gray-600">(' + t.row_count + ')</span></a>'; });
+  var cv = document.getElementById('cv');
+  // Render a Mermaid ER diagram
+  var mmd = 'erDiagram\n';
+  (D.tables||[]).forEach(function(t){
+    (t.columns||[]).forEach(function(c){ var p = c.split(' '); mmd += '    ' + t.name + ' {\n        ' + (p[1]||'TEXT') + ' ' + p[0] + '\n    }\n'; });
+    (t.foreign_keys||[]).forEach(function(fk){ var parts = fk.split(' → '); if (parts.length === 2) { var col = parts[0].split(' ')[0]; mmd += '    ' + t.name + ' }|--|| ' + parts[1] + ' : "' + col + '"\n'; } });
+    // Show which pages use this table
+    (D.pages||[]).forEach(function(p){ if ((p.tables||[]).indexOf(t.name) >= 0) mmd += '    ' + t.name + ' ||--o{ ' + p.route.replace(/\//g,'_').replace(/^_/,'home') + ' : "reads"\n'; });
+  });
+  cv.innerHTML = '<div class="p-8"><div class="bg-white rounded-xl shadow-lg p-6" style="min-width:1000px"><div class="mermaid">' + mmd + '</div></div></div>';
+  try { mermaid.run({nodes: cv.querySelectorAll('.mermaid')}); } catch(e){}
+  // Wire click handlers on mermaid nodes
+  setTimeout(function(){
+    document.querySelectorAll('.mermaid .node').forEach(function(node){
+      node.style.cursor = 'pointer';
+      node.addEventListener('click', function(e){
+        e.stopPropagation();
+        // Extract the node id from the text
+        var text = node.textContent.trim();
+        // Remove emoji prefixes
+        text = text.replace(/📄 |💾 |⚡ /g, '').split('(')[0].trim();
+        sel(tab, text, findDataForId(text));
+        // Visual selection
+        document.querySelectorAll('.mermaid .node').forEach(function(n){ n.classList.remove('selected') });
+        node.classList.add('selected');
+      });
+    });
+  }, 500);
+
+}
+
+function selTable(name){ var t = (D.tables||[]).find(function(x){ return x.name === name }); if (t) sel('data', name, t); }
+
+// ==================== LOGIC TAB ====================
+function renderLogic(){
+  var lp = document.getElementById('lp');
+  lp.innerHTML = '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider">Flows</div>';
+  if (!(D.flows||[]).length) lp.innerHTML += '<div class="px-3 py-2 text-gray-500">No flows.yaml</div>';
+  (D.flows||[]).forEach(function(f){ lp.innerHTML += '<a class="block px-3 py-1.5 text-gray-400 hover:text-white hover:bg-white/5 cursor-pointer" onclick="sel(\'logic\',\'' + f.name + '\',null)">' + f.name + '</a>'; });
+  lp.innerHTML += '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider mt-3">Hooks</div>';
+  var hasHooks = false;
+  (D.tables||[]).forEach(function(t){ (t.hooks||[]).forEach(function(hk){ hasHooks = true; lp.innerHTML += '<a class="block px-3 py-1.5 text-gray-400 hover:text-white hover:bg-white/5 cursor-pointer">' + hk + ': ' + t.name + '</a>'; }); });
+  if (!hasHooks) lp.innerHTML += '<div class="px-3 py-2 text-gray-500">No hooks</div>';
+
+  var cv = document.getElementById('cv');
+  // Mermaid flowchart for logic
+  var mmd = 'flowchart TD\n';
+  (D.flows||[]).forEach(function(f){ mmd += '    ' + f.name + '["' + f.name + '<br/>' + f.trigger + '<br/>' + f.steps + ' steps"]\n'; mmd += '    style ' + f.name + ' fill:#2a1a3e,stroke:#a78bfa,color:#ccc\n'; });
+  (D.tables||[]).forEach(function(t){ (t.hooks||[]).forEach(function(hk){ var id = hk.replace(/\s/g,'') + '_' + t.name; mmd += '    ' + id + '["' + hk + ': ' + t.name + '"]\n'; mmd += '    ' + id + ' --> ' + t.name + '_tbl["' + t.name + '"]\n'; mmd += '    style ' + id + ' fill:#3a2a1a,stroke:#f97316,color:#ccc\n'; mmd += '    style ' + t.name + '_tbl fill:#1a2a1a,stroke:#22c55e,color:#ccc\n'; }); });
+  if (mmd === 'flowchart TD\n') { cv.innerHTML = '<div class="flex items-center justify-center h-96 text-gray-400">No business logic. Add flows.yaml or hooks.yaml.</div>'; return; }
+  cv.innerHTML = '<div class="p-8"><div class="bg-white rounded-xl shadow-lg p-6" style="min-width:1000px"><div class="mermaid">' + mmd + '</div></div></div>';
+  try { mermaid.run({nodes: cv.querySelectorAll('.mermaid')}); } catch(e){}
+  // Wire click handlers on mermaid nodes
+  setTimeout(function(){
+    document.querySelectorAll('.mermaid .node').forEach(function(node){
+      node.style.cursor = 'pointer';
+      node.addEventListener('click', function(e){
+        e.stopPropagation();
+        // Extract the node id from the text
+        var text = node.textContent.trim();
+        // Remove emoji prefixes
+        text = text.replace(/📄 |💾 |⚡ /g, '').split('(')[0].trim();
+        sel(tab, text, findDataForId(text));
+        // Visual selection
+        document.querySelectorAll('.mermaid .node').forEach(function(n){ n.classList.remove('selected') });
+        node.classList.add('selected');
+      });
+    });
+  }, 500);
+
+}
+
+// ==================== USER FLOWS TAB ====================
+function renderUserFlows(){
+  var lp = document.getElementById('lp');
+  lp.innerHTML = '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider">User Flows</div><div class="px-3 py-1 text-gray-500 text-[10px]">Auto-generated from page links</div>';
+
+  var mmd = 'flowchart LR\n';
+  (D.pages||[]).forEach(function(p){
+    var id = p.route.replace(/\//g,'_').replace(/^_/,'home');
+    var label = p.route === '/' ? 'Home' : p.route;
+    mmd += '    ' + id + '["' + label + '"]\n';
+    if (p.auth) mmd += '    style ' + id + ' fill:#1a2744,stroke:#4f7df5,color:#ccc\n';
+    else mmd += '    style ' + id + ' fill:#1a1a2e,stroke:#666,color:#ccc\n';
+    (p.links_to||[]).forEach(function(target){
+      var tid = target.replace(/\//g,'_').replace(/^_/,'home');
+      mmd += '    ' + id + ' --> ' + tid + '\n';
+    });
+  });
+
+  var cv = document.getElementById('cv');
+  cv.innerHTML = '<div class="p-8"><div class="bg-white rounded-xl shadow-lg p-6" style="min-width:1000px"><div class="mermaid">' + mmd + '</div></div></div>';
+  try { mermaid.run({nodes: cv.querySelectorAll('.mermaid')}); } catch(e){}
+  // Wire click handlers on mermaid nodes
+  setTimeout(function(){
+    document.querySelectorAll('.mermaid .node').forEach(function(node){
+      node.style.cursor = 'pointer';
+      node.addEventListener('click', function(e){
+        e.stopPropagation();
+        // Extract the node id from the text
+        var text = node.textContent.trim();
+        // Remove emoji prefixes
+        text = text.replace(/📄 |💾 |⚡ /g, '').split('(')[0].trim();
+        sel(tab, text, findDataForId(text));
+        // Visual selection
+        document.querySelectorAll('.mermaid .node').forEach(function(n){ n.classList.remove('selected') });
+        node.classList.add('selected');
+      });
+    });
+  }, 500);
+
+}
+
+// ==================== DEP GRAPH TAB ====================
+function renderDepGraph(){
+  var lp = document.getElementById('lp');
+  lp.innerHTML = '<div class="p-2 text-[10px] text-gray-500 uppercase tracking-wider">Dependency Graph</div><div class="px-3 py-1 text-gray-500 text-[10px]">Pages → Tables → Hooks</div>';
+
+  var mmd = 'flowchart TD\n';
+  // Pages
+  (D.pages||[]).forEach(function(p){
+    var id = 'page_' + p.route.replace(/\//g,'_').replace(/^_/,'home');
+    mmd += '    ' + id + '["📄 ' + p.route + '"]\n';
+    mmd += '    style ' + id + ' fill:#1a2744,stroke:#4f7df5,color:#ccc\n';
+    (p.tables||[]).forEach(function(t){ mmd += '    ' + id + ' -->|reads| tbl_' + t + '\n'; });
+    (p.writes_to||[]).forEach(function(t){ mmd += '    ' + id + ' -->|writes| tbl_' + t + '\n'; });
+  });
+  // Tables
+  (D.tables||[]).forEach(function(t){
+    mmd += '    tbl_' + t.name + '[("💾 ' + t.name + ' (' + t.row_count + ')")]\n';
+    mmd += '    style tbl_' + t.name + ' fill:#1a2a1a,stroke:#22c55e,color:#ccc\n';
+    (t.hooks||[]).forEach(function(hk){
+      var hid = 'hook_' + hk + '_' + t.name;
+      mmd += '    tbl_' + t.name + ' -->|' + hk + '| ' + hid + '["⚡ ' + hk + '"]\n';
+      mmd += '    style ' + hid + ' fill:#3a2a1a,stroke:#f97316,color:#ccc\n';
+    });
+  });
+
+  var cv = document.getElementById('cv');
+  cv.innerHTML = '<div class="p-8"><div class="bg-white rounded-xl shadow-lg p-6" style="min-width:1000px"><div class="mermaid">' + mmd + '</div></div></div>';
+  try { mermaid.run({nodes: cv.querySelectorAll('.mermaid')}); } catch(e){}
+  // Wire click handlers on mermaid nodes
+  setTimeout(function(){
+    document.querySelectorAll('.mermaid .node').forEach(function(node){
+      node.style.cursor = 'pointer';
+      node.addEventListener('click', function(e){
+        e.stopPropagation();
+        // Extract the node id from the text
+        var text = node.textContent.trim();
+        // Remove emoji prefixes
+        text = text.replace(/📄 |💾 |⚡ /g, '').split('(')[0].trim();
+        sel(tab, text, findDataForId(text));
+        // Visual selection
+        document.querySelectorAll('.mermaid .node').forEach(function(n){ n.classList.remove('selected') });
+        node.classList.add('selected');
+      });
+    });
+  }, 500);
+
+}
+
+// ==================== SELECTION + COMMENTS ====================
+function sel(t, id, data){
+  selTab = t; selId = id; selData = data;
+  document.getElementById('rt').textContent = id;
+  var h = '';
+  if (t === 'design' && data && data.route) {
+    if (data.title) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Title</div><div>' + data.title + '</div></div>';
+    if (data.auth) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Auth</div><div>' + data.auth + '</div></div>';
+    if ((data.components||[]).length) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Components</div><div class="flex flex-wrap gap-1">' + data.components.map(function(c){ return '<span class="px-1.5 py-0.5 bg-gray-700 rounded text-[10px]">' + c + '</span>' }).join('') + '</div></div>';
+    if ((data.tables||[]).length) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Reads</div><div class="flex flex-wrap gap-1">' + data.tables.map(function(x){ return '<span class="px-1.5 py-0.5 bg-green-900/50 text-green-300 rounded text-[10px]">' + x + '</span>' }).join('') + '</div></div>';
+    if ((data.links_to||[]).length) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Links to</div><div class="flex flex-wrap gap-1">' + data.links_to.map(function(x){ return '<span class="px-1.5 py-0.5 bg-blue-900/50 text-blue-300 rounded text-[10px]">' + x + '</span>' }).join('') + '</div></div>';
+    h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Viewport</div><div>' + getVPLabel() + '</div></div>';
+    h += '<a href="http://localhost:' + PORT + data.route + '" target="_blank" class="text-blue-400 text-[10px] hover:underline">Open →</a>';
+  } else if (t === 'data' && data && data.columns) {
+    h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Columns (' + data.columns.length + ')</div>' + data.columns.map(function(c){ return '<div class="py-0.5 border-b border-gray-700">' + c + '</div>' }).join('') + '</div>';
+    if ((data.hooks||[]).length) h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Hooks</div><div class="flex flex-wrap gap-1">' + data.hooks.map(function(x){ return '<span class="px-1.5 py-0.5 bg-orange-900/50 text-orange-300 rounded text-[10px]">' + x + '</span>' }).join('') + '</div></div>';
+    h += '<div class="mb-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Rows</div><div>' + data.row_count + '</div></div>';
+  }
+  document.getElementById('rb').innerHTML = h;
+  renderComments();
+}
+
+function renderComments(){
+  var rc = document.getElementById('rc'); rc.innerHTML = '';
+  (D.comments||[]).filter(function(c){ return c.target === selId && c.tab === selTab }).forEach(function(c){
+    rc.innerHTML += '<div class="p-2 bg-gray-800 rounded mb-1.5"><div class="text-gray-300 text-[11px]">' + c.text + '</div><div class="text-[9px] text-gray-500 mt-1">' + (c.viewport||'') + ' · ' + c.created + '</div></div>';
+  });
+  document.getElementById('ci').onkeydown = function(e){
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault(); var v = document.getElementById('ci');
+      if (!v.value.trim() || !selId) return;
+      if (!D.comments) D.comments = [];
+      D.comments.push({id: 'c' + Date.now(), tab: selTab, target: selId, text: v.value.trim(), viewport: getVPLabel(), created: new Date().toISOString().split('T')[0]});
+      v.value = '';
+      fetch('/api/comments', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(D.comments)});
+      renderComments();
+    }
+  };
+}
+
+function saveNotepad(){
+  if (!D.comments) D.comments = [];
+  // Remove old notepad entry
+  D.comments = D.comments.filter(function(c){ return c.tab !== 'notepad' });
+  var text = document.getElementById('notepad').value;
+  if (text.trim()) D.comments.push({id: 'notepad', tab: 'notepad', target: 'app', text: text, created: new Date().toISOString().split('T')[0]});
+  fetch('/api/comments', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(D.comments)});
+}
+
+
+function findDataForId(id){
+  var t = (D.tables||[]).find(function(x){ return x.name === id });
+  if (t) return t;
+  var p = (D.pages||[]).find(function(x){ return x.route === id || x.route === '/' + id || x.route.replace(/\//g,'_').replace(/^_/,'home') === id });
+  if (p) return p;
+  var f = (D.flows||[]).find(function(x){ return x.name === id });
+  if (f) return f;
+  return {name: id};
+}
+
+function scrollToFrame(route){ if (!frames[route]) return; document.getElementById('cw').scrollTo({left: frames[route].x - 60, top: frames[route].y - 60, behavior: 'smooth'}); sel('design', route, frames[route].data); }
+function changeVP(){ vpW = parseInt(document.getElementById('vp').value); sc = vpW === 1440 ? 0.25 : vpW === 768 ? 0.4 : 0.5; renderDesign(); }
+function copyLLM(){
+  var out = JSON.stringify({pages: D.pages, tables: D.tables, flows: D.flows, comments: D.comments}, null, 2);
+  navigator.clipboard.writeText(out).then(function(){
+    var btn = document.getElementById('copy-btn');
+    btn.textContent = 'Copied!'; btn.classList.add('text-green-400');
+    setTimeout(function(){ btn.textContent = 'Copy for LLM'; btn.classList.remove('text-green-400'); }, 2000);
+  });
+}
+</script>
+</body>
+</html>
