@@ -50,6 +50,10 @@ builds:
       - -tags=sqlite_fts5
     ldflags:
       - -s -w -X main.version={{ .Version }}
+    hooks:
+      post:
+        - cmd: bash scripts/check-release-provenance.sh "{{ .Path }}" "{{ .FullCommit }}" "{{ .Version }}"
+          output: true
     goos:
       - linux
       - darwin
