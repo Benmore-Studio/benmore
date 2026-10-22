@@ -21,6 +21,8 @@ jobs:
       # fixture fail hard if tsc is somehow missing, so drift can't land green.
       - name: Install TypeScript
         run: npm i -g typescript
+      - name: Verify release provenance controls
+        run: python3 -B scripts/test-release-provenance.py
       - name: Vet
         run: go vet -tags sqlite_fts5 ./...
       - name: Build

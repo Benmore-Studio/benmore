@@ -1,5 +1,6 @@
 /benmore
 /benmore-*
+/dist/
 *.db
 *.db-wal
 *.db-shm
