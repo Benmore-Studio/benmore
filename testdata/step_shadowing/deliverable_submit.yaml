@@ -1,0 +1,49 @@
+# Minimal shape of a submission flow as written before 2.7.248: the step
+# that appends the optional note is named `note`, so `${{ note }}` reads the
+# step (nothing yet) instead of the request field, and the note is dropped.
+on:
+  request:
+    method: POST
+    path: /api/flows/deliverable-submit
+    auth: required
+    transaction: true
+
+jobs:
+  submit:
+    steps:
+      - id: claim
+        run: sql
+        with:
+          query: |
+            UPDATE deliverables
+               SET status = 'submitted'
+             WHERE id = :did AND status IN ('open', 'blocked')
+          params:
+            did: "${{ deliverable_id | default:'' }}"
+        expect_rows: "=1"
+
+      - id: note
+        if: "${{ note | default:'' }}"
+        run: sql
+        with:
+          query: |
+            UPDATE deliverables
+               SET detail = COALESCE(NULLIF(detail, '') || char(10), '') || :note
+             WHERE id = :did
+          params:
+            note: "${{ note | default:'' }}"
+            did: "${{ deliverable_id | default:'' }}"
+
+      - id: final
+        run: sql
+        with:
+          query: "SELECT status FROM deliverables WHERE id = :did"
+          params:
+            did: "${{ deliverable_id | default:'' }}"
+
+      - run: respond
+        with:
+          status: 200
+          json:
+            ok: true
+            status: "${{ steps.final.outputs.status }}"

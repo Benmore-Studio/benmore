@@ -344,3 +344,58 @@ func TestEncryptionTriggerUpdatePath(t *testing.T) {
 		t.Fatalf("idempotent update broke decryption: got %q err %v", plain, err)
 	}
 }
+
+// TestEncryptionTriggerKeepsTextAfterNUL: a value with a NUL byte in it (JSON
+// "\u0000" in a request field) is encrypted and blind-indexed whole.
+//
+// The SQL functions get their arguments from the driver. Up to go-sqlite3
+// v1.14.45 it handed a Go function a text argument, and took back a text
+// result, only up to the first NUL: an encrypted column stored the encryption
+// of the part before it and lost the rest, and the blind index of "abc\x00def"
+// was the blind index of "abc", so the two matched each other in an equality
+// search and under a unique index.
+func TestEncryptionTriggerKeepsTextAfterNUL(t *testing.T) {
+	db, cleanup := newEncTestDB(t)
+	defer cleanup()
+
+	if _, err := db.Exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	InstallEncryptionTriggers(db, &EncryptedFieldConfig{
+		Fields: map[string][]EncryptedFieldDef{"notes": {{Column: "body"}}},
+	})
+	const plain = "abc\x00def"
+	if _, err := db.Exec("INSERT INTO notes (body) VALUES (?)", plain); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var stored string
+	if err := db.QueryRow("SELECT body FROM notes").Scan(&stored); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !cryptoIsEncrypted(stored) {
+		t.Fatalf("body should be encrypted, got %q", stored)
+	}
+	if got, err := fieldDecryptCtx(appEncryptionKey, "body", stored); err != nil || got != plain {
+		t.Fatalf("stored value decrypts to %q (err %v), want %q", got, err, plain)
+	}
+	// The same through the SQL functions, both directions.
+	var viaSQL []byte
+	if err := db.QueryRow("SELECT CAST(benmore_decrypt(body, 'notes', 'body') AS BLOB) FROM notes").Scan(&viaSQL); err != nil || string(viaSQL) != plain {
+		t.Fatalf("benmore_decrypt answered %q (err %v), want %q", viaSQL, err, plain)
+	}
+	var blind string
+	if err := db.QueryRow("SELECT benmore_blind_index('abc' || char(0) || 'def')").Scan(&blind); err != nil {
+		t.Fatalf("benmore_blind_index: %v", err)
+	}
+	whole, err := BlindIndexHMAC(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, err := BlindIndexHMAC("abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blind != whole || blind == prefix {
+		t.Fatalf("blind index in SQL: equals the whole value's %v, equals the prefix's %v; want true, false", blind == whole, blind == prefix)
+	}
+}

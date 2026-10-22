@@ -17,7 +17,7 @@ import (
 //
 //   1. /static/*.css and /static/*.js refs in HTML get ?v=<content-hash>
 //      appended, derived from the file's bytes on disk (the .js hash covers
-//      the .tsx/.ts/.jsx source tree it's JIT-compiled from)
+//      every file under static/, since a bundle can import any of them)
 //   2. URLs that already have a query string are NOT rewritten
 //      (idempotent against re-rendering; respects explicit versions)
 //   3. URLs whose files don't exist on disk are NOT rewritten
@@ -158,6 +158,52 @@ func TestVersionStaticAssetsJSVersionTracksSourceTree(t *testing.T) {
 	after := vQueryRe.FindString(string(versionStaticAssets(html, app)))
 	if before == after {
 		t.Errorf("editing a sibling source did not bump the .js version (both %q)", before)
+	}
+}
+
+func TestVersionStaticAssetsJSVersionTracksNonScriptImports(t *testing.T) {
+	// esbuild also bundles .json, .css and any file imported with
+	// {type:'text'}. Cloudflare keeps /static/*.js?v= for about a day, so an
+	// edit to one of those must change the version too.
+	app := &App{Dir: t.TempDir()}
+	staticDir := filepath.Join(app.Dir, "static")
+	os.MkdirAll(filepath.Join(staticDir, "data"), 0755)
+	os.WriteFile(filepath.Join(staticDir, "app.tsx"), []byte("import rows from './data/rows.json'; import note from './note.md' with {type:'text'};"), 0644)
+	os.WriteFile(filepath.Join(staticDir, "data", "rows.json"), []byte(`[1]`), 0644)
+	os.WriteFile(filepath.Join(staticDir, "note.md"), []byte("hello"), 0644)
+
+	html := []byte(`<script src="/static/app.js"></script>`)
+	version := func() string { return vQueryRe.FindString(string(versionStaticAssets(html, app))) }
+	start := version()
+	if start == "" {
+		t.Fatal("app.js got no ?v= token")
+	}
+	os.WriteFile(filepath.Join(staticDir, "data", "rows.json"), []byte(`[1, 2, 3]`), 0644)
+	afterJSON := version()
+	if afterJSON == start {
+		t.Errorf("editing an imported .json did not bump the .js version (%q)", start)
+	}
+	os.WriteFile(filepath.Join(staticDir, "note.md"), []byte("hello, edited"), 0644)
+	if version() == afterJSON {
+		t.Errorf("editing a text-imported .md did not bump the .js version (%q)", afterJSON)
+	}
+	// Desktop metadata sidecars are never served or bundled.
+	before := version()
+	os.WriteFile(filepath.Join(staticDir, "._app.tsx"), []byte("junk"), 0644)
+	if got := version(); got != before {
+		t.Errorf("a metadata sidecar changed the .js version (%q -> %q)", before, got)
+	}
+}
+
+func TestVersionStaticAssetsJSNeedsAScriptSource(t *testing.T) {
+	// Other files alone don't make an unknown .js reference look real.
+	app := &App{Dir: t.TempDir()}
+	staticDir := filepath.Join(app.Dir, "static")
+	os.MkdirAll(staticDir, 0755)
+	os.WriteFile(filepath.Join(staticDir, "logo.png"), []byte("png"), 0644)
+	html := []byte(`<script src="/static/ghost.js"></script>`)
+	if out := string(versionStaticAssets(html, app)); out != string(html) {
+		t.Errorf("a .js ref with no script source should be left untouched, got: %s", out)
 	}
 }
 

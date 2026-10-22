@@ -24,7 +24,8 @@ package main
 //       returns: { slug, members: [{ user_id, joined_at, last_seen }], count }
 //
 // SSE: every join/leave/sweep-expiry fires `{table:"_benmore_presence",
-// action:"insert"|"update"|"delete"}` so clients re-fetch the list.
+// action:"insert"|"delete"}` to signed-in streams (a join or leave only
+// within the caller's tenant in an app with groups:) so clients re-fetch.
 
 import (
 	"database/sql"
@@ -38,6 +39,10 @@ import (
 // Heartbeat staleness window. Clients send a heartbeat every 20s; the
 // server treats anything older than 90s as departed. The sweep loop
 // runs every 60s.
+// presenceTable is the framework table behind bm.presence; its realtime
+// events drive bm.presence(slug).onChange.
+const presenceTable = "_benmore_presence"
+
 const (
 	presenceExpiryWindow = 90 * time.Second
 	presenceSweepEvery   = 60 * time.Second
@@ -61,33 +66,46 @@ func EnsurePresenceTable(db *sql.DB) {
 // Auth required - anonymous presence makes no sense for our use cases
 // (huddles, live rooms, stream watchers); if anon presence is ever a
 // real ask, we can add features.presence_anonymous.
-func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
+func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_presence/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		if !isBearerAuth(r) && !validateCSRF(r) {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
-			return
-		}
+		// The body is read before the CSRF check because it can carry the
+		// token: bm.presence leaves with navigator.sendBeacon on pagehide,
+		// and a beacon cannot set X-CSRF-Token, so the SDK sends the token as
+		// `_csrf` in the JSON payload. It is validated like a header token.
 		var body struct {
 			Slug   string `json:"slug"`
 			Action string `json:"action"`
+			CSRF   string `json:"_csrf"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		decodeErr := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body)
+		if !isBearerAuth(r) && !(body.CSRF != "" && validateCSRFToken(r, body.CSRF)) && !validateCSRF(r) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+			return
+		}
+		if decodeErr != nil {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
 		slug := strings.TrimSpace(body.Slug)
-		if slug == "" || len(slug) > 200 {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required (1-200 chars)"})
+		if slug == "" || len(slug) > 200 || !presenceSlugUsable(slug) {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required (1-200 chars, no NUL)"})
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(body.Action))
 		if action == "" {
 			action = "heartbeat"
+		}
+		// A slug is a room name: declared ws_rooms rules decide who may be
+		// present in it, as they do for bm.room and bm.broadcast. Leaving
+		// stays open so a member removed mid-session can still clear its row.
+		if action != "leave" && !roomMembershipAllowed(app, session, session.UserID, slug) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
+			return
 		}
 		// Tenant-namespaced storage key (cross-tenant presence isolation).
 		key := presenceKey(app, session, slug)
@@ -101,26 +119,26 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 				key, session.UserID,
 			)
 			if err != nil {
-				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
+				serverErrorJSON(w, r, app, "presence", err, "db error")
 				return
 			}
-			BroadcastUnscoped(app, "_benmore_presence", "insert")
+			BroadcastScopedDirect(app, presenceTable, "insert", presenceTenant(app, session), 0)
 		case "heartbeat":
 			_, err := app.DB.Exec(
 				`UPDATE _benmore_presence SET last_seen_at = CURRENT_TIMESTAMP WHERE slug = ? AND user_id = ?`,
 				key, session.UserID,
 			)
 			if err != nil {
-				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
+				serverErrorJSON(w, r, app, "presence", err, "db error")
 				return
 			}
 		case "leave":
 			_, err := app.DB.Exec(`DELETE FROM _benmore_presence WHERE slug = ? AND user_id = ?`, key, session.UserID)
 			if err != nil {
-				httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error: " + err.Error()})
+				serverErrorJSON(w, r, app, "presence", err, "db error")
 				return
 			}
-			BroadcastUnscoped(app, "_benmore_presence", "delete")
+			BroadcastScopedDirect(app, presenceTable, "delete", presenceTenant(app, session), 0)
 		default:
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "action must be join | heartbeat | leave"})
 			return
@@ -141,8 +159,12 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 		slug := strings.TrimSpace(r.URL.Query().Get("slug"))
-		if slug == "" {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug query param required"})
+		if slug == "" || !presenceSlugUsable(slug) {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug query param required (no NUL)"})
+			return
+		}
+		if !roomMembershipAllowed(app, session, session.UserID, slug) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
 			return
 		}
 		members := presenceMembers(app.DB, presenceKey(app, session, slug))
@@ -154,15 +176,33 @@ func RegisterPresenceRoutes(mux *http.ServeMux, app *App) {
 	})
 }
 
-// presenceKey namespaces a slug by the caller's tenant group so a user in one
-// group can't read or write another group's presence (the table has no tenant
-// column, and slugs like "huddle:42" are guessable across tenants). The NUL
-// separator can't appear in a validated slug. No-op for non-multi-tenant apps.
+// presenceKey namespaces a slug by the caller's effective tenant (act-as
+// aware, as every other tenant surface) so a user in one group can't read or
+// write another group's presence (the table has no tenant column, and slugs
+// like "huddle:42" are guessable across tenants). The NUL separator can't
+// appear in a validated slug (presenceSlugUsable). No-op for
+// non-multi-tenant apps.
 func presenceKey(app *App, session *Session, slug string) string {
-	if app.Group != nil && app.Group.Key != "" && session != nil && session.GroupID != "" {
-		return session.GroupID + "\x00" + slug
+	if app.Group != nil && app.Group.Key != "" && session != nil && session.EffectiveGroupID() != "" {
+		return session.EffectiveGroupID() + "\x00" + slug
 	}
 	return slug
+}
+
+// presenceTenant is the tenant a presence change is announced in: the
+// caller's effective tenant in an app with groups:, else none.
+func presenceTenant(app *App, session *Session) string {
+	if app.Group != nil && app.Group.Key != "" && session.EffectiveHasGroup() {
+		return session.EffectiveGroupID()
+	}
+	return ""
+}
+
+// presenceSlugUsable refuses a slug holding NUL, presenceKey's tenant
+// separator: a caller without a tenant is keyed by the bare slug, so
+// "<group>\x00<slug>" would read and write that group's presence list.
+func presenceSlugUsable(slug string) bool {
+	return !strings.ContainsRune(slug, 0)
 }
 
 // presenceMemberCount returns the live count for a slug, honoring the
@@ -215,8 +255,8 @@ func presenceMembers(db *sql.DB, slug string) []map[string]any {
 //
 // Stops when app.Stop closes (matches the cron + jobs worker pattern).
 func StartPresenceSweeper(app *App) {
+	stop := app.workerStopGeneration()
 	safeGo("presence.sweep", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(presenceSweepEvery)
 		defer ticker.Stop()
 		for {
@@ -232,7 +272,7 @@ func StartPresenceSweeper(app *App) {
 					continue
 				}
 				if n, _ := res.RowsAffected(); n > 0 {
-					BroadcastUnscoped(app, "_benmore_presence", "delete")
+					BroadcastUnscoped(app, presenceTable, "delete")
 				}
 			}
 		}

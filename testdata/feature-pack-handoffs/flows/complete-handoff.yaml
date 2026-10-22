@@ -1,0 +1,20 @@
+on:
+  request:
+    method: POST
+    path: /api/handoffs/:id/complete
+    auth: required
+    transaction: true
+jobs:
+  complete:
+    steps:
+      - id: changed
+        run: sql
+        with:
+          query: "UPDATE handoffs SET status='complete' WHERE id=:id AND user_id=:user_id RETURNING id,status"
+          expect_rows: 1
+      - run: respond
+        with:
+          status: 200
+          body:
+            id: ${{ steps.changed.outputs.id }}
+            status: ${{ steps.changed.outputs.status }}

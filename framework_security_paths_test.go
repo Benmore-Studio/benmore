@@ -89,7 +89,7 @@ func TestAuditIdempotencyAtomicReplayAndConflict(t *testing.T) {
 	if w.Code != 403 {
 		t.Fatalf("CSRF replay: %d", w.Code)
 	}
-	auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:read' WHERE id=?", sid)
+	auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:read' WHERE id=?", sessionStorageKey(sid))
 	w = auditPost(mux, sid, "/api/notes", "retry", `{"title":"once"}`, false)
 	if w.Code != 403 {
 		t.Fatalf("scoped replay: %d", w.Code)
@@ -156,10 +156,10 @@ func TestAuditSchedulerTrustedIdentityAndRevocation(t *testing.T) {
 				t.Fatalf("schedule: %d %s", w.Code, w.Body.String())
 			}
 			if mode == "logged_out" {
-				auditExec(t, app.DB, "DELETE FROM _benmore_sessions WHERE id=?", sid)
+				auditExec(t, app.DB, "DELETE FROM _benmore_sessions WHERE id=?", sessionStorageKey(sid))
 			}
 			if mode == "expired" {
-				auditExec(t, app.DB, "UPDATE _benmore_sessions SET expires_at='2000-01-01T00:00:00Z' WHERE id=?", sid)
+				auditExec(t, app.DB, "UPDATE _benmore_sessions SET expires_at='2000-01-01T00:00:00Z' WHERE id=?", sessionStorageKey(sid))
 			}
 			if mode == "deactivated" {
 				auditExec(t, app.DB, "UPDATE _benmore_users SET deactivated_at=CURRENT_TIMESTAMP WHERE id=?", uid)
@@ -189,7 +189,7 @@ func TestAuditSchedulerTrustedIdentityAndRevocation(t *testing.T) {
 func TestAuditTokenScopeAttenuation(t *testing.T) {
 	app, mux := auditApp(t)
 	sid := createCrudScopeSession(t, app, "mint@example.com", "user", "", "")
-	auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:write' WHERE id=?", sid)
+	auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:write' WHERE id=?", sessionStorageKey(sid))
 	for _, scopes := range []string{"*", "*:read", "notes:delete", "rooms:read"} {
 		w := auditPost(mux, sid, "/api/_auth/api-tokens", "", fmt.Sprintf(`{"name":"test","scopes":%q}`, scopes), false)
 		if w.Code != 403 {

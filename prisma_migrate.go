@@ -39,12 +39,13 @@ import (
 // It carries enough structure that the SQL emitter and the
 // human-readable summary can be generated from one source of truth.
 type MigrationDiff struct {
-	TablesAdded   []PrismaModel            // new model: CREATE TABLE + indexes + triggers
-	TablesDropped []string                 // model removed: DROP TABLE
-	ColumnsAdded  map[string][]PrismaField // table → new fields: ALTER ADD COLUMN
-	IndexesAdded  map[string][]PrismaIndex // table → new @@index entries
-	UniquesAdded  map[string][]PrismaIndex // table → new @@unique entries
-	Warnings      []string                 // schema changes we can't safely auto-apply
+	TablesAdded    []PrismaModel            // new model: CREATE TABLE + indexes + triggers
+	TablesDropped  []string                 // model removed: DROP TABLE
+	ColumnsAdded   map[string][]PrismaField // table → new fields: ALTER ADD COLUMN
+	IndexesAdded   map[string][]PrismaIndex // table → new @@index entries
+	UniquesAdded   map[string][]PrismaIndex // table → new @@unique entries
+	RelationsAdded map[string][]PrismaField // populated from live FK metadata, including legacy drift
+	Warnings       []string                 // schema changes we can't safely auto-apply
 }
 
 // Empty reports whether the diff actually changes anything.
@@ -53,7 +54,8 @@ func (d MigrationDiff) Empty() bool {
 		len(d.TablesDropped) == 0 &&
 		len(d.ColumnsAdded) == 0 &&
 		len(d.IndexesAdded) == 0 &&
-		len(d.UniquesAdded) == 0
+		len(d.UniquesAdded) == 0 &&
+		len(d.RelationsAdded) == 0
 }
 
 // DiffSchemas computes the changes needed to transform `prev` into `curr`.
@@ -81,30 +83,34 @@ func DiffSchemas(prev, curr []PrismaModel) MigrationDiff {
 		UniquesAdded: map[string][]PrismaIndex{},
 	}
 
-	prevByName := map[string]PrismaModel{}
+	// Key by TABLE, not model name: renaming a model while @@map keeps its
+	// table is not a drop + create. Keyed by name, the rename emitted DROP
+	// TABLE for the mapped table and the live reconcile then skipped the
+	// CREATE (the table still existed), so the rows were gone.
+	prevByTable := map[string]PrismaModel{}
 	for _, m := range prev {
-		prevByName[m.Name] = m
+		prevByTable[m.Table] = m
 	}
-	currByName := map[string]PrismaModel{}
+	currByTable := map[string]PrismaModel{}
 	for _, m := range curr {
-		currByName[m.Name] = m
+		currByTable[m.Table] = m
 	}
 
 	// New tables.
 	for _, m := range curr {
-		if _, ok := prevByName[m.Name]; !ok {
+		if _, ok := prevByTable[m.Table]; !ok {
 			d.TablesAdded = append(d.TablesAdded, m)
 		}
 	}
 	// Dropped tables.
 	for _, m := range prev {
-		if _, ok := currByName[m.Name]; !ok {
+		if _, ok := currByTable[m.Table]; !ok {
 			d.TablesDropped = append(d.TablesDropped, m.Table)
 		}
 	}
 	// Per-table column + index diffs.
 	for _, currModel := range curr {
-		prevModel, ok := prevByName[currModel.Name]
+		prevModel, ok := prevByTable[currModel.Table]
 		if !ok {
 			continue // handled above as TablesAdded
 		}
@@ -131,6 +137,7 @@ func DiffSchemas(prev, curr []PrismaModel) MigrationDiff {
 			}
 		}
 		// Changed columns (type / nullability / default - also warnings).
+		var gainedUnique []string
 		for col, currF := range currCols {
 			prevF, ok := prevCols[col]
 			if !ok {
@@ -146,6 +153,22 @@ func DiffSchemas(prev, curr []PrismaModel) MigrationDiff {
 					"nullability changed: %s.%s - not auto-applied (would error on rows that violate the new constraint).",
 					currModel.Table, col))
 			}
+			// A field that gains @unique on a live table needs its own index:
+			// CREATE TABLE IF NOT EXISTS never re-runs, so the inline UNIQUE
+			// only exists on tables created with it. Same name the new-column
+			// path uses, so a later reconcile sees it as present.
+			if currF.IsUnique && !prevF.IsUnique {
+				gainedUnique = append(gainedUnique, col)
+			}
+			if prevF.IsUnique && !currF.IsUnique {
+				d.Warnings = append(d.Warnings, fmt.Sprintf(
+					"@unique removed: %s.%s - not auto-applied (an inline UNIQUE needs a table rebuild; a uniq_%s_%s index can be dropped by hand).",
+					currModel.Table, col, currModel.Table, col))
+			}
+		}
+		sort.Strings(gainedUnique) // map order would make the file nondeterministic
+		for _, col := range gainedUnique {
+			d.UniquesAdded[currModel.Table] = append(d.UniquesAdded[currModel.Table], PrismaIndex{Columns: []string{col}})
 		}
 		// New indexes (by column-list signature).
 		prevIdx := map[string]bool{}
@@ -294,7 +317,7 @@ func emitUpSQL(diff MigrationDiff) string {
 			for _, f := range diff.ColumnsAdded[t] {
 				parts := []string{f.Column, f.Type}
 				if !f.Optional {
-					if f.Default == "" {
+					if f.Default == "" && f.FKTable == "" {
 						// Back-fill existing rows with a TYPE-APPROPRIATE zero
 						// value. Always defaulting to '' stored a text empty
 						// string into INTEGER/REAL/DATETIME columns, which then
@@ -308,6 +331,9 @@ func emitUpSQL(diff MigrationDiff) string {
 				if f.Default != "" {
 					parts = append(parts, "DEFAULT "+f.Default)
 				}
+				if f.FKTable != "" {
+					parts = append(parts, "REFERENCES "+quoteIdent(f.FKTable)+"("+quoteIdent(f.FKColumn)+")")
+				}
 				fmt.Fprintf(&out, "ALTER TABLE %s ADD COLUMN %s;\n", t, strings.Join(parts, " "))
 				if f.IsUnique {
 					fmt.Fprintf(&out, "CREATE UNIQUE INDEX IF NOT EXISTS uniq_%s_%s ON %s(%s);\n", t, f.Column, t, f.Column)
@@ -317,13 +343,7 @@ func emitUpSQL(diff MigrationDiff) string {
 				// The initial CREATE TABLE path handles this via
 				// EmitSQL; the ALTER path is the gap we close here.
 				if f.UpdatedAt {
-					fmt.Fprintf(&out,
-						"CREATE TRIGGER IF NOT EXISTS trg_%s_%s_updated\n"+
-							"AFTER UPDATE ON %s\n"+
-							"FOR EACH ROW BEGIN\n"+
-							"  UPDATE %s SET %s = CURRENT_TIMESTAMP WHERE rowid = NEW.rowid;\n"+
-							"END;\n",
-						t, f.Column, t, t, f.Column)
+					out.WriteString(prismaUpdatedAtTriggerSQL(t, f.Column) + "\n")
 				}
 			}
 		}
@@ -650,7 +670,66 @@ func indexName(prefix, table string, idx PrismaIndex) string {
 	return prefix + "_" + table + "_" + strings.Join(idx.Columns, "_")
 }
 
+// PrismaTablesDroppedOnLoad previews the table drops ApplyPrismaMigration
+// would run for dir's schema.prisma against db: tables the last applied
+// source declared that the current one doesn't, and that hold data now. Each
+// entry is "<table> (<n> rows)". Read-only; promote's preflight uses it
+// because its column diff only walks tables dev still declares.
+func PrismaTablesDroppedOnLoad(db *sql.DB, dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "schema.prisma"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	currModels, err := ParsePrismaSchema(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("schema.prisma: %w", err)
+	}
+	if ok, err := tableExists(db, "_benmore_migrations"); err != nil || !ok {
+		return nil, err
+	}
+	var lastHash, lastSource string
+	err = db.QueryRow(`SELECT source_hash, source FROM _benmore_migrations ORDER BY id DESC LIMIT 1`).Scan(&lastHash, &lastSource)
+	if err == sql.ErrNoRows || lastSource == "" || lastHash == schemaHash(string(data)) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prevModels, _ := ParsePrismaSchema(lastSource)
+	var dropped []string
+	for _, table := range DiffSchemas(prevModels, currModels).TablesDropped {
+		if ok, err := tableExists(db, table); err != nil {
+			return nil, err
+		} else if !ok {
+			continue
+		}
+		var n int64
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&n); err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			dropped = append(dropped, fmt.Sprintf("%s (%d rows)", table, n))
+		}
+	}
+	return dropped, nil
+}
+
 func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
+	return applyPrismaMigration(db, dir, prismaSrc, false)
+}
+
+const prismaRuntimeJournalPrefix = "runtime-prisma/"
+
+// Reviewed app source must stay byte-identical after startup. Keep generated
+// Prisma journals in the DB so snapshots retain both rollback SQL and ledger.
+func applyPrismaMigration(db *sql.DB, dir, prismaSrc string, runtimeJournal bool) (string, error) {
+	// Runs in the app process at every boot: repair migration files an older
+	// runtime created 0600 under the unit's umask, so the router can index
+	// them for per-app history (app_source_perms.go).
+	repairAppSourceModes(dir)
 	// Ensure the tracking table exists. Idempotent.
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS _benmore_migrations (
@@ -663,13 +742,21 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	`); err != nil {
 		return "", fmt.Errorf("create _benmore_migrations: %w", err)
 	}
+	if runtimeJournal {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_prisma_runtime_journals (
+			name TEXT PRIMARY KEY, sql TEXT NOT NULL
+		)`); err != nil {
+			return "", fmt.Errorf("create runtime migration journal: %w", err)
+		}
+	}
 
 	currModels, err := ParsePrismaSchema(prismaSrc)
 	if err != nil {
 		return "", err
 	}
 
-	// Fast path: same source as the last applied migration → no-op.
+	// Source equality is insufficient: older runtimes recorded relations on
+	// existing tables without adding physical FKs. Check that contract on load.
 	hash := schemaHash(prismaSrc)
 	if os.Getenv("BENMORE_TEST_BOOT") == "1" {
 		_, _ = db.Exec(`INSERT INTO _benmore_migrations (name, source, source_hash) VALUES (?, ?, ?)`,
@@ -679,7 +766,11 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	var lastHash, lastSource string
 	row := db.QueryRow(`SELECT source_hash, source FROM _benmore_migrations ORDER BY id DESC LIMIT 1`)
 	_ = row.Scan(&lastHash, &lastSource)
-	if lastHash == hash {
+	missingRelations, err := missingPrismaForeignKeys(db, currModels)
+	if err != nil {
+		return "", err
+	}
+	if lastHash == hash && len(missingRelations) == 0 {
 		return "", nil
 	}
 
@@ -699,6 +790,7 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	// PRAGMA table_info so already-present columns / indexes are
 	// dropped from the migration.
 	diff = reconcileDiffAgainstLive(diff, db)
+	diff.RelationsAdded = missingRelations
 	if diff.Empty() {
 		// Source bytes changed (e.g. whitespace) but the parsed model
 		// list is identical. Record the new hash so we stop diffing
@@ -712,23 +804,29 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	// they sort lexicographically and the timestamp + slug are both
 	// readable.
 	migDir := filepath.Join(dir, "migrations")
-	if err := os.MkdirAll(migDir, 0755); err != nil {
-		return "", fmt.Errorf("create migrations/: %w", err)
+	next := 1
+	if runtimeJournal {
+		if err := db.QueryRow("SELECT COALESCE(MAX(id),0)+1 FROM _benmore_migrations").Scan(&next); err != nil {
+			return "", err
+		}
+	} else {
+		if err := os.MkdirAll(migDir, 0755); err != nil {
+			return "", fmt.Errorf("create migrations/: %w", err)
+		}
+		_ = os.Chmod(migDir, appSourceDirMode)
+		next = nextMigrationNumber(migDir)
 	}
 	// UMask 0077 in the per-app unit degrades 0755 to 0700. The router process
 	// (user benmore, shared group) must be able to write shipped migrations/*.sql
 	// into this dir, so widen it to group-writable — mirroring the 0664 chmod
 	// write_file applies to files (mcp_tools.go).
-	_ = os.Chmod(migDir, 0o775)
-	next := nextMigrationNumber(migDir)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 	slug := describeDiff(diff)
 	filename := fmt.Sprintf("%04d_%s_%s.sql", next, timestamp, slug)
 	filePath := filepath.Join(migDir, filename)
-
-	sqlText := EmitMigrationSQL(diff, slug, timestamp)
-	if err := os.WriteFile(filePath, []byte(sqlText), 0644); err != nil {
-		return "", fmt.Errorf("write migration: %w", err)
+	ledgerName := filename
+	if runtimeJournal {
+		ledgerName = prismaRuntimeJournalPrefix + filename
 	}
 
 	// Destructive migrations (table drops) permanently delete every row in
@@ -739,10 +837,19 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	// post-drop state - the exact gap that made a dropped table unrecoverable.
 	if len(diff.TablesDropped) > 0 {
 		if bkPath, bkErr := backupDatabase(dir); bkErr != nil {
-			log.Printf("WARNING: pre-drop backup failed before destructive migration %s: %s", filename, bkErr)
-		} else if bkPath != "" {
+			return "", fmt.Errorf("pre-drop backup required before destructive migration %s: %w", filename, bkErr)
+		} else if bkPath == "" {
+			return "", fmt.Errorf("pre-drop backup required before destructive migration %s: no database snapshot created", filename)
+		} else {
 			log.Printf("DESTRUCTIVE MIGRATION %s: dropping table(s) %v - backed up to %s before applying",
 				filename, diff.TablesDropped, filepath.Base(bkPath))
+		}
+	}
+
+	sqlText := EmitMigrationSQL(diff, slug, timestamp)
+	if !runtimeJournal {
+		if err := writeAppSourceFile(filePath, []byte(sqlText)); err != nil {
+			return "", fmt.Errorf("write migration: %w", err)
 		}
 	}
 
@@ -758,10 +865,13 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 	// ADD COLUMN is transactional too as of SQLite 3.25+.
 	tx, err := db.Begin()
 	if err != nil {
-		return filename, fmt.Errorf("begin migration tx: %w", err)
+		return ledgerName, fmt.Errorf("begin migration tx: %w", err)
 	}
 	rollback := func(cause error) (string, error) {
 		_ = tx.Rollback()
+		if runtimeJournal {
+			return "", fmt.Errorf("apply migration %s: %w", ledgerName, cause)
+		}
 		// Move the failed migration to <filename>.failed so it stays
 		// visible to operators (the SQL that broke is the most valuable
 		// artifact for debugging) but DOESN'T trigger the
@@ -779,12 +889,11 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 		// stripped) and the retry copy is deleted - pre-v2.7.167 every
 		// boot appended ANOTHER timestamped .failed file (one field
 		// report counted 391 in 8 days on a single instance).
-		failedPath := filePath + ".failed"
-		if dup := findExistingFailedDup(filepath.Dir(filePath), sqlText); dup != "" {
+		if dup := findExistingFailedDup(migDir, sqlText); dup != "" {
 			_ = os.Remove(filePath)
 			log.Printf("MIGRATION FAILED (same failure already recorded at migrations/%s - retry copy not kept). Cause: %s",
 				dup, cause)
-		} else if mvErr := os.Rename(filePath, failedPath); mvErr != nil {
+		} else if mvErr := os.Rename(filePath, filePath+".failed"); mvErr != nil {
 			// Fall back to delete if rename couldn't work (cross-fs etc).
 			_ = os.Remove(filePath)
 		} else {
@@ -802,25 +911,76 @@ func ApplyPrismaMigration(db *sql.DB, dir, prismaSrc string) (string, error) {
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
 		}
+		if err := dropFrameworkIndexesForStatement(tx, stmt); err != nil { // scoping_indexes.go
+			return rollback(fmt.Errorf("%s: %w", truncate(stmt, 100), err))
+		}
 		if _, err := tx.Exec(stmt); err != nil {
 			return rollback(fmt.Errorf("%s: %w", truncate(stmt, 100), err))
 		}
 	}
+	// New columns carry REFERENCES inline. Relations attached to existing
+	// columns (including legacy same-source drift) need a preserving rebuild.
+	// Reinspect inside this transaction, after CREATE/ALTER, so both paths share
+	// one physical FK contract and either all schema/ledger changes commit or none.
+	remaining, err := missingPrismaForeignKeys(tx, currModels)
+	if err != nil {
+		return rollback(err)
+	}
+	var relationTables []string
+	for table := range remaining {
+		relationTables = append(relationTables, table)
+	}
+	sort.Strings(relationTables)
+	for _, table := range relationTables {
+		statements, repairErr := rebuildPrismaRelations(tx, table, remaining[table])
+		sqlText = appendPrismaRelationJournal(sqlText, statements)
+		if !runtimeJournal {
+			if err := writeAppSourceFile(filePath, []byte(sqlText)); err != nil {
+				return rollback(fmt.Errorf("write relation migration journal: %w", err))
+			}
+		}
+		if repairErr != nil {
+			return rollback(repairErr)
+		}
+	}
+	// SQLite permits ADD COLUMN REFERENCES with a non-null default when the
+	// connection has foreign_keys disabled. Validate those new inline FKs too;
+	// constraint presence alone does not prove the existing backfill is valid.
+	for table := range diff.RelationsAdded {
+		if err := validateTableForeignKeys(tx, table); err != nil {
+			return rollback(err)
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO _benmore_migrations (name, source, source_hash) VALUES (?, ?, ?)`,
-		filename, prismaSrc, hash); err != nil {
+		ledgerName, prismaSrc, hash); err != nil {
 		return rollback(fmt.Errorf("record migration: %w", err))
+	}
+	if runtimeJournal {
+		if _, err := tx.Exec("INSERT INTO _benmore_prisma_runtime_journals(name,sql) VALUES (?,?)", ledgerName, sqlText); err != nil {
+			return rollback(fmt.Errorf("record runtime migration journal: %w", err))
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return rollback(fmt.Errorf("commit migration: %w", err))
 	}
-	return filename, nil
+	return ledgerName, nil
+}
+
+func prismaMigrationArtifactPath(name string) (string, error) {
+	if strings.HasPrefix(name, prismaRuntimeJournalPrefix) {
+		name = strings.TrimPrefix(name, prismaRuntimeJournalPrefix)
+	}
+	if name == "" || strings.ContainsAny(name, `/\\`) || !strings.HasSuffix(name, ".sql") {
+		return "", fmt.Errorf("invalid Prisma migration artifact name")
+	}
+	return "migrations/" + name, nil
 }
 
 // RollbackPrismaMigration undoes the most recent N applied migrations.
-// For each, it reads the file's DOWN section, executes the reverse
-// statements inside a transaction, deletes the row from
-// _benmore_migrations, and (if delete=true) removes the migration
-// file from disk.
+// For each, it reads the DOWN section from the DB journal or conventional
+// migration file, executes the reverse statements inside a transaction,
+// and deletes the ledger and DB journal rows. If delete=true it also removes
+// conventional migration files from disk.
 //
 // Tables dropped by the forward migration are recreated by re-emitting
 // the previous schema's CREATE TABLE statements from the second-most-
@@ -860,18 +1020,32 @@ func RollbackPrismaMigration(db *sql.DB, dir string, count int, deleteFiles bool
 		return nil, fmt.Errorf("no migrations to roll back")
 	}
 
-	migDir := filepath.Join(dir, "migrations")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 	var done []string
 
 	for i, m := range pending {
-		// File path for this migration. The name column stores the
-		// filename verbatim, so we just join.
-		path := filepath.Join(migDir, m.name)
-		fileData, err := os.ReadFile(path)
+		path, err := prismaMigrationArtifactPath(m.name)
+		if err != nil {
+			return done, err
+		}
+		var fileData []byte
+		runtimeJournal := strings.HasPrefix(m.name, prismaRuntimeJournalPrefix)
+		if runtimeJournal {
+			err = db.QueryRow("SELECT sql FROM _benmore_prisma_runtime_journals WHERE name=?", m.name).Scan(&fileData)
+		} else {
+			fileData, err = root.ReadFile(path)
+		}
 		if err != nil {
 			return done, fmt.Errorf("read %s: %w", m.name, err)
 		}
 		_, downSQL := extractMigrationSection(string(fileData))
+		if strings.Contains(downSQL, prismaRelationExplicitRollback) {
+			return done, fmt.Errorf("rollback %s: added relations require an explicit migration that preserves current data and related rows", m.name)
+		}
 
 		// Figure out which prior source we should use as the
 		// "restored" state. After rolling THIS migration back, the
@@ -904,13 +1078,15 @@ func RollbackPrismaMigration(db *sql.DB, dir string, count int, deleteFiles bool
 		if priorSource != "" {
 			priorModels, _ := ParsePrismaSchema(priorSource)
 			currModels, _ := ParsePrismaSchema(m.source)
-			currNames := map[string]bool{}
+			// By table, as DiffSchemas decides drops: a renamed model that
+			// kept its table was never dropped.
+			currTables := map[string]bool{}
 			for _, cm := range currModels {
-				currNames[cm.Name] = true
+				currTables[cm.Table] = true
 			}
 			var toRecreate []PrismaModel
 			for _, pm := range priorModels {
-				if !currNames[pm.Name] {
+				if !currTables[pm.Table] {
 					toRecreate = append(toRecreate, pm)
 				}
 			}
@@ -933,6 +1109,9 @@ func RollbackPrismaMigration(db *sql.DB, dir string, count int, deleteFiles bool
 			if stmt == "" || strings.HasPrefix(stmt, "--") {
 				continue
 			}
+			if err := dropFrameworkIndexesForStatement(tx, stmt); err != nil { // scoping_indexes.go
+				return done, txRollback(fmt.Errorf("%s: %w", truncate(stmt, 100), err))
+			}
 			if _, err := tx.Exec(stmt); err != nil {
 				return done, txRollback(fmt.Errorf("%s: %w", truncate(stmt, 100), err))
 			}
@@ -953,12 +1132,17 @@ func RollbackPrismaMigration(db *sql.DB, dir string, count int, deleteFiles bool
 		if _, err := tx.Exec(`DELETE FROM _benmore_migrations WHERE name = ?`, m.name); err != nil {
 			return done, txRollback(fmt.Errorf("delete row: %w", err))
 		}
+		if runtimeJournal {
+			if _, err := tx.Exec("DELETE FROM _benmore_prisma_runtime_journals WHERE name=?", m.name); err != nil {
+				return done, txRollback(fmt.Errorf("delete runtime journal: %w", err))
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return done, txRollback(err)
 		}
 
-		if deleteFiles {
-			_ = os.Remove(path)
+		if deleteFiles && !runtimeJournal {
+			_ = root.Remove(path)
 		}
 		done = append(done, m.name)
 	}

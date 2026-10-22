@@ -472,6 +472,27 @@ func isCapitalIdent(s string) bool {
 // like @default(now()) can carry parens.
 var fieldLineRe = regexp.MustCompile(`^(\w+)\s+(\w+)(\??\[?\]?)(.*)$`)
 
+// prismaScalarSQLType is shared by the compiler and authoring validation.
+// An empty result denotes a relation reference or an unsupported type.
+func prismaScalarSQLType(name string) string {
+	switch name {
+	case "Int", "BigInt":
+		return "INTEGER"
+	case "String":
+		return "TEXT"
+	case "Boolean":
+		return "BOOLEAN"
+	case "Float", "Decimal":
+		return "REAL"
+	case "DateTime":
+		return "DATETIME"
+	case "Bytes":
+		return "BLOB"
+	default:
+		return ""
+	}
+}
+
 // parsePrismaField returns (field, isColumnField, fkSourceFieldName, err).
 //   - When the line is a normal scalar field, returns the populated
 //     PrismaField with isColumnField=true and fkSourceFieldName="".
@@ -498,13 +519,8 @@ func parsePrismaField(line string) (PrismaField, bool, string, error) {
 	// real Go bools so JSON responses emit `true`/`false` instead of
 	// `0`/`1`. Without that round-trip, React patterns like
 	// `{flag && <Comp/>}` render "0" on the page when flag is falsy.
-	scalarMap := map[string]string{
-		"Int": "INTEGER", "BigInt": "INTEGER",
-		"String": "TEXT", "Boolean": "BOOLEAN",
-		"Float": "REAL", "Decimal": "REAL",
-		"DateTime": "DATETIME", "Bytes": "BLOB",
-	}
-	sqlType, isScalar := scalarMap[prismaType]
+	sqlType := prismaScalarSQLType(prismaType)
+	isScalar := sqlType != ""
 
 	f := PrismaField{
 		Name:     name,
@@ -561,10 +577,9 @@ func parsePrismaField(line string) (PrismaField, bool, string, error) {
 	//       No SQL column, parser accepts silently.
 	//   (b) It's a typo'd type (`Strng`, `intger`, `missing_type_keyword`).
 	//       We can't reliably tell these apart at THIS point in the
-	//       parse (we don't have the full model list yet), so we mark
-	//       this as a "non-scalar reference" - ParsePrismaSchema's
-	//       post-parse pass validates against the model list and
-	//       emits an error if the type doesn't resolve.
+	//       parse (we don't have the full model list yet). The authoring
+	//       gate and app check validate these references against the full
+	//       model list. Keep this loader behavior for deployed schemas.
 	if !isScalar {
 		// Capitalized → tentatively a relation pointer. Lowercase or
 		// otherwise non-Pascal → definitely a typo'd type, emit now.
@@ -605,7 +620,7 @@ func applyBlockAttr(m *PrismaModel, line string) error {
 		// Backed by SQLite FTS5 - the framework creates a
 		// <table>_fts virtual table + sync triggers at app load
 		// (see fts.go). /api/<table>?q=foo routes queries through
-		// it for ranked full-text search.
+		// it for full-text filtering with normal list ordering.
 		cols := parsePrismaColumnList(line)
 		m.FullText = append(m.FullText, PrismaIndex{Columns: cols})
 	default:
@@ -658,13 +673,7 @@ func parsePrismaDefault(a string) (sqlDefault string, autoincr bool) {
 	case inner == "now()":
 		return "CURRENT_TIMESTAMP", false
 	case inner == "uuid()":
-		// SQLite doesn't have native UUID generation, but we can emit
-		// a portable equivalent using lower(hex(randomblob(N))) with
-		// the canonical 8-4-4-4-12 hex layout. The trailing variant +
-		// version bits are NOT set (so these aren't RFC 4122-strict
-		// UUIDs), but for app-level row IDs the format match is what
-		// matters.
-		return "(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6))))", false
+		return SQLiteUUID4Default, false
 	case inner == "cuid()":
 		// CUIDs sort lexicographically and embed a timestamp. SQLite
 		// has no direct equivalent; we emit a (sortable) timestamp +
@@ -834,20 +843,14 @@ func EmitSQL(models []PrismaModel) string {
 	// AFTER UPDATE triggers for @updatedAt fields. SQLite doesn't
 	// auto-update DEFAULT CURRENT_TIMESTAMP on UPDATE the way some
 	// other engines do - without a trigger, an @updatedAt column
-	// silently stays at its insert-time value. The trigger writes
-	// the current timestamp on every row change.
+	// silently stays at its insert-time value. Preserve explicitly supplied
+	// versions and never regress a precise timestamp during storage maintenance.
 	for _, m := range sortedModels {
 		for _, f := range m.Fields {
 			if !f.UpdatedAt {
 				continue
 			}
-			fmt.Fprintf(&out,
-				"CREATE TRIGGER IF NOT EXISTS trg_%s_%s_updated\n"+
-					"AFTER UPDATE ON %s\n"+
-					"FOR EACH ROW BEGIN\n"+
-					"  UPDATE %s SET %s = CURRENT_TIMESTAMP WHERE rowid = NEW.rowid;\n"+
-					"END;\n",
-				m.Table, f.Column, m.Table, m.Table, f.Column)
+			out.WriteString(prismaUpdatedAtTriggerSQL(m.Table, f.Column) + "\n")
 		}
 	}
 	return out.String()

@@ -1,0 +1,28 @@
+{
+  "name": "benmore",
+  "version": "0.1.35",
+  "description": "The Benmore CLI: build, deploy and verify apps on benmore.ai",
+  "homepage": "https://benmore.ai/cli",
+  "license": "MIT",
+  "bin": {
+    "benmore": "bin/benmore.js"
+  },
+  "files": [
+    "bin/benmore.js",
+    "bin/checksums.json",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "keywords": [
+    "benmore",
+    "cli",
+    "deploy"
+  ]
+}

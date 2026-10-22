@@ -155,6 +155,15 @@ func EnsureUserRolesTable(db *sql.DB) error {
 // in tenant X - which is the right semantic for "see the world as
 // tenant Y."
 func LoadSessionRoles(db *sql.DB, userID int64, primaryRole, effectiveGroupID string) []string {
+	roles, _ := loadSessionRolesWith(db, userID, primaryRole, effectiveGroupID)
+	return roles
+}
+
+func loadSessionRolesWith(db mutationQuerier, userID int64, primaryRole, effectiveGroupID string) ([]string, error) {
+	return loadSessionRolesWithSchema(db, userID, primaryRole, effectiveGroupID, "")
+}
+
+func loadSessionRolesWithSchema(db mutationQuerier, userID int64, primaryRole, effectiveGroupID, schema string) ([]string, error) {
 	seen := map[string]bool{}
 	out := []string{}
 	if primaryRole != "" {
@@ -168,28 +177,36 @@ func LoadSessionRoles(db *sql.DB, userID int64, primaryRole, effectiveGroupID st
 	// group context, only globals."
 	var rows *sql.Rows
 	var err error
+	prefix := ""
+	if schema == "main" {
+		prefix = "main."
+	} else if schema != "" {
+		return out, fmt.Errorf("unsupported role authority schema")
+	}
 	if effectiveGroupID == "" {
 		rows, err = db.Query(`
-			SELECT role FROM _benmore_user_roles
+			SELECT role FROM `+prefix+`_benmore_user_roles
 			WHERE user_id = ?
 			  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 			  AND group_id IS NULL`,
 			userID)
 	} else {
 		rows, err = db.Query(`
-			SELECT role FROM _benmore_user_roles
+			SELECT role FROM `+prefix+`_benmore_user_roles
 			WHERE user_id = ?
 			  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 			  AND (group_id IS NULL OR group_id = ?)`,
 			userID, effectiveGroupID)
 	}
 	if err != nil {
-		return out
+		return out, err
 	}
 	defer rows.Close()
+	var scanErr error
 	for rows.Next() {
 		var r string
 		if err := rows.Scan(&r); err != nil {
+			scanErr = err
 			continue
 		}
 		r = strings.TrimSpace(r)
@@ -199,7 +216,10 @@ func LoadSessionRoles(db *sql.DB, userID int64, primaryRole, effectiveGroupID st
 		seen[r] = true
 		out = append(out, r)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	return out, scanErr
 }
 
 // UserHasGlobalAdminGrant reports whether the user holds a platform-global
@@ -212,32 +232,51 @@ func UserHasGlobalAdminGrant(db *sql.DB, userID int64) bool {
 	if db == nil || userID == 0 {
 		return false
 	}
+	allowed, _ := userHasGlobalAdminGrantWith(db, userID)
+	return allowed
+}
+
+func userHasGlobalAdminGrantWith(db rowQuerier, userID int64) (bool, error) {
+	return userHasGlobalAdminGrantWithSchema(db, userID, "")
+}
+
+func userHasGlobalAdminGrantWithSchema(db rowQuerier, userID int64, schema string) (bool, error) {
+	prefix := ""
+	if schema == "main" {
+		prefix = "main."
+	} else if schema != "" {
+		return false, fmt.Errorf("unsupported role authority schema")
+	}
 	var n int
 	err := db.QueryRow(`
-		SELECT 1 FROM _benmore_user_roles
+		SELECT 1 FROM `+prefix+`_benmore_user_roles
 		WHERE user_id = ? AND role = 'admin' AND group_id IS NULL
 		  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
 		LIMIT 1`, userID).Scan(&n)
-	return err == nil
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // HasAnyRole returns true when the session holds at least one of
-// `wanted`. Admin role always satisfies the check - admins bypass
-// role gates the same way they bypass owner-scoping.
+// `wanted`. A GLOBAL admin (IsAdmin: the users.role column or a
+// group_id IS NULL admin grant) satisfies every role gate, the same
+// way it bypasses owner-scoping.
+//
+// "admin" found only in s.Roles is NOT a shortcut: that slice also
+// carries the tenant membership role (groups.role_field, which a
+// group-less user can mint for themselves through
+// POST /api/_groups/create with founding_role) and group-scoped grants.
+// Treating it as global let any signup pass every `role:` gate. A
+// tenant role named "admin" still matches a literal `role:admin` gate
+// through the loop below, and nothing else.
 func HasAnyRole(s *Session, wanted []string) bool {
 	if s == nil {
 		return false
 	}
-	// Admin shortcut - kept on the Role field for back-compat and
-	// also checked against the multi-role slice (a user could be
-	// admin via the join table without it being their primary role).
 	if s.IsAdmin() {
 		return true
-	}
-	for _, r := range s.Roles {
-		if r == "admin" {
-			return true
-		}
 	}
 	for _, want := range wanted {
 		want = strings.TrimSpace(want)
@@ -261,8 +300,14 @@ func HasAnyRole(s *Session, wanted []string) bool {
 // access.go layer rewrites the user-facing `perm:posts.publish` to
 // `posts:publish` before calling this). `*` and `<resource>:*` and
 // the OAuth2 "write implies read" rule from hasScope are honored.
+//
+// Fails closed when the session has no resolved permissions: an empty
+// Scopes string means "unrestricted" to hasScope's table checks, but a
+// `perm:` gate asks whether a role GRANTED the permission, and an empty
+// set grants nothing. (The access layer also refuses perm: outright in
+// an app without a roles: block - see AccessConfig.Allowed.)
 func HasPermission(s *Session, perm string) bool {
-	if s == nil || perm == "" {
+	if s == nil || perm == "" || strings.TrimSpace(s.Scopes) == "" {
 		return false
 	}
 	resource, action := parseScope(perm)
@@ -280,8 +325,8 @@ func StartRoleExpirySweeper(app *App) {
 	if app == nil || app.DB == nil {
 		return
 	}
+	stop := app.workerStopGeneration()
 	safeGo("rbac.roleExpirySweeper", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -335,7 +380,7 @@ func sweepExpiredRoles(app *App) {
 
 // RegisterRoleRoutes wires the admin endpoints. Mounted from
 // buildAppMux alongside the rest of the framework routes.
-func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
+func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// GET /api/_auth/roles - discovery: every configured role +
 	// its effective (post-inheritance) scope set. Authenticated;
 	// admin-only when the app declares any roles (otherwise the
@@ -345,7 +390,9 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 		// Admin-only (matches the doc above): the full role catalogue + effective
 		// scopes is reconnaissance for in-tenant escalation (tells an attacker
 		// which role name to target). A regular member has no need for it.
-		if session == nil || !session.IsAdmin() {
+		// IsAdminConsole (rule 15b): a scoped token an admin minted for an
+		// integration carries only its scopes, not the admin console.
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -378,7 +425,9 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid user id"})
 			return
 		}
-		if !session.IsAdmin() && session.UserID != uid {
+		// Reading SOMEONE ELSE's grants is admin management: it needs the
+		// admin console (rule 15b), not a scoped token an admin minted.
+		if session.UserID != uid && !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
 			return
 		}
@@ -472,8 +521,8 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 	// in every group context, identical to the v2.7.54 default.
 	mux.HandleFunc("POST /api/_auth/users/{id}/roles", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -551,8 +600,7 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 				granted_at = CURRENT_TIMESTAMP`,
 			uid, role, groupID, session.UserID, expiresAt)
 		if err != nil {
-			log.Printf("RBAC: grant failed user_id=%d role=%s err=%s", uid, role, err)
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "grant failed"})
+			serverErrorJSON(w, r, app, "roles grant", fmt.Errorf("grant user_id=%d role=%s: %w", uid, role, err), "grant failed")
 			return
 		}
 		LogAudit(app, "role_granted", "_benmore_user_roles", strconv.FormatInt(uid, 10),
@@ -578,8 +626,8 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 	// param targets the GLOBAL grant (group_id IS NULL).
 	mux.HandleFunc("PATCH /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -622,7 +670,7 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 				expiresAt, uid, role, groupID)
 		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "update failed"})
+			serverErrorJSON(w, r, app, "roles update", err, "update failed")
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -658,8 +706,8 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 	// can't lock the system out of admin.
 	mux.HandleFunc("DELETE /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -708,7 +756,7 @@ func RegisterRoleRoutes(mux *http.ServeMux, app *App) {
 			res, err = app.DB.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ? AND group_id = ?", uid, role, groupID)
 		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "revoke failed"})
+			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {

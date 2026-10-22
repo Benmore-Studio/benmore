@@ -35,3 +35,41 @@ func TestScaffoldSharedAgentContractMatchesEdition(t *testing.T) {
 		t.Fatal("removed command in scaffold")
 	}
 }
+
+func TestHTMLScaffoldCarriesQASelectorsAndStarterJourney(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteHTMLScaffoldFiles(dir, "QA App"); err != nil {
+		t.Fatal(err)
+	}
+	for file, ids := range map[string][]string{
+		"static/index.html":  {`data-testid="note-form"`, `data-testid="note-add"`, `data-testid="signout"`, `data-testid="nav-login"`},
+		"static/login.html":  {`data-testid="login-email"`, `data-testid="login-submit"`},
+		"static/signup.html": {`data-testid="signup-email"`, `data-testid="signup-submit"`},
+	} {
+		b, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids {
+			if !strings.Contains(string(b), id) {
+				t.Errorf("%s missing %s", file, id)
+			}
+		}
+	}
+	journey, err := os.ReadFile(filepath.Join(dir, "tests", "journeys", "home.yaml"))
+	if err != nil {
+		t.Fatalf("starter journey missing: %v", err)
+	}
+	for _, want := range []string{"name: home", "tags: [smoke]", "path: /", "assertions:", `{visible: "main"}`} {
+		if !strings.Contains(string(journey), want) {
+			t.Errorf("starter journey missing %q:\n%s", want, journey)
+		}
+	}
+	guide, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(guide), "data-testid") || !strings.Contains(string(guide), `api(at:"qa")`) {
+		t.Fatalf("scaffolded AGENTS.md must teach the QA selector convention:\n%s", guide)
+	}
+}

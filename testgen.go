@@ -3,8 +3,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -18,8 +20,10 @@ func GenerateFrameworkTests(app *App) []AppTestFile {
 	files = append(files, generateCRUDTests(app))
 	files = append(files, generateSecurityTests(app))
 	files = append(files, generateLifecycleTests(app))
+	files = append(files, generateRestoreTests(app))
 	files = append(files, generateAuditTests(app))
 	files = append(files, generateBatchTests(app))
+	files = append(files, generateOwnedFieldTests(app))
 	files = append(files, generateDocsTests(app))
 	if NeedsAuth(app) {
 		files = append(files, generateAuthTests(app))
@@ -94,6 +98,16 @@ func generatePageTests(app *App) AppTestFile {
 						Expect: AppTestExpect{Status: 403},
 					}},
 				}
+			} else if role := pageRole(page); role != "" && !pageRoleAllowed(app, &Session{Role: "user"}, role) {
+				// Generated tests authenticate as an ordinary user; respect page-level
+				// role gates instead of mistaking their expected 403 for a page failure.
+				tests["page_"+safeName+"_role_denied"] = AppTestCase{
+					AsUser: frameworkTestUser,
+					Steps: []AppTestStep{{
+						Get:    route,
+						Expect: AppTestExpect{Status: http.StatusForbidden},
+					}},
+				}
 			} else {
 				// Authenticated → renders (no require gate)
 				tests["page_"+safeName+"_authenticated"] = AppTestCase{
@@ -133,7 +147,7 @@ func generateCRUDTests(app *App) AppTestFile {
 
 	for _, table := range tables {
 		cols := tableColumns(app, table)
-		data := smartFormData(cols)
+		data := smartFormData(app, table, cols)
 
 		// Access posture for the synthetic framework test user (a plain
 		// authenticated user: role "user", no group, no extra role/scope/
@@ -305,12 +319,18 @@ func generateSecurityTests(app *App) AppTestFile {
 	// test's teeth (the framework returns 404, not 403, on access denial).
 	bearerTable := targetTable
 	bearerExpect := AppTestExpect{StatusIn: []int{200, 201, 401, 404, 422}}
+	if membershipManageGated(app, bearerTable, OpWrite) {
+		// The groups membership table answers a non-admin's create with 403
+		// (managing members takes a tenant admin); a CSRF rejection is told
+		// apart by its text instead.
+		bearerExpect = AppTestExpect{StatusIn: crudWriteAcceptable, NotContains: []string{"Invalid CSRF token"}}
+	}
 	if w := firstWritableTable(app, tables); w != "" {
 		bearerTable = w
 		bearerExpect = AppTestExpect{Status: 200}
 	}
 	cols := tableColumns(app, bearerTable)
-	data := smartFormData(cols)
+	data := smartFormData(app, bearerTable, cols)
 	tests["bearer_skips_csrf"] = AppTestCase{
 		AsUser: frameworkTestUser,
 		Steps: []AppTestStep{{
@@ -350,11 +370,15 @@ func generateSecurityTests(app *App) AppTestFile {
 	// redirect, preserves method) for legacy /admin → /_admin; for
 	// anonymous GETs that's equivalent to a 303. Accept either by
 	// pointing at /_admin directly, which 303-redirects to /login.
+	adminStatus := http.StatusSeeOther
+	if !app.FeatureEnabled("admin") {
+		adminStatus = http.StatusNotFound
+	}
 	tests["admin_requires_auth"] = AppTestCase{
 		Anon: true,
 		Steps: []AppTestStep{{
 			Get:    "/_admin",
-			Expect: AppTestExpect{Status: 303},
+			Expect: AppTestExpect{Status: adminStatus},
 		}},
 	}
 
@@ -373,7 +397,7 @@ func generateLifecycleTests(app *App) AppTestFile {
 		}
 
 		cols := tableColumns(app, table)
-		data := smartFormData(cols)
+		data := smartFormData(app, table, cols)
 
 		// Find a text column to use as identifier for read assertions
 		identCol := ""
@@ -471,7 +495,7 @@ func generateAuditTests(app *App) AppTestFile {
 			continue
 		}
 		cols := tableColumns(app, t)
-		d := smartFormData(cols)
+		d := smartFormData(app, t, cols)
 		if len(d) > 0 {
 			table = t
 			data = d
@@ -521,7 +545,7 @@ func generateBatchTests(app *App) AppTestFile {
 		return AppTestFile{Name: "_framework_batch", Tests: tests}
 	}
 	cols := tableColumns(app, table)
-	data := smartFormData(cols)
+	data := smartFormData(app, table, cols)
 
 	// Build two JSON records
 	rec1 := make(map[string]any)
@@ -552,16 +576,49 @@ func generateBatchTests(app *App) AppTestFile {
 	return AppTestFile{Name: "_framework_batch", Tests: tests}
 }
 
+// generateOwnedFieldTests asserts that generic CRUD refuses every column a
+// command owns (`command.owns`), for a table the synthetic user can write.
+func generateOwnedFieldTests(app *App) AppTestFile {
+	tests := make(map[string]AppTestCase)
+	app.mu.RLock()
+	flows := app.Flows
+	app.mu.RUnlock()
+	for _, flow := range flows {
+		if flow.Command == nil {
+			continue
+		}
+		for _, own := range flow.Command.Owns {
+			if firstWritableTable(app, []string{own.Table}) == "" {
+				continue
+			}
+			tests["owned_field_"+own.Table+"_"+own.Column+"_refused"] = AppTestCase{
+				AsUser: frameworkTestUser,
+				Steps: []AppTestStep{{
+					API:    fmt.Sprintf("POST /api/%s", own.Table),
+					JSON:   map[string]any{own.Column: "framework-test"},
+					Bearer: true,
+					Expect: AppTestExpect{Status: http.StatusForbidden, Contains: []string{"field_owned_by_command"}},
+				}},
+			}
+		}
+	}
+	return AppTestFile{Name: "_framework_owned_fields", Tests: tests}
+}
+
 // ===== Docs Tests =====
 
 func generateDocsTests(app *App) AppTestFile {
 	tests := make(map[string]AppTestCase)
+	status := http.StatusOK
+	if !app.FeatureEnabled("docs") {
+		status = http.StatusNotFound
+	}
 
 	tests["api_docs_json"] = AppTestCase{
 		AsUser: frameworkTestUser,
 		Steps: []AppTestStep{{
 			Get:    "/api/_docs",
-			Expect: AppTestExpect{Status: 200, Contains: []string{`"endpoints"`}},
+			Expect: AppTestExpect{Status: status, Contains: docsTestContains(status, `"endpoints"`)},
 		}},
 	}
 
@@ -570,7 +627,7 @@ func generateDocsTests(app *App) AppTestFile {
 			AsUser: frameworkTestUser,
 			Steps: []AppTestStep{{
 				Get:    "/docs",
-				Expect: AppTestExpect{Status: 200, Contains: []string{"API Documentation", "Copy for LLM"}},
+				Expect: AppTestExpect{Status: status, Contains: docsTestContains(status, "API Documentation", "Copy for LLM")},
 			}},
 		}
 
@@ -581,14 +638,21 @@ func generateDocsTests(app *App) AppTestFile {
 			Steps: []AppTestStep{{
 				Get: "/docs?format=md",
 				Expect: AppTestExpect{
-					Status:   200,
-					Contains: []string{"# API Documentation", "## Authentication", "## Platform features"},
+					Status:   status,
+					Contains: docsTestContains(status, "# API Documentation", "## Authentication", "## Platform features"),
 				},
 			}},
 		}
 	}
 
 	return AppTestFile{Name: "_framework_docs", Tests: tests}
+}
+
+func docsTestContains(status int, values ...string) []string {
+	if status != http.StatusOK {
+		return nil
+	}
+	return values
 }
 
 // ===== Auth Tests =====
@@ -631,11 +695,15 @@ func generateAuthTests(app *App) AppTestFile {
 			}},
 		}
 	} else {
+		signupExpect := AppTestExpect{Status: http.StatusSeeOther}
+		if authFeatureDisabled(app, "signup") {
+			signupExpect = AppTestExpect{Status: http.StatusNotFound}
+		}
 		tests["signup_post_registered"] = AppTestCase{
 			Anon: true,
 			Steps: []AppTestStep{{
 				API:    "POST " + app.Paths.Signup,
-				Expect: AppTestExpect{Status: 303},
+				Expect: signupExpect,
 			}},
 		}
 	}
@@ -650,16 +718,21 @@ func generateAuthTests(app *App) AppTestFile {
 		}
 	}
 
-	// Token endpoint: create a user first, then test the token exchange
+	// Token endpoint: create a user first, then test the token exchange.
+	// An app that requires the emailed sign-in code refuses the password
+	// exchange (it would skip the code) and says so.
+	tokenExpect := AppTestExpect{Status: 200, Contains: []string{`"token"`}}
+	if authFeatureDisabled(app, "api_tokens") {
+		tokenExpect = AppTestExpect{Status: http.StatusNotFound}
+	} else if otpLoginEnabled(app) {
+		tokenExpect = AppTestExpect{Status: 403, Contains: []string{"otp_required"}}
+	}
 	tests["token_endpoint"] = AppTestCase{
 		AsUser: frameworkTestUser,
 		Steps: []AppTestStep{{
-			API:  "POST /api/_auth/token",
-			JSON: map[string]any{"email": frameworkTestUser, "password": "testpass123"},
-			Expect: AppTestExpect{
-				Status:   200,
-				Contains: []string{`"token"`},
-			},
+			API:    "POST /api/_auth/token",
+			JSON:   map[string]any{"email": frameworkTestUser, "password": "testpass123"},
+			Expect: tokenExpect,
 		}},
 	}
 
@@ -786,15 +859,40 @@ func tableColumns(app *App, table string) []Column {
 }
 
 // smartFormData builds form data from columns using smartTestValue.
-// Skips PK, auto-managed fields, and FK references (*_id) to avoid constraint failures.
-func smartFormData(cols []Column) map[string]any {
+// Skips auto-managed fields and actual foreign keys, whose parent fixtures must
+// be supplied explicitly. A required scalar ending in _id is not itself an FK.
+func smartFormData(app *App, table string, cols []Column) map[string]any {
 	data := make(map[string]any)
+	// Physical FKs also matter when the generator is used before JoinMap was
+	// populated. Metadata inspection only: never assume an existing parent ID.
+	if app == nil || app.DB == nil {
+		return data
+	}
+	declared, err := GetForeignKeys(app.DB, table)
+	if err != nil {
+		// Unknown relationship metadata is not evidence that a column is an
+		// ordinary scalar. Keep the prerequisite failure visible in the test.
+		return data
+	}
+	refs := foreignKeyRefs(app, table)
+	for name, ref := range declared {
+		refs[name] = ref
+	}
 	for _, col := range cols {
 		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "deleted_at" {
 			continue
 		}
-		// Skip all *_id columns (user_id is auto-set, others are FK references)
-		if strings.HasSuffix(col.Name, "_id") {
+		if col.Name == "user_id" || (strings.HasSuffix(col.Name, "_id") && (!col.NotNull || col.Default != "")) {
+			continue
+		}
+		foreign := false
+		for name := range refs {
+			if identIs(name, col.Name) {
+				foreign = true
+				break
+			}
+		}
+		if foreign {
 			continue
 		}
 		data[col.Name] = smartTestValue(col)
@@ -812,9 +910,15 @@ func generateUUIDTests(app *App) AppTestFile {
 			continue
 		}
 		cols := tableColumns(app, table)
-		data := smartFormData(cols)
+		data := smartFormData(app, table, cols)
 
-		// UUID create: verify response ID is a string (not an integer)
+		// UUID create: verify response ID is a string (not an integer).
+		// A real status column owns that response field; only legacy tables
+		// without it receive the operation marker.
+		createContains := []string{`"id":"`}
+		if !hasColumnInList(cols, "status") {
+			createContains = append(createContains, `"status":"created"`)
+		}
 		tests["uuid_create_"+table] = AppTestCase{
 			AsUser: frameworkTestUser,
 			Steps: []AppTestStep{
@@ -825,7 +929,7 @@ func generateUUIDTests(app *App) AppTestFile {
 					Save:   map[string]string{"new_id": "id"},
 					Expect: AppTestExpect{
 						Status:   200,
-						Contains: []string{`"id":"`, `"status":"created"`}, // string ID (not "id":123)
+						Contains: createContains,
 					},
 				},
 				// Verify the UUID row is readable via GET
@@ -839,8 +943,9 @@ func generateUUIDTests(app *App) AppTestFile {
 			},
 		}
 
-		// UUID batch create
-		if len(data) > 0 {
+		// Like ordinary batch tests, a UUID batch success probe requires a
+		// table the synthetic framework user is guaranteed to write.
+		if len(data) > 0 && crudWriteGuaranteed(app, table) {
 			tests["uuid_batch_"+table] = AppTestCase{
 				AsUser: frameworkTestUser,
 				Steps: []AppTestStep{{
@@ -856,13 +961,13 @@ func generateUUIDTests(app *App) AppTestFile {
 		}
 
 		// UUID lifecycle: create → update → delete
-		// Find a non-PK, non-auto text column to update
+		// Use a schema-compatible value for the first editable scalar.
 		updateData := make(map[string]any)
 		for _, col := range cols {
 			if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "deleted_at" || col.Name == "user_id" || strings.HasSuffix(col.Name, "_id") {
 				continue
 			}
-			updateData[col.Name] = "uuid_lifecycle_updated"
+			updateData[col.Name] = smartTestUpdateValue(col)
 			break
 		}
 		if len(updateData) > 0 {
@@ -907,45 +1012,67 @@ func generateWorkflowTests(app *App) AppTestFile {
 	tests := make(map[string]AppTestCase)
 
 	for name, wf := range app.Workflows.Workflows {
-		// Find a valid first transition from the initial state
+		// A map's first target is not stable, and a conditional transition
+		// needs app-specific fixture data that introspection cannot invent.
 		targets := wf.Transitions[wf.Initial]
-		var firstTarget string
+		var targetNames []string
 		for to := range targets {
-			firstTarget = to
-			break
+			targetNames = append(targetNames, to)
 		}
-		if firstTarget == "" {
+		sort.Strings(targetNames)
+		if len(targetNames) == 0 {
 			continue
+		}
+		firstTarget := targetNames[0]
+		var validTarget string
+		for _, to := range targetNames {
+			if targets[to].When == "" {
+				validTarget = to
+				break
+			}
 		}
 
 		// Find a text column for test data
 		cols := tableColumns(app, wf.Table)
-		data := smartFormData(cols)
+		data := smartFormData(app, wf.Table, cols)
 		// Force the initial state
 		data[wf.Field] = wf.Initial
 
 		prefix := "wf_" + name + "_"
 
-		// Test: valid transition succeeds
-		tests[prefix+"valid_transition"] = AppTestCase{
-			AsUser: frameworkTestUser,
-			Steps: []AppTestStep{
-				{
-					API:    fmt.Sprintf("POST /api/%s", wf.Table),
-					Data:   data,
-					Save:   map[string]string{"entity_id": "id"},
-					Expect: AppTestExpect{Status: 200},
-				},
-				{
-					API:    fmt.Sprintf("POST /api/%s/{{entity_id}}/transition", wf.Table),
-					JSON:   map[string]any{"to": firstTarget},
-					Bearer: true,
-					Expect: AppTestExpect{
-						Status:   200,
-						Contains: []string{`"transitioned"`},
+		// Test: an unconditional transition succeeds with its declared role.
+		// loginTestUser assigns a role only when first creating an identity;
+		// never grant a role through the shared ordinary framework test user.
+		if validTarget != "" {
+			role := targets[validTarget].Role
+			user := frameworkTestUser
+			asRole := ""
+			if role != "" && !hasRole("user", role) {
+				digest := sha256.Sum256([]byte(role))
+				user = fmt.Sprintf("_test_workflow_%x@benmore.test", digest[:12])
+				asRole = role
+			}
+			tests[prefix+"valid_transition"] = AppTestCase{
+				AsUser: user,
+				AsRole: asRole,
+				Steps: []AppTestStep{
+					{
+						API:    fmt.Sprintf("POST /api/%s", wf.Table),
+						Data:   data,
+						Save:   map[string]string{"entity_id": "id"},
+						Expect: AppTestExpect{Status: 200},
+					},
+					{
+						API:    fmt.Sprintf("POST /api/%s/{{entity_id}}/transition", wf.Table),
+						JSON:   map[string]any{"to": validTarget},
+						Bearer: true,
+						Expect: AppTestExpect{
+							Status:   200,
+							Contains: []string{`"transitioned"`},
+						},
 					},
 				},
-			},
+			}
 		}
 
 		// Test: invalid transition returns 409

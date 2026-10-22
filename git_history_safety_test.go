@@ -32,11 +32,14 @@ func historyGit(t *testing.T, dir string, args ...string) string {
 func TestGitHistoryStagesOnlySourceDespiteIgnoreOverrides(t *testing.T) {
 	requireGit(t)
 	dir := t.TempDir()
-	historyWrite(t, dir, ".gitignore", "custom.tmp\n!env.yaml\n")
-	historyWrite(t, dir, "nested/.gitignore", "!env.yaml\n!.env\n!*.key\n!*.pem\n!*.log\n!data.db\n!uploads/\n")
+	historyWrite(t, dir, ".gitignore", "custom.tmp\nstatic/data.db-private/\n!env.yaml\n")
+	historyWrite(t, dir, "nested/.gitignore", "!env.yaml\n!.env\n!*.key\n!*.pem\n!*.log\n!data.db*\n!uploads/\n")
 	historyWrite(t, dir, "app.yaml", "name: example")
+	historyWrite(t, dir, "static/data.db-tools/view.tsx", "export const source = true")
+	historyWrite(t, dir, "static/data.db-private/view.tsx", "private draft")
 	historyWrite(t, dir, "custom.tmp", "app exclusion")
 	protected := []string{"env.yaml", "secrets.yaml", ".env", ".env.production", "tls.key", "cert.pem", "data.db", "data.db-wal", "data.db-shm", "uploads/blob", ".benmore/recovery/data.db", "Benmore/bin", "nested/env.yaml", "nested/.env", "nested/private.key", "nested/cert.pem", "nested/runtime.log", "nested/data.db", "nested/uploads/blob"}
+	protected = append(protected, "data.db-journal", "data.db-mj123", "data.db.backup", "nested/data.db-journal")
 	for _, path := range protected {
 		historyWrite(t, dir, path, "synthetic private content")
 	}
@@ -44,6 +47,12 @@ func TestGitHistoryStagesOnlySourceDespiteIgnoreOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	initial := historyGit(t, dir, "ls-files", "-z")
+	if !strings.Contains(initial, "static/data.db-tools/view.tsx\x00") {
+		t.Fatal("ordinary source in a database-prefixed directory was omitted")
+	}
+	if strings.Contains(initial, "static/data.db-private/view.tsx\x00") {
+		t.Fatal("app-specific directory ignore was overridden")
+	}
 	if strings.Contains(initial, "custom.tmp\x00") {
 		t.Fatal("app ignore rule lost on initialization")
 	}
@@ -238,6 +247,34 @@ func TestGitHistoryCommitFailureCannotReturnStaleSnapshot(t *testing.T) {
 	}
 	if _, ok := gitSnapshotHead(dir, "must fail"); ok {
 		t.Fatal("stale snapshot returned")
+	}
+}
+
+func TestGitHistoryRejectsPreviouslyCommittedRollbackJournal(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	historyWrite(t, dir, "app.yaml", "fixture")
+	if err := gitEnsureRepo(dir, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	historyWrite(t, dir, "data.db-journal", "synthetic old database page")
+	historyGit(t, dir, "add", "-f", "data.db-journal")
+	historyGit(t, dir, "commit", "-qm", "synthetic historical journal")
+	unsafe := historyGit(t, dir, "rev-parse", "HEAD")
+	if err := gitAutoCommit(dir, "must refuse tracked journal"); err == nil {
+		t.Fatal("tracked journal was accepted")
+	}
+	historyGit(t, dir, "rm", "--cached", "data.db-journal")
+	historyGit(t, dir, "commit", "-qm", "journal absent from latest tree")
+	if _, err := gitPublishHead(dir); err == nil {
+		t.Fatal("historical journal allowed into export")
+	}
+	if err := gitHardRestore(dir, unsafe); err == nil {
+		t.Fatal("journal restore was accepted")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "data.db-journal"))
+	if err != nil || string(data) != "synthetic old database page" {
+		t.Fatal("refused history operation changed runtime journal")
 	}
 }
 

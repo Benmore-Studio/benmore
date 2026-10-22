@@ -633,6 +633,9 @@ const BaseCSS = `
 // ============================================================
 
 const DefaultJS = `
+// Helpers are defined privately and published only where the page has not
+// defined the same name: this script runs after the page's own script.
+(function() {
 function filterTable(input) {
   var filter = input.value.toLowerCase();
   var table = input.closest('[data-component="table"]');
@@ -669,8 +672,8 @@ function switchTab(btn, idx) {
   btn.classList.remove('text-muted-foreground');
   tabs.querySelectorAll('[data-tab-panel]').forEach(function(p, i) { p.style.display = i === idx ? 'block' : 'none'; });
 }
-function openModal(id) { var d = document.getElementById(id); if (d) d.showModal(); }
-function closeModal(id) { var d = document.getElementById(id); if (d) d.close(); }
+function openModal(id) { var d = document.getElementById(id); if (!d) return; if (typeof d.showModal === 'function') d.showModal(); else d.classList.add('open'); }
+function closeModal(id) { var d = document.getElementById(id); if (!d) return; if (typeof d.close === 'function') d.close(); else d.classList.remove('open'); }
 function toggleAccordion(btn) {
   var content = btn.nextElementSibling;
   var icon = btn.querySelector('[data-accordion-icon]');
@@ -738,4 +741,7 @@ document.addEventListener('click', function(e) {
     }
   }
 });
+var helpers = { filterTable: filterTable, sortTable: sortTable, switchTab: switchTab, openModal: openModal, closeModal: closeModal, toggleAccordion: toggleAccordion, showToast: showToast };
+for (var name in helpers) { if (typeof window[name] !== 'function') window[name] = helpers[name]; }
+})();
 `

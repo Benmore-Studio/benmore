@@ -911,6 +911,8 @@ func TestStartImportCapturesStopAtLaunch(t *testing.T) {
 	app, cleanup := newImportTestApp(t)
 	defer cleanup()
 	app.Stop = make(chan struct{})
+	launchStop := app.Stop
+	defer close(launchStop)
 	content := "sku,qty\n" + strings.Repeat("A,1\n", 10000)
 	sum := stageString(t, app, "stopcap01", content)
 	sess := &importSession{ID: "stopcap01", TableName: "products", Format: "csv", BytesTotal: int64(len(content)), SHA256: sum}
@@ -920,7 +922,10 @@ func TestStartImportCapturesStopAtLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	newStop := make(chan struct{})
+	// Match reload's synchronization with the import's realtime dispatcher.
+	app.mu.Lock()
 	app.Stop = newStop
+	app.mu.Unlock()
 	close(newStop)
 
 	deadline := time.Now().Add(5 * time.Second)

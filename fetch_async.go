@@ -13,11 +13,11 @@ import (
 )
 
 // RegisterFetchRoutes accepts only descriptors emitted by the server's renderer.
-func RegisterFetchRoutes(mux *http.ServeMux, app *App) {
+func RegisterFetchRoutes(mux appRouteRegistrar, app *App) {
 	registerFetchRoutes(mux, app, fetchHTTPClient(2*time.Second))
 }
 
-func registerFetchRoutes(mux *http.ServeMux, app *App, client *http.Client) {
+func registerFetchRoutes(mux appRouteRegistrar, app *App, client *http.Client) {
 	mux.HandleFunc("GET /_internal/fetch", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		session := getSession(app, r)
@@ -57,7 +57,7 @@ func registerFetchRoutes(mux *http.ServeMux, app *App, client *http.Client) {
 		}
 		req, err := http.NewRequestWithContext(r.Context(), "GET", fetchURL, nil)
 		if err != nil {
-			http.Error(w, "Request error", http.StatusBadGateway)
+			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Request error")
 			return
 		}
 		req.Header.Set("Accept", "application/json")
@@ -70,13 +70,16 @@ func registerFetchRoutes(mux *http.ServeMux, app *App, client *http.Client) {
 		setFetchHeaders(req, desc.Headers)
 		resp, err := client.Do(req)
 		if err != nil {
-			http.Error(w, "Failed to load data", http.StatusBadGateway)
+			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Failed to load data")
 			return
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 		if err != nil || len(body) > 1<<20 || resp.StatusCode >= 400 {
-			http.Error(w, "Data unavailable", http.StatusBadGateway)
+			if err == nil {
+				err = fmt.Errorf("upstream %s answered %d with %d bytes (limit %d)", req.URL.Host, resp.StatusCode, len(body), 1<<20)
+			}
+			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Data unavailable")
 			return
 		}
 		var data any
@@ -84,9 +87,7 @@ func registerFetchRoutes(mux *http.ServeMux, app *App, client *http.Client) {
 			data = string(body)
 		}
 		if cacheDuration > 0 && cacheableFetchResponse(resp) {
-			fetchCache.Lock()
-			fetchCache.entries[cacheKey] = &cacheEntry{data: data, expiresAt: time.Now().Add(cacheDuration)}
-			fetchCache.Unlock()
+			fetchCacheStore(cacheKey, data, len(body), cacheDuration)
 		}
 		renderFetchResponse(w, data, desc.As, desc.Inner)
 	})
@@ -195,10 +196,9 @@ func ExpandFetchTagsAsync(content string, app *App, ctx *RenderContext) string {
 		if headers != "" {
 			headers = RenderMustache(headers, ctx.Data)
 		}
-		rawURL = InterpolateEnv(rawURL, app.Dir)
-		if headers != "" {
-			headers = InterpolateEnv(headers, app.Dir)
-		}
+		// No env pass here: RenderTemplate resolved the author's {{env.X}}
+		// before any data was rendered; running it now would expand an env
+		// placeholder inside a rendered row value.
 
 		if _, _, err := resolveFetchURL(app, rawURL); err != nil {
 			return renderFetchError(app, err.Error())

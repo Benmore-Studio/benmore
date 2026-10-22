@@ -1,0 +1,89 @@
+{
+  "package": "@modelcontextprotocol/ext-apps",
+  "version": "2.0.3",
+  "vendored_on": "2026-10-05",
+  "artifact": "app-with-deps.js",
+  "artifact_source": "dist/src/app-with-deps.js in the published tarball, copied verbatim (the package's own prebuilt self-contained browser ESM bundle: the ./app-with-deps export; built upstream with bun). Not rebuilt locally; no npm install, no package scripts run.",
+  "tarball": "https://registry.npmjs.org/@modelcontextprotocol/ext-apps/-/ext-apps-2.0.3.tgz",
+  "registry_integrity": "sha512-Tn+4+cyhO4f4cQSDxNyLiIfEE+qlTTuIbWBJB8JTinEXOhDYgCT4wDTQplxD9MBYZH5pCYGC59GaxiwIT4bu8w==",
+  "registry_shasum": "9ea49774d5ca58f29afa2f4ad313f652a12a9057",
+  "upstream_tag": "https://github.com/modelcontextprotocol/ext-apps/tree/v2.0.3",
+  "bundled_dependencies": [
+    {
+      "name": "@modelcontextprotocol/client",
+      "version": "2.0.0",
+      "license": [
+        "MIT",
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE.modelcontextprotocol",
+      "integrity": "sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw==",
+      "shasum": "4dc18c983c7acb40040f08442123e3c5b88d6074"
+    },
+    {
+      "name": "@modelcontextprotocol/core",
+      "version": "2.0.0",
+      "license": [
+        "MIT",
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE.modelcontextprotocol",
+      "integrity": "sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA==",
+      "shasum": "c918a4c6aef22a7c59dfb0aabc2a82c187cce157"
+    },
+    {
+      "name": "zod",
+      "version": "4.3.5",
+      "license": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.zod",
+      "integrity": "sha512-k7Nwx6vuWx1IJ9Bjuf4Zt1PEllcwe7cls3VNzm4CQ1/hgtFUK2bRNG3rvnpPUhFjmqJKAKtjV576KnUkHocg/g==",
+      "shasum": "aeb269a6f9fc259b1212c348c7c5432aaa474d2a"
+    },
+    {
+      "name": "content-type",
+      "version": "1.0.5",
+      "license": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.content-type",
+      "integrity": "sha512-nTjqfcBFEipKdXCv4YDQWCfmcLZKm81ldF0pAopTvyrFGVbcR6P/VAAd5G7N+0tTr8QqiU0tFadD6FK4NtJwOA==",
+      "shasum": "8b773162656d1d1086784c8f23a54ce6d73d7918"
+    },
+    {
+      "name": "@standard-schema/spec",
+      "version": "1.1.0",
+      "license": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.standard-schema-spec",
+      "integrity": "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==",
+      "shasum": "a79b55dbaf8604812f52d140b2c9ab41bc150bb8",
+      "note": "declared runtime dependency of ext-apps; type-only package (empty runtime module), so no code of it is in the bundle. License kept for completeness."
+    }
+  ],
+  "bundled_dependency_versions_source": "package-lock.json at upstream tag v2.0.3 (the lockfile the published bundle was built from). Each tarball was re-fetched from the registry and its sha512 and sha1 matched the registry dist.integrity and dist.shasum at vendoring time.",
+  "licenses": [
+    "MIT",
+    "Apache-2.0"
+  ],
+  "license_note": "ext-apps and @modelcontextprotocol/* are in a documented MIT to Apache-2.0 relicensing transition; one LICENSE file (identical in all three tarballs) carries both full texts. Both are permissive.",
+  "size_bytes": 418465,
+  "sha256": {
+    "LICENSE.content-type": "257aed98914108e91a337912727b6a802eef218248507f74b76faffaff517a38",
+    "LICENSE.modelcontextprotocol": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+    "LICENSE.standard-schema-spec": "653b779005a3a4d64a7288c940f7b9a0e8f0b1e0375f6aa6af9473caf131e564",
+    "LICENSE.zod": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8",
+    "app-with-deps.js": "fb56376b7583ecafb4820bdebc150abee18feb6258ff84b83c2c944ebd9c3602"
+  },
+  "dynamic_code_allowlist": [
+    {
+      "pattern": "new Function(",
+      "count": 1,
+      "file": "app-with-deps.js",
+      "why": "zod 4 feature probe (allowsEval): try{new Function(\"\");return true}catch{return false}. Executes an empty body only and is skipped on Cloudflare user agents. If a CSP forbids unsafe-eval the probe throws and zod falls back to its non-JIT parser, so the bundle works without unsafe-eval. No input-derived string ever reaches it."
+    }
+  ],
+  "refresh": "Re-fetch the tarball for the new version, verify dist.integrity and dist.shasum, copy dist/src/app-with-deps.js and the LICENSE files, regenerate this file, and re-run TestMCPAppsBundleVendorIntegrity."
+}

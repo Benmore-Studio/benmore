@@ -3,12 +3,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,7 +25,7 @@ func formatColName(name string) string {
 }
 
 // RegisterAdminRoutes sets up the auto-generated admin panel at /_admin/*.
-func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
+func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 	// Admin requires auth + admin role
 	adminAuth := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -32,8 +34,13 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 				http.Redirect(w, r, app.Paths.Login+"?redirect="+r.URL.Path, http.StatusSeeOther)
 				return
 			}
-			role := getUserRole(app.DB, session.UserID)
-			if role != "admin" {
+			// The canonical gate for admin-only management surfaces: an admin
+			// by the primary role column OR a global grant in
+			// _benmore_user_roles (the gate used to read only the column, so
+			// an admin by grant got 403 here and nowhere else), on a
+			// credential that is not delegated - a scoped token or an edge
+			// identity never opens the panel, whoever minted it.
+			if !session.IsAdminConsole() {
 				http.Error(w, "Forbidden - admin access required", http.StatusForbidden)
 				return
 			}
@@ -91,14 +98,21 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 			Request: r,
 			Data:    make(map[string]any),
 			Params:  make(map[string]string),
+			// The form is request input, as on the flow's HTTP route:
+			// sql_dynamic refuses it and identity/reserved keys are dropped.
+			RequestKeys: make(map[string]bool),
+			Writes:      newFlowWriteLog(),
 		}
 		// Populate context with form values
 		for k, v := range r.Form {
 			if k != "_csrf" && k != "_flow_path" && len(v) > 0 {
 				ctx.Data[k] = v[0]
 				ctx.Params[k] = v[0]
+				ctx.RequestKeys[k] = true
 			}
 		}
+		stripRequestIdentityKeys(ctx)
+		shadowStepNamedRequestKeys(ctx, targetFlow.Steps)
 		// Inject session context
 		if session != nil {
 			ctx.Data["user_id"] = session.UserID
@@ -116,15 +130,20 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 				guard := &txCommitGuard{tx: tx}
 				defer guard.rollbackUnlessHandled()
 				executeSteps(ctx, targetFlow.Steps)
+				committed := false
 				if ctx.Error != nil {
 					tx.Rollback()
+				} else if err := tx.Commit(); err != nil {
+					ctx.Error = err
 				} else {
-					tx.Commit()
+					committed = true
 				}
 				guard.MarkHandled()
+				announceFlowWrites(ctx, committed)
 			}
 		} else {
 			executeSteps(ctx, targetFlow.Steps)
+			announceFlowWrites(ctx, false)
 		}
 		if ctx.Error != nil {
 			http.Redirect(w, r, "/_admin/tools?error="+url.QueryEscape(ctx.Error.Error()), http.StatusSeeOther)
@@ -167,6 +186,13 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 		}
 		table := parts[0]
 		action := parts[1]
+		// The table comes from the URL and goes to the CRUD handlers, which
+		// are otherwise reached only through routes registered per table:
+		// same name check as the admin pages (serveAdminTable).
+		if !isValidColumnName(table) {
+			notFoundHandler(app)(w, r)
+			return
+		}
 
 		switch {
 		case action == "create":
@@ -193,10 +219,34 @@ func RegisterAdminRoutes(mux *http.ServeMux, app *App) {
 		role := r.FormValue("role")
 		var uid int64
 		fmt.Sscanf(userID, "%d", &uid)
+		session := getSession(app, r)
+		oldRole := getUserRole(app.DB, uid)
+		newRole := strings.TrimSpace(strings.ToLower(role))
+		// The same last-admin guard as revoking an admin grant (rbac.go): an
+		// admin demoting their own primary role must leave another active
+		// admin, or keep a global admin grant themselves.
+		if session != nil && uid == session.UserID && oldRole == "admin" && newRole != "admin" && !UserHasGlobalAdminGrant(app.DB, uid) {
+			var others int
+			app.DB.QueryRow(`SELECT (
+				(SELECT COUNT(*) FROM _benmore_users
+					WHERE role = 'admin' AND id != ? AND (deactivated_at IS NULL OR deactivated_at = ''))
+				+
+				(SELECT COUNT(*) FROM _benmore_user_roles
+					WHERE role = 'admin' AND user_id != ? AND group_id IS NULL
+					  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')))
+			)`, uid, uid).Scan(&others)
+			if others == 0 {
+				httpError(w, "cannot remove the admin role from the last active admin", http.StatusBadRequest)
+				return
+			}
+		}
 		if err := SetUserRole(app.DB, uid, role); err != nil {
 			httpError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// A primary-role change is a grant like any other: audit it.
+		LogAudit(app, "role_changed", "_benmore_users", strconv.FormatInt(uid, 10), session,
+			map[string]any{"role": oldRole}, map[string]any{"role": newRole})
 		if isHTMX(r) {
 			w.Header().Set("HX-Refresh", "true")
 			return
@@ -259,11 +309,11 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		// admin.yaml: skip tables explicitly hidden by the developer.
 		// This keeps internal/operational tables out of the admin UI
 		// without pulling them out of the schema.
-		if app.Admin.IsTableHidden(t) {
+		if app.adminConfig().IsTableHidden(t) {
 			continue
 		}
 		var count int64
-		app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t)).Scan(&count)
+		app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(t)).Scan(&count)
 		active := ""
 		if t == activeTable {
 			active = "background:hsl(var(--accent));color:hsl(var(--foreground));font-weight:600;"
@@ -271,7 +321,7 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		// Display name precedence: explicit admin.yaml label → strip
 		// _benmore_ prefix → replace underscores. Lets devs rename
 		// "contacts" to "Customers" without changing the schema.
-		displayName := app.Admin.TableLabel(t)
+		displayName := app.adminConfig().TableLabel(t)
 		if displayName == "" {
 			displayName = strings.ReplaceAll(t, "_", " ")
 			if strings.HasPrefix(t, "_benmore_") {
@@ -391,18 +441,30 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		searchItems.push({title:name,sub:count+' records',url:a.href,cat:'Tables'});
 	});`)
 	// Add users to search index
-	userRows, _ := QueryRows(app.DB, "SELECT id, email, role FROM _benmore_users ORDER BY id LIMIT 100")
-	sb.WriteString(`var users=[`)
-	for i, u := range userRows {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(fmt.Sprintf(`{id:%v,email:"%s",role:"%s"}`,
-			u["id"], html.EscapeString(fmt.Sprintf("%v", u["email"])), html.EscapeString(fmt.Sprintf("%v", u["role"]))))
+	userRows, err := queryMetadataRows(app.DB, "SELECT id, email, role FROM _benmore_users ORDER BY id LIMIT 100")
+	if err != nil {
+		// A failed read may carry the rows before it; search none rather
+		// than a list that looks complete.
+		log.Printf("admin search index: %v", err)
+		userRows = nil
 	}
-	sb.WriteString(`];
+	// JSON is a valid script literal for any stored value: json.Marshal
+	// escapes quotes, backslashes, line separators and <, > and &, so no
+	// value can end the string or the script element.
+	index := make([]map[string]any, 0, len(userRows))
+	for _, u := range userRows {
+		index = append(index, map[string]any{"id": u["id"], "email": fmt.Sprintf("%v", u["email"]), "role": fmt.Sprintf("%v", u["role"])})
+	}
+	indexJSON, err := json.Marshal(index)
+	if err != nil {
+		indexJSON = []byte("[]")
+	}
+	sb.WriteString(`var users=`)
+	sb.Write(indexJSON)
+	sb.WriteString(`;
 	users.forEach(function(u){searchItems.push({title:u.email,sub:u.role,url:'/_admin/_benmore_users/'+u.id,cat:'Users'});});
 
+	function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 	function fuzzy(q,t){q=q.toLowerCase();t=t.toLowerCase();if(!q)return 1;if(t.indexOf(q)>=0)return 100+(q.length/t.length*50);var qi=0,s=0;for(var i=0;i<t.length&&qi<q.length;i++){if(t[i]===q[qi]){qi++;s+=10;}}return qi===q.length?s:0;}
 
 	function render(q){
@@ -419,9 +481,9 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		order.forEach(function(cat){if(!groups[cat])return;
 			html+='<div style="padding:8px 16px 4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));">'+cat+'</div>';
 			groups[cat].forEach(function(item){
-				html+='<a href="'+item.url+'" style="display:flex;align-items:center;gap:12px;padding:10px 16px;text-decoration:none;color:inherit;transition:background 0.1s;" onmouseover="this.style.background=\'hsl(var(--accent))\'" onmouseout="this.style.background=\'\'">'
-					+'<span style="flex:1;"><span style="display:block;font-size:14px;font-weight:500;color:hsl(var(--foreground));">'+item.title+'</span>'
-					+'<span style="display:block;font-size:12px;color:hsl(var(--muted-foreground));">'+item.sub+'</span></span></a>';
+				html+='<a href="'+esc(item.url)+'" style="display:flex;align-items:center;gap:12px;padding:10px 16px;text-decoration:none;color:inherit;transition:background 0.1s;" onmouseover="this.style.background=\'hsl(var(--accent))\'" onmouseout="this.style.background=\'\'">'
+					+'<span style="flex:1;"><span style="display:block;font-size:14px;font-weight:500;color:hsl(var(--foreground));">'+esc(item.title)+'</span>'
+					+'<span style="display:block;font-size:12px;color:hsl(var(--muted-foreground));">'+esc(item.sub)+'</span></span></a>';
 			});
 		});
 		el.innerHTML=html;
@@ -618,7 +680,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			continue
 		}
 		var c int64
-		app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t)).Scan(&c)
+		app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(t)).Scan(&c)
 		totalRecords += c
 	}
 
@@ -668,7 +730,11 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			<th style="text-align:right;padding:10px 16px;font-weight:600;color:hsl(var(--muted-foreground));font-size:11px;text-transform:uppercase;letter-spacing:0.04em;"></th>
 		</tr></thead><tbody>`)
 
-	userRows, _ := QueryRows(app.DB, "SELECT id, COALESCE(email, phone, username, 'User #' || id) as email, role, last_login_at, created_at FROM _benmore_users ORDER BY created_at DESC LIMIT 10")
+	userRows, usersErr := queryMetadataRows(app.DB, "SELECT id, COALESCE(email, phone, username, 'User #' || id) as email, role, last_login_at, created_at FROM _benmore_users ORDER BY created_at DESC LIMIT 10")
+	if usersErr != nil {
+		userRows = nil
+		sb.WriteString(adminReadFailedRow(5, "recent users", usersErr))
+	}
 	for _, row := range userRows {
 		uid := fmt.Sprintf("%v", row["id"])
 		email := fmt.Sprintf("%v", row["email"])
@@ -697,7 +763,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			<td style="padding:8px 16px;text-align:right;"><a href="/_admin/_benmore_users/%s" style="font-size:11px;color:hsl(var(--primary));text-decoration:none;font-weight:600;">Step In</a></td>
 		</tr>`, html.EscapeString(email), roleBg, roleColor, html.EscapeString(role), html.EscapeString(lastLogin), html.EscapeString(joined), html.EscapeString(uid)))
 	}
-	if len(userRows) == 0 {
+	if len(userRows) == 0 && usersErr == nil {
 		sb.WriteString(`<tr><td colspan="5" style="padding:24px;text-align:center;color:hsl(var(--muted-foreground));">No users yet.</td></tr>`)
 	}
 	sb.WriteString(`</tbody></table></div>`)
@@ -713,7 +779,11 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			<th style="text-align:right;padding:10px 16px;font-weight:600;color:hsl(var(--muted-foreground));font-size:11px;text-transform:uppercase;letter-spacing:0.04em;">When</th>
 		</tr></thead><tbody>`)
 
-	auditRows, _ := QueryRows(app.DB, "SELECT action, table_name, row_id, user_email, created_at FROM _benmore_audit_log ORDER BY created_at DESC LIMIT 15")
+	auditRows, auditErr := queryMetadataRows(app.DB, "SELECT action, table_name, row_id, user_email, created_at FROM _benmore_audit_log ORDER BY created_at DESC LIMIT 15")
+	if auditErr != nil {
+		auditRows = nil
+		sb.WriteString(adminReadFailedRow(4, "recent activity", auditErr))
+	}
 	for _, row := range auditRows {
 		action := fmt.Sprintf("%v", row["action"])
 		tableName := fmt.Sprintf("%v", row["table_name"])
@@ -738,7 +808,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			<td style="padding:8px 16px;text-align:right;color:hsl(var(--muted-foreground));font-size:12px;">%s</td>
 		</tr>`, actionColor, html.EscapeString(action), html.EscapeString(tableName), html.EscapeString(rowID), html.EscapeString(tableName), html.EscapeString(rowID), html.EscapeString(email), html.EscapeString(created)))
 	}
-	if len(auditRows) == 0 {
+	if len(auditRows) == 0 && auditErr == nil {
 		sb.WriteString(`<tr><td colspan="4" style="padding:24px;text-align:center;color:hsl(var(--muted-foreground));">No activity recorded yet.</td></tr>`)
 	}
 	sb.WriteString(`</tbody></table></div>`)
@@ -754,7 +824,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	}
 	// admin.yaml: hidden tables are not reachable by URL either, even
 	// if an admin guesses the path. Keeps the hide directive honest.
-	if app.Admin.IsTableHidden(table) {
+	if app.adminConfig().IsTableHidden(table) {
 		notFoundHandler(app)(w, r)
 		return
 	}
@@ -763,6 +833,10 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		notFoundHandler(app)(w, r)
 		return
 	}
+	// The create form still offers hidden columns (write-only); the list
+	// and its search neither show nor match them.
+	createCols := cols
+	cols = adminVisibleColumns(app, table, cols)
 
 	page := queryParamInt(r, "page", 1)
 	perPage := 50
@@ -770,21 +844,24 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	search := r.URL.Query().Get("q")
 
 	// Build query
-	query := fmt.Sprintf("SELECT * FROM %s", table)
+	query := "SELECT * FROM " + quoteIdent(table)
 	var args []any
 	if search != "" {
 		var conditions []string
 		for _, col := range cols {
-			conditions = append(conditions, fmt.Sprintf("%s LIKE ?", col.Name))
+			conditions = append(conditions, quoteColumn(table, col.Name)+" LIKE ?")
 			args = append(args, "%"+search+"%")
 		}
 		query += " WHERE " + strings.Join(conditions, " OR ")
 	}
 	query += fmt.Sprintf(" ORDER BY id DESC LIMIT %d OFFSET %d", perPage, offset)
 
-	rows, _ := QueryRows(app.DB, query, args...)
+	rows, rowsErr := queryNativeRowsWith(app.DB, app, table, query, args...)
+	if rowsErr != nil {
+		rows = nil
+	}
 	var total int64
-	app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&total)
+	app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&total)
 
 	csrf := generateCSRFToken()
 
@@ -832,7 +909,9 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		sb.WriteString(`</tr>`)
 	}
 
-	if len(rows) == 0 {
+	if rowsErr != nil {
+		sb.WriteString(adminReadFailedRow(len(cols)+1, table+" records", rowsErr))
+	} else if len(rows) == 0 {
 		sb.WriteString(fmt.Sprintf(`<tr><td colspan="%d" style="padding:32px;text-align:center;color:hsl(var(--muted-foreground));">No records found.</td></tr>`, len(cols)+1))
 	}
 
@@ -841,13 +920,16 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	// Pagination
 	totalPages := (int(total) + perPage - 1) / perPage
 	if totalPages > 1 {
+		// The search term is request input: query-escape it for the URL and
+		// HTML-escape the result for the attribute (& between parameters).
+		searchQ := html.EscapeString(url.QueryEscape(search))
 		sb.WriteString(`<div style="display:flex;gap:8px;margin-top:16px;align-items:center;">`)
 		if page > 1 {
-			sb.WriteString(fmt.Sprintf(`<a href="/_admin/%s?page=%d&q=%s" style="padding:6px 12px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;text-decoration:none;color:hsl(var(--foreground));background:hsl(var(--card));">Prev</a>`, table, page-1, search))
+			sb.WriteString(fmt.Sprintf(`<a href="/_admin/%s?page=%d&q=%s" style="padding:6px 12px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;text-decoration:none;color:hsl(var(--foreground));background:hsl(var(--card));">Prev</a>`, table, page-1, searchQ))
 		}
 		sb.WriteString(fmt.Sprintf(`<span style="font-size:12px;color:hsl(var(--muted-foreground));">Page %d of %d (%d total)</span>`, page, totalPages, total))
 		if page < totalPages {
-			sb.WriteString(fmt.Sprintf(`<a href="/_admin/%s?page=%d&q=%s" style="padding:6px 12px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;text-decoration:none;color:hsl(var(--foreground));background:hsl(var(--card));">Next</a>`, table, page+1, search))
+			sb.WriteString(fmt.Sprintf(`<a href="/_admin/%s?page=%d&q=%s" style="padding:6px 12px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;text-decoration:none;color:hsl(var(--foreground));background:hsl(var(--card));">Next</a>`, table, page+1, searchQ))
 		}
 		sb.WriteString(`</div>`)
 	}
@@ -861,7 +943,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		<div style="padding:20px 24px;"><form method="POST" action="/_admin/api/%s/create">
 		<input type="hidden" name="_csrf" value="%s">`, strings.Title(table), table, csrf))
 
-	for _, col := range cols {
+	for _, col := range createCols {
 		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "user_id" {
 			continue
 		}
@@ -896,17 +978,19 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		notFoundHandler(app)(w, r)
 		return
 	}
-	if app.Admin.IsTableHidden(table) {
+	if app.adminConfig().IsTableHidden(table) {
 		notFoundHandler(app)(w, r)
 		return
 	}
-	rows, err := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
+	rows, err := queryNativeRowsWith(app.DB, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id)
 	if err != nil || len(rows) == 0 {
 		notFoundHandler(app)(w, r)
 		return
 	}
 	row := rows[0]
 	cols, _ := GetTableColumns(app.DB, table)
+	// A hidden column is left out of the form, so saving it keeps its value.
+	cols = adminVisibleColumns(app, table, cols)
 	csrf := generateCSRFToken()
 
 	var sb strings.Builder
@@ -986,11 +1070,16 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		if !hasColumn(app, otherTable, fkCol) {
 			continue
 		}
-		related, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE %s = ? LIMIT 20", otherTable, fkCol), id)
+		related, err := queryNativeRowsWith(app.DB, app, otherTable, "SELECT * FROM "+quoteIdent(otherTable)+" WHERE "+quoteColumn(otherTable, fkCol)+" = ? LIMIT 20", id)
+		if err != nil {
+			sb.WriteString(`<div style="margin-top:24px;"><table style="width:100%;border-collapse:collapse;font-size:12px;">` + adminReadFailedRow(1, "related "+otherTable, err) + `</table></div>`)
+			continue
+		}
 		if len(related) == 0 {
 			continue
 		}
 		relCols, _ := GetTableColumns(app.DB, otherTable)
+		relCols = adminVisibleColumns(app, otherTable, relCols)
 
 		sb.WriteString(fmt.Sprintf(`<div style="margin-top:24px;">
 			<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));margin-bottom:8px;">Related %s (%d)</div>
@@ -1027,6 +1116,30 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	session := getSession(app, r)
 	fmt.Fprint(w, adminShell(sb.String(), fmt.Sprintf("%s #%s", strings.Title(table), id), table, app, session))
+}
+
+// adminVisibleColumns drops the columns no response may carry
+// (apiHiddenColumn: credential hashes, TOTP secrets and backup codes on
+// _benmore_users, secret- and token-named text columns, blind indexes) from
+// what the admin panel shows and searches. The panel printed them in full:
+// a bcrypt hash is exactly 60 characters, the cell cut-off.
+// adminReadFailedRow logs a failed admin read and returns a table row that
+// says so. QueryRows hands back the rows read before a failure (a timed-out
+// statement) with the error; showing them would pass part of a list off as
+// all of it.
+func adminReadFailedRow(colspan int, what string, err error) string {
+	log.Printf("admin: reading %s: %v", what, err)
+	return fmt.Sprintf(`<tr><td colspan="%d" style="padding:24px;text-align:center;color:#dc2626;">Could not load %s: the read failed or timed out. Reload to retry.</td></tr>`, colspan, html.EscapeString(what))
+}
+
+func adminVisibleColumns(app *App, table string, cols []Column) []Column {
+	out := cols[:0:0]
+	for _, c := range cols {
+		if !apiHiddenColumn(app, table, c.Name) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func sel(val, option string) string {

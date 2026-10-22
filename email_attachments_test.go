@@ -24,8 +24,8 @@ func TestBuildRawMIMEMessage_Attachment(t *testing.T) {
 	}}
 
 	raw, err := buildRawMIMEMessage(
-		"GO-180 <no-reply@go180.ai>", "vet@example.com", "Your report",
-		"", "https://go180.ai/unsub", "", "<p>hi</p>", "hi", atts,
+		"GO-180 <no-reply@go180.ai>", "vet@example.com", "", "Your report",
+		"", "https://go180.ai/unsub", false, "", "<p>hi</p>", "hi", atts,
 	)
 	if err != nil {
 		t.Fatalf("buildRawMIMEMessage: %v", err)

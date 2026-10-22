@@ -152,6 +152,7 @@ func wsJoinAs(c *wsClient, rawRoom string) {
 }
 
 func wsReceivedAny(c *wsClient) bool {
+	realtimeFlush() // table events are delivered by the per-app dispatcher
 	select {
 	case <-c.send:
 		return true

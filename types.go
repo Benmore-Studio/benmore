@@ -23,6 +23,19 @@ type App struct {
 	Sessions *SessionStore
 	Hooks    *HookConfig
 	Flows    []Flow
+	MCP      *AppMCPManifest
+	// mcpWithheld says why a present mcp.yaml's connector is off for this
+	// generation (its review does not bind the current source); "" otherwise.
+	mcpWithheld string
+	// mcpGeneration is published with the configuration fields used by private
+	// connector reads. Each successful reload installs a fresh identity.
+	mcpGeneration     *appMCPRuntimeGeneration
+	mcpRevisionPins   atomic.Int64      // pooled connections held by connector read revision pins
+	auditOwner        *App              // policy views route reads to the live owner's audit sink
+	sourceFiles       map[string][]byte // immutable reviewed generation; nil for ordinary apps
+	environment       map[string]string // runtime generation; values guarded by appEnvStore.mu
+	templateEnvSource []byte            // immutable private env.yaml; never part of the public source inventory
+	routeEnv          map[string]string // candidate-only environment snapshot; never published
 	// Scopes lets app.yaml declare per-table override SQL fragments
 	// for the auto-CRUD's read filter. Keyed by table name. The most
 	// common use is `public_read_when: "status = 'published'"` so a
@@ -39,6 +52,8 @@ type App struct {
 	// no pattern keep the historical any-authed-user behavior.
 	WSRooms         []WSRoomRule
 	Workflows       *WorkflowConfig
+	I18n            *I18n // translations from i18n/*.yaml (per app, not a process global)
+	Recordings      *RecordingStore
 	Computed        *ComputedFieldConfig
 	Encrypted       *EncryptedFieldConfig
 	Backup          *BackupConfig
@@ -54,6 +69,9 @@ type App struct {
 	AppID           string        // auto-generated UUID for this app (persisted in .benmore/app_id)
 	ExternalID      string        // optional external system ID from app.yaml (e.g., project tracker ID)
 	DevMode         bool
+	// MCPLocal is `benmore serve --mcp-local`: the connector resource is
+	// http://localhost:<port>/api/_mcp (mcp_local_serve.go).
+	MCPLocal, MCPLocalWrites bool
 	// Optional hosting metadata, populated by the platform layer when present
 	// (all zero/empty in a self-hosted build). Drives the "Built with Benmore"
 	// badge when set.
@@ -82,9 +100,9 @@ type App struct {
 	// MCP context).
 	ServerPort int
 	// walShippedOffset is maintained by the optional platform WAL shipper.
-	// WAL maintenance may only TRUNCATE when this offset has caught up to
-	// the current data.db-wal size; otherwise it runs PASSIVE so frames are
-	// checkpointed without being discarded before S3 shipping sees them.
+	// This is an uploaded committed boundary, never physical file length.
+	// It is diagnostic capture progress, not TRUNCATE permission. The shipper
+	// owns SQLite-coordinated generation rotation; maintenance uses PASSIVE.
 	walShippedOffset atomic.Int64
 	// walCheckpointMu serializes the two in-process checkpointers - the WAL
 	// maintenance loop (db.go) and the WAL shipper's base snapshot
@@ -98,6 +116,15 @@ type App struct {
 	workerWG        sync.WaitGroup
 	shuttingDown    bool
 	shutdownOnce    sync.Once
+	// jobWG tracks the workers that run app code of unbounded length (the
+	// job worker, the scheduled-task sweeper). Shutdown waits for them only
+	// up to jobDrainTimeout, which the single-app `serve` process sets: a
+	// restart then lets the job in progress finish instead of closing the
+	// database under it. Zero (host mode, tests) doesn't wait, so a reload
+	// that shuts one app down under a host-wide lock is never held by a
+	// long job.
+	jobWG           sync.WaitGroup
+	jobDrainTimeout time.Duration
 	// Advances only after a successful handler swap, never on a rejected reload.
 	reloadGeneration atomic.Uint64
 }
@@ -139,6 +166,15 @@ func (app *App) Shutdown() {
 		app.mu.Unlock()
 		app.workerMu.Unlock()
 		app.workerWG.Wait()
+		if app.jobDrainTimeout > 0 {
+			drained := make(chan struct{})
+			safeGo("shutdown.jobDrain", func() { app.jobWG.Wait(); close(drained) })
+			select {
+			case <-drained:
+			case <-time.After(app.jobDrainTimeout):
+				log.Printf("shutdown: a background job was still running after %s; closing the database under it (lease recovery handles the row)", app.jobDrainTimeout)
+			}
+		}
 		if app.DB != nil {
 			// Force a final WAL checkpoint so the next process opens with
 			// a clean WAL. Ignore errors - we still need to close the DB
@@ -172,8 +208,8 @@ func (app *App) FeatureEnabled(name string) bool {
 // keeps the widget on a PUBLISHED prod app - `publish` only flips
 // features.testing, never features.feedback - so clients who want live
 // feedback set features.feedback: true and it survives going live. The
-// amber "testing" banner + the demo password gate stay gated on
-// features.testing alone; prod feedback is silent.
+// demo password gate stays gated on features.testing alone. (There is no
+// testing banner; the feedback flag is the only visible testing chrome.)
 func (app *App) FeedbackWidgetEnabled() bool {
 	return app.FeatureEnabled("testing") || app.FeatureEnabled("feedback")
 }
@@ -272,6 +308,15 @@ func DiscoverAuthPaths(pages map[string]*Page) *AuthPaths {
 // RolesConfig holds developer-defined role → scope mappings from app.yaml.
 type RolesConfig struct {
 	Roles map[string]RoleDef
+	// TablesFromAccess is app.yaml `table_scopes: access`: the auto-CRUD
+	// scope gate (checkScope) admits any schema table (accessTables, bound at
+	// load by bindRoleTableScopes) and leaves the decision to `access:`
+	// rules. Session scopes and permissions are untouched, so roles: scopes
+	// keep gating perm: modes, flow permissions and connector tools.
+	// Without it a roles block that names no table made every auto-CRUD
+	// call 403.
+	TablesFromAccess bool
+	accessTables     map[string]bool
 }
 
 // RoleDef defines a single role: its own scopes plus the parents it
@@ -301,12 +346,35 @@ type GroupConfig struct {
 	// grant in _benmore_user_roles.
 	RoleField string `yaml:"role_field"`
 
+	// ActiveField names a membership-table column that must be truthy for
+	// the row to grant membership (e.g. active, is_active, status_active).
+	// Soft-deleted rows (deleted_at set) never grant membership, with or
+	// without it. See groups_membership.go.
+	ActiveField string `yaml:"active_field"`
+
 	// Bootstrap (v2.7.164) enables POST /api/_groups/create - the
 	// atomic "create my org + my founding membership" primitive every
 	// multi-tenant app previously had to hand-roll as a flow (the
 	// group key is correctly stripped from client bodies, so a
 	// groupless user couldn't found a tenant through plain CRUD).
 	Bootstrap *GroupBootstrapConfig `yaml:"bootstrap"`
+	// Shared lists un-grouped reference tables every tenant shares (a
+	// catalog with no per-tenant rows): on these a tenant role counts on
+	// `role:` gates, as for grouped tables. Any other table without the
+	// group key counts only global roles (tableModeAllowed).
+	Shared []string `yaml:"shared"`
+	// Label (optional) names where a workspace's display name lives, so the
+	// connector's workspace picker and consent page can show "Acme" instead
+	// of the raw tenant id. Display only: it grants and filters nothing.
+	Label *GroupLabelConfig `yaml:"label"`
+}
+
+// GroupLabelConfig reads `SELECT <field> FROM <table> WHERE <key> = <tenant id>`.
+// Key defaults to "id" (the usual org table); table and field are required.
+type GroupLabelConfig struct {
+	Table string `yaml:"table"`
+	Key   string `yaml:"key"`
+	Field string `yaml:"field"`
 }
 
 // GroupBootstrapConfig configures the founding-moment endpoint.
@@ -357,6 +425,7 @@ type Page struct {
 	Image       string // OG image URL
 	Robots      string // "noindex", "nofollow", etc.
 	Require     string // generic user field gating: "plan:pro,enterprise verified:1"
+	Role        string // role gate, any-of: "admin,editor" ("public" = no gate)
 	Type        string // page type: "login", "signup", "forgot-password", "reset-password", "verify-otp", "verify-mfa", "settings"
 	Redirect    string // role-based redirect: "admin:/admin,user:/dashboard"
 	Engine      string // frontmatter engine: "" (mustache default), "gotmpl", "raw"
@@ -375,11 +444,14 @@ type Table struct {
 
 // Column represents a table column.
 type Column struct {
-	Name    string
-	Type    string
-	NotNull bool
-	Default string
-	PK      bool
+	// prismaScalar marks a scalar from the successfully loaded Prisma schema.
+	// It is intentionally absent on columns introspected from a SQL-only app.
+	prismaScalar bool
+	Name         string
+	Type         string
+	NotNull      bool
+	Default      string
+	PK           bool
 }
 
 // ForeignKey represents a foreign key relationship.
@@ -402,14 +474,17 @@ type QueryTag struct {
 // FeaturesConfig holds opt-in/opt-out flags for framework features.
 // All features default to enabled (true) for backwards compatibility.
 type FeaturesConfig struct {
-	Admin *bool `yaml:"admin"` // /admin panel (default: true)
+	Admin   *bool `yaml:"admin"`   // /admin panel (default: true)
+	Uploads *bool `yaml:"uploads"` // generic file-upload endpoints (default: true)
+	Exports *bool `yaml:"exports"` // HTTP PDF and user-data exports (default: true)
 	// Search removed - opinionated feature, not a framework concern
-	SSE       *bool `yaml:"sse"`       // /sse/events endpoint (default: true)
-	WS        *bool `yaml:"ws"`        // /ws WebSocket endpoint (default: true)
-	Docs      *bool `yaml:"docs"`      // /api/_docs + /docs endpoints (default: true)
-	Testing   *bool `yaml:"testing"`   // testing/QA mode: password gate, feedback widget, session banner (default: false, opt-in)
-	Feedback  *bool `yaml:"feedback"`  // visitor feedback widget + API WITHOUT the testing posture (no banner/gate); survives publish so live apps can collect feedback (default: false, opt-in)
-	Analytics *bool `yaml:"analytics"` // per-app analytics beacon + cookie tracking (default: true)
+	SSE             *bool `yaml:"sse"`              // /sse/events endpoint (default: true)
+	WS              *bool `yaml:"ws"`               // /ws WebSocket endpoint (default: true)
+	Docs            *bool `yaml:"docs"`             // /api/_docs + /docs endpoints (default: true)
+	Testing         *bool `yaml:"testing"`          // testing/QA mode: feedback flag widget + demo password gate (default: false, opt-in)
+	Feedback        *bool `yaml:"feedback"`         // visitor feedback widget + API WITHOUT the testing posture (no demo gate); survives publish so live apps can collect feedback (default: false, opt-in)
+	Analytics       *bool `yaml:"analytics"`        // per-app analytics beacon + cookie tracking (default: true)
+	AccountSettings *bool `yaml:"account_settings"` // optional account self-service controls (default: true)
 
 	// WSAnonymous, when true, drops the auth gate on /ws and /sse/events.
 	// Default false - authed apps require a session as before. Opt-in for
@@ -429,9 +504,8 @@ type FeaturesConfig struct {
 func (f *FeaturesConfig) IsEnabled(name string) bool {
 	switch name {
 	case "testing", "feedback":
-		// Opt-in: stays off unless explicitly enabled. Critical that
-		// `benmore serve` on a fresh app doesn't auto-render the orange
-		// "Testing Mode" banner over the user's UI.
+		// Opt-in: stays off unless explicitly enabled, so a fresh
+		// `benmore serve` never shows testing chrome over the user's UI.
 		if f == nil {
 			return false
 		}
@@ -439,8 +513,12 @@ func (f *FeaturesConfig) IsEnabled(name string) bool {
 			return f.Testing != nil && *f.Testing
 		}
 		return f.Feedback != nil && *f.Feedback // feedback: explicit opt-in (independent of testing)
+	case "exports":
+		return f == nil || f.Exports == nil || *f.Exports
 	case "admin":
 		return f == nil || f.Admin == nil || *f.Admin
+	case "uploads":
+		return f == nil || f.Uploads == nil || *f.Uploads
 	case "sse":
 		return f == nil || f.SSE == nil || *f.SSE
 	case "ws":
@@ -449,6 +527,8 @@ func (f *FeaturesConfig) IsEnabled(name string) bool {
 		return f == nil || f.Docs == nil || *f.Docs
 	case "analytics":
 		return f == nil || f.Analytics == nil || *f.Analytics
+	case "account_settings":
+		return f == nil || f.AccountSettings == nil || *f.AccountSettings
 	default:
 		return true
 	}
@@ -531,9 +611,13 @@ type SessionStore struct {
 
 // Session represents an authenticated user session.
 type Session struct {
-	ID     string
-	UserID int64
-	Email  string
+	// accessTables is the app's `table_scopes: access` table set
+	// (accessDecidesTable); nil otherwise.
+	accessTables   map[string]bool
+	connectorGrant bool // code-created delegated identity; never a tenant bypass
+	ID             string
+	UserID         int64
+	Email          string
 	// GroupID is the tenant key from the configured `groups:` table.
 	// Originally INTEGER-only; v2.5.10 widened to string so UUID /
 	// slug / opaque-ID tenants work natively. SQLite's dynamic typing
@@ -558,6 +642,16 @@ type Session struct {
 	Permissions []string
 	Scopes      string // OAuth2-style space-separated: "contacts:read deals:write". Empty = full access.
 	Verified    bool   // from _benmore_users.verified - loaded at session resolution
+	// EmailGrandfathered: the account predates verified-only email grants
+	// (_benmore_users.email_grandfathered); it may keep them unverified.
+	EmailGrandfathered bool
+
+	// CredentialScopes is the scope list the credential itself carries (the
+	// session row, API token or edge grant), before role grants narrow
+	// Scopes. "" or "*" means an unscoped credential; anything else is a
+	// delegated token that must not manage the account (see
+	// accountManagementSession).
+	CredentialScopes string
 	// ActingAsGroup is the platform-admin "step-in" tenant. Non-empty
 	// means an admin has explicitly scoped this session to one group
 	// via POST /api/_auth/act_as. While set, the framework applies
@@ -585,6 +679,13 @@ type Session struct {
 	// makes the documented "tenant-scoped grants can't leak cross-tenant"
 	// guarantee actually hold.
 	GlobalAdmin bool
+
+	// ImpersonatorUserID / ImpersonatorEmail name the admin behind a
+	// support-impersonation session (POST /api/_auth/impersonate). Zero
+	// for every other session. LogAudit records them next to the
+	// impersonated user so the trail shows who really acted.
+	ImpersonatorUserID int64
+	ImpersonatorEmail  string
 }
 
 // HasGroup reports whether the session has a non-empty tenant key.
@@ -604,11 +705,19 @@ func (s *Session) HasGroup() bool {
 // session GroupID. For admins who have stepped into a tenant via
 // /api/_auth/act_as it is the acting-as target - overrides the
 // admin's native (usually empty) GroupID for the duration of step-in.
+//
+// Step-in is an admin's state (POST /api/_auth/act_as requires one), and the
+// session row keeps acting_as_group after the account is demoted. It
+// replaces the tenant, so honoring it then let the session go on answering
+// as an ordinary member of a tenant the account never belonged to. It counts
+// only while the account is still an admin; ActingAsGroup itself stays set,
+// so the session keeps failing the direct-sign-in gates and can still step
+// out (DELETE /api/_auth/act_as).
 func (s *Session) EffectiveGroupID() string {
 	if s == nil {
 		return ""
 	}
-	if s.ActingAsGroup != "" && s.ActingAsGroup != "0" {
+	if s.ActingAsGroup != "" && s.ActingAsGroup != "0" && s.IsAdmin() {
 		return s.ActingAsGroup
 	}
 	return s.GroupID
@@ -636,7 +745,7 @@ func (s *Session) EffectiveHasGroup() bool {
 // grant of admin was a "dead parallel store" - the role showed up in
 // session.Roles but no framework gate respected it.
 func (s *Session) IsAdminBypass() bool {
-	return s.IsAdmin() && s.ActingAsGroup == ""
+	return s != nil && !s.connectorGrant && s.IsAdmin() && s.ActingAsGroup == ""
 }
 
 // IsAdmin reports whether the session holds the admin role via ANY

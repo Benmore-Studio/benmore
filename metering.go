@@ -131,7 +131,7 @@ func meterScope(session *Session) string {
 }
 
 // RegisterUsageAPI sets up the usage metrics endpoint.
-func RegisterUsageAPI(mux *http.ServeMux, app *App) {
+func RegisterUsageAPI(mux appRouteRegistrar, app *App) {
 	// GET /api/_usage - current period metrics for the authenticated scope
 	mux.HandleFunc("GET /api/_usage", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
@@ -148,7 +148,7 @@ func RegisterUsageAPI(mux *http.ServeMux, app *App) {
 			"SELECT metric, count FROM _benmore_usage WHERE scope = ? AND period = ?",
 			scope, period)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_usage", err, "query failed")
 			return
 		}
 		defer rows.Close()
@@ -161,21 +161,23 @@ func RegisterUsageAPI(mux *http.ServeMux, app *App) {
 			metrics[metric] = count
 		}
 
-		// Live gauges: total rows across developer tables
-		var totalRows int64
-		for _, table := range app.Tables {
-			if strings.HasPrefix(table.Name, "_benmore_") {
-				continue
+		// App-wide gauges: every row of every table, whoever owns it, and the
+		// database size. They describe all users and tenants (polled, they
+		// show when anyone else writes), so only the admin console gets them.
+		if session.IsAdminConsole() {
+			var totalRows int64
+			for _, table := range app.Tables {
+				if strings.HasPrefix(table.Name, "_benmore_") {
+					continue
+				}
+				var c int64
+				app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table.Name)).Scan(&c)
+				totalRows += c
 			}
-			var c int64
-			app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM \"%s\"", table.Name)).Scan(&c)
-			totalRows += c
-		}
-		metrics["total_rows"] = totalRows
-
-		// Storage: DB + uploads size
-		if fi, err := os.Stat(app.Dir + "/data.db"); err == nil {
-			metrics["storage_bytes"] = fi.Size()
+			metrics["total_rows"] = totalRows
+			if fi, err := os.Stat(app.Dir + "/data.db"); err == nil {
+				metrics["storage_bytes"] = fi.Size()
+			}
 		}
 
 		httpJSON(w, http.StatusOK, map[string]any{
@@ -188,7 +190,7 @@ func RegisterUsageAPI(mux *http.ServeMux, app *App) {
 	// GET /api/_usage/history - all periods for a scope (admin)
 	mux.HandleFunc("GET /api/_usage/history", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -198,11 +200,11 @@ func RegisterUsageAPI(mux *http.ServeMux, app *App) {
 			scope = meterScope(session)
 		}
 
-		rows, err := QueryRows(app.DB,
+		rows, err := queryMetadataRows(app.DB,
 			"SELECT metric, count, period FROM _benmore_usage WHERE scope = ? ORDER BY period DESC, metric",
 			scope)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_usage", err, "query failed")
 			return
 		}
 		httpJSON(w, http.StatusOK, rows)

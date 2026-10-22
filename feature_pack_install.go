@@ -15,7 +15,6 @@ func PlanFeatureInstall(dir string, pack FeaturePack, files map[string][]byte, d
 }
 
 func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[string][]byte, opts FeatureInstallOptions) (FeatureInstallPlan, error) {
-	pack, files, fileRenames, routeRenames, modelRenames, transformErr := prepareFeaturePackForInstall(pack, files, opts)
 	plan := FeatureInstallPlan{
 		Pack:            pack.Name,
 		Slug:            pack.Slug,
@@ -26,12 +25,28 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 		ModelPrefix:     normalizedModelPrefix(opts.ModelPrefix),
 		RouteMap:        sortedStringMap(opts.RouteMap),
 		ModelMap:        sortedStringMap(opts.ModelMap),
-		FileRenames:     fileRenames,
-		RouteRenames:    routeRenames,
-		ModelRenames:    modelRenames,
 		EnvRefs:         sortedStrings(pack.EnvRefs),
 		RequiredOptions: pack.RequiredOptions,
 	}
+	// Renaming may change a body and regenerate its manifest hash. Validate the
+	// received bytes first, so a transform cannot conceal an original mismatch.
+	originalManifest := map[string]FeaturePackFile{}
+	for _, f := range pack.Files {
+		originalManifest[filepath.ToSlash(f.Path)] = f
+	}
+	for p, body := range files {
+		p = filepath.ToSlash(p)
+		if f, ok := originalManifest[p]; ok && f.SHA256 != "" && hashBytesSHA256(body) != f.SHA256 {
+			plan.Collisions = append(plan.Collisions, p+": sha256 mismatch")
+		}
+	}
+	if len(plan.Collisions) > 0 {
+		sort.Strings(plan.Collisions)
+		plan.Blocked = true
+		return plan, nil
+	}
+	pack, files, fileRenames, routeRenames, modelRenames, transformErr := prepareFeaturePackForInstall(pack, files, opts)
+	plan.FileRenames, plan.RouteRenames, plan.ModelRenames = fileRenames, routeRenames, modelRenames
 	if transformErr != nil {
 		plan.Collisions = append(plan.Collisions, transformErr.Error())
 	}
@@ -141,6 +156,12 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 			plan.Collisions = append(plan.Collisions, "model "+m.Name+": missing source")
 			continue
 		}
+		// Model sources are appended to schema.prisma verbatim, so they get
+		// the same secret scan as pack files.
+		if msg := validateNoCommittedSecrets("schema.prisma", m.Source); msg != "" {
+			plan.Collisions = append(plan.Collisions, "model "+m.Name+": hardcoded secret")
+			continue
+		}
 		plan.SchemaAdds = append(plan.SchemaAdds, m.Name)
 	}
 	if opts.DeleteMissing && deleteMissingAllowed {
@@ -194,10 +215,18 @@ func ApplyFeaturePackToDirWithOptions(dir string, pack FeaturePack, files map[st
 	}
 	pack = preparedPack
 	files = preparedFiles
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return plan, err
+	}
+	defer root.Close()
 	if len(pack.SchemaModels) > 0 {
-		schemaPath := filepath.Join(dir, "schema.prisma")
+		schemaPath, err := featurePackCheckedPath(root, "schema.prisma")
+		if err != nil {
+			return plan, err
+		}
 		var b strings.Builder
-		existing, err := os.ReadFile(schemaPath)
+		existing, err := root.ReadFile(schemaPath)
 		if err != nil && !os.IsNotExist(err) {
 			// A read failure that isn't "file absent" (permission/IO) must
 			// not be treated as an empty schema - that would replace the
@@ -215,19 +244,22 @@ func ApplyFeaturePackToDirWithOptions(dir string, pack FeaturePack, files map[st
 			b.WriteString(strings.TrimSpace(m.Source))
 			b.WriteString("\n")
 		}
-		if err := os.WriteFile(schemaPath, []byte(b.String()), 0664); err != nil {
+		if err := root.WriteFile(schemaPath, []byte(b.String()), 0664); err != nil {
 			return plan, err
 		}
 	}
 	for p, body := range files {
-		abs, err := safeFeatureJoin(dir, p)
+		if _, err := safeFeatureJoin(dir, p); err != nil {
+			return plan, err
+		}
+		rel, err := featurePackCheckedPath(root, p)
 		if err != nil {
 			return plan, err
 		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+		if err := root.MkdirAll(filepath.Dir(rel), 0755); err != nil {
 			return plan, err
 		}
-		if err := os.WriteFile(abs, body, 0664); err != nil {
+		if err := root.WriteFile(rel, body, 0664); err != nil {
 			return plan, err
 		}
 		if featurePackApplyAfterWriteHook != nil {
@@ -237,13 +269,54 @@ func ApplyFeaturePackToDirWithOptions(dir string, pack FeaturePack, files map[st
 		}
 	}
 	for _, p := range plan.FileDeletes {
-		abs, err := safeFeatureJoin(dir, p)
-		if err != nil {
-			return plan, err
-		}
-		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		if err := removeFeaturePackFile(root, dir, p); err != nil {
 			return plan, err
 		}
 	}
 	return plan, nil
+}
+
+// featurePackCheckedPath returns rel in root-relative form after refusing any
+// existing symlink along it. Installs run in the router, and a link planted in
+// the tenant tree must not redirect a write outside the app or onto a
+// framework path inside it (for example .git/). Callers then operate through
+// the os.Root, so a link swapped in mid-install cannot escape either.
+func featurePackCheckedPath(root *os.Root, rel string) (string, error) {
+	rel = filepath.Clean(filepath.FromSlash(rel))
+	if !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("path escapes feature root")
+	}
+	prefix := ""
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		prefix = filepath.Join(prefix, seg)
+		info, err := root.Lstat(prefix)
+		if os.IsNotExist(err) {
+			return rel, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("feature install path %q crosses a symlink", filepath.ToSlash(rel))
+		}
+	}
+	return rel, nil
+}
+
+// removeFeaturePackFile deletes p under root. Parent directories must not be
+// symlinks; a final-component link is removed itself, never its target.
+func removeFeaturePackFile(root *os.Root, dir, p string) error {
+	if _, err := safeFeatureJoin(dir, p); err != nil {
+		return err
+	}
+	rel := filepath.Clean(filepath.FromSlash(p))
+	if parent := filepath.Dir(rel); parent != "." {
+		if _, err := featurePackCheckedPath(root, parent); err != nil {
+			return err
+		}
+	}
+	if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

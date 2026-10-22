@@ -90,7 +90,7 @@ type importSession struct {
 
 // EnsureImportsTable creates the import bookkeeping table and recovers
 // from a process restart mid-load. The name is _benmore_-prefixed, so
-// GetTableNames (db.go:508) filters it out and it never receives auto-CRUD
+// GetTableNames (db.go) filters it out and it never receives auto-CRUD
 // routes.
 func EnsureImportsTable(app *App) {
 	db := app.DB

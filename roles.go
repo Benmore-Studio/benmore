@@ -23,11 +23,11 @@ func EnsureRoleColumn(db *sql.DB) {
 
 // RoleMiddleware checks if the user has the required role for a page.
 // Supports comma-separated roles: role="admin,org" means user needs ANY of them.
-// Checks _benmore_users.role - works with both built-in (admin/manager/editor/user)
-// and developer-defined roles from app.yaml.
+// Works with both built-in (admin/manager/editor/user) and developer-defined
+// roles from app.yaml; which holdings count is pageRoleAllowed's rule.
 func RoleMiddleware(app *App, page *Page, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		requiredRole := extractPageRole(page.RawHTML)
+		requiredRole := pageRole(page)
 		// role="" and role="public" both mean "anyone can view this page".
 		// Previously "public" was treated as a gated role and redirected
 		// anonymous visitors to /login - breaking landing / auth / marketing
@@ -43,28 +43,41 @@ func RoleMiddleware(app *App, page *Page, next http.HandlerFunc) http.HandlerFun
 			return
 		}
 
-		userRole := getUserRole(app.DB, session.UserID)
-
-		// Support comma-separated: role="admin,org" - user needs ANY match
-		allowed := false
-		for _, role := range strings.Split(requiredRole, ",") {
-			role = strings.TrimSpace(role)
-			if role == "" {
-				continue
-			}
-			if hasRole(userRole, role) {
-				allowed = true
-				break
-			}
-		}
-
-		if !allowed {
+		if !pageRoleAllowed(app, session, requiredRole) {
 			http.Error(w, "Forbidden - insufficient permissions", http.StatusForbidden)
 			return
 		}
 
 		next(w, r)
 	}
+}
+
+// pageRoleAllowed reports whether the signed-in user passes a page's role
+// gate (comma-separated, any-of), on the page route and its PDF. A role
+// counts when the account holds it GLOBALLY: the _benmore_users.role column,
+// or an unexpired _benmore_user_roles grant with no group - the sources that
+// open /_admin and pass a role: mode on an un-grouped table. A tenant
+// membership role or a grant scoped to one group never passes: a page has no
+// tenant to bound it. Each held role is matched like the primary one (the
+// built-in hierarchy, a custom role by name), so an admin by grant passes
+// exactly the pages an admin by column does.
+func pageRoleAllowed(app *App, session *Session, requiredRole string) bool {
+	if app == nil || app.DB == nil || session == nil {
+		return false
+	}
+	held := LoadSessionRoles(app.DB, session.UserID, getUserRole(app.DB, session.UserID), "")
+	for _, role := range strings.Split(requiredRole, ",") {
+		role = strings.TrimSpace(role)
+		if role == "" {
+			continue
+		}
+		for _, have := range held {
+			if hasRole(have, role) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // getUserRole fetches the role for a user.
@@ -100,6 +113,18 @@ func hasRole(userRole, requiredRole string) bool {
 	}
 
 	return userLevel >= requiredLevel
+}
+
+// pageRole is the page's role gate from its <page> tag or frontmatter. Pages
+// built outside LoadPages (single-file apps, fixtures) fall back to the tag.
+func pageRole(page *Page) string {
+	if page == nil {
+		return ""
+	}
+	if page.Role != "" {
+		return page.Role
+	}
+	return extractPageRole(page.RawHTML)
 }
 
 // extractPageRole gets the role="..." attribute from the page HTML.

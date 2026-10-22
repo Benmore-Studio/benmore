@@ -323,6 +323,12 @@ func nullLabel(notNull bool) string {
 }
 
 func buildAlterAdd(table string, col Column) string {
+	// Names are left bare here: this is the schema-apply path (the author's
+	// own CREATE/ALTER), and it is consistent with the Prisma/SQL migration
+	// emitters. A column name that is not a plain identifier fails the ALTER
+	// loudly and rolls the migration back, rather than silently creating a
+	// column whose name needs quoting everywhere it is later read. Runtime
+	// reads of the resulting tables are quoted regardless.
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, col.Name))
 	if col.Type != "" {
@@ -350,6 +356,31 @@ const (
 	backupDirMode    = os.ModeSetgid | 0770
 )
 
+// checkBackupMinInterval spaces the pre-migrate snapshots that validation
+// loads take. Every write_file/edit_file in the router runs a full app load, and
+// a snapshot is a whole-database copy (VACUUM INTO), so an edit loop against a
+// 100 MB database would otherwise write 100 MB per call and keep ten of them.
+const checkBackupMinInterval = 10 * time.Minute
+
+// recentPreMigrateBackup reports whether a non-empty pre-migrate snapshot newer
+// than maxAge already exists for the app.
+func recentPreMigrateBackup(dir string, maxAge time.Duration) bool {
+	entries, err := os.ReadDir(filepath.Join(dir, backupDirName))
+	if err != nil {
+		return false
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), backupPrefix) || !strings.HasSuffix(e.Name(), ".db") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.Size() > 0 && info.ModTime().After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
 func prepareBackupDir(backupDir string) error {
 	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		return fmt.Errorf("create backup dir: %w", err)
@@ -375,11 +406,30 @@ func prepareBackupDir(backupDir string) error {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
 			continue
 		}
-		if err := os.Chmod(filepath.Join(backupDir, entry.Name()), backupPermission); err != nil {
+		path := filepath.Join(backupDir, entry.Name())
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat backup %s for permission repair: %w", entry.Name(), err)
+		}
+		if err := ensureBackupFilePermission(path, info.Mode(), os.Chmod); err != nil {
 			return fmt.Errorf("repair backup permissions for %s: %w", entry.Name(), err)
 		}
 	}
 	return nil
+}
+
+func backupFilePermissionNeedsRepair(mode os.FileMode) bool {
+	const specialBits = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	return mode.Perm() != backupPermission || mode&specialBits != 0
+}
+
+func ensureBackupFilePermission(path string, mode os.FileMode, chmod func(string, os.FileMode) error) error {
+	if !backupFilePermissionNeedsRepair(mode) {
+		// The router may have created a correctly protected snapshot as its
+		// own user. Avoid a no-op chmod that systemd may reject.
+		return nil
+	}
+	return chmod(path, backupPermission)
 }
 
 // backupDatabase writes a consistent snapshot of data.db to
@@ -404,6 +454,9 @@ func prepareBackupDir(backupDir string) error {
 // Falls back to file-copy only when VACUUM INTO is unavailable
 // (extremely unlikely - every SQLite >= 3.27 supports it).
 func backupDatabase(dir string) (string, error) {
+	if foreignAppDirs.Load() {
+		return foreignDirBackupDatabase(dir)
+	}
 	dbPath := filepath.Join(dir, "data.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return "", nil // no database to back up
@@ -662,6 +715,14 @@ func isCorruptDBErr(err error) bool {
 // the original cause error is returned so the caller decides whether
 // to log.Fatalf or return up the stack.
 func autoRestoreFromBackup(dir string, cause error) (bool, error) {
+	return autoRestoreFromBackupInternal(dir, cause, nil, false)
+}
+
+func autoRestoreFromBackupWithLease(dir string, cause error, lease *appMCPAuthorityLease) (bool, error) {
+	return autoRestoreFromBackupInternal(dir, cause, lease, true)
+}
+
+func autoRestoreFromBackupInternal(dir string, cause error, lease *appMCPAuthorityLease, policyHeld bool) (bool, error) {
 	backupDir := filepath.Join(dir, backupDirName)
 
 	// Collect candidates - both pre-migrate-* and scheduled-* qualify.
@@ -703,7 +764,16 @@ func autoRestoreFromBackup(dir string, cause error) (bool, error) {
 		return false, fmt.Errorf("auto-restore: all %d backups are also corrupt (cause: %v)", len(candidates), cause)
 	}
 
-	corruptDest, err := swapInBackup(dir, pickedBackup, cause)
+	var corruptDest string
+	var err error
+	if policyHeld {
+		if err := invalidateAppMCPForRestoreWithLease(lease); err != nil {
+			return false, fmt.Errorf("auto-restore connector invalidation: %w", err)
+		}
+		corruptDest, err = swapInBackupWithLease(dir, pickedBackup, cause, lease)
+	} else {
+		corruptDest, err = swapInBackup(dir, pickedBackup, cause)
+	}
 	if err != nil {
 		return false, fmt.Errorf("auto-restore: %w", err)
 	}
@@ -713,6 +783,17 @@ func autoRestoreFromBackup(dir string, cause error) (bool, error) {
 }
 
 func swapInBackup(dir, backupPath string, cause error) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	release, lease, err := beginAppMCPRestorePolicy(ctx, dir)
+	if err != nil {
+		return "", fmt.Errorf("connector restore lease: %w", err)
+	}
+	defer release()
+	return swapInBackupWithLease(dir, backupPath, cause, lease)
+}
+
+func swapInBackupWithLease(dir, backupPath string, cause error, lease *appMCPAuthorityLease) (string, error) {
 	if err := validateSQLiteDB(backupPath); err != nil {
 		return "", fmt.Errorf("invalid backup: %w", err)
 	}
@@ -756,6 +837,17 @@ func swapInBackup(dir, backupPath string, cause error) (string, error) {
 	if err := dst.Close(); err != nil {
 		return "", fmt.Errorf("close: %w", err)
 	}
+	// An older backup must not revive credentials revoked since it was taken.
+	// The moved-aside original is the live state; when it is unreadable every
+	// restored session, token and grant is revoked instead.
+	if _, err := carryForwardRestoreCredentials(context.Background(), corruptDest, dbPath, "auto-recovery"); err != nil {
+		_ = os.Remove(dbPath)
+		_ = os.Remove(dbPath + "-journal")
+		_ = os.Rename(corruptDest, dbPath)
+		_ = os.Rename(corruptDest+"-wal", dbPath+"-wal")
+		_ = os.Rename(corruptDest+"-shm", dbPath+"-shm")
+		return "", fmt.Errorf("carry credentials into the restored database: %w", err)
+	}
 	// The restored file is owned by WHOEVER ran the recovery. When that's
 	// not the per-app user (router-side restore paths), the app process
 	// could read but never write it - a crash loop at its next migration.
@@ -770,8 +862,12 @@ func swapInBackup(dir, backupPath string, cause error) (string, error) {
 }
 
 func verifyPostMigrationAndRestore(dir string, db *sql.DB, backupPath string) error {
+	return verifyPostMigrationAndRestoreWithLease(dir, db, backupPath, nil)
+}
+
+func verifyPostMigrationAndRestoreWithLease(dir string, db *sql.DB, backupPath string, lease *appMCPAuthorityLease) error {
 	if err := sqliteIntegrityCheck(db); err != nil {
-		return restoreAfterPostMigrationFailure(dir, db, backupPath, fmt.Errorf("integrity_check failed: %w", err))
+		return restoreAfterPostMigrationFailureWithLease(dir, db, backupPath, fmt.Errorf("integrity_check failed: %w", err), lease)
 	}
 	models, err := LoadSchemaModelsForDrift(dir)
 	if err != nil {
@@ -867,11 +963,25 @@ func formatDriftSummary(drifts []SchemaDrift) string {
 }
 
 func restoreAfterPostMigrationFailure(dir string, db *sql.DB, backupPath string, cause error) error {
+	return restoreAfterPostMigrationFailureWithLease(dir, db, backupPath, cause, nil)
+}
+
+func restoreAfterPostMigrationFailureWithLease(dir string, db *sql.DB, backupPath string, cause error, lease *appMCPAuthorityLease) error {
 	_ = db.Close()
 	if backupPath == "" {
 		return fmt.Errorf("post-migration verification failed with no backup to restore: %w", cause)
 	}
-	if _, err := swapInBackup(dir, backupPath, cause); err != nil {
+	var err error
+	if lease != nil {
+		if err = invalidateAppMCPForRestoreWithLease(lease); err == nil {
+			_, err = swapInBackupWithLease(dir, backupPath, cause, lease)
+		}
+	} else if os.Getenv("BENMORE_MCP_AUTHORITY_DIR") == "" {
+		_, err = swapInBackupWithLease(dir, backupPath, cause, nil)
+	} else {
+		_, err = swapInBackup(dir, backupPath, cause)
+	}
+	if err != nil {
 		return fmt.Errorf("post-migration verification failed and restore failed: %w (original: %v)", err, cause)
 	}
 	return fmt.Errorf("post-migration verification failed; auto-restored pre-migrate backup: %w", cause)
@@ -880,12 +990,23 @@ func restoreAfterPostMigrationFailure(dir string, db *sql.DB, backupPath string,
 // restoreDatabase copies a backup file over data.db.
 // The caller must close the active DB connection before calling this.
 func restoreDatabase(dir string, backupPath string) error {
-	candidate, cleanup, err := prepareRestoreSnapshot(context.Background(), dir, backupPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	release, lease, err := beginAppMCPRestorePolicy(ctx, dir)
+	if err != nil {
+		return fmt.Errorf("connector restore lease: %w", err)
+	}
+	defer release()
+	candidate, cleanup, err := prepareRestoreSnapshot(ctx, dir, backupPath)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	_, err = installRestoreSnapshot(dir, candidate)
+	// The data rolls back; sign-in state stays what it is now.
+	if _, err := carryForwardRestoreCredentials(ctx, filepath.Join(dir, "data.db"), candidate, "local restore"); err != nil {
+		return fmt.Errorf("carry live credentials into the restored database: %w", err)
+	}
+	_, err = installRestoreSnapshotWithLease(dir, candidate, lease)
 	return err
 }
 

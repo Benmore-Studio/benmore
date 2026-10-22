@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,6 +34,12 @@ type SourceManifest struct {
 	// read (permission/IO). A partial manifest under-reports the file set,
 	// so pull pruning must NOT treat missing entries as deleted_remote.
 	Partial bool `json:"partial,omitempty"`
+	// PullDenied lists, outside Files, the source files the server holds
+	// that `benmore pull` never writes (pullDeniedPath). The server keeps
+	// them out of Files so a client never reports them as missing; a client
+	// reads this list only to name them (they still count toward an MCP
+	// review's execution digest).
+	PullDenied []SourceManifestFile `json:"pull_denied,omitempty"`
 }
 
 type SourceManifestFile struct {
@@ -70,53 +78,92 @@ func BuildSourceManifest(dir string, opts SourceManifestOptions) (SourceManifest
 		ServerGitHead: opts.ServerGitHead,
 		EnvKeys:       sortedStrings(opts.EnvKeys),
 	}
-	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			if isTolerableManifestWalkErr(walkErr) {
-				m.Partial = true
-				if info != nil && info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			return walkErr
+	// A root that is missing, unreadable or not a directory has no files
+	// (missing and unreadable also mark the manifest partial).
+	rootInfo, err := os.Lstat(root)
+	if err == nil && rootInfo.IsDir() {
+		var top *treeDir
+		if top, err = openTreeDir(root); err == nil {
+			err = walkSourceManifest(top, root, "", &m)
+			top.Close()
 		}
-		if info == nil {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == "." {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if sourceManifestExcluded(rel, info.IsDir()) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		h, err := hashFileSHA256Fn(path)
-		if err != nil {
-			if isTolerableManifestWalkErr(err) {
-				m.Partial = true
-				return nil
-			}
-			return err
-		}
-		m.Files = append(m.Files, SourceManifestFile{Path: rel, SHA256: h, Size: info.Size()})
-		return nil
-	})
+	}
 	if err != nil {
-		return SourceManifest{}, err
+		if !isTolerableManifestWalkErr(err) {
+			return SourceManifest{}, err
+		}
+		m.Partial = true
 	}
 	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Path < m.Files[j].Path })
 	return m, nil
+}
+
+// walkSourceManifest adds the files below dir (rel is its slash path under
+// the manifest root, "" or ending in "/"). The tree may belong to a tenant
+// whose process rewrites it while the router reads, so it is walked by
+// directory handle and every file is the one lstat saw (treeDir): a file or a
+// parent directory swapped for a symlink is never followed into another app.
+func walkSourceManifest(dir *treeDir, absDir, rel string, m *SourceManifest) error {
+	names, err := dir.names()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		path := rel + name
+		info, err := dir.lstat(name)
+		if err != nil {
+			if isTolerableManifestWalkErr(err) {
+				m.Partial = true
+				continue
+			}
+			return err
+		}
+		if sourceManifestExcluded(path, info.IsDir()) {
+			continue
+		}
+		if info.IsDir() {
+			sub, err := dir.openDir(name)
+			if err == nil {
+				err = walkSourceManifest(sub, filepath.Join(absDir, name), path+"/", m)
+				sub.Close()
+			}
+			if err != nil {
+				if isTolerableManifestWalkErr(err) {
+					m.Partial = true
+					continue
+				}
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		sourceManifestBeforeHash(filepath.Join(absDir, name))
+		h, err := hashTreeFileSHA256(dir, name)
+		if err != nil {
+			if isTolerableManifestWalkErr(err) {
+				m.Partial = true
+				continue
+			}
+			return err
+		}
+		m.Files = append(m.Files, SourceManifestFile{Path: path, SHA256: h, Size: info.Size()})
+	}
+	return nil
+}
+
+func hashTreeFileSHA256(dir *treeDir, name string) (string, error) {
+	f, _, err := dir.openRegular(name)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func hashFileSHA256(path string) (string, error) {
@@ -132,19 +179,22 @@ func hashFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// hashFileSHA256Fn indirects hashFileSHA256 so tests can simulate a file
-// disappearing between filepath.Walk's stat and the hash read (e.g. a
-// deploy landing mid-request on a live app dir) without a real race.
-var hashFileSHA256Fn = hashFileSHA256
+// sourceManifestBeforeHash runs just before a listed file is opened, so tests
+// can simulate a file disappearing between the walk's lstat and the hash read
+// (e.g. a deploy landing mid-request on a live app dir) without a real race.
+var sourceManifestBeforeHash = func(path string) {}
 
 // isTolerableManifestWalkErr reports whether an error encountered while
 // walking/hashing a file should degrade the manifest to Partial=true rather
 // than aborting the whole build. Permission errors (unreadable file/dir) and
 // not-exist errors (file removed between being listed and being read - the
 // common case during a live deploy) are both tolerated: the manifest just
-// under-reports that one file. Anything else (disk errors, etc.) is fatal.
+// under-reports that one file. So is an entry that stopped being what the
+// walk listed (replaced by a link, a directory, or rewritten again and again
+// while it was read). Anything else (disk errors, etc.) is fatal.
 func isTolerableManifestWalkErr(err error) bool {
-	return os.IsPermission(err) || os.IsNotExist(err)
+	return errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, errTreeNotRegular) || errors.Is(err, errTreeNotDir) || errors.Is(err, errTreeChanged)
 }
 
 func hashBytesSHA256(b []byte) string {
@@ -274,6 +324,11 @@ type SyncReport struct {
 	Counts        map[SyncFileStatus]int `json:"counts"`
 	HasDrift      bool                   `json:"has_drift"`
 	HasConflicts  bool                   `json:"has_conflicts"`
+	// UnpulledSources are server files an MCP review digest covers but
+	// `benmore pull` never writes, which this workspace lacks or holds with
+	// different content. They are not drift; delivering a reviewed mcp.yaml
+	// is blocked on them because its digest could not match the server.
+	UnpulledSources []string `json:"unpulled_sources,omitempty"`
 }
 
 func DiffSourceManifests(base SourceManifest, hasBase bool, local SourceManifest, remote SourceManifest) SyncReport {

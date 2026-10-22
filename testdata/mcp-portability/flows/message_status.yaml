@@ -1,0 +1,15 @@
+on:
+  request:
+    method: GET
+    path: /api/message-status/:id
+    auth: required
+    role: editor
+    permissions: [messages:read]
+jobs:
+  message_status:
+    steps:
+      - id: message
+        query: SELECT id, status, sent_at, COALESCE(delivered_at, '') AS delivered_at FROM messages WHERE id = :id AND user_id = :user_id
+      - run: respond
+        with:
+          body: ${{ steps.message.outputs.rows[0] }}

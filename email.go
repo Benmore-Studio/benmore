@@ -68,29 +68,57 @@ type EmailAttachment struct {
 // transactional path; use SendEmailOpts when you need List-Unsubscribe
 // headers (marketing) or a specific SES configuration set.
 type EmailOpts struct {
-	To               string // single recipient or comma-list
-	Subject          string
-	BodyHTML         string
-	BodyText         string // optional plain-text alt; if set, sends multipart/alternative
-	UnsubscribeURL   string // when set: adds List-Unsubscribe + RFC 8058 one-click
-	ConfigurationSet string // optional SES config set (e.g., "my-config-set")
-	From             string // override SMTP_FROM
-	ReplyTo          string
-	Attachments      []EmailAttachment // when set: multipart/mixed with base64 file parts
+	To             string // single recipient or comma-list
+	CC             string
+	BCC            string
+	Subject        string
+	BodyHTML       string
+	BodyText       string // optional plain-text alt; if set, sends multipart/alternative
+	UnsubscribeURL string // when set: adds List-Unsubscribe
+	// UnsubscribeOneClick also sends the RFC 8058 `List-Unsubscribe-Post:
+	// List-Unsubscribe=One-Click` header, which makes mail clients POST to
+	// UnsubscribeURL with no session. Set it only for a URL built for that
+	// (the platform's marketing drips: a per-subscriber token and a POST
+	// handler). Flow mail opts in with `unsubscribe_one_click: true`.
+	UnsubscribeOneClick bool
+	ConfigurationSet    string // optional SES config set (e.g., "my-config-set")
+	From                string // override SMTP_FROM
+	ReplyTo             string
+	Attachments         []EmailAttachment // when set: multipart/mixed with base64 file parts
 }
 
 func SendEmailOpts(appDir string, opts EmailOpts) error {
-	// Prevent email header injection by stripping newlines from inputs.
-	clean := strings.NewReplacer("\r", "", "\n", "").Replace
-	opts.To = clean(opts.To)
-	opts.Subject = clean(opts.Subject)
-	opts.UnsubscribeURL = clean(opts.UnsubscribeURL)
-	opts.ConfigurationSet = clean(opts.ConfigurationSet)
-	opts.ReplyTo = clean(opts.ReplyTo)
-	// From is a caller-settable field written straight into the SMTP header
-	// block; strip CR/LF so a "send as" / reply-routing caller passing
-	// user-derived data can't inject extra headers (Bcc, a second To, etc.).
-	opts.From = clean(opts.From)
+	if err := validateEmailHeaders(opts.From, opts.To, opts.CC, opts.BCC, opts.ReplyTo, opts.Subject, opts.UnsubscribeURL, opts.ConfigurationSet); err != nil {
+		return err
+	}
+	if opts.UnsubscribeOneClick && emailOneClickURLProblem(opts.UnsubscribeURL) != "" {
+		return fmt.Errorf("one-click unsubscribe requires a valid https unsubscribe_url")
+	}
+	to, err := parseEmailAddressList(opts.To)
+	if err != nil {
+		return err
+	}
+	cc, err := parseEmailAddressList(opts.CC)
+	if err != nil {
+		return err
+	}
+	bcc, err := parseEmailAddressList(opts.BCC)
+	if err != nil {
+		return err
+	}
+	if len(to) == 0 || len(to)+len(cc)+len(bcc) > 50 {
+		return fmt.Errorf("1-50 recipients per send across to, cc and bcc")
+	}
+	if opts.UnsubscribeOneClick && len(to)+len(cc)+len(bcc) != 1 {
+		return fmt.Errorf("one-click unsubscribe requires exactly one recipient")
+	}
+	recipients := append(append(append([]string{}, to...), cc...), bcc...)
+	for i, recipient := range recipients {
+		a, _ := mail.ParseAddress(recipient)
+		recipients[i] = a.Address
+	}
+	opts.To = strings.Join(to, ", ")
+	opts.CC = strings.Join(cc, ", ")
 
 	// Provider priority: platform SES gateway (hosted platform - ALWAYS
 	// wins when reachable) > SMTP (AWS SES SMTP creds or generic).
@@ -101,33 +129,36 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	from := resolveEmailFrom(appDir, opts.From)
 
 	if emailGatewayReachable() {
-		var to []string
-		for _, t := range strings.Split(opts.To, ",") {
-			if t = strings.TrimSpace(t); t != "" {
-				to = append(to, t)
-			}
-		}
 		resp, gerr := requestGatewayEmailSend(emailGatewayReq{
-			From:           from,
-			To:             to,
+			From: from,
+			To:   to,
+			CC:   cc, BCC: bcc,
 			ReplyTo:        opts.ReplyTo,
 			Subject:        opts.Subject,
 			HTML:           stripEmailFrontmatter(opts.BodyHTML),
 			Text:           opts.BodyText,
 			UnsubscribeURL: opts.UnsubscribeURL,
+			OneClick:       opts.UnsubscribeOneClick,
 			Attachments:    opts.Attachments,
 			App:            os.Getenv("BENMORE_APP_NAME"),
 		})
 		if gerr != nil {
 			// The broker's errors are precise + actionable (unauthorized
 			// from-domain, quota, suppression, pause) - surface verbatim.
-			log.Printf("EMAIL [platform gateway failed] to=%s subject=%s: %s", opts.To, opts.Subject, gerr)
+			log.Printf("EMAIL [platform gateway failed] to=%s subject=%s: %s", logRecipientsRef(opts.To), opts.Subject, logSendErrorRecipients(gerr, strings.Join(recipients, ", ")))
 			return gerr
 		}
-		log.Printf("EMAIL [sent via platform] to=%s from=%s subject=%s id=%s", opts.To, resp.From, opts.Subject, resp.MessageID)
+		log.Printf("EMAIL [sent via platform] to=%s from=%s subject=%s id=%s", logRecipientsRef(opts.To), resp.From, opts.Subject, resp.MessageID)
 		return nil
 	}
 
+	// On the hosted platform the SES broker is the only sender. Falling back
+	// to the app's own SMTP_HOST when the broker socket is unreachable would
+	// let an app point the tenant process at the host's loopback services.
+	if hostedTenantProcess() {
+		log.Printf("EMAIL [not sent - platform email service unreachable] to=%s subject=%s", logRecipientsRef(opts.To), opts.Subject)
+		return fmt.Errorf("email not delivered: the platform email service is unreachable; retry shortly (SMTP_HOST is not used on the hosted platform)")
+	}
 	host := GetEnv(appDir, "SMTP_HOST")
 	port := GetEnv(appDir, "SMTP_PORT")
 	user := GetEnv(appDir, "SMTP_USER")
@@ -140,7 +171,7 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 		// global log without realising the hook had effectively no-op'd.
 		// Hook engine surfaces the error to the audit log + can be read
 		// via the get_recent_activity MCP tool.
-		log.Printf("EMAIL [not sent - no provider configured] to=%s subject=%s", opts.To, opts.Subject)
+		log.Printf("EMAIL [not sent - no provider configured] to=%s subject=%s", logRecipientsRef(opts.To), opts.Subject)
 		return fmt.Errorf("email not delivered: no provider configured. " +
 			"On the hosted platform sends route through the platform SES service automatically (zero config). " +
 			"Off-platform, set SMTP_HOST+SMTP_PORT+SMTP_USER+SMTP_PASS (AWS SES SMTP credentials work directly) " +
@@ -171,12 +202,20 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 		from = user
 	}
 
+	envelopeFrom, err := mail.ParseAddress(from)
+	if err != nil {
+		return fmt.Errorf("invalid sender address")
+	}
+
 	// Build headers
 	headers := []string{
 		"From: " + from,
 		"To: " + opts.To,
 		"Subject: " + opts.Subject,
 		"MIME-Version: 1.0",
+	}
+	if opts.CC != "" {
+		headers = append(headers, "Cc: "+opts.CC)
 	}
 	if opts.ReplyTo != "" {
 		headers = append(headers, "Reply-To: "+opts.ReplyTo)
@@ -194,27 +233,25 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	// POST with body "List-Unsubscribe=One-Click", no human nav.
 	if opts.UnsubscribeURL != "" {
 		headers = append(headers, "List-Unsubscribe: <"+opts.UnsubscribeURL+">")
-		headers = append(headers, "List-Unsubscribe-Post: List-Unsubscribe=One-Click")
+		if opts.UnsubscribeOneClick {
+			headers = append(headers, "List-Unsubscribe-Post: List-Unsubscribe=One-Click")
+		}
 	}
 
 	// Attachments require a multipart/mixed envelope, which the shared raw-MIME
 	// builder assembles (headers included) — bypass the simple-body branches.
 	if len(opts.Attachments) > 0 {
-		raw, berr := buildRawMIMEMessage(from, opts.To, opts.Subject, opts.ReplyTo,
-			opts.UnsubscribeURL, opts.ConfigurationSet, opts.BodyHTML, opts.BodyText, opts.Attachments)
+		raw, berr := buildRawMIMEMessage(from, opts.To, opts.CC, opts.Subject, opts.ReplyTo,
+			opts.UnsubscribeURL, opts.UnsubscribeOneClick, opts.ConfigurationSet, opts.BodyHTML, opts.BodyText, opts.Attachments)
 		if berr != nil {
 			return fmt.Errorf("build attachment message: %w", berr)
 		}
 		addr := host + ":" + port
 		auth := smtp.PlainAuth("", user, pass, host)
-		recipients := strings.Split(opts.To, ",")
-		for i := range recipients {
-			recipients[i] = strings.TrimSpace(recipients[i])
-		}
-		if err := smtp.SendMail(addr, auth, from, recipients, raw); err != nil {
+		if err := smtp.SendMail(addr, auth, envelopeFrom.Address, recipients, raw); err != nil {
 			return fmt.Errorf("send email to %s: %w", opts.To, err)
 		}
-		log.Printf("EMAIL sent (smtp) to=%s subject=%s attachments=%d", opts.To, opts.Subject, len(opts.Attachments))
+		log.Printf("EMAIL sent (smtp) to=%s subject=%s attachments=%d", logRecipientsRef(opts.To), opts.Subject, len(opts.Attachments))
 		return nil
 	}
 
@@ -251,17 +288,12 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	addr := host + ":" + port
 	auth := smtp.PlainAuth("", user, pass, host)
 
-	recipients := strings.Split(opts.To, ",")
-	for i := range recipients {
-		recipients[i] = strings.TrimSpace(recipients[i])
-	}
-
-	if err := smtp.SendMail(addr, auth, from, recipients, []byte(msg)); err != nil {
+	if err := smtp.SendMail(addr, auth, envelopeFrom.Address, recipients, []byte(msg)); err != nil {
 		return fmt.Errorf("send email to %s: %w", opts.To, err)
 	}
 
 	log.Printf("EMAIL sent (smtp) to=%s subject=%s configset=%s",
-		opts.To, opts.Subject, opts.ConfigurationSet)
+		logRecipientsRef(opts.To), opts.Subject, opts.ConfigurationSet)
 	return nil
 }
 
@@ -283,7 +315,7 @@ func emailAttachmentType(a EmailAttachment) string {
 // sub-part, then one base64 part per attachment. This is the only shape that
 // can carry binary files — used by the SMTP path directly and, base64-wrapped,
 // by the SESv2 raw-content path (Simple/JSON content can't attach files).
-func buildRawMIMEMessage(from, to, subject, replyTo, unsubscribeURL, configSet, html, text string, attachments []EmailAttachment) ([]byte, error) {
+func buildRawMIMEMessage(from, to, cc, subject, replyTo, unsubscribeURL string, oneClick bool, configSet, html, text string, attachments []EmailAttachment) ([]byte, error) {
 	clean := strings.NewReplacer("\r", "", "\n", "").Replace
 
 	// Build the body first so the mixed boundary is known for the header.
@@ -324,7 +356,9 @@ func buildRawMIMEMessage(from, to, subject, replyTo, unsubscribeURL, configSet, 
 		if err != nil {
 			return nil, fmt.Errorf("attachment %q: invalid base64 content: %w", a.Filename, err)
 		}
-		fn := clean(a.Filename)
+		// The name is written inside a quoted MIME parameter: a quote or
+		// backslash in it would end the parameter and add others.
+		fn := strings.NewReplacer(`"`, "'", `\`, "_").Replace(clean(a.Filename))
 		if fn == "" {
 			fn = "attachment"
 		}
@@ -344,6 +378,9 @@ func buildRawMIMEMessage(from, to, subject, replyTo, unsubscribeURL, configSet, 
 	wh := func(k, v string) { msg.WriteString(k + ": " + v + "\r\n") }
 	wh("From", clean(from))
 	wh("To", clean(to))
+	if cc != "" {
+		wh("Cc", clean(cc))
+	}
 	wh("Subject", mime.QEncoding.Encode("UTF-8", subject))
 	if replyTo != "" {
 		wh("Reply-To", clean(replyTo))
@@ -354,7 +391,9 @@ func buildRawMIMEMessage(from, to, subject, replyTo, unsubscribeURL, configSet, 
 	}
 	if unsubscribeURL != "" {
 		wh("List-Unsubscribe", "<"+clean(unsubscribeURL)+">")
-		wh("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+		if oneClick {
+			wh("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+		}
 	}
 	msg.WriteString("Content-Type: multipart/mixed; boundary=\"" + mixed.Boundary() + "\"\r\n\r\n")
 	msg.Write(bodyBuf.Bytes())
@@ -667,4 +706,38 @@ func AppEmailBrand(app *App, r *http.Request) EmailBrand {
 		b.SiteName = "App"
 	}
 	return b
+}
+
+func validateEmailHeaders(values ...string) error {
+	for _, value := range values {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("email headers must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func parseEmailAddressList(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	addresses, err := mail.ParseAddressList(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid email recipient list")
+	}
+	result := make([]string, len(addresses))
+	for i, a := range addresses {
+		if len(a.Address) > 254 {
+			return nil, fmt.Errorf("email address exceeds 254 bytes")
+		}
+		if a.Name == "" {
+			result[i] = a.Address
+		} else {
+			result[i] = a.String()
+		}
+		if len(result[i]) > 512 {
+			return nil, fmt.Errorf("email recipient exceeds 512 bytes")
+		}
+	}
+	return result, nil
 }

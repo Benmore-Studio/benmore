@@ -52,7 +52,7 @@ func DBCounts(db *sql.DB) {
 	counts := make(map[string]int64)
 	for _, name := range tables {
 		var count int64
-		db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", name)).Scan(&count)
+		db.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(name)).Scan(&count)
 		counts[name] = count
 	}
 	data, _ := json.MarshalIndent(counts, "", "  ")

@@ -11,8 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // AppYAML represents the top-level app.yaml config.
@@ -62,6 +60,7 @@ type HookEntryYAML struct {
 		To       string `yaml:"to"`
 		Subject  string `yaml:"subject"`
 		Template string `yaml:"template"`
+		Body     string `yaml:"body"` // inline body when there is no template
 	} `yaml:"email"`
 	WS *struct {
 		Room    string `yaml:"room"`
@@ -82,6 +81,7 @@ type FlowYAML struct {
 	Auth        string         `yaml:"auth"`
 	Role        string         `yaml:"role"`
 	Steps       []FlowStepYAML `yaml:"steps"`
+	Permissions []string       `yaml:"permissions"`
 }
 
 // FlowStepYAML represents a step in a flow.
@@ -111,9 +111,10 @@ type FlowStepYAML struct {
 
 // FlowEnqueueYAML is the YAML shape for an enqueue step.
 type FlowEnqueueYAML struct {
-	Flow  string            `yaml:"flow"`
-	With  map[string]string `yaml:"with"`
-	RunAt string            `yaml:"run_at"`
+	UniqueKey string            `yaml:"unique_key"`
+	Flow      string            `yaml:"flow"`
+	With      map[string]string `yaml:"with"`
+	RunAt     string            `yaml:"run_at"`
 }
 
 // FlowWSYAML represents a WebSocket broadcast step.
@@ -147,14 +148,18 @@ type FlowAPIPaginateYAML struct {
 
 // FlowEmailYAML represents an email step.
 type FlowEmailYAML struct {
-	To       string            `yaml:"to"`
-	Subject  string            `yaml:"subject"`
-	Template string            `yaml:"template"`
-	Html     string            `yaml:"html"`
-	Body     string            `yaml:"body"` // alias for html
-	Text     string            `yaml:"text"`
-	Data     map[string]string `yaml:"data"`
-	Vars     map[string]string `yaml:"vars"` // alias for data
+	CC                  string            `yaml:"cc"`
+	BCC                 string            `yaml:"bcc"`
+	UnsubscribeURL      string            `yaml:"unsubscribe_url"`
+	UnsubscribeOneClick string            `yaml:"unsubscribe_one_click"`
+	To                  string            `yaml:"to"`
+	Subject             string            `yaml:"subject"`
+	Template            string            `yaml:"template"`
+	Html                string            `yaml:"html"`
+	Body                string            `yaml:"body"` // alias for html
+	Text                string            `yaml:"text"`
+	Data                map[string]string `yaml:"data"`
+	Vars                map[string]string `yaml:"vars"` // alias for data
 }
 
 // FlowRespondYAML represents a respond step.
@@ -321,6 +326,16 @@ func designFromAppYAML(raw map[string]any) *DesignConfig {
 		for k, v := range m {
 			config.Auth[k] = anyToString(v)
 		}
+		// Boolean auth flags are compared to "true", but YAML 1.2 hands
+		// `yes`/`on`/`1` over as strings, so `require_verified: yes`
+		// stayed OFF. Canonicalize the usual spellings once here.
+		for _, k := range authFlagKeys {
+			if v, present := config.Auth[k]; present {
+				if canon, ok := canonicalAuthFlag(v); ok {
+					config.Auth[k] = canon
+				}
+			}
+		}
 	}
 	if m, ok := raw["pwa"].(map[string]any); ok {
 		for k, v := range m {
@@ -399,8 +414,15 @@ func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 		case bool:
 			return &val
 		case string:
-			// String values like "auth" or "public" mean the feature is enabled
-			b := val != "false"
+			// String values like "auth" or "public" mean the feature is
+			// enabled. YAML 1.2 hands `no`/`off`/`0` over as strings too;
+			// only "false" used to count as off, so `ws_anonymous: no`
+			// switched the WS/SSE session gate OFF.
+			canon, known := canonicalAuthFlag(val)
+			if strings.TrimSpace(val) == "" {
+				known = false
+			}
+			b := canon == "true" || (!known && key != "ws_anonymous")
 			return &b
 		case map[string]any:
 			// A map means enabled (e.g., search: { tables: [...] })
@@ -412,12 +434,15 @@ func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 	}
 
 	fc.Admin = parseBoolFeature("admin")
+	fc.Uploads = parseBoolFeature("uploads")
+	fc.Exports = parseBoolFeature("exports")
 	fc.SSE = parseBoolFeature("sse")
 	fc.WS = parseBoolFeature("ws")
 	fc.Docs = parseBoolFeature("docs")
 	fc.Testing = parseBoolFeature("testing")
 	fc.Feedback = parseBoolFeature("feedback")
 	fc.Analytics = parseBoolFeature("analytics")
+	fc.AccountSettings = parseBoolFeature("account_settings")
 	fc.WSAnonymous = parseBoolFeature("ws_anonymous")
 
 	// Parse docs visibility: "public" (default) or "auth" (requires login)
@@ -435,8 +460,12 @@ func LoadGroupConfig(dir string) *GroupConfig {
 	if err != nil {
 		return nil
 	}
+	return parseGroupConfig(data)
+}
+
+func parseGroupConfig(data []byte) *GroupConfig {
 	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		return nil
 	}
 	m, ok := raw["groups"].(map[string]any)
@@ -452,6 +481,40 @@ func LoadGroupConfig(dir string) *GroupConfig {
 	gc := &GroupConfig{Table: table, Key: key, UserField: userField}
 	if rf, _ := m["role_field"].(string); rf != "" {
 		gc.RoleField = rf
+	}
+	if v, present := m["active_field"]; present {
+		// A malformed value is kept as-is: membershipLiveConds then
+		// grants no membership at all rather than ignoring the rule.
+		af, _ := v.(string)
+		gc.ActiveField = strings.TrimSpace(af)
+		if !membershipIdentRe.MatchString(gc.ActiveField) {
+			log.Printf("WARNING: groups.active_field %v is not a column name; no membership will be treated as active", v)
+			if gc.ActiveField == "" {
+				gc.ActiveField = "-"
+			}
+		}
+	}
+	if shared, ok := m["shared"].([]any); ok {
+		for _, v := range shared {
+			if t, _ := v.(string); safeIdent(strings.TrimSpace(t)) {
+				gc.Shared = append(gc.Shared, strings.TrimSpace(t))
+			}
+		}
+	}
+	if l, ok := m["label"].(map[string]any); ok {
+		lt, _ := l["table"].(string)
+		lk, _ := l["key"].(string)
+		lf, _ := l["field"].(string)
+		lt, lk, lf = strings.TrimSpace(lt), strings.TrimSpace(lk), strings.TrimSpace(lf)
+		if lk == "" {
+			lk = "id"
+		}
+		// Display only, so a malformed label is dropped (the picker shows
+		// ids); the write gate and benmore check refuse it loudly.
+		if membershipIdentRe.MatchString(lt) && membershipIdentRe.MatchString(lk) && membershipIdentRe.MatchString(lf) &&
+			!strings.HasPrefix(lt, "_benmore_") && !strings.HasPrefix(strings.ToLower(lt), "sqlite_") {
+			gc.Label = &GroupLabelConfig{Table: lt, Key: lk, Field: lf}
+		}
 	}
 	if b, ok := m["bootstrap"].(map[string]any); ok {
 		orgTable, _ := b["org_table"].(string)
@@ -473,8 +536,12 @@ func LoadWSRooms(dir string) []WSRoomRule {
 	if err != nil {
 		return nil
 	}
+	return parseWSRooms(data)
+}
+
+func parseWSRooms(data []byte) []WSRoomRule {
 	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		return nil
 	}
 	m, ok := raw["ws_rooms"].(map[string]any)
@@ -516,10 +583,14 @@ func LoadScopes(dir string) map[string]ScopeConfig {
 	if err != nil {
 		return nil
 	}
+	return parseScopes(data)
+}
+
+func parseScopes(data []byte) map[string]ScopeConfig {
 	var raw struct {
 		Scopes map[string]ScopeConfig `yaml:"scopes"`
 	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		return nil
 	}
 	if len(raw.Scopes) == 0 {
@@ -604,6 +675,7 @@ func hookFromYAML(e HookEntryYAML) Hook {
 			To:       e.Email.To,
 			Subject:  e.Email.Subject,
 			Template: e.Email.Template,
+			Body:     e.Email.Body,
 		}
 	}
 	if e.Notify != "" {
@@ -690,9 +762,10 @@ func convertSteps(yamlSteps []FlowStepYAML) []FlowStep {
 		case ys.Enqueue != nil:
 			step.Type = "enqueue"
 			step.Enqueue = &FlowEnqueue{
-				Flow:  ys.Enqueue.Flow,
-				With:  ys.Enqueue.With,
-				RunAt: ys.Enqueue.RunAt,
+				UniqueKey: ys.Enqueue.UniqueKey,
+				Flow:      ys.Enqueue.Flow,
+				With:      ys.Enqueue.With,
+				RunAt:     ys.Enqueue.RunAt,
 			}
 		case ys.Email != nil:
 			step.Type = "email"
@@ -705,12 +778,16 @@ func convertSteps(yamlSteps []FlowStepYAML) []FlowStep {
 				data = ys.Email.Vars
 			}
 			step.Email = &FlowEmail{
-				To:       ys.Email.To,
-				Subject:  ys.Email.Subject,
-				Template: ys.Email.Template,
-				Html:     html,
-				Text:     ys.Email.Text,
-				Data:     data,
+				To:                  ys.Email.To,
+				CC:                  ys.Email.CC,
+				BCC:                 ys.Email.BCC,
+				UnsubscribeURL:      ys.Email.UnsubscribeURL,
+				UnsubscribeOneClick: ys.Email.UnsubscribeOneClick,
+				Subject:             ys.Email.Subject,
+				Template:            ys.Email.Template,
+				Html:                html,
+				Text:                ys.Email.Text,
+				Data:                data,
 			}
 		case ys.Redirect != "":
 			step.Type = "redirect"
@@ -766,9 +843,15 @@ func anyToString(v any) string {
 
 // WorkflowYAML is the raw YAML representation of a workflow.
 type WorkflowYAML struct {
-	Table        string                               `yaml:"table"`
-	Field        string                               `yaml:"field"`
-	Initial      string                               `yaml:"initial"`
+	Table   string `yaml:"table"`
+	Field   string `yaml:"field"`
+	Initial string `yaml:"initial"`
+	// States optionally declares the state set. The write gate and
+	// `benmore check` then require every state the workflow names
+	// (initial, transitions, timeout, on_transition) to be listed
+	// (validators_workflows.go); terminal states with no outgoing
+	// transitions can be named here.
+	States       []string                             `yaml:"states"`
 	Transitions  map[string]map[string]TransitionYAML `yaml:"transitions"`
 	OnTransition map[string][]HookEntryYAML           `yaml:"on_transition"`
 	Timeout      map[string]TimeoutYAML               `yaml:"timeout"`
@@ -822,6 +905,20 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 	}
 
 	for name, wy := range raw {
+		// Table and Field are spliced into the transition SQL (and Table is a
+		// route pattern); a non-empty value must be a plain identifier, as the
+		// write gate requires. An empty table/field stays the inert,
+		// write-gate-refused shape it was (the `workflows:` wrapper case).
+		if t := strings.TrimSpace(wy.Table); t != "" {
+			if err := configIdentError(fmt.Sprintf("workflows.yaml: %s.table", name), t); err != nil {
+				return nil, err
+			}
+		}
+		if f := strings.TrimSpace(wy.Field); f != "" {
+			if err := configIdentError(fmt.Sprintf("workflows.yaml: %s.field", name), f); err != nil {
+				return nil, err
+			}
+		}
 		wf := &Workflow{
 			Name:         name,
 			Table:        wy.Table,
@@ -832,22 +929,36 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 			Timeouts:     make(map[string]WorkflowTimeout),
 		}
 
-		// Build states list + transitions map
+		// Build states list + transitions map. Declared `states:` come
+		// first in their written order; states only named by transitions
+		// follow, sorted, so the list (and the generated types) is stable.
 		stateSet := make(map[string]bool)
+		for _, s := range wy.States {
+			if s = strings.TrimSpace(s); s != "" && !stateSet[s] {
+				stateSet[s] = true
+				wf.States = append(wf.States, s)
+			}
+		}
+		var derived []string
+		addDerived := func(s string) {
+			if !stateSet[s] {
+				stateSet[s] = true
+				derived = append(derived, s)
+			}
+		}
 		for from, targets := range wy.Transitions {
-			stateSet[from] = true
+			addDerived(from)
 			wf.Transitions[from] = make(map[string]Transition)
 			for to, rule := range targets {
-				stateSet[to] = true
+				addDerived(to)
 				wf.Transitions[from][to] = Transition{
 					Role: rule.Role,
 					When: rule.When,
 				}
 			}
 		}
-		for s := range stateSet {
-			wf.States = append(wf.States, s)
-		}
+		sort.Strings(derived)
+		wf.States = append(wf.States, derived...)
 
 		// On-transition hooks (reuse hookFromYAML)
 		for state, entries := range wy.OnTransition {
@@ -921,7 +1032,10 @@ func LoadComputedFieldsYAML(dir string) *ComputedFieldConfig {
 	if err != nil {
 		return nil
 	}
+	return parseComputedFieldsYAML(data)
+}
 
+func parseComputedFieldsYAML(data []byte) *ComputedFieldConfig {
 	config := &ComputedFieldConfig{
 		Fields: make(map[string]map[string]*ComputedField),
 	}
@@ -936,7 +1050,7 @@ func LoadComputedFieldsYAML(dir string) *ComputedFieldConfig {
 			Triggers []ComputedTriggerDefYAML `yaml:"triggers"`
 		} `yaml:"fields"`
 	}
-	if err := yaml.Unmarshal(data, &listWrapper); err == nil && len(listWrapper.Fields) > 0 {
+	if err := yamlUnmarshal(data, &listWrapper); err == nil && len(listWrapper.Fields) > 0 {
 		for _, f := range listWrapper.Fields {
 			if f.Table == "" || f.Column == "" {
 				continue
@@ -966,7 +1080,7 @@ func LoadComputedFieldsYAML(dir string) *ComputedFieldConfig {
 
 	// Fall back to nested-map format
 	var raw map[string]map[string]ComputedFieldYAML
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		log.Printf("WARN: computed.yaml parse error: %s", err)
 		return nil
 	}
@@ -1008,8 +1122,12 @@ func LoadRolesConfig(dir string) *RolesConfig {
 	if err != nil {
 		return nil
 	}
+	return parseRolesConfig(data)
+}
+
+func parseRolesConfig(data []byte) *RolesConfig {
 	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		return nil
 	}
 	rolesRaw, ok := raw["roles"].(map[string]any)
@@ -1018,7 +1136,8 @@ func LoadRolesConfig(dir string) *RolesConfig {
 	}
 
 	config := &RolesConfig{
-		Roles: make(map[string]RoleDef),
+		Roles:            make(map[string]RoleDef),
+		TablesFromAccess: raw["table_scopes"] == "access",
 	}
 	for roleName, v := range rolesRaw {
 		def := RoleDef{}
@@ -1146,6 +1265,18 @@ func (rc *RolesConfig) ResolveScopesForRoles(roles []string) string {
 	return strings.Join(out, " ")
 }
 
+// bindRoleTableScopes records the schema tables whose auto-CRUD scope check
+// a `table_scopes: access` app hands to its access: rules (checkScope).
+func bindRoleTableScopes(rc *RolesConfig, tables []Table) {
+	if rc == nil || !rc.TablesFromAccess {
+		return
+	}
+	rc.accessTables = make(map[string]bool, len(tables))
+	for _, t := range tables {
+		rc.accessTables[t.Name] = true
+	}
+}
+
 // KnownRoles returns the configured role names (for /api/_auth/roles).
 func (rc *RolesConfig) KnownRoles() []string {
 	if rc == nil {
@@ -1182,3 +1313,58 @@ func (rc *RolesConfig) ScopesForRole(role string) string {
 
 // LoadAuthPaths is deprecated - use DiscoverAuthPaths(pages) instead.
 // Auth paths are now discovered from page type="" attributes.
+
+// On-demand consumers share the published source generation. Ordinary apps
+// retain their existing disk loader behavior.
+func (app *App) versionedConfig() *VersionedConfig {
+	data, err := app.readSourceFile("app.yaml")
+	if err != nil {
+		return nil
+	}
+	return parseVersionedConfig(data)
+}
+func (app *App) aggregateConfig() []AggregateConfig {
+	data, err := app.readSourceFile("app.yaml")
+	if err != nil {
+		return nil
+	}
+	return parseAggregateConfig(data)
+}
+func (app *App) retentionConfig() []RetentionPolicy {
+	app.mu.RLock()
+	reviewed, sources := app.MCP != nil, app.sourceFiles
+	app.mu.RUnlock()
+	if !reviewed {
+		return LoadRetentionConfig(app.Dir)
+	}
+	return parseRetentionConfig(sources["retention.yaml"], sources["app.yaml"])
+}
+
+// Published feature objects are immutable; readers take their pointer under the
+// same lock as reload publication.
+func (app *App) wsRoomRules() []WSRoomRule {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.WSRooms
+}
+func (app *App) validatorConfig() *ValidatorConfig {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Validators
+}
+func (app *App) adminConfig() *AdminConfig {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Admin
+}
+func (app *App) computedConfig() *ComputedFieldConfig {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Computed
+}
+
+func (app *App) i18nConfig() *I18n {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.I18n
+}

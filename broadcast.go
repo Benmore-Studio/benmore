@@ -30,13 +30,15 @@ package main
 // model as auto-CRUD (publishers must be authed, subscribers depend
 // on features.ws_anonymous).
 //
-// Slug uniqueness: enforced at INSERT - one active publisher per slug.
+// Slug uniqueness: enforced at INSERT - one active publisher per slug, per
+// tenant in an app with groups: (broadcastSlugKey).
 // Re-publishing the same slug fails with 409.
 //
-// Cleanup: `_benmore_broadcasts.last_seen_at` is updated on subscribe;
-// rows older than 5 minutes without a subscribe / stop are GC'd on
-// next publish attempt to that slug, so a publisher who crashed
-// without calling stop doesn't permanently block their slug.
+// Liveness: the publisher heartbeats (POST /api/_broadcast/heartbeat, sent
+// every minute by bm.broadcast.publish), which refreshes `last_seen_at`;
+// subscribes don't. A row with no heartbeat for three minutes is a
+// crashed publisher: its own user can re-publish at any time, and another
+// user can take the slug over only once the row is stale.
 
 import (
 	"bytes"
@@ -44,7 +46,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -60,18 +61,25 @@ func EnsureBroadcastTable(db *sql.DB) {
 		slug TEXT PRIMARY KEY,
 		publisher_session_id TEXT NOT NULL,
 		publisher_user_id INTEGER,
+		publisher_group_id TEXT,
 		viewer_count INTEGER DEFAULT 0,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	)`)
+	// Tables created before the tenant column; the error on a table that
+	// already has it is expected.
+	db.Exec(`ALTER TABLE _benmore_broadcasts ADD COLUMN publisher_group_id TEXT`)
 }
 
 // RegisterBroadcastRoutes wires the four bm.broadcast endpoints.
 // Caller has already loaded app.DB; this routine ensures the
 // _benmore_broadcasts table exists and attaches handlers.
-func RegisterBroadcastRoutes(mux *http.ServeMux, app *App) {
+func RegisterBroadcastRoutes(mux appRouteRegistrar, app *App) {
 	EnsureBroadcastTable(app.DB)
+	registerBroadcastRoutes(mux, app)
+}
 
+func registerBroadcastRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_broadcast/publish", func(w http.ResponseWriter, r *http.Request) {
 		broadcastPublish(w, r, app)
 	})
@@ -81,14 +89,17 @@ func RegisterBroadcastRoutes(mux *http.ServeMux, app *App) {
 	mux.HandleFunc("POST /api/_broadcast/stop", func(w http.ResponseWriter, r *http.Request) {
 		broadcastStop(w, r, app)
 	})
+	mux.HandleFunc("POST /api/_broadcast/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		broadcastHeartbeat(w, r, app)
+	})
 	mux.HandleFunc("GET /api/_broadcast/stats/{slug}", func(w http.ResponseWriter, r *http.Request) {
 		broadcastStats(w, r, app)
 	})
 }
 
 // sfuConfig resolves Cloudflare Realtime SFU credentials, preferring
-// per-app overrides (SFU_CF_APP_ID / SFU_CF_APP_TOKEN) over platform-
-// shared (BENMORE_PLATFORM_SFU_CF_APP_ID / BENMORE_PLATFORM_SFU_CF_APP_TOKEN).
+// a complete per-app pair (SFU_CF_APP_ID + SFU_CF_APP_TOKEN) over the
+// platform-shared pair (BENMORE_PLATFORM_SFU_CF_APP_ID + _TOKEN).
 // Returns ok=false when no creds are configured anywhere - handlers
 // then 503 with a clear message so the SDK can fall back to peer-mesh.
 type sfuConfig struct {
@@ -98,15 +109,10 @@ type sfuConfig struct {
 }
 
 func resolveSFUConfig(app *App) sfuConfig {
-	get := func(key string) string {
-		return strings.TrimSpace(resolveTURNVar(app, key)) // re-uses the per-app→platform precedence ladder
-	}
-	cfg := sfuConfig{
-		appID:    get("SFU_CF_APP_ID"),
-		appToken: get("SFU_CF_APP_TOKEN"),
-	}
-	cfg.ok = cfg.appID != "" && cfg.appToken != ""
-	return cfg
+	// The id and token come from one scope (the app's own pair, else the
+	// platform's), never mixed; see cloudflareCredentialPair.
+	id, token, ok := cloudflareCredentialPair(app, "SFU_CF_APP_ID", "SFU_CF_APP_TOKEN")
+	return sfuConfig{appID: id, appToken: token, ok: ok}
 }
 
 // broadcastPublish - server proxy for the WebRTC publish flow.
@@ -118,9 +124,9 @@ func resolveSFUConfig(app *App) sfuConfig {
 //  4. Forward the client's SDP offer with the session's local tracks.
 //  5. Store slug → sessionId, return CF's answer to the client.
 //
-// On any CF API failure we return a 502 with the upstream error so
-// the agent sees what went wrong (vs. a 200 with broken SDP that
-// would silently fail at setRemoteDescription).
+// On any CF API failure we return a 502 (vs. a 200 with broken SDP that
+// would silently fail at setRemoteDescription); the upstream error is
+// logged, not relayed to the browser.
 func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 	mergeJSONBodyIntoForm(r) // accept JSON bodies via the same shim as auth
 	if !isBearerAuth(r) && !validateCSRF(r) {
@@ -148,24 +154,30 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug + sdp required"})
 		return
 	}
+	// A slug is a room name: declared ws_rooms rules gate who may publish.
+	if !roomMembershipAllowed(app, session, session.UserID, slug) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
+		return
+	}
 
-	// GC stale publishers - rows older than 5min with no recent activity
-	// indicate a publisher that crashed without calling stop.
-	app.DB.Exec("DELETE FROM _benmore_broadcasts WHERE last_seen_at < datetime('now', '-5 minutes')")
-
-	// One live publisher per slug - second concurrent claim returns 409.
-	var existing string
-	err := app.DB.QueryRow("SELECT publisher_session_id FROM _benmore_broadcasts WHERE slug = ?", slug).Scan(&existing)
-	if err == nil && existing != "" {
-		httpJSON(w, http.StatusConflict, map[string]any{"error": "slug already live", "publisher_session_id": existing})
+	// One live publisher per slug. The same user may replace their own
+	// (e.g. after a crash or reload); anyone else only once the row has
+	// gone stale. The publisher's SFU session id is never disclosed: it is
+	// what subscribers pull tracks from.
+	key := broadcastSlugKey(app, session, slug)
+	var ownerID int64
+	var stale bool
+	err := app.DB.QueryRow(`SELECT COALESCE(publisher_user_id, 0), last_seen_at < datetime('now', ?) FROM _benmore_broadcasts WHERE slug = ?`,
+		broadcastStaleModifier, key).Scan(&ownerID, &stale)
+	if err == nil && !stale && ownerID != session.UserID {
+		httpJSON(w, http.StatusConflict, map[string]any{"error": "slug already live"})
 		return
 	}
 
 	// Step 1 - create CF session.
 	sessionID, err := cfCreateSession(cfg)
 	if err != nil {
-		log.Printf("broadcast: cf session create failed: %v", err)
-		httpJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream SFU unavailable"})
+		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast publish", err, map[string]any{"error": "upstream SFU unavailable"})
 		return
 	}
 
@@ -175,18 +187,31 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 	// subscribers will request by stable-naming convention "0", "1", …
 	answer, err := cfPublishTracks(cfg, sessionID, sdpOffer)
 	if err != nil {
-		log.Printf("broadcast: cf publish failed: %v", err)
-		httpJSON(w, http.StatusBadGateway, map[string]any{"error": "SFU rejected offer", "detail": err.Error()})
+		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast publish", err, map[string]any{"error": "SFU rejected offer"})
 		return
 	}
 
-	// Persist the slug → sessionId mapping for subscribers.
-	_, err = app.DB.Exec(`INSERT INTO _benmore_broadcasts
-		(slug, publisher_session_id, publisher_user_id) VALUES (?, ?, ?)`,
-		slug, sessionID, session.UserID)
+	// Persist the slug → sessionId mapping for subscribers. The upsert
+	// re-checks the takeover rule so a concurrent claim can't slip in
+	// between the check above and this write.
+	res, err := app.DB.Exec(`INSERT INTO _benmore_broadcasts
+		(slug, publisher_session_id, publisher_user_id, publisher_group_id) VALUES (?, ?, ?, ?)
+		ON CONFLICT(slug) DO UPDATE SET
+			publisher_session_id = excluded.publisher_session_id,
+			publisher_user_id = excluded.publisher_user_id,
+			publisher_group_id = excluded.publisher_group_id,
+			viewer_count = 0, created_at = CURRENT_TIMESTAMP, last_seen_at = CURRENT_TIMESTAMP
+		WHERE COALESCE(_benmore_broadcasts.publisher_user_id, 0) = excluded.publisher_user_id
+		   OR _benmore_broadcasts.last_seen_at < datetime('now', ?)`,
+		key, sessionID, session.UserID, session.EffectiveGroupID(), broadcastStaleModifier)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n == 0 {
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "slug already live"})
+			return
+		}
+	}
 	if err != nil {
-		log.Printf("broadcast: db insert failed: %v", err)
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "db error"})
+		serverErrorJSON(w, r, app, "broadcast publish", err, "db error")
 		return
 	}
 
@@ -203,17 +228,19 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 func broadcastSubscribe(w http.ResponseWriter, r *http.Request, app *App) {
 	mergeJSONBodyIntoForm(r)
 	// Anon viewers OK when features.ws_anonymous is set; otherwise auth
-	// required. Same model bm.room follows.
-	if !broadcastAllowAnon(app) {
-		if session := getSession(app, r); session == nil {
-			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth required (set features.ws_anonymous: true to allow anon viewers)"})
-			return
-		}
+	// required. Same model bm.room follows, including its ws_rooms rules:
+	// a slug matching a declared room pattern admits members only.
+	session := getSession(app, r)
+	if session == nil && !broadcastAllowAnon(app) {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth required (set features.ws_anonymous: true to allow anon viewers)"})
+		return
 	}
-
-	cfg := resolveSFUConfig(app)
-	if !cfg.ok {
-		httpJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "SFU not configured"})
+	var viewerID int64
+	if session != nil {
+		viewerID = session.UserID
+	}
+	if !roomMembershipAllowed(app, session, viewerID, strings.TrimSpace(r.FormValue("slug"))) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
 		return
 	}
 
@@ -224,33 +251,38 @@ func broadcastSubscribe(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
-	var publisherSessionID string
-	err := app.DB.QueryRow("SELECT publisher_session_id FROM _benmore_broadcasts WHERE slug = ?", slug).Scan(&publisherSessionID)
-	if err != nil || publisherSessionID == "" {
+	var publisherSessionID, publisherGroup string
+	key, _ := broadcastRowKey(app, session, slug)
+	err := app.DB.QueryRow("SELECT publisher_session_id, COALESCE(publisher_group_id, '') FROM _benmore_broadcasts WHERE slug = ?", key).Scan(&publisherSessionID, &publisherGroup)
+	if err != nil || publisherSessionID == "" || !broadcastViewerInTenant(app, session, publisherGroup) {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": "no live broadcast for slug"})
+		return
+	}
+
+	cfg := resolveSFUConfig(app)
+	if !cfg.ok {
+		httpJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "SFU not configured"})
 		return
 	}
 
 	// Step 1 - create subscriber session.
 	subSessionID, err := cfCreateSession(cfg)
 	if err != nil {
-		log.Printf("broadcast: cf session create (sub) failed: %v", err)
-		httpJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream SFU unavailable"})
+		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast subscribe", err, map[string]any{"error": "upstream SFU unavailable"})
 		return
 	}
 
 	// Step 2 - request to pull tracks from the publisher.
 	answer, err := cfPullTracks(cfg, subSessionID, publisherSessionID, sdpOffer)
 	if err != nil {
-		log.Printf("broadcast: cf pull failed: %v", err)
-		httpJSON(w, http.StatusBadGateway, map[string]any{"error": "SFU rejected pull", "detail": err.Error()})
+		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast subscribe", err, map[string]any{"error": "SFU rejected pull"})
 		return
 	}
 
-	// Bump viewer counter + freshness timestamp.
-	app.DB.Exec(`UPDATE _benmore_broadcasts SET
-		viewer_count = viewer_count + 1,
-		last_seen_at = CURRENT_TIMESTAMP WHERE slug = ?`, slug)
+	// Count the viewer. Only the publisher's heartbeat refreshes
+	// last_seen_at: a viewer must not keep a crashed publisher's slug
+	// claimed against everyone else.
+	app.DB.Exec(`UPDATE _benmore_broadcasts SET viewer_count = viewer_count + 1 WHERE slug = ?`, key)
 
 	httpJSON(w, http.StatusOK, map[string]any{
 		"sdp":        answer,
@@ -279,13 +311,56 @@ func broadcastStop(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	// Owner-or-admin only - a viewer can't kill a publisher's stream.
+	key, found := broadcastRowKey(app, session, slug)
+	if !found {
+		httpJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
 	var ownerID int64
-	app.DB.QueryRow("SELECT COALESCE(publisher_user_id, 0) FROM _benmore_broadcasts WHERE slug = ?", slug).Scan(&ownerID)
+	app.DB.QueryRow("SELECT COALESCE(publisher_user_id, 0) FROM _benmore_broadcasts WHERE slug = ?", key).Scan(&ownerID)
 	if ownerID != 0 && ownerID != session.UserID && !session.IsAdmin() {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not the publisher"})
 		return
 	}
-	app.DB.Exec("DELETE FROM _benmore_broadcasts WHERE slug = ?", slug)
+	app.DB.Exec("DELETE FROM _benmore_broadcasts WHERE slug = ?", key)
+	httpJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// broadcastStaleModifier is how long (as a SQLite datetime modifier) a
+// publisher row survives without a heartbeat before another user may take
+// the slug over: three missed one-minute heartbeats.
+const broadcastStaleModifier = "-180 seconds"
+
+// broadcastHeartbeat keeps the caller's live slug claimed.
+func broadcastHeartbeat(w http.ResponseWriter, r *http.Request, app *App) {
+	mergeJSONBodyIntoForm(r)
+	if !isBearerAuth(r) && !validateCSRF(r) {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid csrf"})
+		return
+	}
+	session := getSession(app, r)
+	if session == nil {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth required"})
+		return
+	}
+	slug := strings.TrimSpace(r.FormValue("slug"))
+	if !isValidBroadcastSlug(slug) {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required"})
+		return
+	}
+	// COALESCE fills the tenant of a row published before the column existed.
+	// The bare slug also matches a row published before tenant slug keys.
+	res, err := app.DB.Exec(`UPDATE _benmore_broadcasts SET last_seen_at = CURRENT_TIMESTAMP,
+		publisher_group_id = COALESCE(publisher_group_id, ?) WHERE slug IN (?, ?) AND publisher_user_id = ?`,
+		session.EffectiveGroupID(), broadcastSlugKey(app, session, slug), slug, session.UserID)
+	if err != nil {
+		serverErrorJSON(w, r, app, "broadcast heartbeat", err, "db error")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not the live publisher of this slug"})
+		return
+	}
 	httpJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -295,11 +370,27 @@ func broadcastStats(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required"})
 		return
 	}
+	// Stats go to the stream's audience only: the callers subscribe admits
+	// (signed in unless features.ws_anonymous, a member of a ws_rooms slug,
+	// the publisher's tenant). Anyone else is told the slug is not live, the
+	// answer for an unknown slug, so the stats don't reveal another tenant's
+	// streams either.
+	notLive := map[string]any{"live": false, "viewers": 0}
+	session := getSession(app, r)
+	var viewerID int64
+	if session != nil {
+		viewerID = session.UserID
+	}
+	if (session == nil && !broadcastAllowAnon(app)) || !roomMembershipAllowed(app, session, viewerID, slug) {
+		httpJSON(w, http.StatusOK, notLive)
+		return
+	}
 	var viewers int
-	var createdAt string
-	err := app.DB.QueryRow("SELECT viewer_count, created_at FROM _benmore_broadcasts WHERE slug = ?", slug).Scan(&viewers, &createdAt)
-	if err != nil {
-		httpJSON(w, http.StatusOK, map[string]any{"live": false, "viewers": 0})
+	var createdAt, publisherGroup string
+	key, _ := broadcastRowKey(app, session, slug)
+	err := app.DB.QueryRow("SELECT viewer_count, created_at, COALESCE(publisher_group_id, '') FROM _benmore_broadcasts WHERE slug = ?", key).Scan(&viewers, &createdAt, &publisherGroup)
+	if err != nil || !broadcastViewerInTenant(app, session, publisherGroup) {
+		httpJSON(w, http.StatusOK, notLive)
 		return
 	}
 	httpJSON(w, http.StatusOK, map[string]any{
@@ -307,6 +398,69 @@ func broadcastStats(w http.ResponseWriter, r *http.Request, app *App) {
 		"viewers":    viewers,
 		"started_at": createdAt,
 	})
+}
+
+// broadcastTenantSlugs reports whether slugs are per-tenant namespaces: in an
+// app with groups: whose streams are tenant-private (features.ws_anonymous
+// off). With ws_anonymous a stream is viewable by slug signed out, so slugs
+// stay one app-wide namespace.
+func broadcastTenantSlugs(app *App) bool {
+	return app != nil && app.Group != nil && app.Group.Key != "" && !broadcastAllowAnon(app)
+}
+
+// broadcastSlugKey is the _benmore_broadcasts.slug a caller's slug is stored
+// under: "<effective tenant>/<slug>" where slugs are per-tenant ('/' can't
+// appear in a valid slug, so keys never collide), else the bare slug. A
+// user of one tenant therefore can't hold a slug another tenant needs.
+func broadcastSlugKey(app *App, session *Session, slug string) string {
+	if !broadcastTenantSlugs(app) || !session.EffectiveHasGroup() {
+		return slug
+	}
+	return session.EffectiveGroupID() + "/" + slug
+}
+
+// broadcastRowKey finds the stored key of the broadcast a caller means by
+// slug: its own tenant's row; else a row its tenant published under the bare
+// slug before tenant keys existed; else, for an admin outside the tenants
+// (who may view any tenant's stream, broadcastViewerInTenant), the most
+// recently active row for the slug in any tenant.
+func broadcastRowKey(app *App, session *Session, slug string) (string, bool) {
+	key := broadcastSlugKey(app, session, slug)
+	var x int
+	if app.DB.QueryRow(`SELECT 1 FROM _benmore_broadcasts WHERE slug = ?`, key).Scan(&x) == nil {
+		return key, true
+	}
+	if !broadcastTenantSlugs(app) {
+		return key, false
+	}
+	if key != slug && app.DB.QueryRow(`SELECT 1 FROM _benmore_broadcasts WHERE slug = ? AND COALESCE(publisher_group_id, '') = ?`,
+		slug, session.EffectiveGroupID()).Scan(&x) == nil {
+		return slug, true
+	}
+	if session != nil && session.IsAdminBypass() {
+		var found string
+		if app.DB.QueryRow(`SELECT slug FROM _benmore_broadcasts WHERE slug = ? OR substr(slug, -?) = ? ORDER BY last_seen_at DESC LIMIT 1`,
+			slug, len(slug)+1, "/"+slug).Scan(&found) == nil {
+			return found, true
+		}
+	}
+	return key, false
+}
+
+// broadcastViewerInTenant keeps a grouped app's broadcasts inside the
+// publisher's tenant, as bm.room rooms are: a signed-in viewer must share the
+// publisher's effective group (admins bypass). Slugs are one namespace per
+// app, so without this a user of another tenant could pull a stream by
+// guessing its slug. With features.ws_anonymous the app has made streams
+// viewable signed-out, so any viewer may subscribe by slug.
+func broadcastViewerInTenant(app *App, session *Session, publisherGroup string) bool {
+	if app == nil || app.Group == nil || app.Group.Key == "" || broadcastAllowAnon(app) {
+		return true
+	}
+	if session == nil {
+		return false
+	}
+	return session.IsAdminBypass() || session.EffectiveGroupID() == publisherGroup
 }
 
 // broadcastAllowAnon mirrors the ws_anonymous policy - same opt-in

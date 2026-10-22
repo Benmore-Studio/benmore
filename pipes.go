@@ -256,6 +256,18 @@ func ApplyPipe(value any, pipe string) string {
 		}
 		return strings.Trim(s, "-")
 
+	case "raw":
+		// A marker, not a transform: in an email's inline HTML body it says
+		// the value is markup the author wants written as is
+		// (html_template.go). Everywhere else it changes nothing.
+		return s
+
+	case "recipients":
+		// A marker, not a transform: in an email `to:` it says the value is
+		// meant to be a comma-separated list of recipients
+		// (email_recipients.go). Everywhere else it changes nothing.
+		return s
+
 	case "markdown":
 		// Render Markdown → sanitized HTML via benmark. The result is
 		// already sanitized, so RenderMustache emits it raw (see the

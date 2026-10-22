@@ -41,7 +41,7 @@ func resolveJSONValue(v any, ctx *FlowContext) any {
 			key := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
 			// Raw ctx.Data covers top-level step values (`{{r}}`,
 			// `{{r.outputs}}`).
-			if ctxVal, ok := ctx.Data[key]; ok {
+			if ctxVal, ok := flowDataValue(ctx, key); ok {
 				return maybeDecodeJSONString(ctxVal)
 			}
 			// NESTED whole-refs (`{{r.years}}`, `{{r.obj}}`) only exist in
@@ -52,7 +52,7 @@ func resolveJSONValue(v any, ctx *FlowContext) any {
 			// the native array/object/number is emitted. (Refs with pipes
 			// or operators won't match either map and correctly fall
 			// through to interpolateCtx below, which applies the pipe.)
-			if ctxVal, ok := flatDataForCtx(ctx)[key]; ok {
+			if ctxVal, ok := flowLookup(flatDataForCtx(ctx), key); ok {
 				return maybeDecodeJSONString(ctxVal)
 			}
 		}
@@ -127,7 +127,7 @@ func resolveBindExpr(expr string, flatData map[string]any) (any, bool) {
 	}
 	parts := strings.Split(expr, "|")
 	base := strings.TrimSpace(parts[0])
-	val, ok := flatData[base]
+	val, ok := flowLookup(flatData, base)
 	if !ok {
 		// Base ref doesn't resolve in current scope. Pre-v2.7.6 this
 		// always returned (nil, false), which the v2.7.5 loud-fail
@@ -267,88 +267,69 @@ func sqlBindValue(s string) any {
 // interpolateCtxSafe replaces {{var}} with ? placeholders for SQL parameterization.
 // Processes left-to-right through the string to maintain correct arg ordering.
 func interpolateCtxSafe(template string, ctx *FlowContext) (string, []any) {
-	// First pass: replace :param with ? placeholders (path params are user input, must be parameterized)
+	// First pass: replace :param with ? placeholders (path params are user
+	// input, must be parameterized). Scan the TEMPLATE for `:identifier`
+	// tokens and look each one up exactly. Searching the template for every
+	// request key instead let a key that is not an identifier (it may
+	// contain spaces, operators or another `:name`) match and consume a
+	// span of the author's SQL. Only identifier-shaped names can match now,
+	// and the token boundary is the identifier's own end.
 	var paramResult strings.Builder
 	var paramArgs []any
-	tmp := template
-	for {
-		// Find the earliest :param match WITH word-boundary enforcement.
-		//
-		// Pre-v2.7.6 the loop did `strings.Index(tmp, ":"+k)` with no
-		// boundary check after the name. If both `:expo` and `:export`
-		// were registered params, the search for `:expo` would happily
-		// match the first 5 chars of `:export` in the query, leaving
-		// the trailing `rt` literal in the SQL after the `?` was
-		// inserted. SQLite then either failed to parse or bound the
-		// wrong column. Same shape as the v2.7.5 INSERT…RETURNING bug:
-		// "prefix-based detection without a boundary" was the root cause.
-		//
-		// Fix: require the char AFTER the param name to be a non-
-		// identifier (or EOF). Valid SQL identifier chars are letters,
-		// digits, underscores - so `:expo,` and `:expo)` and `:expo `
-		// all match, but `:export` and `:expoXYZ` and `:expo_v2` do not.
-		bestIdx := -1
-		bestKey := ""
-		bestVal := ""
-		for k, v := range ctx.Params {
-			searchIdx := 0
-			for {
-				rel := strings.Index(tmp[searchIdx:], ":"+k)
-				if rel < 0 {
-					break
-				}
-				abs := searchIdx + rel
-				// Boundary check: char after the param name must be a
-				// non-identifier (or end of string).
-				end := abs + len(":"+k)
-				if end < len(tmp) {
-					c := tmp[end]
-					isIdent := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-						(c >= '0' && c <= '9') || c == '_'
-					if isIdent {
-						// Not a real match - keep scanning past this position.
-						searchIdx = abs + 1
-						continue
-					}
-				}
-				if bestIdx < 0 || abs < bestIdx {
-					bestIdx = abs
-					bestKey = k
-					bestVal = v
-				}
-				break
-			}
+	pi := 0
+	for pi < len(template) {
+		c := template[pi]
+		if c != ':' || pi+1 >= len(template) || !isSQLIdentStart(template[pi+1]) || (pi > 0 && (template[pi-1] == ':' || isSQLIdentChar(template[pi-1]))) {
+			paramResult.WriteByte(c)
+			pi++
+			continue
 		}
-		if bestIdx < 0 {
-			paramResult.WriteString(tmp)
-			break
+		j := pi + 1
+		for j < len(template) && isSQLIdentChar(template[j]) {
+			j++
 		}
-		paramResult.WriteString(tmp[:bestIdx])
-		paramResult.WriteByte('?')
-		// NullParams sidecar: if the source expression resolved to Go
-		// nil, bind SQL NULL rather than the empty string. Distinguishes
-		// "explicit null" from "explicit empty string" - both look the
-		// same in ctx.Params (which is map[string]string) but mean
-		// different things to the column.
-		if ctx.NullParams != nil && ctx.NullParams[bestKey] {
+		name := template[pi+1 : j]
+		val, ok := ctx.Params[name]
+		if !ok {
+			paramResult.WriteString(template[pi:j])
+			pi = j
+			continue
+		}
+		// A numbered marker, not '?': the second pass binds ALL arguments
+		// strictly left to right, so a `:name` after a `{{ }}` ref no
+		// longer binds in the ref's slot. (\x00 cannot occur in YAML SQL.)
+		fmt.Fprintf(&paramResult, "\x00%d\x00", len(paramArgs))
+		// NullParams sidecar: a source expression that resolved to Go nil
+		// binds SQL NULL rather than the empty string.
+		if ctx.NullParams != nil && ctx.NullParams[name] {
 			paramArgs = append(paramArgs, nil)
 		} else {
-			paramArgs = append(paramArgs, sqlBindValue(bestVal))
+			paramArgs = append(paramArgs, sqlBindValue(val))
 		}
-		tmp = tmp[bestIdx+len(":"+bestKey):]
+		pi = j
 	}
 
-	result := InterpolateEnv(paramResult.String(), ctx.App.Dir)
+	result := interpolateEnvValues(paramResult.String(), flowEnvSnapshot(ctx))
 
 	flatData := flatDataForCtx(ctx)
 
 	// Second pass LEFT-TO-RIGHT: scan for {{ }}, resolve each one in order
-	// Start with param args collected above, then append data args in order
+	// Args are appended in the order their placeholders appear: `:name`
+	// markers from the first pass and `{{ }}` refs interleave correctly.
 	args := make([]any, 0, len(paramArgs))
-	args = append(args, paramArgs...)
 	var output strings.Builder
 	i := 0
 	for i < len(result) {
+		if result[i] == 0 {
+			if end := strings.IndexByte(result[i+1:], 0); end >= 0 {
+				if n, err := strconv.Atoi(result[i+1 : i+1+end]); err == nil && n >= 0 && n < len(paramArgs) {
+					output.WriteByte('?')
+					args = append(args, paramArgs[n])
+					i = i + 1 + end + 1
+					continue
+				}
+			}
+		}
 		// Check for '{{key}}' (quoted placeholder - inline as literal, SQL-escaped)
 		if i+3 < len(result) && result[i] == '\'' && result[i+1] == '{' && result[i+2] == '{' {
 			end := strings.Index(result[i+3:], "}}'")
@@ -409,18 +390,23 @@ func interpolateCtxSafe(template string, ctx *FlowContext) (string, []any) {
 // behave identically across SQL (param-bound) and non-SQL (string
 // substitution) contexts. Used by respond:, headers:, run: api, etc.
 func interpolateCtx(template string, ctx *FlowContext) string {
+	// ONE left-to-right pass over the author's template resolves both
+	// `:param` tokens and `{{ref}}` expressions (env included, through the
+	// env.* overlay in flatDataForCtx). A substituted value is written out
+	// and never scanned again: running the env or `{{ }}` pass over text
+	// that already held request, row or step values let a caller submit
+	// `{{env.SECRET}}` and receive the secret back.
 	result := template
-	// Replace :param with param values
-	for k, v := range ctx.Params {
-		result = strings.ReplaceAll(result, ":"+k, v)
-	}
-	// Replace {{env.X}}
-	result = InterpolateEnv(result, ctx.App.Dir)
 	flatData := flatDataForCtx(ctx)
 
 	var output strings.Builder
 	i := 0
 	for i < len(result) {
+		if n, val, ok := colonParamAt(result, i, ctx.Params); ok {
+			output.WriteString(val)
+			i += n
+			continue
+		}
 		if i+2 < len(result) && result[i] == '{' && result[i+1] == '{' {
 			end := strings.Index(result[i+2:], "}}")
 			if end >= 0 {
@@ -493,15 +479,62 @@ func interpolateCtx(template string, ctx *FlowContext) string {
 //
 // The overlay is read-only: we don't mutate the per-app store from
 // here, just copy the snapshot at template-resolution time.
+//
+// The result is cached on ctx until ctx.Data or the env snapshot changes
+// (flows_flat_cache.go). It is shared: callers must not modify it.
 func flatDataForCtx(ctx *FlowContext) map[string]any {
-	flat := flattenData(ctx.Data)
+	if ctx == nil {
+		return buildFlatDataForCtx(nil, nil)
+	}
+	env := flowEnvSnapshot(ctx)
+	ctx.flatCache.mu.Lock()
+	defer ctx.flatCache.mu.Unlock()
+	if flat, ok := ctx.flatCache.lookup(ctx.Data, env); ok {
+		return flat
+	}
+	flat := buildFlatDataForCtx(ctx, env)
+	ctx.flatCache.store(ctx.Data, env, flat)
+	return flat
+}
+
+func buildFlatDataForCtx(ctx *FlowContext, env map[string]string) map[string]any {
+	var data map[string]any
+	if ctx != nil {
+		data = ctx.Data
+	}
+	flat := flattenData(data)
+	// env.* names the app's environment only. A request body key `env`
+	// (or a form key `env.X`) flattens to the same paths and would
+	// otherwise stand in for any variable the app hasn't set.
+	for k := range flat {
+		if k == "env" || strings.HasPrefix(k, "env.") {
+			delete(flat, k)
+		}
+	}
 	if ctx == nil || ctx.App == nil {
 		return flat
 	}
-	for k, v := range AppEnvSnapshot(ctx.App.Dir) {
+	for k, v := range env {
 		flat["env."+k] = v
 	}
 	return flat
+}
+
+// Private reads retain the environment selected with their flow generation.
+// Ordinary flow runs retain the existing live per-app lookup behavior.
+func flowEnvSnapshot(ctx *FlowContext) map[string]string {
+	if ctx == nil || ctx.App == nil {
+		return nil
+	}
+	if ctx.Request != nil {
+		if identity, private := ctx.Request.Context().Value(appMCPPrivateFlowKey{}).(*appMCPPrivateFlow); private {
+			if identity == nil || identity.app != ctx.App || identity.request != ctx.Request {
+				return nil
+			}
+			return appVisibleEnvironment(identity.environment)
+		}
+	}
+	return AppEnvSnapshot(ctx.App.Dir)
 }
 
 func flattenData(data map[string]any) map[string]any {
@@ -576,4 +609,90 @@ func flattenInto(flat map[string]any, prefix string, v any) {
 			flattenInto(flat, fmt.Sprintf("%s.%d", prefix, i), child)
 		}
 	}
+}
+
+func isSQLIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isSQLIdentChar(c byte) bool {
+	return isSQLIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// substituteColonParams replaces each `:identifier` token in template with
+// params[identifier] when present, leaving everything else (including
+// `host:8080`, `::cast` and unknown names) untouched.
+func substituteColonParams(template string, params map[string]string) string {
+	if len(params) == 0 || !strings.Contains(template, ":") {
+		return template
+	}
+	var b strings.Builder
+	i := 0
+	for i < len(template) {
+		if n, v, ok := colonParamAt(template, i, params); ok {
+			b.WriteString(v)
+			i += n
+			continue
+		}
+		b.WriteByte(template[i])
+		i++
+	}
+	return b.String()
+}
+
+// colonParamAt reports whether template[i:] starts a `:identifier` token
+// naming a known param, returning the token's length and the value. A
+// colon directly after an identifier character or another colon
+// (`host:8080`, `a:b`, `::cast`) never starts a token.
+func colonParamAt(template string, i int, params map[string]string) (int, string, bool) {
+	if len(params) == 0 || template[i] != ':' || i+1 >= len(template) || !isSQLIdentStart(template[i+1]) {
+		return 0, "", false
+	}
+	if i > 0 && (template[i-1] == ':' || isSQLIdentChar(template[i-1])) {
+		return 0, "", false
+	}
+	j := i + 1
+	for j < len(template) && isSQLIdentChar(template[j]) {
+		j++
+	}
+	v, ok := params[template[i+1:j]]
+	if !ok {
+		return 0, "", false
+	}
+	return j - i, v, true
+}
+
+// flowStepNamedParamsKey holds request fields whose name is also a step id
+// in the flow. They are moved off the top level of ctx.Data at entry
+// (shadowStepNamedRequestKeys), so `${{ steps.<id>.outputs }}` only ever
+// reads what the step wrote, and `${{ params.<id> }}` still reads the
+// request value. Request input can never set this key.
+const flowStepNamedParamsKey = "__benmore_step_named_params"
+
+// flowLookup resolves a translated ref in a flattened view. `params.X`
+// reads the request field X: from the step-named store when X is also a
+// step id, otherwise from the top level as before.
+func flowLookup(flat map[string]any, key string) (any, bool) {
+	if rest, ok := strings.CutPrefix(key, "params."); ok {
+		if v, ok := flat[flowStepNamedParamsKey+"."+rest]; ok {
+			return v, true
+		}
+		key = rest
+	}
+	v, ok := flat[key]
+	return v, ok
+}
+
+// flowDataValue is flowLookup for a top-level ctx.Data key.
+func flowDataValue(ctx *FlowContext, key string) (any, bool) {
+	if rest, ok := strings.CutPrefix(key, "params."); ok {
+		if m, ok := ctx.Data[flowStepNamedParamsKey].(map[string]any); ok {
+			if v, ok := m[rest]; ok {
+				return v, true
+			}
+		}
+		key = rest
+	}
+	v, ok := ctx.Data[key]
+	return v, ok
 }

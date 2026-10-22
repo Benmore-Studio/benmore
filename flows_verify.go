@@ -21,7 +21,15 @@ import (
 )
 
 func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
-	secret := InterpolateEnv(flow.Secret, appDir)
+	// secret: accepts ${{ env.NAME }} (the documented form) as well as
+	// {{env.NAME}}, as the map-form recipe does (parseVerifyMap).
+	secret := InterpolateEnv(normVerifyEnv(flow.Secret), appDir)
+	if verifySecretUnresolved(secret) {
+		// A secret that still holds a template would authenticate anyone
+		// who can guess its text.
+		log.Printf("SECURITY: webhook verify %q: secret did not resolve (unset env var or unsupported template) - rejecting request as unauthenticated", flow.Verify)
+		return false
+	}
 	if secret == "" {
 		// fail closed: an empty resolved secret must never authenticate a
 		// webhook. When verification is requested (flow.Verify set) but the
@@ -214,4 +222,11 @@ func verifyHMACSHA256(signature, secret string, r *http.Request) bool {
 	expected := hex.EncodeToString(mac.Sum(nil))
 
 	return hmac.Equal([]byte(sig), []byte(expected))
+}
+
+// verifySecretUnresolved reports a secret that still carries template syntax
+// after env interpolation: an unset variable or a form InterpolateEnv doesn't
+// expand. Its literal text must never serve as a verification key.
+func verifySecretUnresolved(secret string) bool {
+	return strings.Contains(secret, "{{") && strings.Contains(secret, "}}")
 }

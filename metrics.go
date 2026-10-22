@@ -205,7 +205,7 @@ func (s *statusCapturingWriter) Unwrap() http.ResponseWriter {
 // RegisterMetricsRoute mounts /metrics if BENMORE_METRICS_TOKEN is set.
 // Without the token the endpoint is dark - no scrape surface at all.
 // Mount BEFORE other routes so /metrics resolves first.
-func RegisterMetricsRoute(mux *http.ServeMux) {
+func RegisterMetricsRoute(mux appRouteRegistrar) {
 	token := strings.TrimSpace(os.Getenv("BENMORE_METRICS_TOKEN"))
 	if token == "" {
 		return

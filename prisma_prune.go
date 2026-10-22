@@ -122,6 +122,9 @@ func PrunePrismaDrift(db *sql.DB, dir string) (PruneResult, error) {
 		return PruneResult{}, fmt.Errorf("prune: %w", cause)
 	}
 	for _, s := range stmts {
+		if err := dropFrameworkIndexesForStatement(tx, s); err != nil { // scoping_indexes.go
+			return rollback(fmt.Errorf("%s: %w", s, err))
+		}
 		if _, err := tx.Exec(s); err != nil {
 			return rollback(fmt.Errorf("%s: %w", s, err))
 		}

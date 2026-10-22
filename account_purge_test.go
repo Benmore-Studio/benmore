@@ -73,7 +73,7 @@ func TestPurgeCurrentUserParser(t *testing.T) {
 		t.Fatalf("parsed flows = %#v", flows)
 	}
 	got := flows[0].Steps[1]
-	if got.Type != "purge_current_user" || got.PurgeCurrentUserConfirm != "{{confirm}}" {
+	if got.Type != "purge_current_user" || got.PurgeCurrentUserConfirm != "{{params.confirm}}" {
 		t.Fatalf("parsed purge step = %#v", got)
 	}
 }
@@ -86,7 +86,7 @@ func TestPurgeCurrentUserRejectsNonSessionAndImpersonation(t *testing.T) {
 	app, cleanup := newPurgeTestApp(t)
 	defer cleanup()
 	insertPurgeUser(t, app, 1, "owner@example.com")
-	sessionID := CreateSession(app.DB, 1, "owner@example.com", "", time.Hour)
+	sessionID := sessionStorageKey(CreateSession(app.DB, 1, "owner@example.com", "", time.Hour))
 
 	step := FlowStep{Type: "purge_current_user", PurgeCurrentUserConfirm: "DELETE"}
 	cases := []struct {
@@ -125,6 +125,14 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	defer cleanup()
 	insertPurgeUser(t, app, 1, "owner@example.com")
 	insertPurgeUser(t, app, 2, "victim@example.com")
+	if err := ensureAppMCPGrantTables(app.DB); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, app.DB, `INSERT INTO _benmore_mcp_grants(id,app,user_id,user_created,tenant,client,resource,epoch,scopes,expires_at) VALUES('owner-grant','app',1,'created','17','client','resource','epoch','notes:read',9999999999),('victim-grant','app',2,'created','29','client','resource','epoch','notes:read',9999999999)`)
+	mustExec(t, app.DB, `INSERT INTO _benmore_mcp_credentials(token_hash,grant_id,kind,expires_at) VALUES('owner-access','owner-grant','access',9999999999),('owner-refresh','owner-grant','refresh',9999999999),('victim-access','victim-grant','access',9999999999)`)
+	mustExec(t, app.DB, `INSERT INTO _benmore_mcp_authorizations(key_hash,kind,user_id,app,payload,expires_at) VALUES('owner-code','code',1,'app','{}',9999999999),('victim-code','code',2,'app','{}',9999999999)`)
+	mustExec(t, app.DB, `INSERT INTO _benmore_mcp_connection_credentials(user_id,connection,upstream_host,secret_ciphertext,updated_at) VALUES(1,'items','h','enc:v2:x',1),(2,'items','h','enc:v2:y',1)`)
+	mustExec(t, app.DB, `INSERT INTO _benmore_signin_challenges(token_hash,user_id,purpose,email,otp_key,credential_binding,expires_at) VALUES('owner-step',1,'mfa-step','owner@example.com','','binding',9999999999),('other-step',2,'mfa-step','victim@example.com','','binding',9999999999)`)
 	sessionID := CreateSession(app.DB, 1, "owner@example.com", "", time.Hour)
 	mustExec(t, app.DB, `INSERT INTO _benmore_api_tokens(user_id,name,token_hash,scopes) VALUES(1,'phone','h','*')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_oauth_tokens(user_id,provider,access_token) VALUES(1,'google','secret')`)
@@ -163,7 +171,17 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || response["deleted"] != true {
 		t.Fatalf("response = %s (%v)", rr.Body.String(), err)
 	}
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_authorizations WHERE user_id=1", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_authorizations WHERE user_id=2", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_grants WHERE user_id=1", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_credentials WHERE grant_id='owner-grant'", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_grants WHERE user_id=2", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_credentials WHERE grant_id='victim-grant'", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_connection_credentials WHERE user_id=1", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_mcp_connection_credentials WHERE user_id=2", 1)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_sessions WHERE user_id=1", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_signin_challenges WHERE user_id=1", 0)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_signin_challenges WHERE user_id=2", 1)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_api_tokens WHERE user_id=1", 0)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_oauth_tokens WHERE user_id=1", 0)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_devices WHERE user_id=1", 0)
@@ -204,7 +222,7 @@ func TestPurgeCurrentUserRequiresExactRuntimeConfirmation(t *testing.T) {
 	app, cleanup := newPurgeTestApp(t)
 	defer cleanup()
 	insertPurgeUser(t, app, 1, "owner@example.com")
-	sessionID := CreateSession(app.DB, 1, "owner@example.com", "", time.Hour)
+	sessionID := sessionStorageKey(CreateSession(app.DB, 1, "owner@example.com", "", time.Hour))
 
 	for _, confirm := range []string{"", "delete", "DELETE ", " DELETE"} {
 		t.Run(strconv.Quote(confirm), func(t *testing.T) {
@@ -285,7 +303,7 @@ func TestPurgeCurrentUserRollsBackWhenOptionalIdentityTableIsIncompatible(t *tes
 	app, cleanup := newPurgeTestApp(t)
 	defer cleanup()
 	insertPurgeUser(t, app, 1, "owner@example.com")
-	sessionID := CreateSession(app.DB, 1, "owner@example.com", "", time.Hour)
+	sessionID := sessionStorageKey(CreateSession(app.DB, 1, "owner@example.com", "", time.Hour))
 	mustExec(t, app.DB, `DROP TABLE _benmore_devices`)
 	mustExec(t, app.DB, `CREATE TABLE _benmore_devices(id INTEGER PRIMARY KEY, token TEXT)`)
 
@@ -338,7 +356,7 @@ func TestPurgeCurrentUserDoesNotSendSuccessBeforeTransactionCommit(t *testing.T)
 		t.Fatalf("commit failure leaked buffered success: %s", rr.Body.String())
 	}
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_users WHERE id=1 AND email='owner@example.com' AND deactivated_at IS NULL", 1)
-	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_sessions WHERE id='"+sessionID+"'", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_sessions WHERE id='"+sessionStorageKey(sessionID)+"'", 1)
 }
 
 func TestPurgeCurrentUserWithNoEmailDoesNotEraseOtherBlankEmailRows(t *testing.T) {

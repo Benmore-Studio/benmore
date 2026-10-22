@@ -204,12 +204,12 @@ func TestBuildSourceManifestFlagsPartialOnUnreadableFile(t *testing.T) {
 	}
 }
 
-// Task 16: a file deleted between filepath.Walk's stat and hashFileSHA256's
-// read (a deploy landing mid-request on a live app dir) must degrade the
-// manifest to Partial=true, matching the permission-error treatment, instead
-// of aborting the whole GET /platform/app-manifest with a 500. We simulate
-// the disappearance deterministically via hashFileSHA256Fn instead of racing
-// a real goroutine against filepath.Walk.
+// Task 16: a file deleted between the walk's lstat and the hash read (a
+// deploy landing mid-request on a live app dir) must degrade the manifest to
+// Partial=true, matching the permission-error treatment, instead of aborting
+// the whole GET /platform/app-manifest with a 500. We simulate the
+// disappearance deterministically via sourceManifestBeforeHash instead of
+// racing a real goroutine against the walk.
 func TestBuildSourceManifestTreatsFileDisappearingMidHashAsPartial(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "keep.tsx"), []byte("ok"), 0644); err != nil {
@@ -220,15 +220,14 @@ func TestBuildSourceManifestTreatsFileDisappearingMidHashAsPartial(t *testing.T)
 		t.Fatal(err)
 	}
 
-	orig := hashFileSHA256Fn
-	defer func() { hashFileSHA256Fn = orig }()
-	hashFileSHA256Fn = func(path string) (string, error) {
+	orig := sourceManifestBeforeHash
+	defer func() { sourceManifestBeforeHash = orig }()
+	sourceManifestBeforeHash = func(path string) {
 		if filepath.Base(path) == "vanishing.tsx" {
 			if err := os.Remove(path); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return orig(path)
 	}
 
 	m, err := BuildSourceManifest(dir, SourceManifestOptions{App: "app"})
@@ -247,5 +246,71 @@ func TestBuildSourceManifestTreatsFileDisappearingMidHashAsPartial(t *testing.T)
 	}
 	if !gotPaths["keep.tsx"] {
 		t.Fatalf("expected keep.tsx to still be in manifest: %#v", m.Files)
+	}
+}
+
+// The router builds manifests of app directories whose tenant process can
+// rewrite them meanwhile. A regular file swapped for a link after the walk
+// listed it, or a directory swapped while its files were being read, used to
+// be followed: another app's file was hashed (and, on the verified promote
+// path, copied) as if it were this app's code.
+func TestBuildSourceManifestNeverHashesThroughASwappedLink(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	write := func(root, rel, body string) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(dir, "pages/a.html", "mine a")
+	write(dir, "pages/b.html", "mine b")
+	write(dir, "static/app.js", "mine js")
+	write(outside, "secret.txt", "other tenant")
+	write(outside, "pages/a.html", "other tenant")
+	write(outside, "pages/b.html", "other tenant")
+
+	orig := sourceManifestBeforeHash
+	defer func() { sourceManifestBeforeHash = orig }()
+	sourceManifestBeforeHash = func(path string) {
+		switch filepath.Base(path) {
+		case "a.html":
+			// The directory being read becomes a link to another app's.
+			if err := os.Rename(filepath.Join(dir, "pages"), filepath.Join(dir, "pages.moved")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(outside, "pages"), filepath.Join(dir, "pages")); err != nil {
+				t.Fatal(err)
+			}
+		case "app.js":
+			// The file about to be read becomes a link to another app's.
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(outside, "secret.txt"), path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m, err := BuildSourceManifest(dir, SourceManifestOptions{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	theirs := hashBytesSHA256([]byte("other tenant"))
+	got := map[string]string{}
+	for _, f := range m.Files {
+		got[f.Path] = f.SHA256
+		if f.SHA256 == theirs {
+			t.Errorf("%s carries the hash of another tenant's file", f.Path)
+		}
+	}
+	if got["pages/a.html"] != hashBytesSHA256([]byte("mine a")) || got["pages/b.html"] != hashBytesSHA256([]byte("mine b")) {
+		t.Errorf("the directory held open was not the one read: %v", got)
+	}
+	if _, listed := got["static/app.js"]; listed || !m.Partial {
+		t.Errorf("a file that became a link must be left out and the manifest marked partial: listed=%v partial=%v", listed, m.Partial)
 	}
 }

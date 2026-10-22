@@ -10,10 +10,17 @@ import (
 // version is the release version. It defaults to the value baked here and is
 // overridden at release time via -ldflags "-X main.version=<tag>" (see the
 // public edition's .goreleaser.yaml).
-var version = "2.7.226"
+var version = "2.7.300"
+
+type appMCPCLIUsageError string
+
+func (err appMCPCLIUsageError) Error() string { return string(err) }
 
 // Full release history lives in the private development repo and git log.
 func main() {
+	if appMCPPDFHelperMain() {
+		return
+	}
 	// GIT_ASKPASS mode (GitHub sync, platform_github.go): the router
 	// execs `git push` with GIT_ASKPASS pointing back at this binary so
 	// the access token reaches git via ENVIRONMENT, never argv
@@ -36,6 +43,12 @@ func main() {
 	}
 
 	cmd := os.Args[1]
+	if cmd == "mcp" {
+		if help := mcpOwnerHelp(os.Args[2:]); help != "" {
+			fmt.Print(help)
+			return
+		}
+	}
 	// Operator preflight must not log in, install skills, emit telemetry, or
 	// start an app. The implementation exists only in the platform edition.
 	if cmd == "upgrade-check" {
@@ -46,6 +59,33 @@ func main() {
 		os.Exit(2)
 	}
 	if cmd == "api" && len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") && dispatchPlatformCLI(cmd) {
+		return
+	}
+	if (cmd == "edge" || cmd == "edges") && len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help") && dispatchPlatformCLI(cmd) {
+		return
+	}
+	// `benmore <cmd> --help` prints that command's usage instead of running
+	// it: `create-app --help` used to create an app named "--help".
+	if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") && !commandsWithOwnHelp[cmd] {
+		if usage := commandUsage(cmd); usage != "" {
+			fmt.Print(usage)
+		} else {
+			printUsage()
+		}
+		return
+	}
+	// Local connector commands must never authenticate remotely, install skills,
+	// emit telemetry, open app data or start workers. The owner switch verbs
+	// (status|enable|disable) are the exception: they call the platform.
+	if cmd == "mcp" && !isMCPConnectorSwitchCommand(os.Args[2:]) {
+		if err := runAppMCPCLI(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "mcp: %s\n", err)
+			code := 1
+			if _, usage := err.(appMCPCLIUsageError); usage {
+				code = 2
+			}
+			os.Exit(code)
+		}
 		return
 	}
 	preflightPlatformCLIAuth(cmd)
@@ -72,7 +112,7 @@ func main() {
 		}
 	case "docs":
 		cmdDocs()
-	case "help":
+	case "help", "--help", "-h":
 		printUsage()
 	default:
 		// Platform CLI commands - login/signup, the deployed-app
@@ -104,18 +144,68 @@ func runCLIUpdateCheck(cmd string, check func()) {
 }
 
 func printUsage() {
-	fmt.Println(`benmore - turn Prisma + vanilla HTML/JS + YAML into web apps
+	fmt.Print(usageText())
+}
+
+// commandUsage returns the usage lines for one command (with their wrapped
+// continuation lines), or "" when the usage text doesn't list it.
+func commandUsage(cmd string) string {
+	var b strings.Builder
+	inEntry := false
+	for _, line := range strings.Split(usageText(), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "benmore "+cmd+" ") || trimmed == "benmore "+cmd:
+			inEntry = true
+		case inEntry && trimmed != "" && !strings.HasPrefix(trimmed, "benmore ") && strings.HasPrefix(line, "        "):
+		default:
+			inEntry = false
+		}
+		if inEntry {
+			b.WriteString(line + "\n")
+		}
+	}
+	return b.String()
+}
+
+func mcpOwnerHelp(args []string) string {
+	if !isMCPConnectorSwitchCommand(args) {
+		return ""
+	}
+	for _, arg := range args[1:] {
+		if arg == "--help" || arg == "-h" {
+			return commandUsage("mcp")
+		}
+	}
+	return ""
+}
+
+// commandsWithOwnHelp parse --help themselves.
+var commandsWithOwnHelp = map[string]bool{
+	"api": true, "open": true, "logs": true, "env": true, "mcp": true, "promote": true,
+	"login": true, "signup": true, "import": true, "verify": true, "ship": true, "qa": true,
+}
+
+// usageText is the command list; platformUsageText is empty in the
+// open-source framework build and lists the hosted deployed-app / MCP
+// commands in the platform build.
+func usageText() string {
+	return `benmore - turn Prisma + vanilla HTML/JS + YAML into web apps
 
   benmore new <dir>                 Scaffold a new app (runnable immediately)
   benmore serve [dir] [--port N]    Run an app from a directory on one port
+  benmore serve [dir] --mcp-local [--mcp-writes]
+                                    Also run its reviewed MCP connector at http://localhost:N/api/_mcp
   benmore test [dir] [--app|--framework] [--json]
   benmore upgrade-check <app-dir> [<app-dir>...] | --apps-dir <dir>  (platform)
+  benmore mcp inspect <appdir> --json   Inspect source connector candidates
+  benmore mcp generate <appdir> --openapi <file> --out <file>
+  benmore mcp check <appdir>            Validate source connector bindings
+  benmore mcp review <appdir> --reviewed   Bind reviewed manifest to current source
   benmore docs [topic]              Built-in framework docs
   benmore version [--json]
-  benmore help`)
-	// platformUsageText is empty in the open-source framework build and lists
-	// the hosted deployed-app / MCP commands in the platform build.
-	fmt.Print(platformUsageText())
+  benmore help
+` + platformUsageText()
 }
 
 // getAppDir returns the app directory from args or defaults to current dir.
@@ -208,7 +298,7 @@ func cmdDocs() {
 		fmt.Fprint(os.Stderr, AgentDocsCatalog())
 		os.Exit(1)
 	}
-	fmt.Print(body)
+	fmt.Print(AgentDocsPointer(topic) + body)
 
 	// Also mark the topic read server-side via the MCP help tool. The
 	// docs-read gate is opt-in (BENMORE_DOCS_GATE=1) but when it IS on,

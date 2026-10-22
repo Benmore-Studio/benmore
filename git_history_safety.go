@@ -19,6 +19,11 @@ func gitProtectedPath(path string) bool {
 	if len(parts) > 0 && parts[0] == "Benmore" {
 		return true
 	}
+	// Database sidecars are files. A source directory such as data.db-tools
+	// must remain usable, matching the source manifest's filename rule.
+	if len(parts) > 0 && strings.HasPrefix(parts[len(parts)-1], "data.db") {
+		return true
+	}
 	for _, part := range parts {
 		switch part {
 		case "data.db", "data.db-wal", "data.db-shm", ".benmore", "uploads", "env.yaml", "secrets.yaml", ".env", ".git":
@@ -246,13 +251,16 @@ func gitCheckRestoreObstructions(dir, sha string) error {
 		if !info.IsDir() {
 			continue
 		}
-		if err := filepath.WalkDir(full, func(p string, _ fs.DirEntry, walkErr error) error {
+		if err := filepath.WalkDir(full, func(p string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
 			rel, err := filepath.Rel(dir, p)
 			if err != nil {
 				return err
+			}
+			if entry.IsDir() {
+				rel += "/"
 			}
 			if gitProtectedPath(rel) {
 				return fmt.Errorf("restore would replace a directory containing runtime data or secrets")

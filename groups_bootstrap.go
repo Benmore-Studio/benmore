@@ -36,13 +36,32 @@ import (
 // RegisterGroupBootstrapRoute wires POST /api/_groups/create when the
 // app declares groups.bootstrap. No-op otherwise - the route 404s like
 // any unknown path.
-func RegisterGroupBootstrapRoute(mux *http.ServeMux, app *App) {
+func RegisterGroupBootstrapRoute(mux appRouteRegistrar, app *App) {
 	if app.Group == nil || app.Group.Bootstrap == nil || app.Group.Bootstrap.OrgTable == "" {
 		return
 	}
 	mux.HandleFunc("POST /api/_groups/create", func(w http.ResponseWriter, r *http.Request) {
 		handleGroupBootstrap(w, r, app)
 	})
+}
+
+// bootstrapOrgWriteAllowed applies the write mode the org table DECLARES
+// on itself (access.<org_table>.write or .all) to the founder. Declaring
+// `companies: {write: admin}` or `role:sales` means only those callers may
+// create organizations, and bootstrap must not be the way around it.
+//
+// Not applied: the implicit default and the global `default:` block (an
+// org table usually has no user_id, so the implicit mode is admin and
+// enforcing it would disable every bootstrap - declaring groups.bootstrap
+// is itself the grant); `group`, which a founder cannot hold before the
+// group exists; and `off`, which disables the auto-CRUD route and is the
+// usual way to make bootstrap the only door.
+func bootstrapOrgWriteAllowed(app *App, orgTable string, session *Session) bool {
+	mode, declared := app.Access.TableDeclaredModeFor(orgTable, OpWrite)
+	if !declared || mode == "group" || mode == "off" {
+		return true
+	}
+	return app.Access.Allowed(mode, session, 0)
 }
 
 func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
@@ -59,6 +78,31 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
+	// Bootstrap writes the org row and the founding membership, so a
+	// scoped credential needs write scope on both - the gate auto-CRUD
+	// applies. Without it a read-only token could create a tenant.
+	for _, t := range []string{orgTable, group.Table} {
+		if err := checkScope(session, t, "write"); err != nil {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if !bootstrapOrgWriteAllowed(app, orgTable, session) {
+		httpJSON(w, http.StatusForbidden, map[string]any{
+			"error": fmt.Sprintf("access.%s.write does not allow this account to create an organization", orgTable),
+		})
+		return
+	}
+	// An email-keyed founding membership counts only for a verified address,
+	// so an unverified founder would create a tenant they can't enter.
+	if emailKeyedColumn(group.UserField) && sessionGrantEmail(session) == "" && !session.IsAdmin() {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "email_unverified", "message": "verify your email before creating an organization"})
+		return
+	}
+	if reason, blocked := checkStorageCap(app, 0); blocked {
+		httpJSON(w, http.StatusInsufficientStorage, map[string]any{"error": "storage cap reached", "detail": reason})
+		return
+	}
 	// One group per user through this door. Joining additional groups /
 	// switching tenants is membership management, not bootstrap.
 	if session.EffectiveHasGroup() {
@@ -70,18 +114,35 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Parse body - JSON object or form, same shapes handleCreate accepts.
-	values := map[string]string{}
+	// JSON lands in r.Form so the :validate rules below read it the same
+	// way they do on an auto-CRUD create.
 	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			for k, v := range body {
-				values[k] = jsonToFormValue(v)
-			}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "expected a JSON object"})
+			return
+		}
+		r.Form = make(map[string][]string)
+		for k, v := range body {
+			r.Form.Set(k, jsonToFormValue(v))
 		}
 	} else {
 		r.ParseForm()
-		for k := range r.Form {
-			values[k] = r.FormValue(k)
+	}
+	values := map[string]string{}
+	for k := range r.Form {
+		values[k] = r.FormValue(k)
+	}
+	// Command-owned org-table columns are never client-writable (the founding
+	// membership row is built from session and config only, never from the body).
+	if v := ownedFieldViolation(app, orgTable, mapKeys(values)...); v != nil {
+		writeOwnedFieldRefusal(w, v)
+		return
+	}
+	if rules := ExtractValidationRules(app, orgTable); len(rules) > 0 {
+		if errs := ValidateFields(r, rules); len(errs) > 0 {
+			FormatValidationErrors(w, r, errs)
+			return
 		}
 	}
 
@@ -93,33 +154,34 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
-	// Build the org INSERT - same protections as auto-CRUD: protected
-	// fields never come from the body, user_id auto-injects from the
-	// session when the org table has it (the creator).
-	protected := map[string]bool{
-		"user_id": true, "created_at": true, "updated_at": true,
-		"password_hash": true, "role": true, "_csrf": true,
-	}
+	// Build the org INSERT - same protections as auto-CRUD create: the
+	// protected set (owner, timestamps, tenant key, computed columns; names
+	// matched case-insensitively) never comes from the body, a workflow's
+	// state column starts in its initial state, and user_id auto-injects
+	// from the session when the org table has it (the creator).
+	protected := protectedCreateFields(app, orgTable)
 	var fields []string
 	var args []any
+	submitted := map[string]any{} // client-supplied values, for the FK visibility gate
 	for _, col := range orgCols {
 		if col.PK {
 			continue
 		}
-		if col.Name == "user_id" {
-			fields = append(fields, "user_id")
+		if identIs(col.Name, "user_id") {
+			fields = append(fields, col.Name)
 			args = append(args, session.UserID)
 			continue
 		}
-		if protected[col.Name] || col.Name == group.Key {
+		if protected.has(col.Name) {
 			continue
 		}
 		v, ok := values[col.Name]
-		if !ok || v == "" {
+		if !ok || v == "" || workflowCreateStateRefused(app, orgTable, col.Name, v) {
 			continue
 		}
 		fields = append(fields, col.Name)
 		args = append(args, v)
+		submitted[col.Name] = v
 	}
 	if len(fields) == 0 {
 		httpJSON(w, http.StatusBadRequest, map[string]any{
@@ -128,25 +190,78 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
+	memberVal := any(session.UserID)
+	if strings.Contains(group.UserField, "email") {
+		memberVal = session.Email
+	}
+
 	tx, err := app.DB.Begin()
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_groups create", err, "Server error")
 		return
 	}
 	defer tx.Rollback()
 
-	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(fields)), ", ")
-	res, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		orgTable, strings.Join(fields, ", "), placeholders), args...)
+	// The session check above races: two concurrent bootstraps from a
+	// groupless user both pass it. Re-check inside the transaction, where
+	// SQLite serializes the writers.
+	var member bool
+	// Same notion of membership as session resolution: only live rows.
+	if err := tx.QueryRow(fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE %s = ? AND %s IS NOT NULL%s)",
+		quoteIdent(group.Table), quoteColumn(group.Table, group.UserField), quoteColumn(group.Table, group.Key),
+		membershipLiveConds(group, group.Table, "", appColumnChecker(app, group.Table))), memberVal).Scan(&member); err != nil {
+		serverError(w, r, app, "_groups create", err, "Server error")
+		return
+	}
+	if member {
+		httpJSON(w, http.StatusConflict, map[string]any{"error": "already a member of a group"})
+		return
+	}
+
+	// Same gates as an auto-CRUD insert into the org table: a submitted
+	// foreign key must name a parent the founder can read, then declarative
+	// cross-field validators, then before-hooks (which can abort).
+	if writeFKTargetDenial(w, foreignKeyTargetDenial(tx, app, orgTable, session, submitted)) {
+		return
+	}
+	if err := materializeValidatorDefaults(tx, app.validatorConfig(), orgTable, orgCols, &fields, &args); err != nil {
+		serverErrorJSON(w, r, app, "_groups create", err, "could not resolve defaults")
+		return
+	}
+	beforeRow := make(map[string]any, len(fields))
+	for i, f := range fields {
+		beforeRow[f] = args[i]
+	}
+	injectSessionContext(beforeRow, session)
+	if err := ValidateCrossField(app.validatorConfig(), orgTable, beforeRow); err != nil {
+		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := fireBeforeHooksWith(tx, app, "insert", orgTable, beforeRow); err != nil {
+		httpError(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
+	writeFields, writeArgs, err := sealNativeCiphertextLiterals(tx, app, orgTable, fields, args)
 	if err != nil {
-		httpJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("org insert failed: %s", err.Error())})
+		serverErrorJSON(w, r, app, "_groups create", err, "could not seal encrypted input")
+		return
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(writeFields)), ", ")
+	res, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		quoteIdent(orgTable), strings.Join(quoteIdents(writeFields), ", "), placeholders), writeArgs...)
+	if err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "org insert failed: " + publicConstraintMessage(app, "bootstrap insert "+orgTable, err)})
 		return
 	}
 	var orgID any
 	if app.IsUUIDTable(orgTable) {
 		var uuidID string
-		if err := tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE rowid = last_insert_rowid()", orgTable)).Scan(&uuidID); err != nil {
-			httpError(w, "org insert succeeded but failed to retrieve UUID", http.StatusInternalServerError)
+		if err := tx.QueryRow("SELECT id FROM " + quoteIdent(orgTable) + " WHERE rowid = last_insert_rowid()").Scan(&uuidID); err != nil {
+			serverError(w, r, app, "_groups create", err, "org insert succeeded but failed to retrieve UUID")
 			return
 		}
 		orgID = uuidID
@@ -157,10 +272,6 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 
 	// Founding membership: key=org id, user_field=session identity,
 	// role_field=founding_role when both are declared.
-	memberVal := any(session.UserID)
-	if strings.Contains(group.UserField, "email") {
-		memberVal = session.Email
-	}
 	mFields := []string{group.Key, group.UserField}
 	mArgs := []any{orgID, memberVal}
 	if group.RoleField != "" && boot.FoundingRole != "" {
@@ -173,15 +284,21 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	mPlaceholders := strings.TrimSuffix(strings.Repeat("?, ", len(mFields)), ", ")
 	if _, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		group.Table, strings.Join(mFields, ", "), mPlaceholders), mArgs...); err != nil {
+		quoteIdent(group.Table), strings.Join(quoteIdents(mFields), ", "), mPlaceholders), mArgs...); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
 		httpJSON(w, http.StatusBadRequest, map[string]any{
-			"error": fmt.Sprintf("founding membership insert into %s failed: %s - the org row was rolled back", group.Table, err.Error()),
+			"error": fmt.Sprintf("founding membership insert into %s failed: %s - the org row was rolled back", group.Table, publicConstraintMessage(app, "bootstrap insert "+group.Table, err)),
 		})
 		return
 	}
 
 	if err := tx.Commit(); err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverError(w, r, app, "_groups create", err, "Server error")
 		return
 	}
 
@@ -209,9 +326,15 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 
 	resp := map[string]any{"status": "created", "group_id": orgID}
 	if full, ok := loadInsertedRow(app, orgTable, idStr); ok {
+		sanitizeResponseRows(app, orgTable, []map[string]any{full}, session)
 		resp["org"] = full
 	} else {
-		resp["org"] = orgRow
+		echo := make(map[string]any, len(orgRow))
+		for k, v := range orgRow {
+			echo[k] = v
+		}
+		sanitizeResponseRows(app, orgTable, []map[string]any{echo}, session)
+		resp["org"] = echo
 	}
 	if boot.FoundingRole != "" && group.RoleField != "" {
 		resp["founding_role"] = boot.FoundingRole

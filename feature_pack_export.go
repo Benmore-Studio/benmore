@@ -3,7 +3,9 @@ package main
 // Feature-pack export and source metadata discovery.
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -75,6 +77,18 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 		pack.WholeSource = true
 	}
 
+	// As in the source manifest, hold each directory by handle and match
+	// regular-file opens against lstat. An app may rewrite its tree while
+	// the router exports it; os.Root alone follows in-root symlink aliases.
+	root, err := openTreeDir(dir)
+	if err != nil {
+		return FeaturePack{}, nil, err
+	}
+	defer root.Close()
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return FeaturePack{}, nil, err
+	}
 	files := map[string][]byte{}
 	for p := range selected {
 		if p == "" || featurePackPathProtected(p) {
@@ -84,19 +98,16 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 		if err != nil {
 			return FeaturePack{}, nil, err
 		}
-		info, err := os.Stat(abs)
-		if err != nil || info.IsDir() {
-			if explicitSelected[p] {
-				if err == nil {
-					err = fmt.Errorf("selected path is a directory")
-				}
-				return FeaturePack{}, nil, fmt.Errorf("selected path %s not found: %w", p, err)
-			}
-			continue
-		}
-		b, err := os.ReadFile(abs)
+		rel, err := filepath.Rel(absDir, abs)
 		if err != nil {
 			return FeaturePack{}, nil, err
+		}
+		b, err := readFeaturePackSource(root, rel)
+		if err != nil {
+			if !explicitSelected[p] && (os.IsNotExist(err) || errors.Is(err, errTreeNotRegular) || errors.Is(err, errTreeNotDir)) {
+				continue
+			}
+			return FeaturePack{}, nil, fmt.Errorf("read selected path %s: %w", p, err)
 		}
 		files[p] = b
 		pack.Files = append(pack.Files, FeaturePackFile{Path: p, SHA256: hashBytesSHA256(b), Size: int64(len(b))})
@@ -114,7 +125,7 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 		pack.EnvRefs = appendUniqueMany(pack.EnvRefs, scanFeatureEnvRefs(string(b))...)
 	}
 	if len(modelNames) > 0 {
-		modelSrc, err := os.ReadFile(filepath.Join(dir, "schema.prisma"))
+		modelSrc, err := readFeaturePackSource(root, "schema.prisma")
 		if err != nil {
 			return FeaturePack{}, nil, fmt.Errorf("read schema.prisma for models: %w", err)
 		}
@@ -131,6 +142,39 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 	sort.Strings(pack.StaticAssets)
 	sort.Strings(pack.EnvRefs)
 	return pack, files, nil
+}
+
+// featurePackBeforeRead lets tests deterministically replace a selected file
+// or its parent directory just before the file is opened.
+var featurePackBeforeRead = func(path string) {}
+
+func readFeaturePackSource(top *treeDir, rel string) ([]byte, error) {
+	rel = filepath.Clean(filepath.FromSlash(rel))
+	if rel == "." || !filepath.IsLocal(rel) {
+		return nil, fmt.Errorf("invalid feature source path")
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	dir := top
+	for _, part := range parts[:len(parts)-1] {
+		next, err := dir.openDir(part)
+		if dir != top {
+			dir.Close()
+		}
+		if err != nil {
+			return nil, err
+		}
+		dir = next
+	}
+	if dir != top {
+		defer dir.Close()
+	}
+	featurePackBeforeRead(filepath.ToSlash(rel))
+	f, _, err := dir.openRegular(parts[len(parts)-1])
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 func extractPrismaModels(src string, names []string) ([]FeaturePackModel, error) {

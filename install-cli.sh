@@ -63,6 +63,26 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 asset=${archive_url##*/}
 curl -fsSL -o "$tmp/$asset" "$archive_url" || die "download failed: $archive_url"
 curl -fsSL -o "$tmp/checksums.txt" "$checksums_url" || die "download failed: $checksums_url"
+# checksums.txt only proves the archive matches a file published beside it in
+# the same release. Releases also carry a keyless Sigstore bundle binding
+# checksums.txt to the Benmore release workflow; verify it when cosign is
+# installed. BENMORE_REQUIRE_SIGNATURE=1 makes a missing cosign or bundle fatal.
+bundle_url=$(printf '%s\n' "$release" | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | grep '/checksums\.txt\.sigstore\.json$' | head -1 || true)
+require_sig=${BENMORE_REQUIRE_SIGNATURE:-}
+if ! command -v cosign >/dev/null 2>&1; then
+  [ "$require_sig" != 1 ] || die "BENMORE_REQUIRE_SIGNATURE=1 but cosign is not installed"
+  say "note: cosign not installed; skipped signature verification of checksums.txt (checksum still enforced)"
+elif [ -z "$bundle_url" ]; then
+  [ "$require_sig" != 1 ] || die "release $tag has no checksums.txt.sigstore.json"
+  say "warning: release $tag has no Sigstore bundle; skipped signature verification"
+else
+  curl -fsSL -o "$tmp/checksums.txt.sigstore.json" "$bundle_url" || die "download failed: $bundle_url"
+  cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/ric897/benmore-go/\.github/workflows/release-cli\.yml@refs/tags/cli-v' \
+    "$tmp/checksums.txt" >/dev/null 2>&1 || die "signature verification of checksums.txt failed"
+  say "verified Sigstore signature of checksums.txt"
+fi
 expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$tmp/checksums.txt")
 [ -n "$expected" ] || die "checksums.txt has no entry for $asset"
 if command -v sha256sum >/dev/null 2>&1; then

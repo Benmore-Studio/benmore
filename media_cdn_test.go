@@ -56,4 +56,11 @@ func TestSignCloudFrontURL(t *testing.T) {
 	if _, err := signCloudFrontURL("https://x/y", 1, "K", nil); err == nil {
 		t.Error("expected error for nil key")
 	}
+	// The resource is formatted into policy JSON; anything that could end
+	// the string is refused rather than signed into a different policy.
+	for _, bad := range []string{`https://cdn.example.com/private/app/a","Resource":"*`, `https://cdn.example.com/private/app/a"`, "https://cdn.example.com/private/app/a\n"} {
+		if _, err := signCloudFrontURL(bad, 1900000000, "K123", key); err == nil {
+			t.Errorf("signed a resource that breaks the policy JSON: %q", bad)
+		}
+	}
 }

@@ -183,7 +183,7 @@ func RunTranscribe(ctx context.Context, app *App, input, model, language string)
 
 	// Decode → 16kHz mono WAV (the input whisper.cpp expects).
 	wavPath := filepath.Join(workDir, "audio.wav")
-	ffmpegArgv := []string{ffmpegPath, "-nostdin", "-y", "-i", srcPath, "-ar", "16000", "-ac", "1", "-f", "wav", wavPath}
+	ffmpegArgv := transcribeFFmpegArgv(ffmpegPath, srcPath, wavPath)
 	if err := runTranscribeCmd(ctx, ffmpegArgv, "ffmpeg (audio decode)"); err != nil {
 		return zero, err
 	}
@@ -209,10 +209,29 @@ func RunTranscribe(ctx context.Context, app *App, input, model, language string)
 	return TranscribeResult{Text: strings.TrimSpace(string(raw)), AudioPath: audioRef}, nil
 }
 
+// transcribeInputFormats are the only demuxers ffmpeg may pick for an
+// uploaded file: audio and audio/video containers. ffmpeg probes the input
+// by CONTENT, not extension, so without a list an "audio" upload that is an
+// HLS playlist or ffconcat script would make ffmpeg open every URL or local
+// path it names (SSRF, and reads of other files on the host decoded into
+// the transcript). Each entry is matched against a demuxer's name list.
+const transcribeInputFormats = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,ogg,mp3,wav,flac,aac,asf,avi,mpeg,mpegts,amr,caf,aiff,w64"
+
+// transcribeFFmpegArgv builds the decode command: src → 16kHz mono WAV.
+// Input options must precede -i. The protocol whitelist confines every
+// open, including any nested one, to local files; the `file:` prefix stops
+// a path containing ':' from being read as a protocol name.
+func transcribeFFmpegArgv(ffmpegPath, srcPath, wavPath string) []string {
+	return []string{ffmpegPath, "-nostdin", "-y",
+		"-protocol_whitelist", "file",
+		"-format_whitelist", transcribeInputFormats,
+		"-i", "file:" + srcPath,
+		"-ar", "16000", "-ac", "1", "-f", "wav", wavPath}
+}
+
 // execStepTranscribe runs a `run: transcribe` flow step. The step's
-// `with:` values go through the same ${{ }} resolvers as `run: api`
-// fields (interpolateCtx for step outputs/params, InterpolateEnv for
-// env refs). Outputs are published exactly like an api step's envelope:
+// `with:` values go through the same ${{ }} resolver as `run: api`
+// fields (interpolateCtx: step outputs, params and env refs). Outputs are published exactly like an api step's envelope:
 // steps.<id>.outputs.text + steps.<id>.outputs.audio_path.
 //
 // Context: an HTTP-triggered flow inherits the request's lifetime; an
@@ -224,9 +243,9 @@ func execStepTranscribe(ctx *FlowContext, step *FlowStep) error {
 	if cfg == nil || strings.TrimSpace(cfg.File) == "" {
 		return fmt.Errorf("transcribe step missing `with.file:` - point it at an uploaded audio file, e.g. file: uploads/brief.webm (or ${{ steps.item.outputs.audio_url }})")
 	}
-	file := strings.TrimSpace(InterpolateEnv(interpolateCtx(cfg.File, ctx), ctx.App.Dir))
-	model := strings.TrimSpace(InterpolateEnv(interpolateCtx(cfg.Model, ctx), ctx.App.Dir))
-	language := strings.TrimSpace(InterpolateEnv(interpolateCtx(cfg.Language, ctx), ctx.App.Dir))
+	file := strings.TrimSpace(interpolateCtx(cfg.File, ctx))
+	model := strings.TrimSpace(interpolateCtx(cfg.Model, ctx))
+	language := strings.TrimSpace(interpolateCtx(cfg.Language, ctx))
 
 	goCtx := context.Background()
 	if ctx.Request != nil {
@@ -281,7 +300,11 @@ func resolveTranscribeInput(ctx context.Context, app *App, input string, cfg tra
 		// off-platform / local-disk deployments (getPlatformMedia()==nil) are a
 		// no-op. The ORIGINAL url is still what we publish as audio_path.
 		fetchURL := in
-		if signed, ok := signPrivateCDNURLForApp(app, in); ok {
+		signed, ok, err := signPrivateCDNURLForApp(app, in)
+		if err != nil {
+			return "", "", noop, err
+		}
+		if ok {
 			fetchURL = signed
 		}
 		path, cleanup, err := downloadTranscribeURL(ctx, fetchURL, cfg)
@@ -316,39 +339,32 @@ func resolveTranscribeInput(ctx context.Context, app *App, input string, cfg tra
 
 // signPrivateCDNURLForApp returns a short-TTL signed CloudFront URL for
 // rawURL when, and only when, it is THIS app's own PRIVATE platform-CDN
-// object (host == the media CDN domain and key == private/<app-prefix>/…).
+// object (cdnURLForServe: the media CDN host and private/<app-prefix>/…).
 // Private CDN objects are stored unsigned and 403 a direct GET, so a
 // server-side transcribe fetch of a private audio_url needs a signature.
 // Scoping to the app's own private prefix means it can never sign another
-// app's file or a public object. Returns ("", false) - a safe no-op - when
-// the platform media CDN is not configured, the URL isn't a CDN object, or
-// it isn't this app's private object, so nothing changes off-platform or in
-// tests. The TTL is deliberately short (a signed URL is a bearer credential;
-// see signCloudFrontURL) and only has to outlive the immediate download.
-func signPrivateCDNURLForApp(app *App, rawURL string) (string, bool) {
+// app's file or a public object. Returns ("", false, nil) - a safe no-op -
+// when the platform media CDN is not configured, the URL isn't a CDN object,
+// or it isn't this app's private object, so nothing changes off-platform or
+// in tests. A signing failure is an error: fetching the object unsigned
+// would only surface as a misleading 403. The TTL is deliberately short (a
+// signed URL is a bearer credential; see signCloudFrontURL) and only has to
+// outlive the immediate download.
+func signPrivateCDNURLForApp(app *App, rawURL string) (string, bool, error) {
 	cfg := getPlatformMedia()
 	if cfg == nil || app == nil {
-		return "", false
+		return "", false, nil
 	}
-	u, err := neturl.Parse(rawURL)
-	if err != nil || u.Host != cfg.CDNDomain {
-		return "", false
+	cdnURL, isPrivate, ok := cdnURLForServe(app, rawURL, cfg)
+	if !ok || !isPrivate {
+		return "", false, nil
 	}
-	key := strings.TrimPrefix(u.Path, "/")
-	if !strings.HasPrefix(key, "private/"+appMediaPrefix(app)+"/") {
-		return "", false
-	}
-	expires := time.Now().Add(2 * time.Minute).Unix()
-	signed, err := signCloudFrontURL(rawURL, expires, cfg.KeyPairID, cfg.PrivateKey)
+	signed, err := signPrivateMediaURL(app, cfg, cdnURL, 2*time.Minute)
 	if err != nil {
-		// Log before the unsigned fallback - otherwise a misconfigured
-		// CloudFront key pair (bad private key, wrong key-pair ID) is
-		// invisible here and only surfaces downstream as a misleading
-		// "audio URL must be publicly readable" 4xx from the plain GET.
-		log.Printf("transcribe: signCloudFrontURL failed for %s (falling back to unsigned, which will likely 403): %s", key, err)
-		return "", false
+		log.Printf("transcribe: %v", err)
+		return "", false, fmt.Errorf("transcribe: could not sign this app's private media URL for download: %w", err)
 	}
-	return signed, true
+	return signed, true, nil
 }
 
 // maxAudioDownload caps a URL-input download - a recording, not a

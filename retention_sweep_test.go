@@ -22,7 +22,7 @@ func TestRetentionKeysToDeleteKeepsExpectedWindows(t *testing.T) {
 		{Key: "app/pre-deploy-20260610-120000.db.gz"},     // pre-deploy > 7d
 		{Key: "app/litestream/20260623T120000Z/wal/x.gz"}, // unrelated PITR object
 	}
-	got := retentionKeysToDelete(objs, now)
+	got := retentionKeysToDeleteForApps(objs, now, map[string]bool{"app": true})
 	want := []string{
 		"app/2026-05-01-00.db.gz",
 		"app/2026-06-14-01.db.gz",
@@ -55,5 +55,20 @@ func TestLitestreamKeysToDeleteGCsOldGenerationsAtomically(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("litestreamKeysToDelete = %#v, want %#v", got, want)
+	}
+}
+
+func TestRetentionKeepsNewestSnapshotForEveryIdleApp(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	objects := []S3Object{
+		{Key: "idle/2026-08-01-12.db.gz"},
+		{Key: "idle/2026-07-01-12.db.gz"},
+		{Key: "other/pre-deploy-20260801-120000.db.gz"},
+		{Key: "other/2026-07-01-12.db.gz"},
+		{Key: "invalid/not-a-snapshot"},
+	}
+	want := []string{"idle/2026-07-01-12.db.gz", "other/2026-07-01-12.db.gz"}
+	if got := retentionKeysToDeleteForApps(objects, now, map[string]bool{"idle": true, "other": true}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("deleted=%v want=%v", got, want)
 	}
 }

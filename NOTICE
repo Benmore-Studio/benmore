@@ -20,3 +20,8 @@ Transitive dependencies (e.g. dlclark/regexp2, go-sourcemap/sourcemap,
 google/pprof, google/uuid, gorilla/css, shopspring/decimal) are likewise
 permissively licensed. Run `go mod download` and consult each module's LICENSE
 file for the authoritative text.
+
+The embedded MCP Apps browser bundle (embedded/mcp-apps/, vendored from the npm
+package @modelcontextprotocol/ext-apps 2.0.3, bundling @modelcontextprotocol/client,
+@modelcontextprotocol/core, zod and content-type) is used under MIT and Apache-2.0.
+The license texts and exact provenance are in embedded/mcp-apps/.

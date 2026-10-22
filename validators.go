@@ -3,12 +3,14 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
 	"strings"
-
-	"gopkg.in/yaml.v3"
+	"time"
 )
 
 // Cross-field validators: declarative rules that check relationships between
@@ -39,9 +41,12 @@ func LoadValidators(dir string) *ValidatorConfig {
 	if err != nil {
 		return nil
 	}
+	return parseValidatorsYAML(data)
+}
 
+func parseValidatorsYAML(data []byte) *ValidatorConfig {
 	var raw map[string][]ValidatorRule
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		log.Printf("WARN: validators.yaml parse error: %s", err)
 		return nil
 	}
@@ -85,6 +90,7 @@ func ValidateCrossField(config *ValidatorConfig, table string, data map[string]a
 // evaluateCrossFieldExpr evaluates an expression where BOTH sides can be field names.
 // "end_date > start_date" resolves both end_date and start_date from data.
 // "value >= 0" resolves value from data and treats 0 as a literal.
+// The write gate mirrors how it finds the comparison (splitCrossFieldRule).
 func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
 	for _, op := range []string{"!=", ">=", "<=", "=", ">", "<"} {
 		idx := strings.Index(expr, " "+op+" ")
@@ -104,31 +110,19 @@ func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
 		case "!=":
 			return leftVal != rightVal
 		case ">", ">=", "<", "<=":
-			var lf, rf float64
-			_, lErr := fmt.Sscanf(leftVal, "%f", &lf)
-			_, rErr := fmt.Sscanf(rightVal, "%f", &rf)
-			if lErr == nil && rErr == nil {
-				switch op {
-				case ">":
-					return lf > rf
-				case ">=":
-					return lf >= rf
-				case "<":
-					return lf < rf
-				case "<=":
-					return lf <= rf
-				}
+			order, ok := crossFieldCompare(leftVal, rightVal)
+			if !ok {
+				return false
 			}
-			// Fall back to string comparison (works for dates in ISO format)
 			switch op {
 			case ">":
-				return leftVal > rightVal
+				return order > 0
 			case ">=":
-				return leftVal >= rightVal
+				return order >= 0
 			case "<":
-				return leftVal < rightVal
+				return order < 0
 			case "<=":
-				return leftVal <= rightVal
+				return order <= 0
 			}
 		}
 	}
@@ -136,6 +130,52 @@ func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
 	// No operator found - treat as truthy check
 	val := resolveFieldOrLiteral(expr, data)
 	return val != "" && val != "0" && val != "<nil>"
+}
+
+// crossFieldDateLayouts are the ISO-8601 date and date-time shapes an
+// ordering rule compares as instants (a zone-less value reads as UTC;
+// fractional seconds are accepted after the seconds field), plus the text
+// of a scanned DATETIME value (time.Time's String form).
+var crossFieldDateLayouts = []string{
+	"2006-01-02",
+	time.RFC3339,
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04:05",
+	"2006-01-02 15:04:05Z07:00",
+	"2006-01-02T15:04",
+	"2006-01-02 15:04",
+	"2006-01-02 15:04:05.999999999 -0700 MST",
+}
+
+func crossFieldInstant(s string) (time.Time, bool) {
+	for _, layout := range crossFieldDateLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// crossFieldCompare orders two operands of a `<`/`>`/`<=`/`>=` rule: as
+// numbers when each whole operand is one, as instants when each is an
+// ISO-8601 date or date-time, otherwise as text. A numeric PREFIX is never
+// read as the number ("2024-03-05" is not 2024, "12abc" is not 12). ok is
+// false when the numbers can't be ordered (NaN): every comparison fails.
+func crossFieldCompare(a, b string) (order int, ok bool) {
+	af, aErr := strconv.ParseFloat(strings.TrimSpace(a), 64)
+	bf, bErr := strconv.ParseFloat(strings.TrimSpace(b), 64)
+	if aErr == nil && bErr == nil {
+		if math.IsNaN(af) || math.IsNaN(bf) {
+			return 0, false
+		}
+		return cmp.Compare(af, bf), true
+	}
+	if at, ok := crossFieldInstant(strings.TrimSpace(a)); ok {
+		if bt, ok := crossFieldInstant(strings.TrimSpace(b)); ok {
+			return at.Compare(bt), true
+		}
+	}
+	return strings.Compare(a, b), true
 }
 
 // resolveFieldOrLiteral tries to look up a value from data by field name.

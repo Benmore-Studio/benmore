@@ -22,8 +22,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // frameworkTables enumerates the internal tables the runtime creates
@@ -184,6 +182,11 @@ func CrossFileWarnings(appDir, writtenPath string) []string {
 		}
 	}
 
+	// access: rules and encrypted tables/columns that name nothing in the
+	// schema (the real table keeps its default; the real column stays
+	// plaintext).
+	warnings = append(warnings, contractCrossFileWarnings(appDir, tables)...)
+
 	// Typo-dir detection. The framework loads files from a fixed set
 	// of named subdirectories - `emails/`, `partials/`, `layouts/`,
 	// `i18n/`, `migrations/`, `tests/`, `flows/`, `static/`,
@@ -271,7 +274,7 @@ func scanHooksRefs(appDir string) []tableRef {
 		return nil
 	}
 	var top map[string]map[string]any
-	if err := yaml.Unmarshal(data, &top); err != nil {
+	if err := yamlUnmarshal(data, &top); err != nil {
 		return nil
 	}
 	known := map[string]bool{
@@ -300,7 +303,7 @@ func scanWorkflowRefs(appDir string) []tableRef {
 	var top map[string]struct {
 		Table string `yaml:"table"`
 	}
-	if err := yaml.Unmarshal(data, &top); err != nil {
+	if err := yamlUnmarshal(data, &top); err != nil {
 		return nil
 	}
 	var refs []tableRef
@@ -323,7 +326,7 @@ func scanFlowsSQLTables(appDir string) []tableRef {
 	}
 	// Try GHA shape first.
 	var ghaFile FlowFileGHA
-	if err := yaml.Unmarshal(data, &ghaFile); err == nil && ghaFile.Jobs != nil {
+	if err := yamlUnmarshal(data, &ghaFile); err == nil && ghaFile.Jobs != nil {
 		var refs []tableRef
 		for jobName, job := range ghaFile.Jobs {
 			for _, step := range job.Steps {
@@ -345,7 +348,7 @@ func scanFlowsSQLTables(appDir string) []tableRef {
 	}
 	// Legacy shape.
 	var legacy map[string]FlowYAML
-	if err := yaml.Unmarshal(data, &legacy); err == nil {
+	if err := yamlUnmarshal(data, &legacy); err == nil {
 		var refs []tableRef
 		for name, fy := range legacy {
 			for _, step := range fy.Steps {
@@ -369,7 +372,7 @@ func scanFlowsSQLTables(appDir string) []tableRef {
 func detectFlowCRUDConflictsInContent(content string, tables map[string]bool) string {
 	// GHA shape first.
 	var ghaFile FlowFileGHA
-	if yaml.Unmarshal([]byte(content), &ghaFile) == nil && ghaFile.On.Request != nil && ghaFile.Jobs != nil {
+	if yamlUnmarshal([]byte(content), &ghaFile) == nil && ghaFile.On.Request != nil && ghaFile.Jobs != nil {
 		method := strings.ToUpper(ghaFile.On.Request.Method)
 		if method == "" {
 			method = "POST"
@@ -378,7 +381,7 @@ func detectFlowCRUDConflictsInContent(content string, tables map[string]bool) st
 	}
 	// Legacy shape.
 	var legacy map[string]FlowYAML
-	if yaml.Unmarshal([]byte(content), &legacy) == nil {
+	if yamlUnmarshal([]byte(content), &legacy) == nil {
 		for name, fy := range legacy {
 			if fy.Trigger == "" {
 				continue
@@ -423,7 +426,7 @@ func detectFlowCRUDConflicts(appDir string, tables map[string]bool) []string {
 
 	// Try GHA shape first.
 	var ghaFile FlowFileGHA
-	if yaml.Unmarshal(data, &ghaFile) == nil && ghaFile.On.Request != nil && ghaFile.Jobs != nil {
+	if yamlUnmarshal(data, &ghaFile) == nil && ghaFile.On.Request != nil && ghaFile.Jobs != nil {
 		method := strings.ToUpper(ghaFile.On.Request.Method)
 		if method == "" {
 			method = "POST"
@@ -436,7 +439,7 @@ func detectFlowCRUDConflicts(appDir string, tables map[string]bool) []string {
 
 	// Legacy shape.
 	var legacy map[string]FlowYAML
-	if yaml.Unmarshal(data, &legacy) == nil {
+	if yamlUnmarshal(data, &legacy) == nil {
 		for name, fy := range legacy {
 			if fy.Trigger == "" {
 				continue

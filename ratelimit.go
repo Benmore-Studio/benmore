@@ -4,8 +4,9 @@ package main
 
 import (
 	"database/sql"
-	"net"
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -33,6 +34,9 @@ type RateLimiter struct {
 type visitor struct {
 	tokens    int
 	lastReset time.Time
+	// denied is set by the first refusal in the current window, so a caller
+	// can log a bucket running dry once per window instead of once per request.
+	denied bool
 }
 
 // NewRateLimiter creates a process-lifetime in-memory rate limiter (the
@@ -114,14 +118,23 @@ func EnsureRateLimitsTable(db *sql.DB) {
 
 // Allow checks if a request from this key should be allowed.
 func (rl *RateLimiter) Allow(key string) bool {
-	if rl.db != nil {
-		return rl.allowShared(key)
-	}
-	return rl.allowLocal(key)
+	ok, _, _ := rl.Check(key)
+	return ok
 }
 
-// allowLocal is the fast in-memory path for single-instance mode.
-func (rl *RateLimiter) allowLocal(key string) bool {
+// Check is Allow plus what a refusal needs: how long until this key's window
+// resets (for a Retry-After header) and whether this is the first refusal in
+// the window (to log a bucket running dry once, not once per request). Both
+// are zero values when the request is allowed. Counting is identical to Allow.
+func (rl *RateLimiter) Check(key string) (allowed bool, retryAfter time.Duration, firstDenial bool) {
+	if rl.db != nil {
+		return rl.checkShared(key)
+	}
+	return rl.checkLocal(key)
+}
+
+// checkLocal is the fast in-memory path for single-instance mode.
+func (rl *RateLimiter) checkLocal(key string) (bool, time.Duration, bool) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -136,20 +149,22 @@ func (rl *RateLimiter) allowLocal(key string) bool {
 			rl.evictStalestLocked()
 		}
 		rl.visitors[key] = &visitor{tokens: rl.rate - 1, lastReset: time.Now()}
-		return true
+		return true, 0, false
 	}
 
 	if v.tokens <= 0 {
-		return false
+		first := !v.denied
+		v.denied = true
+		return false, rl.window - time.Since(v.lastReset), first
 	}
 
 	v.tokens--
-	return true
+	return true, 0, false
 }
 
-// allowShared uses SQLite for cross-instance rate limiting.
+// checkShared uses SQLite for cross-instance rate limiting.
 // Atomic: uses INSERT OR REPLACE with window check in a single transaction.
-func (rl *RateLimiter) allowShared(key string) bool {
+func (rl *RateLimiter) checkShared(key string) (bool, time.Duration, bool) {
 	windowSec := int(rl.window.Seconds())
 
 	// Atomic check-and-increment using SQLite's UPSERT.
@@ -171,18 +186,36 @@ func (rl *RateLimiter) allowShared(key string) bool {
 	`, key, windowSec, windowSec)
 	if err != nil {
 		// On error, fail open (allow the request)
-		return true
+		return true, 0, false
 	}
 
 	// Check if the request was allowed by reading the current count
 	_ = result
 	var count int
-	err = rl.db.QueryRow("SELECT count FROM _benmore_rate_limits WHERE key = ?", key).Scan(&count)
+	var elapsed float64
+	err = rl.db.QueryRow(
+		"SELECT count, (julianday('now') - julianday(window_start)) * 86400 FROM _benmore_rate_limits WHERE key = ?", key,
+	).Scan(&count, &elapsed)
 	if err != nil {
-		return true // fail open
+		return true, 0, false // fail open
 	}
+	if count <= rl.rate {
+		return true, 0, false
+	}
+	// Every request increments the shared counter, so rate+1 is the first
+	// refusal of the window.
+	return false, rl.window - time.Duration(elapsed*float64(time.Second)), count == rl.rate+1
+}
 
-	return count <= rl.rate
+// setRetryAfter writes a Retry-After header in whole seconds, rounded up and
+// never below 1, so a client that waits exactly that long lands in a fresh
+// window rather than one more refusal.
+func setRetryAfter(w http.ResponseWriter, d time.Duration) {
+	secs := int(math.Ceil(d.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
 }
 
 func (rl *RateLimiter) cleanup() {
@@ -277,13 +310,10 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 		// whole thing gave a connection that reconnects per request its
 		// own fresh bucket. SplitHostPort drops the port; fall back to the
 		// raw value if it has no port.
-		host := r.RemoteAddr
-		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			host = h
-		}
-		key := "ip:" + host
+		key := "ip:" + rateLimitClientHost(r)
 
-		if !rl.Allow(key) {
+		if ok, retry, _ := rl.Check(key); !ok {
+			setRetryAfter(w, retry)
 			http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
 			return
 		}
@@ -301,4 +331,12 @@ func AuthRateLimiter() *RateLimiter {
 // nil stop = process-lifetime cleanup (callers that live for the whole process).
 func SharedAuthRateLimiter(db *sql.DB) *RateLimiter {
 	return NewSharedRateLimiter(db, 5, time.Minute, nil)
+}
+
+// rateLimitClientHost returns the host to key per-client limits on: the
+// client address resolved from trusted peers only (client_ip.go). Apps run
+// behind the platform router, whose loopback RemoteAddr would otherwise pool
+// every visitor of an app into one bucket.
+func rateLimitClientHost(r *http.Request) string {
+	return clientIP(r)
 }

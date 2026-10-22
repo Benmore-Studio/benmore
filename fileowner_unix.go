@@ -9,6 +9,7 @@ package main
 // for the stubs.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -59,3 +60,31 @@ func writableByOwningUser(path string) bool {
 		return int(sys.Uid) != os.Geteuid() && st.Mode().Perm()&0200 != 0
 	}
 }
+
+// fileOwnedByProcess checks authority metadata's actual owner, including root services.
+// fileOwnerUID returns the owning uid recorded in info.
+func fileOwnerUID(info os.FileInfo) (uint32, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return stat.Uid, true
+}
+
+func fileOwnedByProcess(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Geteuid()
+}
+
+var errAuthorityLockBusy = errors.New("connector authority lock is busy")
+
+func tryLockAuthorityFile(file *os.File) error {
+	err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return errAuthorityLockBusy
+	}
+	return err
+}
+
+func lockAuthorityFile(file *os.File) error { return syscall.Flock(int(file.Fd()), syscall.LOCK_EX) }
+func unlockAuthorityFile(file *os.File)     { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }

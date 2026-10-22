@@ -12,11 +12,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // LoadFlows reads flows.yaml from the app directory.
@@ -58,6 +61,9 @@ func flowParallelHasSQL(parallel *FlowStep) bool {
 // instead of hitting a nondeterministic data race at runtime. Returns a
 // descriptive error naming the flow, or nil when the flow is safe.
 func flowValidateParallelTx(flow *Flow) error {
+	if err := flowValidateParallelHTTP(flow); err != nil {
+		return err
+	}
 	if flow == nil || !flow.Transaction {
 		return nil
 	}
@@ -94,9 +100,17 @@ func flowValidateParallelTx(flow *Flow) error {
 // validator catches the same case prescriptively so agents fix it
 // before saving - this is just the runtime safety net for any flows
 // that bypassed validation (legacy files on disk, etc.).
-func RegisterFlows(mux *http.ServeMux, app *App, flows []Flow) {
+func RegisterFlows(mux appRouteRegistrar, app *App, flows []Flow) map[string]string {
+	registered := make(map[string]string)
 	for _, flow := range flows {
 		f := flow
+		if f.Command != nil || f.Trigger.Type == "command" {
+			continue
+		}
+		if err := flowValidateTransactionalResponse(&f); err != nil {
+			log.Printf("ERROR: %s - skipping flow registration", err)
+			continue
+		}
 		// H-4: reject SQL-in-parallel-in-transaction at registration time.
 		// Skip registering the offending flow (rather than crash the app)
 		// and log loudly so the author fixes the unsafe shared-*sql.Tx
@@ -127,6 +141,7 @@ func RegisterFlows(mux *http.ServeMux, app *App, flows []Flow) {
 				mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 					executeFlowHTTP(app, &f, w, r)
 				})
+				registered[f.Name] = pattern
 				log.Printf("  flow: %s %s → %s", f.Trigger.Method, f.Trigger.Path, f.Name)
 			}()
 
@@ -143,6 +158,7 @@ func RegisterFlows(mux *http.ServeMux, app *App, flows []Flow) {
 			log.Printf("  flow: cron %s → %s (via persistent scheduler)", f.Trigger.Cron, f.Name)
 		}
 	}
+	return registered
 }
 
 // FireFlowsForEvent triggers all data-event flows for a given table/event.
@@ -171,15 +187,26 @@ const flowsEventFanoutLimit = 32
 var flowsEventSem = make(chan struct{}, flowsEventFanoutLimit)
 
 func runFlowEvent(app *App, f Flow, row map[string]any) {
+	runFlowEventWith(app, f, row, nil)
+}
+
+// runFlowEventWith is runFlowEvent with a hook that sees the finished
+// context (tests).
+func runFlowEventWith(app *App, f Flow, row map[string]any, done func(*FlowContext)) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("FLOW EVENT PANIC [%s]: %v", f.Name, r)
 		}
 	}()
 	ctx := &FlowContext{
-		App:    app,
-		Data:   make(map[string]any),
-		Params: make(map[string]string),
+		App:         app,
+		Data:        make(map[string]any),
+		Params:      make(map[string]string),
+		Writes:      newFlowWriteLog(),
+		RequestKeys: flowEventRowTaint(app, row),
+	}
+	if done != nil {
+		defer done(ctx)
 	}
 	// Seed context with row data
 	for k, v := range row {
@@ -196,16 +223,45 @@ func runFlowEvent(app *App, f Flow, row map[string]any) {
 	}
 	executeSteps(ctx, f.Steps)
 	// Commit or rollback
+	committed := false
 	if ctx.Tx != nil {
 		if ctx.Error != nil {
 			ctx.Tx.Rollback()
+		} else if err := ctx.Tx.Commit(); err != nil {
+			ctx.Error = fmt.Errorf("commit: %w", err)
 		} else {
-			ctx.Tx.Commit()
+			committed = true
 		}
 	}
+	announceFlowWrites(ctx, committed)
 	if ctx.Error != nil {
 		log.Printf("FLOW ERROR [%s] %s", f.Name, ctx.Error)
 	}
+}
+
+// flowEventRowTaint is the request-taint set of a data-event flow. The row is
+// what the caller just wrote, so its columns are request input for the
+// sql_dynamic and enqueue guards, as they were on the write itself. The
+// columns the framework sets (the id, owner, tenant, timestamps and session
+// keys, and their old_* copies) are trusted: realtime scoping reads the owner
+// and tenant from them (sessionlessWriteScope).
+func flowEventRowTaint(app *App, row map[string]any) map[string]bool {
+	trusted := map[string]bool{
+		"id": true, "user_id": true, "created_at": true, "updated_at": true, "deleted_at": true,
+		"user_email": true, "user_role": true, "user_roles": true, "user_group_id": true,
+		"_group_id": true, "_group_key": true,
+	}
+	if app != nil && app.Group != nil && app.Group.Key != "" {
+		trusted[app.Group.Key] = true
+	}
+	keys := make(map[string]bool, len(row))
+	for k := range row {
+		if trusted[k] || trusted[strings.TrimPrefix(k, "old_")] {
+			continue
+		}
+		keys[k] = true
+	}
+	return keys
 }
 
 // The returned error lets internal dispatchers observe failures after a respond
@@ -217,12 +273,60 @@ func executeFlowHTTP(app *App, flow *Flow, w http.ResponseWriter, r *http.Reques
 // scheduledActor is supplied only by the scheduler after owner/permission checks.
 // It never comes from an HTTP header or body and cannot mint a login session.
 func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Request, scheduledActor *Session) (executionErr error) {
+	return executeFlowHTTPAsWithAPIClient(app, flow, w, r, scheduledActor, nil)
+}
+
+// executeFlowHTTPAsWithAPIClient is the package-private native-test seam for
+// running a parsed HTTP flow against a controlled transport. Production callers
+// use executeFlowHTTPAs, which always leaves the client nil and uses the strict
+// SSRF-guarded client. URL validation in execAPIRequest remains unconditional.
+func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter, r *http.Request, scheduledActor *Session, apiClient *http.Client) (executionErr error) {
+	if flow != nil && (flow.Command != nil || flow.Trigger.Type == "command") {
+		return fmt.Errorf("command declarations cannot execute as ordinary HTTP flows")
+	}
+	if err := flowValidateTransactionalResponse(flow); err != nil {
+		serverError(w, r, app, "flow "+flow.Name, err, "Invalid flow configuration")
+		return err
+	}
+	if err := flowValidateParallelHTTP(flow); err != nil {
+		serverError(w, r, app, "flow "+flow.Name, err, "Invalid flow configuration")
+		return err
+	}
+	var strictJSONBody map[string]any
+	if flow.Trigger.StrictJSON {
+		mediaType, _, mediaErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaErr != nil || !strings.EqualFold(mediaType, "application/json") {
+			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
+			return errInvalidStrictJSONRequest
+		}
+		rawBody, readErr := io.ReadAll(io.LimitReader(r.Body, flowStrictJSONMaxBytes+1))
+		if readErr != nil || len(rawBody) > flowStrictJSONMaxBytes {
+			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
+			return errInvalidStrictJSONRequest
+		}
+		var decodeErr error
+		strictJSONBody, decodeErr = decodeStrictFlowJSON(rawBody)
+		if decodeErr != nil {
+			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
+			return errInvalidStrictJSONRequest
+		}
+		r.Body = io.NopCloser(bytes.NewReader(rawBody))
+	}
+	privateFlow, connectorRead := r.Context().Value(appMCPPrivateFlowKey{}).(*appMCPPrivateFlow)
+	if connectorRead && (privateFlow == nil || privateFlow.flow != flow || appMCPReadFlowPolicy(flow) != nil || getSession(app, r) == nil) {
+		http.Error(w, "Connector grant denied", 403)
+		return errAppMCPGrantDenied
+	}
 	// Declarative rate limiting (opt-in via `rate_limit:` on on.request).
 	// Reject over-limit requests with 429 + Retry-After BEFORE any work runs.
 	if flow.RateLimit != nil {
 		key := rateLimitKey(app, flow.RateLimit.Scope, r)
 		if scheduledActor != nil {
 			key = rateLimitKeyForSession(scheduledActor, flow.RateLimit.Scope, r)
+		} else if connectorRead && flow.RateLimit.Scope == "ip" {
+			// A connector call is in-process and has no client address; an
+			// ip bucket would be one bucket shared by every connected user.
+			key = "mcp:u:" + strconv.FormatInt(privateFlow.actor.UserID, 10)
 		}
 		if !flowLimiterFor(app, flow).Allow(key) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(flow.RateLimit.Window.Seconds())))
@@ -234,26 +338,25 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 		}
 	}
 	ctx := &FlowContext{
-		App:     app,
-		Request: r,
-		Writer:  w,
-		Data:    make(map[string]any),
-		Params:  make(map[string]string),
+		App:       app,
+		Request:   r,
+		Writer:    w,
+		apiClient: apiClient,
+		Data:      make(map[string]any),
+		Params:    make(map[string]string),
 		// Taint set: every key written below originates from the inbound
 		// request, so sql_dynamic must treat it as untrusted (see M-1 /
 		// flowDynamicGuardRequestRefs).
 		RequestKeys: make(map[string]bool),
+		Writes:      newFlowWriteLog(),
 	}
 	defer func() { executionErr = ctx.Error }()
 
-	// A purge flow must not send its irreversible-looking success response
-	// before SQLite has actually committed. Ordinary transactional flows retain
-	// their existing streaming behavior; the identity-erasure primitive uses a
-	// small response buffer and flushes it only after a successful commit.
-	var purgeResponse *flowResponseBuffer
-	if flowHasPurgeCurrentUser(flow.Steps) {
-		purgeResponse = newFlowResponseBuffer()
-		ctx.Writer = purgeResponse
+	// Transactional responses stay private until COMMIT succeeds.
+	var responseBuffer *flowResponseBuffer
+	if flow.Transaction {
+		responseBuffer = newFlowResponseBuffer()
+		ctx.Writer = responseBuffer
 	}
 
 	// Extract path params from the original :param definitions
@@ -305,6 +408,17 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else if flow.Verify != "" {
+		// The provider verifiers read the whole body; buffer it under the
+		// same cap as the recipe form first, so an unauthenticated caller
+		// cannot make the process hold an arbitrarily large body.
+		if _, err := readVerifyBody(r); err != nil {
+			if errors.Is(err, errVerifyBodyTooLarge) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "Invalid signature", http.StatusUnauthorized)
+			}
+			return
+		}
 		if !verifyWebhookSignature(flow, r, app.Dir) {
 			http.Error(w, "Invalid signature", http.StatusUnauthorized)
 			return
@@ -330,13 +444,44 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 	// SQL steps. Now any object-shaped JSON body lands the same way as
 	// a form body. Body is restored on r.Body so downstream `parse:`
 	// steps still see it.
-	if scheduledActor != nil || r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+	if connectorRead || scheduledActor != nil || r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
 		ct := strings.ToLower(r.Header.Get("Content-Type"))
 		if strings.Contains(ct, "application/json") && r.Body != nil {
-			rawBody, _ := io.ReadAll(io.LimitReader(r.Body, flowVerifyBodyMaxBytes))
+			rawBody, readErr := io.ReadAll(io.LimitReader(r.Body, flowVerifyBodyMaxBytes+1))
+			if len(flow.Trigger.Inputs) > 0 && (readErr != nil || int64(len(rawBody)) > flowVerifyBodyMaxBytes) {
+				http.Error(w, "Invalid or oversized flow request body", http.StatusBadRequest)
+				return
+			}
 			r.Body = io.NopCloser(bytes.NewReader(rawBody))
 			var data map[string]any
-			if err := json.Unmarshal(rawBody, &data); err == nil {
+			decode := func() error {
+				if flow.Trigger.StrictJSON {
+					data = strictJSONBody
+					return nil
+				}
+				if !connectorRead {
+					return json.Unmarshal(rawBody, &data)
+				}
+				decoder := json.NewDecoder(bytes.NewReader(rawBody))
+				decoder.UseNumber()
+				return decoder.Decode(&data)
+			}
+			if err := decode(); len(flow.Trigger.Inputs) > 0 && (err != nil || data == nil) {
+				http.Error(w, "Flow request body must be a JSON object", http.StatusBadRequest)
+				return
+			} else if err == nil {
+				// A later parse step can consume body values even when query/path
+				// binding wins. Validate every declared body value before skipping it.
+				bodyInputs := make(map[string]FlowInput)
+				for name := range data {
+					if input, ok := flow.Trigger.Inputs[name]; ok {
+						bodyInputs[name] = input
+					}
+				}
+				if err := validateFlowInputValues(bodyInputs, data); err != nil {
+					http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+					return
+				}
 				for k, v := range data {
 					if _, taken := ctx.Params[k]; taken {
 						continue
@@ -382,19 +527,56 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 	//
 	// The check is scoped to requests that actually carry the session
 	// cookie: CSRF is an ambient-credential attack, so a request with no
-	// `_benmore_session` cookie has no victim session to ride and is not a
+	// session cookie has no victim session to ride and is not a
 	// CSRF vector (this also preserves cookieless API/webhook callers).
 	// GET/HEAD/OPTIONS are nullipotent by convention and skip the check.
 	switch r.Method {
 	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-		if c, _ := r.Cookie(sessionCookieName); c != nil && !isBearerAuth(r) && !validateCSRF(r) {
+		// Connector dispatch (connectorRead) is an in-process call whose request
+		// carries no cookie; it is recognized only through an unexported context
+		// value no HTTP request can supply.
+		if c, _ := requestSessionCookie(r); c != nil && !connectorRead && !isBearerAuth(r) && !validateCSRF(r) {
 			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 			return
 		}
 	}
 
+	// Identity keys are server-owned in EVERY flow. Strip any request-supplied
+	// value first: an auth-required flow re-populates them from the session
+	// below, and a public flow must never bind a caller-claimed user id or
+	// tenant (it gets the real identity only if the caller is signed in).
+	stripRequestIdentityKeys(ctx)
+	// Step outputs can shadow request names; retain the declared input values
+	// before that move so both optional and required inputs remain checked.
+	inputValues := make(map[string]any, len(flow.Trigger.Inputs))
+	for name := range flow.Trigger.Inputs {
+		if value, present := ctx.Data[name]; present {
+			inputValues[name] = value
+		}
+	}
+	shadowStepNamedRequestKeys(ctx, flow.Steps)
+	if scheduledActor == nil && flow.Auth != "required" && flow.Role == "" && len(flow.Permissions) == 0 {
+		// Anonymous default: identity placeholders bind SQL NULL.
+		if ctx.NullParams == nil {
+			ctx.NullParams = map[string]bool{}
+		}
+		for _, key := range []string{"user_id", "user_email", "_group_id", "_group_key"} {
+			ctx.Params[key] = ""
+			ctx.NullParams[key] = true
+		}
+		if session := getSession(app, r); session != nil {
+			ctx.privateResponse = true
+			delete(ctx.NullParams, "user_id")
+			delete(ctx.NullParams, "user_email")
+			ctx.Data["user_id"] = session.UserID
+			ctx.Data["user_email"] = session.Email
+			ctx.Params["user_id"] = fmt.Sprint(session.UserID)
+			ctx.Params["user_email"] = session.Email
+		}
+	}
+
 	// Auth enforcement for HTTP-triggered flows
-	if scheduledActor != nil || flow.Auth == "required" || flow.Role != "" {
+	if scheduledActor != nil || flow.Auth == "required" || flow.Role != "" || len(flow.Permissions) > 0 {
 		session := scheduledActor
 		if session == nil {
 			session = getSession(app, r)
@@ -412,6 +594,10 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 		// holding the required role only via the join table was wrongly
 		// denied (and an admin grant via the join table didn't bypass).
 		if flow.Role != "" && !HasAnyRole(session, []string{flow.Role}) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if len(flow.Permissions) > 0 && !scopesWithin(session.Scopes, strings.Join(flow.Permissions, " ")) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -455,10 +641,19 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 			}
 		}
 
-		for _, key := range []string{"user", "user_id", "user_email", "user_role", "_group_id", "_group_key"} {
+		for _, key := range flowIdentityKeys {
 			delete(ctx.Params, key)
 			delete(ctx.NullParams, key)
 			delete(ctx.RequestKeys, key)
+		}
+		// `${{ user.group_id }}` / `${{ user.org_id }}` translate to
+		// user_group_id: the caller's current tenant (an admin's act-as
+		// tenant), as in hooks. Nothing set it for flows, so the only
+		// value it could take was a same-named request field.
+		delete(ctx.Data, "user_group_id")
+		if gid := session.EffectiveGroupID(); gid != "" {
+			ctx.Data["user_group_id"] = gid
+			ctx.Params["user_group_id"] = gid
 		}
 		ctx.Params["user_id"] = fmt.Sprint(session.UserID)
 		ctx.Params["user_email"] = session.Email
@@ -484,6 +679,21 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	if err := validateFlowInputValues(flow.Trigger.Inputs, inputValues); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
+	if connectorRead {
+		closeConn, err := startAppMCPReadFlow(ctx)
+		if err != nil {
+			serverError(w, r, app, "flow "+flow.Name, err, "Connector read unavailable")
+			ctx.Error = err
+			return
+		}
+		defer closeConn()
+	}
+
 	// Async flow: enqueue + respond {job_id, status_url} immediately.
 	// The background worker (StartJobWorker) picks the job up and runs
 	// executeFlowJob with the captured ctx.Data. This dodges the 30s
@@ -496,10 +706,35 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 		for k, v := range ctx.Data {
 			payload[k] = v
 		}
+		// The request-taint set must survive the async boundary, or the
+		// worker runs sql_dynamic with no taint and the M-1 guard never fires.
+		// Written after the copy so a request field of the same name cannot
+		// forge or clear it.
+		if len(ctx.RequestKeys) > 0 {
+			keys := make([]string, 0, len(ctx.RequestKeys))
+			for k := range ctx.RequestKeys {
+				keys = append(keys, k)
+			}
+			payload[flowRequestKeysPayloadField] = keys
+		} else {
+			delete(payload, flowRequestKeysPayloadField)
+		}
+		// Nothing has run yet, so nothing is secret-derived; a request field
+		// of the reserved name must not reach the worker as the secret set.
+		delete(payload, flowSecretKeysPayloadField)
+		// The signed-in caller the job runs for, so the worker can re-check
+		// the account before it acts for them (flowJobActorLive). Written
+		// after the copy, like the taint set, so a request can't set it.
+		if ctx.Session != nil && ctx.Session.UserID > 0 {
+			payload[flowJobActorPayloadField] = snapshotFlowJobActor(ctx.Session)
+		} else {
+			delete(payload, flowJobActorPayloadField)
+		}
 		jobID, jobToken, err := EnqueueJob(app.DB, flow.Name, payload, nil)
 		if err != nil {
-			log.Printf("FLOW ASYNC ENQUEUE ERROR [%s]: %s", flow.Name, err)
-			http.Error(w, "Internal error", http.StatusInternalServerError)
+			id := recordRequestError(r, serverErrorDetail("flow "+flow.Name+" enqueue", err))
+			log.Printf("FLOW ASYNC ENQUEUE ERROR [%s]: %s (request %s)", flow.Name, err, id)
+			answerServerError(w, app, http.StatusInternalServerError, id, err, "Internal error")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -517,30 +752,41 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 
 	// Start transaction if flow requires it
 	var guard *txCommitGuard
-	if flow.Transaction {
+	if flow.Transaction && connectorRead {
+		if err := appMCPReadFlowTransaction(ctx, "BEGIN"); err != nil {
+			ctx.Error = err
+			return
+		}
+		defer appMCPReadFlowTransaction(ctx, "ROLLBACK")
+	} else if flow.Transaction {
 		tx, err := app.DB.Begin()
 		if err != nil {
 			log.Printf("FLOW ERROR [%s] begin tx: %s", flow.Name, err)
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
+			ctx.Error = err
+		} else {
+			ctx.Tx = tx
+			// guard (txCommitGuard, jobs.go) finalizes the *sql.Tx exactly once even
+			// if executeSteps PANICS. recoverMiddleware (host.go/router.go/server.go)
+			// is the OUTERMOST defer and swallows the panic, so without this the stack
+			// unwinds straight past the commit/rollback below and the *sql.Tx is never
+			// finalized: its connection never returns to the pool, and under SQLite WAL
+			// an unreturned write-tx holds the app's write lock UNTIL RESTART - the
+			// sustained "[locks] cleanup error: database is locked" storm. cron.go and
+			// jobs.go already guard their tx paths; this is the HTTP flow route.
+			guard = &txCommitGuard{tx: tx}
+			defer guard.rollbackUnlessHandled()
 		}
-		ctx.Tx = tx
-		// guard (txCommitGuard, jobs.go) finalizes the *sql.Tx exactly once even
-		// if executeSteps PANICS. recoverMiddleware (host.go/router.go/server.go)
-		// is the OUTERMOST defer and swallows the panic, so without this the stack
-		// unwinds straight past the commit/rollback below and the *sql.Tx is never
-		// finalized: its connection never returns to the pool, and under SQLite WAL
-		// an unreturned write-tx holds the app's write lock UNTIL RESTART - the
-		// sustained "[locks] cleanup error: database is locked" storm. cron.go and
-		// jobs.go already guard their tx paths; this is the HTTP flow route (every
-		// browser request), and it was the one holding-lock path they missed.
-		guard = &txCommitGuard{tx: tx}
-		defer guard.rollbackUnlessHandled()
 	}
 
-	executeSteps(ctx, flow.Steps)
+	if ctx.Error == nil {
+		executeSteps(ctx, flow.Steps)
+	}
+	if responseBuffer != nil && responseBuffer.err != nil && ctx.Error == nil {
+		ctx.Error = responseBuffer.err
+	}
 
 	// Commit or rollback transaction
+	committed := false
 	if ctx.Tx != nil {
 		if ctx.Error != nil {
 			ctx.Tx.Rollback()
@@ -548,25 +794,56 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 			if err := ctx.Tx.Commit(); err != nil {
 				log.Printf("FLOW ERROR [%s] commit: %s", flow.Name, err)
 				ctx.Error = err
+			} else {
+				committed = true
 			}
 		}
 		guard.MarkHandled()
 	}
-	if purgeResponse != nil {
-		if ctx.Error == nil {
-			purgeResponse.flushTo(w)
-		} else {
-			// Discard any success body/status produced before a rollback or failed
-			// commit and let the normal error path write to the real response.
+	if connectorRead && flow.Transaction {
+		statement := "COMMIT"
+		if ctx.Error != nil {
+			statement = "ROLLBACK"
+		}
+		if err := appMCPReadFlowTransaction(ctx, statement); err != nil {
+			ctx.Error = err
+		}
+	}
+	// The cause, for the server-side record: a connector read's result
+	// replaces it with a fixed failure code below.
+	failure := ctx.Error
+	if connectorRead && ctx.Error != nil {
+		ctx.Error = appMCPResultFailure("incomplete_result")
+	}
+	announceFlowWrites(ctx, committed)
+	if responseBuffer != nil {
+		// An error handler may deliberately answer after the failed transaction
+		// rolls back. Keep the original failure, and never release an incomplete
+		// buffer or a failed connector read's result.
+		canRespond := ctx.Error == nil || ctx.errorResponse && !connectorRead
+		if canRespond && responseBuffer.err == nil && responseBuffer.status != 0 {
+			responseBuffer.flushTo(w)
+		} else if ctx.Error != nil {
+			// Discard output produced before a rollback or failed commit.
 			ctx.Writer = w
 			ctx.Stopped = false
 		}
 	}
 
+	// A failed flow's request log row carries what broke (failing step, its
+	// type, the error and the step hint), under the request id its answer
+	// carries; the journal keeps the FLOW ERROR lines.
+	requestID := ""
 	if ctx.Error != nil {
-		log.Printf("FLOW ERROR [%s] %s", flow.Name, ctx.Error)
+		requestID = recordRequestError(r, flowFailureDetail(flow, ctx, failure))
+		log.Printf("FLOW ERROR [%s] %s (request %s)", flow.Name, failure, requestID)
 		if !ctx.Stopped {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
+			// A write past the app's storage limit is a capacity condition the
+			// caller can act on, not a server fault.
+			if respondStorageFull(w, app, ctx.Error) {
+				return
+			}
+			answerServerError(w, app, http.StatusInternalServerError, requestID, failure, "Internal error")
 		}
 	}
 
@@ -584,6 +861,10 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 	// knowing the flow was broken. Now we return 500 with a diagnostic
 	// so the route's bad state is visible at the network layer.
 	if !ctx.Stopped {
+		if requestID == "" {
+			requestID = recordRequestError(r, fmt.Sprintf("[flow %s] flow_no_response: %d of %d steps ran without erroring and none responded", flow.Name, ctx.StepsRun, len(flow.Steps)))
+			w.Header().Set(requestIDHeader, requestID)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		resp := map[string]any{
@@ -591,16 +872,18 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 			"flow":           flow.Name,
 			"steps_declared": len(flow.Steps),
 			"steps_run":      ctx.StepsRun,
+			"request_id":     requestID,
 		}
 		if ctx.Error != nil {
 			// A step errored out. Log the granular detail (failing step,
 			// type, raw error, hint) server-side, but DO NOT leak the raw
 			// SQL/step error text to the client - it can expose schema,
 			// query shape, and internal paths. The client gets only a
-			// generic marker; operators correlate via the server log.
-			log.Printf("FLOW ERROR DETAIL [%s] failed_step=%q failed_type=%q error=%s hint=%s",
-				flow.Name, ctx.FailedStep, ctx.FailedType, ctx.Error.Error(),
-				stepFailureHint(ctx.FailedStep, ctx.FailedType, ctx.Error.Error()))
+			// generic marker; operators correlate via the server log and
+			// the request log row of request_id.
+			log.Printf("FLOW ERROR DETAIL [%s] failed_step=%q failed_type=%q error=%s hint=%s request=%s",
+				flow.Name, ctx.FailedStep, ctx.FailedType, errorText(failure),
+				stepFailureHint(ctx.FailedStep, ctx.FailedType, errorText(failure)), requestID)
 			resp["failed_step"] = ctx.FailedStep
 			resp["failed_type"] = ctx.FailedType
 		} else {
@@ -612,9 +895,319 @@ func executeFlowHTTPAs(app *App, flow *Flow, w http.ResponseWriter, r *http.Requ
 
 }
 
+// flowFailureDetail is a failed flow's request log error: the failing step,
+// its type, the error and the step-type hint, as the FLOW ERROR DETAIL line
+// has them. A failure outside a step (begin, commit) has no step.
+func flowFailureDetail(flow *Flow, ctx *FlowContext, failure error) string {
+	msg := errorText(failure)
+	if ctx.FailedStep == "" {
+		return fmt.Sprintf("[flow %s] %s", flow.Name, msg)
+	}
+	return fmt.Sprintf("[flow %s] failed_step=%q failed_type=%q error=%s hint=%s",
+		flow.Name, ctx.FailedStep, ctx.FailedType, msg, stepFailureHint(ctx.FailedStep, ctx.FailedType, msg))
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
+}
+
+// flowRequestKeysPayloadField carries an async flow's request-taint set
+// (FlowContext.RequestKeys) through the job payload to executeFlowJob.
+const flowRequestKeysPayloadField = "__benmore_request_keys"
+
+// flowSecretKeysPayloadField carries the secret-derived keys of an enqueue
+// step's payload (FlowContext.SecretKeys) to the job flow.
+const flowSecretKeysPayloadField = "__benmore_secret_keys"
+
+// flowJobActorPayloadField carries server-owned identity and restrictions for
+// an async HTTP flow. It never contains a reusable credential.
+const flowJobActorPayloadField = "__benmore_job_actor"
+
+type flowJobActorSnapshot struct {
+	Version            int      `json:"version"`
+	UserID             int64    `json:"user_id"`
+	GroupID            string   `json:"group_id"`
+	ActingAsGroup      string   `json:"acting_as_group"`
+	Scopes             string   `json:"scopes"`
+	CredentialScopes   string   `json:"credential_scopes"`
+	Roles              []string `json:"roles"`
+	GlobalAdmin        bool     `json:"global_admin"`
+	ConnectorGrant     bool     `json:"connector_grant"`
+	ImpersonatorUserID int64    `json:"impersonator_user_id"`
+	ImpersonatorEmail  string   `json:"impersonator_email"`
+}
+
+func snapshotFlowJobActor(session *Session) flowJobActorSnapshot {
+	roles := append([]string(nil), session.Roles...)
+	if len(roles) == 0 && session.Role != "" {
+		roles = []string{session.Role}
+	}
+	return flowJobActorSnapshot{
+		Version: 1, UserID: session.UserID, GroupID: session.GroupID,
+		ActingAsGroup: session.ActingAsGroup, Scopes: session.Scopes,
+		CredentialScopes: session.CredentialScopes, Roles: roles,
+		GlobalAdmin: session.IsAdmin(), ConnectorGrant: session.connectorGrant,
+		ImpersonatorUserID: session.ImpersonatorUserID, ImpersonatorEmail: session.ImpersonatorEmail,
+	}
+}
+
+// Numeric actors were queued by older runtimes without their restrictions.
+// Keep those jobs usable, but never infer direct-sign-in authority from them.
+func takeFlowJobActor(data map[string]any) (*flowJobActorSnapshot, error) {
+	raw, ok := data[flowJobActorPayloadField]
+	if !ok {
+		return nil, nil
+	}
+	delete(data, flowJobActorPayloadField)
+	switch raw.(type) {
+	case int, int64, float64, json.Number, string:
+		if id := toInt64(raw); id > 0 {
+			return &flowJobActorSnapshot{UserID: id}, nil
+		}
+	}
+	encoded, err := json.Marshal(raw)
+	var actor flowJobActorSnapshot
+	if err != nil || json.Unmarshal(encoded, &actor) != nil || actor.Version != 1 || actor.UserID <= 0 {
+		return nil, fmt.Errorf("invalid queued flow identity")
+	}
+	return &actor, nil
+}
+
+// takeFlowRequestKeys removes the reserved taint field from a job payload
+// and returns the taint set it carried (nil when absent).
+func takeFlowRequestKeys(data map[string]any) map[string]bool {
+	raw, ok := data[flowRequestKeysPayloadField]
+	if !ok {
+		return nil
+	}
+	delete(data, flowRequestKeysPayloadField)
+	keys := map[string]bool{}
+	switch list := raw.(type) {
+	case []any:
+		for _, k := range list {
+			if s, ok := k.(string); ok && s != "" {
+				keys[s] = true
+			}
+		}
+	case []string:
+		for _, s := range list {
+			if s != "" {
+				keys[s] = true
+			}
+		}
+	}
+	return keys
+}
+
+// takeFlowSecretKeys removes the reserved secret-taint field from a job
+// payload and returns the keys it marked (nil when absent).
+func takeFlowSecretKeys(data map[string]any) map[string]bool {
+	raw, ok := data[flowSecretKeysPayloadField]
+	if !ok {
+		return nil
+	}
+	delete(data, flowSecretKeysPayloadField)
+	return takeFlowRequestKeys(map[string]any{flowRequestKeysPayloadField: raw})
+}
+
+// shadowStepNamedRequestKeys moves request fields whose name is also a step
+// id off the top level of ctx.Data, into flowStepNamedParamsKey. A step's
+// output lives at ctx.Data[<id>], so a same-named request field could stand
+// in for the output of a step that was skipped or hasn't run. The value
+// stays readable as `${{ params.<id> }}` and `:<id>` (ctx.Params).
+//
+// Step ids are not the only names a step writes at the top level: `run:
+// set` writes every one of its keys there, a for_each writes its loop
+// variable (`as:`, default `item`), and an unnamed parse step writes `body`
+// or `form`. A request field with one of those names could stand in for a
+// skipped `set` (`if: ${{ allowed }}` after a set that never ran) the same
+// way. Those names are common request field names, though, and a flow often
+// reads the request's value before the step that redefines the name (an
+// early step reads `text`, a later set writes its own `text`). So a request
+// field named like one of them stays readable by its bare name until
+// execution reaches a step that defines the name - whether that step runs
+// or is skipped - and is shadowed from then on (shadowReachedSteps).
+func shadowStepNamedRequestKeys(ctx *FlowContext, steps []FlowStep) {
+	ids := map[string]bool{}
+	var collect func([]FlowStep)
+	collect = func(list []FlowStep) {
+		for _, s := range list {
+			if s.Name != "" {
+				ids[s.Name] = true
+			}
+			collect(s.Steps)
+			collect(s.ElseSteps)
+			collect(s.OnError)
+		}
+	}
+	collect(steps)
+	idPrefixes := flowNamePrefixes(ids)
+	defined := map[string]bool{}
+	flowDefinedNames(steps, true, defined)
+	definedPrefixes := flowNamePrefixes(defined)
+	shadow := map[string]any{}
+	pending := map[string]bool{}
+	for key := range ctx.RequestKeys {
+		if _, ok := ctx.Data[key]; !ok {
+			continue
+		}
+		switch {
+		case flowRequestKeyNamed(key, ids, idPrefixes):
+			shadow[key] = ctx.Data[key]
+			delete(ctx.Data, key)
+		case flowRequestKeyNamed(key, defined, definedPrefixes):
+			pending[key] = true
+		}
+	}
+	if len(shadow) > 0 {
+		ctx.Data[flowStepNamedParamsKey] = shadow
+	}
+	if len(pending) > 0 {
+		ctx.lazyShadow = &flowLazyShadow{pending: pending}
+	}
+}
+
+// flowLazyShadow is the set of request fields still readable by a bare name
+// that some step in the flow defines.
+type flowLazyShadow struct {
+	mu      sync.Mutex
+	pending map[string]bool
+}
+
+// flowRequestKeyNamed reports whether request key reads like name: the same
+// name, a dotted key under it (`coupon.discount` under `coupon`), or an
+// object that flattens onto a dotted name (`gate` onto `gate.ok`).
+func flowRequestKeyNamed(key string, names, prefixes map[string]bool) bool {
+	head, _, _ := strings.Cut(key, ".")
+	return names[key] || names[head] || prefixes[key]
+}
+
+// flowNamePrefixes returns every proper dotted prefix of the names.
+func flowNamePrefixes(names map[string]bool) map[string]bool {
+	prefixes := map[string]bool{}
+	for name := range names {
+		for i := 1; i < len(name); i++ {
+			if name[i] == '.' {
+				prefixes[name[:i]] = true
+			}
+		}
+	}
+	return prefixes
+}
+
+// flowDefinedNames adds the top-level names the steps write besides their
+// ids: set keys, a for_each loop variable, an unnamed parse step's outputs.
+// deep includes nested steps (blocks, loop bodies, else branches) and every
+// on_error handler; otherwise only the steps' own names and their on_error
+// handlers are added.
+func flowDefinedNames(steps []FlowStep, deep bool, into map[string]bool) {
+	for i := range steps {
+		s := &steps[i]
+		for k := range s.Set {
+			if k != "" {
+				into[k] = true
+			}
+		}
+		if s.Type == "for_each" || s.ForEach != "" {
+			if s.ForAs != "" {
+				into[s.ForAs] = true
+			} else {
+				into["item"] = true
+			}
+		}
+		if s.Type == "parse" && s.Name == "" {
+			into["body"] = true
+			into["form"] = true
+		}
+		flowDefinedNames(s.OnError, true, into)
+		if deep {
+			flowDefinedNames(s.Steps, true, into)
+			flowDefinedNames(s.ElseSteps, true, into)
+		}
+	}
+}
+
+// shadowReachedSteps shadows the pending request fields named like a name
+// the steps define (see flowDefinedNames for deep): execution has reached
+// the point where those names belong to the flow, whether the steps then
+// run or are skipped. A field moves to flowStepNamedParamsKey, so it stays
+// readable as `${{ params.<name> }}` and `:<name>`.
+func shadowReachedSteps(ctx *FlowContext, steps []FlowStep, deep bool) {
+	if ctx == nil || ctx.lazyShadow == nil || len(steps) == 0 {
+		return
+	}
+	ls := ctx.lazyShadow
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if len(ls.pending) == 0 {
+		return
+	}
+	names := map[string]bool{}
+	flowDefinedNames(steps, deep, names)
+	if len(names) == 0 {
+		return
+	}
+	prefixes := flowNamePrefixes(names)
+	ctx.DataMu.Lock()
+	defer ctx.DataMu.Unlock()
+	var store map[string]any
+	for key := range ls.pending {
+		if !flowRequestKeyNamed(key, names, prefixes) {
+			continue
+		}
+		delete(ls.pending, key)
+		v, ok := ctx.Data[key]
+		if !ok {
+			continue
+		}
+		if store == nil {
+			// A new map, not an edit in place (flows_flat_cache.go).
+			store = map[string]any{}
+			if old, ok := ctx.Data[flowStepNamedParamsKey].(map[string]any); ok {
+				maps.Copy(store, old)
+			}
+		}
+		store[key] = v
+		delete(ctx.Data, key)
+	}
+	if store != nil {
+		ctx.Data[flowStepNamedParamsKey] = store
+	}
+}
+
+// flowIdentityKeys are set only by the runtime from the authenticated
+// session; request input may never supply them.
+var flowIdentityKeys = []string{"user", "user_id", "user_email", "user_role", "user_group_id", "_group_id", "_group_key"}
+
+// stripRequestIdentityKeys removes request-supplied identity values (and any
+// `user.*` dotted keys) from a flow context before execution.
+func stripRequestIdentityKeys(ctx *FlowContext) {
+	drop := func(key string) {
+		delete(ctx.Data, key)
+		delete(ctx.Params, key)
+		delete(ctx.NullParams, key)
+		delete(ctx.RequestKeys, key)
+	}
+	for _, key := range flowIdentityKeys {
+		drop(key)
+	}
+	// `user.*` is the session's; `env` / `env.*` is the app environment.
+	// A request field under either name would shadow them in templates.
+	reserved := func(key string) bool {
+		return strings.HasPrefix(key, "user.") || key == "env" || strings.HasPrefix(key, "env.") ||
+			key == flowStepNamedParamsKey || strings.HasPrefix(key, flowStepNamedParamsKey+".")
+	}
+	for key := range ctx.Data {
+		if reserved(key) {
+			drop(key)
+		}
+	}
+	for key := range ctx.Params {
+		if reserved(key) {
+			drop(key)
+		}
+	}
 }

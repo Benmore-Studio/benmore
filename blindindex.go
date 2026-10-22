@@ -44,6 +44,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -172,32 +173,50 @@ func BlindIndexColumnsForTable(config *EncryptedFieldConfig, table string) map[s
 //     would forbid that and break equality search
 //
 // Index gives the query planner a B-tree to seek on, no more.
-func EnsureBlindColumns(db *sql.DB, config *EncryptedFieldConfig) {
+func EnsureBlindColumns(db *sql.DB, config *EncryptedFieldConfig) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := ensureBlindColumnsWith(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func ensureBlindColumnsWith(db mutationTx, config *EncryptedFieldConfig) error {
 	if config == nil {
-		return
+		return nil
 	}
 	for table, defs := range config.Fields {
 		for _, d := range defs {
 			if !d.BlindIndex {
 				continue
 			}
+			if !membershipIdentRe.MatchString(table) || !membershipIdentRe.MatchString(d.Column) {
+				return fmt.Errorf("blind index %q.%q is not a plain table and column name", table, d.Column)
+			}
+			cols, err := mainTableColumnsWith(db, table)
+			if err != nil {
+				return err
+			}
+			if !versionHasColumn(cols, d.Column) {
+				return fmt.Errorf("blind index %s.%s: source column does not exist", table, d.Column)
+			}
 			blindCol := d.Column + blindColSuffix
-			var count int
-			_ = db.QueryRow(
-				"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
-				table, blindCol).Scan(&count)
-			if count == 0 {
-				stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT", table, blindCol)
-				if _, err := db.Exec(stmt); err != nil {
-					log.Printf("BLIND COLUMN ERROR [%s.%s]: %s", table, blindCol, err)
-					continue
+			if !versionHasColumn(cols, blindCol) {
+				if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT", table, blindCol)); err != nil {
+					return fmt.Errorf("blind column %s.%s: %w", table, blindCol, err)
 				}
 			}
 			idxName := fmt.Sprintf("idx_blind_%s_%s", table, d.Column)
-			_, _ = db.Exec(fmt.Sprintf(
-				"CREATE INDEX IF NOT EXISTS %s ON %s(%s)", idxName, table, blindCol))
+			if _, err := db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", idxName, table, blindCol)); err != nil {
+				return fmt.Errorf("blind index %s: %w", idxName, err)
+			}
 		}
 	}
+	return nil
 }
 
 // InstallBlindIndexTriggers creates INSERT and UPDATE triggers that
@@ -219,22 +238,52 @@ func EnsureBlindColumns(db *sql.DB, config *EncryptedFieldConfig) {
 // Idempotency: triggers are named with a stable scheme and dropped/
 // recreated each boot. The blind trigger's WHEN clause excludes NULL
 // (so a row with no email stays NULL on the blind column too).
-func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) {
+func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := installBlindIndexTriggersWith(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func installBlindIndexTriggersWith(db mutationTx, config *EncryptedFieldConfig) error {
+	return installBlindIndexTriggersMode(db, config, true)
+}
+
+func installBlindIndexTriggersMode(db mutationTx, config *EncryptedFieldConfig, replace bool) error {
 	if config == nil {
-		return
+		return nil
 	}
 	// Drop any pre-existing blind triggers so renames/removes propagate.
-	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '_benmore_blind_%'")
-	if err == nil {
+	if replace {
+		rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '_benmore_blind_%'")
+		if err != nil {
+			return err
+		}
 		var existing []string
 		for rows.Next() {
-			var n string
-			rows.Scan(&n)
-			existing = append(existing, n)
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return err
+			}
+			existing = append(existing, name)
 		}
-		rows.Close()
-		for _, n := range existing {
-			db.Exec("DROP TRIGGER IF EXISTS " + n)
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, name := range existing {
+			if _, err := db.Exec("DROP TRIGGER IF EXISTS " + quoteIdent(name)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -245,6 +294,9 @@ func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 				continue
 			}
 			col := d.Column
+			if !membershipIdentRe.MatchString(table) || !membershipIdentRe.MatchString(col) {
+				return fmt.Errorf("blind index %q.%q is not a plain table and column name", table, col)
+			}
 			blindCol := col + blindColSuffix
 
 			// AFTER INSERT - populate blind from the raw INSERT value.
@@ -260,7 +312,7 @@ func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 				triggerName, table, col, col, table, blindCol, col,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
-				log.Printf("BLIND TRIGGER ERROR [%s]: %s", triggerName, err)
+				return fmt.Errorf("blind trigger %s: %w", triggerName, err)
 			} else {
 				installed++
 			}
@@ -275,7 +327,7 @@ func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 				triggerName, col, table, col, col, table, blindCol, col,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
-				log.Printf("BLIND TRIGGER ERROR [%s]: %s", triggerName, err)
+				return fmt.Errorf("blind trigger %s: %w", triggerName, err)
 			} else {
 				installed++
 			}
@@ -288,6 +340,7 @@ func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 	if installed > 0 {
 		log.Printf("BLIND INDEX: installed %d triggers", installed)
 	}
+	return nil
 }
 
 // RebuildAllBlindIndices recomputes every `<col>_blind` value under
@@ -331,6 +384,12 @@ func RebuildAllBlindIndices(app *App) (int, error) {
 	return total, nil
 }
 
+// blindBackfillRefusal is a backfill refusal written for the operator who
+// asked for it; a database failure is reported through serverErrorJSON.
+type blindBackfillRefusal struct{ msg string }
+
+func (e *blindBackfillRefusal) Error() string { return e.msg }
+
 // backfillBlindIndexOne computes `<col>_blind` for every row of `table`
 // where the source column has a value. Used by:
 //   - the per-app backfill endpoint (one-shot agent-driven catch-up)
@@ -346,10 +405,10 @@ func RebuildAllBlindIndices(app *App) (int, error) {
 // dryRun=true counts rows without writing.
 func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error) {
 	if app == nil || app.DB == nil {
-		return 0, fmt.Errorf("app not initialised")
+		return 0, &blindBackfillRefusal{"app not initialised"}
 	}
 	if !isValidColumnName(table) || !isValidColumnName(col) {
-		return 0, fmt.Errorf("invalid identifier")
+		return 0, &blindBackfillRefusal{"invalid identifier"}
 	}
 	blindCol := col + blindColSuffix
 	// Verify the blind column actually exists (defensive - boot path
@@ -360,16 +419,16 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error
 		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
 		table, blindCol).Scan(&exists)
 	if exists == 0 {
-		return 0, fmt.Errorf("blind column %s.%s does not exist (restart the app after enabling blind_index)", table, blindCol)
+		return 0, &blindBackfillRefusal{fmt.Sprintf("blind column %s.%s does not exist (restart the app after enabling blind_index)", table, blindCol)}
 	}
-	// Pull (id, plaintext). The framework's QueryRows wrapper auto-
-	// decrypts via DecryptRowFields → so what comes back IS the
-	// plaintext, even though the on-disk value is ciphertext.
+	// Pull (id, plaintext) using the configured physical source column.
+	// Ordinary fields never gain decryption authority from a value prefix.
 	// rowid (not id): backfill must work for tables whose PK column is not
 	// named `id` (e.g. account_id TEXT PRIMARY KEY) — same reason the
 	// encryption/blind-index triggers use NEW.rowid. rowid == id for
 	// INTEGER PRIMARY KEY tables, so this is fully backward-compatible.
-	rows, err := QueryRows(app.DB, fmt.Sprintf("SELECT rowid, %s FROM %s WHERE %s IS NOT NULL AND %s != ''", col, table, col, col))
+	source := quoteColumn(table, col)
+	rows, err := queryNativeRowsWith(app.DB, app, table, fmt.Sprintf("SELECT rowid, %s FROM %s WHERE %s IS NOT NULL AND %s != ''", source, quoteIdent(table), source, source))
 	if err != nil {
 		return 0, err
 	}
@@ -415,7 +474,7 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error
 		// encryption trigger (different column) or the blind trigger
 		// (which watches UPDATE OF the source col only).
 		if _, err := app.DB.Exec(
-			fmt.Sprintf("UPDATE %s SET %s = ? WHERE rowid = ?", table, blindCol),
+			"UPDATE "+quoteIdent(table)+" SET "+quoteIdent(blindCol)+" = ? WHERE rowid = ?",
 			hash, idStr,
 		); err != nil {
 			return updated, err
@@ -434,10 +493,10 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error
 // Admin-only, audit-logged. Symmetric with the encryption backfill +
 // rotation endpoints (item 4 + item 7 in the enterprise-hardening
 // roadmap).
-func RegisterBlindIndexRoutes(mux *http.ServeMux, app *App) {
+func RegisterBlindIndexRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_internal/blind/backfill", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -471,8 +530,13 @@ func RegisterBlindIndexRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 		n, err := backfillBlindIndexOne(app, body.Table, body.Column, !body.Confirm)
+		var refusal *blindBackfillRefusal
+		if errors.As(err, &refusal) {
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": refusal.Error()})
+			return
+		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			serverErrorJSON(w, r, app, "blind index backfill", err, "backfill failed")
 			return
 		}
 		// Audit only on real writes - dry-run is read-only.
@@ -516,6 +580,113 @@ func applyBlindIndexRewrite(app *App, table, col, plaintext string) (string, str
 		return col, plaintext, false
 	}
 	return col + blindColSuffix, hash, true
+}
+
+// blindFilterAccess is how far a caller may use a blind index as a filter.
+type blindFilterAccess int
+
+const (
+	blindFilterRefused blindFilterAccess = iota
+	blindFilterOwnRows
+	blindFilterTenantRows
+	blindFilterOwnerOrTenantRows
+	blindFilterAllRows
+)
+
+// blindFilterAccessFor decides whether `session` may filter (or sort) `table`
+// by the blind index of encrypted column `col`. A blind-index equality
+// filter is a plaintext ORACLE: `?ssn=123-45-6789` answers "does any row I
+// can list hold this value" even when every value in the response comes
+// back masked. So it is honored only where the caller would see the
+// plaintext anyway - the same unmask decision MaskEncryptedFields makes:
+//
+//   - column has no unmask roles, caller is an admin, or holds an unmask
+//     role                                      → all rows in scope
+//   - tenant-only role → matching tenant rows only
+//   - `self`/`owner` unmask on a user_id table → the caller's OWN rows
+//     (combined with tenant rows when both grants are configured)
+//   - otherwise                                 → refused
+func blindFilterAccessFor(app *App, table, col string, session *Session) blindFilterAccess {
+	if app == nil || app.Encrypted == nil {
+		return blindFilterAllRows
+	}
+	for _, def := range app.Encrypted.Fields[table] {
+		if def.Column != col {
+			continue
+		}
+		access := encryptedFieldAccessFor(app, app.DB, table, def, session)
+		switch {
+		case access.allRows:
+			return blindFilterAllRows
+		case access.tenantColumn != "" && access.ownerID != 0:
+			return blindFilterOwnerOrTenantRows
+		case access.tenantColumn != "":
+			return blindFilterTenantRows
+		case access.ownerID != 0:
+			return blindFilterOwnRows
+		default:
+			return blindFilterRefused
+		}
+	}
+	return blindFilterAllRows
+}
+
+// blindFilterColumn maps a filter/sort column onto the blind-indexed source
+// column it probes: `email` (equality/IN only - other operators on an
+// encrypted column are dropped, not rewritten) or the explicit sibling
+// `email_blind` (any operator). ok=false when the column is not a blind
+// index probe.
+func blindFilterColumn(blindCols map[string]bool, col, op string) (string, bool) {
+	if blindCols[col] {
+		return col, op == "=" || op == "IN"
+	}
+	if base := strings.TrimSuffix(col, blindColSuffix); base != col && blindCols[base] {
+		return base, true
+	}
+	return "", false
+}
+
+// blindFilterRefusal returns the first column the request filters or sorts
+// on through a blind index that the caller may not use (see
+// blindFilterAccessFor), or "". Own-rows callers pass here; the rewrite in
+// applyAPIWhereWithApp restricts their probe to rows they own.
+func blindFilterRefusal(r *http.Request, app *App, table string, session *Session) string {
+	if app == nil || app.Encrypted == nil {
+		return ""
+	}
+	blindCols := BlindIndexColumnsForTable(app.Encrypted, table)
+	if len(blindCols) == 0 {
+		return ""
+	}
+	q := r.URL.Query()
+	for key := range q {
+		if apiFilterReservedParam(key) {
+			continue
+		}
+		col, op := splitAPIFilterKey(key)
+		if col == "" {
+			continue
+		}
+		if base, probe := blindFilterColumn(blindCols, col, op); probe && blindFilterAccessFor(app, table, base, session) == blindFilterRefused {
+			return base
+		}
+	}
+	sortCol := q.Get("sort")
+	if ob := q.Get("orderBy"); sortCol == "" && ob != "" {
+		sortCol = strings.SplitN(ob, ":", 2)[0]
+	}
+	if base := strings.TrimSuffix(sortCol, blindColSuffix); base != sortCol && blindCols[base] &&
+		blindFilterAccessFor(app, table, base, session) != blindFilterAllRows {
+		return base
+	}
+	return ""
+}
+
+// writeBlindFilterRefusal renders the refusal for a blind-index probe.
+func writeBlindFilterRefusal(w http.ResponseWriter, table, col string) {
+	httpJSON(w, http.StatusForbidden, map[string]any{
+		"error": fmt.Sprintf("filtering %s by encrypted column %s is not allowed: you would see %s masked, and an equality filter would confirm guessed values. Only callers in the column's unmask roles (encrypted.yaml) may filter on it; `self`/`owner` unmask allows filtering your own rows.", table, col, col),
+	})
 }
 
 // blindKeyMatchesEncryptionKey is a debug helper used only by tests -

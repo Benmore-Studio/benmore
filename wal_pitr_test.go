@@ -63,12 +63,18 @@ func TestWALCheckpointModeWaitsForShipping(t *testing.T) {
 	// happen (a half-configured deployment keeps truncating instead of bloating).
 	t.Setenv("BACKUP_S3_BUCKET", "test-bucket")
 	app := &App{Dir: "/apps/example"}
+	if !platformBuild {
+		if walShippingEnabledForApp(app) || walCheckpointMode(app, 2048) != "TRUNCATE" {
+			t.Fatal("edition without a shipper must retain ordinary checkpoint behavior")
+		}
+		return
+	}
 	app.walShippedOffset.Store(1024)
 	if got := walCheckpointMode(app, 2048); got != "PASSIVE" {
 		t.Fatalf("walCheckpointMode behind = %s, want PASSIVE", got)
 	}
 	app.walShippedOffset.Store(2048)
-	if got := walCheckpointMode(app, 2048); got != "TRUNCATE" {
-		t.Fatalf("walCheckpointMode caught up = %s, want TRUNCATE", got)
+	if got := walCheckpointMode(app, 2048); got != "PASSIVE" {
+		t.Fatalf("physical length is not checkpoint permission: got %s, want PASSIVE", got)
 	}
 }

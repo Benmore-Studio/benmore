@@ -120,6 +120,34 @@ func TestGuardRestoreStatementAllowsWithCTE(t *testing.T) {
 	}
 }
 
+// Pins the Mode B boundary security.md 31i documents: DML may reach
+// framework tables (owner authority, same as sql write:true), table-valued
+// pragma functions pass the word-anchored PRAGMA check, and schema objects
+// that would outlive the restore (triggers, views) are refused.
+func TestGuardRestoreStatementDocumentedBoundary(t *testing.T) {
+	for _, stmt := range []string{
+		"WITH c AS (SELECT 1) INSERT INTO _benmore_sessions (id) SELECT 'x' FROM c",
+		"REPLACE INTO _benmore_user_roles (user_id, role) VALUES (1, 'admin')",
+		"INSERT INTO t (name) SELECT name FROM pragma_table_info('t')",
+	} {
+		if err := guardRestoreStatement(stmt); err != nil {
+			t.Errorf("documented-allowed statement rejected: %q: %v", stmt, err)
+		}
+	}
+	for _, stmt := range []string{
+		"CREATE TRIGGER t1 AFTER INSERT ON t BEGIN DELETE FROM t; END",
+		"CREATE VIEW v AS SELECT 1",
+		"DROP VIEW v",
+		"END",
+		"PRAGMA writable_schema=ON",
+		"INSERT INTO t SELECT load_extension('x')",
+	} {
+		if err := guardRestoreStatement(stmt); err == nil {
+			t.Errorf("documented-refused statement accepted: %q", stmt)
+		}
+	}
+}
+
 // TestRunSQLRestoreCommitCannotBreakAtomicity is the end-to-end
 // regression for the reviewer's most serious finding: a script that
 // smuggles a COMMIT after a real row-producing statement must not be

@@ -128,5 +128,8 @@ func rateLimitKeyForSession(s *Session, scope string, r *http.Request) string {
 			}
 		}
 	}
-	return "ip:" + clientIP(r)
+	// An IPv6 client counts by its /64, like every other per-address limit:
+	// keyed on the full address, one subscriber's /64 gave it a fresh budget
+	// on every request.
+	return "ip:" + clientRateBucket(clientIP(r))
 }

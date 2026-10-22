@@ -56,15 +56,22 @@ func extractID(path, table string) string {
 	return ""
 }
 
-func getUpdateFields(r *http.Request) map[string]string {
-	fields := make(map[string]string)
+func getUpdateFields(r *http.Request, app *App, table string) map[string]any {
+	columns := prismaWriteColumns(app, table)
+	fields := make(map[string]any)
 
 	// Try JSON body first
-	if r.Header.Get("Content-Type") == "application/json" {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&body); err == nil {
 			for k, v := range body {
-				fields[k] = jsonToFormValue(v)
+				if _, declared := columns[k]; declared {
+					fields[k] = v
+				} else {
+					fields[k] = jsonToUpdateValue(v)
+				}
 			}
 			return fields
 		}
@@ -77,7 +84,15 @@ func getUpdateFields(r *http.Request) map[string]string {
 	// (`CASE WHEN x THEN ... END`) treat it as falsy.
 	for k, v := range r.Form {
 		if len(v) > 0 {
-			fields[k] = coerceBoolString(v[0])
+			if column, declared := columns[k]; declared {
+				if !column.NotNull && column.Type != "TEXT" && column.Type != "BLOB" && strings.TrimSpace(v[0]) == "" {
+					fields[k] = nil // an empty optional HTML scalar control clears the value
+				} else {
+					fields[k] = v[0]
+				}
+			} else {
+				fields[k] = coerceBoolString(v[0])
+			}
 		}
 	}
 
@@ -92,6 +107,17 @@ func getUpdateFields(r *http.Request) map[string]string {
 	}
 
 	return fields
+}
+
+// jsonToUpdateValue retains an explicit JSON null as SQL NULL. Non-null
+// values keep the existing form-compatible conversion (including true/false
+// to 1/0), so validators and hooks see the same inputs on single and batch
+// updates. An omitted key is never added to the update map.
+func jsonToUpdateValue(v any) any {
+	if v == nil {
+		return nil
+	}
+	return jsonToFormValue(v)
 }
 
 // jsonToFormValue converts a JSON-decoded value into the string shape
@@ -134,9 +160,9 @@ func coerceBoolString(s string) string {
 
 func hasColumn(app *App, table, column string) bool {
 	for _, t := range app.Tables {
-		if t.Name == table {
+		if sqliteIdentifierFold(t.Name) == sqliteIdentifierFold(table) {
 			for _, c := range t.Columns {
-				if c.Name == column {
+				if sqliteIdentifierFold(c.Name) == sqliteIdentifierFold(column) {
 					return true
 				}
 			}

@@ -99,3 +99,22 @@ func smartTestValue(col Column) string {
 		return "test_" + col.Name
 	}
 }
+
+// smartTestUpdateValue exercises an actual change while retaining the column's
+// scalar type. Generic lifecycle tests must not rely on SQLite accepting text
+// in an integer, boolean or date column.
+func smartTestUpdateValue(col Column) string {
+	upper := strings.ToUpper(col.Type)
+	switch {
+	case strings.Contains(upper, "BOOL"):
+		return "1"
+	case strings.Contains(upper, "INT"):
+		return "2"
+	case strings.Contains(upper, "REAL") || strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE"):
+		return "2.00"
+	case strings.Contains(upper, "DATE"):
+		return "2026-01-02"
+	default:
+		return "uuid_lifecycle_updated"
+	}
+}

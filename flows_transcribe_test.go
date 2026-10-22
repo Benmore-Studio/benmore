@@ -188,6 +188,75 @@ jobs:
 	}
 }
 
+// `with.timeout` caps a transcription as well. It was read only on api and
+// compute steps, so on this step it was accepted and dropped and
+// TRANSCRIBE_TIMEOUT alone applied. The step-level key still wins.
+func TestTranscribeWithTimeoutHonored(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+
+	binDir := t.TempDir()
+	writeFakeBin(t, binDir, "ffmpeg", fakeFfmpegScript)
+	writeFakeBin(t, binDir, "whisper-cli", "sleep 60")
+	setFakePATH(t, binDir)
+	seedModel(t, "base.en")
+	seedUpload(t, app, "x.webm")
+
+	const yamlWithTimeout = `on:
+  request:
+    method: POST
+    path: /api/transcribe-brief
+jobs:
+  main:
+    steps:
+      - id: t
+        run: transcribe
+        with:
+          file: uploads/x.webm
+          model: base.en
+          timeout: 1
+      - id: both
+        run: transcribe
+        timeout: 2s
+        with:
+          file: uploads/x.webm
+          timeout: 90s
+`
+	if msg := validateFlowsYAML(yamlWithTimeout); msg != "" {
+		t.Fatalf("write gate refused with.timeout on run: transcribe: %s", msg)
+	}
+	if err := os.WriteFile(filepath.Join(app.Dir, "flows.yaml"), []byte(yamlWithTimeout), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flows := LoadFlowsGHA(app.Dir)
+	if len(flows) != 1 || len(flows[0].Steps) != 2 {
+		t.Fatalf("expected 1 flow of 2 steps, got %d flows", len(flows))
+	}
+	if got := flows[0].Steps[0].Timeout; got != time.Second {
+		t.Fatalf("with.timeout: parsed step Timeout = %v, want 1s", got)
+	}
+	if got := flows[0].Steps[1].Timeout; got != 2*time.Second {
+		t.Fatalf("step-level timeout over with.timeout: parsed step Timeout = %v, want 2s", got)
+	}
+
+	ctx := &FlowContext{
+		App:     app,
+		Request: httptest.NewRequest("POST", "/api/transcribe-brief", nil),
+		Writer:  httptest.NewRecorder(),
+		Data:    map[string]any{},
+		Params:  map[string]string{},
+	}
+	start := time.Now()
+	executeSteps(ctx, flows[0].Steps[:1])
+	elapsed := time.Since(start)
+	if ctx.Error == nil || !strings.Contains(ctx.Error.Error(), "time budget") {
+		t.Fatalf("error = %v, want the time budget to be exceeded", ctx.Error)
+	}
+	if elapsed > 15*time.Second {
+		t.Errorf("step took %s - with.timeout was not honored", elapsed)
+	}
+}
+
 // TestTranscribeBriefFlowYAML executes the REAL _platform flow
 // (apps/_platform/flows/transcribe_brief.yaml - the file the portal
 // ships, not a fixture copy) through the real loader against a seeded
@@ -247,6 +316,7 @@ func TestTranscribeBriefFlowYAML(t *testing.T) {
 	} {
 		mustExec(t, app.DB, q)
 	}
+	EnsureUploadOwnersTable(app.DB) // created at app load; the flow checks the audio's uploader
 	audioFull := filepath.Join(app.Dir, "uploads", "onboarding", "7.webm")
 	if err := os.MkdirAll(filepath.Dir(audioFull), 0o755); err != nil {
 		t.Fatal(err)

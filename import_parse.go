@@ -182,6 +182,24 @@ type ndjsonSource struct {
 	// derive the effective column list; the first Next() call drains it
 	// instead of reading the decoder again.
 	pending map[string]any
+	// refuse, when set, rejects an object naming a column the table does not
+	// let a bulk import write (command-owned columns: a hard error, not a
+	// silent drop). Set by the loader through refuseKeys.
+	refuse func(keys []string) error
+}
+
+// refuseKeys installs the per-object key check and applies it to the buffered
+// first object.
+func (s *ndjsonSource) refuseKeys(check func(keys []string) error) error {
+	s.refuse = check
+	return s.checkKeys(s.pending)
+}
+
+func (s *ndjsonSource) checkKeys(obj map[string]any) error {
+	if s.refuse == nil {
+		return nil
+	}
+	return s.refuse(mapKeys(obj))
 }
 
 // newNDJSONSource streams newline-delimited JSON objects. JSON has no
@@ -248,6 +266,9 @@ func (s *ndjsonSource) Next() ([]any, error) {
 	} else {
 		if err := s.dec.Decode(&obj); err != nil {
 			return nil, err // io.EOF passes through; a parse error aborts the load
+		}
+		if err := s.checkKeys(obj); err != nil {
+			return nil, err
 		}
 		for k := range obj {
 			if s.allNames[k] && !s.effNames[k] {

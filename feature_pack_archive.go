@@ -118,13 +118,63 @@ func writeTarFile(tw *tar.Writer, name string, body []byte, mode int64) error {
 	return err
 }
 
+// featurePackEntryOverhead is the decompressed tar framing allowed per entry
+// on top of file bodies: a 512-byte header, up to 511 bytes of padding and a
+// PAX record for a long path, with room to spare.
+const featurePackEntryOverhead = 16 << 10
+
+// featurePackStreamLimit bounds the whole decompressed archive. The per-file
+// checks below only see regular entries; the bodies of skipped entries and
+// PAX headers are decompressed by archive/tar without ever reaching them.
+func featurePackStreamLimit() int64 {
+	if featurePackLimits.MaxUncompressedBytes <= 0 {
+		return 0
+	}
+	entries := int64(featurePackLimits.MaxFiles)
+	if entries <= 0 {
+		entries = 1
+	}
+	return featurePackLimits.MaxUncompressedBytes + (entries+2)*featurePackEntryOverhead
+}
+
+// featurePackBoundedReader fails once more than limit decompressed bytes
+// have been read. A stream that ends exactly at the limit still reads cleanly.
+type featurePackBoundedReader struct {
+	r     io.Reader
+	limit int64
+	read  int64
+}
+
+func (b *featurePackBoundedReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.read >= b.limit {
+		var probe [1]byte
+		if n, err := b.r.Read(probe[:]); n == 0 {
+			return 0, err
+		}
+		return 0, fmt.Errorf("feature pack archive expands past %d bytes", b.limit)
+	}
+	if room := b.limit - b.read; int64(len(p)) > room {
+		p = p[:room]
+	}
+	n, err := b.r.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
 func ReadFeaturePackTarGz(r io.Reader) (FeaturePack, map[string][]byte, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return FeaturePack{}, nil, err
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+	var stream io.Reader = gz
+	if limit := featurePackStreamLimit(); limit > 0 {
+		stream = &featurePackBoundedReader{r: gz, limit: limit}
+	}
+	tr := tar.NewReader(stream)
 	files := map[string][]byte{}
 	var pack FeaturePack
 	entryCount := 0
@@ -170,7 +220,7 @@ func ReadFeaturePackTarGz(r io.Reader) (FeaturePack, map[string][]byte, error) {
 			return FeaturePack{}, nil, err
 		}
 		if name == "feature.yaml" {
-			if err := yaml.Unmarshal(body, &pack); err != nil {
+			if err := yamlUnmarshal(body, &pack); err != nil {
 				return FeaturePack{}, nil, err
 			}
 			continue

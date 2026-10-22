@@ -7,15 +7,12 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 )
 
 func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string) {
-	// Coarse access gate (v2.7.12). `update: admin` blocks non-admins
-	// before we even look at the row. The existing owner-WHERE on the
-	// UPDATE statement still enforces per-row in `self`/`group` modes.
 	if !EnforceCRUDAccess(w, r, app, table, OpUpdate, 0) {
 		return
 	}
@@ -24,223 +21,119 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		httpError(w, "Missing ID", http.StatusBadRequest)
 		return
 	}
-
-	// CSRF validation - HX-Request header is trivially forgeable, never bypass CSRF for it
+	if !rowIDCanonical(app, table, id) {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": errUpdateTarget.Error()})
+		return
+	}
 	if !validateCSRF(r) && !isBearerAuth(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
-
-	// Record lock check - reject if locked by another user
-	if lockSession := getSession(app, r); lockSession != nil {
-		if locked, lockedBy := CheckLock(app.DB, table, id, lockSession.UserID); locked {
+	session := getSession(app, r)
+	if session != nil {
+		// A lock answers 409 only on a row the caller may edit; any other
+		// row is the scoped update's 404, never a confirmation it exists.
+		if locked, lockedBy := CheckLock(app.DB, table, id, session.UserID); locked && canAccessRowScoped(app, table, id, session, "edit") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
-			resp := lockErrorResponse(app.DevMode, lockedBy)
-			json.NewEncoder(w).Encode(resp)
+			_ = json.NewEncoder(w).Encode(lockErrorResponse(app.DevMode, lockedBy))
 			return
 		}
 	}
-
 	if err := r.ParseForm(); err != nil {
 		httpError(w, "Bad request", http.StatusBadRequest)
 		return
 	}
+	fields := getUpdateFields(r, app, table)
+	expected := ""
+	if value := fields["_expected_updated_at"]; value != nil {
+		expected = jsonToFormValue(value)
+	}
+	if expected == "" {
+		expected = r.FormValue("_expected_updated_at")
+	}
+	delete(fields, "_expected_updated_at")
+	values := make(map[string]any, len(fields))
+	for key, value := range fields {
+		values[key] = value
+	}
 
-	// Accept both form values and JSON body
-	fields := getUpdateFields(r)
-
-	// Build allowlist of valid column names for this table
-	cols, err := GetTableColumns(app.DB, table)
+	tx, err := app.DB.Begin()
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, table+" update", err, "Transaction start failed")
 		return
 	}
-	validCols := make(map[string]bool)
-	for _, c := range cols {
-		validCols[c.Name] = true
-	}
-
-	// Protected fields - never accept from user input
-	protected := map[string]bool{
-		"id": true, "user_id": true, "created_at": true,
-		"updated_at": true, "password_hash": true, "role": true, "_csrf": true,
-		"password_change_required": true,
-	}
-	if app.Group != nil && app.Group.Key != "" {
-		protected[app.Group.Key] = true
-	}
-	// H-10: the configurable in-tenant RoleField (e.g. member_role) must be
-	// protected on the membership table, otherwise a tenant member could
-	// PATCH their own membership row to elevate their role. The hard-coded
-	// "role" above only covers the default column name; RoleField may differ.
-	// invariant: a member must never self-set their in-tenant role via CRUD.
-	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
-		protected[app.Group.RoleField] = true
-	}
-	// Block workflow-controlled fields (must use transition API)
-	for _, f := range workflowProtectedFields(app, table) {
-		protected[f] = true
-	}
-
-	var sets []string
-	var values []any
-	for k, v := range fields {
-		// SECURITY: only allow known column names, block protected fields
-		if protected[k] || !validCols[k] {
-			continue
-		}
-		sets = append(sets, fmt.Sprintf("%s = ?", k))
-		values = append(values, v)
-	}
-
-	if len(sets) == 0 {
-		httpError(w, "No fields to update", http.StatusBadRequest)
-		return
-	}
-
-	// Fire before-hooks (can abort)
-	session := getSession(app, r)
-	if session != nil {
-		if err := checkScope(session, table, "write"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+	defer tx.Rollback()
+	before, after, refreshTables, err := applyCanonicalUpdateTx(tx, app, session, table, id, values, expected)
+	if err != nil {
+		if respondOwnedField(w, err) {
 			return
 		}
-	}
-
-	// member-of: re-pointing a child row's join column (PATCHing a
-	// message's room_id to a different room) must verify membership in
-	// the NEW parent - the row-scope WHERE only proves membership in
-	// the row's CURRENT parent. 404 so the target's existence doesn't
-	// leak to non-members. (Shared with batch update via
-	// memberOfRepointDenial.)
-	if d := memberOfRepointDenial(app, table, session, func(col string) string { return fields[col] }); d != nil {
-		writeMemberOfDenial(w, r, d)
-		return
-	}
-
-	beforeRow := make(map[string]any)
-	beforeRow["id"] = id
-	for k, v := range fields {
-		beforeRow[k] = v
-	}
-	injectSessionContext(beforeRow, session)
-	// Cross-field validators on update - check rules against the MERGED data
-	// (existing row + submitted changes)
-	if err := ValidateCrossField(app.Validators, table, beforeRow); err != nil {
-		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := FireBeforeHooks(app, "update", table, beforeRow); err != nil {
-		httpError(w, err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-
-	// Capture old row for audit log before updating - with same scoping as the UPDATE
-	oldScopeSQL := ""
-	var oldScopeArgs []any
-	if pred, pargs, bypass := rowScopeClause(app, table, session, "edit"); !bypass && pred != "" {
-		oldScopeSQL = " AND " + pred
-		oldScopeArgs = append(oldScopeArgs, pargs...)
-	}
-	prefetchArgs := append([]any{id}, oldScopeArgs...)
-	oldRows, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?%s", table, oldScopeSQL), prefetchArgs...)
-
-	// Auto-set updated_at if column exists
-	if hasColumn(app, table, "updated_at") && !protected["updated_at"] {
-		// updated_at is protected from user input but we set it here
-		sets = append(sets, "updated_at = datetime('now')")
-	}
-
-	values = append(values, id)
-	sql := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", table, strings.Join(sets, ", "))
-
-	// Soft delete filter: cannot update deleted records
-	if hasColumn(app, table, "deleted_at") {
-		sql += " AND deleted_at IS NULL"
-	}
-
-	// Optimistic concurrency: if client sends _expected_updated_at, enforce it
-	if expected := r.FormValue("_expected_updated_at"); expected != "" && hasColumn(app, table, "updated_at") {
-		sql += " AND updated_at = ?"
-		values = append(values, expected)
-	}
-
-	// SECURITY: enforce scoping on updates (owner/org OR explicit ACL edit grant)
-	if pred, pargs, bypass := rowScopeClause(app, table, session, "edit"); !bypass && pred != "" {
-		sql += " AND " + pred
-		values = append(values, pargs...)
-	}
-
-	result, err := app.DB.Exec(sql, values...)
-	if err != nil {
-		httpError(w, fmt.Sprintf("Update failed: %s", err.Error()), http.StatusBadRequest)
-		return
-	}
-	// Check rows affected for optimistic concurrency conflict
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		// Could be scoping (not authorized) or concurrency conflict
-		if r.FormValue("_expected_updated_at") != "" {
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]any{"error": "conflict", "message": "Record was modified by another user"})
+		var denied *memberOfUpdateError
+		if errors.As(err, &denied) {
+			writeMemberOfDenial(w, r, denied.denial)
 			return
 		}
-		httpError(w, "Not found or not authorized", http.StatusNotFound)
+		if errors.Is(err, errUpdateConflict) {
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "conflict", "message": "Record was modified by another user"})
+			return
+		}
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		var requestErr *updateRequestError
+		if errors.As(err, &requestErr) && requestErr.noopEcho {
+			// Only unchanged command-owned values were submitted: nothing to write.
+			httpJSON(w, http.StatusOK, map[string]any{"status": "updated"})
+			return
+		}
+		if errors.As(err, &requestErr) {
+			writeUpdateRequestError(w, r, app, table+" update", requestErr)
+		} else {
+			serverErrorJSON(w, r, app, table+" update", err, "Update failed")
+		}
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverError(w, r, app, table+" update", err, "Commit failed")
 		return
 	}
 
-	// Fire update hooks - fetch the updated row for context
-	updatedRows, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
-	if len(updatedRows) > 0 {
-		injectSessionContext(updatedRows[0], session)
-		// Inject old_* fields so hooks can reference previous values: {{old_status}}, {{old_amount}}
-		if len(oldRows) > 0 {
-			for k, v := range oldRows[0] {
-				updatedRows[0]["old_"+k] = v
-			}
-		}
-		FireHooks(app, "update", table, updatedRows[0])
-		FireFlowsForEvent(app, "on_update", table, updatedRows[0])
-		FireWebhookSubscriptions(app, "update", table, updatedRows[0], session)
-		Broadcast(app, table, "update", session)
+	eventRow := make(map[string]any, len(after)+len(before))
+	for k, v := range after {
+		eventRow[k] = v
 	}
-	var oldRow map[string]any
-	if len(oldRows) > 0 {
-		oldRow = oldRows[0]
+	for k, v := range before {
+		eventRow["old_"+k] = v
 	}
-	var newRow map[string]any
-	if len(updatedRows) > 0 {
-		newRow = updatedRows[0]
-	}
-	LogAudit(app, "update", table, id, session, oldRow, newRow)
+	injectSessionContext(eventRow, session)
+	FireFlowsForEvent(app, "on_update", table, eventRow)
+	Broadcast(app, table, "update", session)
+	broadcastHookRefreshes(app, refreshTables, []transactionResult{{Table: table, Action: "update"}})
 	appendHXTrigger(w, "benmore:changed")
-
 	if isHTMX(r) {
 		w.Header().Set("HX-Refresh", "true")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"status": "updated"})
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "updated"})
 }
 
 // tableHasUniqueUserID reports whether `table` has a single-column UNIQUE
 // constraint on user_id (a "one row per user" singleton). Used to gate the
 // PATCH /api/{table} (no ID) upsert route.
 func tableHasUniqueUserID(db *sql.DB, table string) bool {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA index_list(%s)", table))
+	rows, err := db.Query("PRAGMA index_list(" + quoteIdent(table) + ")")
 	if err != nil {
 		return false
 	}
 	defer rows.Close()
 
-	type idx struct {
-		name   string
-		unique bool
-	}
-	var indexes []idx
+	var indexes []string
 	for rows.Next() {
 		var seq int
 		var name string
@@ -249,28 +142,46 @@ func tableHasUniqueUserID(db *sql.DB, table string) bool {
 		var partial sql.NullInt64
 		// SQLite returns: seq, name, unique, origin, partial
 		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-			continue
+			return false
 		}
-		if unique == 1 {
-			indexes = append(indexes, idx{name: name, unique: true})
+		// A partial unique index only constrains rows matching its WHERE;
+		// it cannot establish a global one-row-per-user invariant.
+		if unique == 1 && partial.Valid && partial.Int64 == 0 {
+			indexes = append(indexes, name)
 		}
 	}
-	for _, ix := range indexes {
-		colRows, err := db.Query(fmt.Sprintf("PRAGMA index_info(%s)", ix.name))
+	if rows.Err() != nil {
+		return false
+	}
+	for _, name := range indexes {
+		// An index is named by whoever created it; the name is not a plain
+		// identifier by any rule.
+		colRows, err := db.Query("PRAGMA index_info(" + quoteIdent(name) + ")")
 		if err != nil {
 			continue
 		}
-		var cols []string
+		var columns int
+		var onlyUserID bool
+		valid := true
 		for colRows.Next() {
 			var seqno, cid int
-			var cname string
+			var cname sql.NullString
 			if err := colRows.Scan(&seqno, &cid, &cname); err != nil {
-				continue
+				valid = false
+				break
 			}
-			cols = append(cols, cname)
+			// Expression keys have a NULL name and cid = -2. They still
+			// count as keys; skipping them misclassifies a composite index.
+			columns++
+			onlyUserID = cid >= 0 && cname.Valid && identIs(cname.String, "user_id")
 		}
-		colRows.Close()
-		if len(cols) == 1 && cols[0] == "user_id" {
+		if colRows.Err() != nil {
+			valid = false
+		}
+		if err := colRows.Close(); err != nil {
+			valid = false
+		}
+		if valid && columns == 1 && onlyUserID {
 			return true
 		}
 	}
@@ -312,7 +223,7 @@ func handleSingletonUpdate(w http.ResponseWriter, r *http.Request, app *App, tab
 	// through to handleCreate so the row is materialized with user_id set
 	// from the session.
 	var existingID sql.NullString
-	row := app.DB.QueryRow(fmt.Sprintf("SELECT CAST(id AS TEXT) FROM %s WHERE user_id = ? LIMIT 1", table), session.UserID)
+	row := app.DB.QueryRow("SELECT CAST(id AS TEXT) FROM "+quoteIdent(table)+" WHERE user_id = ? LIMIT 1", session.UserID)
 	_ = row.Scan(&existingID)
 
 	if existingID.Valid && existingID.String != "" {

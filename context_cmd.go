@@ -87,7 +87,7 @@ func BuildContext(app *App) AppContext {
 			colStrs = append(colStrs, s)
 		}
 		var count int64
-		app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", name)).Scan(&count)
+		app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(name)).Scan(&count)
 
 		fks, _ := GetForeignKeys(app.DB, name)
 		var fkStrs []string
@@ -104,7 +104,7 @@ func BuildContext(app *App) AppContext {
 	for route, page := range app.Pages {
 		rc := RouteContext{
 			Path: route, File: page.File, Auth: page.Auth, Title: page.Title,
-			Role: extractPageRole(page.RawHTML), Type: page.Type,
+			Role: pageRole(page), Type: page.Type,
 		}
 		rc.Features = detectPageFeatures2(page.RawHTML)
 		ctx.Routes = append(ctx.Routes, rc)

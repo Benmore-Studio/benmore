@@ -3,12 +3,30 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestRecipe_BeforeRequestInheritsFlowContext(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	flowReq, err := http.NewRequestWithContext(parent, http.MethodPost, "https://example.com/callback", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newRecipeEnv(flowReq, nil, nil, nil)
+	req, err := buildRecipeBeforeRequest(env, &RecipeBeforeRequest{URL: "https://8.8.8.8/token"})
+	if err != nil {
+		t.Fatalf("build signer pre-request: %v", err)
+	}
+	if req.Context().Err() != context.Canceled {
+		t.Fatalf("signer pre-request context error = %v", req.Context().Err())
+	}
+}
 
 // AWS sigv4 - recipe vs. the published "get-vanilla" test vector.
 // If this drifts, every Athena/S3/Bedrock call signed by the framework

@@ -4,6 +4,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -136,13 +138,46 @@ func hotReloadApp(app *App, dev bool) error {
 // is published only after checked loaders and migrations succeed. Schema work that
 // already committed is not undone when a later operation fails.
 func reloadAppConfig(app *App) error {
-	nextEnv, err := readAppEnv(app.Dir)
+	config, err := loadServedRuntimeConfig(app.Dir)
+	if err != nil {
+		return err
+	}
+	if config.mcpWithheld != "" {
+		log.Printf("  MCP connector withheld: %s", config.mcpWithheld)
+	}
+	nextEnv, err := config.stageEnvironment(app.Dir)
 	if err != nil {
 		return fmt.Errorf("environment: %w", err)
 	}
-	config, err := loadRuntimeConfig(app.Dir)
-	if err != nil {
+	return reloadAppConfigStaged(app, config, nextEnv)
+}
+
+// Publish already checked values after fallible schema work. Keeping this seam
+// value-based prevents deployment-file rereads from replacing staged authority.
+func reloadAppConfigStaged(app *App, config *runtimeConfig, nextEnv map[string]string) error {
+	if err := validateReloadEncryptionKey(app, config.encrypted, nextEnv); err != nil {
 		return err
+	}
+	policyCtx, cancelPolicy := context.WithTimeout(context.Background(), 30*time.Second)
+	policyRelease, _, policyErr := beginAppMCPPolicyChange(policyCtx, app.Dir)
+	cancelPolicy()
+	if policyErr != nil {
+		return fmt.Errorf("connector policy lease: %w", policyErr)
+	}
+	defer policyRelease()
+	if err := validateAppMCPCandidateRoutes(app.Dir, config, app.DB, nextEnv); err != nil {
+		return err
+	}
+	lifecycleCtx, cancelLifecycle := context.WithTimeout(context.Background(), 30*time.Second)
+	lifecyclePlan, err := preflightAppMCPOperationLifecycle(lifecycleCtx, app, config, nextEnv, true)
+	cancelLifecycle()
+	if err != nil {
+		return fmt.Errorf("operation lifecycle preflight: %w", err)
+	}
+	if config.mcp != nil {
+		if err := ensureAppMCPGrantTables(app.DB); err != nil {
+			return fmt.Errorf("connector grant migration: %w", err)
+		}
 	}
 	// schema - rerun migrations (idempotent).
 	//
@@ -158,7 +193,7 @@ func reloadAppConfig(app *App) error {
 	// with `[locks] cleanup error: file is not a database` while
 	// returning 5xx on every write path. Agents had no escape hatch
 	// because no CLI command shells out to `systemctl restart`.
-	tables, deferredDDL, err := LoadSchema(app.DB, app.Dir)
+	tables, deferredDDL, err := config.loadSchema(app.DB, app.Dir)
 	if err != nil {
 		if isDBHandleWedged(err) {
 			log.Fatalf(
@@ -176,7 +211,7 @@ func reloadAppConfig(app *App) error {
 	// alongside flows/cron so concurrent readers (hasColumn ranging app.Tables,
 	// request handlers reading app.Design) never see a mid-reload reassignment.
 	uuidTables := DetectUUIDTables(tables)
-	annotateFullTextFromPrisma(app.Dir, tables)
+	config.annotateFullText(app.Dir, tables)
 	if _, err := Migrate(app.DB, tables, false); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
@@ -188,11 +223,18 @@ func reloadAppConfig(app *App) error {
 	// per-app process (never router-side); the schema-diff migrate above only
 	// handles column adds, not arbitrary SQL. Keep the old handler and workers
 	// when a migration fails; do not advertise a completed reload.
-	if err := runUserMigrationsWithBackup(app.DB, app.Dir); err != nil {
+	if err := config.runUserMigrations(context.Background(), app.DB, app.Dir, false); err != nil {
 		return fmt.Errorf("user migration: %w", err)
+	}
+	joinMap, err := buildJoinMapChecked(app.DB)
+	if err != nil {
+		return fmt.Errorf("relationships: %w", err)
 	}
 	if err := EnsureFTSTables(app.DB, tables); err != nil {
 		return err
+	}
+	if err := installComputedTriggersChecked(app.DB, config.computed); err != nil {
+		return fmt.Errorf("computed triggers: %w", err)
 	}
 	// v2.7.17: re-load the configs that hot-reload was missing.
 	// Without these, every change to app.yaml's `roles:` / `access:` /
@@ -200,17 +242,51 @@ func reloadAppConfig(app *App) error {
 	// restart, and the bm.d.ts generator served stale types reflecting
 	// the boot-time state. Same loader functions app_loader.loadApp uses
 	// on cold start - keep them in sync if any are added.
-	roles := LoadRolesConfig(app.Dir)
-	access := LoadAccess(app.Dir)
-	scopes := LoadScopes(app.Dir)
-	group := LoadGroupConfig(app.Dir)
-	encrypted := LoadEncryptedFieldsConfig(app.Dir)
+	roles := config.roles
+	access := config.access
+	scopes := config.scopes
+	group := config.group
+	encrypted := config.encrypted
+	stagedHooks := cloneHookConfig(config.hooks)
+	stagedApp := &App{Design: config.design, Hooks: stagedHooks}
+	synthesizeAutoMembershipHooks(stagedApp)
+	stagedHooks = stagedApp.Hooks
+	pages := config.pages
+	if pages == nil {
+		app.mu.RLock()
+		pages = app.Pages
+		app.mu.RUnlock()
+	}
+	lifecycleCtx, cancelLifecycle = context.WithTimeout(context.Background(), 30*time.Second)
+	err = finishAppMCPOperationLifecycle(lifecycleCtx, app, lifecyclePlan, false)
+	cancelLifecycle()
+	if err != nil {
+		return fmt.Errorf("operation lifecycle finalization: %w", err)
+	}
+	// Reconcile history last: a later rejected candidate must not replace the
+	// active generation's history/encryption policy.
+	versionSource := &App{Dir: app.Dir, MCP: config.mcp, sourceFiles: config.sourceFiles}
+	if err := installReloadStorage(app.DB, versionSource.versionedConfig(), config.encrypted); err != nil {
+		return err
+	}
+
+	bindRoleTableScopes(roles, tables) // before the generation captures roles
+	generation := newAppMCPRuntimeGeneration(app, config.mcp, group, roles, access, scopes, config.design, tables, uuidTables, encrypted, config.flows, config.sourceFiles, nextEnv, config.templateEnvSource, stagedHooks, config.validators, config.computed, config.workflows, pages)
+	generation.view.JoinMap = joinMap
 	app.mu.Lock()
 	app.Design, app.Backup = config.design, config.backup
 	app.Tables = tables
+	app.JoinMap = joinMap
 	app.UUIDTables = uuidTables
 	app.Flows = config.flows
-	app.Hooks = config.hooks
+	app.MCP, app.mcpWithheld = config.mcp, config.mcpWithheld
+	app.sourceFiles = config.sourceFiles
+	app.templateEnvSource = config.templateEnvSource
+	app.environment = nextEnv
+	if config.pages != nil {
+		app.Pages, app.Partials, app.Paths = config.pages, config.partials, config.paths
+	}
+	app.Hooks = stagedHooks
 	app.Workflows = config.workflows
 	app.Cron = config.cron
 	app.Roles = roles
@@ -218,12 +294,20 @@ func reloadAppConfig(app *App) error {
 	app.Scopes = scopes
 	app.Group = group
 	app.Encrypted = encrypted
+	app.mcpGeneration = generation
+	app.WSRooms, app.Validators, app.Admin, app.Computed = config.wsRooms, config.validators, config.admin, config.computed
+	app.I18n = config.i18n
+	// Publish the merged environment before generation readers can observe
+	// the new manifest, flows and YAML-only template source.
+	storeAppEnv(app.Dir, nextEnv)
 	app.mu.Unlock()
+	// Connections the new manifest no longer declares lose their stored
+	// credentials, so re-adding one later does not bring them back.
+	purgeUndeclaredAppMCPConnectionCredentials(app.DB, config.mcp)
 	// NOTE: cron is (re)started by buildAppMux, which always runs after this on
 	// the hot-reload path - starting it here too double-spawned the scheduler
 	// each reload (the second start closed the first's channel and respawned),
 	// relying entirely on cronUniqueKey dedup to avoid a duplicate fire.
-	storeAppEnv(app.Dir, nextEnv)
 	return nil
 }
 
@@ -253,7 +337,29 @@ func isDBHandleWedged(err error) bool {
 // buildAppMux creates the full HTTP mux for an app with all route groups registered.
 // This is the single source of truth for route registration - used by both StartServer and HostPlatform.
 func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
-	mux := http.NewServeMux()
+	return buildAppRouteMux(app, dev, baseURL, true, nil).ServeMux
+}
+
+// Candidate and runtime use identical registration order and handler bodies.
+// initialize is false only for preflight: no handler is served or startup work run.
+func buildAppRouteMux(app *App, dev bool, baseURL string, initialize bool, tables []string) *appRouteMux {
+	mux := &appRouteMux{ServeMux: http.NewServeMux()}
+
+	if app.MCP != nil {
+		if initialize {
+			if err := ensureAppMCPArtifactTables(app.DB); err != nil {
+				log.Printf("MCP artifact table unavailable: %v", err)
+			}
+		}
+		registerAppMCPTransport(mux, app, appMCPResourceAt(app, baseURL))
+	} else if app.mcpWithheld != "" {
+		registerAppMCPWithheldRoutes(mux, app)
+	}
+	if initialize {
+		// Also without mcp.yaml: bytes of artifacts made before it was removed.
+		sweepAppMCPOrphanArtifacts(app)
+		retireUnusedAppMCPRevisionLedger(app)
+	}
 
 	// Prometheus /metrics endpoint - dark unless BENMORE_METRICS_TOKEN
 	// is set. Registered first so it doesn't get shadowed by clean-URL
@@ -261,93 +367,174 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	RegisterMetricsRoute(mux)
 
 	// Framework tables (auto-created)
-	EnsureAuditLogTable(app.DB)
+	if initialize {
+		EnsureAuditLogTable(app.DB)
+		EnsureScopingIndexes(app) // user_id / tenant key / FK / member-of (scoping_indexes.go)
+		StartAuditRetentionWorker(app)
+	}
+	if initialize {
+		EnsureUploadOwnersTable(app.DB)
+	}
 	// Audit-log shipper: tail _benmore_audit_log → POST to a configured
 	// webhook destination. No-op unless BENMORE_AUDIT_WEBHOOK_URL is set.
 	// Spawns one background goroutine per app, watched by app.Stop.
-	StartAuditShipper(app)
+	if initialize {
+		StartAuditShipper(app)
+	}
 	// Encryption key rotation endpoint (POST /api/_internal/encryption/rotate,
 	// admin-only). Lives on the per-app mux because the rotation has to
 	// run inside the per-app process - that's where appEncryptionKey + the
 	// per-tenant Encrypted config are loaded; the router process has neither.
 	RegisterEncryptionRotationRoute(mux, app)
+	// Owner connector switches (router-minted owner token only).
+	registerAppMCPConnectorControl(mux, app)
 	// Blind-index backfill endpoint - same architectural reason as
 	// rotation (per-app process holds the derived key + the
 	// `blind_index:` config). Admin-only, audit-logged.
 	RegisterBlindIndexRoutes(mux, app)
-	EnsureIdempotencyTable(app.DB)
-	EnsureLocksTable(app.DB)
-	EnsureNotificationsTable(app.DB)
-	EnsureContextGraphTables(app.DB)
-	EnsureRequestLogTable(app.DB)
+	if initialize {
+		EnsureIdempotencyTable(app.DB)
+	}
+	if initialize {
+		EnsureLocksTable(app.DB)
+	}
+	if initialize {
+		EnsureNotificationsTable(app.DB)
+	}
+	if initialize {
+		EnsureContextGraphTables(app.DB)
+	}
+	if initialize {
+		EnsureRequestLogTable(app.DB)
+	}
 
 	// Bulk import - chunked, resumable, all-or-nothing data loading.
 	// Registered on the per-app mux so it exists in `benmore serve` and
 	// `benmore host` alike; the framework edition gets it without the
 	// platform. RegisterImportRoutes calls EnsureImportsTable itself.
-	RegisterImportRoutes(mux, app)
-
-	// Analytics - auto-enabled by default, disable with features.analytics: false
-	RegisterAnalyticsRoutes(mux, app)
-
-	// Populate the context graph from the app's current in-memory state.
+	if initialize {
+		RegisterImportRoutes(mux, app)
+	} else {
+		registerImportRoutes(mux, app)
+	}
+	if initialize {
+		RegisterAnalyticsRoutes(mux, app)
+	} else {
+		registerAnalyticsRoutes(mux, app)
+	}
 	// Runs once at load; MCP write_file also triggers a rebuild so LLM
 	// edits flow into the graph immediately. Extraction is O(pages) and
 	// transactional, so the cost is in the tens of ms for typical apps.
-	app.startWorker("contextGraph.rebuild", func(stop <-chan struct{}) {
-		select {
-		case <-stop:
-			return
-		default:
-			RebuildContextGraph(app)
-		}
-	})
+	if initialize {
+		app.startWorker("contextGraph.rebuild", func(stop <-chan struct{}) {
+			select {
+			case <-stop:
+				return
+			default:
+				RebuildContextGraph(app)
+			}
+		})
+	}
 
 	// Cluster mode: SQLite-based pub/sub for horizontal scaling
 	if IsClusterMode() {
-		EnsureEventsTable(app.DB)
-		EnsureRateLimitsTable(app.DB)
-		StartEventPoller(app)
+		if initialize {
+			EnsureEventsTable(app.DB)
+		}
+		if initialize {
+			EnsureRateLimitsTable(app.DB)
+		}
+		if initialize {
+			StartEventPoller(app)
+		}
 	}
 
 	// Storage backend (local disk or S3)
-	InitStorage(app.Dir)
+	if initialize {
+		InitStorage(app.Dir)
+	}
 
 	// Framework APIs
 	RegisterAuditAPI(mux, app)
 	syncAudit := app.Design != nil && app.Design.Auth["read_audit_sync"] == "true"
-	InitReadAudit(app, syncAudit)
+	if initialize {
+		InitReadAudit(app, syncAudit)
+	}
 	RegisterReadAuditAPI(mux, app)
 	// API docs: public in dev, auth-required in production (opt-out via features.docs)
 	if app.FeatureEnabled("docs") {
 		RegisterAPIDocsRoutes(mux, app)
 	}
-	RegisterDeviceRoutes(mux, app)
-	RegisterNotificationRoutes(mux, app)
-
-	// Dynamic schema (custom fields API)
-	RegisterCustomFieldRoutes(mux, app)
-
-	// Tenant bootstrap: POST /api/_groups/create (no-op unless
+	if initialize {
+		RegisterDeviceRoutes(mux, app)
+	} else {
+		registerDeviceRoutes(mux, app)
+	}
+	if initialize {
+		RegisterNotificationRoutes(mux, app)
+	} else {
+		registerNotificationRoutes(mux, app)
+	}
+	if initialize {
+		RegisterCustomFieldRoutes(mux, app)
+	} else {
+		registerCustomFieldRoutes(mux, app)
+	}
 	// groups.bootstrap is declared in app.yaml)
 	RegisterGroupBootstrapRoute(mux, app)
 
 	// API routes
-	RegisterQueryAPI(mux, app)      // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
-	RegisterSchedulingAPI(mux, app) // /api/_scheduled + /api/_approvals - per-record deferred tasks + approvals
-	RegisterLockRoutes(mux, app)    // must register before CRUD so /api/{table}/{id}/lock is more specific
-	RegisterCRUD(mux, app)
+	if initialize {
+		RegisterQueryAPI(mux, app) // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
+	} else {
+		registerQueryAPI(mux, app) // POST /api/_query - declarative cross-cut reads (scoped, column-validated)
+	}
+	if initialize {
+		RegisterSchedulingAPI(mux, app)
+	} else {
+		registerSchedulingAPI(mux, app)
+	}
+	if initialize {
+		RegisterLockRoutes(mux, app)
+	} else {
+		registerLockTables(mux, app, tables)
+	}
+	if initialize {
+		RegisterCRUD(mux, app)
+	} else {
+		registerCRUDTables(mux, app, tables)
+	}
 	RegisterFileUploadRoute(mux, app)
 	if NeedsAuth(app) {
-		RegisterAuthRoutes(mux, app)
-		RegisterMFARoutes(mux, app)
+		if initialize {
+			RegisterAuthRoutes(mux, app)
+		} else {
+			registerAuthRoutes(mux, app)
+		}
+		if initialize {
+			RegisterMFARoutes(mux, app)
+		} else {
+			registerMFARoutes(mux, app)
+		}
 		RegisterMFALoginRoute(mux, app)
-		RegisterOAuthTokensAPI(mux, app)
+		if initialize {
+			RegisterPasskeyRoutes(mux, app)
+		} else {
+			registerPasskeyRoutes(mux, app)
+		}
+		if initialize {
+			RegisterOAuthTokensAPI(mux, app)
+		} else {
+			registerOAuthTokensAPI(mux, app)
+		}
 		RegisterRoleRoutes(mux, app)
 		// Per-app OAuth 2.1 provider: lets external MCP clients (Claude,
-		// ChatGPT, Cursor) authenticate an APP user; minted tokens land in
-		// _benmore_api_tokens so the normal bearer path validates them.
-		RegisterAppOAuthProvider(mux, app)
+		// ChatGPT, Cursor) authenticate an APP user. Reviewed connector apps
+		// use distinct audience-bound credentials; legacy API tokens stay separate.
+		if initialize {
+			appOAuthEnsureTables(app)
+		}
+		registerAppOAuthProviderAt(mux, app, appMCPResourceAt(app, baseURL))
 	}
 	// Edge auth consent flow + grants UI live on the parent app's
 	// origin. Only relevant when the app declares auth.edge_scopes
@@ -355,23 +542,40 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// endpoints just refuse all consent requests.
 	RegisterEdgeAuthOnApp(mux, app)
 	// Auto-create user columns referenced by page require="" attributes
-	EnsureRequiredUserFields(app.DB, app.Pages)
+	if initialize {
+		EnsureRequiredUserFields(app.DB, app.Pages)
+	}
 	// Auto-create user columns listed in auth.signup_fields
 	if app.Design != nil {
-		EnsureSignupFieldColumns(app.DB, app.Design.Auth["signup_fields"])
+		if initialize {
+			EnsureSignupFieldColumns(app.DB, app.Design.Auth["signup_fields"])
+		}
 	}
 	if len(app.Flows) > 0 {
-		RegisterFlows(mux, app, app.Flows)
+		mux.flows = RegisterFlows(mux, app, app.Flows)
 	}
 	if app.Workflows != nil && len(app.Workflows.Workflows) > 0 {
-		RegisterWorkflows(mux, app)
+		if initialize {
+			RegisterWorkflows(mux, app)
+		} else {
+			registerWorkflows(mux, app)
+		}
 	}
-	versionConfig := LoadVersionedConfig(app.Dir)
+	// A `when:` that can't be evaluated, or a workflow key/state the
+	// runtime ignores, is logged, never refused: the write gate and
+	// `benmore check` report it as an error.
+	if initialize {
+		warnWhenConditions(app)
+		warnWorkflowShape(app)
+	}
+	versionConfig := app.versionedConfig()
 	if versionConfig != nil {
 		RegisterVersioningAPI(mux, app, versionConfig)
 	}
 	if HasOAuthProviders(app.Dir) {
-		EnsureRoleColumn(app.DB)
+		if initialize {
+			EnsureRoleColumn(app.DB)
+		}
 	}
 	RegisterOAuthRoutes(mux, app)
 
@@ -387,26 +591,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// the same validate-port → mint → redirect helper the OAuth callback uses
 	// (a no-op stub in the framework build, which then falls back to the form).
 	if filepath.Base(app.Dir) == "_platform" {
-		mux.HandleFunc("GET /auth/cli-session", func(w http.ResponseWriter, r *http.Request) {
-			port := r.URL.Query().Get("port")
-			// Validate numeric up front so it's safe to reflect into the
-			// fallback redirect below (no header/redirect injection).
-			if n, err := strconv.Atoi(port); err != nil || n <= 0 || n >= 65536 {
-				http.Error(w, "invalid port", http.StatusBadRequest)
-				return
-			}
-			sess := getSession(app, r)
-			if sess == nil || sess.Email == "" {
-				// No active session - send them to the sign-in form (port preserved).
-				http.Redirect(w, r, "/cli-auth?port="+port, http.StatusSeeOther)
-				return
-			}
-			if oauthMintCLIToken(w, r, sess.Email, port) {
-				return // token minted + redirected to the localhost callback
-			}
-			// Framework build / mint unavailable - fall back to the form.
-			http.Redirect(w, r, "/cli-auth?port="+port, http.StatusSeeOther)
-		})
+		mux.HandleFunc("GET /auth/cli-session", cliSessionHandler(app))
+		mux.HandleFunc("POST /auth/cli-session", cliSessionHandler(app)) // the confirmation page posts here to mint
+		registerCLIDeviceRoutes(mux, app)
 	}
 
 	// Admin, billing, settings (admin panel opt-out via features.admin).
@@ -414,7 +601,9 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// /admin path redirects to /_admin only when no user-defined page
 	// claims /admin - keeps existing apps working while letting new
 	// apps own the /admin URL for their own UI.
-	EnsureRoleColumn(app.DB)
+	if initialize {
+		EnsureRoleColumn(app.DB)
+	}
 	if app.FeatureEnabled("admin") {
 		RegisterAdminRoutes(mux, app)
 		if _, userOwnsAdmin := app.Pages["/admin"]; !userOwnsAdmin {
@@ -423,9 +612,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 			})
 		}
 	}
-	RegisterSettingsRoutes(mux, app)
-
-	// Testing / feedback mode.
+	if initialize {
+		RegisterSettingsRoutes(mux, app)
+	} else {
+		registerSettingsRoutes(mux, app)
+	}
 	//
 	// When features.testing is enabled in app.yaml the feedback tables
 	// are created so the visitor widget can write to them and so admin
@@ -436,12 +627,18 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// the MCP path works - the submission widget just won't accept
 	// anonymous visitors without the gate.
 	if app.FeedbackWidgetEnabled() {
-		EnsureFeedbackTables(app.DB)
-		demoPassword := GetAppEnv(app.Dir, "DEMO_PASSWORD")
+		if initialize {
+			EnsureFeedbackTables(app.DB)
+		}
+		demoPassword := appRouteEnv(app, "DEMO_PASSWORD")
 		if app.FeatureEnabled("testing") && demoPassword != "" {
 			// Demo mode (testing only): password gate + feedback routes that
 			// accept demo tokens. Registers the /_demo/login route too.
-			RegisterDemoRoutes(mux, app, demoPassword)
+			if initialize {
+				RegisterDemoRoutes(mux, app, demoPassword)
+			} else {
+				registerDemoRoutes(mux, app, demoPassword)
+			}
 		} else {
 			// Prod feedback (features.feedback) or testing without a demo
 			// password: session/anon feedback API. Read is admin-gated on a
@@ -453,7 +650,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 				RegisterDemoLoginRoute(mux, app, demoPassword)
 			}
 		}
-	} else if demoPassword := GetAppEnv(app.Dir, "DEMO_PASSWORD"); demoPassword != "" {
+	} else if demoPassword := appRouteEnv(app, "DEMO_PASSWORD"); demoPassword != "" {
 		// v2.7.164: the visitor-password gate no longer requires
 		// features.testing. Previously set_demo_password returned
 		// ok:true on an app without testing enabled and the app stayed
@@ -464,44 +661,72 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	}
 
 	// Resource-level permissions (share/revoke API per table)
-	RegisterPermissionRoutes(mux, app)
+	if initialize {
+		RegisterPermissionRoutes(mux, app)
+	} else {
+		registerPermissionTables(mux, app, tables)
+	}
 
 	// Webhook subscriptions
-	RegisterWebhookRoutes(mux, app)
-
-	// Background services
-	StartJobWorker(app)
-	CleanOldJobs(app)
+	if initialize {
+		RegisterWebhookRoutes(mux, app)
+	} else {
+		registerWebhookRoutes(mux, app)
+	}
+	if initialize {
+		StartJobWorker(app)
+	}
+	if initialize {
+		CleanOldJobs(app)
+	}
 	RegisterJobsAPI(mux, app)
 
 	// Scheduled backups
-	StartBackupWorker(app, app.Backup)
-	StartLockCleanupWorker(app)
-	StartWALShipper(app)
+	if initialize {
+		StartBackupWorker(app, app.Backup)
+	}
+	if initialize {
+		StartLockCleanupWorker(app)
+	}
+	if initialize {
+		StartWALShipper(app)
+	}
 	// Per-app WAL truncation - keeps data.db-wal from bloating to 4MB
 	// under continuous read traffic. Issue #1.
-	StartAppWALMaintenance(app)
+	if initialize {
+		StartAppWALMaintenance(app)
+	}
 
 	// Presence - framework primitive replacing the hand-rolled
 	// pagehide+heartbeat+cleanup-cron pattern that every chat / live /
 	// huddle app re-derives. See presence.go and bm.presence() in
 	// the SDK.
-	EnsurePresenceTable(app.DB)
+	if initialize {
+		EnsurePresenceTable(app.DB)
+	}
 	RegisterPresenceRoutes(mux, app)
-	StartPresenceSweeper(app)
+	if initialize {
+		StartPresenceSweeper(app)
+	}
 
 	// Usage metering
-	InitMetering(app)
+	if initialize {
+		InitMetering(app)
+	}
 	RegisterUsageAPI(mux, app)
 
 	// Data retention / TTL
-	retentionPolicies := LoadRetentionConfig(app.Dir)
-	StartRetentionWorker(app, retentionPolicies)
+	retentionPolicies := app.retentionConfig()
+	if initialize {
+		StartRetentionWorker(app, retentionPolicies)
+	}
 
 	// Materialized aggregates
-	aggregateConfigs := LoadAggregateConfig(app.Dir)
+	aggregateConfigs := app.aggregateConfig()
 	if len(aggregateConfigs) > 0 {
-		StartAggregateWorker(app, aggregateConfigs)
+		if initialize {
+			StartAggregateWorker(app, aggregateConfigs)
+		}
 		RegisterAggregateRoutes(mux, app)
 	}
 
@@ -519,24 +744,33 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Embedded libraries + PWA + dev tools
 	RegisterTailwindRoute(mux)
 	RegisterLibRoutes(mux)
-	RegisterBMTypesRoute(mux, app)    // /_internal/types.d.ts - per-app TS defs
-	RegisterUploadRoute(mux, app)     // POST /api/_upload - generic file upload (v2.7.20)
-	RegisterWebRTCRoute(mux, app)     // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
-	RegisterBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
+	RegisterBMTypesRoute(mux, app) // /_internal/types.d.ts - per-app TS defs
+	RegisterI18nRoutes(mux, app)   // /api/_i18n/{lang} - per-app dictionaries
+	RegisterUploadRoute(mux, app)  // POST /api/_upload - generic file upload (v2.7.20)
+	RegisterWebRTCRoute(mux, app)  // GET /api/_webrtc/ice - STUN/TURN list (v2.7.28)
+	if initialize {
+		RegisterBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
+	} else {
+		registerBroadcastRoutes(mux, app) // POST /api/_broadcast/{publish,subscribe,stop} (v2.7.29)
+	}
 	RegisterPWARoutes(mux, app)
 
 	// Cron - scheduled jobs declared in cron.yaml. Background ticker
 	// fires the matching schedule entries; integrates with the same
 	// app.Stop channel as other workers so a graceful shutdown drains
 	// in-flight jobs cleanly.
-	StartCronScheduler(app)
+	if initialize {
+		StartCronScheduler(app)
+	}
 
 	// Stripe billing - auto-creates _benmore_subscriptions +
 	// _benmore_invoices and mounts /api/_billing/* when app.yaml
 	// declares `billing_provider: stripe`. No-op otherwise.
-	RegisterBillingRoutes(mux, app)
-
-	// DSAR / GDPR data export. Auto-mounts /api/_my-data which
+	if initialize {
+		RegisterBillingRoutes(mux, app)
+	} else {
+		registerBillingRoutes(mux, app)
+	}
 	// returns every row scoped to the current user.
 	RegisterDSARRoute(mux, app)
 
@@ -546,9 +780,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Client-side error capture. Auto-mounts /api/_errors which
 	// inserts into _benmore_client_errors and optionally forwards
 	// to Sentry/Slack when configured.
-	RegisterErrorCaptureRoute(mux, app)
-
-	// Image transforms. /api/_images/transform?src=&w=&fmt= takes
+	if initialize {
+		RegisterErrorCaptureRoute(mux, app)
+	} else {
+		registerErrorCaptureRoute(mux, app)
+	}
 	// any /uploads/* image and returns a resized/re-encoded copy,
 	// public derivatives cached outside uploads, after source authorization.
 	RegisterImageTransformRoute(mux, app)
@@ -562,70 +798,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	// Health check
 	mux.HandleFunc("GET /health", healthHandler(app))
 
-	// Page routes - all registered explicitly, including dynamic routes.
-	// Dynamic routes use :param in filenames (e.g., contacts-:id.html → /contacts/:id).
-	// Converted to Go 1.22 {param} syntax for proper mux registration.
-	for route, page := range app.Pages {
-		p := page
-		p.Require = ExtractPageRequire(p.RawHTML)
-
-		// Convert :param to {param} for Go 1.22 mux
-		muxPattern := route
-		if strings.Contains(route, ":") {
-			parts := strings.Split(route, "/")
-			for i, part := range parts {
-				if strings.HasPrefix(part, ":") {
-					parts[i] = "{" + strings.TrimPrefix(part, ":") + "}"
-				}
-			}
-			muxPattern = strings.Join(parts, "/")
-		}
-
-		handler := func(w http.ResponseWriter, r *http.Request) {
-			// Convert Go 1.22 path values back to query params for template access
-			if strings.Contains(route, ":") {
-				q := r.URL.Query()
-				parts := strings.Split(route, "/")
-				for _, part := range parts {
-					if strings.HasPrefix(part, ":") {
-						paramName := strings.TrimPrefix(part, ":")
-						q.Set(paramName, r.PathValue(paramName))
-					}
-				}
-				r.URL.RawQuery = q.Encode()
-			}
-			servePage(w, r, app, p, dev)
-		}
-		if p.Require != "" {
-			handler = RequireMiddleware(app, p, handler)
-		}
-		// role="public" means "anyone can view" - don't wrap with middleware.
-		if pageRole := extractPageRole(p.RawHTML); pageRole != "" && pageRole != "public" {
-			handler = RoleMiddleware(app, p, handler)
-		}
-		pattern := fmt.Sprintf("GET %s", muxPattern)
-		if route == "/" {
-			pattern = "GET /{$}"
-		}
-		// Recover-wrap the registration so a user page that collides
-		// with a framework-reserved route (e.g. /api/_*, internal helpers)
-		// doesn't crash the whole hosted process. Framework routes registered
-		// earlier in buildAppMux always win on collision; the user page is
-		// skipped with a clear log line for the dashboard to surface.
-		// Issue #6: framework panics on route collision - this is the fix.
-		func() {
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("  [%s] route conflict: page %q collides with framework route - skipped (%v)", filepath.Base(app.Dir), route, rec)
-				}
-			}()
-			if p.Auth == "required" || p.Require != "" {
-				mux.HandleFunc(pattern, AuthMiddleware(app, p, handler))
-			} else {
-				mux.HandleFunc(pattern, handler)
-			}
-		}()
-	}
+	registerAppPageRoutes(mux, app, dev)
 
 	// 404 handler - no catch-all. All routes registered explicitly above.
 	// This handles truly unmatched paths for ALL methods (not just GET).
@@ -656,8 +829,25 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 		relativePath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/uploads/"))
 		serveUploadAsset(w, r, app, dev, relativePath)
 	})
-	RegisterSignedURLRoutes(mux, app)
+	if initialize {
+		RegisterSignedURLRoutes(mux, app)
+	} else {
+		registerSignedURLRoutes(mux, app)
+	}
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		if appMCPManifestSnapshot(app) != nil {
+			for _, name := range []string{"static/favicon.ico", "static/favicon.png", "favicon.ico", "favicon.png"} {
+				data, err := app.readSourceFile(name)
+				if err == nil {
+					w.Header().Set("Cache-Control", "no-store")
+					http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
+					return
+				}
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			http.NotFound(w, r)
+			return
+		}
 		for _, name := range []string{"static/favicon.ico", "static/favicon.png", "favicon.ico", "favicon.png"} {
 			path := filepath.Join(app.Dir, name)
 			if _, err := os.Stat(path); err == nil {
@@ -669,13 +859,24 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	})
 
 	// SEO feeds
+	// Hand-authored overrides, as for llms.txt: an app's static/sitemap.xml
+	// and static/robots.txt are served verbatim. The generated sitemap lists
+	// only server-rendered pages, so a TSX/static app's was empty.
 	mux.HandleFunc("GET /sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
-		w.Write([]byte(GenerateSitemap(app, baseURL)))
+		if b, err := app.readSourceFile("static/sitemap.xml"); err == nil {
+			w.Write(b)
+			return
+		}
+		w.Write([]byte(GenerateSitemap(app, seoBaseURL(app, r, baseURL))))
 	})
 	mux.HandleFunc("GET /robots.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(GenerateRobots(baseURL)))
+		if b, err := app.readSourceFile("static/robots.txt"); err == nil {
+			w.Write(b)
+			return
+		}
+		w.Write([]byte(GenerateRobots(seoBaseURL(app, r, baseURL))))
 	})
 	llmsTxtHandler := func(w http.ResponseWriter, r *http.Request) {
 		// Respect features.docs visibility for LLM discoverability endpoints
@@ -689,11 +890,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 		w.Header().Set("Content-Type", "text/plain")
 		// Hand-authored override: a static/llms.txt in the app is served
 		// verbatim; the auto-generated public-page list is the fallback.
-		if b, err := os.ReadFile(filepath.Join(app.Dir, "static", "llms.txt")); err == nil {
+		if b, err := app.readSourceFile("static/llms.txt"); err == nil {
 			w.Write(b)
 			return
 		}
-		w.Write([]byte(GenerateLLMsTxt(app, baseURL)))
+		w.Write([]byte(GenerateLLMsTxt(app, seoBaseURL(app, r, baseURL))))
 	}
 	mux.HandleFunc("GET /llms.txt", llmsTxtHandler)
 	mux.HandleFunc("GET /.well-known/llms.txt", llmsTxtHandler)
@@ -707,7 +908,7 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 				return
 			}
 		}
-		b, err := os.ReadFile(filepath.Join(app.Dir, "static", "llms-full.txt"))
+		b, err := app.readSourceFile("static/llms-full.txt")
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -717,11 +918,11 @@ func buildAppMux(app *App, dev bool, baseURL string) *http.ServeMux {
 	})
 	mux.HandleFunc("GET /.well-known/security.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(GenerateSecurityTxt(app, baseURL)))
+		w.Write([]byte(GenerateSecurityTxt(app, seoBaseURL(app, r, baseURL))))
 	})
 	mux.HandleFunc("GET /feed.xml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/atom+xml")
-		w.Write([]byte(GenerateAtomFeed(app, baseURL)))
+		w.Write([]byte(GenerateAtomFeed(app, seoBaseURL(app, r, baseURL))))
 	})
 
 	return mux
@@ -737,6 +938,28 @@ func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	if serveTSXIfPresent(w, r, app, requested) {
 		return
 	}
+	// Desktop-metadata sidecars (`._app.js`, `.DS_Store`) are never app
+	// content; refuse them even when a sync left them on disk.
+	if pathHasMetadataSidecar(requested) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if appMCPManifestSnapshot(app) != nil {
+		name := filepath.Clean(requested)
+		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := app.readSourceFile(filepath.Join("static", name))
+		if err != nil {
+			w.Header().Set("Cache-Control", "no-store")
+			http.NotFound(w, r)
+			return
+		}
+		serveCapturedStaticAsset(w, r, name, data)
+		return
+	}
 	fullPath := filepath.Join(app.Dir, "static", requested)
 	// Verify path stays within static directory, resolving symlinks so a
 	// link inside static/ can't point outside it (containment on the
@@ -744,17 +967,18 @@ func serveStaticAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	// ServeMux normalizes `..` before routing, so the lexical part is
 	// defense-in-depth, but symlink-escape is not caught by filepath.Clean.
 	staticRoot := filepath.Join(app.Dir, "static")
-	resolved, ok := resolveServableFile(staticRoot, fullPath)
+	file, ok := openServableFile(staticRoot, fullPath)
 	if !ok {
 		// no-store so browsers/CDNs don't pin a deploy-race miss.
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
 	}
+	defer file.Close()
 	if !dev {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
-	http.ServeFile(w, r, resolved)
+	file.serveHTTP(w, r)
 }
 
 // serveUploadAsset serves a file from the app's uploads/ directory, enforcing
@@ -764,6 +988,12 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	// Legacy transform caches may contain derivatives of private sources.
 	// New caches live outside uploads and are served only after source checks.
 	if strings.HasPrefix(filepath.ToSlash(filepath.Clean(relativePath)), "_transforms/") {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	// Connector artifacts are served only by GET /api/_mcp/artifacts/{id}.
+	if appMCPArtifactStorageReference("uploads/" + filepath.ToSlash(relativePath)) {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
@@ -788,34 +1018,31 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	}
 	// Resolve symlinks and confirm containment within uploads/ (filepath.Clean
 	// alone does not catch a symlink inside uploads/ pointing elsewhere).
-	resolved, ok := resolveServableFile(uploadsRoot, fullPath)
+	file, ok := openServableFile(uploadsRoot, fullPath)
 	if !ok {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
 	}
+	defer file.Close()
 	// Re-check the private gate against the symlink-RESOLVED target: a
 	// non-private URL (e.g. uploads/public.png) that is a symlink into
 	// private/ would pass the URL-based check above yet resolve to a private
-	// file. EvalSymlinks both sides so e.g. macOS /var -> /private/var
-	// normalizes consistently.
-	privateBase := uploadsRoot
-	if realUploads, err := filepath.EvalSymlinks(uploadsRoot); err == nil {
-		privateBase = realUploads
-	}
-	if rel, err := filepath.Rel(privateBase, resolved); err == nil && strings.HasPrefix(filepath.ToSlash(rel), "_transforms/") {
+	// file. Use the relative path captured while opening the file, rather
+	// than resolving the root again after it could have been replaced.
+	resolvedRelative := filepath.ToSlash(file.relative)
+	if strings.HasPrefix(resolvedRelative, "_transforms/") || appMCPArtifactStorageReference("uploads/"+resolvedRelative) {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
 	}
-	if rel, err := filepath.Rel(privateBase, resolved); err != nil ||
-		isPrivateUploadPath("uploads/"+filepath.ToSlash(rel)) {
+	if isPrivateUploadPath("uploads/" + resolvedRelative) {
 		private = true
 		// Use the SAME predicate as the URL gate (matches any /private/
 		// segment, not just a top-level one) so a symlink resolving into a
 		// NESTED private dir (e.g. public.png -> x/private/secret) can't be
 		// served unsigned.
-		if err != nil || !ValidateSignedURL(relativePath, r) {
+		if !ValidateSignedURL(relativePath, r) {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "Forbidden - invalid or expired signed URL", http.StatusForbidden)
 			return
@@ -828,8 +1055,8 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	}
 	// Force download for active-content types so a user-uploaded
 	// .html / .svg / .xml can't execute JS in the app's origin.
-	applyUploadDispositionHeaders(w, resolved)
-	http.ServeFile(w, r, resolved)
+	applyUploadFileDispositionHeaders(w, file.path, file)
+	file.serveHTTP(w, r)
 }
 
 // wrapMiddleware applies the standard middleware chain to a handler.
@@ -884,6 +1111,10 @@ func wrapMiddleware(handler http.Handler, app *App, dev bool) http.Handler {
 	// _benmore_request_log persistence - powers the Runtime Logs tab
 	// in the dashboard. Async insert per request; static assets skipped.
 	handler = requestLogMiddleware(app, handler)
+	// Per-request session cache (auth_session_cache.go): outside the request
+	// log so the password-change gate, the handler and the log share one
+	// session lookup.
+	handler = requestSessionCacheMiddleware(handler)
 	// Outermost: recover from panics in any inner middleware/handler so a
 	// single bad request doesn't take down the whole process. Issue #2.
 	handler = recoverMiddleware(handler)
@@ -893,7 +1124,7 @@ func wrapMiddleware(handler http.Handler, app *App, dev bool) http.Handler {
 	// (see buildAppMux's RegisterDemoLoginRoute branch for the matching
 	// login endpoint).
 	if demoPassword := GetAppEnv(app.Dir, "DEMO_PASSWORD"); demoPassword != "" {
-		handler = DemoGateMiddleware(demoPassword, handler)
+		handler = DemoGateMiddleware(app, demoPassword, handler)
 	}
 
 	return handler
@@ -918,19 +1149,45 @@ func serverResolveMaxBodyBytes(app *App) int64 {
 	return max
 }
 
-// serverBodyLimitMiddleware caps the request body size for the non-upload
-// surface. Multipart requests are skipped so the upload path's own (larger)
-// http.MaxBytesReader governs them instead - capping twice would truncate
-// legitimate large uploads. A configured cap of <=0 disables the limit.
+// serverMaxMultipartBodyCeiling bounds MAX_UPLOAD_BODY_BYTES.
+const serverMaxMultipartBodyCeiling int64 = 1 << 30 // 1GB
+
+// serverResolveMaxMultipartBytes is the total cap for a multipart request
+// body: by default one full-size file plus framing. Forms that post several
+// files at once raise it with MAX_UPLOAD_BODY_BYTES (up to 1GB). Each file is
+// still held to maxUploadSize.
+func serverResolveMaxMultipartBytes(app *App) int64 {
+	max := int64(maxUploadSize + uploadBodyOverhead)
+	if app != nil {
+		if v := strings.TrimSpace(GetAppEnv(app.Dir, "MAX_UPLOAD_BODY_BYTES")); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				max = n
+				if max > serverMaxMultipartBodyCeiling {
+					max = serverMaxMultipartBodyCeiling
+				}
+			}
+		}
+	}
+	return max
+}
+
+// serverBodyLimitMiddleware caps the request body size. Multipart bodies
+// get their own total cap (serverResolveMaxMultipartBytes): net/http spills
+// file parts to temporary disk as it parses, so any handler that reads a form
+// field of an uncapped multipart body wrote it to disk in full. Other bodies
+// get the global cap; a configured cap of <=0 disables that one.
 func serverBodyLimitMiddleware(next http.Handler, app *App) http.Handler {
 	maxBytes := serverResolveMaxBodyBytes(app)
-	if maxBytes <= 0 {
-		return next
-	}
+	maxMultipart := serverResolveMaxMultipartBytes(app)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Bodyless methods carry nothing to cap; skip the wrap.
 		if r.Body != nil && r.ContentLength != 0 {
 			ct := r.Header.Get("Content-Type")
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/") {
+				r.Body = http.MaxBytesReader(w, r.Body, maxMultipart)
+				next.ServeHTTP(w, r)
+				return
+			}
 			// Uploads (multipart/form-data) are capped by HandleFileUpload's
 			// own MaxBytesReader; don't double-cap and truncate them. Bulk
 			// import chunk PUTs (import_http.go) are the same shape: their
@@ -942,7 +1199,7 @@ func serverBodyLimitMiddleware(next http.Handler, app *App) http.Handler {
 			// `benmore serve` smoke test - the existing import test suite
 			// only ever exercises RegisterImportRoutes on a bare mux, which
 			// never goes through this middleware, so no test had caught it.
-			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/") && !isImportChunkUploadPath(r) {
+			if maxBytes > 0 && !isImportChunkUploadPath(r) {
 				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 			}
 		}
@@ -966,17 +1223,27 @@ func isImportChunkUploadPath(r *http.Request) bool {
 func StartServer(app *App, port int, dev bool) error {
 	app.DevMode = dev
 	app.ServerPort = port
+	startPprofListener() // opt-in, loopback + token only (debug_pprof.go)
 
 	baseURL := ""
 	if app.Design != nil {
 		baseURL = app.Design.SEO["url"]
 	}
-	if baseURL == "" {
+	if baseURL == "" || app.MCPLocal {
 		baseURL = fmt.Sprintf("http://localhost:%d", port)
 	}
 
 	mux := buildAppMux(app, dev, baseURL)
 	handler := wrapMiddleware(mux, app, dev)
+	if app.MCPLocal {
+		// After the mux: route registration creates the framework tables
+		// the switch audit and grants use.
+		status, err := enableMCPLocal(app, app.MCPLocalWrites)
+		if err != nil {
+			return fmt.Errorf("--mcp-local: connector not enabled: %s", appMCPControlText(err))
+		}
+		log.Printf("  MCP local: %s/api/_mcp exposed=%v approved_writes=%v command_tools=%d", baseURL, status.Exposed, status.ApprovedWrites, status.CommandTools)
+	}
 
 	// Install the hot-swap handler. SIGHUP rebuilds the mux + middleware
 	// in place and atomic-swaps. Zero downtime - the listening socket
@@ -991,10 +1258,11 @@ func StartServer(app *App, port int, dev bool) error {
 	// keeps the per-app HTTP port off all external interfaces - defense
 	// in depth beyond ufw. The per-app service unit sets BENMORE_BIND_LOOPBACK=1.
 	// Standalone `benmore serve` (single-app self-host, local dev) keeps
-	// binding all interfaces so it's directly reachable.
-	addr := fmt.Sprintf(":%d", port)
-	if os.Getenv("BENMORE_BIND_LOOPBACK") == "1" {
-		addr = fmt.Sprintf("127.0.0.1:%d", port)
+	// binding all interfaces so it's directly reachable, unless BENMORE_LISTEN
+	// names an address (serveListenAddr).
+	addr, err := serveListenAddr(port, app.MCPLocal)
+	if err != nil {
+		log.Fatalf("serve: %v", err)
 	}
 	server := &http.Server{
 		Addr:    addr,
@@ -1070,6 +1338,87 @@ func applySecurityHeaders(w http.ResponseWriter, dev bool, app *App) {
 	//
 	// 'unsafe-eval' was dropped earlier: React SPA mode compiles bundles
 	// ahead of time via esbuild, so no app code needs runtime eval.
+	d := pageCSPDirectives(app)
+	scriptSrc, styleSrc, imgSrc, mediaSrc := d["script_src"], d["style_src"], d["img_src"], d["media_src"]
+	fontSrc, connectSrc, frameSrc := d["font_src"], d["connect_src"], d["frame_src"]
+	if app != nil && app.Design != nil {
+		pick := func(directive string) string {
+			if v := app.Design.CSP[directive]; v != "" {
+				return v
+			}
+			return app.Design.SEO[directive]
+		}
+		// frame_ancestors WIDENS who may iframe this app. Unlike the
+		// *-src directives it extends the framing allowlist rather than a
+		// fetch allowlist, so it's the one embed-shaped knob: an app that
+		// ships an embeddable page (e.g. /embed share views with a
+		// made-with watermark) sets `csp.frame_ancestors: "*"` (or a list
+		// of specific origins) and third-party sites + LLM-host iframes
+		// can render it. Default stays locked down (self + platform +
+		// desktop webview) - this is strictly opt-in per app.
+		if v := pick("frame_ancestors"); v != "" {
+			trimmed := strings.TrimSpace(v)
+			if frameAncestorsHasNone(trimmed) {
+				// CSP requires 'none' to be the only source expression. Fail
+				// closed even for legacy configs that bypass write-time checks.
+				framePolicy = "frame-ancestors 'none'"
+				xframe = "DENY"
+			} else if trimmed == "*" {
+				framePolicy = "frame-ancestors *"
+			} else {
+				framePolicy += " " + v
+				xframe = "" // CSP frame-ancestors is authoritative; XFO can't express origin lists
+			}
+		}
+	}
+
+	csp := strings.Join([]string{
+		"default-src 'self'",
+		"script-src " + scriptSrc,
+		"style-src " + styleSrc,
+		"img-src " + imgSrc,
+		"media-src " + mediaSrc,
+		"font-src " + fontSrc,
+		"connect-src " + connectSrc,
+		"frame-src " + frameSrc,
+		// Zero-risk hardening: no app loads plugins/Flash/Java, so block all
+		// <object>/<embed> content; and lock <base href> to same-origin so
+		// injected markup can't rebase relative URLs onto an attacker origin.
+		"object-src 'none'",
+		"base-uri 'self'",
+		// TODO(csp-strict): drop 'unsafe-inline' from script-src once nonces
+		// are threaded through every inline-script emit site (see the
+		// security.csp_strict punch list above). Tracked in MEMORY.md.
+		framePolicy,
+	}, "; ")
+	w.Header().Set("Content-Security-Policy", csp)
+
+	if xframe != "" {
+		w.Header().Set("X-Frame-Options", xframe)
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	if !dev {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	}
+
+	// Permissions-Policy: default restrictive, but allow apps to declare needed permissions
+	// Apps set permissions_policy in seo: to override (e.g., "camera=*, microphone=*")
+	permPolicy := "geolocation=(), payment=()"
+	if app != nil && app.Design != nil {
+		if v := app.Design.SEO["permissions_policy"]; v != "" {
+			permPolicy = v
+		}
+	}
+	w.Header().Set("Permissions-Policy", permPolicy)
+}
+
+// pageCSPDirectives returns the fetch-directive source lists for an app's
+// pages: framework defaults plus the app's `csp:` (or legacy `seo:`)
+// extensions. Keys are the csp: directive names (script_src, style_src,
+// img_src, media_src, font_src, connect_src, frame_src). Page responses and
+// the PDF render sandbox both derive their policy from it.
+func pageCSPDirectives(app *App) map[string]string {
 	scriptSrc := "'self' 'unsafe-inline'"
 	styleSrc := "'self' 'unsafe-inline'"
 	fontSrc := "'self'"
@@ -1159,92 +1508,144 @@ func applySecurityHeaders(w http.ResponseWriter, dev bool, app *App) {
 		if v := pick("font_src"); v != "" {
 			fontSrc += " " + v
 		}
-		// frame_ancestors WIDENS who may iframe this app. Unlike the
-		// *-src directives it extends the framing allowlist rather than a
-		// fetch allowlist, so it's the one embed-shaped knob: an app that
-		// ships an embeddable page (e.g. /embed share views with a
-		// made-with watermark) sets `csp.frame_ancestors: "*"` (or a list
-		// of specific origins) and third-party sites + LLM-host iframes
-		// can render it. Default stays locked down (self + platform +
-		// desktop webview) - this is strictly opt-in per app.
-		if v := pick("frame_ancestors"); v != "" {
-			if strings.TrimSpace(v) == "*" {
-				framePolicy = "frame-ancestors *"
-			} else {
-				framePolicy += " " + v
-			}
-			xframe = "" // CSP frame-ancestors is authoritative; XFO can't express origin lists
-		}
 	}
-
-	csp := strings.Join([]string{
-		"default-src 'self'",
-		"script-src " + scriptSrc,
-		"style-src " + styleSrc,
-		"img-src " + imgSrc,
-		"media-src " + mediaSrc,
-		"font-src " + fontSrc,
-		"connect-src " + connectSrc,
-		"frame-src " + frameSrc,
-		// Zero-risk hardening: no app loads plugins/Flash/Java, so block all
-		// <object>/<embed> content; and lock <base href> to same-origin so
-		// injected markup can't rebase relative URLs onto an attacker origin.
-		"object-src 'none'",
-		"base-uri 'self'",
-		// TODO(csp-strict): drop 'unsafe-inline' from script-src once nonces
-		// are threaded through every inline-script emit site (see the
-		// security.csp_strict punch list above). Tracked in MEMORY.md.
-		framePolicy,
-	}, "; ")
-	w.Header().Set("Content-Security-Policy", csp)
-
-	if xframe != "" {
-		w.Header().Set("X-Frame-Options", xframe)
+	return map[string]string{
+		"script_src": scriptSrc, "style_src": styleSrc, "img_src": imgSrc, "media_src": mediaSrc,
+		"font_src": fontSrc, "connect_src": connectSrc, "frame_src": frameSrc,
 	}
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-	if !dev {
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-	}
-
-	// Permissions-Policy: default restrictive, but allow apps to declare needed permissions
-	// Apps set permissions_policy in seo: to override (e.g., "camera=*, microphone=*")
-	permPolicy := "geolocation=(), payment=()"
-	if app != nil && app.Design != nil {
-		if v := app.Design.SEO["permissions_policy"]; v != "" {
-			permPolicy = v
-		}
-	}
-	w.Header().Set("Permissions-Policy", permPolicy)
 }
 
 // securityHeaders wraps applySecurityHeaders as middleware for single-app mode.
 func securityHeaders(next http.Handler, dev bool, app *App) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		applySecurityHeaders(w, dev, app)
+		if app != nil && !app.FeatureEnabled("analytics") {
+			w = noTransformHTMLResponseWriter{ResponseWriter: w}
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+// frameAncestorsHasNone detects the CSP keyword even in an invalid mixed
+// source list. Such a list is rejected by app.yaml validation and denies
+// framing here as a fail-closed fallback for already-loaded legacy config.
+func frameAncestorsHasNone(value string) bool {
+	for _, source := range strings.Fields(value) {
+		if strings.EqualFold(source, "'none'") {
+			return true
+		}
+	}
+	return false
+}
+
+// noTransformHTMLResponseWriter prevents an intermediary such as Cloudflare
+// from injecting its own analytics script into HTML when app analytics are
+// disabled. It only adds a Cache-Control directive; existing no-store and
+// no-cache directives are preserved. Non-HTML responses are unchanged.
+type noTransformHTMLResponseWriter struct{ http.ResponseWriter }
+
+func (w noTransformHTMLResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w noTransformHTMLResponseWriter) WriteHeader(status int) {
+	w.ensureHTMLNoTransform()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w noTransformHTMLResponseWriter) Write(body []byte) (int, error) {
+	w.ensureHTMLNoTransform()
+	return w.ResponseWriter.Write(body)
+}
+
+func (w noTransformHTMLResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w noTransformHTMLResponseWriter) FlushError() error {
+	w.ensureHTMLNoTransform()
+	if f, ok := w.ResponseWriter.(interface{ FlushError() error }); ok {
+		return f.FlushError()
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+		return nil
+	}
+	return http.ErrNotSupported
+}
+
+func (w noTransformHTMLResponseWriter) ensureHTMLNoTransform() {
+	if isHTMLResponse(w.Header()) {
+		addCacheControlDirective(w.Header(), "no-transform")
+	}
+}
+
+func (w noTransformHTMLResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+func (w noTransformHTMLResponseWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
+func isHTMLResponse(h http.Header) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(h.Get("Content-Type"))), "text/html")
+}
+
+func addCacheControlDirective(h http.Header, directive string) {
+	values := h.Values("Cache-Control")
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), directive) {
+				return
+			}
+		}
+	}
+	values = append(values, directive)
+	h.Set("Cache-Control", strings.Join(values, ", "))
+}
+
 // resolveAppRole looks up the user's role from the app's group membership table.
 // Returns the role string (e.g., "org", "mgmt", "site") or empty if not found.
+//
+// The role is the one held in the session's EFFECTIVE tenant (act-as aware).
+// A user can belong to several tenants with a different role in each; reading
+// any membership row let an approver in one tenant pass role-gated workflow
+// transitions and SSR role sections in another.
 func resolveAppRole(app *App, session *Session) string {
 	if app.Group == nil || session == nil {
 		return ""
 	}
-	// Check if the membership table has a "role" column
-	if !hasColumn(app, app.Group.Table, "role") {
+	roleField := workflowMembershipRoleField(app)
+	if roleField == "" {
 		return ""
 	}
-	var role string
-	query := fmt.Sprintf("SELECT role FROM %s WHERE %s = ? LIMIT 1", app.Group.Table, app.Group.UserField)
 	var lookupVal any
-	if app.Group.UserField == "email" {
-		lookupVal = session.Email
+	if emailKeyedColumn(app.Group.UserField) {
+		// Email-keyed membership counts only for a verified address.
+		if lookupVal = sessionGrantEmail(session); lookupVal == "" {
+			return ""
+		}
 	} else {
 		lookupVal = session.UserID
 	}
-	app.DB.QueryRow(query, lookupVal).Scan(&role)
+	args := []any{lookupVal}
+	tenant := ""
+	if app.Group.Key != "" {
+		if !session.EffectiveHasGroup() {
+			return ""
+		}
+		tenant = " AND " + quoteColumn(app.Group.Table, app.Group.Key) + " = ?"
+		args = append(args, session.EffectiveGroupID())
+	}
+	var role string
+	query := "SELECT " + quoteColumn(app.Group.Table, roleField) + " FROM " + quoteIdent(app.Group.Table) + " WHERE " + quoteColumn(app.Group.Table, app.Group.UserField) + " = ?" + tenant +
+		membershipLiveConds(app.Group, app.Group.Table, "", appColumnChecker(app, app.Group.Table)) + " LIMIT 1"
+	app.DB.QueryRow(query, args...).Scan(&role)
 	return role
 }
 
@@ -1289,14 +1690,15 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 	}
 	// In dev mode, re-read the file on each request for hot reload
 	if dev {
-		data, err := os.ReadFile(filepath.Join(app.Dir, page.File))
-		if err == nil {
-			page.RawHTML = string(data)
-			page.Auth, page.Scope, page.Title, page.Layout = ParsePageAttrs(page.RawHTML)
-			page.Require = ExtractPageRequire(page.RawHTML)
-			page.Redirect = ExtractPageRedirect(page.RawHTML)
+		app.mu.Lock()
+		if app.MCP == nil {
+			data, err := os.ReadFile(filepath.Join(app.Dir, page.File))
+			if err == nil {
+				setPageAttrsFromSource(page, string(data))
+			}
+			app.Partials = reloadPartials(app.Dir)
 		}
-		app.Partials = reloadPartials(app.Dir)
+		app.mu.Unlock()
 	}
 
 	session := getSession(app, r)
@@ -1389,20 +1791,12 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, `<div class="benmore-error"><strong>Render Error</strong><pre>%s</pre></div>`, err.Error())
 		} else {
-			// Production: log full error, show generic message. ALSO
-			// stash the error in the X-Benmore-Error response header
-			// so the request_log middleware can record it - the
-			// agent's `get_request_logs` then surfaces the real
-			// failure cause via the `error` column. The header is
-			// stripped from the outgoing response by the middleware
-			// so it never reaches the user's browser.
-			log.Printf("ERROR [%s] %s", page.File, err.Error())
-			detail := err.Error()
-			if len(detail) > 500 {
-				detail = detail[:500] + "..."
-			}
-			w.Header().Set("X-Benmore-Error", fmt.Sprintf("[%s] %s", page.File, detail))
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			// Production: the full error goes to the journal and the
+			// request log's `error` column (get_request_logs), the
+			// caller gets a generic message with the request id. It
+			// stays server-side (a response header reached the client
+			// before the middleware could strip it).
+			serverError(w, r, app, page.File, err, "Internal Server Error")
 		}
 		return
 	}
@@ -1478,8 +1872,8 @@ func reloadPartials(dir string) map[string]string {
 		return partials
 	}
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".html") {
-			data, err := os.ReadFile(filepath.Join(partialDir, entry.Name()))
+		if strings.HasSuffix(entry.Name(), ".html") && !isMetadataSidecar(entry.Name()) {
+			data, err := readFileInRoot(partialDir, entry.Name()) // include_root.go: no symlink escape
 			if err == nil {
 				partials["partials/"+entry.Name()] = string(data)
 			}
@@ -1542,6 +1936,129 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
 
+// Rendering consumes reviewed bytes when MCP is enabled. Runtime storage and
+// environment paths remain anchored to the original app directory.
+func (app *App) readSourceFile(name string) ([]byte, error) {
+	app.mu.RLock()
+	reviewed, sources := app.MCP != nil, app.sourceFiles
+	app.mu.RUnlock()
+	if !reviewed {
+		return readFileFromDir(app.Dir, name)
+	}
+	if sources == nil {
+		return nil, fmt.Errorf("missing captured app source")
+	}
+	data := sources[filepath.ToSlash(filepath.Clean(name))]
+	if data == nil {
+		return nil, os.ErrNotExist
+	}
+	return data, nil
+}
+
 func readFileFromDir(dir, name string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(dir, name))
+}
+
+// serveListenAddr is the address `serve` listens on. Hosted per-app units set
+// BENMORE_BIND_LOOPBACK=1 (loopback, and the hosted-tenant guards that come
+// with it). A self-hoster behind a local proxy sets BENMORE_LISTEN to an IP
+// such as 127.0.0.1 to get the loopback listener without those guards. A
+// value that isn't a bare IP is an error, never a silent bind-all. With
+// --mcp-local the connector's resource is http://localhost, so the default is
+// loopback only; an explicit BENMORE_LISTEN still wins.
+func serveListenAddr(port int, mcpLocal bool) (string, error) {
+	if os.Getenv("BENMORE_BIND_LOOPBACK") == "1" {
+		return fmt.Sprintf("127.0.0.1:%d", port), nil
+	}
+	host := strings.TrimSpace(os.Getenv("BENMORE_LISTEN"))
+	if host == "" && mcpLocal {
+		return fmt.Sprintf("127.0.0.1:%d", port), nil
+	}
+	if host == "" {
+		return fmt.Sprintf(":%d", port), nil
+	}
+	if net.ParseIP(host) == nil {
+		return "", fmt.Errorf("BENMORE_LISTEN=%q is not an IP address (use e.g. 127.0.0.1; the port comes from --port)", host)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// registerAppPageRoutes shares actual page registration with candidate preflight.
+// Returned patterns contain only successful registrations; handlers are not invoked.
+func registerAppPageRoutes(mux appRouteRegistrar, app *App, dev bool) []string {
+	// Page routes - all registered explicitly, including dynamic routes.
+	// Dynamic routes use :param in filenames (e.g., contacts-:id.html → /contacts/:id).
+	// Converted to Go 1.22 {param} syntax for proper mux registration.
+	registered := make([]string, 0, len(app.Pages))
+	for route, page := range app.Pages {
+		p := page
+		// LoadPages already merged the <page> tag with frontmatter; only
+		// pages built elsewhere (single-file apps, fixtures) need the tag
+		// read here. Overwriting unconditionally dropped a frontmatter
+		// require: and left the page with no gate at all.
+		if p.Require == "" {
+			p.Require = ExtractPageRequire(p.RawHTML)
+		}
+		p.Auth = normalizePageAuth(p.Auth, p.File)
+
+		// Convert :param to {param} for Go 1.22 mux
+		muxPattern := route
+		if strings.Contains(route, ":") {
+			parts := strings.Split(route, "/")
+			for i, part := range parts {
+				if strings.HasPrefix(part, ":") {
+					parts[i] = "{" + strings.TrimPrefix(part, ":") + "}"
+				}
+			}
+			muxPattern = strings.Join(parts, "/")
+		}
+
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			// Convert Go 1.22 path values back to query params for template access
+			if strings.Contains(route, ":") {
+				q := r.URL.Query()
+				parts := strings.Split(route, "/")
+				for _, part := range parts {
+					if strings.HasPrefix(part, ":") {
+						paramName := strings.TrimPrefix(part, ":")
+						q.Set(paramName, r.PathValue(paramName))
+					}
+				}
+				r.URL.RawQuery = q.Encode()
+			}
+			servePage(w, r, app, p, dev)
+		}
+		if p.Require != "" {
+			handler = RequireMiddleware(app, p, handler)
+		}
+		// role="public" means "anyone can view" - don't wrap with middleware.
+		if role := pageRole(p); role != "" && role != "public" {
+			handler = RoleMiddleware(app, p, handler)
+		}
+		pattern := fmt.Sprintf("GET %s", muxPattern)
+		if route == "/" {
+			pattern = "GET /{$}"
+		}
+		// Recover-wrap the registration so a user page that collides
+		// with a framework-reserved route (e.g. /api/_*, internal helpers)
+		// doesn't crash the whole hosted process. Framework routes registered
+		// earlier in buildAppMux always win on collision; the user page is
+		// skipped with a clear log line for the dashboard to surface.
+		// Issue #6: framework panics on route collision - this is the fix.
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("  [%s] route conflict: page %q collides with framework route - skipped (%v)", filepath.Base(app.Dir), route, rec)
+				}
+			}()
+			if p.Auth == "required" || p.Require != "" {
+				mux.HandleFunc(pattern, AuthMiddleware(app, p, handler))
+			} else {
+				mux.HandleFunc(pattern, handler)
+			}
+			registered = append(registered, pattern)
+		}()
+	}
+
+	return registered
 }

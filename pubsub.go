@@ -4,7 +4,6 @@ package main
 
 import (
 	"database/sql"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -38,9 +37,12 @@ func EnsureEventsTable(db *sql.DB) {
 
 // PublishEvent inserts a change event into the shared events table.
 func PublishEvent(db *sql.DB, table, action string, groupID string, userID int64) {
+	// The legacy group_id column has INTEGER affinity. Bind opaque tenant IDs
+	// as bytes so SQLite cannot coerce "001" to 1 or "1e2" to 100. Pollers scan
+	// both these bytes and existing integer rows into strings unchanged.
 	_, err := db.Exec(
 		`INSERT INTO _benmore_events (table_name, action, group_id, user_id) VALUES (?, ?, ?, ?)`,
-		table, action, groupID, userID,
+		table, action, []byte(groupID), userID,
 	)
 	if err != nil {
 		log.Printf("PUBSUB ERROR: failed to publish event: %s", err)
@@ -201,22 +203,26 @@ func Broadcast(app *App, table, action string, session *Session) {
 		// Cluster mode: write to shared events table; pollers distribute
 		PublishEvent(app.DB, table, action, groupID, userID)
 	} else {
-		// Single instance: direct SSE + WS broadcast (no DB overhead)
-		broadcastToSSE(app, table, action, groupID, userID)
-		BroadcastWSChange(app, table, action, groupID, userID)
+		// Single instance: hand the event to this app's dispatcher; the
+		// writer's request does not pay for the fan-out (realtime_dispatch.go).
+		dispatchRealtimeChange(app, realtimeChange{table: table, action: action, groupID: groupID, userID: userID})
 	}
 }
 
-// BroadcastUnscoped is for broadcasts without a session (system events, cascades).
-// Same single/cluster mode logic as Broadcast.
+// BroadcastUnscoped is for broadcasts without a session (system events,
+// cascades). The caller names no tenant or owner, so delivery derives the
+// audience from the table's read access mode (realtimeAudienceFor): a
+// publicly readable table reaches every reader, while a tenant, owner or
+// membership-scoped table reaches admins in full and other readers only as
+// the generic refresh, which names no table. Same single/cluster mode logic
+// as Broadcast.
 func BroadcastUnscoped(app *App, table, action string) {
 	InvalidateQueryCacheForTable(table)
 
 	if IsClusterMode() {
 		PublishEvent(app.DB, table, action, "", 0)
 	} else {
-		broadcastToSSE(app, table, action, "", 0)
-		BroadcastWSChange(app, table, action, "", 0)
+		dispatchRealtimeChange(app, realtimeChange{table: table, action: action})
 	}
 }
 
@@ -228,61 +234,6 @@ func BroadcastScopedDirect(app *App, table, action string, groupID string, userI
 	if IsClusterMode() {
 		PublishEvent(app.DB, table, action, groupID, userID)
 	} else {
-		broadcastToSSE(app, table, action, groupID, userID)
-		BroadcastWSChange(app, table, action, groupID, userID)
-	}
-}
-
-// broadcastToSSE pushes a change event directly to the local SSE hub.
-// This is the fast path for single-instance mode and the delivery path
-// for the cluster-mode poller.
-func broadcastToSSE(app *App, table, action string, groupID string, userID int64) {
-	msg := fmt.Sprintf(`{"table":"%s","action":"%s"}`, table, action)
-	genericMsg := `{"table":"","action":"refresh"}`
-
-	sseHub.mu.RLock()
-	defer sseHub.mu.RUnlock()
-	for client := range sseHub.clients {
-		if !realtimeSameApp(app, client.principal.app) || !client.principal.canRead(table, userID) {
-			continue
-		}
-		// Server-side scope filtering.
-		// Three cases:
-		//   1. group-scoped event (groupID is set + not "0"): only
-		//      clients in the same group see anything. Admins bypass.
-		//   2. owner-scoped event (groupID empty, userID > 0):
-		//      the owner sees the full event; other non-admin
-		//      clients see a generic refresh (so they know SOMETHING
-		//      changed and can re-fetch a scoped list, without
-		//      learning which row).
-		//   3. unscoped event (groupID empty, userID 0): everyone
-		//      sees the full event - used for system-wide cascades
-		//      like analytics, config changes, public table updates.
-		//
-		// Pre-v2.7.5 the owner-scoped check was buggy: the operator-
-		// precedence rules in Go meant `groupID == ""` short-
-		// circuited the OR, so EVERY non-group event landed in the
-		// generic-refresh branch - even for the owner. Effect:
-		// owners never got detailed events for their own mutations.
-		// Parens added below + explicit "unscoped means broadcast"
-		// branch.
-		if groupID != "" && groupID != "0" && !client.isAdmin && client.groupID != groupID {
-			continue // case 1: wrong group, skip
-		}
-		ownerScoped := (groupID == "" || groupID == "0") && userID > 0
-		if ownerScoped && !client.isAdmin && client.userID != userID {
-			// case 2: non-owner gets the generic refresh
-			select {
-			case client.ch <- genericMsg:
-			default:
-			}
-			continue
-		}
-		// case 3 (or owner / admin in case 1/2): full event
-		select {
-		case client.ch <- msg:
-		default:
-			// Drop if client is slow
-		}
+		dispatchRealtimeChange(app, realtimeChange{table: table, action: action, groupID: groupID, userID: userID})
 	}
 }

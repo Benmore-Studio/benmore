@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type RecordingSession struct {
 	StartedAt string           `json:"started_at"`
 	URL       string           `json:"url"`
 	Events    []RecordingEvent `json:"events"`
+	bytes     int              // request bytes accepted, for maxRecordingSessionBytes
 }
 
 // RecordingEvent is a single captured event.
@@ -34,10 +36,61 @@ type RecordingEvent struct {
 	Data      any    `json:"data"`
 }
 
-var (
-	recordingSessions   = make(map[string]*RecordingSession)
-	recordingSessionsMu sync.RWMutex
+// Bounds on the anonymous recording beacon: it is unauthenticated, and each
+// app keeps its buffers in memory.
+const (
+	maxRecordingBatchBytes       = 4 << 20
+	maxRecordingIDLen            = 64
+	maxRecordingEventsPerSession = 50000
+	// The event count alone would allow 50000 events of a whole batch each.
+	maxRecordingSessionBytes = 16 << 20
+	// /_internal/ is exempt from the app's general rate limiter, so the
+	// beacon has its own per-client budget. The recorder flushes at most
+	// every 5 seconds per open page (plus twice on unload), about 12 a
+	// minute; 240 leaves room for many tabs or visitors behind one address.
+	recordingBeaconsPerMinute = 240
+	// Decoding a batch costs many times its wire size; at most this many
+	// batches per app are decoded at once.
+	maxRecordingConcurrentDecodes = 4
 )
+
+// countingReader counts the bytes a request body yields.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// RecordingStore holds one app's captured sessions. It used to be a process
+// global, so in a `benmore host` process every app shared one buffer and one
+// app's admin could read the DOM snapshots and input events (PII) another
+// app's recorder posted. It now lives on App.Recordings.
+type RecordingStore struct {
+	mu       sync.RWMutex
+	sessions map[string]*RecordingSession
+	// decodeSlots bounds the beacon batches being decoded at once.
+	decodeSlots chan struct{}
+}
+
+func newRecordingStore() *RecordingStore {
+	return &RecordingStore{
+		sessions:    make(map[string]*RecordingSession),
+		decodeSlots: make(chan struct{}, maxRecordingConcurrentDecodes),
+	}
+}
+
+// recordingStore returns the app's store, creating it on first use.
+func (app *App) recordingStore() *RecordingStore {
+	if app.Recordings == nil {
+		app.Recordings = newRecordingStore()
+	}
+	return app.Recordings
+}
 
 // IsRecordingEnabled checks if recording is enabled for this app.
 func IsRecordingEnabled(app *App, devMode bool) bool {
@@ -102,6 +155,59 @@ func RecorderScript(app *App, devMode bool) string {
     return false;
   }
 
+  // Secret surfaces. An element inside [data-bm-mask] (or sdui's
+  // [data-bm-sensitive]) is never recorded by value: snapshots replace its
+  // content, and its input, click and attribute events carry '***'. Sensitive
+  // inputs also lose their value attribute in snapshots and mutations, and
+  // credential-named URL parameters (a reset link's token) lose their value.
+  var maskSel = '[data-bm-mask],[data-bm-sensitive]';
+  function inMask(el){
+    return !!(el && el.closest && el.closest(maskSel));
+  }
+  function maskedField(el){
+    return inMask(el) || (maskInputs && isSensitive(el));
+  }
+  function maskURL(u){
+    return String(u||'').replace(/([?&#;])([^=&#;]*)=([^&#;]*)/g,function(m,sep,k){
+      var n=k.toLowerCase();
+      for(var i=0;i<sensitiveFields.length;i++){
+        if(n.indexOf(sensitiveFields[i])>=0) return sep+k+'=***';
+      }
+      return m;
+    });
+  }
+  var otpauthRe = /otpauth(:|%%3a)[^"'<>\s]*/gi;
+  function maskElement(el){
+    var keep = {'class':1,'style':1,'id':1,'data-bm-mask':1,'data-bm-sensitive':1};
+    var names = [];
+    for(var i=0;i<el.attributes.length;i++) names.push(el.attributes[i].name);
+    for(var j=0;j<names.length;j++) if(!keep[names[j]]) el.removeAttribute(names[j]);
+    el.textContent = '***';
+  }
+  function snapshotHTML(){
+    var root = document.documentElement;
+    var fields = maskInputs ? root.querySelectorAll('input[value],textarea') : [];
+    var sensitive = false;
+    for(var i=0;i<fields.length&&!sensitive;i++) sensitive = isSensitive(fields[i]);
+    var html;
+    if(!sensitive && !root.querySelectorAll(maskSel).length){
+      html = root.outerHTML;
+    } else {
+      // Mask a copy owned by an inert document, so nothing in it loads.
+      var copy = document.implementation.createHTMLDocument('').importNode(root, true);
+      var masked = copy.querySelectorAll(maskSel);
+      for(var m=0;m<masked.length;m++) maskElement(masked[m]);
+      var copies = maskInputs ? copy.querySelectorAll('input[value],textarea') : [];
+      for(var c=0;c<copies.length;c++){
+        if(!isSensitive(copies[c])) continue;
+        if(copies[c].tagName==='TEXTAREA') copies[c].textContent='***';
+        else copies[c].setAttribute('value','***');
+      }
+      html = copy.outerHTML;
+    }
+    return html.replace(otpauthRe,'otpauth:***');
+  }
+
   function getSelector(el){
     if(!el||!el.tagName) return '';
     var parts=[];
@@ -131,29 +237,31 @@ func RecorderScript(app *App, devMode bool) string {
 
   // Initial DOM snapshot
   record('snapshot',{
-    url:location.href,
+    url:maskURL(location.href),
     title:document.title,
-    html:document.documentElement.outerHTML,
+    html:snapshotHTML(),
     width:window.innerWidth,
     height:window.innerHeight
   });
 
   // Click tracking
   document.addEventListener('click',function(e){
+    var masked = inMask(e.target);
+    var link = e.target.closest('a');
     record('click',{
       selector:getSelector(e.target),
       tag:e.target.tagName.toLowerCase(),
-      text:(e.target.innerText||'').substring(0,40),
+      text:masked?'***':(e.target.innerText||'').substring(0,40),
       x:e.clientX,y:e.clientY,
-      href:e.target.closest('a')?e.target.closest('a').getAttribute('href'):'',
-      action:e.target.getAttribute('hx-get')||e.target.getAttribute('hx-post')||e.target.getAttribute('hx-delete')||''
+      href:masked?'***':maskURL(link?link.getAttribute('href'):'').replace(otpauthRe,'otpauth:***'),
+      action:maskURL(e.target.getAttribute('hx-get')||e.target.getAttribute('hx-post')||e.target.getAttribute('hx-delete')||'')
     });
   },true);
 
   // Input tracking (masked for sensitive fields)
   document.addEventListener('input',function(e){
     var val = e.target.value;
-    if(maskInputs && isSensitive(e.target)) val = '***';
+    if(maskedField(e.target)) val = '***';
     record('input',{
       selector:getSelector(e.target),
       name:e.target.name||'',
@@ -190,11 +298,12 @@ func RecorderScript(app *App, devMode bool) string {
           removed:m.removedNodes.length
         });
       } else if(m.type==='attributes'){
+        var hide = inMask(m.target) || (m.attributeName==='value' && maskInputs && isSensitive(m.target));
         record('mutation',{
           type:'attributes',
           target:getSelector(m.target),
           attr:m.attributeName,
-          value:(m.target.getAttribute(m.attributeName)||'').substring(0,100)
+          value:hide?'***':(m.target.getAttribute(m.attributeName)||'').substring(0,100)
         });
       }
     });
@@ -203,7 +312,7 @@ func RecorderScript(app *App, devMode bool) string {
 
   // Navigation tracking (SPA-style via HTMX)
   document.addEventListener('htmx:afterSwap',function(e){
-    record('navigate',{url:location.href,target:getSelector(e.detail.target)});
+    record('navigate',{url:maskURL(location.href),target:getSelector(e.detail.target)});
   });
 
   // Flush events to server periodically
@@ -216,7 +325,7 @@ func RecorderScript(app *App, devMode bool) string {
   window.addEventListener('beforeunload',flush);
   // Final snapshot before unload
   window.addEventListener('beforeunload',function(){
-    record('snapshot',{url:location.href,html:document.documentElement.outerHTML,width:window.innerWidth,height:window.innerHeight});
+    record('snapshot',{url:maskURL(location.href),html:snapshotHTML(),width:window.innerWidth,height:window.innerHeight});
     flush();
   });
 })();
@@ -234,54 +343,81 @@ func RecorderScript(app *App, devMode bool) string {
 // recording config → no routes (404). The read endpoints below additionally
 // require an admin session (captured sessions are sensitive; only the app
 // operator should read them).
-func RegisterRecordingRoutes(mux *http.ServeMux, app *App) {
+func RegisterRecordingRoutes(mux appRouteRegistrar, app *App) {
 	if !IsRecordingEnabled(app, app.DevMode) {
 		return
 	}
 	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
 		s := getSession(app, r)
-		if s == nil || !s.IsAdmin() {
+		if s == nil || !s.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return false
 		}
 		return true
 	}
-	// Receive recording events
+	// Receive recording events. Anonymous, so it is budgeted per client
+	// address and the number of batches decoded at once is capped (the
+	// buffered sessions themselves are bounded below).
+	beaconLimiter := NewRateLimiterStoppable(recordingBeaconsPerMinute, time.Minute, app.Stop)
 	mux.HandleFunc("POST /_internal/recording", func(w http.ResponseWriter, r *http.Request) {
+		if ok, retry, _ := beaconLimiter.Check("ip:" + clientRateBucket(clientIP(r))); !ok {
+			setRetryAfter(w, retry)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		store := app.recordingStore()
+		select {
+		case store.decodeSlots <- struct{}{}:
+			defer func() { <-store.decodeSlots }()
+		default:
+			setRetryAfter(w, time.Second)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		var payload struct {
 			ID     string           `json:"id"`
 			Events []RecordingEvent `json:"events"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		body := &countingReader{r: http.MaxBytesReader(w, r.Body, maxRecordingBatchBytes)}
+		if err := json.NewDecoder(body).Decode(&payload); err != nil ||
+			payload.ID == "" || len(payload.ID) > maxRecordingIDLen {
 			w.WriteHeader(400)
 			return
 		}
 
-		recordingSessionsMu.Lock()
-		session, ok := recordingSessions[payload.ID]
+		store.mu.Lock()
+		session, ok := store.sessions[payload.ID]
 		if !ok {
 			session = &RecordingSession{
 				ID:        payload.ID,
 				StartedAt: time.Now().UTC().Format(time.RFC3339),
 			}
-			recordingSessions[payload.ID] = session
+			store.sessions[payload.ID] = session
 		}
-		session.Events = append(session.Events, payload.Events...)
+		// The beacon is anonymous (any visitor's browser posts it), so one
+		// session's buffer is bounded: past the cap further events drop.
+		if room := maxRecordingEventsPerSession - len(session.Events); room > 0 && session.bytes+body.n <= maxRecordingSessionBytes {
+			session.bytes += body.n
+			if len(payload.Events) > room {
+				payload.Events = payload.Events[:room]
+			}
+			session.Events = append(session.Events, payload.Events...)
+		}
 
 		// Cap at 10 sessions, prune oldest
-		if len(recordingSessions) > 10 {
+		if len(store.sessions) > 10 {
 			var oldest string
 			var oldestTime time.Time
-			for id, s := range recordingSessions {
+			for id, s := range store.sessions {
 				t, _ := time.Parse(time.RFC3339, s.StartedAt)
 				if oldest == "" || t.Before(oldestTime) {
 					oldest = id
 					oldestTime = t
 				}
 			}
-			delete(recordingSessions, oldest)
+			delete(store.sessions, oldest)
 		}
-		recordingSessionsMu.Unlock()
+		store.mu.Unlock()
 
 		w.WriteHeader(204)
 	})
@@ -291,11 +427,12 @@ func RegisterRecordingRoutes(mux *http.ServeMux, app *App) {
 		if !requireAdmin(w, r) {
 			return
 		}
-		recordingSessionsMu.RLock()
-		defer recordingSessionsMu.RUnlock()
+		store := app.recordingStore()
+		store.mu.RLock()
+		defer store.mu.RUnlock()
 
 		var sessions []*RecordingSession
-		for _, s := range recordingSessions {
+		for _, s := range store.sessions {
 			sessions = append(sessions, s)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -308,9 +445,10 @@ func RegisterRecordingRoutes(mux *http.ServeMux, app *App) {
 			return
 		}
 		id := r.URL.Path[len("/_internal/recording/"):]
-		recordingSessionsMu.RLock()
-		session, ok := recordingSessions[id]
-		recordingSessionsMu.RUnlock()
+		store := app.recordingStore()
+		store.mu.RLock()
+		session, ok := store.sessions[id]
+		store.mu.RUnlock()
 		if !ok {
 			w.WriteHeader(404)
 			return
@@ -324,11 +462,12 @@ func RegisterRecordingRoutes(mux *http.ServeMux, app *App) {
 		if !requireAdmin(w, r) {
 			return
 		}
-		recordingSessionsMu.RLock()
-		defer recordingSessionsMu.RUnlock()
+		store := app.recordingStore()
+		store.mu.RLock()
+		defer store.mu.RUnlock()
 
 		var latest *RecordingEvent
-		for _, s := range recordingSessions {
+		for _, s := range store.sessions {
 			for i := len(s.Events) - 1; i >= 0; i-- {
 				if s.Events[i].Type == "snapshot" {
 					latest = &s.Events[i]

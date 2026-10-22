@@ -3,8 +3,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
+	"net/http"
 	"strings"
 )
 
@@ -117,7 +119,7 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 
 	// head.html - custom scripts (analytics, pixels, etc.) - always loaded regardless of CSS mode
 	if app != nil {
-		if headHTML, err := readFileFromDir(app.Dir, "head.html"); err == nil {
+		if headHTML, err := app.readSourceFile("head.html"); err == nil {
 			sb.WriteString(InterpolateEnv(string(headHTML), app.Dir))
 		}
 	}
@@ -209,15 +211,8 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 	}
 	if app != nil {
 		sb.WriteString(RecorderScript(app, app.DevMode))
-		// Testing mode: the amber preview banner. Shown on every page
-		// (including pre-auth /login, /signup) when features.testing
-		// is opted in - the whole point is to make every view obviously
-		// non-production for anyone who lands on the app. The feedback
-		// widget is gated separately (below) so features.feedback can
-		// run it on a published prod app WITHOUT this banner.
-		if app.FeatureEnabled("testing") {
-			sb.WriteString(TestingBannerHTML(session, app))
-		}
+		// Testing mode shows the feedback flag (below); there is no banner.
+		// features.feedback keeps the flag on a published prod app.
 		if app.FeedbackWidgetEnabled() {
 			sb.WriteString(FeedbackWidgetHTML(app.FeatureEnabled("testing")))
 		}
@@ -229,7 +224,7 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 	// Analytics beacon - auto-injected when features.analytics is enabled (default: true)
 	if app.FeatureEnabled("analytics") {
 		sb.WriteString(AnalyticsBeaconJS())
-		sb.WriteString(AnalyticsCookieNotice())
+		sb.WriteString(AnalyticsCookieNotice(app))
 	}
 	// Form control styling handled by @tailwindcss/forms plugin (embedded in tailwind.min.js)
 	sb.WriteString(`</body></html>`)
@@ -240,7 +235,7 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 // loadNamedLayout reads a layout file from the app's layouts/ directory.
 func loadNamedLayout(app *App, name string) string {
 	path := fmt.Sprintf("layouts/%s.html", name)
-	data, err := readFileFromDir(app.Dir, path)
+	data, err := app.readSourceFile(path)
 	if err != nil {
 		return ""
 	}
@@ -270,7 +265,7 @@ func wrapHTMLShell(content, title string, app *App, session *Session, page *Page
 		}
 	}
 	if app != nil {
-		if headHTML, err := readFileFromDir(app.Dir, "head.html"); err == nil {
+		if headHTML, err := app.readSourceFile("head.html"); err == nil {
 			sb.WriteString(InterpolateEnv(string(headHTML), app.Dir))
 		}
 	}
@@ -346,12 +341,7 @@ func wrapHTMLShell(content, title string, app *App, session *Session, page *Page
 	}
 	if app != nil {
 		sb.WriteString(RecorderScript(app, app.DevMode))
-		// Testing mode: the amber preview banner (testing-only). The
-		// feedback widget is gated separately so features.feedback can
-		// run it on a published prod app without the banner.
-		if app.FeatureEnabled("testing") {
-			sb.WriteString(TestingBannerHTML(session, app))
-		}
+		// Testing mode shows the feedback flag (below); there is no banner.
 		if app.FeedbackWidgetEnabled() {
 			sb.WriteString(FeedbackWidgetHTML(app.FeatureEnabled("testing")))
 		}
@@ -365,7 +355,7 @@ func loadThemeCSS(app *App) string {
 	if app == nil {
 		return ""
 	}
-	data, err := readFile(app.Dir, "theme.css")
+	data, err := app.readSourceFile("theme.css")
 	if err != nil {
 		return ""
 	}
@@ -475,71 +465,165 @@ func buildSEOTags(app *App, page *Page, title string) string {
 		sb.WriteString(fmt.Sprintf(`<meta name="twitter:image" content="%s">`, html.EscapeString(image)))
 	}
 
-	// JSON-LD: WebSite schema (homepage only)
+	// JSON-LD: WebSite schema (homepage only). Structured values are built
+	// as maps and serialized with encoding/json, so a quote in a site name or
+	// description cannot produce invalid JSON, and `<` is escaped so a value
+	// cannot terminate the <script> element.
 	route := ""
 	if page != nil {
 		route = page.Route
 	}
 	if siteURL != "" && siteName != "" && route == "/" {
-		sb.WriteString(fmt.Sprintf(`<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"%s","url":"%s"`, siteName, siteURL))
-		if desc != "" {
-			sb.WriteString(fmt.Sprintf(`,"description":"%s"`, desc))
+		website := map[string]any{
+			"@context": "https://schema.org",
+			"@type":    "WebSite",
+			"name":     siteName,
+			"url":      siteURL,
 		}
-		// SearchAction for sitelinks search box
-		sb.WriteString(fmt.Sprintf(`,"potentialAction":{"@type":"SearchAction","target":{"@type":"EntryPoint","urlTemplate":"%s/search?q={search_term_string}"},"query-input":"required name=search_term_string"}`, siteURL))
-		sb.WriteString(`}</script>`)
+		if desc != "" {
+			website["description"] = desc
+		}
+		// Sitelinks search box: only advertise a SearchAction when the app
+		// actually has a search page, or declares one under seo.search_url.
+		// Google flags a SearchAction whose target 404s.
+		if searchURL := siteSearchURL(app, siteURL); searchURL != "" {
+			website["potentialAction"] = map[string]any{
+				"@type": "SearchAction",
+				"target": map[string]any{
+					"@type":       "EntryPoint",
+					"urlTemplate": searchURL,
+				},
+				"query-input": "required name=search_term_string",
+			}
+		}
+		writeJSONLD(&sb, website)
 
 		// Organization schema
 		org := app.Design.SEO["org"]
 		if org == "" {
 			org = siteName
 		}
-		sb.WriteString(fmt.Sprintf(`<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"%s","url":"%s"`, org, siteURL))
-		if favicon := app.Design.SEO["favicon"]; favicon != "" {
-			sb.WriteString(fmt.Sprintf(`,"logo":"%s%s"`, siteURL, favicon))
+		organization := map[string]any{
+			"@context": "https://schema.org",
+			"@type":    "Organization",
+			"name":     org,
+			"url":      siteURL,
 		}
-		sb.WriteString(`}</script>`)
+		if favicon := app.Design.SEO["favicon"]; favicon != "" {
+			organization["logo"] = siteURL + favicon
+		}
+		writeJSONLD(&sb, organization)
 	}
 
 	// JSON-LD: WebPage schema (every page)
 	if siteURL != "" && route != "" {
-		sb.WriteString(fmt.Sprintf(`<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"%s","url":"%s%s"`, title, siteURL, route))
-		if desc != "" {
-			sb.WriteString(fmt.Sprintf(`,"description":"%s"`, desc))
+		webpage := map[string]any{
+			"@context": "https://schema.org",
+			"@type":    "WebPage",
+			"name":     title,
+			"url":      siteURL + route,
 		}
-		sb.WriteString(`}</script>`)
+		if desc != "" {
+			webpage["description"] = desc
+		}
+		writeJSONLD(&sb, webpage)
 	}
 
 	// JSON-LD: BreadcrumbList (auto-generated from URL path)
 	if siteURL != "" && route != "" && route != "/" {
 		parts := strings.Split(strings.Trim(route, "/"), "/")
-		sb.WriteString(`<script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[`)
-		sb.WriteString(fmt.Sprintf(`{"@type":"ListItem","position":1,"name":"Home","item":"%s/"}`, siteURL))
+		items := []map[string]any{{
+			"@type":    "ListItem",
+			"position": 1,
+			"name":     "Home",
+			"item":     siteURL + "/",
+		}}
 		path := ""
 		for i, part := range parts {
 			path += "/" + part
-			name := strings.Title(strings.ReplaceAll(part, "-", " "))
-			sb.WriteString(fmt.Sprintf(`,{"@type":"ListItem","position":%d,"name":"%s","item":"%s%s"}`, i+2, name, siteURL, path))
+			items = append(items, map[string]any{
+				"@type":    "ListItem",
+				"position": i + 2,
+				"name":     strings.Title(strings.ReplaceAll(part, "-", " ")),
+				"item":     siteURL + path,
+			})
 		}
-		sb.WriteString(`]}</script>`)
+		writeJSONLD(&sb, map[string]any{
+			"@context":        "https://schema.org",
+			"@type":           "BreadcrumbList",
+			"itemListElement": items,
+		})
 	}
 
 	return sb.String()
 }
 
+// siteSearchURL returns the SearchAction URL template for an app, or "" when
+// the app has nothing to search. An explicit `seo.search_url` wins (it must
+// contain the `{search_term_string}` placeholder); otherwise a page routed at
+// /search enables the framework default. Apps without either emit no
+// SearchAction, since advertising a search box that 404s is a structured-data
+// error, not an SEO feature.
+func siteSearchURL(app *App, siteURL string) string {
+	if app == nil || app.Design == nil {
+		return ""
+	}
+	if custom := strings.TrimSpace(app.Design.SEO["search_url"]); custom != "" {
+		if !strings.Contains(custom, "{search_term_string}") {
+			return ""
+		}
+		if strings.HasPrefix(custom, "/") {
+			return siteURL + custom
+		}
+		return custom
+	}
+	if _, ok := app.Pages["/search"]; ok {
+		return siteURL + "/search?q={search_term_string}"
+	}
+	return ""
+}
+
+// writeJSONLD serializes v into a <script type="application/ld+json"> element.
+// encoding/json escapes <, > and & as < etc., so no value can close the
+// script element early. A marshal failure (impossible for the map/string/int
+// shapes used here) emits nothing rather than a half-written element.
+func writeJSONLD(sb *strings.Builder, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	sb.WriteString(`<script type="application/ld+json">`)
+	sb.Write(data)
+	sb.WriteString(`</script>`)
+}
+
 // GenerateSitemap creates a sitemap.xml from truly public routes only.
 // Excludes: auth-required pages, typed pages (login/signup), require-gated pages,
 // and pages with robots="noindex". Only publicly accessible pages appear.
+// pagePubliclyListable reports whether a page may appear in a public discovery
+// surface (sitemap, llms.txt, feed). It excludes every page an anonymous
+// crawler can't fully reach - auth, require, role, a redirect spec, a typed
+// auth page - and any page marked noindex. One predicate keeps the three
+// generators from drifting apart (a role- or require-gated page had been
+// listed with its title and description).
+func pagePubliclyListable(page *Page) bool {
+	if page == nil {
+		return false
+	}
+	if page.Auth == "required" || page.Type != "" || page.Require != "" ||
+		pageRole(page) != "" || page.Redirect != "" {
+		return false
+	}
+	return page.Robots != "noindex"
+}
+
 func GenerateSitemap(app *App, baseURL string) string {
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
 	sb.WriteString(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`)
 
 	for route, page := range app.Pages {
-		if page.Auth == "required" || page.Type != "" || page.Require != "" {
-			continue
-		}
-		if page.Robots == "noindex" {
+		if !pagePubliclyListable(page) {
 			continue
 		}
 		priority := "0.5"
@@ -559,6 +643,28 @@ func GenerateSitemap(app *App, baseURL string) string {
 
 	sb.WriteString(`</urlset>`)
 	return sb.String()
+}
+
+// seoBaseURL is the public origin the discovery files (sitemap, robots.txt,
+// llms.txt, feed, security.txt) put in absolute links: the configured
+// seo.url or public origin, else the request's own host where something
+// trustworthy vetted it (dev mode, or the platform router, which serves only
+// hosts it matched to this app), else fallback. Hosted apps run behind the
+// router on a loopback port, so the old fallback alone (http://localhost:N)
+// told crawlers the sitemap was on localhost.
+func seoBaseURL(app *App, r *http.Request, fallback string) string {
+	if app.Design != nil {
+		if u := app.Design.SEO["url"]; u != "" {
+			return strings.TrimRight(u, "/")
+		}
+	}
+	if origin := uploadsCanonicalOrigin(app); origin != "" {
+		return strings.TrimRight(origin, "/")
+	}
+	if r != nil && (app.DevMode || routerVettedHost(r)) {
+		return protoOf(r) + "://" + r.Host
+	}
+	return fallback
 }
 
 // GenerateRobots creates robots.txt with AI crawler directives.
@@ -606,10 +712,7 @@ func GenerateLLMsTxt(app *App, baseURL string) string {
 	// List truly public pages only - same filter as sitemap
 	sb.WriteString("## Pages\n\n")
 	for route, page := range app.Pages {
-		if page.Auth == "required" || page.Type != "" || page.Require != "" {
-			continue
-		}
-		if page.Robots == "noindex" {
+		if !pagePubliclyListable(page) {
 			continue
 		}
 		title := page.Title
@@ -656,10 +759,7 @@ func GenerateAtomFeed(app *App, baseURL string) string {
 	sb.WriteString(fmt.Sprintf(`<id>%s/</id>`, html.EscapeString(baseURL)))
 
 	for route, page := range app.Pages {
-		if page.Auth == "required" || page.Type != "" {
-			continue
-		}
-		if page.Robots == "noindex" {
+		if !pagePubliclyListable(page) {
 			continue
 		}
 		title := page.Title

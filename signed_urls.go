@@ -113,7 +113,7 @@ func ValidateSignedURL(path string, r *http.Request) bool {
 
 // RegisterSignedURLRoutes adds the signed URL generation endpoint
 // and protects /uploads/private/ with signature verification.
-func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
+func RegisterSignedURLRoutes(mux appRouteRegistrar, app *App) {
 	// Derive signing key from the per-process server secret.
 	// NOT from app.Dir (predictable) or a static string. csrfKeyBytes
 	// also lazily derives this on first call, so we're idempotent
@@ -124,6 +124,10 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 	signedURLKey = h.Sum(nil)
 	signedURLKeyMu.Unlock()
 
+	registerSignedURLRoutes(mux, app)
+}
+
+func registerSignedURLRoutes(mux appRouteRegistrar, app *App) {
 	// GET /api/_signed_url - generate a signed URL for a private file
 	mux.HandleFunc("GET /api/_signed_url", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
@@ -135,6 +139,12 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 		path := r.URL.Query().Get("path")
 		if path == "" {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "path required"})
+			return
+		}
+		// Connector artifacts have no generic bearer link: their own route
+		// rechecks the owner, tenant, role and scopes on every read.
+		if appMCPArtifactStorageReference(path) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "connector artifacts are only downloadable from /api/_mcp/artifacts/{id}"})
 			return
 		}
 
@@ -203,10 +213,13 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 					httpJSON(w, http.StatusForbidden, map[string]any{"error": "record_table/record_id does not reference this file"})
 					return
 				}
-				expires := time.Now().Add(expiresIn).Unix()
-				signed, err := signCloudFrontURL(cdnURL, expires, cfg.KeyPairID, cfg.PrivateKey)
+				if !privateUploadVouched(app, session, rt, rid, privateUploadKey(app, path)) {
+					httpJSON(w, http.StatusForbidden, map[string]any{"error": "this record does not own the file: it was uploaded by someone the record doesn't belong to"})
+					return
+				}
+				signed, err := signPrivateMediaURL(app, cfg, cdnURL, expiresIn)
 				if err != nil {
-					httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "media signing unavailable"})
+					serverErrorJSON(w, r, app, "_signed_url", err, "media signing unavailable")
 					return
 				}
 				httpJSON(w, http.StatusOK, map[string]any{"url": signed, "path": signed, "expires_in": int(expiresIn.Seconds())})
@@ -270,6 +283,10 @@ func RegisterSignedURLRoutes(mux *http.ServeMux, app *App) {
 				httpJSON(w, http.StatusForbidden, map[string]any{"error": "record_table/record_id does not reference this file"})
 				return
 			}
+			if !privateUploadVouched(app, session, rt, rid, localRel) {
+				httpJSON(w, http.StatusForbidden, map[string]any{"error": "this record does not own the file: it was uploaded by someone the record doesn't belong to"})
+				return
+			}
 		}
 		signedURL := GenerateSignedURL(r.Host, localRel, expiresIn)
 		fullURL := fmt.Sprintf("%s://%s%s", protoOf(r), r.Host, signedURL)
@@ -303,7 +320,7 @@ func authorizeRecordReadForSigning(r *http.Request, app *App, table, id string) 
 		return false
 	}
 	// Access-mode gate (role:/perm:/admin/group/owner/authed/everyone).
-	if !app.Access.Allowed(mode, session, 0) {
+	if !tableModeAllowed(app, table, OpRead, mode, session, 0) {
 		return false
 	}
 	// RBAC scope union (role → scopes, inheritance).
@@ -312,9 +329,16 @@ func authorizeRecordReadForSigning(r *http.Request, app *App, table, id string) 
 			return false
 		}
 	}
-	// Broadly-readable modes: the row is in scope by policy.
+	// Broadly-readable modes: the row is in scope by policy, as long as it
+	// is a live row. A soft-deleted record is hidden from every read, so it
+	// can't authorize its files either (canAccessRow checks the same below).
 	if mode == "anon" || mode == "everyone" {
-		return true
+		q := "SELECT 1 FROM " + quoteIdent(table) + " WHERE id = ?"
+		if hasColumn(app, table, "deleted_at") {
+			q += " AND deleted_at IS NULL"
+		}
+		var live int
+		return app.DB.QueryRow(q, id).Scan(&live) == nil
 	}
 	// Per-row: group / owner / explicit ACL grant / admin bypass.
 	return canAccessRow(app, table, id, session)
@@ -330,7 +354,7 @@ func recordReferencesFile(app *App, table, id, path string, cfg *PlatformMediaCo
 	if !ok {
 		return false
 	}
-	rows, err := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
+	rows, err := queryNativeRowsWith(app.DB, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id)
 	if err != nil || len(rows) == 0 {
 		return false
 	}
@@ -369,7 +393,7 @@ func uploadRelPath(p string) string {
 // failed a legitimate authorized sign.
 func recordReferencesLocalFile(app *App, table, id, path string) bool {
 	want := uploadRelPath(path)
-	rows, err := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
+	rows, err := queryNativeRowsWith(app.DB, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id)
 	if err != nil || len(rows) == 0 {
 		return false
 	}

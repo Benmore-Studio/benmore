@@ -3,8 +3,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -29,28 +31,103 @@ func marshalScheduledAuthority(s *Session) string {
 // loadScheduledActor resolves a real account and its current permissions without
 // creating a session. Legacy tasks may infer a tenant only if it is unambiguous.
 func loadScheduledActor(app *App, userID int64, group *string) (*Session, error) {
+	return loadScheduledActorWith(app, app.DB, userID, group, false)
+}
+
+// strict is used by connector authority; legacy scheduled tasks retain their
+// existing optional role-table fallback during upgrade inventory.
+// scheduledActorReadError marks a strict actor load that failed to READ
+// (busy, I/O, cancellation) as opposed to reading an actor that is absent or
+// not allowed. Authority checks deny the second and report the first.
+type scheduledActorReadError struct{ err error }
+
+func (e *scheduledActorReadError) Error() string { return e.err.Error() }
+func (e *scheduledActorReadError) Unwrap() error { return e.err }
+
+// scheduledActorFailure wraps the formatted error as a read failure unless
+// cause is sql.ErrNoRows, which is an absent row (a denial).
+func scheduledActorFailure(cause error, format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	if errors.Is(cause, sql.ErrNoRows) {
+		return err
+	}
+	return &scheduledActorReadError{err: err}
+}
+
+func loadScheduledActorWith(app *App, db mutationQuerier, userID int64, group *string, strict bool) (*Session, error) {
+	schema := ""
+	prefix := ""
+	if strict {
+		schema = "main"
+		prefix = "main."
+	}
 	actor := &Session{UserID: userID}
 	var deactivated sql.NullString
-	var verified int
-	err := app.DB.QueryRow("SELECT COALESCE(email,''), COALESCE(role,'user'), deactivated_at, COALESCE(verified,0) FROM _benmore_users WHERE id=? AND COALESCE(password_change_required,0)=0", userID).Scan(&actor.Email, &actor.Role, &deactivated, &verified)
+	var verified, grandfathered int
+	err := db.QueryRow("SELECT COALESCE(email,''), COALESCE(role,'user'), deactivated_at, COALESCE(verified,0), COALESCE(email_grandfathered,0) FROM "+prefix+"_benmore_users WHERE id=? AND COALESCE(password_change_required,0)=0", userID).Scan(&actor.Email, &actor.Role, &deactivated, &verified, &grandfathered)
 	if err != nil {
+		if strict {
+			return nil, scheduledActorFailure(err, "task owner is missing or unavailable: %w", err)
+		}
 		return nil, fmt.Errorf("task owner is missing or unavailable")
 	}
 	if deactivated.Valid && deactivated.String != "" {
 		return nil, fmt.Errorf("task owner is deactivated")
 	}
 	actor.Verified = verified == 1
+	actor.EmailGrandfathered = grandfathered == 1
 	if app.Design != nil && app.Design.Auth["require_verified"] == "true" && !actor.Verified {
 		return nil, fmt.Errorf("task owner must verify their account")
 	}
-	actor.GlobalAdmin = actor.Role == "admin" || UserHasGlobalAdminGrant(app.DB, userID)
+	actor.GlobalAdmin = actor.Role == "admin"
+	if !actor.GlobalAdmin {
+		actor.GlobalAdmin, err = userHasGlobalAdminGrantWithSchema(db, userID, schema)
+		if strict && err != nil {
+			return nil, scheduledActorFailure(err, "task owner's administrator grants are unavailable: %w", err)
+		}
+	}
 	if group != nil {
 		actor.GroupID = *group
 	}
 	if g := app.Group; g != nil && g.Table != "" && g.Key != "" && g.UserField != "" {
-		rows, err := queryRowsWith(app.DB, fmt.Sprintf("SELECT DISTINCT %s AS group_id FROM %s WHERE %s=? AND %s IS NOT NULL", g.Key, g.Table, g.UserField, g.Key), actor.Email)
-		if err != nil {
-			return nil, fmt.Errorf("task owner's tenant membership is unavailable")
+		// Same rules as a request's tenant check (groupMembershipLive): only
+		// live rows count, an email-keyed row needs a verified or
+		// grandfathered address, and an id-keyed row matches the user id.
+		var rows []map[string]any
+		if member, ok := groupMemberValue(g, actor); ok {
+			if strict && (!membershipIdentRe.MatchString(g.Key) || !membershipIdentRe.MatchString(g.UserField) || g.RoleField != "" && !membershipIdentRe.MatchString(g.RoleField)) {
+				return nil, fmt.Errorf("task owner's tenant configuration is unavailable")
+			}
+			hasCol, metadataErr := dbColumnCheckerWith(db, g.Table, schema)
+			conds := membershipLiveConds(g, g.Table, "", hasCol)
+			if strict && metadataErr() != nil {
+				return nil, scheduledActorFailure(metadataErr(), "task owner's tenant metadata is unavailable: %w", metadataErr())
+			}
+			from, name := quoteIdent(g.Table), g.Table
+			if strict {
+				var valid bool
+				from, name, valid = mainAuthorityTable(g.Table)
+				if !valid {
+					return nil, fmt.Errorf("task owner's tenant table is unavailable")
+				}
+			}
+			key := quoteColumn(name, g.Key)
+			query := fmt.Sprintf("SELECT DISTINCT %s AS group_id FROM %s WHERE %s=? AND %s IS NOT NULL%s", key, from, quoteColumn(name, g.UserField), key, conds)
+			if strict {
+				key, keyErr := cryptoKeyForQuerierMainChecked(db)
+				if keyErr != nil {
+					return nil, scheduledActorFailure(keyErr, "task owner's tenant encryption key is unavailable: %w", keyErr)
+				}
+				rows, err = queryRowsWithKeyContextDecrypt(context.Background(), db, key, nativeRowDecryptor(nil, ""), query, member)
+			} else {
+				rows, err = queryMetadataRows(db, query, member)
+			}
+			if err != nil {
+				if strict {
+					return nil, scheduledActorFailure(err, "task owner's tenant membership is unavailable: %w", err)
+				}
+				return nil, fmt.Errorf("task owner's tenant membership is unavailable")
+			}
 		}
 		var groups []string
 		for _, row := range rows {
@@ -72,8 +149,15 @@ func loadScheduledActor(app *App, userID int64, group *string) (*Session, error)
 	} else if actor.GroupID != "" {
 		return nil, fmt.Errorf("task's tenant configuration was removed")
 	}
-	actor.Roles = LoadSessionRoles(app.DB, userID, actor.Role, actor.GroupID)
-	return applySessionRoleScopes(app, actor), nil
+	actor.Roles, err = loadSessionRolesWithSchema(db, userID, actor.Role, actor.GroupID, schema)
+	if strict && err != nil {
+		return nil, fmt.Errorf("task owner's role grants are unavailable: %w", err)
+	}
+	actor, err = applySessionRoleScopesWith(app, db, actor, schema)
+	if strict && err != nil {
+		return nil, err
+	}
+	return actor, nil
 }
 
 // prepareScheduledFlow is read-only. Both the upgrade check and the worker call

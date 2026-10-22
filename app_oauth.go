@@ -30,6 +30,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -43,30 +44,79 @@ const (
 
 // RegisterAppOAuthProvider mounts the per-app OAuth endpoints. Called for
 // every app that has auth configured (same gate as RegisterAuthRoutes).
-func RegisterAppOAuthProvider(mux *http.ServeMux, app *App) {
+func RegisterAppOAuthProvider(mux appRouteRegistrar, app *App) {
 	appOAuthEnsureTables(app)
+	registerAppOAuthProvider(mux, app)
+}
 
+func registerAppOAuthProvider(mux appRouteRegistrar, app *App) {
+	registerAppOAuthProviderAt(mux, app, "")
+}
+
+func registerAppOAuthProviderAt(mux appRouteRegistrar, app *App, resource string) {
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		if appMCPManifestSnapshot(app) != nil {
+			appMCPOAuthMetadata(w, r, app, resource, false)
+			return
+		}
 		appOAuthMetadata(w, r, app)
 	})
 	// RFC 9728: metadata for a path-scoped resource lives at
 	// /.well-known/oauth-protected-resource/<path-of-resource>. Serve both
 	// the bare document and any path-suffixed variant.
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
+		if appMCPManifestSnapshot(app) != nil {
+			appMCPOAuthMetadata(w, r, app, resource, true)
+			return
+		}
 		appOAuthPRMetadata(w, r, app, "")
 	})
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if appMCPManifestSnapshot(app) != nil || r.PathValue("rest") == "api/_mcp" {
+			if r.PathValue("rest") != "api/_mcp" {
+				http.NotFound(w, r)
+				return
+			}
+			appMCPOAuthMetadata(w, r, app, resource, true)
+			return
+		}
 		appOAuthPRMetadata(w, r, app, "/"+r.PathValue("rest"))
 	})
 	mux.HandleFunc("POST /oauth/register", func(w http.ResponseWriter, r *http.Request) {
-		appOAuthRegister(w, r, app)
+		appMCPOAuthRegister(w, r, app, resource)
 	})
 	mux.HandleFunc("GET /oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
+		if appMCPManifestSnapshot(app) != nil || appMCPOAuthTarget(r.URL.Query()) {
+			appMCPOAuthAuthorize(w, r, app, resource)
+			return
+		}
 		appOAuthAuthorize(w, r, app)
 	})
+	mux.HandleFunc("POST /oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		if r.ParseForm() != nil {
+			http.Error(w, "invalid request", 400)
+			return
+		}
+		if appMCPManifestSnapshot(app) != nil || appMCPOAuthTarget(r.Form) {
+			appMCPOAuthDecision(w, r, app, resource)
+			return
+		}
+		appOAuthAuthorizeDecision(w, r, app)
+	})
 	mux.HandleFunc("POST /oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		if r.ParseForm() != nil {
+			httpJSON(w, 400, map[string]any{"error": "invalid_request"})
+			return
+		}
+		if appMCPOAuthTokenTarget(r.Form) {
+			appMCPOAuthToken(w, r, app, resource)
+			return
+		}
 		appOAuthToken(w, r, app)
 	})
+	mux.HandleFunc("POST /oauth/revoke", func(w http.ResponseWriter, r *http.Request) { appMCPOAuthRevoke(w, r, app, resource) })
 }
 
 func appOAuthEnsureTables(app *App) {
@@ -185,16 +235,13 @@ func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
 		})
 		return
 	}
+	// Same rule as the platform's MCP OAuth server: the scheme is checked,
+	// not just the host (javascript://localhost/... would otherwise pass).
 	for _, u := range req.RedirectURIs {
-		parsed, err := url.Parse(u)
-		if err != nil {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_redirect_uri"})
-			return
-		}
-		if parsed.Scheme != "https" && parsed.Hostname() != "localhost" && parsed.Hostname() != "127.0.0.1" {
+		if !validOAuthClientRedirect(u) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{
 				"error":             "invalid_redirect_uri",
-				"error_description": "redirect URIs must use HTTPS",
+				"error_description": "redirect URIs must use https, or http to localhost/127.0.0.1/[::1]",
 			})
 			return
 		}
@@ -210,7 +257,7 @@ func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
 		`INSERT INTO _benmore_oauth_clients (client_id, name, redirect_uris, scopes) VALUES (?, ?, ?, ?)`,
 		clientID, req.ClientName, string(redirectJSON), scopes,
 	); err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		serverErrorCode(w, r, app, "oauth register", err, "server_error")
 		return
 	}
 
@@ -228,74 +275,149 @@ func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
 
 // ===== Authorization endpoint =====
 
-func appOAuthAuthorize(w http.ResponseWriter, r *http.Request, app *App) {
-	q := r.URL.Query()
-	clientID := q.Get("client_id")
-	redirectURI := q.Get("redirect_uri")
-	state := q.Get("state")
-	codeChallenge := q.Get("code_challenge")
-	resource := q.Get("resource")
+// appParseAuthorize validates an authorize request from the query (GET) or
+// the approval form (POST) against this app's registered clients.
+func appParseAuthorize(app *App, v url.Values) (oauthAuthorizeParams, int, string) {
+	return appParseAuthorizeWith(app.DB, v, false)
+}
 
-	if q.Get("response_type") != "code" {
-		http.Error(w, "response_type must be 'code'", http.StatusBadRequest)
-		return
+func appParseAuthorizeWith(db rowQuerier, v url.Values, strict bool) (oauthAuthorizeParams, int, string) {
+	p := oauthAuthorizeParams{
+		ClientID: v.Get("client_id"), RedirectURI: v.Get("redirect_uri"), State: v.Get("state"),
+		Scope: v.Get("scope"), CodeChallenge: v.Get("code_challenge"), CodeChallengeMethod: v.Get("code_challenge_method"),
+		Resource: v.Get("resource"),
 	}
-	if codeChallenge == "" || q.Get("code_challenge_method") != "S256" {
-		http.Error(w, "PKCE required (code_challenge with S256)", http.StatusBadRequest)
-		return
+	if v.Get("response_type") != "code" {
+		return p, http.StatusBadRequest, "response_type must be 'code'"
 	}
-
+	if p.CodeChallenge == "" || p.CodeChallengeMethod != "S256" {
+		return p, http.StatusBadRequest, "PKCE required (code_challenge with S256)"
+	}
 	var name, redirectJSON, clientScopes string
-	if err := app.DB.QueryRow(
-		`SELECT name, redirect_uris, scopes FROM _benmore_oauth_clients WHERE client_id = ?`, clientID,
+	table := "_benmore_oauth_clients"
+	if strict {
+		table = "main." + table
+	}
+	if err := db.QueryRow(
+		`SELECT name, redirect_uris, scopes FROM `+table+` WHERE client_id = ?`, p.ClientID,
 	).Scan(&name, &redirectJSON, &clientScopes); err != nil {
-		http.Error(w, "unknown client_id", http.StatusBadRequest)
-		return
+		return p, http.StatusBadRequest, "unknown client_id"
 	}
 	var uris []string
 	json.Unmarshal([]byte(redirectJSON), &uris)
 	allowed := false
 	for _, u := range uris {
-		if u == redirectURI {
+		if u == p.RedirectURI {
 			allowed = true
 			break
 		}
 	}
 	if !allowed {
-		http.Error(w, "redirect_uri not registered for this client", http.StatusBadRequest)
+		return p, http.StatusBadRequest, "redirect_uri not registered for this client"
+	}
+	if p.Scope == "" {
+		p.Scope = clientScopes
+	}
+	p.clientName, p.clientScopes = name, clientScopes
+	return p, 0, ""
+}
+
+// appOAuthGrantScope is the API-token scope an authorization grants, and the
+// scope the consent page shows. A list of valid resource:action scopes
+// (validateScopes) narrows the token to exactly that list. Anything else -
+// no scope, `*`, or names that are not framework scopes such as `openid` -
+// grants full access, and the consent page says so instead of echoing the
+// client's text.
+func appOAuthGrantScope(requested string) string {
+	s := strings.Join(strings.Fields(requested), " ")
+	if s == "" || s == "*" || validateScopes(s) != nil {
+		return "*"
+	}
+	return s
+}
+
+// appOAuthSubject binds consent to the exact app account.
+func appOAuthSubject(s *Session) string {
+	return fmt.Sprintf("app-user:%d|%s", s.UserID, s.Email)
+}
+
+// appOAuthAuthorize (GET) validates, requires an app session, and shows the
+// consent page. It never issues a code (see oauth_consent.go).
+func appOAuthAuthorize(w http.ResponseWriter, r *http.Request, app *App) {
+	p, status, msg := appParseAuthorize(app, r.URL.Query())
+	if status != 0 {
+		http.Error(w, msg, status)
 		return
 	}
-
-	// The user must hold an app session. Otherwise bounce through the
-	// app's own login page and return here with identical params.
 	session := getSession(app, r)
 	if session == nil {
-		loginURL := app.Paths.Login + "?next=" + url.QueryEscape(r.URL.String())
+		loginURL := app.Paths.Login + "?next=" + url.QueryEscape(r.URL.RequestURI())
 		http.Redirect(w, r, loginURL, http.StatusFound)
 		return
 	}
-
-	scope := q.Get("scope")
-	if scope == "" {
-		scope = clientScopes
+	// Approval mints a full-access token, so it takes the user's own login -
+	// not an API token, scoped session, act-as or support session.
+	if !directLoginSession(app, session) {
+		http.Error(w, "sign in directly to connect an app", http.StatusForbidden)
+		return
 	}
+	redirectHost := p.RedirectURI
+	if ru, err := url.Parse(p.RedirectURI); err == nil && ru.Host != "" {
+		redirectHost = ru.Host
+	}
+	scopeText := "full access to your account"
+	if g := appOAuthGrantScope(p.Scope); g != "*" {
+		scopeText = g
+	}
+	writeOAuthConsentPage(w, p.clientName, appSiteName(app), session.Email, redirectHost, scopeText, map[string]string{
+		"response_type": "code", "client_id": p.ClientID, "redirect_uri": p.RedirectURI, "state": p.State, "scope": p.Scope,
+		"code_challenge": p.CodeChallenge, "code_challenge_method": p.CodeChallengeMethod, "resource": p.Resource,
+		"consent": mintOAuthConsent(appOAuthSubject(session), p, time.Now()),
+	}, "")
+}
+
+// appOAuthAuthorizeDecision (POST) issues a code only for an explicit,
+// same-origin approval whose consent token matches this user and request.
+func appOAuthAuthorizeDecision(w http.ResponseWriter, r *http.Request, app *App) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	p, status, msg := appParseAuthorize(app, r.PostForm)
+	if status != 0 {
+		http.Error(w, msg, status)
+		return
+	}
+	session := getSession(app, r)
+	if session == nil || !directLoginSession(app, session) || !sameOriginPost(r) || !verifyOAuthConsent(r.PostForm.Get("consent"), appOAuthSubject(session), p, time.Now()) {
+		http.Error(w, "authorization not confirmed - start the connection again from your tool", http.StatusForbidden)
+		return
+	}
+	ru, _ := url.Parse(p.RedirectURI)
+	rq := ru.Query()
+	if p.State != "" {
+		rq.Set("state", p.State)
+	}
+	if r.PostForm.Get("decision") != "approve" {
+		rq.Set("error", "access_denied")
+		ru.RawQuery = rq.Encode()
+		http.Redirect(w, r, ru.String(), http.StatusFound)
+		return
+	}
+	// Only the code's SHA-256 is stored (as on the platform's MCP OAuth
+	// server), so a database read doesn't yield a redeemable code.
 	code := generateToken(32)
 	if _, err := app.DB.Exec(`
 		INSERT INTO _benmore_oauth_codes
 		(client_id, user_id, code, code_challenge, code_challenge_method, redirect_uri, resource, scopes, expires_at)
 		VALUES (?, ?, ?, ?, 'S256', ?, ?, ?, ?)
-	`, clientID, session.UserID, code, codeChallenge, redirectURI, resource, scope,
+	`, p.ClientID, session.UserID, hashAPIToken(code), p.CodeChallenge, p.RedirectURI, p.Resource, p.Scope,
 		time.Now().Add(appOAuthCodeTTL).UTC().Format(time.RFC3339)); err != nil {
-		http.Error(w, "failed to issue code", http.StatusInternalServerError)
+		serverError(w, r, app, "oauth authorize", err, "failed to issue code")
 		return
 	}
-
-	ru, _ := url.Parse(redirectURI)
-	rq := ru.Query()
 	rq.Set("code", code)
-	if state != "" {
-		rq.Set("state", state)
-	}
 	ru.RawQuery = rq.Encode()
 	http.Redirect(w, r, ru.String(), http.StatusFound)
 }
@@ -334,7 +456,7 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 	)
 	tx, err := app.DB.Begin()
 	if err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		serverErrorCode(w, r, app, "oauth token", err, "server_error")
 		return
 	}
 	defer tx.Rollback()
@@ -346,7 +468,7 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 		LEFT JOIN _benmore_oauth_clients cl ON cl.client_id = c.client_id
 		WHERE c.code = ? AND COALESCE(u.password_change_required,0)=0
 		AND COALESCE(u.deactivated_at,'')=''
-	`, code).Scan(&rowID, &userID, &storedClient, &storedRedirect, &challenge, &scopes, &storedResource, &expiresAtStr, &clientName)
+	`, hashAPIToken(code)).Scan(&rowID, &userID, &storedClient, &storedRedirect, &challenge, &scopes, &storedResource, &expiresAtStr, &clientName)
 	if err != nil {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
 		return
@@ -354,7 +476,7 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 	// One-time use: burn the code no matter how the rest goes.
 	result, err := tx.Exec(`DELETE FROM _benmore_oauth_codes WHERE id = ?`, rowID)
 	if err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		serverErrorCode(w, r, app, "oauth token", err, "server_error")
 		return
 	}
 	if n, err := result.RowsAffected(); err != nil || n != 1 {
@@ -391,16 +513,21 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 	// existing bearer path validates it with zero extra plumbing, and the
 	// user can see + revoke it via GET/DELETE /api/_auth/api-tokens.
 	rawToken := "bma_" + generateToken(32)
+	grantScope := appOAuthGrantScope(scopes)
 	expiresAt := time.Now().Add(appOAuthTokenTTL).UTC().Format(time.RFC3339)
-	if _, err := tx.Exec(
-		`INSERT INTO _benmore_api_tokens (user_id, name, token_hash, scopes, expires_at) VALUES (?, ?, ?, ?, ?)`,
-		userID, "oauth: "+clientName, hashToken(rawToken), "*", expiresAt,
-	); err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+	stored, err := insertAPITokenWithinCap(tx, userID, "oauth: "+clientName, hashToken(rawToken), grantScope, expiresAt)
+	if err != nil {
+		serverErrorCode(w, r, app, "oauth token", err, "server_error")
+		return
+	}
+	if !stored {
+		// The account is at its API-token cap. The code stays spent.
+		_ = tx.Commit()
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "access_denied", "error_description": apiTokenCapMessage})
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "server_error"})
+		serverErrorCode(w, r, app, "oauth token", err, "server_error")
 		return
 	}
 
@@ -408,6 +535,27 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 		"access_token": rawToken,
 		"token_type":   "Bearer",
 		"expires_in":   int(appOAuthTokenTTL.Seconds()),
-		"scope":        scopes,
+		"scope":        grantScope,
 	})
+}
+
+// validOAuthClientRedirect accepts https, or http to a loopback host, with no
+// userinfo or fragment (RFC 6749 §3.1.2).
+func validOAuthClientRedirect(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return true
+	case "http":
+		h := u.Hostname()
+		if h == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(h)
+		return ip != nil && ip.IsLoopback()
+	}
+	return false
 }

@@ -64,10 +64,16 @@ func TestServerNewReportsResolvedDirectoryAndEditionWorkflow(t *testing.T) {
 		t.Fatalf("output did not report resolved directory %q:\n%s", wantDir, text)
 	}
 	if editionName == "framework" {
+		if _, err := os.Stat(filepath.Join(wantDir, "mcp.yaml")); err != nil {
+			t.Fatalf("self-hosted starter lost its reviewed connector: %v", err)
+		}
 		if !strings.Contains(text, "benmore serve") || !strings.Contains(text, "http://localhost:8080") {
 			t.Fatalf("framework next steps omitted self-hosted serve:\n%s", text)
 		}
 		return
+	}
+	if _, err := os.Stat(filepath.Join(wantDir, "mcp.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("hosted new created an active connector manifest that prevents its advertised first deploy: %v", err)
 	}
 	if strings.Contains(text, "localhost") || strings.Contains(text, "benmore serve") {
 		t.Fatalf("hosted next steps advertised a local server:\n%s", text)

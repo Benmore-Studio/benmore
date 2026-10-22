@@ -11,8 +11,11 @@ export interface User {
 export interface ListOpts {
   limit?: number;
   offset?: number;
-  cursor?: string;
+  cursor?: string | number;
   q?: string;
+  /** Column to order by (snake_case, as stored). */
+  sort?: string;
+  order?: 'asc' | 'desc';
   where?: Record<string, string | number | boolean>;
 }
 
@@ -51,6 +54,27 @@ export interface AuthCalls {
   refreshMe(): Promise<User | null>;
   signIn(identifier: string, password: string): Promise<User | null>;
   signUp(fields: { email: string; password: string; [extraField: string]: unknown }): Promise<User | null>;
+  /** Passkeys (WebAuthn): Face ID, Touch ID, Windows Hello, a phone. */
+  passkey: PasskeyCalls;
+}
+
+export interface Passkey {
+  id: number;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface PasskeyCalls {
+  /** False where the browser has no WebAuthn. */
+  supported(): boolean;
+  /** Signed in: create a passkey on this device and save it. Send the current
+   * password or an authenticator code; optional within 10 minutes of signing in. */
+  register(name?: string, proof?: { password?: string; mfa_code?: string }): Promise<{ id: number; name: string }>;
+  /** Signed out: sign in with any passkey saved for this site. */
+  signIn(): Promise<User | null>;
+  list(): Promise<Passkey[]>;
+  remove(id: number): Promise<void>;
 }
 
 export interface UsersCalls {
@@ -63,17 +87,38 @@ export interface CountOpts {
   q?: string;
 }
 
+export interface UpdateReceipt {
+  status: 'updated';
+}
+export interface VersionMetadata {
+  _version: number;
+  _valid_from: string;
+  _valid_to: string | null;
+  _changed_by: number | null;
+  _change_type: string;
+}
+export interface VersionHistory {
+  id: string;
+  versions: VersionMetadata[];
+}
+export interface RevertReceipt {
+  status: 'reverted';
+  id: string;
+  reverted_to_version: string;
+  owned_fields_kept: string[] | null;
+}
+
 export interface TableClient<Row = Record<string, unknown>> {
   readonly name: string;
   list(opts?: ListOpts): Promise<Row[]>;
   get(id: number | string): Promise<Row>;
   create(body: Partial<Row>): Promise<Row>;
-  update(id: number | string, body: Partial<Row>): Promise<Row>;
+  update(id: number | string, body: Partial<Row>): Promise<UpdateReceipt>;
   delete(id: number | string): Promise<void>;
   count(opts?: CountOpts): Promise<number>;
   restore(id: number | string): Promise<Row>;
-  versions(id: number | string): Promise<Array<{ version: number; data: Row; created_at: string }>>;
-  revertTo(id: number | string, version: number): Promise<Row>;
+  versions(id: number | string): Promise<VersionHistory>;
+  revertTo(id: number | string, version: number): Promise<RevertReceipt>;
 }
 
 export interface RoomClient {

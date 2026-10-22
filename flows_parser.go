@@ -63,7 +63,7 @@ func parseFlows(content string) []Flow {
 			case "secret":
 				current.Secret = val
 			case "auth":
-				current.Auth = val
+				current.Auth = normalizeFlowAuth(val, current.Name)
 			case "role":
 				current.Role = val
 			}
@@ -465,6 +465,22 @@ func applyStepProperty(step *FlowStep, key, val string) {
 				step.Respond.JSON = make(map[string]any)
 			}
 			step.Respond.JSON[key] = val
+		}
+	case "cc":
+		if step.Email != nil {
+			step.Email.CC = val
+		}
+	case "bcc":
+		if step.Email != nil {
+			step.Email.BCC = val
+		}
+	case "unsubscribe_url":
+		if step.Email != nil {
+			step.Email.UnsubscribeURL = val
+		}
+	case "unsubscribe_one_click":
+		if step.Email != nil {
+			step.Email.UnsubscribeOneClick = val
 		}
 	case "reply_to":
 		if step.Email != nil {

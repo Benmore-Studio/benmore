@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"hash"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -123,7 +122,13 @@ func evalExpr(expr string, env *recipeEnv) (string, error) {
 				return "", fmt.Errorf("pipe %s arg: %w", name, err)
 			}
 		}
-		val, err = pipe(val, argVal, hasArg)
+		if name == "or_env" {
+			// The fallback reads the recipe's own app environment, never the
+			// process environment (see recipeEnv.orEnv).
+			val, err = env.orEnv(val, argVal, hasArg)
+		} else {
+			val, err = pipe(val, argVal, hasArg)
+		}
 		if err != nil {
 			return "", fmt.Errorf("pipe %s: %w", name, err)
 		}
@@ -343,18 +348,35 @@ func pipeDefault(input, fallback string, hasArg bool) (string, error) {
 	return input, nil
 }
 
-// pipeOrEnv returns input if non-empty, else looks up an env var by name.
-// Useful in recipes that want to accept a value as a sign-block param
-// but fall back to a conventional env var when the caller hasn't passed
-// one. Example: `{{ params.secret | or_env:WEBHOOK_SECRET }}`.
-func pipeOrEnv(input, envName string, hasArg bool) (string, error) {
+// pipeOrEnv is the registry entry for or_env; evalExpr routes the pipe to
+// recipeEnv.orEnv, which needs the recipe's app. Reaching this means a caller
+// evaluated or_env without that context, so it resolves nothing.
+func pipeOrEnv(input, _ string, hasArg bool) (string, error) {
+	if !hasArg {
+		return "", fmt.Errorf("or_env needs an env var name arg")
+	}
+	return input, nil
+}
+
+// orEnv returns input if non-empty, else the named variable from the
+// recipe's app environment - the same lookup as env.NAME. Useful in recipes
+// that accept a value as a sign-block param but fall back to a conventional
+// env var: `{{ params.secret | or_env:WEBHOOK_SECRET }}`. The process
+// environment is not consulted for an app: a hosted unit also loads the
+// platform's environment file and `benmore host` serves many apps from one
+// process, so a process lookup would hand operator credentials to app code.
+func (e *recipeEnv) orEnv(input, envName string, hasArg bool) (string, error) {
 	if input != "" {
 		return input, nil
 	}
 	if !hasArg {
 		return "", fmt.Errorf("or_env needs an env var name arg")
 	}
-	return os.Getenv(envName), nil
+	dir := ""
+	if e != nil && e.app != nil {
+		dir = e.app.Dir
+	}
+	return GetEnv(dir, envName), nil
 }
 
 func pipeURLEncode(input, _ string, _ bool) (string, error) {

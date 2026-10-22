@@ -441,11 +441,11 @@ func TestSignPrivateCDNURLForApp_NoOpOffPlatform(t *testing.T) {
 	app := &App{Dir: t.TempDir()}
 	// No platform media configured (the test/off-platform case): must be a
 	// safe no-op so the plain URL path is unchanged.
-	if _, ok := signPrivateCDNURLForApp(app, "https://cdn.example.com/private/x/uploads/private/a.webm"); ok {
-		t.Fatalf("signPrivateCDNURLForApp signed a URL with no media CDN configured")
+	if _, ok, err := signPrivateCDNURLForApp(app, "https://cdn.example.com/private/x/uploads/private/a.webm"); ok || err != nil {
+		t.Fatalf("signPrivateCDNURLForApp signed a URL with no media CDN configured (err %v)", err)
 	}
-	if _, ok := signPrivateCDNURLForApp(app, "https://evil.example.com/whatever"); ok {
-		t.Fatalf("signPrivateCDNURLForApp signed an arbitrary URL")
+	if _, ok, err := signPrivateCDNURLForApp(app, "https://evil.example.com/whatever"); ok || err != nil {
+		t.Fatalf("signPrivateCDNURLForApp signed an arbitrary URL (err %v)", err)
 	}
 }
 

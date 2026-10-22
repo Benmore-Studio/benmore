@@ -16,6 +16,24 @@ go test -tags sqlite_fts5 ./...           # tests
 The `sqlite_fts5` tag is required (the SQLite driver uses cgo, so you also need
 a C toolchain).
 
+For complete Linux PDF tests under race detection, install the fixed tools and
+build a non-race child from the same clean checkout. The parent remains under
+`-race`; the child retains the production sandbox and resource limits. Tests
+verify its source revision, hash, toolchain, platform, and edition before use.
+
+```bash
+sudo bash scripts/install-doc-tools.sh
+pdf_test_root=$(mktemp -d)
+python3 scripts/build-pdf-test-worker.py "$pdf_test_root/worker" --edition framework
+BENMORE_REQUIRE_PDF_INTEGRATION=1 \
+BENMORE_PDF_TEST_WORKER="$pdf_test_root/worker/pdf-worker.test" \
+BENMORE_PDF_TEST_WORKER_MANIFEST="$pdf_test_root/worker/manifest.json" \
+go test -race -buildvcs=true -tags sqlite_fts5 ./...
+```
+
+Missing or mismatched helpers fail mandatory PDF qualification. The hard-memory
+limit regression itself still runs in a race-instrumented child.
+
 Codex and Claude can read [AGENTS.md](AGENTS.md); the app scaffold also emits a
 shared instruction contract. Do not invent an `example/` directory or a hosted
 command in the framework edition. See `benmore help` and `benmore docs`.

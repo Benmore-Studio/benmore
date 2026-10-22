@@ -80,8 +80,11 @@ func prepareFeaturePackForInstall(pack FeaturePack, files map[string][]byte, opt
 	if len(modelMap) > 0 {
 		seenModels := map[string]bool{}
 		for i, m := range pack.SchemaModels {
+			// Relations inside an unchanged model still need to follow renamed
+			// models. Always rewrite references from the original source.
+			src := replaceModelIdentifiers(m.Source, modelMap)
+			pack.SchemaModels[i].Source = src
 			if next := modelMap[m.Name]; next != "" {
-				src := replaceModelIdentifiers(m.Source, modelMap)
 				renamed := curatedModel(next, src)
 				if renamed.Source == "" {
 					renamed = m
@@ -123,6 +126,16 @@ func prepareFeaturePackForInstall(pack FeaturePack, files map[string][]byte, opt
 			}
 		}
 	}
+	// A declared custom route is independent of a same-named model/table.
+	// Keep identity entries for model-only installs too, without turning them
+	// into file moves or advertised route renames.
+	routeLiterals := make(map[string]string, len(pack.Routes))
+	for _, route := range pack.Routes {
+		routeLiterals[route] = route
+		if next := routeMap[route]; next != "" {
+			routeLiterals[route] = next
+		}
+	}
 	rewriteMap := map[string]string{}
 	for old, next := range tableMap {
 		rewriteMap[old] = next
@@ -147,7 +160,7 @@ func prepareFeaturePackForInstall(pack FeaturePack, files map[string][]byte, opt
 			return pack, files, fileRenames, routeRenames, modelRenames, fmt.Errorf("route transforms create duplicate file path %s", nextPath)
 		}
 		seenPaths[nextPath] = true
-		body = transformFeatureBody(body, nextPath, rewriteMap, routeMap, transformedBodies)
+		body = transformFeatureBody(body, nextPath, rewriteMap, routeLiterals, transformedBodies)
 		preparedFiles[nextPath] = body
 	}
 
@@ -158,7 +171,7 @@ func prepareFeaturePackForInstall(pack FeaturePack, files map[string][]byte, opt
 		nextPath = transformedFeatureFilePath(nextPath, files[oldPath], routeMap, routePrefix)
 		body, ok := preparedFiles[nextPath]
 		if !ok {
-			body = transformFeatureBody(files[oldPath], nextPath, rewriteMap, routeMap, transformedBodies)
+			body = transformFeatureBody(files[oldPath], nextPath, rewriteMap, routeLiterals, transformedBodies)
 		}
 		sha := f.SHA256
 		size := f.Size
@@ -177,7 +190,7 @@ func prepareFeaturePackForInstall(pack FeaturePack, files map[string][]byte, opt
 			pack.Routes = appendUnique(pack.Routes, routeForStaticPath(f.Path))
 		}
 	}
-	for _, route := range routeMap {
+	for _, route := range routeLiterals {
 		if strings.HasPrefix(route, "/api/") {
 			pack.Routes = appendUnique(pack.Routes, route)
 		}
@@ -358,48 +371,55 @@ func normalizeFeatureModelMap(in map[string]string) (map[string]string, error) {
 }
 
 func rewriteFeaturePackText(s string, tokenMap, routeMap map[string]string) string {
-	s = replaceModelIdentifiers(s, tokenMap)
 	if len(routeMap) == 0 || s == "" {
-		return s
+		return replaceModelIdentifiers(s, tokenMap)
 	}
 	routes := make([]string, 0, len(routeMap))
 	for old := range routeMap {
-		routes = append(routes, old)
+		if old != "" {
+			routes = append(routes, old)
+		}
 	}
-	sort.Slice(routes, func(i, j int) bool { return len(routes[i]) > len(routes[j]) })
-	for _, old := range routes {
-		s = replaceRouteLiteral(s, old, routeMap[old])
+	if len(routes) == 0 {
+		return replaceModelIdentifiers(s, tokenMap)
 	}
-	return s
-}
-
-func replaceRouteLiteral(s, old, replacement string) string {
-	if s == "" || old == "" || old == replacement {
-		return s
+	sort.Slice(routes, func(i, j int) bool {
+		if len(routes[i]) == len(routes[j]) {
+			return routes[i] < routes[j]
+		}
+		return len(routes[i]) > len(routes[j])
+	})
+	byFirstByte := make(map[byte][]string)
+	for _, route := range routes {
+		byFirstByte[route[0]] = append(byFirstByte[route[0]], route)
 	}
+	// Match against the original text once. Token rewrites only see the gaps,
+	// so neither a source route nor a mapped destination is consumed by model
+	// replacement, and one route destination cannot cascade into another map.
+	// These are literal paths, not a regular expression. A malformed or very
+	// large manifest route must not turn preparation into a regexp panic.
 	var b strings.Builder
 	pos := 0
-	changed := false
-	for {
-		idx := strings.Index(s[pos:], old)
-		if idx < 0 {
-			break
+	for start := 0; start < len(s); start++ {
+		candidates := byFirstByte[s[start]]
+		if len(candidates) == 0 || !routeLiteralBoundaryBefore(s, start) {
+			continue
 		}
-		start := pos + idx
-		end := start + len(old)
-		b.WriteString(s[pos:start])
-		if routeLiteralBoundaryBefore(s, start) && routeLiteralBoundaryAfter(s, end) {
-			b.WriteString(replacement)
-			changed = true
-		} else {
-			b.WriteString(s[start:end])
+		for _, route := range candidates {
+			if !strings.HasPrefix(s[start:], route) {
+				continue
+			}
+			end := start + len(route)
+			if routeLiteralBoundaryAfter(s, end) {
+				b.WriteString(replaceModelIdentifiers(s[pos:start], tokenMap))
+				b.WriteString(routeMap[route])
+				pos = end
+				start = end - 1
+				break
+			}
 		}
-		pos = end
 	}
-	if !changed {
-		return s
-	}
-	b.WriteString(s[pos:])
+	b.WriteString(replaceModelIdentifiers(s[pos:], tokenMap))
 	return b.String()
 }
 
@@ -426,20 +446,22 @@ func isRouteLiteralPathRune(r rune) bool {
 		(r >= 'a' && r <= 'z')
 }
 
+// Match the same ASCII word tokens as the former per-name \b replacements.
+// The expression is fixed; model/table names are looked up, never compiled.
+var featureModelIdentifierTokenRE = regexp.MustCompile(`[A-Za-z0-9_]+`)
+
 func replaceModelIdentifiers(s string, modelMap map[string]string) string {
 	if len(modelMap) == 0 || s == "" {
 		return s
 	}
-	names := make([]string, 0, len(modelMap))
-	for old := range modelMap {
-		names = append(names, old)
-	}
-	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
-	for _, old := range names {
-		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(old) + `\b`)
-		s = re.ReplaceAllString(s, modelMap[old])
-	}
-	return s
+	// Emit each original identifier's destination once. A destination that is
+	// also another map's source must not be renamed again (chains and swaps).
+	return featureModelIdentifierTokenRE.ReplaceAllStringFunc(s, func(token string) string {
+		if next, ok := modelMap[token]; ok {
+			return next
+		}
+		return token
+	})
 }
 
 func featurePackLooksBinary(b []byte) bool {

@@ -26,10 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
-
-	"github.com/Masterminds/sprig/v3"
-	"gopkg.in/yaml.v3"
 )
 
 // Frontmatter is the parsed YAML block from the top of a page file.
@@ -73,7 +71,7 @@ func ExtractFrontmatter(raw string) (*Frontmatter, string, error) {
 	yamlText := raw[m[2]:m[3]]
 	body := raw[m[1]:]
 	var fm Frontmatter
-	if err := yaml.Unmarshal([]byte(yamlText), &fm); err != nil {
+	if err := yamlUnmarshal([]byte(yamlText), &fm); err != nil {
 		return nil, raw, fmt.Errorf("frontmatter yaml: %w", err)
 	}
 	return &fm, body, nil
@@ -104,6 +102,9 @@ func ApplyFrontmatterToPage(p *Page, fm *Frontmatter) {
 	}
 	if p.Require == "" {
 		p.Require = fm.Require
+	}
+	if p.Role == "" {
+		p.Role = fm.Role
 	}
 	if p.Redirect == "" {
 		p.Redirect = fm.Redirect
@@ -142,7 +143,7 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 	// Multi-row queries (no LIMIT 1) keep the slice shape they've
 	// always had, so {{range .todos}} works unchanged.
 	for name, sql := range fm.Queries {
-		rows, err := runFrontmatterQuery(app, ctx, sql)
+		rows, err := runFrontmatterQuery(app, page, ctx, sql)
 		if err != nil {
 			if app.DevMode {
 				return "", fmt.Errorf("query %q: %w", name, err)
@@ -177,18 +178,31 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 	// 2a. Parse partials/ as named templates so {{template "name" .}} works
 	// for shared snippets. Best-effort - failure to parse one partial
 	// shouldn't kill the page render.
-	partialsDir := filepath.Join(app.Dir, "partials")
-	if entries, err := os.ReadDir(partialsDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".html") {
+	if appMCPManifestSnapshot(app) != nil {
+		app.mu.RLock()
+		partials := app.Partials
+		app.mu.RUnlock()
+		names := make([]string, 0, len(partials))
+		for name := range partials {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			pName := strings.TrimSuffix(strings.TrimPrefix(name, "partials/"), ".html")
+			if _, err := tmpl.New(pName).Parse(partials[name]); err != nil {
+				log.Printf("gotmpl partial %q parse: %s", pName, err)
+			}
+		}
+	} else {
+		// Read through an os.Root at the app dir so a symlinked partial
+		// can't render a file from outside the app.
+		partials := readGotmplPartials(app.Dir)
+		for _, file := range sortedGotmplPartialNames(partials) {
+			if !strings.HasSuffix(file, ".html") {
 				continue
 			}
-			pData, err := os.ReadFile(filepath.Join(partialsDir, e.Name()))
-			if err != nil {
-				continue
-			}
-			pName := strings.TrimSuffix(e.Name(), ".html")
-			if _, err := tmpl.New(pName).Parse(string(pData)); err != nil {
+			pName := strings.TrimSuffix(file, ".html")
+			if _, err := tmpl.New(pName).Parse(partials[file]); err != nil {
 				log.Printf("gotmpl partial %q parse: %s", pName, err)
 			}
 		}
@@ -200,9 +214,9 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 		return "", fmt.Errorf("template parse: %w", err)
 	}
 
-	// 3. Execute against ctx.Data.
+	// 3. Execute against ctx.Data, with a ceiling on the page size.
 	var buf bytes.Buffer
-	if err := parsed.Execute(&buf, ctx.Data); err != nil {
+	if err := parsed.Execute(&gotmplLimitWriter{w: &buf, limit: gotmplMaxRenderBytes}, ctx.Data); err != nil {
 		return "", fmt.Errorf("template execute: %w", err)
 	}
 	return buf.String(), nil
@@ -217,7 +231,10 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 // mod, strings upper/lower/title/trim/replace/split/join/regex,
 // dates now/dateFormat, lists, dicts, defaults, type coercion,
 // crypto/encoding, etc.) - same surface Helm/kubectl expose, which
-// is what the agent's training prior reaches for first.
+// is what the agent's training prior reaches for first - minus the
+// helpers that read the process environment or the network
+// (expandenv, getHostByName) or generate keys, and with the
+// allocation-multiplying helpers capped (gotmpl_sandbox.go).
 //
 // On top of Sprig we layer the framework-specific helpers (csrf,
 // env, t, dict - yes, sprig's `dict` is overridden to keep the
@@ -227,7 +244,7 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 // `ctx` when they're nil, so the write-time validator's stub-execute
 // pass against nil data doesn't crash on a real template.
 func gotmplHelpers(app *App, ctx *RenderContext) template.FuncMap {
-	fm := sprig.HtmlFuncMap()
+	fm := gotmplSprigFuncs()
 
 	// ----- Framework helpers (override Sprig where names collide) -----
 
@@ -244,9 +261,19 @@ func gotmplHelpers(app *App, ctx *RenderContext) template.FuncMap {
 	// variables; we override to read the per-app env.yaml - that's
 	// the framework convention. Returns "" when missing or app=nil
 	// (nil-app comes from the write-time validator's stub-execute).
+	var reviewedEnv bool
+	var envSource []byte
+	if app != nil {
+		app.mu.RLock()
+		reviewedEnv, envSource = app.MCP != nil, app.templateEnvSource
+		app.mu.RUnlock()
+	}
 	fm["env"] = func(key string) string {
 		if app == nil {
 			return ""
+		}
+		if reviewedEnv {
+			return envLookupFromSource(envSource, key)
 		}
 		return EnvLookup(app.Dir, key)
 	}
@@ -261,7 +288,10 @@ func gotmplHelpers(app *App, ctx *RenderContext) template.FuncMap {
 				lang = c.Value
 			}
 		}
-		return T(key, lang)
+		if app == nil {
+			return key
+		}
+		return app.i18nConfig().T(key, lang)
 	}
 	// dict - Sprig has this too with the same signature. Keeping our
 	// version pinned for backwards compat in case Sprig changes.
@@ -300,6 +330,9 @@ func gotmplHelpers(app *App, ctx *RenderContext) template.FuncMap {
 // When true, the renderer stores the row as a map directly. Templates
 // write `.stats.total` and missing/zero-row cases resolve cleanly via
 // missingkey=zero - no `(index .x 0)` indexing.
+// frontmatterBindRe matches the :name placeholders runFrontmatterQuery binds.
+var frontmatterBindRe = regexp.MustCompile(`:([a-zA-Z_][a-zA-Z0-9_]*)`)
+
 var singleRowQueryRe = regexp.MustCompile(`(?i)\blimit\s+1\s*;?\s*$`)
 
 // aggregateSelectRe matches a SELECT statement whose every output column
@@ -395,12 +428,15 @@ func isSingleRowQuery(sql string) bool {
 // parameters (:user_id, :user_email, :user_role, :user_group_id, and
 // :param_<name> from URL query string) substituted in. Returns the rows
 // as []map[string]any so they're directly usable from html/template.
-func runFrontmatterQuery(app *App, ctx *RenderContext, sqlText string) ([]map[string]any, error) {
+//
+// A page with `scope: owner` gets the same owner clause as a mustache page's
+// <query> tags; the gotmpl runner used to ignore it and return every owner's
+// rows.
+func runFrontmatterQuery(app *App, page *Page, ctx *RenderContext, sqlText string) ([]map[string]any, error) {
 	// Substitute :name placeholders with ? and collect args in order.
 	// Supports the same set the rest of the framework supports.
-	bindRe := regexp.MustCompile(`:([a-zA-Z_][a-zA-Z0-9_]*)`)
 	var args []any
-	resolved := bindRe.ReplaceAllStringFunc(sqlText, func(m string) string {
+	resolved := frontmatterBindRe.ReplaceAllStringFunc(sqlText, func(m string) string {
 		name := strings.TrimPrefix(m, ":")
 		val, ok := resolveBind(ctx, name)
 		if !ok {
@@ -411,6 +447,17 @@ func runFrontmatterQuery(app *App, ctx *RenderContext, sqlText string) ([]map[st
 		args = append(args, val)
 		return "?"
 	})
+	if page != nil && page.Scope == "owner" {
+		var uid int64
+		if ctx.User != nil {
+			uid = ctx.User.UserID
+		}
+		scoped, err := injectOwnerScope(resolved, uid, ctx.User != nil)
+		if err != nil {
+			return nil, err
+		}
+		resolved = scoped
+	}
 	rows, err := QueryRows(app.DB, resolved, args...)
 	if err != nil {
 		return nil, err
@@ -470,8 +517,15 @@ func EnvLookup(appDir, key string) string {
 	if err != nil {
 		return ""
 	}
+	return envLookupFromSource(data, key)
+}
+
+func envLookupFromSource(data []byte, key string) string {
+	if runtimePrivateEnvKey(key) {
+		return ""
+	}
 	var env map[string]any
-	if err := yaml.Unmarshal(data, &env); err != nil {
+	if err := yamlUnmarshal(data, &env); err != nil {
 		return ""
 	}
 	if v, ok := env[key]; ok {

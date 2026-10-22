@@ -13,7 +13,7 @@ import (
 
 // RegisterAPIDocsRoutes adds auto-generated API documentation endpoints.
 // Respects features.docs visibility: "public" (default) or "auth" (requires login).
-func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
+func RegisterAPIDocsRoutes(mux appRouteRegistrar, app *App) {
 	requireAuth := app.Design != nil && app.Design.Features != nil && app.Design.Features.DocsRequireAuth()
 	// Align the docs default with the data default. Since v2.7.11 table DATA
 	// is private-by-default; the docs (full schema: tables/columns/types +
@@ -26,30 +26,29 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 	}
 
 	// JSON: legacy Benmore docs shape ({endpoints,pages,features}).
+	// Every docs surface is filtered to what THIS caller may read
+	// (apidocs_audience.go), so the response varies per caller.
 	mux.HandleFunc("GET /api/_docs", func(w http.ResponseWriter, r *http.Request) {
-		if requireAuth {
-			session := getSession(app, r)
-			if session == nil {
-				http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
-				return
-			}
+		session := getSession(app, r)
+		if requireAuth && session == nil {
+			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(generateAPIDocs(app))
+		w.Header().Set("Cache-Control", "private, no-store")
+		json.NewEncoder(w).Encode(generateAPIDocs(app, docsViewerFor(session)))
 	})
 
 	// JSON: real OpenAPI 3.1 contract for the app runtime CRUD surface.
 	openAPIHandler := func(w http.ResponseWriter, r *http.Request) {
-		if requireAuth {
-			session := getSession(app, r)
-			if session == nil {
-				http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
-				return
-			}
+		session := getSession(app, r)
+		if requireAuth && session == nil {
+			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		json.NewEncoder(w).Encode(generateRuntimeOpenAPI(app))
+		w.Header().Set("Cache-Control", "private, no-store")
+		json.NewEncoder(w).Encode(generateRuntimeOpenAPIFor(app, docsViewerFor(session)))
 	}
 	for _, path := range []string{"/api/_openapi", "/openapi.json", "/api/openapi.json"} {
 		mux.HandleFunc("GET "+path, openAPIHandler)
@@ -73,26 +72,26 @@ func RegisterAPIDocsRoutes(mux *http.ServeMux, app *App) {
 	// HTML: rendered docs page - skip if the app has its own /docs page
 	if _, hasDocsPage := app.Pages["/docs"]; !hasDocsPage {
 		mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) {
-			if requireAuth {
-				session := getSession(app, r)
-				if session == nil {
-					if r.URL.Query().Get("format") == "md" {
-						http.Error(w, "authentication required", http.StatusUnauthorized)
-						return
-					}
-					http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
+			session := getSession(app, r)
+			if requireAuth && session == nil {
+				if r.URL.Query().Get("format") == "md" {
+					http.Error(w, "authentication required", http.StatusUnauthorized)
 					return
 				}
+				http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
+				return
 			}
+			viewer := docsViewerFor(session)
+			w.Header().Set("Cache-Control", "private, no-store")
 			// Machine/LLM-friendly markdown export from the same docs model -
 			// backs the "Copy for LLM" buttons. No second source of truth.
 			if r.URL.Query().Get("format") == "md" {
 				w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-				fmt.Fprint(w, renderDocsMarkdown(app))
+				fmt.Fprint(w, renderDocsMarkdownFor(app, viewer))
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprint(w, WrapLayout(renderDocsHTML(app), "API Documentation", app, nil))
+			fmt.Fprint(w, WrapLayout(renderDocsHTML(app, viewer), "API Documentation", app, nil))
 		})
 	}
 }
@@ -123,23 +122,20 @@ func appHasAnonReadableTable(app *App) bool {
 	return false
 }
 
-func generateAPIDocs(app *App) map[string]any {
+func generateAPIDocs(app *App, viewer docsViewer) map[string]any {
 	tables, _ := GetTableNames(app.DB)
 
 	endpoints := make(map[string]any)
 	for _, table := range tables {
-		if strings.HasPrefix(table, "_benmore_") {
+		if strings.HasPrefix(table, "_benmore_") || !viewer.showsTable(app, table) {
 			continue
 		}
 		cols, _ := GetTableColumns(app.DB, table)
 
 		// Never expose sensitive columns in API docs
-		sensitiveColumns := map[string]bool{
-			"password_hash": true, "totp_secret": true, "backup_codes": true,
-		}
 		fields := make([]map[string]string, 0)
 		for _, col := range cols {
-			if sensitiveColumns[col.Name] {
+			if docsHiddenColumn(app, table, col.Name) {
 				continue
 			}
 			field := map[string]string{
@@ -158,18 +154,13 @@ func generateAPIDocs(app *App) map[string]any {
 			fields = append(fields, field)
 		}
 
+		routes := make([]map[string]string, 0, 8)
+		for _, rt := range viewer.routes(app, table) {
+			routes = append(routes, map[string]string{"method": rt.method, "path": rt.path, "description": rt.desc})
+		}
 		tableInfo := map[string]any{
 			"fields": fields,
-			"routes": []map[string]string{
-				{"method": "GET", "path": fmt.Sprintf("/api/%s", table), "description": "List all records"},
-				{"method": "GET", "path": fmt.Sprintf("/api/%s/{id}", table), "description": "Get a single record"},
-				{"method": "POST", "path": fmt.Sprintf("/api/%s", table), "description": "Create a record"},
-				{"method": "PATCH", "path": fmt.Sprintf("/api/%s/{id}", table), "description": "Update a record"},
-				{"method": "DELETE", "path": fmt.Sprintf("/api/%s/{id}", table), "description": "Delete a record"},
-				{"method": "POST", "path": fmt.Sprintf("/api/%s/batch", table), "description": "Batch create (JSON array)"},
-				{"method": "PATCH", "path": fmt.Sprintf("/api/%s/batch", table), "description": "Batch update ({ids, fields})"},
-				{"method": "DELETE", "path": fmt.Sprintf("/api/%s/batch", table), "description": "Batch delete ({ids})"},
-			},
+			"routes": routes,
 		}
 		if app.IsUUIDTable(table) {
 			tableInfo["id_format"] = "uuid"
@@ -180,6 +171,9 @@ func generateAPIDocs(app *App) map[string]any {
 	// Pages
 	pages := make([]map[string]string, 0)
 	for route, page := range app.Pages {
+		if !viewer.showsPage(page) {
+			continue
+		}
 		p := map[string]string{"route": route, "file": page.File}
 		if page.Auth != "" {
 			p["auth"] = page.Auth
@@ -198,8 +192,7 @@ func generateAPIDocs(app *App) map[string]any {
 			"scoping":     "owner (user_id) + org (configurable key)",
 			"soft_delete": "auto if deleted_at column exists",
 			"audit_trail": "GET /api/_audit",
-			"export":      "Export table rows as CSV, JSON, or XLSX",
-			"pagination":  "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)",
+			"pagination":  "?page=N&per_page=N or ?limit=N&offset=N (offset); ?cursor=X&limit=N (keyset)",
 			"idempotency": "X-Idempotency-Key header on POST",
 			"concurrency": "_expected_updated_at field for optimistic locking",
 			"cache":       "<query cache=\"5m\"> for query result caching",
@@ -207,7 +200,14 @@ func generateAPIDocs(app *App) map[string]any {
 	}
 }
 
+// generateRuntimeOpenAPI is the full developer contract (every table and
+// operation) - `benmore verify` and tests. HTTP callers get
+// generateRuntimeOpenAPIFor with their own docsViewer.
 func generateRuntimeOpenAPI(app *App) map[string]any {
+	return generateRuntimeOpenAPIFor(app, fullDocs)
+}
+
+func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
 	paths := map[string]any{}
 	schemas := map[string]any{
 		"Problem": map[string]any{
@@ -233,7 +233,7 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 		// _benmore_* table, so this guard is normally dead code. Keep it
 		// so a future change to sortedTables can't leak an internal table
 		// into the public contract.
-		if strings.HasPrefix(table.Name, "_benmore_") {
+		if strings.HasPrefix(table.Name, "_benmore_") || !viewer.showsTable(app, table.Name) {
 			continue
 		}
 		schemaName := pascalCase(singularize(table.Name))
@@ -241,7 +241,7 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 			schemaName = pascalCase(table.Name)
 		}
 		seenSchema[schemaName] = true
-		schemas[schemaName] = openAPISchemaForTable(table)
+		schemas[schemaName] = openAPISchemaForTable(app, table)
 		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(table, "create")
 		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(table, "update")
 		paths["/api/"+table.Name] = map[string]any{
@@ -250,10 +250,10 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				"tags":        []string{table.Name},
 				"summary":     "List " + table.Name,
 				// Parameters mirror the auto-CRUD list handler (crud_read.go):
-				// offset paging is ?page=&per_page=, keyset paging is
-				// ?cursor=&limit= (limit is cursor-scoped only), ?count
+				// offset paging is ?page=&per_page= or ?limit=&offset=; keyset
+				// paging is ?cursor=&limit=, ?count
 				// returns just the total, ?q is full-text, ?include expands
-				// relations. There is no ?offset param.
+				// relations.
 				"parameters": openAPIListParams(schemaName),
 				"responses": openAPIResponses(map[string]any{
 					// The runtime returns one of: a bare array (default),
@@ -310,6 +310,23 @@ func generateRuntimeOpenAPI(app *App) map[string]any {
 				}),
 			},
 		}
+		if tableHasColumn(table, "deleted_at") && !restoreRouteOwnedByFlow(app, table.Name) {
+			paths["/api/"+table.Name+"/{id}/restore"] = map[string]any{
+				"post": map[string]any{
+					"operationId": "restore" + schemaName,
+					"tags":        []string{table.Name},
+					"summary":     "Restore a soft-deleted " + singularize(table.Name),
+					"description": "Requires read and update access. Clears deleted_at through update validation, locks, hooks, audit and versioning; returns the sanitized row. Does not restore children. Missing, unreadable or already-live rows return 404.",
+					"parameters":  []map[string]any{openAPIIDParam()},
+					"responses": openAPIResponses(map[string]any{
+						"200": openAPIJSONResponse("Restored row", map[string]any{"$ref": "#/components/schemas/" + schemaName}),
+						"409": openAPIProblemResponse("Record is locked"),
+						"422": openAPIProblemResponse("Update validation failed"),
+					}),
+				},
+			}
+		}
+		viewer.pruneOpenAPIPaths(app, table.Name, paths)
 	}
 
 	return map[string]any{
@@ -340,11 +357,20 @@ func appOpenAPITitle(app *App) string {
 	return "Benmore App API"
 }
 
-func openAPISchemaForTable(table Table) map[string]any {
+// docsHiddenColumn reports a column every generated description (/api/_docs,
+// its HTML and Markdown renderings, the OpenAPI read schema, /api/_schema)
+// leaves out: exactly the columns read responses strip (apiHiddenColumn,
+// response_columns.go), plus the framework credential names on any table.
+// Listing a column the API never returns only advertises where a secret lives.
+func docsHiddenColumn(app *App, table, column string) bool {
+	return isSensitiveUserColumn(column) || apiHiddenColumn(app, table, column)
+}
+
+func openAPISchemaForTable(app *App, table Table) map[string]any {
 	props := map[string]any{}
 	required := []string{}
 	for _, col := range table.Columns {
-		if isSensitiveUserColumn(col.Name) {
+		if docsHiddenColumn(app, table.Name, col.Name) {
 			continue
 		}
 		props[col.Name] = openAPISchemaForColumn(col)
@@ -488,14 +514,15 @@ func openAPIIDParam() map[string]any {
 }
 
 // openAPIListParams describes the query parameters the auto-CRUD list
-// handler actually honors (crud_read.go). Offset paging is page/per_page; keyset
-// paging is cursor/limit (limit is cursor-scoped only). There is no ?offset.
+// handler actually honors (crud_read.go). Offset paging accepts page/per_page
+// or the SDK limit/offset aliases; keyset paging uses cursor/limit.
 func openAPIListParams(schemaName string) []map[string]any {
 	return []map[string]any{
 		{"name": "page", "in": "query", "description": "Offset-paging page number (1-based). Triggers the {data,total,page,per_page} response shape.", "schema": map[string]any{"type": "integer", "minimum": 1}},
-		{"name": "per_page", "in": "query", "description": "Rows per page for offset paging (default 20).", "schema": map[string]any{"type": "integer", "minimum": 1}},
+		{"name": "per_page", "in": "query", "description": "Rows per page for offset paging (default 50, maximum 500). Explicit page/per_page controls take precedence over limit/offset.", "schema": map[string]any{"type": "integer", "minimum": 1}},
 		{"name": "cursor", "in": "query", "description": "Keyset-paging cursor (an id). Triggers the {data,next_cursor,limit} response shape.", "schema": map[string]any{"type": "string"}},
-		{"name": "limit", "in": "query", "description": "Page size for keyset (cursor) paging only; capped at 500. Ignored for offset paging.", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 500}},
+		{"name": "limit", "in": "query", "description": "Rows per page, capped at 500; default 20 with cursor, otherwise 50. Explicit page/per_page takes precedence for offset paging.", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 500}},
+		{"name": "offset", "in": "query", "description": "Rows to skip (default 0, maximum 100000). Used with limit when neither page nor per_page is set; ignored with cursor.", "schema": map[string]any{"type": "integer", "minimum": 0, "maximum": 100000}},
 		{"name": "count", "in": "query", "description": "When truthy, return only {count: N} (the filtered total, ignoring paging).", "schema": map[string]any{"type": "boolean"}},
 		{"name": "include", "in": "query", "description": "Comma-separated relation names to expand inline (e.g. include=contact,tasks). Adds extra keys to each row.", "schema": map[string]any{"type": "string"}},
 		{"name": "q", "in": "query", "description": "Full-text search query applied across the table's searchable text columns.", "schema": map[string]any{"type": "string"}},
@@ -582,7 +609,6 @@ func openAPIWriteStatusSchema(status string) map[string]any {
 // authoritative as the backend.
 func generateRichSchema(app *App, session *Session) map[string]any {
 	tables, _ := GetTableNames(app.DB)
-	sensitive := map[string]bool{"password_hash": true, "totp_secret": true, "backup_codes": true}
 
 	// Pre-pass: forward FKs per table, inverted into a reverse-relation
 	// index (parent table → child {table,column}) so a Detail view can
@@ -600,29 +626,44 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 		}
 	}
 
-	out := make(map[string]any)
+	// Per-user allowed ops - coarse (the server still enforces per row).
+	// targetUserID = the caller so `self` mode resolves true for "their
+	// own rows" rather than false. A non-admin is only told about tables
+	// they can do SOMETHING with (a write-only form table still appears),
+	// matching the per-caller filtering of the other docs surfaces. RBAC
+	// scopes count too, with the scope action each CRUD handler checks.
+	scopeAction := map[AccessOp]string{OpRead: "read", OpWrite: "write", OpUpdate: "write", OpDelete: "delete"}
+	opsFor := map[string]map[string]bool{}
 	for _, table := range tables {
 		if strings.HasPrefix(table, "_benmore_") {
+			continue
+		}
+		hasUID := hasColumn(app, table, "user_id")
+		hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
+		ops := map[string]bool{}
+		anyOp := false
+		for _, op := range []AccessOp{OpRead, OpWrite, OpUpdate, OpDelete} {
+			mode := app.Access.ModeFor(table, op, hasUID, hasGroupKey)
+			ops[string(op)] = mode != "off" && tableModeAllowed(app, table, op, mode, session, session.UserID) && hasScope(session, table, scopeAction[op])
+			anyOp = anyOp || ops[string(op)]
+		}
+		if anyOp || session.IsAdminConsole() {
+			opsFor[table] = ops
+		}
+	}
+
+	out := make(map[string]any)
+	for _, table := range tables {
+		ops, ok := opsFor[table]
+		if !ok {
 			continue
 		}
 		cols, _ := GetTableColumns(app.DB, table)
 		fks := fksByTable[table]
 
-		hasUID := hasColumn(app, table, "user_id")
-		hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-
-		// Per-user allowed ops - coarse (the server still enforces per row).
-		// targetUserID = the caller so `self` mode resolves true for "their
-		// own rows" rather than false.
-		ops := map[string]bool{}
-		for _, op := range []AccessOp{OpRead, OpWrite, OpUpdate, OpDelete} {
-			mode := app.Access.ModeFor(table, op, hasUID, hasGroupKey)
-			ops[string(op)] = mode != "off" && app.Access.Allowed(mode, session, session.UserID)
-		}
-
 		fields := make([]map[string]any, 0, len(cols))
 		for _, col := range cols {
-			if sensitive[col.Name] {
+			if docsHiddenColumn(app, table, col.Name) {
 				continue
 			}
 			encDef := encryptedDefFor(app, table, col.Name)
@@ -659,8 +700,14 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 				"soft_delete": hasColumn(app, table, "deleted_at"),
 			},
 		}
-		if len(childrenOf[table]) > 0 {
-			td["children"] = childrenOf[table] // reverse relations (one-to-many)
+		var children []map[string]string
+		for _, c := range childrenOf[table] {
+			if _, ok := opsFor[c["table"]]; ok {
+				children = append(children, c)
+			}
+		}
+		if len(children) > 0 {
+			td["children"] = children // reverse relations (one-to-many)
 		}
 		if app.IsUUIDTable(table) {
 			td["id_format"] = "uuid"
@@ -694,8 +741,9 @@ func encryptedDefFor(app *App, table, col string) *EncryptedFieldDef {
 	return nil
 }
 
-// sessionCanUnmask reports whether the session sees the decrypted value.
-// Mirrors MaskEncryptedFields' role gate (no roles → everyone with read).
+// sessionCanUnmask is a field-level UI hint that the session may unmask some
+// rows. Actual values use MaskEncryptedFields' per-row tenant/owner policy;
+// this schema metadata does not assert that every readable row is unmasked.
 func sessionCanUnmask(session *Session, def *EncryptedFieldDef) bool {
 	if len(def.Roles) == 0 {
 		return true
@@ -766,7 +814,7 @@ func humanizeField(s string) string {
 	return strings.Join(parts, " ")
 }
 
-func renderDocsHTML(app *App) string {
+func renderDocsHTML(app *App, viewer docsViewer) string {
 	tables, _ := GetTableNames(app.DB)
 
 	var sb strings.Builder
@@ -789,7 +837,7 @@ func renderDocsHTML(app *App) string {
 	sb.WriteString(`</div>`)
 
 	for _, table := range tables {
-		if strings.HasPrefix(table, "_benmore_") {
+		if strings.HasPrefix(table, "_benmore_") || !viewer.showsTable(app, table) {
 			continue
 		}
 		cols, _ := GetTableColumns(app.DB, table)
@@ -801,6 +849,9 @@ func renderDocsHTML(app *App) string {
 			html.EscapeString(table)))
 
 		for _, col := range cols {
+			if docsHiddenColumn(app, table, col.Name) {
+				continue
+			}
 			notes := ""
 			if col.PK {
 				notes = "primary key, auto-increment"
@@ -821,14 +872,7 @@ func renderDocsHTML(app *App) string {
 
 		// Routes
 		sb.WriteString(`<div class="space-y-1 text-sm">`)
-		routes := []struct{ method, path, desc string }{
-			{"GET", "/api/" + table, "List all"},
-			{"GET", "/api/" + table + "/{id}", "Get one"},
-			{"POST", "/api/" + table, "Create"},
-			{"PATCH", "/api/" + table + "/{id}", "Update"},
-			{"DELETE", "/api/" + table + "/{id}", "Delete"},
-		}
-		for _, rt := range routes {
+		for _, rt := range viewer.routes(app, table) {
 			color := "bg-emerald-500/10 text-emerald-500"
 			if rt.method == "POST" {
 				color = "bg-blue-500/10 text-blue-500"
@@ -851,7 +895,13 @@ func renderDocsHTML(app *App) string {
 // machine/LLM-friendly export served by `GET /docs?format=md` and copied by the
 // "Copy for LLM" button. It walks the SAME tables/columns/routes/features the
 // HTML and JSON views do, so there's no second source of truth.
+// renderDocsMarkdown is the full developer contract; HTTP callers get
+// renderDocsMarkdownFor with their own docsViewer.
 func renderDocsMarkdown(app *App) string {
+	return renderDocsMarkdownFor(app, fullDocs)
+}
+
+func renderDocsMarkdownFor(app *App, viewer docsViewer) string {
 	tables, _ := GetTableNames(app.DB)
 	var sb strings.Builder
 
@@ -863,9 +913,8 @@ func renderDocsMarkdown(app *App) string {
 	sb.WriteString("- **API / native:** `POST /api/_auth/token` with `{\"email\",\"password\"}` returns `{\"token\"}`.\n")
 	sb.WriteString("- **Usage:** send header `Authorization: Bearer {token}`.\n\n")
 
-	sensitive := map[string]bool{"password_hash": true, "totp_secret": true, "backup_codes": true}
 	for _, table := range tables {
-		if strings.HasPrefix(table, "_benmore_") {
+		if strings.HasPrefix(table, "_benmore_") || !viewer.showsTable(app, table) {
 			continue
 		}
 		cols, _ := GetTableColumns(app.DB, table)
@@ -875,7 +924,7 @@ func renderDocsMarkdown(app *App) string {
 		}
 		sb.WriteString("| Field | Type | Notes |\n|---|---|---|\n")
 		for _, col := range cols {
-			if sensitive[col.Name] {
+			if docsHiddenColumn(app, table, col.Name) {
 				continue
 			}
 			var notes []string
@@ -890,7 +939,7 @@ func renderDocsMarkdown(app *App) string {
 			fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", col.Name, col.Type, strings.Join(notes, ", "))
 		}
 		sb.WriteString("\nRoutes:\n\n")
-		for _, rt := range docsCRUDRoutes(table) {
+		for _, rt := range viewer.routes(app, table) {
 			fmt.Fprintf(&sb, "- `%s %s` - %s\n", rt.method, rt.path, rt.desc)
 		}
 		sb.WriteString("\n")
@@ -899,8 +948,10 @@ func renderDocsMarkdown(app *App) string {
 	if len(app.Pages) > 0 {
 		sb.WriteString("## Pages\n\n")
 		routes := make([]string, 0, len(app.Pages))
-		for route := range app.Pages {
-			routes = append(routes, route)
+		for route, page := range app.Pages {
+			if viewer.showsPage(page) {
+				routes = append(routes, route)
+			}
 		}
 		sort.Strings(routes)
 		for _, route := range routes {
@@ -950,8 +1001,7 @@ func docsPlatformFeatures() []docsFeature {
 		{"Scoping", "owner (user_id) + org (configurable key)"},
 		{"Soft delete", "auto if a deleted_at column exists"},
 		{"Audit trail", "GET /api/_audit"},
-		{"Export", "table rows as CSV, JSON, or XLSX"},
-		{"Pagination", "?page=N&per_page=N (offset) or ?cursor=X&limit=N (keyset)"},
+		{"Pagination", "?page=N&per_page=N or ?limit=N&offset=N (offset); ?cursor=X&limit=N (keyset)"},
 		{"Idempotency", "X-Idempotency-Key header on POST"},
 		{"Concurrency", "_expected_updated_at field for optimistic locking"},
 	}

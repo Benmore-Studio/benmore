@@ -44,7 +44,7 @@ var importCreateLimiter = NewRateLimiter(10, time.Minute)
 
 // importTableAllowed reports whether a table may be an import target.
 // Resolution goes through GetTableNames, which already filters _benmore_%
-// and sqlite_% (db.go:508) - so framework tables are unreachable
+// and sqlite_% (db.go) - so framework tables are unreachable
 // structurally, with no deny-list to maintain or forget.
 func importTableAllowed(app *App, table string) bool {
 	names, err := GetTableNames(app.DB)
@@ -110,7 +110,12 @@ func importCallerAuthorized(w http.ResponseWriter, r *http.Request, app *App) (*
 	}
 	// IsAdminBypass, not IsAdmin: a stepped-in admin (act-as) must not
 	// bulk-load into the tenant it stepped into. See types.go:622.
-	if !session.IsAdminBypass() {
+	// IsAdminConsole too (rule 15b): an atomic bulk load is an admin
+	// management surface, so a delegated credential an admin minted (a
+	// scoped API token or Bearer session, an edge identity) does not
+	// qualify even when its scopes cover the table. The CLI path uses the
+	// owner token above and is unaffected.
+	if !session.IsAdminBypass() || !session.IsAdminConsole() {
 		httpJSON(w, http.StatusForbidden, map[string]any{
 			"error": "bulk import requires an admin or owner session",
 		})
@@ -143,9 +148,12 @@ func newImportID() (string, error) {
 }
 
 // RegisterImportRoutes wires the import endpoints onto an app mux.
-func RegisterImportRoutes(mux *http.ServeMux, app *App) {
+func RegisterImportRoutes(mux appRouteRegistrar, app *App) {
 	EnsureImportsTable(app)
+	registerImportRoutes(mux, app)
+}
 
+func registerImportRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_import", func(w http.ResponseWriter, r *http.Request) {
 		handleImportCreate(w, r, app)
 	})
@@ -339,6 +347,9 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 		// validated at load time instead (import_run.go newNDJSONSource).
 		if len(req.Columns) > 0 {
 			if err := validateImportColumns(app.DB, req.Table, app, req.Columns); err != nil {
+				if respondOwnedField(w, err) {
+					return
+				}
 				httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
@@ -347,7 +358,7 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 
 	id, err := newImportID()
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_import create", err, "Server error")
 		return
 	}
 	_, err = app.DB.Exec(`INSERT INTO _benmore_imports
@@ -357,7 +368,7 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 		id, table, req.Format, gz, req.Bytes, req.UncompressedBytes, req.SHA256,
 		req.NullAs, session.UserID, session.Email)
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_import create", err, "Server error")
 		return
 	}
 
@@ -436,8 +447,7 @@ func handleImportChunk(w http.ResponseWriter, r *http.Request, app *App) {
 			httpJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": err.Error()})
 			return
 		}
-		log.Printf("IMPORT %s: chunk %d write failed: %v", sess.ID, n, err)
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_import chunk", fmt.Errorf("import %s chunk %d write failed: %w", sess.ID, n, err), "Server error")
 		return
 	}
 	current, err := loadImportSession(app.DB, sess.ID)
@@ -518,7 +528,7 @@ func handleImportCommit(w http.ResponseWriter, r *http.Request, app *App) {
 		`UPDATE _benmore_imports SET state='running', rows_loaded=0, error='' WHERE id=? AND state='staging'`,
 		sess.ID)
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_import commit", err, "Server error")
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
@@ -661,13 +671,13 @@ func handleImportCancel(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	changed, err := saveImportStateIf(app.DB, sess.ID, "staging", "cancelled", 0, "cancelled by caller")
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, "_import cancel", err, "Server error")
 		return
 	}
 	if !changed {
 		current, err := loadImportSession(app.DB, sess.ID)
 		if err != nil {
-			httpError(w, "Server error", http.StatusInternalServerError)
+			serverError(w, r, app, "_import cancel", err, "Server error")
 			return
 		}
 		httpJSON(w, http.StatusConflict, map[string]any{"error": fmt.Sprintf("import already %s; nothing to cancel", current.State), "state": current.State})

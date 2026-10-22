@@ -64,7 +64,7 @@ func builtinRecipeNames() []string {
 // preserved (ordering matters: compute bindings reference earlier ones).
 func parseRecipeYAML(src string) (*Recipe, error) {
 	var root yaml.Node
-	if err := yaml.Unmarshal([]byte(src), &root); err != nil {
+	if err := yamlUnmarshal([]byte(src), &root); err != nil {
 		return nil, err
 	}
 	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 {
@@ -200,7 +200,7 @@ func nodeToStringMap(node *yaml.Node) map[string]string {
 // a binding (params.<key>).
 func parseSignBlock(src string) (*FlowAPISign, error) {
 	var root yaml.Node
-	if err := yaml.Unmarshal([]byte(src), &root); err != nil {
+	if err := yamlUnmarshal([]byte(src), &root); err != nil {
 		return nil, fmt.Errorf("yaml: %w", err)
 	}
 	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 {

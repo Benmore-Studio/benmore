@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +35,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // serveStaticHTML attempts to serve a request from the app's static/
@@ -45,8 +48,11 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 		return false
 	}
 	staticRoot := filepath.Join(app.Dir, "static")
-	if st, err := os.Stat(staticRoot); err != nil || !st.IsDir() {
-		return false
+	reviewed := appMCPManifestSnapshot(app) != nil
+	if !reviewed {
+		if st, err := os.Stat(staticRoot); err != nil || !st.IsDir() {
+			return false
+		}
 	}
 
 	clean := filepath.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
@@ -64,6 +70,11 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 	if strings.Contains(rel, "..") {
 		return false
 	}
+	// Desktop-metadata sidecars (`._index.html`) are never pages. A real
+	// 404 here also keeps them out of the SPA index fallback below.
+	if pathHasMetadataSidecar(rel) {
+		return false
+	}
 
 	// Candidate resolution order:
 	//   1. static/<rel>.html              (clean URL → file)
@@ -75,11 +86,15 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 		filepath.Join(staticRoot, rel),
 	}
 	for _, candidate := range candidates {
-		// Verify the symlink-RESOLVED path stays inside static/. filepath.Clean
-		// has already removed `..`, but Stat/ServeFile follow symlinks, so a
-		// link escaping static/ needs EvalSymlinks-based containment
-		// (resolveServableFile, see static_file_security.go).
-		resolved, ok := resolveServableFile(staticRoot, candidate)
+		if reviewed {
+			if strings.HasSuffix(strings.ToLower(candidate), ".html") && tryServeHTMLFile(w, r, app, candidate) {
+				return true
+			}
+			continue
+		}
+		// Open the contained file once; reads must not reopen a pathname that
+		// could be replaced after the containment check.
+		file, ok := openServableFile(staticRoot, candidate)
 		if !ok {
 			// A candidate that exists on disk (even as a symlink) but is
 			// rejected by the resolver is a containment block, not a plain
@@ -91,14 +106,19 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 			}
 			continue
 		}
+		defer file.Close()
 		// Only inject CSRF on actual .html files. Other extensions
 		// (.js, .css, .png) fall through to the /static/ handler
 		// when the agent uses absolute paths - but if someone serves
 		// them via clean URL routing too, just stream them as-is.
-		if strings.HasSuffix(strings.ToLower(resolved), ".html") {
-			return tryServeHTMLFile(w, r, app, resolved)
+		if strings.HasSuffix(strings.ToLower(file.path), ".html") {
+			data, err := io.ReadAll(file)
+			if err != nil {
+				return false
+			}
+			return serveHTMLBytes(w, r, app, data)
 		}
-		http.ServeFile(w, r, resolved)
+		file.serveHTTP(w, r)
 		return true
 	}
 
@@ -131,20 +151,31 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 // the read failed (in which case the caller falls through to 404 - no
 // response has been written yet).
 func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path string) bool {
-	// Confirm the symlink-resolved path stays within static/ before reading
-	// (callers may pass a path that escapes via symlink).
-	if app != nil {
-		staticRoot := filepath.Join(app.Dir, "static")
-		resolved, ok := resolveServableFile(staticRoot, path)
+	var data []byte
+	var err error
+	if app != nil && appMCPManifestSnapshot(app) != nil {
+		rel, relErr := filepath.Rel(filepath.Join(app.Dir, "static"), path)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return false
+		}
+		data, err = app.readSourceFile(filepath.Join("static", rel))
+	} else if app != nil {
+		file, ok := openServableFile(filepath.Join(app.Dir, "static"), path)
 		if !ok {
 			return false
 		}
-		path = resolved
+		defer file.Close()
+		data, err = io.ReadAll(file)
+	} else {
+		data, err = os.ReadFile(path)
 	}
-	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
+	return serveHTMLBytes(w, r, app, data)
+}
+
+func serveHTMLBytes(w http.ResponseWriter, r *http.Request, app *App, data []byte) bool {
 	// Defensive: an older agent may have written a YAML frontmatter
 	// block at the top of a static file (the pre-v2.5.6 page-contract
 	// validator wrongly told them to add `engine: raw`). The frontmatter
@@ -163,9 +194,11 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 	// pages are unaffected.
 	if app != nil {
 		staticRoot := filepath.Join(app.Dir, "static")
-		data = []byte(ProcessIncludes(string(data), app.Partials, staticRoot))
+		data = []byte(processIncludesWithReader(string(data), app.Partials, staticRoot, func(name string) ([]byte, error) {
+			return app.readIncludeSource("static", name)
+		}))
 	}
-	injected := injectCSRFMeta(data)
+	injected := injectI18nBootstrap(injectCSRFMeta(data), app)
 	// Auto-fill hidden _csrf inputs on native POST forms. The token
 	// reuses the same generator (HMAC + timestamp), so the form's
 	// value passes the same validator as the meta tag's value.
@@ -191,7 +224,7 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 			// Cookie banner sits with the analytics beacon - the beacon
 			// is what the consent gates, so they belong together. Banner
 			// goes in first so it's visible before the beacon JS fires.
-			injected = injectCookieBanner(injected)
+			injected = injectCookieBanner(injected, app)
 			injected = injectAnalyticsBeacon(injected)
 		}
 		if devReloadClientEnabled(app) {
@@ -326,11 +359,11 @@ func injectFeedbackWidget(html []byte, testing bool) []byte {
 // AnalyticsCookieNotice and cookieConsentGiven for the runtime side.
 //
 // Idempotency: bails when the bm-cookie id is already in the document.
-func injectCookieBanner(html []byte) []byte {
+func injectCookieBanner(html []byte, app *App) []byte {
 	if bytes.Contains(html, []byte(`id="bm-cookie"`)) {
 		return html
 	}
-	chunk := []byte("\n" + AnalyticsCookieNotice() + "\n")
+	chunk := []byte("\n" + AnalyticsCookieNotice(app) + "\n")
 	lower := bytes.ToLower(html)
 	if i := bytes.LastIndex(lower, []byte("</body>")); i >= 0 {
 		out := make([]byte, 0, len(html)+len(chunk))
@@ -411,6 +444,10 @@ func versionStaticAssets(html []byte, app *App) []byte {
 		return html
 	}
 	staticRoot := filepath.Join(app.Dir, "static")
+	// Every .js reference shares one tree version: resolve it at most once
+	// per render (and at most once per staticTreeVersionTTL across renders).
+	var treeVer string
+	var treeOK, treeDone bool
 	return staticAssetRefRe.ReplaceAllFunc(html, func(match []byte) []byte {
 		groups := staticAssetRefRe.FindSubmatch(match)
 		if len(groups) < 6 {
@@ -419,7 +456,17 @@ func versionStaticAssets(html []byte, app *App) []byte {
 		// groups[4] is the optional existing `?v=<digits>` - discarded.
 		attr, quote, urlPath, closeQuote := groups[1], groups[2], groups[3], groups[5]
 		rel := strings.TrimPrefix(string(urlPath), "/static/")
-		ver, ok := assetContentVersion(staticRoot, rel)
+		var ver string
+		var ok bool
+		if strings.HasSuffix(rel, ".js") {
+			if !treeDone {
+				treeVer, treeOK = cachedStaticTreeVersion(staticRoot)
+				treeDone = true
+			}
+			ver, ok = treeVer, treeOK
+		} else {
+			ver, ok = assetContentVersion(staticRoot, rel)
+		}
 		if !ok {
 			return match
 		}
@@ -596,38 +643,49 @@ func assetContentVersion(staticRoot, rel string) (string, bool) {
 	return v, true
 }
 
-// staticSourceTreeVersion hashes every .tsx/.ts/.jsx/.js file under staticRoot
-// (sorted by relpath, content included) into one version, memoized by the
-// tree's (max-mtime, total-size, file-count). Bounded - apps have dozens of
-// source files, and the memo means the walk+hash only runs after an edit.
+// staticSourceTreeVersion is the ?v= of every /static/*.js reference: one
+// hash over the whole static/ tree, memoized by the tree's (max-mtime,
+// total-size, file-count). A bundle can pull in more than script sources
+// (.json, .css, any file imported with {type:'text'}), and Cloudflare keeps
+// /static/*.js?v= for about a day, so every file counts: a small file by
+// content (a revert to older bytes gets its old version back), a large one by
+// size and mtime so media isn't read. Metadata sidecars are never bundled and
+// don't count. Reports false when the tree has no script source, so a
+// reference to a .js that can't exist is left alone.
 func staticSourceTreeVersion(staticRoot string) (string, bool) {
-	type srcFile struct {
-		rel  string
-		path string
+	type treeFile struct {
+		rel, path   string
+		size, mtime int64
 	}
-	var files []srcFile
+	staticTreeWalks.Add(1)
+	var files []treeFile
 	var maxMtime, totalSize int64
+	hasScript := false
 	_ = filepath.Walk(staticRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil || !info.Mode().IsRegular() || isMetadataSidecar(info.Name()) {
 			return nil
 		}
-		name := info.Name()
-		if strings.HasSuffix(name, ".tsx") || strings.HasSuffix(name, ".ts") ||
-			strings.HasSuffix(name, ".jsx") || strings.HasSuffix(name, ".js") {
-			rel, _ := filepath.Rel(staticRoot, path)
-			files = append(files, srcFile{rel: rel, path: path})
-			if m := info.ModTime().UnixNano(); m > maxMtime {
-				maxMtime = m
-			}
-			totalSize += info.Size()
+		rel, _ := filepath.Rel(staticRoot, path)
+		if pathHasMetadataSidecar(rel) {
+			return nil
 		}
+		switch strings.ToLower(filepath.Ext(info.Name())) {
+		case ".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs":
+			hasScript = true
+		}
+		m := info.ModTime().UnixNano()
+		files = append(files, treeFile{rel: rel, path: path, size: info.Size(), mtime: m})
+		if m > maxMtime {
+			maxMtime = m
+		}
+		totalSize += info.Size()
 		return nil
 	})
-	if len(files) == 0 {
+	if !hasScript {
 		return "", false
 	}
 	stable := "__tree__|" + staticRoot
-	probe := strconv.FormatInt(maxMtime, 10) + "|" +
+	probe := version + "|" + strconv.FormatInt(maxMtime, 10) + "|" +
 		strconv.FormatInt(totalSize, 10) + "|" +
 		strconv.Itoa(len(files))
 	if v, ok := cachedAssetVer(stable, probe); ok {
@@ -635,17 +693,85 @@ func staticSourceTreeVersion(staticRoot string) (string, bool) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 	h := sha256.New()
+	// The framework release is part of the version: /static/app.js?v= is
+	// served immutable for a year (serveTSXIfPresent), and the bytes behind it
+	// are this release's esbuild output, so a framework upgrade that changes
+	// compiled output must not reuse a URL browsers and CDNs already hold.
+	h.Write([]byte(version))
+	h.Write([]byte{0})
 	for _, f := range files {
-		b, _ := os.ReadFile(f.path)
 		h.Write([]byte(f.rel))
 		h.Write([]byte{0})
-		h.Write(b)
+		if f.size <= staticTreeContentHashMax {
+			b, _ := os.ReadFile(f.path)
+			h.Write(b)
+		} else {
+			h.Write([]byte(strconv.FormatInt(f.size, 10) + "|" + strconv.FormatInt(f.mtime, 10)))
+		}
 		h.Write([]byte{0})
 	}
 	v := hex.EncodeToString(h.Sum(nil))[:12]
 	storeAssetVer(stable, probe, v)
 	return v, true
 }
+
+// staticTreeVersionTTL bounds how often a page view re-walks static/ to
+// version its script references. An edit shows up in emitted ?v= values
+// within this window; a hot reload clears it at once
+// (invalidateStaticTreeVersion). The /static/*.js handler never trusts this
+// cached value for its immutable response (serveTSXIfPresent).
+var staticTreeVersionTTL = time.Second
+
+// staticTreeWalks counts full walks of a static/ tree (observability for
+// tests).
+var staticTreeWalks atomic.Uint64
+
+var staticTreeVersions = struct {
+	sync.Mutex
+	m map[string]staticTreeVersionEntry
+}{m: map[string]staticTreeVersionEntry{}}
+
+type staticTreeVersionEntry struct {
+	ver string
+	ok  bool
+	at  time.Time
+}
+
+// cachedStaticTreeVersion is staticSourceTreeVersion memoized for
+// staticTreeVersionTTL per static root.
+func cachedStaticTreeVersion(staticRoot string) (string, bool) {
+	staticTreeVersions.Lock()
+	e, hit := staticTreeVersions.m[staticRoot]
+	staticTreeVersions.Unlock()
+	if hit && time.Since(e.at) < staticTreeVersionTTL {
+		return e.ver, e.ok
+	}
+	ver, ok := staticSourceTreeVersion(staticRoot)
+	staticTreeVersions.Lock()
+	if len(staticTreeVersions.m) >= 4096 {
+		// One entry per app; a bound keeps a long-lived host process from
+		// accumulating removed apps.
+		clear(staticTreeVersions.m)
+	}
+	staticTreeVersions.m[staticRoot] = staticTreeVersionEntry{ver: ver, ok: ok, at: time.Now()}
+	staticTreeVersions.Unlock()
+	return ver, ok
+}
+
+// invalidateStaticTreeVersion drops the memoized tree version of an app, so
+// the next page view versions its scripts from the files on disk.
+func invalidateStaticTreeVersion(appDir string) {
+	if appDir == "" {
+		return
+	}
+	staticTreeVersions.Lock()
+	delete(staticTreeVersions.m, filepath.Join(appDir, "static"))
+	staticTreeVersions.Unlock()
+}
+
+// staticTreeContentHashMax is the largest static/ file staticSourceTreeVersion
+// hashes by content; larger files count by size and mtime.
+const staticTreeContentHashMax = 1 << 20
 
 // cachedAssetVer returns the cached version for stable id `stable` IFF its
 // stored probe still matches `probe` (i.e. the asset hasn't changed).

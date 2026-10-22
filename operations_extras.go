@@ -25,7 +25,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,8 +38,12 @@ import (
 // table that has a `user_id` column. Audit log rows where actor =
 // current user are also included. Designed to satisfy Right of
 // Access requests without writing per-app glue.
-func RegisterDSARRoute(mux *http.ServeMux, app *App) {
+func RegisterDSARRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_my-data", func(w http.ResponseWriter, r *http.Request) {
+		if !app.FeatureEnabled("exports") {
+			http.NotFound(w, r)
+			return
+		}
 		session := getSession(app, r)
 		if session == nil {
 			httpError(w, "authentication required", http.StatusUnauthorized)
@@ -72,19 +79,12 @@ func RegisterDSARRoute(mux *http.ServeMux, app *App) {
 				query += " AND (" + pred + ")"
 				args = append(args, scopeArgs...)
 			}
-			records, err := QueryRows(app.DB, query, args...)
+			records, err := queryNativeRowsWith(app.DB, app, t.Name, query, args...)
 			if err != nil {
-				httpError(w, "data export failed", http.StatusInternalServerError)
+				serverError(w, r, app, "data export "+t.Name, err, "data export failed")
 				return
 			}
-			MaskEncryptedFields(app.Encrypted, t.Name, records, session)
-			for _, record := range records {
-				for col := range record {
-					if queryHiddenColumn(app, t.Name, col) {
-						delete(record, col)
-					}
-				}
-			}
+			sanitizeResponseRows(app, t.Name, records, session)
 			tables[t.Name] = records
 		}
 		// Profile from _benmore_users.
@@ -177,7 +177,7 @@ func sanitizeIdent(s string) string {
 // GET /_status renders a minimal HTML page (no auth) with uptime
 // summary + error rate. Pulls from _benmore_request_log; cheap query
 // because the table is indexed on created_at.
-func RegisterStatusRoute(mux *http.ServeMux, app *App) {
+func RegisterStatusRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /_status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=30")
@@ -263,7 +263,7 @@ func writeStatusRow(sb *strings.Builder, name string, ok bool, val string) {
 // bm.js POSTs uncaught errors to /api/_errors. We insert into
 // _benmore_client_errors (auto-created) and forward to Sentry/Slack
 // when those envs are configured on the app.
-func RegisterErrorCaptureRoute(mux *http.ServeMux, app *App) {
+func RegisterErrorCaptureRoute(mux appRouteRegistrar, app *App) {
 	app.DB.Exec(`CREATE TABLE IF NOT EXISTS _benmore_client_errors (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		kind TEXT, message TEXT, stack TEXT, source TEXT,
@@ -272,6 +272,16 @@ func RegisterErrorCaptureRoute(mux *http.ServeMux, app *App) {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	app.DB.Exec(`CREATE INDEX IF NOT EXISTS idx_client_err_created ON _benmore_client_errors(created_at)`)
+
+	registerErrorCaptureRoute(mux, app)
+}
+
+func registerErrorCaptureRoute(mux appRouteRegistrar, app *App) {
+	var inserts atomic.Int64
+	// The endpoint is anonymous by design (window.onerror runs before login),
+	// so what it forwards to Sentry/Slack is rate limited per app.
+	stop := app.Stop
+	forwardLimiter := sync.OnceValue(func() *RateLimiter { return NewRateLimiterStoppable(30, time.Minute, stop) })
 
 	mux.HandleFunc("POST /api/_errors", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -284,6 +294,11 @@ func RegisterErrorCaptureRoute(mux *http.ServeMux, app *App) {
 			w.WriteHeader(204)
 			return
 		}
+		body.Kind = truncateRunes(body.Kind, 40)
+		body.Message = truncateRunes(body.Message, clientErrorMessageMax)
+		body.Stack = truncateRunes(body.Stack, clientErrorStackMax)
+		body.Source = truncateRunes(clientErrorLocation(body.Source), 500)
+		body.URL = truncateRunes(clientErrorLocation(body.URL), 500)
 		userID := int64(0)
 		if s := getSession(app, r); s != nil {
 			userID = s.UserID
@@ -296,8 +311,15 @@ func RegisterErrorCaptureRoute(mux *http.ServeMux, app *App) {
 		app.DB.Exec(`INSERT INTO _benmore_client_errors (kind, message, stack, source, line, col, status, url, ua, user_id, ip)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			body.Kind, body.Message, body.Stack, body.Source, body.Line, body.Col, body.Status, body.URL, ua, userID, ip)
+		// Keep the newest rows only: anyone can POST here, so an unpruned
+		// table is an unbounded write.
+		if inserts.Add(1)%200 == 0 {
+			app.DB.Exec(`DELETE FROM _benmore_client_errors WHERE id NOT IN (SELECT id FROM _benmore_client_errors ORDER BY id DESC LIMIT ?)`, clientErrorRowCap)
+		}
 		// Best-effort external forwarding.
-		go forwardErrorExternals(app, body, ip)
+		if forwardLimiter().Allow("forward") {
+			go forwardErrorExternals(app, body, ip)
+		}
 		w.WriteHeader(204)
 	})
 }
@@ -306,6 +328,23 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 // when the relevant env vars are configured. Both are HTTP POSTs;
 // failures swallowed (don't let an external outage block more
 // important work).
+// clientErrorLocation reduces a reported page or script URL to origin and
+// path. The browser sends location.href, and on a password-reset, email
+// verification or magic-link page the query string or fragment is a live
+// credential; the stored row is read by collaborators (get_client_errors)
+// and forwarded to Sentry/Slack.
+func clientErrorLocation(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if i := strings.IndexAny(raw, "?#"); i >= 0 {
+			return raw[:i]
+		}
+		return raw
+	}
+	u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment, u.User = "", false, "", "", nil
+	return u.String()
+}
+
 func forwardErrorExternals(app *App, body struct {
 	Kind, Message, Stack, Source, URL string
 	Line, Col, Status                 int
@@ -366,6 +405,35 @@ func sendToSentry(dsn string, body struct {
 	resp.Body.Close()
 }
 
+// Caps on what the anonymous error beacon stores.
+const (
+	clientErrorMessageMax = 1000
+	clientErrorStackMax   = 8000
+	clientErrorRowCap     = 5000
+)
+
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "")
+}
+
+// slackFieldSafe neutralizes visitor-supplied text for Slack mrkdwn: & < >
+// are entity-escaped (so <!channel>, <@user> and <url|label> stay literal) and
+// backticks are dropped (so the text cannot close its code fence and add
+// formatted content of its own).
+func slackFieldSafe(s string, max int) string {
+	s = truncateRunes(s, max)
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "`", "'").Replace(s)
+}
+
+func slackErrorText(subdomain, kind, message, source string, line, col int, ip string) string {
+	return fmt.Sprintf("*[%s] %s error*\n```%s```\nat %s:%d:%d\nIP %s",
+		slackFieldSafe(subdomain, 80), slackFieldSafe(kind, 40), slackFieldSafe(message, 500),
+		slackFieldSafe(source, 200), line, col, slackFieldSafe(ip, 64))
+}
+
 func sendErrorToSlack(webhook string, app *App, body struct {
 	Kind, Message, Stack, Source, URL string
 	Line, Col, Status                 int
@@ -377,8 +445,7 @@ func sendErrorToSlack(webhook string, app *App, body struct {
 	if app != nil {
 		subdomain = app.AppID
 	}
-	text := fmt.Sprintf("*[%s] %s error*\n```%s```\nat %s:%d:%d\nIP %s",
-		subdomain, body.Kind, body.Message, body.Source, body.Line, body.Col, ip)
+	text := slackErrorText(subdomain, body.Kind, body.Message, body.Source, body.Line, body.Col, ip)
 	payload, _ := json.Marshal(map[string]any{"text": text})
 	resp, err := safeHTTPClientStrict(5*time.Second).Post(webhook, "application/json", strings.NewReader(string(payload)))
 	if err == nil {

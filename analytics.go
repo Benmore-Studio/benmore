@@ -29,6 +29,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"net/url"
@@ -37,6 +38,15 @@ import (
 )
 
 const analyticsEventCap = 50000
+
+// analyticsPruneEvery is how many recorded pageviews pass between prunes.
+const analyticsPruneEvery = 500
+
+// analyticsVisitorCap bounds _benmore_visitors. Every new visitor adds a row
+// and the beacon is public, so without a bound any caller can grow the
+// table one request at a time until the app's database is full. The least
+// recently seen visitors go first. A variable so tests can lower it.
+var analyticsVisitorCap = 100000
 
 // EnsureAnalyticsTables creates the per-app analytics tables.
 func EnsureAnalyticsTables(db *sql.DB) {
@@ -90,18 +100,62 @@ func EnsureAnalyticsTables(db *sql.DB) {
 		session_count INTEGER DEFAULT 1,
 		pageview_count INTEGER DEFAULT 0
 	)`)
+	// pruneAnalyticsVisitors removes the least recently seen visitors.
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_visitors_last_seen ON _benmore_visitors(last_seen, pageview_count)`)
+}
+
+// pruneAnalyticsVisitors keeps at most keep rows of _benmore_visitors,
+// dropping the least recently seen first (and, among those seen in the same
+// second, the ones with the fewest pageviews).
+func pruneAnalyticsVisitors(db *sql.DB, keep int) {
+	_, _ = db.Exec(`DELETE FROM _benmore_visitors WHERE id IN (
+		SELECT id FROM _benmore_visitors ORDER BY last_seen ASC, pageview_count ASC, id ASC
+		LIMIT MAX((SELECT COUNT(*) FROM _benmore_visitors) - ?, 0))`, keep)
+}
+
+// analyticsVisitorIDOK reports whether v has the shape generateVisitorID
+// mints (16 lowercase hex digits). The cookie comes back from the browser, so
+// anything else is a value somebody chose: it is replaced, never stored.
+func analyticsVisitorIDOK(v string) bool {
+	if len(v) != 16 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// analyticsCountry keeps a two-letter country code and drops everything else
+// (Cloudflare's XX/T1 placeholders, or whatever a direct caller put in the
+// header).
+func analyticsCountry(v string) string {
+	if len(v) != 2 || v == "XX" || v == "T1" {
+		return ""
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 'A' || v[i] > 'Z' {
+			return ""
+		}
+	}
+	return v
 }
 
 // RegisterAnalyticsRoutes adds the beacon endpoint.
-func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
-	if app == nil || app.DB == nil {
-		return
-	}
-	if !app.FeatureEnabled("analytics") {
+func RegisterAnalyticsRoutes(mux appRouteRegistrar, app *App) {
+	if app == nil || app.DB == nil || !app.FeatureEnabled("analytics") {
 		return
 	}
 	EnsureAnalyticsTables(app.DB)
+	registerAnalyticsRoutes(mux, app)
+}
 
+func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
+	if app == nil || app.DB == nil || !app.FeatureEnabled("analytics") {
+		return
+	}
 	var insertCount atomic.Int64
 
 	mux.HandleFunc("POST /api/_analytics", func(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +188,7 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 
 		// Get or create visitor cookie
 		vid := ""
-		if cookie, err := r.Cookie("_bm_vid"); err == nil && cookie.Value != "" {
+		if cookie, err := r.Cookie("_bm_vid"); err == nil && analyticsVisitorIDOK(cookie.Value) {
 			vid = cookie.Value
 		}
 		if vid == "" {
@@ -173,7 +227,7 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 				ev.Duration, vid, path,
 			)
 			if err != nil {
-				http.Error(w, "analytics storage unavailable", http.StatusServiceUnavailable)
+				serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "_analytics", err, "analytics storage unavailable")
 				return
 			}
 			w.WriteHeader(204)
@@ -212,10 +266,8 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 
 		// Country from Cloudflare header - free, accurate, zero latency.
 		// CF adds this on every proxied request. Falls back to empty.
-		country := r.Header.Get("CF-IPCountry")
-		if country == "XX" || country == "T1" {
-			country = "" // XX = unknown, T1 = Tor
-		}
+		// XX = unknown, T1 = Tor.
+		country := analyticsCountry(r.Header.Get("CF-IPCountry"))
 
 		// Sanitize path
 		path := ev.Path
@@ -279,16 +331,15 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 			return tx.Commit()
 		}()
 		if err != nil {
-			http.Error(w, "analytics storage unavailable", http.StatusServiceUnavailable)
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "_analytics", err, "analytics storage unavailable")
 			return
 		}
 
-		// Lazy prune
-		if insertCount.Add(1)%500 == 0 {
-			app.DB.Exec(fmt.Sprintf(
-				"DELETE FROM _benmore_analytics WHERE id NOT IN (SELECT id FROM _benmore_analytics ORDER BY id DESC LIMIT %d)",
-				analyticsEventCap,
-			))
+		// Lazy prune: a range delete below the boundary id (request_log.go
+		// pruneRingTable), not the old NOT IN over a 50,000-row subquery.
+		if insertCount.Add(1)%analyticsPruneEvery == 0 {
+			pruneRingTable(app.DB, "_benmore_analytics", analyticsEventCap)
+			pruneAnalyticsVisitors(app.DB, analyticsVisitorCap)
 		}
 
 		w.WriteHeader(204)
@@ -297,15 +348,13 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 	// GET /api/_analytics/summary - aggregated stats for the dashboard
 	mux.HandleFunc("GET /api/_analytics/summary", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, "admin required", 403)
 			return
 		}
-		days := r.URL.Query().Get("days")
-		if days == "" {
-			days = "7"
-		}
-		since := fmt.Sprintf("datetime('now', '-%s days')", days)
+		// Only the parsed integer reaches the SQL text.
+		days := min(queryInt(r, "days", 7), 365)
+		since := fmt.Sprintf("datetime('now', '-%d days')", days)
 
 		summary := map[string]any{}
 
@@ -338,35 +387,36 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 		app.DB.QueryRow("SELECT COALESCE(AVG(d),0) FROM (SELECT session_id, MAX(duration_ms) as d FROM _benmore_analytics WHERE created_at >= " + since + " GROUP BY session_id)").Scan(&avgDur)
 		summary["avg_duration_ms"] = avgDur
 
+		// Breakdowns. QueryRows returns the rows read before a failure (a
+		// timed-out statement) along with the error, so a failed breakdown
+		// fails the summary instead of showing as a shorter list.
+		var readErr error
+		breakdown := func(key, query string) {
+			rows, err := queryMetadataRows(app.DB, query)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
+			summary[key] = rows
+		}
+
 		// Top pages
-		topPages, _ := QueryRows(app.DB,
-			"SELECT path, COUNT(*) as views, COUNT(DISTINCT visitor_id) as uniques FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY path ORDER BY views DESC LIMIT 10",
-		)
-		summary["top_pages"] = topPages
+		breakdown("top_pages", "SELECT path, COUNT(*) as views, COUNT(DISTINCT visitor_id) as uniques FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY path ORDER BY views DESC LIMIT 10")
 
 		// Top referrers
-		topRefs, _ := QueryRows(app.DB,
-			"SELECT referrer_domain, COUNT(*) as views FROM _benmore_analytics WHERE referrer_domain != '' AND created_at >= "+since+" GROUP BY referrer_domain ORDER BY views DESC LIMIT 10",
-		)
-		summary["top_referrers"] = topRefs
+		breakdown("top_referrers", "SELECT referrer_domain, COUNT(*) as views FROM _benmore_analytics WHERE referrer_domain != '' AND created_at >= "+since+" GROUP BY referrer_domain ORDER BY views DESC LIMIT 10")
 
 		// Device breakdown
-		devices, _ := QueryRows(app.DB,
-			"SELECT device_type, COUNT(*) as views FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY device_type ORDER BY views DESC",
-		)
-		summary["devices"] = devices
+		breakdown("devices", "SELECT device_type, COUNT(*) as views FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY device_type ORDER BY views DESC")
 
 		// Browser breakdown
-		browsers, _ := QueryRows(app.DB,
-			"SELECT browser, COUNT(*) as views FROM _benmore_analytics WHERE browser != '' AND created_at >= "+since+" GROUP BY browser ORDER BY views DESC LIMIT 8",
-		)
-		summary["browsers"] = browsers
+		breakdown("browsers", "SELECT browser, COUNT(*) as views FROM _benmore_analytics WHERE browser != '' AND created_at >= "+since+" GROUP BY browser ORDER BY views DESC LIMIT 8")
 
 		// Daily pageviews (for sparkline)
-		daily, _ := QueryRows(app.DB,
-			"SELECT DATE(created_at) as day, COUNT(*) as views, COUNT(DISTINCT visitor_id) as uniques FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY day ORDER BY day",
-		)
-		summary["daily"] = daily
+		breakdown("daily", "SELECT DATE(created_at) as day, COUNT(*) as views, COUNT(DISTINCT visitor_id) as uniques FROM _benmore_analytics WHERE created_at >= "+since+" GROUP BY day ORDER BY day")
+		if readErr != nil {
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "_analytics summary", readErr, "analytics query failed")
+			return
+		}
 
 		// New vs returning visitors
 		var newV, retV int64
@@ -382,8 +432,11 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 	// POST /api/_analytics/funnel - create a funnel definition
 	mux.HandleFunc("POST /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, "admin required", 403)
+			return
+		}
+		if !requireCSRF(w, r) {
 			return
 		}
 		var req struct {
@@ -397,7 +450,7 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 		stepsJSON, _ := json.Marshal(req.Steps)
 		result, err := app.DB.Exec("INSERT INTO _benmore_funnels (name, steps) VALUES (?, ?)", req.Name, string(stepsJSON))
 		if err != nil {
-			http.Error(w, "insert failed", 500)
+			serverError(w, r, app, "_analytics funnel", err, "insert failed")
 			return
 		}
 		id, _ := result.LastInsertId()
@@ -408,15 +461,13 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 	// GET /api/_analytics/funnels - list + evaluate all funnels
 	mux.HandleFunc("GET /api/_analytics/funnels", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, "admin required", 403)
 			return
 		}
-		days := r.URL.Query().Get("days")
-		if days == "" {
-			days = "30"
-		}
-		since := fmt.Sprintf("datetime('now', '-%s days')", days)
+		// Only the parsed integer reaches the SQL text.
+		days := min(queryInt(r, "days", 30), 365)
+		since := fmt.Sprintf("datetime('now', '-%d days')", days)
 
 		rows, err := app.DB.Query("SELECT id, name, steps FROM _benmore_funnels ORDER BY id")
 		if err != nil {
@@ -451,8 +502,11 @@ func RegisterAnalyticsRoutes(mux *http.ServeMux, app *App) {
 	// DELETE /api/_analytics/funnel?id=X
 	mux.HandleFunc("DELETE /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, "admin required", 403)
+			return
+		}
+		if !requireCSRF(w, r) {
 			return
 		}
 		id := r.URL.Query().Get("id")
@@ -659,39 +713,55 @@ w.addEventListener('beforeunload',function(){send(Date.now()-t0,1);});
 // can add /privacy themselves and reference it from their own
 // footer. The security scan's GDPR check (security_scan.go) flags
 // missing /privacy as a warning so this gets surfaced.
-func AnalyticsCookieNotice() string {
-	return `<div id="bm-cookie" style="display:none;position:fixed;bottom:16px;left:16px;z-index:99990;max-width:380px;padding:14px 16px;border-radius:10px;background:#18181b;border:1px solid #27272a;box-shadow:0 8px 24px rgba(0,0,0,0.3);font-family:system-ui,sans-serif;font-size:12px;color:#a1a1aa;line-height:1.5;">
-  <div style="margin-bottom:10px;">We use cookies for anonymous analytics - pageviews and session timing only. No third-party trackers.</div>
+func AnalyticsCookieNotice(app *App) string {
+	text, link := analyticsNoticeCopy(app)
+	return `<div id="bm-cookie" role="region" aria-label="Cookie consent" style="display:none;position:fixed;bottom:16px;left:16px;z-index:99990;max-width:380px;padding:14px 16px;border-radius:10px;background:#18181b;border:1px solid #27272a;box-shadow:0 8px 24px rgba(0,0,0,0.3);font-family:system-ui,sans-serif;font-size:12px;color:#a1a1aa;line-height:1.5;">
+  <div style="margin-bottom:10px;">` + text + link + `</div>
   <div style="display:flex;gap:8px;">
-    <button id="bm-cookie-accept" style="padding:6px 14px;border-radius:6px;border:1px solid #52525b;background:#27272a;color:#e4e4e7;font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;">Accept</button>
-    <button id="bm-cookie-decline" style="padding:6px 14px;border-radius:6px;border:1px solid #3f3f46;background:transparent;color:#a1a1aa;font-size:11px;font-weight:500;cursor:pointer;font-family:inherit;">Decline</button>
+    <button id="bm-cookie-accept" type="button" style="padding:6px 14px;border-radius:6px;border:1px solid #52525b;background:#27272a;color:#e4e4e7;font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;">Accept</button>
+    <button id="bm-cookie-decline" type="button" style="padding:6px 14px;border-radius:6px;border:1px solid #3f3f46;background:transparent;color:#a1a1aa;font-size:11px;font-weight:500;cursor:pointer;font-family:inherit;">Decline</button>
   </div>
 </div>
 <script>
 (function(){
+  // The choice lives in the bm_cookie_consent cookie ("accepted" or
+  // "declined"). Page scripts read it with window.bmCookieConsent() and
+  // hear changes as a bm:cookie-consent event on document (detail is the
+  // choice), so a third-party script can wait for "accepted".
+  // window.bmCookieSettings() shows the banner again to change the choice.
+  function read(){
+    var c = document.cookie.split('; ').find(function(c){ return c.startsWith('bm_cookie_consent='); });
+    return c ? c.slice('bm_cookie_consent='.length) : '';
+  }
+  function show(on){ var el = document.getElementById('bm-cookie'); if (el) el.style.display = on ? 'block' : 'none'; }
   function setConsent(v){
     // 1 year, SameSite=Lax. Secure flag set automatically when served over https.
     var maxAge = 365*24*3600;
     var secure = location.protocol === 'https:' ? '; Secure' : '';
     document.cookie = 'bm_cookie_consent=' + v + '; Max-Age=' + maxAge + '; Path=/; SameSite=Lax' + secure;
-    var el = document.getElementById('bm-cookie');
-    if (el) el.remove();
+    show(false);
+    try { document.dispatchEvent(new CustomEvent('bm:cookie-consent', { detail: v })); } catch(e) {}
   }
-  var consent = document.cookie.split('; ').find(function(c){ return c.startsWith('bm_cookie_consent='); });
+  window.bmCookieConsent = read;
+  window.bmCookieSettings = function(){ show(true); };
   // Migrate old localStorage-based "OK" click → cookie consent. The
   // previous banner stored consent in localStorage.bm_cookie_ok, which
   // the server can't read (so visitors who already clicked OK before
   // this change would see the new banner reappear). Carry the old
   // click forward as an explicit accept + clean up the stale key.
-  if (!consent) {
+  // Automated browsers (navigator.webdriver: Playwright, Puppeteer, CDP)
+  // get no banner: it covered the page in agents' own checks. Their consent
+  // stays unset, which already means no analytics; bmCookieSettings() still
+  // shows it on demand.
+  if (!read() && !navigator.webdriver) {
     try {
       if (localStorage.getItem('bm_cookie_ok') === '1') {
         setConsent('accepted');
         localStorage.removeItem('bm_cookie_ok');
-        return;
+      } else {
+        show(true);
       }
-    } catch(e) { /* localStorage may be blocked - fall through to show banner */ }
-    document.getElementById('bm-cookie').style.display = 'block';
+    } catch(e) { show(true); /* localStorage may be blocked */ }
   }
   var accept = document.getElementById('bm-cookie-accept');
   var decline = document.getElementById('bm-cookie-decline');
@@ -699,6 +769,39 @@ func AnalyticsCookieNotice() string {
   if (decline) decline.onclick = function(){ setConsent('declined'); };
 })();
 </script>`
+}
+
+// analyticsDefaultNotice is what the banner says unless the app sets
+// seo.cookie_notice. It describes only the framework's own analytics: a
+// visitor cookie and page-view events, recorded after Accept. It does not
+// promise anonymity (a signed-in visitor's account id is recorded) or the
+// absence of trackers an app adds itself.
+const analyticsDefaultNotice = "We use a cookie to measure how this site is used. Nothing is recorded unless you accept."
+
+// analyticsNoticeCopy returns the banner's escaped text and optional privacy
+// link from app.yaml seo.cookie_notice and seo.privacy_url. An app that adds
+// its own trackers (analytics, ads) must name them in cookie_notice. The link
+// accepts a same-origin path or an https URL only.
+func analyticsNoticeCopy(app *App) (text, link string) {
+	text = html.EscapeString(analyticsDefaultNotice)
+	if app == nil || app.Design == nil {
+		return text, ""
+	}
+	if custom := strings.TrimSpace(app.Design.SEO["cookie_notice"]); custom != "" {
+		text = html.EscapeString(custom)
+	}
+	if u := strings.TrimSpace(app.Design.SEO["privacy_url"]); analyticsNoticeLinkOK(u) {
+		link = ` <a href="` + html.EscapeString(u) + `" style="color:inherit;text-decoration:underline;">Privacy policy</a>`
+	}
+	return text, link
+}
+
+func analyticsNoticeLinkOK(u string) bool {
+	if strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "//") && !strings.ContainsAny(u, "\\ \t\n") {
+		return true
+	}
+	parsed, err := url.Parse(u)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
 }
 
 // cookieConsentGiven returns true when the visitor has explicitly

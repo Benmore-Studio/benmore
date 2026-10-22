@@ -12,6 +12,9 @@ package main
 func dispatchPlatformCLI(cmd string) bool { return false }
 func preflightPlatformCLIAuth(cmd string) {}
 
+// The owner switch verbs of `benmore mcp` need the hosted platform.
+func isMCPConnectorSwitchCommand(args []string) bool { return false }
+
 // maybeAutoInstallSkill is a no-op in the pure framework build - the bundled
 // skill teaches the cloud workflow (deploy/push), which this edition lacks.
 func maybeAutoInstallSkill() {}

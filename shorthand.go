@@ -9,20 +9,39 @@ import (
 )
 
 // JoinMap caches foreign key relationships for fast lookup during shorthand expansion.
-// Built once at app startup: table → column → ForeignKey
+// Replaced after successful schema reloads: table → column → ForeignKey.
 type JoinMap map[string]map[string]ForeignKey
+
+// Published maps are immutable. Snapshot the pointer under the same lock used
+// by reload so in-flight relationship readers never race its replacement.
+func (app *App) joinMapSnapshot() JoinMap {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.JoinMap
+}
 
 // BuildJoinMap creates the FK lookup cache from the live database.
 func BuildJoinMap(db *sql.DB) JoinMap {
+	jm, _ := buildJoinMapChecked(db)
+	return jm
+}
+
+func buildJoinMapChecked(db *sql.DB) (JoinMap, error) {
 	jm := make(JoinMap)
-	tables, _ := GetTableNames(db)
+	tables, err := GetTableNames(db)
+	if err != nil {
+		return nil, err
+	}
 	for _, table := range tables {
 		fks, err := GetForeignKeys(db, table)
-		if err == nil && len(fks) > 0 {
+		if err != nil {
+			return nil, err
+		}
+		if len(fks) > 0 {
 			jm[table] = fks
 		}
 	}
-	return jm
+	return jm, nil
 }
 
 // ExpandShorthand converts shorthand attributes into a valid SQL query.
@@ -38,9 +57,22 @@ func BuildJoinMap(db *sql.DB) JoinMap {
 //	sort   - "column [asc|desc]" (default: id DESC)
 //	limit  - max rows (default: 100)
 //	offset - skip rows
-func ExpandShorthand(app *App, table string, attrs map[string]string, userID int64) (string, []any) {
+//
+// where= arrives with its template values already bound (bindTemplateSQL);
+// whereArgs are its ? arguments, in order. Every identifier the builder
+// writes into the SQL (table, pick, owned) must name a real column, since a
+// page can fill these attributes from template values.
+func ExpandShorthand(app *App, table string, attrs map[string]string, userID int64, whereArgs []any) (string, []any, error) {
 	if table == "" {
-		return "", nil
+		return "", nil, nil
+	}
+	tableCols, err := GetTableColumns(app.DB, table)
+	if err != nil || len(tableCols) == 0 {
+		return "", nil, fmt.Errorf("query from=%q: unknown table", table)
+	}
+	colSet := make(map[string]bool, len(tableCols))
+	for _, c := range tableCols {
+		colSet[c.Name] = true
 	}
 
 	pick := strings.TrimSpace(attrs["pick"])
@@ -69,8 +101,11 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 				refName := parts[0]  // "contact"
 				refField := parts[1] // "name"
 
-				joinAlias, joinSQL := resolveJoin(app, table, refName, joinAliases)
+				joinAlias, joinSQL, joinTable := resolveJoin(app, table, refName, joinAliases)
 				if joinSQL != "" && joinAlias != "" {
+					if !liveTableHasColumn(app, joinTable, refField) {
+						return "", nil, fmt.Errorf("query pick=%q: unknown column on %s", col, joinTable)
+					}
 					// Check if this join is already added
 					alreadyJoined := false
 					for _, j := range joins {
@@ -82,10 +117,13 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 					if !alreadyJoined {
 						joins = append(joins, joinSQL)
 					}
-					selectCols = append(selectCols, fmt.Sprintf("%s.%s AS %s_%s", joinAlias, refField, refName, refField))
+					selectCols = append(selectCols, quoteColumn(joinAlias, refField)+" AS "+quoteIdent(refName+"_"+refField))
 				}
 			} else {
-				selectCols = append(selectCols, fmt.Sprintf("%s.%s", table, col))
+				if !colSet[col] {
+					return "", nil, fmt.Errorf("query pick=%q: unknown column on %s", col, table)
+				}
+				selectCols = append(selectCols, quoteColumn(table, col))
 			}
 		}
 	} else if hide != "" {
@@ -94,10 +132,9 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 		for _, h := range strings.Split(hide, ",") {
 			hideCols[strings.TrimSpace(h)] = true
 		}
-		cols, _ := GetTableColumns(app.DB, table)
-		for _, c := range cols {
+		for _, c := range tableCols {
 			if !hideCols[c.Name] {
-				selectCols = append(selectCols, fmt.Sprintf("%s.%s", table, c.Name))
+				selectCols = append(selectCols, quoteColumn(table, c.Name))
 			}
 		}
 	}
@@ -108,32 +145,40 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 		selectStr = strings.Join(selectCols, ", ")
 	}
 
-	// Build FROM + JOINs
-	fromStr := table
+	// Build FROM + JOINs. The base table is a real table (GetTableColumns
+	// above); the join SQL is built from the FK map (resolveJoin).
+	fromStr := quoteIdent(table)
 	if len(joins) > 0 {
-		fromStr = table + " " + strings.Join(joins, " ")
+		fromStr = quoteIdent(table) + " " + strings.Join(joins, " ")
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM %s", selectStr, fromStr)
 
-	// Build WHERE
-	// NOTE: where is developer-authored SQL from template attributes (not user input).
-	// It is NOT parameterized here because it may contain arbitrary expressions.
-	// Developers must never pass user input directly into the where attribute.
+	// Build WHERE. where is the author's expression with any template values
+	// already replaced by ? placeholders; their arguments come first.
+	args = append(args, whereArgs...)
+	// Parenthesized so an OR in the author's where= can't escape the owner
+	// condition ANDed after it.
 	var conditions []string
 	if where != "" {
-		conditions = append(conditions, where)
+		conditions = append(conditions, "("+where+"\n)")
 	}
 
-	// Owner scoping
+	// Owner scoping. Without a signed-in user nothing is owned, so the
+	// query matches no rows instead of every owner's.
 	if owned != "" {
 		ownerCol := "user_id"
 		if owned != "true" && owned != "" {
+			if !colSet[owned] {
+				return "", nil, fmt.Errorf("query owned=%q: unknown column on %s", owned, table)
+			}
 			ownerCol = owned
 		}
 		if userID > 0 {
-			conditions = append(conditions, fmt.Sprintf("%s.%s = ?", table, ownerCol))
+			conditions = append(conditions, quoteColumn(table, ownerCol)+" = ?")
 			args = append(args, userID)
+		} else {
+			conditions = append(conditions, "0")
 		}
 	}
 
@@ -161,6 +206,7 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 			for _, c := range sortCols {
 				if c.Name == dotParts[1] {
 					sortValid = true
+					col = quoteColumn(dotParts[0], dotParts[1])
 					break
 				}
 			}
@@ -169,20 +215,18 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 			for _, c := range sortCols {
 				if c.Name == col {
 					sortValid = true
+					col = quoteColumn(table, col)
 					break
 				}
-			}
-			if sortValid {
-				col = table + "." + col
 			}
 		}
 		if sortValid {
 			query += fmt.Sprintf(" ORDER BY %s %s", col, dir)
 		} else {
-			query += fmt.Sprintf(" ORDER BY %s.id DESC", table)
+			query += " ORDER BY " + quoteColumn(table, "id") + " DESC"
 		}
 	} else {
-		query += fmt.Sprintf(" ORDER BY %s.id DESC", table)
+		query += " ORDER BY " + quoteColumn(table, "id") + " DESC"
 	}
 
 	// LIMIT (validate as integer to prevent injection)
@@ -205,20 +249,35 @@ func ExpandShorthand(app *App, table string, attrs map[string]string, userID int
 		}
 	}
 
-	return query, args
+	return query, args, nil
+}
+
+// liveTableHasColumn reports whether the live table has a column named col.
+func liveTableHasColumn(app *App, table, col string) bool {
+	cols, err := GetTableColumns(app.DB, table)
+	if err != nil {
+		return false
+	}
+	for _, c := range cols {
+		if c.Name == col {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveJoin figures out the JOIN clause for a dotted reference like "contact.name".
-func resolveJoin(app *App, baseTable, refName string, aliases map[string]string) (alias, joinSQL string) {
-	if app.JoinMap == nil {
-		return "", ""
+func resolveJoin(app *App, baseTable, refName string, aliases map[string]string) (alias, joinSQL, target string) {
+	joins := app.joinMapSnapshot()
+	if joins == nil {
+		return "", "", ""
 	}
 
 	// Look for a FK column that matches: contact → contact_id
 	fkCol := refName + "_id"
-	fks, ok := app.JoinMap[baseTable]
+	fks, ok := joins[baseTable]
 	if !ok {
-		return "", ""
+		return "", "", ""
 	}
 
 	fk, ok := fks[fkCol]
@@ -226,7 +285,7 @@ func resolveJoin(app *App, baseTable, refName string, aliases map[string]string)
 		// Try without _id suffix - maybe the column is named exactly like the ref
 		fk, ok = fks[refName]
 		if !ok {
-			return "", ""
+			return "", "", ""
 		}
 		fkCol = refName
 	}
@@ -235,8 +294,8 @@ func resolveJoin(app *App, baseTable, refName string, aliases map[string]string)
 	alias = refName + "_join"
 	aliases[refName] = alias
 
-	joinSQL = fmt.Sprintf("LEFT JOIN %s AS %s ON %s.id = %s.%s", fk.Table, alias, alias, baseTable, fkCol)
-	return alias, joinSQL
+	joinSQL = fmt.Sprintf("LEFT JOIN %s AS %s ON %s = %s", quoteIdent(fk.Table), quoteIdent(alias), quoteColumn(alias, "id"), quoteColumn(baseTable, fkCol))
+	return alias, joinSQL, fk.Table
 }
 
 // ValidateShorthand checks shorthand attributes against the schema.

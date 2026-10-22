@@ -12,7 +12,7 @@ import (
 // Empty scopes means unrestricted (cookie sessions, backward compatible).
 // Admin role does NOT bypass scopes - scopes are a constraint ON TOP of roles.
 func checkScope(session *Session, table string, action string) error {
-	if !hasScope(session, table, action) {
+	if !hasScope(session, table, action) && !accessDecidesTable(session, table, action) {
 		return fmt.Errorf("scope denied: token does not have %s:%s permission", table, action)
 	}
 	return nil
@@ -191,4 +191,26 @@ func isScopeIdentifier(s string) bool {
 		}
 	}
 	return true
+}
+
+// sessionHasFullAccess reports whether the session is an unrestricted
+// credential (cookie session, legacy bearer, or an explicit "*" token).
+// Admin-management actions such as granting roles require it: a token
+// scoped to, say, contacts:read held by an admin must never be able to widen
+// its own or anyone else's access.
+func sessionHasFullAccess(s *Session) bool {
+	return s != nil && (s.Scopes == "" || s.Scopes == "*")
+}
+
+// accessDecidesTable is the `table_scopes: access` path of the auto-CRUD scope
+// gate: for a schema table the role scopes do not decide, the caller's own
+// credential (an API token's or connector grant's scopes) still must allow
+// the action, and access: rules decide the rest. Only checkScope consults it;
+// session scopes, perm: modes, flow and connector permissions never do.
+func accessDecidesTable(session *Session, table, action string) bool {
+	if session == nil || !session.accessTables[table] {
+		return false
+	}
+	cred := session.CredentialScopes
+	return cred == "" || cred == "*" || hasScope(&Session{Scopes: cred}, table, action)
 }

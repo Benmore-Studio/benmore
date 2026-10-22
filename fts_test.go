@@ -246,6 +246,44 @@ func TestEnsureFTSRefusesOrdinaryTableCollision(t *testing.T) {
 	}
 }
 
+func TestFTSShadowDefinitionsMustMatchPristineSQLite(t *testing.T) {
+	db := openFTSTestDB(t)
+	defer db.Close()
+	mustExec(t, db, "CREATE TABLE proj(id INTEGER PRIMARY KEY, name TEXT)")
+	if err := EnsureFTSTables(db, []Table{{Name: "proj", FullText: [][]string{{"name"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	definition, err := makeFTSDefinition("proj", []string{"name"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexMatches, triggersMatch, err := definition.matches(db)
+	if err != nil || !indexMatches || !triggersMatch {
+		t.Fatalf("pristine generated FTS closure did not match itself: index=%t triggers=%t err=%v", indexMatches, triggersMatch, err)
+	}
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM main.sqlite_schema WHERE type='table' AND name='proj_fts_docsize'`).Scan(&ddl); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, ")") {
+		t.Fatalf("unexpected SQLite FTS shadow DDL: %q", ddl)
+	}
+	tampered := strings.Replace(ddl, ")", ", FOREIGN KEY(id) REFERENCES proj(id) ON DELETE CASCADE)", 1)
+	mustExec(t, db, "PRAGMA writable_schema=ON")
+	if _, err := db.Exec(`UPDATE main.sqlite_schema SET sql=? WHERE type='table' AND name='proj_fts_docsize'`, tampered); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "PRAGMA schema_version=12345")
+	mustExec(t, db, "PRAGMA writable_schema=OFF")
+	indexMatches, triggersMatch, err = definition.matches(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexMatches {
+		t.Fatalf("FTS shadow table with a forged cascading foreign key was accepted: index=%t triggers=%t", indexMatches, triggersMatch)
+	}
+}
+
 func TestEnsureFTSRefusesContentOwningFTSCollision(t *testing.T) {
 	db := openFTSTestDB(t)
 	defer db.Close()

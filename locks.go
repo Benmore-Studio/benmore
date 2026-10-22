@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -31,13 +32,18 @@ func EnsureLocksTable(db *sql.DB) {
 }
 
 // RegisterLockRoutes registers lock acquire/release/status endpoints for all tables.
-func RegisterLockRoutes(mux *http.ServeMux, app *App) {
+func RegisterLockRoutes(mux appRouteRegistrar, app *App) {
 	tables, err := GetTableNames(app.DB)
 	if err != nil {
 		return
 	}
 
-	lockLimiter := NewRateLimiterStoppable(30, time.Minute, app.Stop) // 30 lock acquisitions per minute
+	registerLockTables(mux, app, tables)
+}
+
+func registerLockTables(mux appRouteRegistrar, app *App, tables []string) {
+	stop := app.Stop
+	lockLimiter := sync.OnceValue(func() *RateLimiter { return NewRateLimiterStoppable(30, time.Minute, stop) })
 
 	for _, table := range tables {
 		t := table // capture for closure
@@ -48,11 +54,11 @@ func RegisterLockRoutes(mux *http.ServeMux, app *App) {
 				return
 			}
 			// Rate limit lock acquisition
-			key := r.RemoteAddr
+			key := clientRateBucket(rateLimitClientHost(r))
 			if session := getSession(app, r); session != nil {
 				key = fmt.Sprintf("user:%d", session.UserID)
 			}
-			if !lockLimiter.Allow(key) {
+			if !lockLimiter().Allow(key) {
 				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
 				return
 			}
@@ -113,9 +119,17 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 	// owner OR ACL, admin (not stepped-in) bypass. Pre-consolidation this was
 	// user_id-ONLY, so a group-scoped table without user_id let any authed
 	// caller lock any row across tenants (contention/DoS + existence oracle).
-	if !canAccessRow(app, table, id, session) {
-		// Distinguish "doesn't exist" from "exists but not yours": an admin-
-		// bypass caller that still can't see it means the row is gone.
+	// A lock blocks everyone else's edits, so acquiring one needs EDIT
+	// rights: the table's update mode and the row's edit scope. View access
+	// alone let a read-only collaborator (or a view-only ACL grantee) lock
+	// the owner out of their own record.
+	// A row the caller cannot READ answers 404 exactly like a missing one, so
+	// the lock endpoints are no oracle for which ids exist in other tenants.
+	if !lockRowReadable(app, table, id, session) {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return
+	}
+	if !SessionCanAccessTable(app, table, OpUpdate, session) || !canAccessRowScoped(app, table, id, session, "edit") || membershipRowControlDenied(app, table, id, session) {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "access denied"})
 		return
 	}
@@ -181,7 +195,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 			httpJSON(w, http.StatusConflict, map[string]any{"error": "record is locked by another user"})
 			return
 		}
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to acquire lock"})
+		serverErrorJSON(w, r, app, table+" lock", err, "failed to acquire lock")
 		return
 	}
 
@@ -209,6 +223,15 @@ func handleLockRelease(w http.ResponseWriter, r *http.Request, app *App, table s
 	session := getSession(app, r)
 	if session == nil {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return
+	}
+
+	// Release used to answer 404 (no lock) vs 403 (someone else's lock) on
+	// ANY row id - telling a caller in another tenant which of its rows are
+	// being edited right now. The row's read gate runs first, and a row the
+	// caller cannot read gets the same 404 whether or not it is locked.
+	if !lockRowReadable(app, table, id, session) {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
 	}
 
@@ -243,6 +266,17 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 		return
 	}
 
+	// Lock status names the editor holding the lock, so it follows the row's
+	// own read gate: the table's read mode + token scope, then the canonical
+	// row scope. Without this any signed-in caller could learn, for any row in
+	// any tenant (or on an admin-only table), that it is being edited and by
+	// whom. 404 on denial so the row's existence doesn't leak either.
+	session := getSession(app, r)
+	if !lockRowReadable(app, table, id, session) {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return
+	}
+
 	// Clean expired locks first
 	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
 		table, id)
@@ -265,6 +299,13 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 		"locked_at":  lockedAt,
 		"expires_at": expiresAt,
 	})
+}
+
+// lockRowReadable is the read gate every lock endpoint applies first: the
+// table's read mode + token scope, then the canonical row scope
+// (rowScopeClause via canAccessRowScoped). Callers answer 404 when it fails.
+func lockRowReadable(app *App, table, id string, session *Session) bool {
+	return SessionCanAccessTable(app, table, OpRead, session) && canAccessRowScoped(app, table, id, session, "view")
 }
 
 // CheckLock checks if a record is locked by another user.
@@ -296,8 +337,8 @@ func CheckLock(db *sql.DB, table, rowID string, userID int64) (bool, string) {
 // Exits cleanly when app.Stop is closed (e.g. during hot reload), so the goroutine
 // doesn't leak and spam errors against a closed DB handle.
 func StartLockCleanupWorker(app *App) {
+	stop := app.workerStopGeneration()
 	safeGo("locks.cleanup", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -311,12 +352,30 @@ func StartLockCleanupWorker(app *App) {
 					return
 				default:
 				}
-				if _, err := app.DB.Exec(`DELETE FROM _benmore_locks WHERE datetime(expires_at) < datetime('now')`); err != nil {
-					log.Printf("[locks] cleanup error: %v", err)
-				}
+				cleanupExpiredLocks(app.DB)
 			}
 		}
 	})
+}
+
+// cleanupExpiredLocks deletes expired locks. The DELETE takes SQLite's write
+// lock (and, with _txlock=immediate semantics on the pool, queues behind any
+// writer) even when it matches nothing, and this runs every 10 seconds in
+// every app, so it first asks with a read - which WAL serves without the
+// write lock - whether anything has expired. Same datetime() comparison in
+// both statements, so the two agree on what "expired" means.
+func cleanupExpiredLocks(db *sql.DB) {
+	var expired int
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM _benmore_locks WHERE datetime(expires_at) < datetime('now'))`).Scan(&expired); err != nil {
+		log.Printf("[locks] cleanup check error: %v", err)
+		return
+	}
+	if expired == 0 {
+		return
+	}
+	if _, err := db.Exec(`DELETE FROM _benmore_locks WHERE datetime(expires_at) < datetime('now')`); err != nil {
+		log.Printf("[locks] cleanup error: %v", err)
+	}
 }
 
 // lockErrorResponse returns the appropriate error response for a lock conflict.

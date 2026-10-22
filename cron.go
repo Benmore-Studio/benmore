@@ -328,8 +328,8 @@ func StartCronScheduler(app *App) {
 	}
 	cronStop := make(chan struct{})
 	app.CronStop = cronStop
+	appStop := app.workerStopGeneration()
 	safeGo("cron.scheduler", func() {
-		appStop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
 		// First tick: run any job that was scheduled in the last minute
@@ -477,6 +477,17 @@ func (s *cronState) tick(app *App, now time.Time) {
 		s.mu.Lock()
 		last := s.lastFire[j.ID]
 		s.mu.Unlock()
+		// Another scheduler on the same database (a BENMORE_CLUSTER
+		// sibling) may have fired since this one hydrated. The minute-
+		// scoped unique key only collapses fires in the SAME minute, so an
+		// `every 15m` job fired by one process at 12:00:59 was fired again
+		// by the other at 12:01:05 from its stale in-memory last_fire.
+		if persisted, ok := s.persistedLastFire(j.ID); ok && persisted.After(last) {
+			last = persisted
+			s.mu.Lock()
+			s.lastFire[j.ID] = persisted
+			s.mu.Unlock()
+		}
 		if !cronShouldFire(j.Schedule, now, last) {
 			continue
 		}
@@ -494,6 +505,19 @@ func (s *cronState) tick(app *App, now time.Time) {
 		s.lastFire[j.ID] = stamp
 		s.mu.Unlock()
 	}
+}
+
+// persistedLastFire reads a job's durable last fire time.
+func (s *cronState) persistedLastFire(jobID string) (time.Time, bool) {
+	if s.app == nil || s.app.DB == nil {
+		return time.Time{}, false
+	}
+	var ts string
+	if err := s.app.DB.QueryRow(`SELECT last_fire FROM _benmore_cron_state WHERE job_id = ?`, jobID).Scan(&ts); err != nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	return t, err == nil
 }
 
 // cronMaxAttempts resolves a cron job's retry budget. Default is 1 -
@@ -631,6 +655,7 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		App:    app,
 		Data:   ctxData,
 		Params: map[string]string{},
+		Writes: newFlowWriteLog(),
 	}
 
 	// Begin a transaction when the resolved flow asked for one, so SQL steps
@@ -671,6 +696,7 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 				log.Printf("CRON [%s] tx rollback error: %s", j.ID, rbErr)
 			}
 			log.Printf("CRON [%s] rolled back (step %q failed): %s", j.ID, ctx.FailedStep, ctx.Error)
+			announceFlowWrites(ctx, false)
 			return ctx.Error
 		}
 		commitErr := ctx.Tx.Commit()
@@ -678,12 +704,14 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		// database/sql's perspective - mark handled either way so the
 		// deferred guard never double-calls Rollback/Commit.
 		guard.MarkHandled()
+		announceFlowWrites(ctx, commitErr == nil)
 		if commitErr != nil {
 			return fmt.Errorf("cron %s: commit transaction: %w", j.ID, commitErr)
 		}
 		return nil
 	}
 
+	announceFlowWrites(ctx, false)
 	if ctx.Error != nil {
 		log.Printf("CRON [%s] step %q failed: %s", j.ID, ctx.FailedStep, ctx.Error)
 	}

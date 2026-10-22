@@ -1,0 +1,16 @@
+model Handoff {
+ id Int @id @default(autoincrement())
+ userId Int @map("user_id")
+ title String
+ status String @default("open")
+ items HandoffItem[]
+ updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+}
+model HandoffItem {
+ id Int @id @default(autoincrement())
+ userId Int @map("user_id")
+ handoffId Int @map("handoff_id")
+ handoff Handoff @relation(fields:[handoffId],references:[id])
+ label String
+ done Boolean @default(false)
+}

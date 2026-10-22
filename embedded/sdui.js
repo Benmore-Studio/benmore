@@ -26,6 +26,40 @@ function esc(v) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+// safeUrl: a URL bound for href/src/navigation. Escaping keeps a row value
+// inside its attribute, but javascript: still runs on click (the app CSP
+// allows inline script). Same rule as server-rendered pages
+// (template_context.go dangerousURL): javascript:, vbscript:, livescript:
+// and data: other than a raster image become '#blocked-unsafe-url', with the
+// scheme read as the URL parser reads it (leading control characters and any
+// tab or newline ignored, so "java\tscript:" is caught). Callers still esc().
+const _rasterDataURL = /^data:\s*image\/(png|gif|jpe?g|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i;
+function safeUrl(v) {
+  const s = String(v ?? '');
+  const u = s.replace(/^[\x00-\x20]+/, '').replace(/[\t\n\r]/g, '');
+  const m = /^([^:/?#]+):/.exec(u);
+  if (!m) return s;
+  const scheme = m[1].toLowerCase();
+  if (scheme === 'javascript' || scheme === 'vbscript' || scheme === 'livescript') return '#blocked-unsafe-url';
+  return scheme === 'data' && !_rasterDataURL.test(u) ? '#blocked-unsafe-url' : s;
+}
+// sameOriginRedirect: where Login/Signup go after signing in. An app may pass
+// a value from the URL (?next=), so only this origin is honored: a relative
+// reference, or an absolute URL on location.origin. Anything else (another
+// host, a "//host" or "\\host" network path, a script URL) becomes '/'.
+// Leading controls and tab/newline are dropped first, as the URL parser does.
+function sameOriginRedirect(v) {
+  const s = String(v ?? '').replace(/^[\x00-\x20]+/, '').replace(/[\t\n\r]/g, '');
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+    const origin = String((typeof location !== 'undefined' && location.origin) || '').toLowerCase();
+    const lower = s.toLowerCase();
+    const next = lower.charAt(origin.length);
+    return origin && lower.startsWith(origin) && (next === '' || '/?#'.includes(next)) ? s : '/';
+  }
+  return /^[\/\\]{2}/.test(s) ? '/' : s;
+}
+// safeColor: a CSS color from data, allowed only as a hex literal.
+const safeColor = (v, fallback) => (typeof v === 'string' && /^#[0-9a-f]{3,8}$/i.test(v) ? v : fallback);
 
 // ─── schema descriptor (cached per session) ──────────────────────────
 let _schema = null;
@@ -156,7 +190,7 @@ function lucide(name, size = 16) {
 // hidden input named after the column so RecordForm's FormData picks it up.
 function previewInner(v, isImage) {
   if (isImage) return v ? `<img src="${esc(v)}" alt="" style="width:52px;height:52px;border-radius:8px;object-fit:cover">` : `<span style="display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:8px;background:rgba(128,128,128,.12);opacity:.45">${lucide('image', 22)}</span>`;
-  return v ? `<a href="${esc(v)}" target="_blank" rel="noopener" style="font-size:13px;color:var(--bm-accent,#2563eb)">${esc(String(v).split('/').pop())}</a>` : `<span style="font-size:13px;opacity:.5">No file</span>`;
+  return v ? `<a href="${esc(safeUrl(v))}" target="_blank" rel="noopener" style="font-size:13px;color:var(--bm-accent,#2563eb)">${esc(String(v).split('/').pop())}</a>` : `<span style="font-size:13px;opacity:.5">No file</span>`;
 }
 function uploadFieldHTML(f, v, isImage) {
   return `<div data-bm-upload-field data-img="${isImage ? 1 : 0}" style="display:flex;align-items:center;gap:10px"><input type="hidden" name="${esc(f.name)}" value="${esc(v)}"><span data-prev>${previewInner(v, isImage)}</span><button type="button" data-up style="font-size:13px;padding:6px 12px;border:1px solid rgba(128,128,128,.3);border-radius:7px;background:none;cursor:pointer">${v ? 'Replace' : (isImage ? 'Upload image' : 'Upload file')}</button></div>`;
@@ -224,13 +258,13 @@ function cellHTML(f, value) {
   if (value == null || value === '') return '<span class="text-zinc-300 dark:text-zinc-600">-</span>';
   switch (f.control) {
     case 'image': return `<img src="${esc(value)}" alt="" style="width:32px;height:32px;border-radius:6px;object-fit:cover;vertical-align:middle">`;
-    case 'file':  return `<a href="${esc(value)}" target="_blank" rel="noopener" class="bm-accent-text hover:underline">${esc(String(value).split('/').pop())}</a>`;
+    case 'file':  return `<a href="${esc(safeUrl(value))}" target="_blank" rel="noopener" class="bm-accent-text hover:underline">${esc(String(value).split('/').pop())}</a>`;
     case 'checkbox':
       return Number(value)
         ? '<span class="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">✓</span>'
         : '<span class="text-zinc-400">✗</span>';
     case 'email': return `<a href="mailto:${esc(value)}" class="bm-accent-text hover:underline">${esc(value)}</a>`;
-    case 'url':   return `<a href="${esc(value)}" target="_blank" rel="noopener" class="bm-accent-text hover:underline">${esc(value)}</a>`;
+    case 'url':   return `<a href="${esc(safeUrl(value))}" target="_blank" rel="noopener" class="bm-accent-text hover:underline">${esc(value)}</a>`;
     case 'date': {
       const d = new Date(String(value));
       return isNaN(d.getTime()) ? esc(value) : `<span class="text-zinc-500">${d.toLocaleDateString()}</span>`;
@@ -626,7 +660,7 @@ function humanize(s) {
 let _flows = null;
 async function flowsRegistry() {
   if (_flows) return _flows;
-  const res = await fetch('/_internal/flows.json', { credentials: 'same-origin' });
+  const res = await fetch('/_internal/flows.json', { credentials: 'same-origin', cache: 'no-store' });
   _flows = res.ok ? await res.json() : {};
   return _flows;
 }
@@ -695,9 +729,16 @@ function flowControlHTML(name, inp) {
 // when the flow is mode: async, and renders the response.
 export async function FlowForm(target, opts) {
   const el = resolveEl(target);
-  const reg = await flowsRegistry();
-  const def = reg[opts.flow];
-  if (!def) throw new Error(`sdui: flow "${opts.flow}" not in /_internal/flows.json`);
+  let reg = await flowsRegistry();
+  let def = reg[opts.flow];
+  if (!def) {
+    // flows.json lists only the caller's callable flows; refetch once in case
+    // it was loaded before sign-in.
+    _flows = null;
+    reg = await flowsRegistry();
+    def = reg[opts.flow];
+  }
+  if (!def) throw new Error(`sdui: flow "${opts.flow}" not in /_internal/flows.json (or not callable by this user)`);
   const inputs = def.inputs || {};
   const names = Object.keys(inputs).sort();
   const body = names.map((n) => {
@@ -1031,7 +1072,7 @@ export function Dropdown(target, opts) {
   const onDoc = (e) => { if (!el.contains(e.target)) close(); };
   const close = () => { menu.hidden = true; document.removeEventListener('click', onDoc); };
   trigger.addEventListener('click', (e) => { e.stopPropagation(); if (menu.hidden) { menu.hidden = false; setTimeout(() => document.addEventListener('click', onDoc), 0); } else close(); });
-  (opts.items || []).forEach((it, i) => el.querySelector(`[data-dd-item="${i}"]`)?.addEventListener('click', () => { close(); if (it.href) location.href = it.href; else if (it.onClick) it.onClick(); }));
+  (opts.items || []).forEach((it, i) => el.querySelector(`[data-dd-item="${i}"]`)?.addEventListener('click', () => { close(); if (it.href) location.href = safeUrl(it.href); else if (it.onClick) it.onClick(); }));
   return { close, destroy: () => { el.innerHTML = ''; } };
 }
 // Tooltip(target, { text }) → { destroy }
@@ -1114,7 +1155,7 @@ export function Login(target, opts = {}) {
     const fd = new FormData(form);
     try {
       const user = await bm.auth.signIn(fd.get('identifier'), fd.get('password'));
-      if (opts.onSuccess) opts.onSuccess(user); else if (opts.redirect !== false) location.href = opts.redirect || '/';
+      if (opts.onSuccess) opts.onSuccess(user); else if (opts.redirect !== false) location.href = sameOriginRedirect(opts.redirect || '/');
     } catch (ex) { errEl.textContent = ex?.message || 'Sign-in failed'; errEl.hidden = false; }
   });
   return { destroy: () => { el.innerHTML = ''; } };
@@ -1130,7 +1171,7 @@ export function Signup(target, opts = {}) {
     const fd = new FormData(form); const body = {}; for (const f of fields) body[f.name] = fd.get(f.name);
     try {
       const user = await bm.auth.signUp(body);
-      if (opts.onSuccess) opts.onSuccess(user); else if (opts.redirect !== false) location.href = opts.redirect || '/';
+      if (opts.onSuccess) opts.onSuccess(user); else if (opts.redirect !== false) location.href = sameOriginRedirect(opts.redirect || '/');
     } catch (ex) { errEl.textContent = ex?.message || 'Sign-up failed'; errEl.hidden = false; }
   });
   return { destroy: () => { el.innerHTML = ''; } };
@@ -1194,13 +1235,25 @@ export async function MfaSetup(target, opts = {}) {
       form.addEventListener('submit', async (e) => { e.preventDefault(); try { await bm.mfa.disable(new FormData(form).get('password')); bm.auth.refreshMe && bm.auth.refreshMe(); render(); } catch (ex) { errEl.textContent = ex?.message; errEl.hidden = false; } });
       return;
     }
-    const res = await bm.mfa.enroll(); // { secret, otpauth_url?, qr? }
-    el.innerHTML = `<div data-bm-mfa class="space-y-3">
+    // Enrolling from a signed-in session needs the current password (the
+    // server refuses without it), so ask for it first.
+    el.innerHTML = `<div data-bm-mfa class="space-y-3"><div class="text-sm">Two-factor auth is <b>off</b>.</div><form data-bm-form class="space-y-3">${skin.error('')}${skinField('password', 'Confirm password to set up 2FA', { type: 'password', required: true })}${skin.button({ label: 'Set up 2FA' })}</form></div>`;
+    const pwForm = el.querySelector('form'), pwErr = el.querySelector('[data-bm-error]');
+    pwForm.addEventListener('submit', async (e) => {
+      e.preventDefault(); pwErr.hidden = true;
+      let res;
+      try { res = await bm.mfa.enroll(new FormData(pwForm).get('password')); } // { secret, otpauth_uri, backup_codes }
+      catch (ex) { pwErr.textContent = ex?.message || 'Could not start 2FA setup'; pwErr.hidden = false; return; }
+      const codes = Array.isArray(res.backup_codes) ? res.backup_codes : [];
+      el.innerHTML = `<div data-bm-mfa class="space-y-3">
       <div class="text-sm">Add this secret to your authenticator app:</div>
-      <code class="block p-2 rounded bg-zinc-100 dark:bg-zinc-800 text-sm break-all">${esc(res.secret || res.otpauth_url || '')}</code>
+      <code data-bm-mask class="block p-2 rounded bg-zinc-100 dark:bg-zinc-800 text-sm break-all">${esc(res.secret || '')}</code>
+      ${res.otpauth_uri ? `<div class="text-sm">Or this setup link:</div><code data-bm-mask class="block p-2 rounded bg-zinc-100 dark:bg-zinc-800 text-xs break-all">${esc(res.otpauth_uri)}</code>` : ''}
+      ${codes.length ? `<div class="text-sm">Backup codes (shown once - store them somewhere safe; each signs you in once if you lose your authenticator):</div><code data-bm-mask class="block p-2 rounded bg-zinc-100 dark:bg-zinc-800 text-sm whitespace-pre-line">${codes.map(esc).join('\n')}</code>` : ''}
       <form data-bm-form class="space-y-3">${skin.error('')}${skinField('code', 'Enter the 6-digit code', { required: true })}${skin.button({ label: 'Verify & enable' })}</form></div>`;
-    const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
-    form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; try { await bm.mfa.verify(new FormData(form).get('code')); bm.auth.refreshMe && await bm.auth.refreshMe(); Toast('2FA enabled ✓', { type: 'success' }); render(); } catch (ex) { errEl.textContent = ex?.message || 'Invalid code'; errEl.hidden = false; } });
+      const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
+      form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; try { await bm.mfa.verify(new FormData(form).get('code')); bm.auth.refreshMe && await bm.auth.refreshMe(); Toast('2FA enabled ✓', { type: 'success' }); render(); } catch (ex) { errEl.textContent = ex?.message || 'Invalid code'; errEl.hidden = false; } });
+    });
   };
   await render();
   return { destroy: () => { el.innerHTML = ''; } };
@@ -1277,7 +1330,7 @@ export async function ApiTokenManager(target, opts = {}) {
     try {
       const r = await bm.api.post('/api/_auth/api-tokens', { name: fd.get('name'), scopes: fd.get('scopes') || '*' });
       form.reset();
-      Modal({ title: 'Copy your token now - it won\'t be shown again', size: 'md', content: `<code style="display:block;padding:12px;background:rgba(128,128,128,.12);border-radius:8px;word-break:break-all;font-size:13px">${esc(r.token)}</code>` });
+      Modal({ title: 'Copy your token now - it won\'t be shown again', size: 'md', content: `<code data-bm-mask style="display:block;padding:12px;background:rgba(128,128,128,.12);border-radius:8px;word-break:break-all;font-size:13px">${esc(r.token)}</code>` });
       renderList();
     } catch (ex) { errEl.textContent = ex?.message || 'Failed'; errEl.hidden = false; }
   });
@@ -1337,7 +1390,10 @@ export async function AuditLog(target, opts = {}) {
 // RecordLock(target, { table, id }) - GET/POST/DELETE /api/{t}/{id}/lock
 export async function RecordLock(target, opts) {
   const el = resolveEl(target);
-  const base = `/api/${opts.table}/${opts.id}/lock`;
+  // One encoded segment each, never '.'/'..': an id from the page URL such as
+  // '../_auth/api-tokens/7?' made the Release button DELETE another endpoint.
+  const seg = (v) => { const e = encodeURIComponent(String(v)); if (e === '.' || e === '..') throw new Error('RecordLock: invalid id'); return e; };
+  const base = `/api/${seg(opts.table)}/${seg(opts.id)}/lock`;
   const render = async () => {
     let lock = null;
     try { lock = await bm.api.get(base); } catch (_) {}
@@ -1349,23 +1405,35 @@ export async function RecordLock(target, opts) {
   await render();
   return { refresh: render, destroy: () => { el.innerHTML = ''; } };
 }
-// ShareDialog(target, { table, id }) - bm.permissions list/share/revoke
+// ShareDialog(target, { table, id }) - native list/share and exact grant revoke
 export async function ShareDialog(target, opts) {
   const el = resolveEl(target);
+  const seg = (v) => { const e = encodeURIComponent(String(v)); if (!e || e === '.' || e === '..') throw new Error('ShareDialog: invalid identifier'); return e; };
+  const revokeBase = `/api/${seg(opts.table)}/${seg(opts.id)}/share/`;
+  let generation = 0, destroyed = false;
   const render = async () => {
+    if (destroyed) return;
+    const current = ++generation;
     let rows = [];
-    try { const r = await bm.permissions.list(opts.table, opts.id); rows = Array.isArray(r) ? r : (r.permissions || []); } catch (_) {}
+    try { const r = await bm.permissions.list(opts.table, opts.id); rows = Array.isArray(r) ? r : (r.permissions || []); }
+    catch (ex) {
+      if (destroyed || current !== generation) return;
+      el.innerHTML = `<div data-bm-share class="space-y-3"><p role="alert" class="text-sm text-red-600">Couldn't load sharing. ${esc(ex?.message || 'Please try again.')}</p><button type="button" data-bm-retry class="px-3 py-2 rounded-md border text-sm">Retry</button></div>`;
+      el.querySelector('[data-bm-retry]').addEventListener('click', render);
+      return;
+    }
+    if (destroyed || current !== generation) return;
     el.innerHTML = `<div data-bm-share class="space-y-3"><form data-bm-form class="flex gap-2 items-end">${skin.error('')}
       <label class="flex-1 space-y-1"><span class="text-sm font-medium">Email</span><input name="email" type="email" required class="${inputCls}"></label>
       <label class="space-y-1"><span class="text-sm font-medium">Access</span><select name="permission" class="${inputCls}"><option value="view">View</option><option value="edit">Edit</option><option value="delete">Delete</option><option value="admin">Admin</option></select></label>
       ${skin.button({ label: 'Share' })}</form>
-      <div data-bm-shares class="space-y-1">${rows.map((p) => `<div class="flex items-center justify-between text-sm px-1"><span>${esc(p.email)} · ${esc(p.permission)}</span><button data-revoke="${esc(p.email)}" class="text-red-600">Revoke</button></div>`).join('') || '<p class="text-sm text-zinc-500">Not shared with anyone.</p>'}</div></div>`;
+      <div data-bm-shares class="space-y-1">${rows.map((p) => `<div class="flex items-center justify-between text-sm px-1"><span>${esc(p.grantee_id)} · ${esc(p.permission)}</span><button data-revoke="${esc(p.id)}" class="text-red-600">Revoke</button></div>`).join('') || '<p class="text-sm text-zinc-500">Not shared with anyone.</p>'}</div></div>`;
     const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
     form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); try { await bm.permissions.share(opts.table, opts.id, fd.get('email'), fd.get('permission')); render(); } catch (ex) { errEl.textContent = ex?.message || 'Share failed'; errEl.hidden = false; } });
-    el.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => { try { await bm.permissions.revoke(opts.table, opts.id, b.getAttribute('data-revoke')); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
+    el.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete(revokeBase + seg(b.getAttribute('data-revoke'))); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
   };
   await render();
-  return { refresh: render, destroy: () => { el.innerHTML = ''; } };
+  return { refresh: render, destroy: () => { destroyed = true; generation++; el.innerHTML = ''; } };
 }
 // DownloadMyData(target, { label? }) - gather every readable table → JSON download
 export async function DownloadMyData(target, opts = {}) {
@@ -2020,7 +2088,7 @@ export function AppShell(target, opts) {
   el.innerHTML = `<div data-bm-appshell style="display:flex;min-height:100vh">
     <aside style="width:220px;flex-shrink:0;border-right:1px solid rgba(128,128,128,.15);padding:16px;background:rgba(128,128,128,.03)">
       <div style="font-weight:700;font-size:15px;margin-bottom:16px">${esc(opts.brand || opts.title || 'App')}</div>
-      <nav data-nav style="display:flex;flex-direction:column;gap:2px">${(opts.nav || []).map((n, i) => `<a data-i="${i}" href="${esc(n.href || '#')}" style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;font-size:14px;text-decoration:none;color:inherit;${i === (opts.active || 0) ? 'background:rgba(37,99,235,.12);color:#1d4ed8;font-weight:600' : ''}">${n.icon ? esc(n.icon) + ' ' : ''}${esc(n.label)}</a>`).join('')}</nav>
+      <nav data-nav style="display:flex;flex-direction:column;gap:2px">${(opts.nav || []).map((n, i) => `<a data-i="${i}" href="${esc(safeUrl(n.href || '#'))}" style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;font-size:14px;text-decoration:none;color:inherit;${i === (opts.active || 0) ? 'background:rgba(37,99,235,.12);color:#1d4ed8;font-weight:600' : ''}">${n.icon ? esc(n.icon) + ' ' : ''}${esc(n.label)}</a>`).join('')}</nav>
     </aside>
     <main data-content style="flex:1;padding:28px;min-width:0"></main></div>`;
   (opts.nav || []).forEach((n, i) => { if (n.onClick) el.querySelector(`[data-i="${i}"]`).addEventListener('click', (e) => { e.preventDefault(); n.onClick(); }); });
@@ -2029,14 +2097,14 @@ export function AppShell(target, opts) {
 // Nav(target, { items:[{label,href?,onClick?}], active? }) → { destroy }
 export function Nav(target, opts) {
   const el = resolveEl(target);
-  el.innerHTML = `<nav data-bm-nav style="display:flex;gap:4px">${(opts.items || []).map((n, i) => `<a data-i="${i}" href="${esc(n.href || '#')}" style="padding:8px 12px;border-radius:8px;font-size:14px;text-decoration:none;color:inherit;${i === (opts.active || 0) ? 'background:rgba(37,99,235,.12);color:#1d4ed8;font-weight:600' : ''}">${esc(n.label)}</a>`).join('')}</nav>`;
+  el.innerHTML = `<nav data-bm-nav style="display:flex;gap:4px">${(opts.items || []).map((n, i) => `<a data-i="${i}" href="${esc(safeUrl(n.href || '#'))}" style="padding:8px 12px;border-radius:8px;font-size:14px;text-decoration:none;color:inherit;${i === (opts.active || 0) ? 'background:rgba(37,99,235,.12);color:#1d4ed8;font-weight:600' : ''}">${esc(n.label)}</a>`).join('')}</nav>`;
   (opts.items || []).forEach((n, i) => { if (n.onClick) el.querySelector(`[data-i="${i}"]`).addEventListener('click', (e) => { e.preventDefault(); n.onClick(); }); });
   return { destroy: () => { el.innerHTML = ''; } };
 }
 // Breadcrumbs(target, { items:[{label,href?}] }) → { destroy }
 export function Breadcrumbs(target, opts) {
   const el = resolveEl(target);
-  el.innerHTML = `<nav data-bm-breadcrumbs style="display:flex;align-items:center;gap:6px;font-size:13px;opacity:.8">${(opts.items || []).map((it, i) => `${i ? '<span style="opacity:.4">/</span>' : ''}${it.href ? `<a href="${esc(it.href)}" style="color:var(--bm-accent,#2563eb);text-decoration:none">${esc(it.label)}</a>` : `<span>${esc(it.label)}</span>`}`).join('')}</nav>`;
+  el.innerHTML = `<nav data-bm-breadcrumbs style="display:flex;align-items:center;gap:6px;font-size:13px;opacity:.8">${(opts.items || []).map((it, i) => `${i ? '<span style="opacity:.4">/</span>' : ''}${it.href ? `<a href="${esc(safeUrl(it.href))}" style="color:var(--bm-accent,#2563eb);text-decoration:none">${esc(it.label)}</a>` : `<span>${esc(it.label)}</span>`}`).join('')}</nav>`;
   return { destroy: () => { el.innerHTML = ''; } };
 }
 // CommandPalette({ commands:[{label,run,hint?}], hotkey? }) → { open, close, destroy }
@@ -2109,10 +2177,42 @@ export async function Markdown(target, opts) {
   await renderMarkdownInto(el, (opts && opts.text) || '');
   return { destroy: () => { el.innerHTML = ''; } };
 }
+// richTextHTML: RichText's value is stored HTML, i.e. whatever the last
+// writer saved (possibly another user, straight through the API). Parse it
+// inert in a <template> and keep only formatting markup, so a saved
+// onerror= or <script> can't run when the editor opens. Only an <a href>
+// with a safe URL keeps an attribute.
+const _rtKeep = new Set(['B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'DEL', 'SUB', 'SUP', 'P', 'DIV', 'SPAN', 'BR', 'HR', 'UL', 'OL', 'LI', 'BLOCKQUOTE', 'PRE', 'CODE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'A']);
+const _rtUnwrap = new Set(['FONT', 'SMALL', 'BIG', 'MARK', 'ABBR', 'CITE', 'Q', 'KBD', 'SAMP', 'VAR', 'TIME', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'MAIN', 'ASIDE', 'NAV', 'FIGURE', 'FIGCAPTION', 'DL', 'DT', 'DD', 'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'CAPTION', 'CENTER', 'LABEL']);
+function richTextHTML(html) {
+  if (typeof document === 'undefined') return esc(html);
+  const t = document.createElement('template');
+  t.innerHTML = String(html ?? '');
+  const clean = (node) => {
+    for (const child of [...node.childNodes]) {
+      if (child.nodeType === 3) continue; // text
+      if (child.nodeType !== 1) { child.remove(); continue; } // comments, PIs
+      const tag = child.tagName.toUpperCase();
+      if (!_rtKeep.has(tag)) {
+        // Unknown and active content (script, style, svg, math, iframe,
+        // img, form controls, ...) goes with its subtree; plain layout
+        // wrappers keep their text.
+        if (_rtUnwrap.has(tag)) { clean(child); child.replaceWith(...child.childNodes); } else child.remove();
+        continue;
+      }
+      for (const a of [...child.attributes]) {
+        if (!(tag === 'A' && a.name === 'href' && safeUrl(a.value) === a.value)) child.removeAttribute(a.name);
+      }
+      clean(child);
+    }
+  };
+  clean(t.content);
+  return t.innerHTML;
+}
 // RichText(target, { value?, onChange? }) → { html, destroy } - minimal toolbar.
 export function RichText(target, opts = {}) {
   const el = resolveEl(target);
-  el.innerHTML = `<div data-bm-richtext style="border:1px solid rgba(128,128,128,.3);border-radius:8px;overflow:hidden"><div style="display:flex;gap:2px;padding:6px;border-bottom:1px solid rgba(128,128,128,.15)">${[['bold', 'B'], ['italic', 'I'], ['insertUnorderedList', '• List']].map(([c, l]) => `<button type="button" data-cmd="${c}" style="padding:4px 8px;background:none;border:none;cursor:pointer;font-weight:600;border-radius:4px">${l}</button>`).join('')}</div><div data-edit contenteditable="true" style="padding:10px;min-height:120px;outline:none;font-size:14px">${opts.value || ''}</div></div>`;
+  el.innerHTML = `<div data-bm-richtext style="border:1px solid rgba(128,128,128,.3);border-radius:8px;overflow:hidden"><div style="display:flex;gap:2px;padding:6px;border-bottom:1px solid rgba(128,128,128,.15)">${[['bold', 'B'], ['italic', 'I'], ['insertUnorderedList', '• List']].map(([c, l]) => `<button type="button" data-cmd="${c}" style="padding:4px 8px;background:none;border:none;cursor:pointer;font-weight:600;border-radius:4px">${l}</button>`).join('')}</div><div data-edit contenteditable="true" style="padding:10px;min-height:120px;outline:none;font-size:14px">${richTextHTML(opts.value || '')}</div></div>`;
   const edit = el.querySelector('[data-edit]');
   el.querySelectorAll('[data-cmd]').forEach((b) => b.addEventListener('mousedown', (e) => { e.preventDefault(); document.execCommand(b.getAttribute('data-cmd')); edit.focus(); }));
   edit.addEventListener('input', () => opts.onChange && opts.onChange(edit.innerHTML));
@@ -2358,7 +2458,7 @@ export async function MapView(target, opts) {
     map = L.map(host).setView([opts.lat ?? 0, opts.lng ?? 0], opts.zoom || 11);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 19 }).addTo(map);
     const markers = opts.markers || (opts.lat != null ? [{ lat: opts.lat, lng: opts.lng, label: opts.label }] : []);
-    markers.forEach((mk) => { const m = L.marker([mk.lat, mk.lng]).addTo(map); if (mk.label) m.bindPopup(String(mk.label)); });
+    markers.forEach((mk) => { const m = L.marker([mk.lat, mk.lng]).addTo(map); if (mk.label) m.bindPopup(esc(mk.label)); /* a string popup is HTML to Leaflet */ });
     setTimeout(() => map.invalidateSize(), 120);
   } catch (ex) { host.innerHTML = skin.emptyState('Map unavailable: ' + (ex?.message || '')); }
   return { map, destroy: () => { try { map && map.remove(); } catch (_) {} el.innerHTML = ''; } };
@@ -2438,7 +2538,7 @@ export async function GanttChart(target, opts) {
     const tip = (it) => opts.tooltip ? opts.tooltip(it) : `${it.label} · ${fmtD(it.s)} → ${fmtD(it.e)}`;
     const barRow = (it, i, sub, meta) => {
       const left = pct(it.s), width = Math.max(1.5, pct(it.e) - pct(it.s));
-      const color = (typeof it.color === 'string' && it.color.startsWith('#')) ? it.color : _chartPalette[i % _chartPalette.length];
+      const color = safeColor(it.color, _chartPalette[i % _chartPalette.length]);
       const h = sub ? 22 : 30, bh = sub ? 11 : 18;
       const chevron = (meta && meta.hasKids) ? `<button data-toggle="${esc(meta.key)}" style="background:none;border:none;cursor:pointer;padding:0 5px 0 0;color:inherit;opacity:.55;font-size:11px;flex-shrink:0">${meta.collapsed ? '▸' : '▾'}</button>` : '';
       // Optional in-bar title: opts.barLabel === true → item.label; a function → custom string.
@@ -2492,7 +2592,7 @@ export function Checklist(target, opts) {
     const row = (it) => `<div style="display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid rgba(128,128,128,.1)">
       <input type="checkbox" ${it.done ? 'checked' : ''} data-toggle="${it._i}" style="width:16px;height:16px;accent-color:#16a34a;cursor:pointer">
       <div style="flex:1"><div style="font-size:13px;${it.done ? 'opacity:.55;text-decoration:line-through' : ''}">${esc(it.label)}${it.required ? ' <span style="color:#dc2626;font-size:11px">required</span>' : ''}</div>${it.hint ? `<div style="font-size:11px;opacity:.5">${esc(it.hint)}</div>` : ''}</div>
-      ${it.fileUrl ? `<a href="${esc(it.fileUrl)}" target="_blank" rel="noopener" style="font-size:12px;color:var(--bm-accent,#2563eb)">view</a>` : (opts.onUpload ? `<button data-up="${it._i}" style="font-size:12px;color:var(--bm-accent,#2563eb);background:none;border:none;cursor:pointer">upload</button>` : '')}</div>`;
+      ${it.fileUrl ? `<a href="${esc(safeUrl(it.fileUrl))}" target="_blank" rel="noopener" style="font-size:12px;color:var(--bm-accent,#2563eb)">view</a>` : (opts.onUpload ? `<button data-up="${it._i}" style="font-size:12px;color:var(--bm-accent,#2563eb);background:none;border:none;cursor:pointer">upload</button>` : '')}</div>`;
     el.innerHTML = `<div data-bm-checklist>${opts.title ? `<div style="font-weight:600;font-size:14px;margin-bottom:8px">${esc(opts.title)}</div>` : ''}<div style="margin-bottom:12px">${ProgressBar(total ? (done / total) * 100 : 0, { label: `${done}/${total} complete` })}</div>${Object.keys(groups).map((g) => `${g ? `<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;opacity:.5;margin:14px 0 2px">${esc(g)}</div>` : ''}${groups[g].map(row).join('')}`).join('')}</div>`;
     el.querySelectorAll('[data-toggle]').forEach((c) => c.addEventListener('change', () => { const i = Number(c.getAttribute('data-toggle')); items[i].done = c.checked; if (opts.onToggle) opts.onToggle(items[i], c.checked); render(); }));
     if (opts.onUpload) el.querySelectorAll('[data-up]').forEach((b) => b.addEventListener('click', () => {
@@ -2566,7 +2666,7 @@ export function Switch(target, opts = {}) {
 export function Slider(target, opts = {}) {
   const el = resolveEl(target);
   const min = opts.min ?? 0, max = opts.max ?? 100;
-  el.innerHTML = `<div data-bm-slider><div style="display:flex;justify-content:space-between;font-size:12px;opacity:.6;margin-bottom:4px"><span>${esc(opts.label || '')}</span><span data-val>${esc(opts.value ?? min)}</span></div><input type="range" min="${min}" max="${max}" step="${opts.step ?? 1}" value="${opts.value ?? min}" style="width:100%;accent-color:var(--bm-accent,#2563eb)"></div>`;
+  el.innerHTML = `<div data-bm-slider><div style="display:flex;justify-content:space-between;font-size:12px;opacity:.6;margin-bottom:4px"><span>${esc(opts.label || '')}</span><span data-val>${esc(opts.value ?? min)}</span></div><input type="range" min="${esc(min)}" max="${esc(max)}" step="${esc(opts.step ?? 1)}" value="${esc(opts.value ?? min)}" style="width:100%;accent-color:var(--bm-accent,#2563eb)"></div>`;
   const input = el.querySelector('input'), val = el.querySelector('[data-val]');
   input.addEventListener('input', () => { val.textContent = input.value; if (opts.onChange) opts.onChange(Number(input.value)); });
   return { get value() { return Number(input.value); }, destroy: () => { el.innerHTML = ''; } };
@@ -2596,7 +2696,7 @@ export function NumberStepper(target, opts = {}) {
   const el = resolveEl(target);
   let value = opts.value ?? 0; const step = opts.step ?? 1;
   const clamp = (n) => { if (opts.min != null) n = Math.max(opts.min, n); if (opts.max != null) n = Math.min(opts.max, n); return n; };
-  const draw = () => { el.innerHTML = `<div data-bm-numberstepper style="display:inline-flex;align-items:center;border:1px solid rgba(128,128,128,.3);border-radius:8px;overflow:hidden"><button data-d="-1" style="padding:6px 12px;background:none;border:none;cursor:pointer;font-size:16px">−</button><input data-n type="number" value="${value}" style="width:60px;text-align:center;border:none;border-left:1px solid rgba(128,128,128,.2);border-right:1px solid rgba(128,128,128,.2);padding:6px 0;background:none;color:inherit"><button data-d="1" style="padding:6px 12px;background:none;border:none;cursor:pointer;font-size:16px">+</button></div>`; el.querySelectorAll('[data-d]').forEach((b) => b.addEventListener('click', () => { value = clamp(value + step * Number(b.getAttribute('data-d'))); draw(); if (opts.onChange) opts.onChange(value); })); el.querySelector('[data-n]').addEventListener('change', (e) => { value = clamp(Number(e.target.value) || 0); draw(); if (opts.onChange) opts.onChange(value); }); };
+  const draw = () => { el.innerHTML = `<div data-bm-numberstepper style="display:inline-flex;align-items:center;border:1px solid rgba(128,128,128,.3);border-radius:8px;overflow:hidden"><button data-d="-1" style="padding:6px 12px;background:none;border:none;cursor:pointer;font-size:16px">−</button><input data-n type="number" value="${esc(value)}" style="width:60px;text-align:center;border:none;border-left:1px solid rgba(128,128,128,.2);border-right:1px solid rgba(128,128,128,.2);padding:6px 0;background:none;color:inherit"><button data-d="1" style="padding:6px 12px;background:none;border:none;cursor:pointer;font-size:16px">+</button></div>`; el.querySelectorAll('[data-d]').forEach((b) => b.addEventListener('click', () => { value = clamp(value + step * Number(b.getAttribute('data-d'))); draw(); if (opts.onChange) opts.onChange(value); })); el.querySelector('[data-n]').addEventListener('change', (e) => { value = clamp(Number(e.target.value) || 0); draw(); if (opts.onChange) opts.onChange(value); }); };
   draw();
   return { get value() { return value; }, destroy: () => { el.innerHTML = ''; } };
 }
@@ -2763,7 +2863,8 @@ export async function TeamManager(target, opts = {}) {
 }
 
 // StepUp({ title?, message? }) → Promise<boolean> - re-auth confirm (verify the
-// signed-in user's password via the token endpoint) before a sensitive action.
+// signed-in user's password via the token endpoint, then revoke the session
+// that exchange mints) before a sensitive action.
 export async function StepUp(opts = {}) {
   const me = await currentUser();
   const email = me?.email;
@@ -2777,8 +2878,15 @@ export async function StepUp(opts = {}) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault(); errEl.hidden = true;
       const res = await bm.api.raw.post('/api/_auth/token', { email, password: new FormData(form).get('password') });
-      if (res.ok) finish(true);
-      else { errEl.textContent = 'Incorrect password'; errEl.hidden = false; }
+      if (res.ok) {
+        // The token endpoint signs in a new Bearer session; only the password
+        // check was wanted, so end that session now. The token is the only
+        // credential sent (credentials: 'omit'), so /logout ends it and leaves
+        // this browser's own session alone.
+        const minted = res.data && res.data.token;
+        if (minted) { try { await fetch('/logout', { method: 'POST', credentials: 'omit', headers: { Authorization: 'Bearer ' + minted, Accept: 'application/json' } }); } catch (_) {} }
+        finish(true);
+      } else { errEl.textContent = 'Incorrect password'; errEl.hidden = false; }
     });
   });
 }
@@ -2829,6 +2937,18 @@ export async function ModuleGate(target, opts) {
   return ok;
 }
 
+// csvCell renders one CSV field. Rows come from other users, and a
+// spreadsheet runs a cell that starts with = + - @ (or a tab / CR before
+// one) as a formula - HYPERLINK exfiltration, DDE - so such a text value
+// gets a leading ' (the server-side csvSafeCell rule); a JSON number such as
+// -5 is left alone. Quotes, commas and line breaks are quoted per RFC 4180;
+// nested objects are written as JSON.
+function csvCell(v) {
+  let s = v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
 // ExportButton(target, { table, columns?, where?, filename?, label? }) - rows → CSV download.
 export function ExportButton(target, opts) {
   const el = resolveEl(target);
@@ -2838,8 +2958,7 @@ export function ExportButton(target, opts) {
     try {
       const rows = await listRows(opts.table, { limit: opts.limit || 5000, where: opts.where });
       const cols = opts.columns ? opts.columns.split(',').map((c) => c.trim()) : (rows.length ? Object.keys(rows[0]) : []);
-      const escCsv = (v) => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-      const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => escCsv(r[c])).join(','))].join('\n');
+      const csv = [cols.map(csvCell).join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n');
       const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = opts.filename || (opts.table + '.csv'); a.click(); URL.revokeObjectURL(a.href);
     } catch (ex) { Toast(ex?.message || 'Export failed', { type: 'error' }); }
     btn.textContent = txt; btn.disabled = false;
@@ -2864,7 +2983,7 @@ export function ConsentManager(opts = {}) {
   if (prior) { if (prior === 'accept' && opts.onAccept) opts.onAccept(); return { destroy: () => {} }; }
   const bar = document.createElement('div');
   bar.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;max-width:560px;margin:0 auto;z-index:9996;background:#18181b;color:#fff;border-radius:12px;padding:14px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 10px 30px rgba(0,0,0,.3);font-size:13px';
-  bar.innerHTML = `<span style="flex:1">${esc(opts.message || 'We use cookies to improve your experience.')}${opts.policyUrl ? ` <a href="${esc(opts.policyUrl)}" style="color:#93c5fd">Learn more</a>` : ''}</span><button data-decline style="background:none;border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:7px;padding:6px 12px;cursor:pointer">Decline</button><button data-accept style="background:var(--bm-accent,#2563eb);border:none;color:#fff;border-radius:7px;padding:6px 14px;cursor:pointer;font-weight:600">Accept</button>`;
+  bar.innerHTML = `<span style="flex:1">${esc(opts.message || 'We use cookies to improve your experience.')}${opts.policyUrl ? ` <a href="${esc(safeUrl(opts.policyUrl))}" style="color:#93c5fd">Learn more</a>` : ''}</span><button data-decline style="background:none;border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:7px;padding:6px 12px;cursor:pointer">Decline</button><button data-accept style="background:var(--bm-accent,#2563eb);border:none;color:#fff;border-radius:7px;padding:6px 14px;cursor:pointer;font-weight:600">Accept</button>`;
   const close = (choice) => { try { localStorage.setItem(KEY, choice); } catch (_) {} bar.remove(); };
   bar.querySelector('[data-accept]').addEventListener('click', () => { close('accept'); opts.onAccept && opts.onAccept(); });
   bar.querySelector('[data-decline]').addEventListener('click', () => { close('decline'); opts.onDecline && opts.onDecline(); });
@@ -3031,14 +3150,14 @@ export function Heatmap(target, opts) {
   const xs = [...new Set(data.map((d) => String(d.x)))], ys = [...new Set(data.map((d) => String(d.y)))];
   const map = {}; let max = 0; data.forEach((d) => { map[`${d.x}|${d.y}`] = d.value; max = Math.max(max, d.value); });
   const base = opts.color || '37,99,235';
-  el.innerHTML = `<div data-bm-heatmap style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:3px"><thead><tr><th></th>${xs.map((x) => `<th style="font-size:10px;opacity:.6;font-weight:500;padding:2px 4px">${esc(x)}</th>`).join('')}</tr></thead><tbody>${ys.map((y) => `<tr><td style="font-size:10px;opacity:.6;padding-right:6px;white-space:nowrap">${esc(y)}</td>${xs.map((x) => { const v = map[`${x}|${y}`] ?? 0; const a = max ? v / max : 0; return `<td title="${esc(x)} · ${esc(y)}: ${esc(v)}" style="width:26px;height:26px;border-radius:4px;background:rgba(${base},${(a * 0.9 + 0.05).toFixed(2)});text-align:center;font-size:10px;color:${a > 0.5 ? '#fff' : 'inherit'}">${v || ''}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
+  el.innerHTML = `<div data-bm-heatmap style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:3px"><thead><tr><th></th>${xs.map((x) => `<th style="font-size:10px;opacity:.6;font-weight:500;padding:2px 4px">${esc(x)}</th>`).join('')}</tr></thead><tbody>${ys.map((y) => `<tr><td style="font-size:10px;opacity:.6;padding-right:6px;white-space:nowrap">${esc(y)}</td>${xs.map((x) => { const v = map[`${x}|${y}`] ?? 0; const a = max ? v / max : 0; return `<td title="${esc(x)} · ${esc(y)}: ${esc(v)}" style="width:26px;height:26px;border-radius:4px;background:rgba(${base},${(a * 0.9 + 0.05).toFixed(2)});text-align:center;font-size:10px;color:${a > 0.5 ? '#fff' : 'inherit'}">${esc(v || '')}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
   return { destroy: () => { el.innerHTML = ''; } };
 }
 
 // DocViewer(target, { url, height? }) - embed a PDF/doc.
 export function DocViewer(target, opts) {
   const el = resolveEl(target);
-  el.innerHTML = `<iframe data-bm-docviewer src="${esc(opts.url)}" style="width:100%;height:${opts.height || '480px'};border:1px solid rgba(128,128,128,.2);border-radius:8px" title="document"></iframe>`;
+  el.innerHTML = `<iframe data-bm-docviewer src="${esc(safeUrl(opts.url))}" style="width:100%;height:${opts.height || '480px'};border:1px solid rgba(128,128,128,.2);border-radius:8px" title="document"></iframe>`;
   return { destroy: () => { el.innerHTML = ''; } };
 }
 
@@ -3113,7 +3232,7 @@ export function FieldArray(target, opts) {
 export function FileField(target, opts = {}) {
   const el = resolveEl(target); let url = opts.value || '';
   const draw = () => {
-    el.innerHTML = `<div data-bm-filefield style="display:flex;align-items:center;gap:10px">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener" style="font-size:13px;color:var(--bm-accent,#2563eb);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(url.split('/').pop())}</a>` : '<span style="font-size:13px;opacity:.5">No file</span>'}<button data-up style="font-size:13px;padding:6px 12px;border:1px solid rgba(128,128,128,.3);border-radius:7px;background:none;cursor:pointer">${url ? 'Replace' : 'Upload'}</button></div>`;
+    el.innerHTML = `<div data-bm-filefield style="display:flex;align-items:center;gap:10px">${url ? `<a href="${esc(safeUrl(url))}" target="_blank" rel="noopener" style="font-size:13px;color:var(--bm-accent,#2563eb);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(url.split('/').pop())}</a>` : '<span style="font-size:13px;opacity:.5">No file</span>'}<button data-up style="font-size:13px;padding:6px 12px;border:1px solid rgba(128,128,128,.3);border-radius:7px;background:none;cursor:pointer">${url ? 'Replace' : 'Upload'}</button></div>`;
     el.querySelector('[data-up]').addEventListener('click', () => { const inp = document.createElement('input'); inp.type = 'file'; inp.onchange = async () => { if (!inp.files || !inp.files[0]) return; try { const r = await bm.upload(inp.files[0]); url = r.url || r.path || ''; draw(); if (opts.onChange) opts.onChange(url); } catch (ex) { Toast(ex?.message || 'Upload failed', { type: 'error' }); } }; inp.click(); });
   };
   draw();

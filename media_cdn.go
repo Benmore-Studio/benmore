@@ -23,8 +23,14 @@ package main
 //   BENMORE_PLATFORM_MEDIA_REGION        default us-east-1
 //   BENMORE_PLATFORM_MEDIA_CDN_DOMAIN    e.g. cdn.example.com
 //   BENMORE_PLATFORM_MEDIA_KEYPAIR_ID    CloudFront public-key id (signing)
-//   BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_FILE  path to the RSA private key PEM
-//   BENMORE_PLATFORM_MEDIA_PRIVATE_KEY   (alt) inline PEM if no file
+//   BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_B64   base64 RSA private key PEM
+//   BENMORE_PLATFORM_MEDIA_PRIVATE_KEY   (alt) inline PEM
+//   BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_FILE  (alt) path to the PEM
+//
+// The KEYPAIR_ID and PRIVATE_KEY* values are for whoever signs: the router
+// (which signs for hosted tenants through the presign broker), `benmore
+// host`, or a self-hosted `benmore serve`. A hosted tenant process never
+// loads them; see signPrivateMediaURL.
 
 import (
 	"crypto"
@@ -41,6 +47,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // PlatformMediaConfig is the resolved deployment-wide media backend (nil = unset).
@@ -72,51 +79,65 @@ var (
 // getPlatformMedia resolves the platform media config once. Returns nil when
 // the bucket/CDN aren't configured (→ callers fall back to local disk).
 func getPlatformMedia() *PlatformMediaConfig {
-	platformMediaOnce.Do(func() {
-		bucket := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_BUCKET"))
-		cdn := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_CDN_DOMAIN"))
-		if bucket == "" || cdn == "" {
-			return // not configured
-		}
-		cfg := &PlatformMediaConfig{
-			Bucket:    bucket,
-			Region:    strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_REGION")),
-			CDNDomain: strings.TrimPrefix(strings.TrimPrefix(cdn, "https://"), "http://"),
-			KeyPairID: strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_KEYPAIR_ID")),
-			S3Key:     strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_S3_KEY")),
-			S3Secret:  strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_S3_SECRET")),
-		}
-		if cfg.Region == "" {
-			cfg.Region = "us-east-1"
-		}
-		// Private signing key - preferred form is base64-encoded PEM in the
-		// env var itself (single-line, always present in the process env, no
-		// filesystem read under the sandboxed app namespace). Falls back to
-		// inline PEM, then a file path.
-		pemStr := ""
-		if b64 := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_B64")); b64 != "" {
-			if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
-				pemStr = string(dec)
-			}
-		}
-		if pemStr == "" {
-			pemStr = os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY")
-		}
-		if pemStr == "" {
-			if p := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_FILE")); p != "" {
-				if b, err := os.ReadFile(p); err == nil {
-					pemStr = string(b)
-				}
-			}
-		}
-		if pemStr != "" {
-			if k, err := parseRSAPrivateKey([]byte(pemStr)); err == nil {
-				cfg.PrivateKey = k
-			}
-		}
-		platformMedia = cfg
-	})
+	platformMediaOnce.Do(func() { platformMedia = loadPlatformMediaConfig() })
 	return platformMedia
+}
+
+// loadPlatformMediaConfig reads the media block from the process environment.
+func loadPlatformMediaConfig() *PlatformMediaConfig {
+	bucket := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_BUCKET"))
+	cdn := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_CDN_DOMAIN"))
+	if bucket == "" || cdn == "" {
+		return nil // not configured
+	}
+	cfg := &PlatformMediaConfig{
+		Bucket:    bucket,
+		Region:    strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_REGION")),
+		CDNDomain: strings.TrimPrefix(strings.TrimPrefix(cdn, "https://"), "http://"),
+		S3Key:     strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_S3_KEY")),
+		S3Secret:  strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_S3_SECRET")),
+	}
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+	// A hosted tenant process signs through the router's presign broker and
+	// never loads the deployment-wide CloudFront key, even if its environment
+	// still carries one (a tenant.env written before signing moved to the
+	// router). Tenant code can then sign nothing the router would refuse.
+	if hostedTenantProcess() {
+		return cfg
+	}
+	cfg.KeyPairID = strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_KEYPAIR_ID"))
+	// Private signing key - preferred form is base64-encoded PEM in the env
+	// var itself (single-line, no filesystem read). Falls back to inline PEM,
+	// then a file path.
+	pemStr := ""
+	if b64 := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_B64")); b64 != "" {
+		if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
+			pemStr = string(dec)
+		}
+	}
+	if pemStr == "" {
+		pemStr = os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY")
+	}
+	if pemStr == "" {
+		if p := strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_MEDIA_PRIVATE_KEY_FILE")); p != "" {
+			if b, err := os.ReadFile(p); err == nil {
+				pemStr = string(b)
+			}
+		}
+	}
+	if pemStr != "" {
+		if k, err := parseRSAPrivateKey([]byte(pemStr)); err == nil {
+			cfg.PrivateKey = k
+		}
+	}
+	return cfg
+}
+
+// canSign reports whether this process holds the CloudFront signing key.
+func (c *PlatformMediaConfig) canSign() bool {
+	return c != nil && c.PrivateKey != nil && c.KeyPairID != ""
 }
 
 // mediaCDNEnabled reports whether the platform CDN media backend is active.
@@ -261,16 +282,15 @@ func cdnURLForServe(app *App, raw string, cfg *PlatformMediaConfig) (url string,
 		key := strings.TrimPrefix(clean, prefix)
 		// TENANT CLAMP: the signing key is deployment-wide, so a flow could
 		// otherwise hand serve_file another app's CDN URL and get it
-		// signed. Require the key's <visibility>/<app>/ segment to be THIS
-		// app's own prefix; refuse anything else (→ caller 404s).
-		parts := strings.SplitN(key, "/", 3)
-		if len(parts) < 3 || parts[1] != appMediaPrefix(app) || (parts[0] != "public" && parts[0] != "private") {
+		// signed (→ caller 404s). The router's broker applies the same rule.
+		vis, ok := mediaKeyVisibility(key, appMediaPrefix(app))
+		if !ok {
 			return "", false, false
 		}
-		return clean, parts[0] == "private", true
+		return clean, vis == "private", true
 	}
 	p := strings.TrimPrefix(raw, "/")
-	if strings.HasPrefix(p, "uploads/") && !strings.Contains(p, "..") {
+	if strings.HasPrefix(p, "uploads/") && !cdnKeyUnsafe(p) {
 		c := newCDNStorage(app)
 		if c == nil {
 			return "", false, false
@@ -281,7 +301,57 @@ func cdnURLForServe(app *App, raw string, cfg *PlatformMediaConfig) (url string,
 	return "", false, false
 }
 
+// mediaKeyVisibility is the one containment rule for a bucket key
+// <visibility>/<app prefix>/<rest>: the app segment must be exactly prefix,
+// the tier public or private, and the rest free of traversal and encoding so
+// the key can never normalize into another app's prefix downstream. Used by
+// the app process (cdnURLForServe) and by the router's broker before signing.
+func mediaKeyVisibility(key, prefix string) (visibility string, ok bool) {
+	parts := strings.SplitN(key, "/", 3)
+	if prefix == "" || len(parts) < 3 || parts[1] != prefix || (parts[0] != "public" && parts[0] != "private") || parts[2] == "" || cdnKeyUnsafe(key) {
+		return "", false
+	}
+	return parts[0], true
+}
+
 // ─── CloudFront signed URLs (private files) ──────────────────────────────
+
+// signPrivateMediaURL returns a CloudFront signed URL, valid for ttl, for the
+// unsigned https://<cdn>/private/<app prefix>/... URL that cdnURLForServe
+// resolved for app.
+//
+// Whenever the presign broker socket is reachable the router signs it: the
+// app sends the object key and requested lifetime, the router checks the key
+// against the connecting uid's own prefix, caps the lifetime and signs with
+// the key only it holds. A broker refusal is final. A hosted tenant process
+// (hostedTenantProcess) never signs locally and fails closed when the broker
+// is unreachable. Self-hosted `benmore serve` and single-process `benmore
+// host` have no broker and sign with the key in their own environment.
+func signPrivateMediaURL(app *App, cfg *PlatformMediaConfig, cdnURL string, ttl time.Duration) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("media: platform media CDN not configured")
+	}
+	key, found := strings.CutPrefix(cdnURL, "https://"+cfg.CDNDomain+"/")
+	if !found {
+		return "", fmt.Errorf("media: %q is not a media CDN URL", cdnURL)
+	}
+	if sock := presignBrokerSocketPath(); brokerSocketReachable(sock) {
+		resp, err := requestPresignBroker(sock, presignReq{
+			Operation: "sign",
+			Prefix:    appMediaPrefix(app),
+			Path:      key,
+			ExpiresIn: int64(ttl / time.Second),
+		})
+		if err != nil {
+			return "", fmt.Errorf("media: sign private URL: %w", err)
+		}
+		return resp.URL, nil
+	}
+	if hostedTenantProcess() {
+		return "", fmt.Errorf("media: sign private URL: the platform media signer (presign broker) is unreachable; hosted apps never sign locally")
+	}
+	return signCloudFrontURL(cdnURL, time.Now().Add(ttl).Unix(), cfg.KeyPairID, cfg.PrivateKey)
+}
 
 // parseRSAPrivateKey parses a PEM RSA private key (PKCS1 or PKCS8).
 func parseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
@@ -318,11 +388,20 @@ func cfBase64(b []byte) string {
 // Because the digest can't be strengthened, the mitigation is to keep `expires`
 // SHORT: a leaked signed URL is a replayable bearer credential until it expires,
 // so the caller (RegisterSignedURLRoutes) clamps the TTL to oauthMaxSignedURLTTL
-// rather than the prior 24h. Keep that cap tight; do not widen the window to
-// compensate for the weak-by-mandate signing alg.
+// rather than the prior 24h, and the presign broker enforces the same cap
+// (mediaSignMaxTTL) on every tenant request. Keep that cap tight; do not
+// widen the window to compensate for the weak-by-mandate signing alg.
 func signCloudFrontURL(resourceURL string, expires int64, keyPairID string, priv *rsa.PrivateKey) (string, error) {
 	if priv == nil || keyPairID == "" {
 		return "", fmt.Errorf("media: CloudFront signing not configured (key pair id / private key missing)")
+	}
+	// The resource is formatted into policy JSON. A quote, backslash or
+	// control character could close the string and turn the signed bytes
+	// into a different (custom) policy, e.g. one naming another app's prefix.
+	for i := 0; i < len(resourceURL); i++ {
+		if c := resourceURL[i]; c == '"' || c == '\\' || c < 0x20 || c == 0x7f {
+			return "", fmt.Errorf("media: refusing to sign a resource containing %q", c)
+		}
 	}
 	policy := fmt.Sprintf(`{"Statement":[{"Resource":"%s","Condition":{"DateLessThan":{"AWS:EpochTime":%d}}}]}`, resourceURL, expires)
 	sum := sha1.Sum([]byte(policy))
@@ -336,4 +415,10 @@ func signCloudFrontURL(resourceURL string, expires int64, keyPairID string, priv
 	}
 	return fmt.Sprintf("%s%sExpires=%d&Signature=%s&Key-Pair-Id=%s",
 		resourceURL, sep, expires, cfBase64(sig), keyPairID), nil
+}
+
+// cdnKeyUnsafe rejects key material that a CDN or origin could normalize
+// into a different object: dot segments, percent-encoding and backslashes.
+func cdnKeyUnsafe(k string) bool {
+	return strings.Contains(k, "..") || strings.ContainsAny(k, "%\\") || strings.Contains(k, "//")
 }

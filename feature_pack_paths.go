@@ -128,8 +128,9 @@ func safeFeatureJoin(root, rel string) (string, error) {
 // let an install overwrite the app's HMAC/session/OAuth secret or its git
 // history. Reject any path with a protected directory segment as well.
 func featurePackPathProtected(rel string) bool {
-	rel = filepath.ToSlash(strings.TrimPrefix(rel, "./"))
-	if sourceManifestExcluded(rel, false) {
+	// Judge the path the join will reach: "data.db/." names data.db.
+	rel = filepath.ToSlash(filepath.Clean(strings.TrimPrefix(filepath.ToSlash(rel), "/")))
+	if rel == "." || sourceManifestExcluded(rel, false) {
 		return true
 	}
 	for _, seg := range strings.Split(rel, "/") {
@@ -138,7 +139,8 @@ func featurePackPathProtected(rel string) bool {
 			return true
 		}
 	}
-	return false
+	// Editor/agent auto-run config is refused like the hosted write tools do.
+	return workspaceAutoRunPath(rel, false)
 }
 
 func routeForStaticPath(p string) string {

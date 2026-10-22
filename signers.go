@@ -26,6 +26,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 )
 
 // FlowAPISign is the parsed `sign:` block under a `run: api` step.
@@ -70,4 +71,36 @@ func applySigner(req *http.Request, body []byte, sign *FlowAPISign, app *App) er
 		return fmt.Errorf("sign: invalid YAML block: %s", perr)
 	}
 	return runSignRecipe(req, body, sign, app)
+}
+
+var (
+	signParamRefRe     = regexp.MustCompile(`\bparams\.([A-Za-z_][A-Za-z0-9_]*)`)
+	signSoleParamRefRe = regexp.MustCompile(`^\s*\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\s*$`)
+)
+
+// signExchangeURLParams names the sign bindings (params.<name>) that the
+// recipe's token-exchange URL reads, for a recipe with a `before:` step. sole
+// is true when that URL is exactly one binding and nothing else, i.e. the
+// binding IS the URL (oauth_client_credentials' token_url).
+//
+// The exchange request carries the app's credentials (client secret, API
+// key) to that URL before the API call is made, so the caller applies the
+// API URL's own rule to these bindings: request input may not choose the
+// scheme or host.
+func signExchangeURLParams(sign *FlowAPISign) (names []string, sole bool) {
+	if sign == nil {
+		return nil, false
+	}
+	recipe := sign.Inline
+	if sign.Recipe != "" {
+		recipe, _ = lookupBuiltinRecipe(sign.Recipe)
+	}
+	if recipe == nil || recipe.Before == nil || recipe.Before.Request == nil {
+		return nil, false
+	}
+	url := recipe.Before.Request.URL
+	for _, m := range signParamRefRe.FindAllStringSubmatch(url, -1) {
+		names = append(names, m[1])
+	}
+	return names, signSoleParamRefRe.MatchString(url)
 }

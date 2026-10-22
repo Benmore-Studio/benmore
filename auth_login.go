@@ -5,7 +5,9 @@ package main
 // Interactive login, signup, OTP verification, logout, and group switching.
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -36,23 +38,31 @@ func handleSwitchGroup(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	// Platform admins can switch to any org; others must belong to the org
 	if !session.IsAdmin() {
-		var count int
-		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = ? AND %s = ?",
-			app.Group.Table, app.Group.Key, app.Group.UserField)
-		var lookupVal any
-		if app.Group.UserField == "email" {
-			lookupVal = session.Email
-		} else {
-			lookupVal = session.UserID
+		// Email-keyed memberships count only for a verified address.
+		if _, ok := groupMemberValue(app.Group, session); !ok {
+			http.Error(w, "Verify your email to join this organization", http.StatusForbidden)
+			return
 		}
-		app.DB.QueryRow(query, newGroupID, lookupVal).Scan(&count)
-		if count == 0 {
+		// Only a live membership row (not soft-deleted, active per
+		// groups.active_field) lets the user into the organization.
+		if !groupMembershipLive(app.DB, app.Group, session, newGroupID) {
 			http.Error(w, "Not a member of this organization", http.StatusForbidden)
 			return
 		}
 	}
-	// Update session org_id
-	app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", newGroupID, session.ID)
+	// Update session org_id. The tenant lives on the session row: an API
+	// token or edge identity has none, and reporting a switch that did not
+	// happen sent the caller's next writes to the tenant it left.
+	res, err := app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", newGroupID, session.ID)
+	if err != nil {
+		serverError(w, r, app, "switch organization", err, "Could not switch organization")
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		http.Error(w, "Switching organization needs a sign-in session: an API token or edge identity can't hold one", http.StatusBadRequest)
+		return
+	}
+	invalidateRequestSession(r)
 	referer := r.Header.Get("Referer")
 	if referer == "" {
 		referer = "/"
@@ -83,7 +93,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 
 	// CSRF validation - prevent cross-site login attacks
 	if !validateCSRF(r) {
-		authRedirect(w, r, app.Paths.Login, "Invalid request")
+		authCSRFRefused(w, r, app.Paths.Login)
 		return
 	}
 
@@ -117,6 +127,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Brute force check (per-account). Stops a focused attack on one user.
+	defer lockAttempt(loginValue)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, loginValue) {
 		authRedirect(w, r, app.Paths.Login, "Too many failed attempts. Try again in 15 minutes.")
 		return
@@ -143,12 +154,20 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email)
 	if err != nil {
+		burnPasswordCheck(password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
 		return
 	}
 
+	// Capture the generation before checking the password. Challenge issuance
+	// rechecks it while holding the writer, including same-hash resets.
+	_, proofHash, proofBinding, err := mfaSetupAccountState(app, app.DB, id, email)
+	if err != nil || !hmac.Equal([]byte(hash), []byte(proofHash)) {
+		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
+		return
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
@@ -159,115 +178,66 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	// Success
 	recordLoginAttempt(app.DB, loginValue, true)
 
+	// A grandfathered, unverified account proves its email before any factor.
+	if _, stop := grandfatheredSignInNeedsProof(app, r, id); stop {
+		authRedirect(w, r, app.Paths.Login, grandfatheredVerifyMessage)
+		return
+	}
+
 	// MFA check: if user has TOTP enabled, require code before creating session
 	if CheckMFA(app.DB, id) {
 		mfaCode := strings.TrimSpace(r.FormValue("mfa_code"))
 		if mfaCode == "" {
-			// Redirect to MFA verification page
-			http.SetCookie(w, &http.Cookie{
-				Name: "_benmore_mfa_uid", Value: signTempCookie(fmt.Sprintf("%d|%s", id, email)),
-				Path: "/", HttpOnly: true, Secure: !app.DevMode,
-				SameSite: http.SameSiteLaxMode, MaxAge: 300,
-			})
+			// Keep the accepted password generation and exact OTP lookup key
+			// in a one-use challenge; social sign-ins carry no OTP key.
+			token := mintSignInChallenge(app, tempCookieMFA, id, email, loginValue, proofBinding)
+			if token == "" {
+				authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
+				return
+			}
+			setFlowCookie(w, flowCookieMFA, token, !app.DevMode, 300)
 			http.Redirect(w, r, app.Paths.VerifyMFA, http.StatusSeeOther)
 			return
 		}
-		mfaKey := mfaLockKey(id)
-		if isAccountLocked(app.DB, mfaKey) {
-			authRedirect(w, r, app.Paths.Login, "Too many MFA attempts. Try again in 15 minutes.")
-			return
-		}
-		if !ValidateMFACode(app.DB, id, mfaCode) {
-			recordLoginAttempt(app.DB, mfaKey, false)
-			authRedirect(w, r, app.Paths.Login, "Invalid MFA code")
-			return
-		}
-		recordLoginAttempt(app.DB, mfaKey, true)
+		completeInlineMFALogin(w, r, app, id, email, loginValue, hash, proofBinding, mfaCode)
+		return
 	} else {
 		// MFA not enrolled. If the user's role appears in
 		// `auth.require_mfa_for_roles`, redirect to the enrollment
 		// page instead of issuing a session. The setup-token cookie
 		// authorises /api/_auth/mfa/setup + /verify on this user's
 		// behalf; verify mints the real session on successful enroll.
-		var role string
-		app.DB.QueryRow("SELECT COALESCE(role, '') FROM _benmore_users WHERE id = ?", id).Scan(&role)
-		if roleRequiresMFAEnrollment(app, role) {
-			http.SetCookie(w, &http.Cookie{
-				Name: "_benmore_mfa_setup", Value: mintMFASetupToken(id, email),
-				Path: "/", HttpOnly: true, Secure: !app.DevMode,
-				SameSite: http.SameSiteLaxMode, MaxAge: int(mfaSetupTokenTTL.Seconds()),
-			})
-			redirect := "/mfa-setup"
-			if app.Design != nil {
-				if v := strings.TrimSpace(app.Design.Auth["mfa_setup_redirect"]); v != "" {
-					redirect = v
-				}
-			}
-			http.Redirect(w, r, redirect, http.StatusSeeOther)
+		//
+		// With auth.otp on, the emailed code comes first: the setup token
+		// ends in a full session, so minting it on the password alone would
+		// skip the OTP. handleVerifyOTP starts enrollment once the code is
+		// proven.
+		if userRequiresMFAEnrollment(app, id) && !otpLoginEnabled(app) {
+			redirectToMFAEnrollment(w, r, app, id, email, hash, proofBinding)
 			return
 		}
 	}
 
-	// Update last_login_at and fire user hooks (on_update: _benmore_users)
-	app.DB.Exec("UPDATE _benmore_users SET last_login_at = datetime('now') WHERE id = ?", id)
-	FireUserHooks(app, "update", id)
-
-	// Dashboard login → heal platform_users with the verified hash so
-	// existing accounts that pre-date the sync hook get auto-fixed on
-	// next login. No-op for every app other than _platform.
-	syncPlatformUserFromDashboard(app, email, hash)
-
 	// OTP check: if auth_otp is set, send a code before creating session
 	// Supports email OTP and phone OTP (SMS) depending on identifier config
-	if app.Design != nil && app.Design.Auth["otp"] == "true" {
-		code := generateOTP()
-		app.DB.Exec("CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
-		app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", loginValue)
-		app.DB.Exec("INSERT INTO _benmore_otp (email, code, attempts, expires_at) VALUES (?, ?, 0, datetime('now', '+10 minutes'))", loginValue, code)
-
-		// Send OTP via SMS or email depending on identifier
-		if identifier == "phone" {
-			// Look up phone number
-			var phone string
-			app.DB.QueryRow("SELECT COALESCE(phone, '') FROM _benmore_users WHERE id = ?", id).Scan(&phone)
-			if phone != "" {
-				if err := SendSMS(app.Dir, phone, fmt.Sprintf("Your verification code: %s", code)); err != nil {
-					log.Printf("auth: SMS send failed for verification code (phone=%s): %v", phone, err)
-				}
-			}
-		} else {
-			// Send via email (default) - branded shell + logo via the
-			// shared template helper so OTP emails match every other
-			// transactional email from this app.
-			brand := AppEmailBrand(app, r)
-			siteName := brand.SiteName
-			body := RenderBrandedCodeEmail(
-				brand,
-				"Your verification code",
-				fmt.Sprintf("Enter this code to finish signing in to %s. It expires in 10 minutes.", html.EscapeString(siteName)),
-				code,
-				"If you didn't try to sign in, you can ignore this email - your account is safe.",
-			)
-			if err := SendEmail(app.Dir, email, "Your verification code · "+siteName, body); err != nil {
-				log.Printf("auth: email send failed for verification code (to=%s): %v", email, err)
-			}
+	if otpLoginEnabled(app) {
+		if startLoginOTP(w, r, app, id, email, loginValue, proofBinding) {
+			app.DB.Exec("UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=?", id)
+			FireUserHooks(app, "update", id)
+			syncPlatformUserFromDashboard(app, email, hash)
 		}
-
-		// Store user ID + the OTP lookup key in a temp cookie for the OTP
-		// page. H-12: the OTP row was INSERTed under loginValue (the
-		// normalized identifier - username/phone/email), but verify used
-		// to look it up by email, so non-email identifiers never matched
-		// and those users were locked out. Carry the exact send-time key
-		// (loginValue) through the signed cookie so verify keys on the
-		// SAME value. Format is id|email|otpkey; the 2-part legacy form
-		// still parses (verify falls back to email as the key).
-		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s|%s", id, email, loginValue)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-		sendOTPChallenge(w, r, app)
 		return
 	}
 
 	groupID := ResolveGroupID(app.DB, app.Group, email)
-	sessionID := CreateSession(app.DB, id, email, groupID, app.SessionDuration)
+	sessionID, err := createPasswordSignInSession(app, id, email, groupID, proofBinding)
+	if err != nil {
+		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
+		return
+	}
+	FireUserHooks(app, "update", id)
+	// Dashboard-only healing happens after the accepted proof was rechecked.
+	syncPlatformUserFromDashboard(app, email, hash)
 
 	AttachSessionContext(app.DB, sessionID, r)
 	http.SetCookie(w, sessionCookie(sessionID, app.DevMode, app.SessionDuration))
@@ -296,6 +266,91 @@ func generateOTP() string {
 	rand.Read(b)
 	n := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
 	return fmt.Sprintf("%06d", n%1000000)
+}
+
+// startLoginOTP sends the auth.otp sign-in code for an account whose
+// password - and second factor, when one is enrolled - already passed, and
+// routes the browser to the code step. No session exists until the code is
+// proven (handleVerifyOTP). loginValue is the normalized identifier the
+// account signed in with; the code row is keyed on it.
+func startLoginOTP(w http.ResponseWriter, r *http.Request, app *App, id int64, email, loginValue string, expected ...string) bool {
+	binding := ""
+	if len(expected) > 0 {
+		binding = expected[0]
+	}
+	code, token, err := prepareLoginOTP(app, id, email, loginValue, binding)
+	if err != nil {
+		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
+		return false
+	}
+	sendLoginOTP(w, r, app, id, email, loginValue, code, token)
+	return true
+}
+
+func prepareLoginOTP(app *App, id int64, email, loginValue, binding string) (code, token string, err error) {
+	tx, err := signInWriteTx(app.DB)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+	code, token, err = prepareLoginOTPTx(app, tx, id, email, loginValue, binding)
+	if err == nil {
+		err = tx.Commit()
+	}
+	return
+}
+
+func prepareLoginOTPTx(app *App, tx *sql.Tx, id int64, email, loginValue, binding string) (code, token string, err error) {
+	token, err = mintSignInChallengeTx(app, tx, tempCookieOTP, id, email, loginValue, binding)
+	if err != nil {
+		return "", "", err
+	}
+	code = generateOTP()
+	if _, err = tx.Exec("CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)"); err != nil {
+		return "", "", err
+	}
+	if _, err = tx.Exec("DELETE FROM _benmore_otp WHERE email=?", loginValue); err != nil {
+		return "", "", err
+	}
+	_, err = tx.Exec("INSERT INTO _benmore_otp(email,code,attempts,expires_at) VALUES (?,?,0,datetime('now','+10 minutes'))", loginValue, code)
+	return
+}
+
+func sendLoginOTP(w http.ResponseWriter, r *http.Request, app *App, id int64, email, loginValue, code, token string) {
+	identifier := authIdentifier(app)
+
+	// Send OTP via SMS or email depending on identifier
+	if identifier == "phone" {
+		// Look up phone number
+		var phone string
+		app.DB.QueryRow("SELECT COALESCE(phone, '') FROM _benmore_users WHERE id = ?", id).Scan(&phone)
+		if phone != "" {
+			if err := SendSMS(app.Dir, phone, fmt.Sprintf("Your verification code: %s", code)); err != nil {
+				log.Printf("auth: SMS send failed for verification code (user=%d): %s", id, logSendError(err, phone))
+			}
+		}
+	} else {
+		// Send via email (default) - branded shell + logo via the
+		// shared template helper so OTP emails match every other
+		// transactional email from this app.
+		brand := AppEmailBrand(app, r)
+		siteName := brand.SiteName
+		body := RenderBrandedCodeEmail(
+			brand,
+			"Your verification code",
+			fmt.Sprintf("Enter this code to finish signing in to %s. It expires in 10 minutes.", html.EscapeString(siteName)),
+			code,
+			"If you didn't try to sign in, you can ignore this email - your account is safe.",
+		)
+		if err := SendEmail(app.Dir, email, "Your verification code · "+siteName, body); err != nil {
+			log.Printf("auth: email send failed for verification code (user=%d): %s", id, logSendError(err, email))
+		}
+	}
+
+	// The opaque cookie resolves to the account and exact send-time key in
+	// SQLite; username/phone identifiers must not be replaced by the email.
+	setFlowCookie(w, flowCookieOTP, token, !app.DevMode, 600)
+	sendOTPChallenge(w, r, app)
 }
 
 // sendOTPChallenge routes the caller to the OTP verification step after a code
@@ -331,66 +386,124 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 		otpPath += "?next=" + url.QueryEscape(next)
 	}
 
-	cookie, err := r.Cookie("_benmore_otp_uid")
+	// The step cookie is the ambient credential here and the code is the only
+	// secret, so the form carries no CSRF token; but another site (a sibling
+	// tenant is same-site, so SameSite=Lax doesn't stop it) must not be able
+	// to post guesses through a visitor's half-finished sign-in and burn the
+	// code or lock the step.
+	if _, ok := csrfOriginReason(r); !ok {
+		authRedirect(w, r, otpPath, "This form expired. Reload the page and try again.")
+		return
+	}
+
+	cookie, err := requestFlowCookie(r, flowCookieOTP)
 	if err != nil || cookie.Value == "" {
 		authRedirect(w, r, otpPath, "Session expired. Please log in again.")
 		return
 	}
 
-	// Verify cookie signature (prevents forgery)
-	verified := verifyTempCookie(cookie.Value)
-	if verified == "" {
+	challenge, err := signInChallengeIdentity(app, app.DB, cookie.Value, tempCookieOTP)
+	if err != nil {
 		authRedirect(w, r, otpPath, "Invalid session. Please log in again.")
 		return
 	}
-	// Cookie payload is id|email|otpkey (H-12). The 3rd field is the exact
-	// key the OTP row was stored under at send time (the normalized
-	// identifier - which for username/phone identifiers is NOT the email).
-	// Older cookies are 2-part (id|email); for those we fall back to email
-	// as the lookup key, matching the pre-fix behavior for email apps.
-	parts := strings.SplitN(verified, "|", 3)
-	if len(parts) < 2 {
-		authRedirect(w, r, otpPath, "Invalid session. Please log in again.")
+	id, email, otpKey := challenge.UserID, challenge.Email, challenge.OTPKey
+
+	// Every correct-password login issues a fresh code with 5 tries, so
+	// failures must also count per account across codes, or holding the
+	// password alone lets a caller keep guessing the second factor.
+	otpLockKey := "otp:" + otpKey
+	defer lockAttempt(otpLockKey)() // serialize this account's check→verify→record (lockout race)
+	if isAccountLocked(app.DB, otpLockKey) {
+		authRedirect(w, r, otpPath, "Too many attempts. Try again in 15 minutes.")
 		return
-	}
-	uidStr, email := parts[0], parts[1]
-	otpKey := email
-	if len(parts) == 3 && parts[2] != "" {
-		otpKey = parts[2]
 	}
 
-	// Verify OTP with attempt limiting. Keyed on otpKey so it matches the
-	// value the row was INSERTed under on send (H-12).
+	groupID := ResolveGroupID(app.DB, app.Group, email)
+	tx, err := signInWriteTx(app.DB)
+	if err != nil {
+		serverErrorJSON(w, r, app, "OTP sign-in", err, "Sign-in could not be saved")
+		return
+	}
+	defer tx.Rollback()
+	challenge, err = signInChallengeIdentity(app, tx, cookie.Value, tempCookieOTP)
+	if err != nil {
+		authRedirect(w, r, otpPath, "Invalid session. Please log in again.")
+		return
+	}
 	var storedCode string
 	var attempts int
-	err = app.DB.QueryRow("SELECT code, attempts FROM _benmore_otp WHERE email = ? AND datetime(expires_at) > datetime('now')", otpKey).Scan(&storedCode, &attempts)
+	err = tx.QueryRow("UPDATE _benmore_otp SET attempts=attempts+1 WHERE email=? AND attempts<5 AND datetime(expires_at)>datetime('now') RETURNING code,attempts", otpKey).Scan(&storedCode, &attempts)
 	if err != nil {
+		var exists int
+		tx.QueryRow("SELECT COUNT(*) FROM _benmore_otp WHERE email=? AND datetime(expires_at)>datetime('now')", otpKey).Scan(&exists)
+		if exists > 0 {
+			if _, err = tx.Exec("DELETE FROM _benmore_otp WHERE email=?", otpKey); err == nil {
+				err = tx.Commit()
+			}
+			if err != nil {
+				serverErrorJSON(w, r, app, "OTP sign-in", err, "Sign-in could not be saved")
+				return
+			}
+			authRedirect(w, r, otpPath, "Too many attempts. Please log in again.")
+			return
+		}
 		authRedirect(w, r, otpPath, "Code expired. Please log in again.")
 		return
 	}
-
-	if attempts >= 5 {
-		app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", otpKey)
-		authRedirect(w, r, otpPath, "Too many attempts. Please log in again.")
-		return
-	}
-
 	if !SecureCompare(code, storedCode) {
-		app.DB.Exec("UPDATE _benmore_otp SET attempts = attempts + 1 WHERE email = ?", otpKey)
-		authRedirect(w, r, otpPath, fmt.Sprintf("Invalid code. %d attempts remaining.", 4-attempts))
+		if err = tx.Commit(); err != nil {
+			serverErrorJSON(w, r, app, "OTP sign-in", err, "Sign-in could not be saved")
+			return
+		}
+		recordLoginAttempt(app.DB, otpLockKey, false)
+		authRedirect(w, r, otpPath, fmt.Sprintf("Invalid code. %d attempts remaining.", 5-attempts))
 		return
 	}
-
-	// OTP valid - clean up and create session
-	app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", otpKey)
-	http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Path: "/", MaxAge: -1})
-
-	var id int64
-	fmt.Sscanf(uidStr, "%d", &id)
-
-	groupID := ResolveGroupID(app.DB, app.Group, email)
-	sessionID := CreateSession(app.DB, id, email, groupID, app.SessionDuration)
-
+	needsEnrollment, err := needsMFAEnrollmentWith(app, tx, id)
+	if err != nil {
+		serverErrorJSON(w, r, app, "OTP sign-in", err, "Sign-in could not be saved")
+		return
+	}
+	var sessionID, setupToken string
+	if err = consumeSignInChallenge(tx, challenge); err == nil {
+		_, err = tx.Exec("DELETE FROM _benmore_otp WHERE email=?", otpKey)
+	}
+	if err == nil && authIdentifier(app) != "phone" {
+		_, err = tx.Exec("UPDATE _benmore_users SET verified=1 WHERE id=? AND email=? COLLATE NOCASE", id, email)
+	}
+	if err == nil {
+		if needsEnrollment {
+			setupToken = mintMFASetupTokenWith(app, tx, id, email)
+			if setupToken == "" {
+				err = fmt.Errorf("could not issue enrollment grant")
+			}
+		} else {
+			sessionID, err = createSignInSessionTx(tx, id, email, groupID, app.SessionDuration)
+		}
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		serverErrorJSON(w, r, app, "OTP sign-in", err, "Sign-in could not be saved")
+		return
+	}
+	recordLoginAttempt(app.DB, otpLockKey, true)
+	clearFlowCookie(w, flowCookieOTP)
+	platformEmailProved(app, email, true)
+	if authIdentifier(app) != "phone" {
+		activateEmailInvites(app, id, email)
+	}
+	if setupToken != "" {
+		setFlowCookie(w, flowCookieMFASetup, setupToken, !app.DevMode, int(mfaSetupTokenTTL.Seconds()))
+		redirect := "/mfa-setup"
+		if app.Design != nil && strings.TrimSpace(app.Design.Auth["mfa_setup_redirect"]) != "" {
+			redirect = app.Design.Auth["mfa_setup_redirect"]
+		}
+		http.Redirect(w, r, redirect, http.StatusSeeOther)
+		return
+	}
 	AttachSessionContext(app.DB, sessionID, r)
 	http.SetCookie(w, sessionCookie(sessionID, app.DevMode, app.SessionDuration))
 
@@ -464,6 +577,11 @@ func emailMatchesGate(email, domainRaw, allowRaw string) (bool, string) {
 		return true, "" // no restriction configured
 	}
 	email = strings.ToLower(strings.TrimSpace(email))
+	// A gate compares the address, so it must be one address: a list or a
+	// second "@" would let a foreign mailbox ride along with an allowed tail.
+	if !validAuthEmail(email) {
+		return false, "Enter a valid email address."
+	}
 
 	// Exact-address allowlist - bypasses the domain check (domain mode) AND is
 	// the sole gate in closed exact-allowlist mode.
@@ -495,6 +613,9 @@ func emailMatchesGate(email, domainRaw, allowRaw string) (bool, string) {
 }
 
 func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
+	if refuseDisabledAuthFeature(w, r, app, "signup") {
+		return
+	}
 	// OAuth-only mode (app.yaml auth.oauth_only): no password signup.
 	if oauthOnly(app) {
 		authRedirect(w, r, app.Paths.Signup, "Please sign up with Google.")
@@ -508,7 +629,7 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 
 	// CSRF validation - prevent cross-site signup attacks
 	if !validateCSRF(r) {
-		authRedirect(w, r, app.Paths.Signup, "Invalid request")
+		authCSRFRefused(w, r, app.Paths.Signup)
 		return
 	}
 
@@ -519,16 +640,16 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		authRedirect(w, r, app.Paths.Signup, "Email and password are required")
 		return
 	}
-	// Reject pipe / control chars in the identifier (round-2 #M). The signed
-	// OTP / MFA-setup / signed-URL cookies are `|`-delimited over this value;
-	// a `|` (or CR/LF/NUL) would shift the field boundaries and let a crafted
-	// identifier desync the parsed fields from what was signed.
-	if strings.ContainsAny(email, "|\r\n\x00") {
+	// One plain mailbox: no list, display-name form, "|", control or
+	// invisible characters (validAuthEmail, the rule OAuth sign-in and email
+	// change share).
+	if !validAuthEmail(email) {
 		authRedirect(w, r, app.Paths.Signup, "Invalid email")
 		return
 	}
 
 	// Brute force protection on signup
+	defer lockAttempt(email)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, email) {
 		authRedirect(w, r, app.Paths.Signup, "Too many attempts. Try again in 15 minutes.")
 		return
@@ -546,6 +667,17 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
+	// Abuse limits (auth_signup_limits.go), before the bcrypt hash and the
+	// account row: per client address, and per mailbox when this sign-up
+	// sends mail (plus-addressing makes unlimited accounts for one inbox).
+	if retry, limited := signupRateLimited(app, r, email); limited {
+		if wantsJSON(r) {
+			setRetryAfter(w, retry)
+		}
+		authRedirect(w, r, app.Paths.Signup, "Too many sign-up attempts. Try again later.")
+		return
+	}
+
 	hash, err := generateBcryptHash([]byte(password))
 	if err != nil {
 		authRedirect(w, r, app.Paths.Signup, "Server error")
@@ -560,18 +692,16 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	values := []any{username, email, string(hash)}
 
 	if app.Design != nil {
-		if sf := app.Design.Auth["signup_fields"]; sf != "" {
-			for _, field := range strings.Split(sf, ",") {
-				field = strings.TrimSpace(field)
-				if field == "" || field == "email" || field == "password" || field == "password_hash" || field == "username" || field == "password_change_required" {
-					continue
-				}
-				val := strings.TrimSpace(r.FormValue(field))
-				if val != "" {
-					fields = append(fields, field)
-					placeholders = append(placeholders, "?")
-					values = append(values, val)
-				}
+		// Only plain profile columns: signupFieldList drops role, verified,
+		// secrets, tenant columns and anything that isn't an identifier, so
+		// a public signup can't name its own authority (or reach the SQL
+		// text below with anything but a validated column name).
+		for _, field := range signupFieldList(app.Design.Auth["signup_fields"], app.Group) {
+			val := strings.TrimSpace(r.FormValue(field))
+			if val != "" {
+				fields = append(fields, quoteIdent(field))
+				placeholders = append(placeholders, "?")
+				values = append(values, val)
 			}
 		}
 	}
@@ -599,8 +729,9 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// No-op for every app other than _platform.
 	syncPlatformUserFromDashboard(app, email, string(hash))
 
-	// Activate any pending invites for this email (app-level user_roles table)
-	app.DB.Exec("UPDATE user_roles SET user_id = ?, is_active = 1, invite_accepted_at = datetime('now') WHERE email = ? AND user_id IS NULL AND is_active = 0", id, email)
+	// Pending invites for this email (app-level user_roles table) are not
+	// activated here: the address is unproven until the verification link,
+	// an emailed OTP or a verified OAuth sign-in (markEmailVerified).
 
 	// Email verification (opt-in via auth.verify_email in app.yaml).
 	//
@@ -620,13 +751,18 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// immediate login + a soft "please verify" banner) and rely on the
 	// request-time check rather than withholding the session at signup.
 	needsVerification := app.Design != nil && app.Design.Auth["verify_email"] == "true"
+	// No trustworthy origin → no link (securityLinkBaseURL logged why).
+	linkBase, linkOK := "", false
 	if needsVerification {
+		linkBase, linkOK = securityLinkBaseURL(app, r)
+	}
+	if needsVerification && linkOK {
 		token := generateToken(32)
 		expires := time.Now().Add(1 * time.Hour)
 		app.DB.Exec("INSERT INTO _benmore_password_resets (token, email, expires_at, type) VALUES (?, ?, ?, 'verify')",
 			hashResetToken(token), email, expires.UTC().Format(time.RFC3339))
 
-		verifyURL := fmt.Sprintf("%s/verify-email?token=%s", securityLinkBaseURL(app, r), token)
+		verifyURL := fmt.Sprintf("%s/verify-email?token=%s", linkBase, token)
 
 		siteName := "App"
 		if sn, ok := app.Design.SEO["site_name"]; ok && sn != "" {
@@ -638,7 +774,7 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 <p><a href="%s">Verify Email</a></p>`, html.EscapeString(siteName), verifyURL)
 
 		if err := SendEmail(app.Dir, email, "Verify your email - "+siteName, body); err != nil {
-			log.Printf("auth: signup verification email failed (to=%s): %v", email, err)
+			log.Printf("auth: signup verification email failed (user=%d): %s", id, logSendError(err, email))
 		}
 	}
 
@@ -647,11 +783,14 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// the OAuth callback, not here, so they're exempt by construction. The
 	// account row already exists; the session is only minted once the code is
 	// confirmed on /verify-otp (same flow login uses).
-	if app.Design != nil && app.Design.Auth["otp"] == "true" {
-		code := generateOTP()
-		app.DB.Exec("CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
-		app.DB.Exec("DELETE FROM _benmore_otp WHERE email = ?", email)
-		app.DB.Exec("INSERT INTO _benmore_otp (email, code, attempts, expires_at) VALUES (?, ?, 0, datetime('now', '+10 minutes'))", email, code)
+	if otpLoginEnabled(app) {
+		code, token, err := prepareLoginOTP(app, id, email, email, "")
+		if err != nil {
+			serverErrorJSON(w, r, app, "OTP signup", err, "Sign-up could not be saved")
+			return
+		}
+		// Signup proves the email, even when subsequent logins use a phone
+		// identifier. Keep its delivery and message distinct from sign-in.
 		brand := AppEmailBrand(app, r)
 		body := RenderBrandedCodeEmail(
 			brand,
@@ -661,18 +800,15 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 			"If you didn't sign up, you can ignore this email.",
 		)
 		if err := SendEmail(app.Dir, email, "Your verification code · "+brand.SiteName, body); err != nil {
-			log.Printf("auth: signup OTP email failed (to=%s): %v", email, err)
+			log.Printf("auth: signup OTP email failed (user=%d): %s", id, logSendError(err, email))
 		}
-		// H-12: signup keys the OTP row on email, so the cookie's OTP key
-		// is email too. Carry it explicitly (id|email|otpkey) so the
-		// verify handler uses the identical key on lookup.
-		http.SetCookie(w, &http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s|%s", id, email, email)), Path: "/", HttpOnly: true, Secure: !app.DevMode, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+		setFlowCookie(w, flowCookieOTP, token, !app.DevMode, 600)
 		sendOTPChallenge(w, r, app)
 		return
 	}
 
 	groupID := ResolveGroupID(app.DB, app.Group, email)
-	sessionID := CreateSession(app.DB, id, email, groupID, app.SessionDuration)
+	sessionID := createSignInSession(app.DB, id, email, groupID, app.SessionDuration)
 
 	AttachSessionContext(app.DB, sessionID, r)
 
@@ -702,18 +838,13 @@ func handleLogout(w http.ResponseWriter, r *http.Request, app *App) {
 		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		DeleteSessionFromDB(app.DB, cookie.Value)
+	// The session this request authenticates with: the cookie, or a Bearer
+	// session token (persistent API tokens are revoked on their own route).
+	if id := authRawSessionID(r); id != "" {
+		DeleteSessionFromDB(app.DB, id)
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   !app.DevMode,
-	})
+	invalidateRequestSession(r)
+	clearSessionCookies(w, app.DevMode)
 	if wantsJSON(r) {
 		httpJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
@@ -725,6 +856,9 @@ func handleLogout(w http.ResponseWriter, r *http.Request, app *App) {
 // POST /api/_auth/token with JSON body: {"email": "...", "password": "..."}
 // Returns: {"token": "...", "user_id": N, "email": "..."}
 func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
+	if refuseDisabledAuthFeature(w, r, app, "api_tokens") {
+		return
+	}
 	// OAuth-only mode (app.yaml auth.oauth_only): the email+password →
 	// Bearer exchange is a password sign-in path, so it must be refused
 	// too - otherwise oauth_only would close the interactive login/signup
@@ -733,7 +867,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		http.Error(w, `{"error":"password auth is disabled - this app uses social sign-in only"}`, http.StatusForbidden)
 		return
 	}
-	if !tokenAuthIPLimiter.Allow("token:" + clientIP(r)) {
+	if !tokenAuthIPLimiter.Allow(appLimiterKey(app, "token", clientRateBucket(clientIP(r)))) {
 		http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
 		return
 	}
@@ -757,6 +891,11 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	if authIdentifier(app) == "email" {
 		body.Email = normalizeEmail(body.Email)
+		// Same auth.domain / auth.allow_emails gate as interactive login.
+		if ok, reason := emailAllowedForApp(app, body.Email); !ok {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": reason})
+			return
+		}
 	}
 
 	// Validate scopes if provided
@@ -770,8 +909,17 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Check brute force lockout
+	defer lockAttempt(body.Email)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, body.Email) {
 		http.Error(w, `{"error":"too many attempts, try again later"}`, http.StatusTooManyRequests)
+		return
+	}
+	// The same per-IP failure cap as /login: this is a password sign-in
+	// too, and without it a spray rotating identifiers here dodged the
+	// network lock the interactive form applies.
+	loginIP := clientIP(r)
+	if authIsIPLocked(app.DB, loginIP) {
+		http.Error(w, `{"error":"too many failed attempts from this network, try again later"}`, http.StatusTooManyRequests)
 		return
 	}
 
@@ -785,22 +933,36 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending)
 	if err != nil {
+		burnPasswordCheck(body.Password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, body.Email, false)
+		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil {
 		recordLoginAttempt(app.DB, body.Email, false)
+		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
 
 	recordLoginAttempt(app.DB, body.Email, true)
+	if _, stop := grandfatheredSignInNeedsProof(app, r, userID); stop {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "email_verification_required", "message": grandfatheredVerifyMessage})
+		return
+	}
 	// Pending accounts must finish the interactive login path, including any
 	// configured email OTP. A password-only token must not bypass that proof.
 	if pending != 0 {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "password_change_required", "redirect": app.Paths.Login})
+		return
+	}
+	// The same holds for every account when auth.otp is set: only the
+	// interactive login proves the emailed code, so this exchange can't
+	// issue a session on the password alone.
+	if app.Design != nil && app.Design.Auth["otp"] == "true" {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "otp_required", "redirect": app.Paths.Login})
 		return
 	}
 
@@ -829,10 +991,15 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		// real session on successful enrollment.
 		var role string
 		app.DB.QueryRow("SELECT COALESCE(role, '') FROM _benmore_users WHERE id = ?", userID).Scan(&role)
-		if roleRequiresMFAEnrollment(app, role) {
+		if userRequiresMFAEnrollment(app, userID) {
+			setupToken := mintMFASetupToken(app, userID, email, hash)
+			if setupToken == "" {
+				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "credentials changed; sign in again"})
+				return
+			}
 			httpJSON(w, http.StatusOK, map[string]any{
 				"mfa_setup_required": true,
-				"setup_token":        mintMFASetupToken(userID, body.Email),
+				"setup_token":        setupToken, // the account's email, never the typed identifier
 				"user_id":            userID,
 				"email":              body.Email,
 				"role":               role,
@@ -847,6 +1014,9 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 
 	groupID := ResolveGroupID(app.DB, app.Group, email)
 	token := CreateSession(app.DB, userID, email, groupID, app.SessionDuration, body.Scopes)
+	// Each exchange leaves a session behind for the whole session lifetime;
+	// the account keeps its newest ones (auth_credential_caps.go).
+	trimTokenExchangeSessions(app.DB, userID)
 
 	AttachSessionContext(app.DB, token, r)
 

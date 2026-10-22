@@ -160,8 +160,8 @@ func StartAuditShipper(app *App) {
 
 	log.Printf("audit-shipper: enabled - dest=%s interval=%s batch=%d", redactURL(url), interval, batch)
 
+	stop := app.workerStopGeneration()
 	safeGo("audit.shipper", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -198,16 +198,35 @@ type auditRow struct {
 	App       string          `json:"app"`
 }
 
+// auditShippedValue is how a stored old_values/new_values text travels: as
+// the JSON it holds, or - when it is not valid JSON - as a JSON string of the
+// text itself, so one malformed row cannot make the batch unmarshallable.
+func auditShippedValue(stored string) json.RawMessage {
+	if stored == "" {
+		return nil
+	}
+	if json.Valid([]byte(stored)) {
+		return json.RawMessage(stored)
+	}
+	quoted, _ := json.Marshal(stored)
+	return quoted
+}
+
 func shipOnce(db *sql.DB, url, secret, token string, batch int, appName string) {
 	var cursor int64
 	if err := db.QueryRow(fmt.Sprintf("SELECT last_shipped_id FROM %s WHERE id = 1", auditShipperCursorTable)).Scan(&cursor); err != nil {
 		log.Printf("audit-shipper: cursor read failed: %s", err)
 		return
 	}
+	// App flows write audit rows too, so no column is trusted to hold what
+	// the framework would put there: every value is read as text. A row the
+	// shipper cannot parse still ships (auditShippedValue), because dropping
+	// it would lose the entry and refusing it would stop shipping for good.
 	rows, err := db.Query(`
-		SELECT id, action, table_name, COALESCE(row_id, ''), COALESCE(user_id, 0),
-		       COALESCE(user_email, ''), COALESCE(old_values, ''), COALESCE(new_values, ''),
-		       COALESCE(created_at, '')
+		SELECT id, CAST(COALESCE(action, '') AS TEXT), CAST(COALESCE(table_name, '') AS TEXT),
+		       CAST(COALESCE(row_id, '') AS TEXT), CAST(COALESCE(user_id, 0) AS TEXT),
+		       CAST(COALESCE(user_email, '') AS TEXT), CAST(COALESCE(old_values, '') AS TEXT),
+		       CAST(COALESCE(new_values, '') AS TEXT), CAST(COALESCE(created_at, '') AS TEXT)
 		FROM _benmore_audit_log
 		WHERE id > ?
 		ORDER BY id
@@ -222,17 +241,16 @@ func shipOnce(db *sql.DB, url, secret, token string, batch int, appName string) 
 	var maxID int64
 	for rows.Next() {
 		var r auditRow
-		var oldVals, newVals string
-		if err := rows.Scan(&r.ID, &r.Action, &r.TableName, &r.RowID, &r.UserID, &r.UserEmail, &oldVals, &newVals, &r.CreatedAt); err != nil {
-			continue
+		var userID, oldVals, newVals string
+		if err := rows.Scan(&r.ID, &r.Action, &r.TableName, &r.RowID, &userID, &r.UserEmail, &oldVals, &newVals, &r.CreatedAt); err != nil {
+			// Never advance past a row that was not shipped.
+			log.Printf("audit-shipper: audit row unreadable, batch not shipped (will retry next tick): %s", err)
+			return
 		}
 		r.App = appName
-		if oldVals != "" {
-			r.OldValues = json.RawMessage(oldVals)
-		}
-		if newVals != "" {
-			r.NewValues = json.RawMessage(newVals)
-		}
+		r.UserID, _ = strconv.ParseInt(strings.TrimSpace(userID), 10, 64)
+		r.OldValues = auditShippedValue(oldVals)
+		r.NewValues = auditShippedValue(newVals)
 		entries = append(entries, r)
 		if r.ID > maxID {
 			maxID = r.ID
@@ -271,7 +289,7 @@ func shipOnce(db *sql.DB, url, secret, token string, batch int, appName string) 
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := auditShipperHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("audit-shipper: POST failed: %s (will retry next tick)", err)
@@ -292,6 +310,28 @@ func shipOnce(db *sql.DB, url, secret, token string, batch int, appName string) 
 	} else {
 		log.Printf("audit-shipper: dest returned %d (will retry same window next tick)", resp.StatusCode)
 	}
+}
+
+// auditShipperHTTPClient delivers to the destination validated at startup.
+// That check resolved the hostname once; every tick re-resolves it, and a
+// public endpoint can redirect. Unless the operator explicitly allowed
+// private destinations (BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1), deliver with the
+// strict client so each redirect and the address actually dialed stay public.
+func auditShipperHTTPClient() *http.Client {
+	if auditWebhookAllowsPrivate() {
+		return &http.Client{Timeout: 15 * time.Second}
+	}
+	return safeHTTPClientStrict(15 * time.Second)
+}
+
+// auditWebhookAllowsPrivate reports whether the on-prem override may send
+// audit batches to a private address. A platform-managed tenant
+// (BENMORE_BIND_LOOPBACK=1) sets its own env, and there a private address can
+// only be the host's own services, so the override keeps allowing http:// but
+// never a private destination.
+func auditWebhookAllowsPrivate() bool {
+	return strings.TrimSpace(os.Getenv("BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP")) == "1" &&
+		os.Getenv("BENMORE_BIND_LOOPBACK") != "1"
 }
 
 // validateAuditWebhookURL enforces the security gate documented on
@@ -323,8 +363,8 @@ func validateAuditWebhookURL(raw string) string {
 		// When the operator explicitly opted into HTTP for an on-prem
 		// internal link via BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1, allow
 		// private destinations (that's the whole point of the override).
-		if !allowHTTP {
-			return "URL resolves to a private / loopback / link-local address - refused (set BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1 if this is an intentional on-prem internal endpoint)"
+		if !auditWebhookAllowsPrivate() {
+			return "URL resolves to a private / loopback / link-local address - refused (set BENMORE_AUDIT_WEBHOOK_ALLOW_HTTP=1 if this is an intentional on-prem internal endpoint; hosted apps cannot use one)"
 		}
 	}
 	return ""

@@ -337,32 +337,32 @@ func TestInterpolateCtxSafe_ParamWordBoundary(t *testing.T) {
 }
 
 // TestEvaluateCondition_MissingKeyNotEqualEmpty pins the v2.7.6 fix
-// for `field != ”` firing on missing keys. Pre-fix, nil formatted
-// as `"<nil>"` via fmt.Sprintf, so `<nil> != ”` always evaluated
-// true - agents gating on optional columns hit this every time.
+// for "field != empty string" firing on missing keys. Pre-fix, nil
+// formatted as `"<nil>"` via fmt.Sprintf, so it always evaluated true -
+// agents gating on optional columns hit this every time. `when:` is SQL
+// now: != against the empty string still means "has a value" (NULL
+// counts as empty there), and a column absent from the row is NULL.
 func TestEvaluateCondition_MissingKeyNotEqualEmpty(t *testing.T) {
-	// Missing key: should compare equal to '' (i.e. != '' is false).
-	row := map[string]any{"present": "value"}
-	if evaluateCondition("missing != ''", row) {
-		t.Error("missing key with `!= ''` should evaluate false (missing = empty)")
+	app := newWhenTestApp(t)
+	for _, c := range []struct {
+		row  map[string]any
+		want bool
+	}{
+		{map[string]any{"stage": "value"}, false}, // note absent
+		{map[string]any{"note": nil}, false},
+		{map[string]any{"note": ""}, false},
+		{map[string]any{"note": "hello"}, true},
+	} {
+		if got := whenHolds(app.DB, app, "orders", "note != ''", c.row); got != c.want {
+			t.Errorf("note != '' on %v = %v, want %v", c.row, got, c.want)
+		}
 	}
-	if !evaluateCondition("missing = ''", row) {
-		t.Error("missing key with `= ''` should evaluate true (missing = empty)")
+	// `= ''` is SQL equality: false for NULL (2.7.246 treated NULL as '').
+	if whenHolds(app.DB, app, "orders", "note = ''", map[string]any{}) {
+		t.Error("note = '' held for a NULL note")
 	}
-	// Explicit nil: same behavior as missing.
-	rowNil := map[string]any{"x": nil}
-	if evaluateCondition("x != ''", rowNil) {
-		t.Error("nil value with `!= ''` should evaluate false (nil = empty)")
-	}
-	// Empty string: same.
-	rowEmpty := map[string]any{"x": ""}
-	if evaluateCondition("x != ''", rowEmpty) {
-		t.Error("empty string with `!= ''` should evaluate false")
-	}
-	// Non-empty string: != '' is true.
-	rowVal := map[string]any{"x": "hello"}
-	if !evaluateCondition("x != ''", rowVal) {
-		t.Error("non-empty string with `!= ''` should evaluate true")
+	if !whenHolds(app.DB, app, "orders", "coalesce(note, '') = ''", map[string]any{}) {
+		t.Error("coalesce(note, '') = '' should hold for a NULL note")
 	}
 }
 
@@ -1134,13 +1134,13 @@ func TestEvaluateFlowCondition_OptionalParam_NoOp(t *testing.T) {
 
 	// The exact translations ghaIfToFlowCondition emits for the three
 	// operator-less forms the agent tried.
-	if got := ghaIfToFlowCondition("${{ params.invite_token }}"); got != "invite_token" {
+	if got := ghaIfToFlowCondition("${{ params.invite_token }}"); got != "params.invite_token" {
 		t.Fatalf("translation drift: bare ref → %q", got)
 	}
-	if got := ghaIfToFlowCondition("${{ params.invite_token | default:'' }}"); got != "invite_token | default:''" {
+	if got := ghaIfToFlowCondition("${{ params.invite_token | default:'' }}"); got != "params.invite_token | default:''" {
 		t.Fatalf("translation drift: default pipe → %q", got)
 	}
-	if got := ghaIfToFlowCondition("${{ params.invite_token || '' }}"); got != "invite_token || ''" {
+	if got := ghaIfToFlowCondition("${{ params.invite_token || '' }}"); got != "params.invite_token || ''" {
 		t.Fatalf("translation drift: || fallback → %q", got)
 	}
 
@@ -1585,6 +1585,9 @@ func TestResolveGroupID_TextKey_ReturnsString(t *testing.T) {
 		t.Fatal(err)
 	}
 	grp := &GroupConfig{Table: "customers", Key: "id", UserField: "customer_email"}
+	// Email-keyed memberships resolve for a verified account only.
+	EnsureUsersTable(app.DB)
+	mustExec(t, app.DB, `INSERT INTO _benmore_users (username, email, verified) VALUES ('a', 'a@b.com', 1)`)
 	got := ResolveGroupID(app.DB, grp, "a@b.com")
 	if got != uuid {
 		t.Errorf("ResolveGroupID = %q, want %q", got, uuid)
