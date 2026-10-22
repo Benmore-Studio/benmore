@@ -22,6 +22,7 @@ runtime OpenAPI; hosted account, push, skill, and MCP API commands are separate.
 ## Recent
 
 - Runtime 2.7.302: data-event transaction panics release their database connection after rollback. See `api(at:"flows")` (`event_transaction_cleanup`).
+- Runtime 2.7.302: platform upload-retention sweeps keep selection and deletion on their captured database. See `api(at:"recovery")` (`worker_generations`).
 
 - Runtime 2.7.302: PDF jobs isolate Chrome HOME/XDG caches, select disposable credential stores and report cleanup failures; host startup and old residue remain separate. See `api(at:"pdf")` (`runtime_cleanup`).
 
@@ -30,6 +31,7 @@ runtime OpenAPI; hosted account, push, skill, and MCP API commands are separate.
 - Runtime 2.7.302: source history separates successful Git warnings from parsed paths; unreadable-directory cleanup remains separate. See `api(at:"github")` (`git_diagnostics`).
 
 - Runtime 2.7.302: test diagnostics retain published root pages and partials until validated reload. See `api(at:"frontend")` (`root_page_reload`).
+- Runtime 2.7.302: route registration and graph extraction preserve published page definitions and use matching effective gates. See `api(at:"frontend")` (`root_page_reload`).
 
 - Runtime 2.7.302: reviewed command SQL admits `json_array_length` and `json_group_array` without widening table or function authority. See `api(at:"connector")` (`connector_grants`).
 

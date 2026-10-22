@@ -145,7 +145,8 @@ func extractPartials(tx *sql.Tx, app *App) {
 // --- Pages ---
 
 func extractPages(tx *sql.Tx, app *App, userTables []string) {
-	for file, page := range app.Pages {
+	for file, source := range app.Pages {
+		page := pageRouteSnapshot(source)
 		route := page.Route
 		ref := "page:" + route
 		meta := map[string]any{
