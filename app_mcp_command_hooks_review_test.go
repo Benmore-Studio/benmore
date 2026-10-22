@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"slices"
@@ -216,6 +217,98 @@ func TestAppMCPExposureBroadcastsOnlyAfterConfirmedCommit(t *testing.T) {
 	}
 	if sse, ws := sub.drain(); len(sse)+len(ws) != 0 {
 		t.Fatalf("replay broadcast: %v %v", sse, ws)
+	}
+}
+
+func TestAppMCPExposureExpectRowsMismatchIsRetryableConflict(t *testing.T) {
+	returningSQL := "query: UPDATE tasks SET status = 'done', completed_by = :actor, completed_at = datetime('now') WHERE id = :id AND project_id = :project_id AND org_id = :tenant AND status <> 'done'"
+	for _, tc := range []struct {
+		name      string
+		hooks     string
+		returning bool
+	}{
+		{name: "ordinary write"},
+		{name: "hooked write", hooks: hookFiredOnUpdate},
+		{name: "returning write", returning: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flow := strings.Replace(commandTaskFlowFixture, "expect_rows: '>0'", "expect_rows: '=2'", 1)
+			if tc.returning {
+				flow = strings.Replace(flow, returningSQL, returningSQL+" RETURNING id", 1)
+			}
+			h := newExposureHarnessWithFlow(t, flow, tc.hooks)
+			id := h.prepare()
+			h.approveOK(id)
+			if _, code := h.call(h.client, appMCPCommitTool, map[string]any{"operation_id": id}); code != "conflict" {
+				t.Fatalf("commit error code = %q, want conflict", code)
+			}
+			assertConflict := func() map[string]any {
+				t.Helper()
+				state := h.status(id)
+				attempt, _ := state["attempt"].(map[string]any)
+				if state["state"] != "conflict" || state["business"] != "not_committed" || state["receipt"] != nil || state["retryable"] != true || attempt["state"] != "conflict" || attempt["error_class"] != "conflict" {
+					t.Fatalf("durable conflict status: %#v", state)
+				}
+				if h.taskDone() || h.count("SELECT count(*) FROM activities WHERE task_id=1") != 0 {
+					t.Fatal("row-count conflict left business or activity rows")
+				}
+				return attempt
+			}
+			firstAttempt := assertConflict()
+			if _, code := h.call(h.client, appMCPCommitTool, map[string]any{"operation_id": id}); code != "conflict" {
+				t.Fatalf("retry error code = %q, want conflict", code)
+			}
+			secondAttempt := assertConflict()
+			if firstAttempt["attempt_id"] == secondAttempt["attempt_id"] {
+				t.Fatal("retry did not record a new attempt")
+			}
+		})
+	}
+}
+
+func TestAppMCPCommandRowCountErrorClassificationIsNarrow(t *testing.T) {
+	conflict := &appMCPCommandRowCountConflictError{}
+	for name, err := range map[string]error{
+		"bare mismatch":     conflict,
+		"wrapped mismatch":  fmt.Errorf("apply step: %w", conflict),
+		"joined mismatches": errors.Join(conflict, &appMCPCommandRowCountConflictError{}),
+	} {
+		if got := appMCPCommandErrorClass(err); got != "conflict" {
+			t.Errorf("%s class = %q, want conflict", name, got)
+		}
+	}
+	if got := appMCPCommandErrorClass(&appMCPCommandOutcomeUnknownError{cause: conflict}); got != "unknown_execution" {
+		t.Fatalf("unknown outcome wrapping a mismatch class = %q, want unknown_execution", got)
+	}
+	for name, err := range map[string]error{
+		"invalid assertion":               func() error { _, err := evalExpectRows("invalid", 0); return err }(),
+		"SQL failure":                     errors.New("SQL execution failed"),
+		"RowsAffected error":              errors.New("driver could not report RowsAffected"),
+		"provider failure":                errors.New("provider unavailable"),
+		"joined provider failure":         errors.Join(conflict, errors.New("SQL provider failed")),
+		"joined rollback cleanup failure": errors.Join(fmt.Errorf("assertion: %w", conflict), errors.New("rollback cleanup failed")),
+	} {
+		if got := appMCPCommandErrorClass(err); err == nil || got != "unavailable_provider" {
+			t.Errorf("%s class = %q for %v, want unavailable_provider", name, got, err)
+		}
+	}
+}
+
+func TestAppMCPExposureSQLFailureRemainsOperational(t *testing.T) {
+	flow := strings.Replace(commandTaskFlowFixture, "status = 'done'", "status = NULL", 1)
+	h := newExposureHarnessWithFlow(t, flow, "")
+	id := h.prepare()
+	h.approveOK(id)
+	if _, code := h.call(h.client, appMCPCommitTool, map[string]any{"operation_id": id}); code != "unavailable_provider" {
+		t.Fatalf("SQL failure code = %q, want unavailable_provider", code)
+	}
+	state := h.status(id)
+	attempt, _ := state["attempt"].(map[string]any)
+	if state["state"] != "failed" || state["business"] != "not_committed" || state["receipt"] != nil || state["retryable"] != true || attempt["error_class"] != "unavailable_provider" {
+		t.Fatalf("SQL failure status: %#v", state)
+	}
+	if h.taskDone() || h.count("SELECT count(*) FROM activities WHERE task_id=1") != 0 {
+		t.Fatal("failed SQL left business or activity rows")
 	}
 }
 

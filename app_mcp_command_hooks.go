@@ -618,8 +618,11 @@ func (exec *appMCPCommandExecution) executeHookedWrite(step *FlowStep, args []an
 	affected := int64(len(rows))
 	if step.ExpectRows != "" {
 		ok, checkErr := evalExpectRows(step.ExpectRows, affected)
-		if checkErr != nil || !ok {
-			return 0, errors.New("command SQL mutation cardinality check failed")
+		if checkErr != nil {
+			return 0, checkErr
+		}
+		if !ok {
+			return 0, &appMCPCommandRowCountConflictError{message: "command SQL mutation cardinality check failed"}
 		}
 	}
 	if action == "update" {

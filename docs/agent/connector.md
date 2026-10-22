@@ -521,7 +521,8 @@ may call only these functions: `abs`, `avg`, `char`, `coalesce`, `concat`,
 `length`, `like`, `lower`, `ltrim`, `max`, `min`, `nullif`, `printf`, `quote`,
 `replace`, `round`, `rtrim`, `sign`, `soundex`, `sqlite_version`, `substr`,
 `substring`, `sum`, `time`, `total`, `trim`, `typeof`, `unicode`, `upper`,
-`zeroblob`, `julianday`, `strftime` and the `json`, `json_array`, `json_extract`,
+`zeroblob`, `julianday`, `strftime` and the `json`, `json_array`,
+`json_array_length`, `json_group_array`, `json_extract`,
 `json_insert`, `json_object`, `json_patch`, `json_remove`, `json_replace`,
 `json_type`, `json_valid`, `json_quote` family, plus `raise`, `current_timestamp`
 and `benmore_encrypt`, which only triggers may call. Any other call (`random`, `randomblob`, `iif`) and bare
@@ -658,6 +659,11 @@ transaction, where a refusal must remain an `expect_rows` assertion that rolls
 the transaction back. Equality in an `if:` of a command (`== 0`, `== 'x'`) is
 evaluated as written; `!=`, `>`, `<`, `>=` and `<=` work the same way.
 
+When an apply step's valid `expect_rows` assertion fails, `_commit` returns
+`conflict`; `_status` records a retryable `conflict` attempt after the business
+transaction rolls back. Invalid assertions, SQL failures and unavailable row
+counts remain `unavailable_provider` operational failures.
+
 ### Server-generated tokens (invitations)
 
 A row that needs an unguessable value, such as an invitation token, cannot get
@@ -726,7 +732,20 @@ receive it.
 ## Files, reports, resources and providers
 
 Private file tools refer to a readable table row and its exact private upload
-reference. They do not accept arbitrary paths or URLs. `kind: file` supports
+reference. Declare `handler: {kind: file, operation: ingest, table: documents,
+file_column: file_url}` (and the same binding for `verify`) to authorize only the
+row's current `file_url`. Other string columns, including notes, cannot vouch for
+that file. The declared column must exist in the reviewed schema; every read,
+cache reuse, verification and publication rechecks its current readable text
+value, row authority and upload ownership. Hidden, encrypted and non-text
+columns refuse at runtime. The binding is reviewed contract content and requires
+resealing; the snapshot remains immutable, but a changed column no longer grants
+access to its old processing result. Without `file_column`, legacy tools retain
+their broader any-string-column reference check; do not use that mode to claim an
+exact document-version binding. This addition is unreleased; source review and
+fixture tests do not prove an installed or hosted runtime supports it.
+
+File tools do not accept arbitrary paths or URLs. `kind: file` supports
 `ingest` and `verify`; permissions include both `files:read` and the row's
 `<table>:read`. Ingested results are paginated and retain source locations;
 verification uses the returned `processing_id` to compare a value against the

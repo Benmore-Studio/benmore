@@ -249,8 +249,8 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	output, err := runPDFChrome(chromeCtx, cmd, pdfPath)
 	if err != nil {
 		if chromeCtx.Err() == context.DeadlineExceeded {
-			log.Printf("PDF ERROR [%s]: Chrome timed out after 30s", pagePath)
-			pdfServerError(w, r, app, http.StatusGatewayTimeout, errors.New("Chrome timed out after 30s"), "PDF generation timed out")
+			log.Printf("PDF ERROR [%s]: Chrome timed out after 30s: %v", pagePath, err)
+			pdfServerError(w, r, app, http.StatusGatewayTimeout, fmt.Errorf("Chrome timed out after 30s: %w", err), "PDF generation timed out")
 			return
 		}
 		log.Printf("PDF ERROR [%s]: Chrome failed: %s\n%s", pagePath, err.Error(), string(output))
@@ -277,7 +277,44 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 // Chrome can finish printing while desktop helper processes keep it alive.
 // Reuse the existing process-group cancellation, and stop the private job only
 // after a complete PDF and the same settling period used by the sandbox test.
-func runPDFChrome(ctx context.Context, cmd *exec.Cmd, path string) ([]byte, error) {
+func runPDFChrome(ctx context.Context, cmd *exec.Cmd, path string) (result []byte, resultErr error) {
+	// Chrome's --user-data-dir does not contain desktop caches (fontconfig,
+	// dconf and XDG helpers). Keep those in this private job too, including
+	// when startup fails before a PDF exists. The callers own the output dir.
+	home, err := os.MkdirTemp(filepath.Dir(path), "chrome-home-")
+	if err != nil {
+		return nil, fmt.Errorf("PDF runtime home: %w", err)
+	}
+	// Registered before process cleanup, so cancellation and Wait complete
+	// before removing the runtime home. Retain both errors if rendering failed.
+	defer func() {
+		if cleanupErr := os.RemoveAll(home); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("PDF runtime home cleanup: %w", cleanupErr))
+		}
+	}()
+	runtimeDirs := map[string]string{
+		"HOME":            home,
+		"XDG_CACHE_HOME":  filepath.Join(home, "cache"),
+		"XDG_CONFIG_HOME": filepath.Join(home, "config"),
+		"XDG_DATA_HOME":   filepath.Join(home, "data"),
+		"XDG_RUNTIME_DIR": filepath.Join(home, "runtime"),
+	}
+	for _, dir := range runtimeDirs {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("PDF runtime directory: %w", err)
+		}
+	}
+	env := cmd.Environ()
+	cmd.Env = make([]string, 0, len(env)+len(runtimeDirs))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := runtimeDirs[key]; !replaced {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	for key, dir := range runtimeDirs {
+		cmd.Env = append(cmd.Env, key+"="+dir)
+	}
 	setTranscribeProcAttrs(cmd)
 	if cmd.WaitDelay == 0 {
 		cmd.WaitDelay = 5 * time.Second

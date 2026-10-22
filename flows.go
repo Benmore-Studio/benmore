@@ -212,31 +212,49 @@ func runFlowEventWith(app *App, f Flow, row map[string]any, done func(*FlowConte
 	for k, v := range row {
 		ctx.Data[k] = v
 	}
-	// Start transaction if flow requires it
-	if f.Transaction {
-		tx, err := app.DB.Begin()
-		if err != nil {
-			log.Printf("FLOW ERROR [%s] begin tx: %s", f.Name, err)
-			return
-		}
-		ctx.Tx = tx
-	}
-	executeSteps(ctx, f.Steps)
-	// Commit or rollback
-	committed := false
-	if ctx.Tx != nil {
-		if ctx.Error != nil {
-			ctx.Tx.Rollback()
-		} else if err := ctx.Tx.Commit(); err != nil {
-			ctx.Error = fmt.Errorf("commit: %w", err)
-		} else {
-			committed = true
-		}
-	}
+	committed := runFlowEventTransaction(ctx, f, func(ctx *FlowContext) {
+		executeSteps(ctx, f.Steps)
+	})
 	announceFlowWrites(ctx, committed)
 	if ctx.Error != nil {
 		log.Printf("FLOW ERROR [%s] %s", f.Name, ctx.Error)
 	}
+}
+
+// runFlowEventTransaction owns the transaction lifecycle around a data-event
+// flow. The deferred guard is registered immediately after Begin so a panic
+// in executeSteps rolls back before runFlowEventWith's outer recover logs it.
+func runFlowEventTransaction(ctx *FlowContext, f Flow, execute func(*FlowContext)) bool {
+	if f.Transaction {
+		tx, err := ctx.App.DB.Begin()
+		if err != nil {
+			log.Printf("FLOW ERROR [%s] begin tx: %s", f.Name, err)
+			return false
+		}
+		ctx.Tx = tx
+	}
+
+	var guard *txCommitGuard
+	if ctx.Tx != nil {
+		guard = &txCommitGuard{tx: ctx.Tx}
+		defer guard.rollbackUnlessHandled()
+	}
+
+	execute(ctx)
+	committed := false
+	if ctx.Tx != nil {
+		if ctx.Error != nil {
+			ctx.Tx.Rollback()
+			guard.MarkHandled()
+		} else if err := ctx.Tx.Commit(); err != nil {
+			guard.MarkHandled()
+			ctx.Error = fmt.Errorf("commit: %w", err)
+		} else {
+			guard.MarkHandled()
+			committed = true
+		}
+	}
+	return committed
 }
 
 // flowEventRowTaint is the request-taint set of a data-event flow. The row is

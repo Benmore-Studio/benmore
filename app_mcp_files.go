@@ -182,6 +182,7 @@ type appMCPFileSnapshotScope struct {
 	Table          string
 	RecordID       string
 	FileRef        string
+	FileColumn     string
 }
 
 type appMCPFileSnapshot struct {
@@ -221,12 +222,22 @@ type appMCPFileSnapshotQueryer interface {
 // appMCPFileRecordAuthorizedFrom repeats the established file-read gates using
 // the publication transaction, so a long parse cannot publish after its row,
 // scope, uploader ownership, or file reference has changed.
-func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor *Session, table, id, logical string) bool {
-	if q == nil || app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || !SessionCanAccessTable(app, table, OpRead, actor) || checkScope(actor, table, "read") != nil {
+func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor *Session, table, id, logical string, fileColumns ...string) bool {
+	column := ""
+	if len(fileColumns) > 1 {
+		return false
+	}
+	if len(fileColumns) == 1 {
+		column = fileColumns[0]
+	}
+	if q == nil || app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || id != strings.TrimSpace(id) || strings.ContainsAny(id, "/?#\\\x00") || !SessionCanAccessTable(app, table, OpRead, actor) || checkScope(actor, table, "read") != nil {
+		return false
+	}
+	if column != "" && !appMCPFileColumnReadable(q, app, table, column) {
 		return false
 	}
 	predicate, args, bypass := rowScopeClause(app, table, actor, "view")
-	query := "SELECT * FROM " + quoteIdent(table) + " WHERE id=?"
+	query := "SELECT * FROM main." + quoteIdent(table) + " WHERE id=?"
 	queryArgs := []any{id}
 	if hasColumn(app, table, "deleted_at") {
 		query += " AND deleted_at IS NULL"
@@ -270,7 +281,10 @@ func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor
 	}
 	want := uploadRelPath(logical)
 	referenced := false
-	for _, value := range values {
+	for i, value := range values {
+		if column != "" && columnNames[i] != column {
+			continue
+		}
 		if text, ok := value.(string); ok && text != "" {
 			if uploadRelPath(text) == want {
 				referenced = true
@@ -312,6 +326,65 @@ func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor
 		var rowGroup string
 		if q.QueryRowContext(context.Background(), "SELECT "+quoteColumn(table, app.Group.Key)+" FROM "+quoteIdent(table)+" WHERE id=?", id).Scan(&rowGroup) == nil && rowGroup == group {
 			return true
+		}
+	}
+	return false
+}
+
+func validateAppMCPFileColumnBindings(manifest *AppMCPManifest, definitions []crudTableDefinition) error {
+	if manifest == nil {
+		return nil
+	}
+	for _, tool := range manifest.Tools {
+		if tool.Handler.FileColumn == "" {
+			continue
+		}
+		found := false
+		for _, table := range definitions {
+			if table.name == tool.Handler.Table && table.columns[tool.Handler.FileColumn] {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("mcp.yaml: tool %q has unresolved file_column %q", tool.Name, tool.Handler.FileColumn)
+		}
+	}
+	return nil
+}
+
+func appMCPFileColumnReadable(q appMCPFileSnapshotQueryer, app *App, table, column string) bool {
+	if q == nil || app == nil || !safeIdent(table) || !safeIdent(column) || apiHiddenColumn(app, table, column) {
+		return false
+	}
+	if app.Encrypted != nil {
+		for _, field := range app.Encrypted.Fields[table] {
+			if field.Column == column {
+				return false
+			}
+		}
+	}
+	rows, err := q.QueryContext(context.Background(), "PRAGMA main.table_info("+quoteIdent(table)+")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	columns := []Column{}
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var def any
+		if rows.Scan(&cid, &name, &kind, &notNull, &def, &primary) != nil {
+			return false
+		}
+		columns = append(columns, Column{Name: name, Type: kind})
+	}
+	if rows.Err() != nil || !listColumnAllowlist(app, table, columns)[column] {
+		return false
+	}
+	for _, field := range columns {
+		if field.Name == column {
+			kind := strings.ToUpper(field.Type)
+			return strings.Contains(kind, "TEXT") || strings.Contains(kind, "CHAR") || strings.Contains(kind, "CLOB")
 		}
 	}
 	return false
@@ -457,7 +530,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 	var result IngestResult
 	if tool.Handler.Operation == "verify" {
 		processingID, _ = input["processing_id"].(string)
-		if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical) {
+		if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical, tool.Handler.FileColumn) {
 			return nil, appMCPResultFailure("denied")
 		}
 		stored, readErr := appMCPReadFileSnapshot(ctx, app, processingID, actor.UserID, grant.UserCreated, grant.Tenant, tool.Handler.Table, recordID, logical)
@@ -467,7 +540,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 		result = stored.Snapshot.Result
 		pdfResult = stored.Snapshot.PDF
 	} else {
-		data, contentType, err := appMCPReadAuthorizedPrivateUpload(ctx, app, actor, tool.Handler.Table, recordID, logical, limits.MaxFileBytes)
+		data, contentType, err := appMCPReadAuthorizedPrivateUpload(ctx, app, actor, tool.Handler.Table, recordID, logical, limits.MaxFileBytes, tool.Handler.FileColumn)
 		if err != nil {
 			var failure *appMCPResultError
 			if errors.As(err, &failure) && failure.Code == "denied" {
@@ -479,7 +552,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 			}
 			return nil, appMCPResultFailure("incomplete_result")
 		}
-		scope := appMCPFileSnapshotScope{OwnerCreatedAt: grant.UserCreated, Tenant: grant.Tenant, Table: tool.Handler.Table, RecordID: recordID, FileRef: logical}
+		scope := appMCPFileSnapshotScope{OwnerCreatedAt: grant.UserCreated, Tenant: grant.Tenant, Table: tool.Handler.Table, RecordID: recordID, FileRef: logical, FileColumn: tool.Handler.FileColumn}
 		if reusedID, reused, ok := appMCPFindReusableFileProcessing(ctx, app, actor.UserID, scope, data, limits); ok {
 			processingID = reusedID
 			result, pdfResult = reused.Snapshot.Result, reused.Snapshot.PDF
@@ -523,7 +596,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 				}
 				return nil, appMCPResultFailure("incomplete_result")
 			}
-			if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical) {
+			if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical, tool.Handler.FileColumn) {
 				return nil, appMCPResultFailure("denied")
 			}
 			if processingID, err = appMCPRecordFileProcessing(app, actor.UserID, logical, result.SHA256, "private_upload", result.SHA256, contentType, limits, true, quality, appMCPFileSnapshotInput{Scope: scope, Original: data, Result: result, PDF: pdfResult, Actor: actor}); err != nil {
@@ -574,7 +647,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 		return nil, appMCPResultFailure("incomplete_result")
 	}
 	currentGrant, currentActor, authErr := resolveAppMCPAccessForGeneration(ctx, origin, generation, raw, resource, time.Now())
-	if authErr != nil || currentGrant.ID != grant.ID || !appMCPAuthorityUnchanged(actor, currentActor) || !appMCPToolAllowed(app, tool, currentActor) || !appMCPAuthorizeFileRecord(app, currentActor, tool.Handler.Table, recordID, logical) {
+	if authErr != nil || currentGrant.ID != grant.ID || !appMCPAuthorityUnchanged(actor, currentActor) || !appMCPToolAllowed(app, tool, currentActor) || !appMCPAuthorizeFileRecord(app, currentActor, tool.Handler.Table, recordID, logical, tool.Handler.FileColumn) {
 		return nil, appMCPResultFailure("denied")
 	}
 	pageCount := (len(result.Blocks) + perPage - 1) / perPage
@@ -622,7 +695,13 @@ func appMCPFileTool(manifest *AppMCPManifest, name string) *AppMCPTool {
 	return nil
 }
 
-func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical string) bool {
+func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical string, fileColumns ...string) bool {
+	if len(fileColumns) > 1 {
+		return false
+	}
+	if len(fileColumns) == 1 && fileColumns[0] != "" {
+		return app != nil && app.DB != nil && appMCPFileRecordAuthorizedFrom(app.DB, app, actor, table, id, logical, fileColumns[0])
+	}
 	if app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || id != strings.TrimSpace(id) || strings.ContainsAny(id, "/?#\\\x00") {
 		return false
 	}
@@ -637,8 +716,8 @@ func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical stri
 	return privateUploadVouched(app, actor, table, id, privateUploadKey(app, logical))
 }
 
-func appMCPReadAuthorizedPrivateUpload(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64) ([]byte, string, error) {
-	if !appMCPAuthorizeFileRecord(app, actor, table, id, logical) {
+func appMCPReadAuthorizedPrivateUpload(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64, fileColumns ...string) ([]byte, string, error) {
+	if !appMCPAuthorizeFileRecord(app, actor, table, id, logical, fileColumns...) {
 		return nil, "", appMCPResultFailure("denied")
 	}
 	return appMCPReadPrivateUpload(ctx, app, logical, maxBytes)
@@ -781,7 +860,7 @@ func appMCPRecordFileProcessing(app *App, userID int64, fileID, sha, origin, ver
 	// app with groups never has an empty or "0" tenant (the grant authority
 	// refuses one), so neither is stored for it.
 	grouped := app.Group != nil && app.Group.Table != ""
-	if scope.OwnerCreatedAt == "" || (grouped && (scope.Tenant == "" || scope.Tenant == "0")) || len(scope.Tenant) > appMCPInputLimit || !safeIdent(scope.Table) || scope.RecordID == "" || scope.FileRef != fileID || len(snapshotInput.Original) == 0 || int64(len(snapshotInput.Original)) > limits.MaxFileBytes {
+	if (scope.FileColumn != "" && (!safeIdent(scope.FileColumn) || snapshotInput.Actor == nil)) || scope.OwnerCreatedAt == "" || (grouped && (scope.Tenant == "" || scope.Tenant == "0")) || len(scope.Tenant) > appMCPInputLimit || !safeIdent(scope.Table) || scope.RecordID == "" || scope.FileRef != fileID || len(snapshotInput.Original) == 0 || int64(len(snapshotInput.Original)) > limits.MaxFileBytes {
 		return "", errors.New("source snapshot scope or size is invalid")
 	}
 	sourceHash := sha256.Sum256(snapshotInput.Original)
@@ -831,7 +910,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, fileID, sha, origin, ver
 	if err := tx.QueryRow(`SELECT created_at FROM _benmore_users WHERE id=?`, userID).Scan(&currentOwnerCreatedAt); err != nil || !sameAccountIncarnation(currentOwnerCreatedAt, scope.OwnerCreatedAt) {
 		return "", errors.New("source snapshot owner account changed during processing")
 	}
-	if snapshotInput.Actor != nil && !appMCPFileRecordAuthorizedFrom(tx, app, snapshotInput.Actor, scope.Table, scope.RecordID, scope.FileRef) {
+	if snapshotInput.Actor != nil && !appMCPFileRecordAuthorizedFrom(tx, app, snapshotInput.Actor, scope.Table, scope.RecordID, scope.FileRef, scope.FileColumn) {
 		return "", errors.New("source record authorization changed during processing")
 	}
 	if err := appMCPCheckFileSnapshotBudget(tx, id, 0); err != nil {

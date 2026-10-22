@@ -116,10 +116,11 @@ type AppMCPTransfer struct {
 	ResultChecksumField     string `yaml:"result_checksum_field,omitempty" json:"ResultChecksumField,omitempty"`
 }
 type AppMCPHandler struct {
-	Kind      string `yaml:"kind"`
-	Operation string `yaml:"operation"`
-	Table     string `yaml:"table"`
-	Flow      string `yaml:"flow"`
+	FileColumn string `yaml:"file_column,omitempty" json:"FileColumn,omitempty"`
+	Kind       string `yaml:"kind"`
+	Operation  string `yaml:"operation"`
+	Table      string `yaml:"table"`
+	Flow       string `yaml:"flow"`
 	// External read handler: kind: external, connection, operation_id.
 	Connection  string `yaml:"connection,omitempty" json:",omitempty"`
 	OperationID string `yaml:"operation_id,omitempty" json:",omitempty"`
@@ -339,6 +340,9 @@ func validateAppMCPManifestGated(m *AppMCPManifest, externalEnabled bool) error 
 		fileTool := tool.Handler.Kind == "file"
 		if tool.Handler.Kind != "native" && !commandTool && !externalTool && !fileTool {
 			return fmt.Errorf("tool %q has unsupported handler kind %q; native table reads use handler: {kind: native, table: notes, operation: table.list} or table.read; see benmore docs connector", tool.Name, tool.Handler.Kind)
+		}
+		if tool.Handler.FileColumn != "" && (!fileTool || !safeIdent(tool.Handler.FileColumn) || apiHiddenColumn(nil, tool.Handler.Table, tool.Handler.FileColumn) || strings.HasSuffix(tool.Handler.FileColumn, blindColSuffix)) {
+			return fmt.Errorf("tool %q file_column requires a canonical readable file-handler column", tool.Name)
 		}
 		if fileTool && (tool.Handler.Table == "" || tool.Handler.Flow != "" || tool.Handler.Connection != "" || tool.Handler.OperationID != "" || (tool.Handler.Operation != "ingest" && tool.Handler.Operation != "verify")) {
 			return fmt.Errorf("tool %q file handler requires one table binding and a supported file operation", tool.Name)
@@ -581,11 +585,14 @@ func validateAppMCPBindings(dir string, m *AppMCPManifest, flows []Flow) error {
 	if m == nil {
 		return nil
 	}
-	tables, err := appMCPSchemaTables(dir)
+	definitions, err := appMCPSchemaTableDefinitions(dir)
 	if err != nil {
 		return err
 	}
-	if err := validateAppMCPBindingsForTables(m, flows, tables, LoadRolesConfig(dir)); err != nil {
+	if err := validateAppMCPFileColumnBindings(m, definitions); err != nil {
+		return err
+	}
+	if err := validateAppMCPBindingsForTables(m, flows, eligibleCRUDTables(definitions), LoadRolesConfig(dir)); err != nil {
 		return err
 	}
 	return validateAppMCPDeclaredSources(dir, m)

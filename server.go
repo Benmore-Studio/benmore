@@ -1688,18 +1688,9 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 			return
 		}
 	}
-	// In dev mode, re-read the file on each request for hot reload
-	if dev {
-		app.mu.Lock()
-		if app.MCP == nil {
-			data, err := os.ReadFile(filepath.Join(app.Dir, page.File))
-			if err == nil {
-				setPageAttrsFromSource(page, string(data))
-			}
-			app.Partials = reloadPartials(app.Dir)
-		}
-		app.mu.Unlock()
-	}
+	// Requests use the published page and partials, including the test mux
+	// that enables dev diagnostics. Source activation belongs to validated
+	// reloads; rereading here would replace shared state after gate checks.
 
 	session := getSession(app, r)
 	if session != nil {

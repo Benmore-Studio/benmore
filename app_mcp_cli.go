@@ -280,7 +280,11 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 		report.ContractDigest = config.mcp.ContractDigest
 		report.ExecutionDigest = config.mcp.ExecutionDigest
 		for _, tool := range config.mcp.Tools {
-			report.ReviewedTools = append(report.ReviewedTools, map[string]any{"name": tool.Name, "description": tool.Description, "handler": map[string]string{"kind": tool.Handler.Kind, "operation": tool.Handler.Operation, "table": tool.Handler.Table, "flow": tool.Handler.Flow}, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema, "permissions": tool.Permissions, "effect": tool.Effect, "approval": tool.Approval, "idempotency": tool.Idempotency, "reconciliation": tool.Reconciliation, "output_projection": tool.Output.Include, "component": tool.Component})
+			handler := map[string]string{"kind": tool.Handler.Kind, "operation": tool.Handler.Operation, "table": tool.Handler.Table, "flow": tool.Handler.Flow}
+			if tool.Handler.FileColumn != "" {
+				handler["file_column"] = tool.Handler.FileColumn
+			}
+			report.ReviewedTools = append(report.ReviewedTools, map[string]any{"name": tool.Name, "description": tool.Description, "handler": handler, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema, "permissions": tool.Permissions, "effect": tool.Effect, "approval": tool.Approval, "idempotency": tool.Idempotency, "reconciliation": tool.Reconciliation, "output_projection": tool.Output.Include, "component": tool.Component})
 		}
 	}
 	names := make([]string, 0, len(tables))
