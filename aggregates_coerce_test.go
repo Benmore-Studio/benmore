@@ -11,7 +11,7 @@ import (
 
 // TestLoadAggregateValues_NumericCoercion locks the fix: aggregate values
 // stored in the TEXT value column are served as NUMBERS when numeric, so
-// bm.aggregate('x') / {{agg.x}} don't hand the client the string "9.12"
+// bm.aggregate('x') / {{aggregate.x}} don't hand the client the string "9.12"
 // (which threw `n.toFixed is not a function`). Non-numeric aggregates
 // (e.g. a name) stay strings.
 func TestLoadAggregateValues_NumericCoercion(t *testing.T) {

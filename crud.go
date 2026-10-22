@@ -26,6 +26,12 @@ import (
 // this op. The legacy `auth.public_api` whitelist still works as a
 // shorthand for tables that are anon for every op.
 func requireAPIAuth(w http.ResponseWriter, r *http.Request, app *App, table string) bool {
+	return requireAPIAuthForOp(w, r, app, table, accessOpForMethod(r.Method))
+}
+
+// Action routes such as POST restore are updates, not creates. Keep their
+// authentication exemptions aligned with the operation enforced downstream.
+func requireAPIAuthForOp(w http.ResponseWriter, r *http.Request, app *App, table string, op AccessOp) bool {
 	// Auth is opt-in: only enforce when the developer wrote an `auth:`
 	// block in app.yaml. Check `len(...)`, not nil - the map is always
 	// initialized non-nil during config load, so a nil-check would
@@ -47,7 +53,6 @@ func requireAPIAuth(w http.ResponseWriter, r *http.Request, app *App, table stri
 	// EnforceCRUDAccess still runs downstream and enforces the per-op
 	// rules; this just stops requireAPIAuth from masking them.
 	if app.Access != nil {
-		op := accessOpForMethod(r.Method)
 		hasUID := hasColumn(app, table, "user_id")
 		hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
 		if app.Access.AllowsAnon(app.Access.ModeFor(table, op, hasUID, hasGroupKey)) {
@@ -61,7 +66,6 @@ func requireAPIAuth(w http.ResponseWriter, r *http.Request, app *App, table stri
 		// An earlier app build built a custom /api/feed flow before
 		// discovering this was the right lever.
 		body := `{"error":"authentication required"}`
-		op := accessOpForMethod(r.Method)
 		hasUID := hasColumn(app, table, "user_id")
 		if op == OpRead && hasUID && !app.Access.HasExplicitRule(table, op) {
 			body = `{"error":"authentication required","hint":"This table is owner-scoped (visitors see 401). For a public feed, declare ` + "`access:\\n  " + table + ":\\n    read: anon`" + ` in app.yaml. Run benmore docs for the full access-mode catalogue."}`
@@ -97,12 +101,17 @@ func accessOpForMethod(method string) AccessOp {
 	return "read"
 }
 
-func RegisterCRUD(mux *http.ServeMux, app *App) {
+func RegisterCRUD(mux appRouteRegistrar, app *App) {
 	tables, err := GetTableNames(app.DB)
 	if err != nil {
 		return
 	}
 
+	registerCRUDTables(mux, app, tables)
+}
+
+// Shared canonical registration for runtime and route-only configuration preflight.
+func registerCRUDTables(mux appRouteRegistrar, app *App, tables []string) {
 	for _, table := range tables {
 		t := table // capture for closure
 		// POST /api/{table} - create
@@ -153,6 +162,17 @@ func RegisterCRUD(mux *http.ServeMux, app *App) {
 			}
 			handleDelete(w, r, app, t)
 		})
+
+		// Preserve app-authored restore flows/commands that predate this native
+		// route, including broader parameterized handlers covering this path.
+		if !restoreRouteOwnedByFlow(app, t) {
+			mux.HandleFunc(fmt.Sprintf("POST /api/%s/{id}/restore", t), func(w http.ResponseWriter, r *http.Request) {
+				if requireAPIAuthForOp(w, r, app, t, OpUpdate) {
+					return
+				}
+				handleRestore(w, r, app, t)
+			})
+		}
 
 		// POST /api/{table}/batch - batch create (JSON array)
 		mux.HandleFunc(fmt.Sprintf("POST /api/%s/batch", t), func(w http.ResponseWriter, r *http.Request) {

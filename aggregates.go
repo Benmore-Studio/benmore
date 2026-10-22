@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"os"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // AggregateConfig represents a single materialized aggregate definition.
@@ -36,8 +34,12 @@ func LoadAggregateConfig(dir string) []AggregateConfig {
 	if err != nil {
 		return nil
 	}
+	return parseAggregateConfig(data)
+}
+
+func parseAggregateConfig(data []byte) []AggregateConfig {
 	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yamlUnmarshal(data, &raw); err != nil {
 		return nil
 	}
 	aggRaw, ok := raw["aggregates"].(map[string]any)
@@ -86,7 +88,11 @@ func LoadAggregateConfig(dir string) []AggregateConfig {
 // refreshAggregate executes the aggregate SQL and stores the result.
 func refreshAggregate(db *sql.DB, config AggregateConfig) error {
 	var value string
-	err := db.QueryRow(config.SQL).Scan(&value)
+	query, ok := sqlRunnableText(config.SQL)
+	if !ok {
+		return fmt.Errorf("aggregate %q: %w", config.Name, errNoSQLStatement)
+	}
+	err := db.QueryRow(query).Scan(&value)
 	if err != nil {
 		return fmt.Errorf("aggregate %q: %w", config.Name, err)
 	}
@@ -117,8 +123,7 @@ func StartAggregateWorker(app *App, configs []AggregateConfig) {
 	// Start per-aggregate ticker goroutines
 	for _, config := range configs {
 		c := config
-		safeGo("aggregates.refresh:"+c.Name, func() {
-			stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
+		app.startWorker("aggregates.refresh:"+c.Name, func(stop <-chan struct{}) {
 			ticker := time.NewTicker(c.Refresh)
 			defer ticker.Stop()
 			for {
@@ -126,6 +131,11 @@ func StartAggregateWorker(app *App, configs []AggregateConfig) {
 				case <-stop:
 					return // hot reload / shutdown - don't leak a refresher per push
 				case <-ticker.C:
+					select {
+					case <-stop:
+						return
+					default:
+					}
 					if err := refreshAggregate(app.DB, c); err != nil {
 						log.Printf("  aggregate refresh error: %s", err)
 					}
@@ -152,7 +162,7 @@ func LoadAggregateValues(db *sql.DB) map[string]any {
 			// The _benmore_aggregates.value column is TEXT (the stored
 			// form), but aggregates are overwhelmingly numeric (SUM,
 			// COUNT, AVG, …). Serve a clean numeric value AS A NUMBER so
-			// `bm.aggregate('x')` and `{{agg.x}}` give the caller a
+			// `bm.aggregate('x')` and `{{aggregate.x}}` give the caller a
 			// number, not the string "9.12" that blew up `.toFixed()`.
 			// Non-numeric aggregates (e.g. MAX(name)) stay strings.
 			values[name] = coerceNumericBind(value)
@@ -162,7 +172,7 @@ func LoadAggregateValues(db *sql.DB) map[string]any {
 }
 
 // RegisterAggregateRoutes sets up the GET /api/_aggregates endpoint.
-func RegisterAggregateRoutes(mux *http.ServeMux, app *App) {
+func RegisterAggregateRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_aggregates", func(w http.ResponseWriter, r *http.Request) {
 		// Auth required
 		session := getSession(app, r)
@@ -172,14 +182,14 @@ func RegisterAggregateRoutes(mux *http.ServeMux, app *App) {
 		}
 
 		// Admin-only for listing all aggregates via API
-		if !session.IsAdmin() {
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
 
-		rows, err := QueryRows(app.DB, "SELECT name, value, updated_at FROM _benmore_aggregates ORDER BY name")
+		rows, err := queryMetadataRows(app.DB, "SELECT name, value, updated_at FROM _benmore_aggregates ORDER BY name")
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_aggregates", err, "query failed")
 			return
 		}
 		// value is a TEXT column, so QueryRows returns it as a string;
@@ -201,7 +211,7 @@ func RegisterAggregateRoutes(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		if !session.IsAdmin() {
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -214,7 +224,7 @@ func RegisterAggregateRoutes(mux *http.ServeMux, app *App) {
 			}
 		}
 
-		configs := LoadAggregateConfig(app.Dir)
+		configs := app.aggregateConfig()
 		var refreshed []string
 		for _, c := range configs {
 			if err := refreshAggregate(app.DB, c); err != nil {

@@ -96,6 +96,12 @@ func buildAutoMembershipHook(parent string, cfg AutoMembershipConfig) Hook {
 	if cfg.Table == "" || cfg.Parent == "" || cfg.UserField == "" {
 		return Hook{}
 	}
+	// Table/parent/user_field are spliced into the synthesized hook's INSERT
+	// as identifiers; a non-identifier is invalid config, skipped like an
+	// empty one. (members: stays a raw author SQL fragment.)
+	if !membershipIdentRe.MatchString(cfg.Table) || !membershipIdentRe.MatchString(cfg.Parent) || !membershipIdentRe.MatchString(cfg.UserField) {
+		return Hook{}
+	}
 
 	// Default WHERE: every active _benmore_users row. SQLite's empty-
 	// string-vs-NULL on deactivated_at requires both branches.
@@ -113,7 +119,7 @@ func buildAutoMembershipHook(parent string, cfg AutoMembershipConfig) Hook {
 	// canonical shape every chat schema has.
 	sql := fmt.Sprintf(
 		"%s INSERT INTO %s (%s, %s) SELECT id, {{id}} FROM _benmore_users WHERE %s ON CONFLICT DO NOTHING",
-		autoMembershipMarker(parent), cfg.Table, cfg.UserField, cfg.Parent, whereClause,
+		autoMembershipMarker(parent), quoteIdent(cfg.Table), quoteIdent(cfg.UserField), quoteIdent(cfg.Parent), whereClause,
 	)
 	return Hook{SQL: sql}
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -129,10 +131,18 @@ func cryptoCtxArgs(ctx []any) (table, column string) {
 // the app process could never read them back (and vice versa).
 var appEncryptionKey []byte
 
+// appEncryptionKeyEphemeral reports that appEncryptionKey was generated for
+// this process only (no ENCRYPTION_KEY configured and none persisted), so
+// nothing sealed under it survives a restart.
+var appEncryptionKeyEphemeral bool
+
 // dbCryptoKeys carries the derived key material for one database file.
 type dbCryptoKeys struct {
 	aes   []byte // 32-byte AES-256-GCM key
 	blind []byte // HKDF-derived blind-index HMAC key
+	// ephemeral: generated for this process only. Values that must outlive
+	// the process (TOTP secrets) are not sealed under such a key.
+	ephemeral bool
 }
 
 // dbCryptoRegistry maps canonical data.db paths → *dbCryptoKeys. Populated:
@@ -173,8 +183,12 @@ func canonicalDBPath(p string) string {
 
 // RegisterDBEncryptionKey installs the derived AES key (plus the HKDF
 // blind-index sibling) for one database file. Idempotent; last write wins
-// (key rotation re-registers).
+// (key rotation re-registers). The key is a configured, durable one.
 func RegisterDBEncryptionKey(dbPath string, aesKey []byte) {
+	registerDBEncryptionKey(dbPath, aesKey, false)
+}
+
+func registerDBEncryptionKey(dbPath string, aesKey []byte, ephemeral bool) {
 	if dbPath == "" || len(aesKey) == 0 {
 		return
 	}
@@ -183,7 +197,7 @@ func RegisterDBEncryptionKey(dbPath string, aesKey []byte) {
 		log.Printf("  encryption: blind-index derivation for %s failed: %s", dbPath, err)
 		blind = nil
 	}
-	dbCryptoRegistry.Store(canonicalDBPath(dbPath), &dbCryptoKeys{aes: aesKey, blind: blind})
+	dbCryptoRegistry.Store(canonicalDBPath(dbPath), &dbCryptoKeys{aes: aesKey, blind: blind, ephemeral: ephemeral})
 }
 
 // cryptoKeysForDBPath returns the registered keys for a database file, or
@@ -233,6 +247,10 @@ type EncryptedFieldDef struct {
 // or generated. This matches the Rails/Laravel pattern where the key is
 // always present from day one.
 func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
+	return initFieldEncryption(dir, config, GetEnv(dir, "ENCRYPTION_KEY"))
+}
+
+func initFieldEncryption(dir string, config *EncryptedFieldConfig, keyStr string) error {
 	// Always initialize the key, even when the app has no encrypted.yaml
 	// - the framework itself uses fieldEncrypt for OAuth provider tokens
 	// stored in _benmore_oauth_tokens. Without this, those tokens silently
@@ -240,9 +258,6 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 	if config == nil {
 		config = &EncryptedFieldConfig{}
 	}
-
-	// LoadEnv already resolved the owning process/files/vault before this call.
-	keyStr := GetEnv(dir, "ENCRYPTION_KEY")
 
 	// 3. Auto-generate. Persist to env.yaml ONLY when the app actually
 	// has encrypted fields configured - otherwise an ephemeral
@@ -253,12 +268,16 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 	// bogus "encrypted fields configured but cannot persist
 	// ENCRYPTION_KEY" error on every save for apps that have no
 	// encryption configured.
+	// ephemeral: the key below exists only in this process. TOTP secrets
+	// stay unsealed under such a key (see totpSealKey).
+	ephemeral := false
 	if keyStr == "" {
 		b := make([]byte, 32)
 		if _, err := rand.Read(b); err != nil {
 			return fmt.Errorf("failed to generate encryption key: %w", err)
 		}
 		keyStr = hex.EncodeToString(b)
+		ephemeral = true
 
 		hasEncryptedFields := false
 		for _, cols := range config.Fields {
@@ -275,6 +294,7 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 				// every write_file was the wrong call.
 				log.Printf("  encryption: WARN couldn't persist ENCRYPTION_KEY to env.yaml: %s - using ephemeral in-memory key (OAuth tokens written this session won't decrypt after restart). Set ENCRYPTION_KEY in env.yaml or the environment for persistence.", err)
 			} else {
+				ephemeral = false
 				log.Printf("  encryption: generated ENCRYPTION_KEY → env.yaml")
 				log.Printf("  For production, set ENCRYPTION_KEY in env.yaml or your environment")
 			}
@@ -287,9 +307,10 @@ func InitFieldEncryption(dir string, config *EncryptedFieldConfig) error {
 	}
 	if !isolateAppEnvironment.Load() {
 		appEncryptionKey = derived
+		appEncryptionKeyEphemeral = ephemeral
 	}
 	// Shared processes use only the per-database registry.
-	RegisterDBEncryptionKey(filepath.Join(dir, "data.db"), derived)
+	registerDBEncryptionKey(filepath.Join(dir, "data.db"), derived, ephemeral)
 	// Blind-index key is HKDF-derived from the AES key so it has the
 	// same lifecycle (rotated with the encryption key) but is
 	// cryptographically distinct material. Failure to derive is fatal
@@ -374,7 +395,23 @@ func appendToEnvYaml(dir string, key string, value string) error {
 // benmore_encrypt() and benmore_decrypt() SQL functions available in
 // every connection - triggers, queries, generated columns, everything.
 func RegisterEncryptedSQLiteDriver() {
-	sql.Register("sqlite3_benmore", &sqlite3.SQLiteDriver{
+	sql.Register("sqlite3_benmore", benmoreSQLiteDriver(true))
+	// Framework maintenance on a database that is not being served (a restore
+	// candidate, a file being recovered) needs the same SQL functions, so app
+	// triggers still compile, but not the storage ceiling: it never grows the
+	// served database through SQLite.
+	sql.Register(sqliteMaintenanceDriver, benmoreSQLiteDriver(false))
+}
+
+// sqliteMaintenanceDriver is the framework driver without the storage
+// ceiling. Only framework maintenance code opens it; app SQL never runs on it.
+const sqliteMaintenanceDriver = "sqlite3_benmore_maintenance"
+
+// benmoreSQLiteDriver prepares every framework-driver connection: the
+// benmore_* SQL functions, the ATTACH ban and, when enforceStorageLimit is
+// set, the storage ceiling.
+func benmoreSQLiteDriver(enforceStorageLimit bool) *sqlite3.SQLiteDriver {
+	return &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			// Resolve the connection's OWN database file once, so the
 			// SQL functions below can pick the per-DB key from
@@ -439,6 +476,49 @@ func RegisterEncryptedSQLiteDriver() {
 				table, column := cryptoCtxArgs(ctx)
 				return fieldEncryptCtx(key, table, column, plaintext)
 			}, true); err != nil {
+				return err
+			}
+			// This entry point treats every non-NULL argument as plaintext; unlike
+			// benmore_encrypt it never trusts a caller-supplied enc: prefix.
+			if err := conn.RegisterFunc("benmore_encrypt_plaintext", func(value, tableValue, columnValue any) (any, error) {
+				if value == nil {
+					return nil, nil
+				}
+				table, column := stringifyForCrypto(tableValue), stringifyForCrypto(columnValue)
+				if table == "" || column == "" {
+					return "", fmt.Errorf("benmore_encrypt_plaintext requires table and column context")
+				}
+				key := aesKeyForConn()
+				if len(key) == 0 {
+					return "", fmt.Errorf("benmore_encrypt_plaintext called but ENCRYPTION_KEY not initialized")
+				}
+				return fieldEncryptCtx(key, table, column, stringifyForCrypto(value))
+			}, false); err != nil {
+				return err
+			}
+			// Trigger recursion and key rotation must recognize only authentic
+			// ciphertext bound to this field, never an enc: prefix by itself.
+			if err := conn.RegisterFunc("benmore_ciphertext_matches", func(value, tableValue, columnValue any) bool {
+				if value == nil {
+					return false
+				}
+				table, column := stringifyForCrypto(tableValue), stringifyForCrypto(columnValue)
+				return fieldCiphertextMatches(aesKeyForConn(), table, column, stringifyForCrypto(value))
+			}, false); err != nil {
+				return err
+			}
+
+			// History retains the source field's AAD. Authenticate existing
+			// ciphertext too: an enc: prefix alone is never proof of sealing.
+			if err := conn.RegisterFunc("benmore_history_encrypt", func(value any, table, column string) (any, error) {
+				return sealVersionedValue(value, aesKeyForConn(), table, column)
+			}, false); err != nil {
+				return err
+			}
+
+			if err := conn.RegisterFunc("benmore_history_normalized", func(old, next any, table, column string) (bool, error) {
+				return versionedStorageNormalization(old, next, aesKeyForConn(), table, column)
+			}, false); err != nil {
 				return err
 			}
 
@@ -524,14 +604,31 @@ func RegisterEncryptedSQLiteDriver() {
 			// the result depends on the current 30-second time step, so
 			// SQLite must re-evaluate it per row and per statement rather
 			// than caching or hoisting a verdict that goes stale.
+			//
+			// Secrets sealed at rest (mfa_secret_store.go) are opened here
+			// with this connection's key; one that can't be opened fails
+			// closed, like a malformed secret.
 			if err := conn.RegisterFunc("benmore_totp_valid", func(secret, code string) bool {
 				secret = strings.TrimSpace(secret)
 				code = strings.TrimSpace(code)
-				if secret == "" || code == "" || strings.HasPrefix(secret, "pending:") {
+				if secret == "" || code == "" || strings.HasPrefix(secret, totpPendingPrefix) {
 					return false
+				}
+				if cryptoIsEncrypted(secret) {
+					plain, err := fieldDecryptCtx(aesKeyForConn(), totpSecretColumn, secret)
+					if err != nil {
+						return false
+					}
+					secret = plain
 				}
 				return ValidateTOTP(secret, code)
 			}, false); err != nil {
+				return err
+			}
+			if err := registerBenmoreToday(conn, time.Now); err != nil {
+				return err
+			}
+			if err := registerVersionHistoryClock(conn, time.Now); err != nil {
 				return err
 			}
 
@@ -544,39 +641,98 @@ func RegisterEncryptedSQLiteDriver() {
 			// level. The framework never attaches databases itself - pure deny.
 			conn.SetLimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
 
-			return nil
+			// Storage ceiling (storage_limit.go): a write that would grow a
+			// database with a registered limit past it fails with SQLITE_FULL
+			// on every code path that uses this driver.
+			if !enforceStorageLimit {
+				return nil
+			}
+			return applyDBStorageLimit(conn, connDB)
 		},
-	})
+	}
 }
 
-// InstallEncryptionTriggers creates SQLite triggers that auto-encrypt on INSERT/UPDATE.
-// Same pattern as computed field triggers - fires at the database level on every mutation.
-func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) {
-	if config == nil || cryptoKeyForQuerier(db) == nil {
-		return
+// InstallEncryptionTriggers atomically replaces the INSERT/UPDATE triggers
+// that encrypt configured columns. A failed replacement leaves the prior set.
+func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin encrypted-field trigger replacement: %w", err)
 	}
+	defer tx.Rollback()
+	if err := installEncryptionTriggersWith(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
-	// Drop existing encryption triggers
-	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '_benmore_enc_%'")
-	if err == nil {
-		defer rows.Close()
+// Shared with reload's atomic encryption, blind-index and history installation.
+func installEncryptionTriggersWith(tx mutationTx, config *EncryptedFieldConfig) error {
+	return installEncryptionTriggersMode(tx, config, true)
+}
+
+func installEncryptionTriggersMode(tx mutationTx, config *EncryptedFieldConfig, replace bool) error {
+	if config == nil {
+		return nil
+	}
+	fields := 0
+	for _, defs := range config.Fields {
+		fields += len(defs)
+	}
+	if fields > 0 {
+		key, err := cryptoKeyForQuerierChecked(tx)
+		if err != nil {
+			return fmt.Errorf("resolve encryption key for triggers: %w", err)
+		}
+		if len(key) == 0 {
+			return fmt.Errorf("cannot install encrypted-field triggers without ENCRYPTION_KEY")
+		}
+	}
+	if replace {
+		rows, err := tx.Query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '_benmore_enc_%'")
+		if err != nil {
+			return fmt.Errorf("list existing encrypted-field triggers: %w", err)
+		}
 		var triggers []string
 		for rows.Next() {
 			var name string
-			rows.Scan(&name)
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return fmt.Errorf("read existing encrypted-field trigger: %w", err)
+			}
 			triggers = append(triggers, name)
 		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("read existing encrypted-field triggers: %w", err)
+		}
 		for _, name := range triggers {
-			db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", name))
+			if _, err := tx.Exec("DROP TRIGGER IF EXISTS " + quoteIdent(name)); err != nil {
+				return fmt.Errorf("drop encrypted-field trigger %q: %w", name, err)
+			}
 		}
 	}
 
 	var installed int
 	for table, defs := range config.Fields {
+		cols, err := mainTableColumnsWith(tx, table)
+		if err != nil {
+			return err
+		}
 		for _, def := range defs {
 			col := def.Column
-			// table/column SQL string literals passed to benmore_encrypt
-			// so the ciphertext is GCM-AAD-bound to its location (M-3).
+			if !versionHasColumn(cols, col) {
+				return fmt.Errorf("encrypted field %s.%s: source column does not exist", table, col)
+			}
+			// The trigger text below is written with bare names, and the
+			// connector's trigger check regenerates exactly that text
+			// (verifyAppMCPDeclaredTriggerClosure), so the names must be
+			// plain identifiers. A checked load already refused anything
+			// else; a config read without that check gets no trigger.
+			if !membershipIdentRe.MatchString(table) || !membershipIdentRe.MatchString(col) {
+				return fmt.Errorf("encrypted-field trigger %q.%q is not a plain table and column name", table, col)
+			}
+			// Table/column SQL string literals bind ciphertext to its field
+			// through benmore_encrypt_plaintext (M-3).
 			// Single-quotes doubled defensively even though these are
 			// framework-controlled identifiers, not user input.
 			tableLit := "'" + strings.ReplaceAll(table, "'", "''") + "'"
@@ -594,33 +750,39 @@ func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) {
 			// INTEGER PRIMARY KEY tables, so this is fully back-compat.
 			triggerName := fmt.Sprintf("_benmore_enc_%s_%s_insert", table, col)
 			triggerSQL := fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
-				triggerName, table, col, col, table, col, col, tableLit, colLit,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
+				triggerName, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit,
 			)
-			if _, err := db.Exec(triggerSQL); err != nil {
-				log.Printf("ENCRYPTION TRIGGER ERROR [%s]: %s", triggerName, err)
-			} else {
-				installed++
+			if _, err := tx.Exec(triggerSQL); err != nil {
+				return fmt.Errorf("create encrypted-field trigger %q: %w", triggerName, err)
 			}
+			installed++
 
-			// AFTER UPDATE: encrypt if value changed and isn't already encrypted.
+			// AFTER UPDATE: encrypt if the value is not authentic field ciphertext.
 			// Same rowid fix as the INSERT trigger above.
 			triggerName = fmt.Sprintf("_benmore_enc_%s_%s_update", table, col)
 			triggerSQL = fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_encrypt(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
-				triggerName, col, table, col, col, table, col, col, tableLit, colLit,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
+				triggerName, col, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit,
 			)
-			if _, err := db.Exec(triggerSQL); err != nil {
-				log.Printf("ENCRYPTION TRIGGER ERROR [%s]: %s", triggerName, err)
-			} else {
-				installed++
+			if _, err := tx.Exec(triggerSQL); err != nil {
+				return fmt.Errorf("create encrypted-field trigger %q: %w", triggerName, err)
 			}
+			installed++
 		}
 	}
-
 	if installed > 0 {
 		log.Printf("  encryption: %d triggers installed", installed)
 	}
+	return nil
+}
+
+// encryptedRowIDsSQL lists the rows of table whose column holds ciphertext
+// (v1 or v2). The column is qualified so a name the table does not have is an
+// error, not a comparison with a string (quoteColumn).
+func encryptedRowIDsSQL(table, column string) string {
+	col := quoteColumn(table, column)
+	return "SELECT rowid FROM " + quoteIdent(table) + " WHERE " + col + " LIKE 'enc:v1:%' OR " + col + " LIKE 'enc:v2:%'"
 }
 
 // EncryptedFieldDefYAML supports both simple and detailed formats via custom unmarshalling.
@@ -672,10 +834,25 @@ type EncryptedYAML struct {
 //	    - column: ssn
 //	      roles: [admin, manager]
 func LoadEncryptedFieldsConfig(dir string) *EncryptedFieldConfig {
+	encData, encErr := os.ReadFile(fmt.Sprintf("%s/encrypted.yaml", dir))
+	if encErr != nil {
+		encData = nil
+	}
+	appData, appErr := os.ReadFile(fmt.Sprintf("%s/app.yaml", dir))
+	if appErr != nil {
+		appData = nil
+	}
+	return parseEncryptedFieldsConfig(encData, appData)
+}
+
+// parseEncryptedFieldsConfig is LoadEncryptedFieldsConfig over file
+// contents (nil = file absent), so write-time validators can evaluate a
+// not-yet-written encrypted.yaml / app.yaml with the same precedence.
+func parseEncryptedFieldsConfig(encData, appData []byte) *EncryptedFieldConfig {
 	config := &EncryptedFieldConfig{Fields: make(map[string][]EncryptedFieldDef)}
 
 	// 1. Dedicated encrypted.yaml (preferred)
-	if data, err := os.ReadFile(fmt.Sprintf("%s/encrypted.yaml", dir)); err == nil {
+	if data := encData; data != nil {
 		// `blind_index:` is the v2.7.55+ flag - a list of columns
 		// (must be a subset of `fields:`) that get a deterministic
 		// HMAC sibling column populated by triggers so equality
@@ -687,7 +864,7 @@ func LoadEncryptedFieldsConfig(dir string) *EncryptedFieldConfig {
 				BlindIndex  []string `yaml:"blind_index"`
 			} `yaml:"tables"`
 		}
-		if yaml.Unmarshal(data, &wrapper) == nil {
+		if yamlUnmarshal(data, &wrapper) == nil {
 			for table, spec := range wrapper.Tables {
 				blindSet := map[string]bool{}
 				for _, b := range spec.BlindIndex {
@@ -709,9 +886,9 @@ func LoadEncryptedFieldsConfig(dir string) *EncryptedFieldConfig {
 
 	// 2. app.yaml inline encrypted: section (merged for tables not
 	// already set by encrypted.yaml)
-	if data, err := os.ReadFile(fmt.Sprintf("%s/app.yaml", dir)); err == nil {
+	if data := appData; data != nil {
 		var raw EncryptedYAML
-		if yaml.Unmarshal(data, &raw) == nil && len(raw.Encrypted) > 0 {
+		if yamlUnmarshal(data, &raw) == nil && len(raw.Encrypted) > 0 {
 			for table, defs := range raw.Encrypted {
 				if _, already := config.Fields[table]; already {
 					continue
@@ -735,83 +912,35 @@ func LoadEncryptedFieldsConfig(dir string) *EncryptedFieldConfig {
 	return config
 }
 
-// MaskEncryptedFields replaces decrypted values with masked versions
-// for callers whose roles aren't in the column's `unmask_roles:` list.
-// Called from CRUD API handlers after QueryRows, before JSON response.
-//
-// Authorization rules (v2.7.58+ multi-role aware):
-//   - field has no `unmask_roles:` configured → everyone sees decrypted
-//   - caller is admin (via PRIMARY role OR _benmore_user_roles) → unmasked
-//   - caller holds ANY role listed in `unmask_roles:` via the primary
-//     column OR the join table → unmasked
-//   - otherwise → masked (last 4 chars visible)
-//
-// Pre-v2.7.58 this function took a single `userRole string` and
-// compared it directly. A user granted `admin` via the join table
-// (whose primary role was something else, e.g. `platform_admin`)
-// was masked despite the `unmask_roles: [admin]` config - same shape
-// as the v2.7.56 admin-elevation gap, different code path. Now the
-// check honors the full Session.Roles slice via Session.IsAdmin()
-// for admin shortcuts and an explicit slice-membership test for
-// every other named role.
-func MaskEncryptedFields(config *EncryptedFieldConfig, table string, rows []map[string]any, session *Session) {
-	if config == nil {
+// MaskEncryptedFields applies the column's unmask policy to each returned row.
+// Tenant roles authorize only rows in the session's effective tenant. A row
+// without its tenant key (or the tenant-root id) stays masked unless a global
+// or explicit owner grant applies. It never reloads scope from a current row:
+// historical rows and projected SQL results must carry their own identity.
+func MaskEncryptedFields(app *App, table string, rows []map[string]any, session *Session) {
+	if app == nil {
 		return
 	}
-	defs, ok := config.Fields[table]
-	if !ok {
+	var db rowQuerier
+	if app.DB != nil {
+		db = app.DB
+	}
+	maskEncryptedFieldsWith(app, db, table, rows, session)
+}
+
+// The explicit querier keeps command reads on their authority transaction,
+// rather than opening another connection while that transaction holds locks.
+func maskEncryptedFieldsWith(app *App, db rowQuerier, table string, rows []map[string]any, session *Session) {
+	if app == nil || app.Encrypted == nil {
 		return
 	}
-	// Build a single set of "roles this caller holds" so the
-	// per-field loop doesn't re-walk the slice once per column.
-	held := map[string]bool{}
-	if session != nil {
-		if session.Role != "" {
-			held[session.Role] = true
-		}
-		for _, r := range session.Roles {
-			held[r] = true
-		}
-	}
-	isAdmin := session.IsAdmin()
-	var sessUserID int64
-	if session != nil {
-		sessUserID = session.UserID
-	}
-
-	for _, def := range defs {
-		if len(def.Roles) == 0 {
-			continue // no role restriction - everyone sees decrypted
-		}
-		// Admin bypasses every column's mask. Otherwise check whether ANY held
-		// role appears in the unmask list. The special tokens `self`/`owner`
-		// don't name a role - they mean "the row's owner sees their OWN row
-		// decrypted" (per-row), which is how per-user private data (journals,
-		// notes, health) stays usable by the person it belongs to. Without this
-		// an owner-scoped encrypted column was masked even from its owner -
-		// they saw their own data as `****`.
-		globallyAuthorized := isAdmin
-		ownerUnmask := false
-		if !globallyAuthorized {
-			for _, r := range def.Roles {
-				if r == "self" || r == "owner" {
-					ownerUnmask = true
-					continue
-				}
-				if held[r] {
-					globallyAuthorized = true
-					break
-				}
-			}
-		}
-		if globallyAuthorized {
-			continue // unmask all rows
-		}
-
-		// Not globally authorized: mask, but leave the caller's OWN rows
-		// decrypted when `self`/`owner` is configured.
+	for _, def := range app.Encrypted.Fields[table] {
+		access := encryptedFieldAccessFor(app, db, table, def, session)
 		for _, row := range rows {
-			if ownerUnmask && sessUserID != 0 && rowOwnedBy(row, sessUserID) {
+			if def.BlindIndex {
+				delete(row, def.Column+blindColSuffix)
+			}
+			if access.allowsRow(row) {
 				continue
 			}
 			if val, ok := row[def.Column]; ok && val != nil {
@@ -819,6 +948,116 @@ func MaskEncryptedFields(config *EncryptedFieldConfig, table string, rows []map[
 			}
 		}
 	}
+}
+
+// encryptedFieldAccess is shared by response masking and SQL filtering so
+// a filter cannot reveal a value that the matching response would mask.
+type encryptedFieldAccess struct {
+	allRows      bool
+	tenantColumn string
+	tenantID     string
+	ownerID      int64
+}
+
+func encryptedTenantColumn(app *App, table string) string {
+	if app == nil || app.Group == nil || app.Group.Key == "" {
+		return ""
+	}
+	if hasColumn(app, table, app.Group.Key) {
+		return app.Group.Key
+	}
+	if tenantRootTable(app, table) && hasColumn(app, table, "id") {
+		return "id"
+	}
+	return ""
+}
+
+func encryptedFieldAccessFor(app *App, db rowQuerier, table string, def EncryptedFieldDef, session *Session) encryptedFieldAccess {
+	if len(def.Roles) == 0 {
+		return encryptedFieldAccess{allRows: true}
+	}
+	access := encryptedFieldAccess{}
+	if q, ok := db.(*sql.DB); ok && q == nil {
+		db = nil
+	}
+	if session == nil {
+		return access
+	}
+	var roles []string
+	for _, role := range def.Roles {
+		if role == "self" || role == "owner" {
+			if hasColumn(app, table, "user_id") {
+				access.ownerID = session.UserID
+			}
+		} else {
+			roles = append(roles, role)
+		}
+	}
+	// A stepped-in admin or tenant-bound connector keeps authority inside
+	// its selected tenant, but must not regain the cross-tenant shortcut.
+	connectorBound := session.connectorGrant && (session.EffectiveHasGroup() || app != nil && app.Group != nil && app.Group.Table != "")
+	bound := session.ActingAsGroup != "" || connectorBound
+	if !bound {
+		if tier, args, ok := globalRoleTier(session, roles); ok {
+			if tier == "1=1" {
+				access.allRows = true
+			} else if db != nil {
+				var held bool
+				access.allRows = db.QueryRow("SELECT "+tier, args...).Scan(&held) == nil && held
+			}
+		}
+		if session.IsAdminBypass() {
+			access.allRows = true
+		}
+	}
+	if access.allRows || !HasAnyRole(session, roles) {
+		return access
+	}
+	col := encryptedTenantColumn(app, table)
+	if col != "" && session.EffectiveHasGroup() {
+		access.tenantColumn, access.tenantID = col, session.EffectiveGroupID()
+	} else if col == "" && groupSharedTable(app, table) {
+		// Explicit shared reference catalogs have no per-tenant rows. Their
+		// role semantics match tableModeAllowed's groups.shared exception.
+		access.allRows = true
+	}
+	return access
+}
+
+func (access encryptedFieldAccess) allowsRow(row map[string]any) bool {
+	if access.allRows || access.ownerID != 0 && rowOwnedBy(row, access.ownerID) {
+		return true
+	}
+	if access.tenantColumn != "" {
+		for col, value := range row {
+			if sqliteIdentifierFold(col) == sqliteIdentifierFold(access.tenantColumn) && value != nil {
+				return stringifyForCrypto(value) == access.tenantID
+			}
+		}
+	}
+	return false
+}
+
+// scopePredicate bounds an operation that examines the encrypted value to
+// exactly the rows the caller may unmask. Column names come from app schema.
+func (access encryptedFieldAccess) scopePredicate(table string) (string, []any) {
+	if access.allRows {
+		return "", nil
+	}
+	var clauses []string
+	var args []any
+	if access.tenantColumn != "" {
+		clauses = append(clauses, quoteColumn(table, access.tenantColumn)+" = ?")
+		args = append(args, access.tenantID)
+	}
+	if access.ownerID != 0 {
+		clauses = append(clauses, quoteColumn(table, "user_id")+" = ?")
+		args = append(args, access.ownerID)
+	}
+	if len(clauses) == 0 {
+		return "0=1", nil
+	}
+	return "(" + strings.Join(clauses, " OR ") + ")", args
 }
 
 // rowOwnedBy reports whether the row's user_id matches the given session user.
@@ -917,6 +1156,29 @@ func cryptoIsEncrypted(s string) bool {
 	return strings.HasPrefix(s, encPrefix) || strings.HasPrefix(s, encPrefixV2)
 }
 
+func fieldCiphertextMatches(key []byte, table, column, value string) bool {
+	if len(key) == 0 || table == "" || column == "" || !cryptoIsEncrypted(value) {
+		return false
+	}
+	if strings.HasPrefix(value, encPrefixV2) {
+		body := strings.TrimPrefix(value, encPrefixV2)
+		sep := strings.IndexByte(body, ':')
+		if sep < 0 {
+			return false
+		}
+		aad, err := hex.DecodeString(body[:sep])
+		if err != nil {
+			return false
+		}
+		storedTable, storedColumn, ok := cryptoParseAAD(aad)
+		if !ok || storedTable != table || storedColumn != column {
+			return false
+		}
+	}
+	_, err := fieldDecryptCtx(key, column, value)
+	return err == nil
+}
+
 // decryptFailMask replaces a value that LOOKS encrypted but could not be
 // decrypted under the owning database key. Returning the raw `enc:v1:…` ciphertext
 // to an API client is both a data leak (ciphertext is still confidential
@@ -945,16 +1207,52 @@ func logDecryptFailureThrottled(key string) {
 // cryptoKeyForQuerier resolves only the database being queried. Resolve before
 // opening result rows, including on *sql.Tx, to avoid nested active cursors.
 func cryptoKeyForQuerier(db mutationQuerier) []byte {
+	key, err := cryptoKeyForQuerierChecked(db)
+	if err != nil && !isolateAppEnvironment.Load() {
+		return appEncryptionKey
+	}
+	return key
+}
+
+func cryptoKeyForQuerierChecked(db mutationQuerier) ([]byte, error) {
 	var path string
-	if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&path); err == nil {
-		if keys := cryptoKeysForDBPath(path); keys != nil {
-			return keys.aes
-		}
+	if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&path); err != nil {
+		return nil, err
+	}
+	if keys := cryptoKeysForDBPath(path); keys != nil {
+		return keys.aes, nil
 	}
 	if isolateAppEnvironment.Load() {
-		return nil
+		return nil, nil
 	}
-	return appEncryptionKey
+	return appEncryptionKey, nil
+}
+
+// cryptoKeyForQuerierMainChecked is for strict transaction authority reads.
+// Explicitly naming main prevents a TEMP pragma_database_list table from
+// redirecting database identity. Unknown database identity fails closed; the
+// process-wide single-app fallback is intentionally unavailable here.
+func cryptoKeyForQuerierMainChecked(db mutationQuerier) ([]byte, error) {
+	path, err := mainDatabasePathForQuerier(db)
+	if err != nil {
+		return nil, err
+	}
+	keys := cryptoKeysForDBPath(path)
+	if keys == nil || len(keys.aes) == 0 {
+		return nil, fmt.Errorf("database encryption key is not registered")
+	}
+	return keys.aes, nil
+}
+
+func mainDatabasePathForQuerier(db rowQuerier) (string, error) {
+	var path string
+	if err := db.QueryRow("SELECT file FROM main.pragma_database_list WHERE name = 'main'").Scan(&path); err != nil {
+		return "", err
+	}
+	if path == "" {
+		return "", fmt.Errorf("main database path is unavailable")
+	}
+	return path, nil
 }
 
 func fieldEncryptForDB(db mutationQuerier, value string) (string, error) {
@@ -1264,6 +1562,12 @@ func cryptoParseAAD(aad []byte) (table, column string, ok bool) {
 
 // ===== Key rotation =====
 
+// rotationRefusal is a key-rotation refusal written for the operator who asked
+// for it (nothing to rotate, no current key, a short new key).
+type rotationRefusal struct{ msg string }
+
+func (e *rotationRefusal) Error() string { return e.msg }
+
 // RotateEncryptionKey re-encrypts every row of every configured-encrypted
 // column with a NEW key, then swaps the in-memory key + persists the new
 // key to env.yaml. Idempotent on success: ciphertext written carries the
@@ -1297,16 +1601,44 @@ func cryptoParseAAD(aad []byte) (table, column string, ok bool) {
 // are 32 random bytes hex-encoded (64-char string) for operator
 // readability, but the rotation accepts any non-empty string the
 // operator provides - same behavior as the env-var path.
+//
+// A refusal written for the operator is a *rotationRefusal; any other error
+// is a failure the HTTP endpoint reports through serverErrorJSON.
 func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error) {
 	if app == nil || app.DB == nil {
-		return 0, fmt.Errorf("nil app")
+		return 0, &rotationRefusal{"nil app"}
 	}
-	if app.Encrypted == nil || len(app.Encrypted.Fields) == 0 {
-		return 0, fmt.Errorf("no encrypted fields configured in encrypted.yaml - nothing to rotate")
+	// TOTP secrets are sealed under this key too (mfa_secret_store.go), so
+	// an app with MFA enrollments but no encrypted.yaml still has data to
+	// rotate.
+	totpSealed, err := countSealedTOTPSecrets(app.DB)
+	if err != nil {
+		return 0, fmt.Errorf("count sealed TOTP secrets: %w", err)
+	}
+	// Connector command storage (operations, approvals, marker) is sealed under
+	// this key too; leaving it behind would make every command and the next
+	// load fail.
+	commandPresent, commandRows, err := appMCPCommandStorageRows(app.DB)
+	if err != nil {
+		return 0, fmt.Errorf("count command storage: %w", err)
+	}
+	// Per-user upstream connection credentials are sealed under this key too.
+	credentialsPresent, credentialRows, err := appMCPConnectionCredentialRows(app.DB)
+	if err != nil {
+		return 0, fmt.Errorf("count connection credentials: %w", err)
+	}
+	// Hook and webhook-subscription jobs that can still be delivered carry
+	// their row's encrypted.yaml values sealed under this key too.
+	sealedJobs, err := countSealedJobRows(app.DB)
+	if err != nil {
+		return 0, fmt.Errorf("count sealed job rows: %w", err)
+	}
+	if (app.Encrypted == nil || len(app.Encrypted.Fields) == 0) && totpSealed == 0 && !commandPresent && credentialRows == 0 {
+		return 0, &rotationRefusal{"no encrypted fields configured in encrypted.yaml - nothing to rotate"}
 	}
 	currentKey := cryptoKeyForQuerier(app.DB)
 	if currentKey == nil {
-		return 0, fmt.Errorf("no current encryption key loaded - set ENCRYPTION_KEY before rotating")
+		return 0, &rotationRefusal{"no current encryption key loaded - set ENCRYPTION_KEY before rotating"}
 	}
 
 	// Pick / validate the new key source string. The 32-byte AES key
@@ -1321,7 +1653,7 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 		newKeySource = hex.EncodeToString(b)
 	}
 	if len(newKeySource) < 32 {
-		return 0, fmt.Errorf("new key source must be at least 32 chars for adequate entropy (got %d). Use `openssl rand -hex 32` to generate a strong one.", len(newKeySource))
+		return 0, &rotationRefusal{fmt.Sprintf("new key source must be at least 32 chars for adequate entropy (got %d). Use `openssl rand -hex 32` to generate a strong one.", len(newKeySource))}
 	}
 	// Derive the new AES key via the SAME versioned derivation as
 	// InitFieldEncryption (M-4), so a restart that re-reads the persisted
@@ -1344,74 +1676,201 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 
 	// Count rows that need rotating across all configured columns.
 	type plan struct {
-		Table, Column string
-		IDs           []int64
+		Table, Column, Source, RowID string
+		IDs                          []int64
 	}
 	var plans []plan
 	totalRows := 0
-	for table, defs := range app.Encrypted.Fields {
-		for _, def := range defs {
-			// Catch BOTH legacy v1 and AAD-bound v2 ciphertext (M-3) so a
-			// key rotation re-encrypts every encrypted row regardless of
-			// which format it was last written in.
-			// rowid (not id): rotation must work for tables whose PK column is
-			// not named `id` — consistent with the rowid trigger fix. rowid == id
-			// for INTEGER PRIMARY KEY tables, so this is backward-compatible.
-			q := fmt.Sprintf("SELECT rowid FROM %s WHERE %s LIKE 'enc:v1:%%' OR %s LIKE 'enc:v2:%%'", table, def.Column, def.Column)
-			rows, err := app.DB.Query(q)
+	var fields map[string][]EncryptedFieldDef
+	if app.Encrypted != nil {
+		fields = app.Encrypted.Fields
+	}
+	for table, defs := range fields {
+		history := table + "_history"
+		hasHistory, err := versionHistoryExists(app.DB, history)
+		if err != nil {
+			return 0, err
+		}
+		var historyCols []Column
+		if hasHistory {
+			historyCols, err = mainTableColumnsWith(app.DB, history)
 			if err != nil {
-				return 0, fmt.Errorf("count rows for %s.%s: %w", table, def.Column, err)
+				return 0, err
 			}
-			var ids []int64
-			for rows.Next() {
-				var id int64
-				if err := rows.Scan(&id); err == nil {
+		}
+		for _, def := range defs {
+			targets := []string{table}
+			if hasHistory && versionHasColumn(historyCols, def.Column) {
+				targets = append(targets, history)
+			}
+			for _, target := range targets {
+				q := encryptedRowIDsSQL(target, def.Column)
+				rowID := "rowid"
+				if target != table {
+					rowID, err = versionHistoryRowID(historyCols)
+					if err != nil {
+						return 0, err
+					}
+					q = versionedRotationRowIDsSQL(target, def.Column, rowID)
+				}
+				rows, err := app.DB.Query(q)
+				if err != nil {
+					return 0, fmt.Errorf("count rows for %s.%s: %w", target, def.Column, err)
+				}
+				var ids []int64
+				for rows.Next() {
+					var id int64
+					if err := rows.Scan(&id); err != nil {
+						rows.Close()
+						return 0, err
+					}
 					ids = append(ids, id)
 				}
-			}
-			rows.Close()
-			if len(ids) > 0 {
-				plans = append(plans, plan{Table: table, Column: def.Column, IDs: ids})
+				if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+					return 0, err
+				}
+				// Keep empty targets: writers may insert between preflight and BEGIN.
+				plans = append(plans, plan{Table: target, Column: def.Column, Source: table, RowID: rowID, IDs: ids})
 				totalRows += len(ids)
 			}
 		}
 	}
-	log.Printf("encryption-rotate: planned - %d rows across %d (table, column) pairs", totalRows, len(plans))
+
+	log.Printf("encryption-rotate: planned - %d rows across %d (table, column) pairs, plus %d TOTP secret(s)", totalRows, len(plans), totpSealed)
+	totalRows += totpSealed + commandRows + credentialRows
 
 	if dryRun {
 		return totalRows, nil
 	}
-
-	// Re-encrypt every row. We bypass the UPDATE trigger by writing a
-	// value that already starts with enc:v1: (trigger's WHEN clause
-	// excludes already-encrypted values).
-	rotated := 0
-	for _, p := range plans {
-		for _, id := range p.IDs {
-			var raw string
-			if err := app.DB.QueryRow(fmt.Sprintf("SELECT %s FROM %s WHERE rowid = ?", p.Column, p.Table), id).Scan(&raw); err != nil {
-				return rotated, fmt.Errorf("rotate %s.%s id=%d: read: %w", p.Table, p.Column, id, err)
-			}
-			// Decrypt enforcing the v2 column binding: a value whose AAD
-			// names a different column than where it lives is a tamper /
-			// move and must not be silently re-bound under the new key.
-			// v1 values carry no AAD and skip the check.
-			plaintext, err := fieldDecryptCtx(oldKey, p.Column, raw)
-			if err != nil {
-				return rotated, fmt.Errorf("rotate %s.%s id=%d: decrypt with OLD key: %w (row may be corrupt, moved, or already rotated)", p.Table, p.Column, id, err)
-			}
-			// Re-encrypt as v2, re-binding table||column as AAD (M-3) so
-			// rotation upgrades legacy v1 rows to the bound format too.
-			recrypted, err := fieldEncryptCtx(newKey, p.Table, p.Column, plaintext)
-			if err != nil {
-				return rotated, fmt.Errorf("rotate %s.%s id=%d: encrypt with NEW key: %w", p.Table, p.Column, id, err)
-			}
-			if _, err := app.DB.Exec(fmt.Sprintf("UPDATE %s SET %s = ? WHERE rowid = ?", p.Table, p.Column), recrypted, id); err != nil {
-				return rotated, fmt.Errorf("rotate %s.%s id=%d: update: %w", p.Table, p.Column, id, err)
-			}
-			rotated++
+	if commandPresent {
+		// A connector command in flight seals under the registered key; hold
+		// the policy lock so none can interleave with the swap below. Only the
+		// wait is bounded: the lock is then held for the whole rotation.
+		lockCtx, cancelLock := context.WithTimeout(context.Background(), 30*time.Second)
+		_, release, _, err := acquireAppMCPWritePolicy(lockCtx, app.Dir)
+		cancelLock()
+		if err != nil {
+			return 0, fmt.Errorf("command storage is in use, cannot rotate: %w", err)
 		}
-		log.Printf("encryption-rotate: %s.%s done (%d rows)", p.Table, p.Column, len(p.IDs))
+		defer release()
+	}
+
+	// Every sealed row moves in ONE transaction - configured columns, TOTP
+	// secrets and the connector command stores - so either all of it is under
+	// the new key or none is, and a retry still finds the old key everywhere.
+	// app.DB opens with _txlock=immediate, so this takes the write lock at
+	// BEGIN and no writer can break a later upgrade. We bypass the UPDATE
+	// trigger by writing a value that already starts with enc:v: (the trigger's
+	// WHEN clause excludes already-encrypted values).
+	rotated := 0
+	if len(plans) > 0 || totpSealed > 0 || commandPresent || credentialsPresent || sealedJobs > 0 {
+		tx, err := app.DB.Begin()
+		if err != nil {
+			return 0, fmt.Errorf("begin rotation transaction: %w", err)
+		}
+		fail := func(err error) (int, error) {
+			tx.Rollback()
+			return 0, fmt.Errorf("rotation rolled back, nothing changed: %w", err)
+		}
+		versionTriggers, err := suspendVersioningTriggers(tx)
+		if err != nil {
+			return fail(fmt.Errorf("suspend history during rotation: %w", err))
+		}
+		encryptionTriggers, err := suspendEncryptionTriggers(tx)
+		if err != nil {
+			return fail(fmt.Errorf("suspend field encryption triggers during rotation: %w", err))
+		}
+
+		for _, p := range plans {
+			// Re-select inside the transaction: it is the authoritative set.
+			query := encryptedRowIDsSQL(p.Table, p.Column)
+			if p.Table != p.Source {
+				query = versionedRotationRowIDsSQL(p.Table, p.Column, p.RowID)
+			}
+			idRows, err := tx.Query(query)
+			if err != nil {
+				return fail(fmt.Errorf("rotate %s.%s: list rows: %w", p.Table, p.Column, err))
+			}
+			var ids []int64
+			for idRows.Next() {
+				var id int64
+				if err := idRows.Scan(&id); err != nil {
+					idRows.Close()
+					return fail(fmt.Errorf("rotate %s.%s: scan row id: %w", p.Table, p.Column, err))
+				}
+				ids = append(ids, id)
+			}
+			if err := errors.Join(idRows.Err(), idRows.Close()); err != nil {
+				return fail(fmt.Errorf("rotate %s.%s: list rows: %w", p.Table, p.Column, err))
+			}
+			for _, id := range ids {
+				var raw string
+				if err := tx.QueryRow("SELECT "+quoteColumn(p.Table, p.Column)+" FROM "+quoteIdent(p.Table)+" WHERE "+quoteIdent(p.RowID)+" = ?", id).Scan(&raw); err != nil {
+					return fail(fmt.Errorf("rotate %s.%s id=%d: read: %w", p.Table, p.Column, id, err))
+				}
+				// Decrypt enforcing the v2 column binding: a value whose AAD
+				// names a different column than where it lives is a tamper /
+				// move and must not be silently re-bound under the new key.
+				// v1 values carry no AAD and skip the check.
+				plaintext, sealed, err := appEncryptionRotationOpen(raw, oldKey, p.Source, p.Column)
+				if err == nil && !sealed {
+					plaintext = raw
+				}
+				if err != nil {
+					return fail(fmt.Errorf("rotate %s.%s id=%d: decrypt with OLD key: %w (row may be corrupt, moved, or already rotated)", p.Table, p.Column, id, err))
+				}
+				// Re-encrypt as v2, re-binding table||column as AAD (M-3) so
+				// rotation upgrades legacy v1 rows to the bound format too.
+				recrypted, err := fieldEncryptCtx(newKey, p.Source, p.Column, plaintext)
+				if err != nil {
+					return fail(fmt.Errorf("rotate %s.%s id=%d: encrypt with NEW key: %w", p.Table, p.Column, id, err))
+				}
+				if _, err := tx.Exec("UPDATE "+quoteIdent(p.Table)+" SET "+quoteIdent(p.Column)+" = ? WHERE "+quoteIdent(p.RowID)+" = ?", recrypted, id); err != nil {
+					return fail(fmt.Errorf("rotate %s.%s id=%d: update: %w", p.Table, p.Column, id, err))
+				}
+				rotated++
+			}
+			log.Printf("encryption-rotate: %s.%s staged (%d rows)", p.Table, p.Column, len(ids))
+		}
+		// Each TOTP swap compares the value read, so a concurrent enrollment
+		// or disable is never overwritten.
+		n, commandMoved := 0, 0
+		if totpSealed > 0 {
+			if n, err = rotateTOTPSecretsTx(tx, oldKey, newKey); err != nil {
+				return fail(fmt.Errorf("rotate _benmore_users.totp_secret: %w", err))
+			}
+		}
+		if commandPresent {
+			if commandMoved, err = rotateAppMCPCommandStorageTx(context.Background(), tx, app, oldKey, newKey); err != nil {
+				return fail(err)
+			}
+		}
+		credentialsMoved := 0
+		if credentialsPresent {
+			if credentialsMoved, err = rotateAppMCPConnectionCredentialsTx(context.Background(), tx, oldKey, newKey); err != nil {
+				return fail(fmt.Errorf("rotate connection credentials: %w", err))
+			}
+		}
+		// Queued job rows are re-sealed with everything else, so a job that
+		// is delivered (or retried) after the swap still opens.
+		jobsMoved, err := rotateSealedJobRowsTx(tx, oldKey, newKey)
+		if err != nil {
+			return fail(fmt.Errorf("rotate sealed job rows: %w", err))
+		}
+		if err := restoreEncryptionTriggers(tx, encryptionTriggers); err != nil {
+			return fail(fmt.Errorf("restore field encryption triggers after rotation: %w", err))
+		}
+		if err := restoreVersioningTriggers(tx, versionTriggers); err != nil {
+			return fail(fmt.Errorf("restore history after rotation: %w", err))
+		}
+
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			return 0, fmt.Errorf("rotation commit failed, nothing changed: %w", err)
+		}
+		n += credentialsMoved
+		rotated += n + commandMoved
+		log.Printf("encryption-rotate: committed %d row(s) (%d TOTP secret(s), %d command storage row(s)); re-sealed %d queued job(s)", rotated, n, commandMoved, jobsMoved)
 	}
 
 	// Swap in-memory key BEFORE writing env.yaml - if env.yaml write
@@ -1422,12 +1881,22 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	RegisterDBEncryptionKey(filepath.Join(app.Dir, "data.db"), newKey)
 	if !isolateAppEnvironment.Load() {
 		appEncryptionKey = newKey
+		appEncryptionKeyEphemeral = false
+	}
+	// Persist the new key SOURCE STRING to env.yaml right after the commit and
+	// BEFORE any blind-index work, which can return early: the blind index is
+	// derived and rebuildable, the key is not. On the next process start,
+	// InitFieldEncryption reads this string and derives the 32-byte AES key
+	// via the same versioned derivation - matching what we just registered.
+	// Writing raw key bytes instead would make every rotated row undecryptable.
+	if err := replaceEnvYamlKey(app.Dir, "ENCRYPTION_KEY", newKeySource); err != nil {
+		return rotated, fmt.Errorf("DB rotation completed (%d rows) but env.yaml write FAILED: %w. CRITICAL: in-memory key now differs from env.yaml - the next process restart will load the stale OLD key and fail to decrypt rotated rows. Manually edit env.yaml to set ENCRYPTION_KEY=<new source> before restart.", rotated, err)
 	}
 	// Blind-index key is HKDF-derived from the AES key. Rotate it
 	// in-step so every blind index recomputed below uses the new HMAC
 	// material. If derivation fails, we abort BEFORE rebuilding (the
 	// blind indices would otherwise be left half-rebuilt under
-	// inconsistent keys).
+	// inconsistent keys). The new key is already persisted, so a later boot can rebuild.
 	if err := SetBlindIndexKey(newKey); err != nil {
 		return rotated, fmt.Errorf("DB rotation completed (%d rows) but blind-index key derivation FAILED: %w. Equality search on blind-indexed columns is now broken until the next successful boot.", rotated, err)
 	}
@@ -1439,16 +1908,6 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 		return rotated, fmt.Errorf("DB rotation completed (%d rows) but blind-index rebuild FAILED after %d rows: %w", rotated, rebuilt, err)
 	} else if rebuilt > 0 {
 		log.Printf("encryption-rotate: rebuilt %d blind-index rows under new HMAC key", rebuilt)
-	}
-
-	// Persist new key SOURCE STRING to env.yaml. On the next process
-	// start, InitFieldEncryption reads this string and derives the
-	// 32-byte AES key via sha256(source) - matching what we just put
-	// into appEncryptionKey above. If we wrote raw key bytes instead,
-	// the restart-derived key would be sha256(<hex-of-bytes>) and
-	// every rotated row would fail to decrypt.
-	if err := replaceEnvYamlKey(app.Dir, "ENCRYPTION_KEY", newKeySource); err != nil {
-		return rotated, fmt.Errorf("DB rotation completed (%d rows) but env.yaml write FAILED: %w. CRITICAL: in-memory key now differs from env.yaml - the next process restart will load the stale OLD key and fail to decrypt rotated rows. Manually edit env.yaml to set ENCRYPTION_KEY=<new source> before restart.", rotated, err)
 	}
 
 	// Audit-log the rotation (rotation itself is a significant security
@@ -1469,10 +1928,10 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 // Called from the MCP rotate_encryption_key tool via probe_route, which
 // impersonates an admin user and POSTs to this endpoint with their
 // session. Server-side trust = admin role; rotation itself is audit-logged.
-func RegisterEncryptionRotationRoute(mux *http.ServeMux, app *App) {
+func RegisterEncryptionRotationRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_internal/encryption/rotate", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -1485,10 +1944,21 @@ func RegisterEncryptionRotationRoute(mux *http.ServeMux, app *App) {
 			Confirm bool   `json:"confirm"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Hosted: the vault holds the key the next start loads, so only the
+		// router's signed rotation (which saves it there) may commit one.
+		if body.Confirm && hostedTenantProcess() && !rotateSigValid(r, body.NewKey) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "on the hosted platform the key is rotated by the app owner through rotate_encryption_key, which saves the new key to the app's environment; a rotation from inside the app would be undone at the next restart"})
+			return
+		}
 
 		rotated, err := RotateEncryptionKey(app, body.NewKey, !body.Confirm)
+		var refusal *rotationRefusal
+		if errors.As(err, &refusal) {
+			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": refusal.Error()})
+			return
+		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			serverErrorJSON(w, r, app, "encryption rotate", err, "key rotation failed")
 			return
 		}
 		if !body.Confirm {

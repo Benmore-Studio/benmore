@@ -1,0 +1,4 @@
+# This fixture comment claims messages are public; comments do not grant access.
+access:
+  messages:
+    read: self

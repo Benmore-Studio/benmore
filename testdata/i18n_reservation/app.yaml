@@ -1,0 +1,35 @@
+{
+  "site_name": "Reservation Review",
+  "theme": "zinc",
+  "mode": "light",
+  "seo": {
+    "lang": "en"
+  },
+  "auth": {
+    "identifier": "email",
+    "session_duration": "1h",
+    "signup_fields": "first_name"
+  },
+  "features": {
+    "testing": true,
+    "analytics": false
+  },
+  "frontend": {
+    "stack": "html"
+  },
+  "access": {
+    "slots": {
+      "read": "everyone",
+      "write": "role:admin",
+      "update": "role:admin",
+      "delete": "role:admin"
+    },
+    "bookings": {
+      "read": "self",
+      "write": "role:admin",
+      "update": "role:admin",
+      "delete": "role:admin"
+    },
+    "approval_journals": "role:admin"
+  }
+}

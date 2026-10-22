@@ -284,6 +284,8 @@ const curatedNotifyHubBroadcastFlowYAML = `on:
     method: POST
     path: /api/notify-hub/broadcast
     auth: required
+    # Writes into every verified user's inbox, so only admins may broadcast.
+    role: admin
 
 jobs:
   broadcast:

@@ -52,6 +52,7 @@ func ScaffoldNewHTML(name string) {
 	fmt.Printf("Created %s/ (TSX-by-default; auto-compiled by embedded esbuild)\n", name)
 	fmt.Printf("  app.yaml          - auth + theme\n")
 	fmt.Printf("  schema.prisma     - example Note model\n")
+	fmt.Printf("  mcp.yaml          - reviewed read-only Notes connector (owner opt-in)\n")
 	fmt.Printf("  static/index.html - home page\n")
 	fmt.Printf("  static/login.html - login UI\n")
 	fmt.Printf("  static/signup.html - signup UI\n")
@@ -72,6 +73,13 @@ func ScaffoldNewHTML(name string) {
 // between the CLI scaffold (`benmore new --html`) and the MCP
 // `create_app` tool (once it learns about the HTML stack).
 func WriteHTMLScaffoldFiles(dir, title string) error {
+	return writeHTMLScaffoldFiles(dir, title, true)
+}
+
+// An unlinked hosted workspace cannot yet attest server-contributed source.
+// Keep its first deploy usable; author/review a connector after pulling the
+// deployed source. Server-created and self-hosted starters can bind it now.
+func writeHTMLScaffoldFiles(dir, title string, withConnector bool) error {
 	name := filepath.Base(dir)
 	if title == "" {
 		title = strings.Title(name)
@@ -102,7 +110,7 @@ auth:
   signup_fields: "first_name"
 
 features:
-  testing: true   # amber banner + feedback widget (turn off when this is no longer a prototype)
+  testing: true   # feedback flag widget (+ demo password gate if set); "benmore publish" turns it off
 
 frontend:
   stack: html      # TSX in static/*.tsx; framework auto-compiles to /static/*.js
@@ -159,7 +167,7 @@ frontend:
       <h1 class="text-2xl font-semibold tracking-tight">`+title+`</h1>
       <div class="who flex items-center gap-3" hidden>
         <span class="who-name text-sm text-zinc-600 dark:text-zinc-400"></span>
-        <button type="button" data-action="signout" class="text-sm px-3 py-1.5 rounded-md border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800">Sign out</button>
+        <button type="button" data-action="signout" data-testid="signout" class="text-sm px-3 py-1.5 rounded-md border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800">Sign out</button>
       </div>
     </header>
 
@@ -167,21 +175,24 @@ frontend:
     <section class="anon space-y-2" hidden>
       <p class="text-zinc-600 dark:text-zinc-400">You're not signed in.</p>
       <p class="text-sm">
-        <a href="/login.html" class="text-blue-600 dark:text-blue-400 hover:underline">Log in</a>
+        <a href="/login.html" data-testid="nav-login" class="text-blue-600 dark:text-blue-400 hover:underline">Log in</a>
         <span class="text-zinc-400">&middot;</span>
-        <a href="/signup.html" class="text-blue-600 dark:text-blue-400 hover:underline">Sign up</a>
+        <a href="/signup.html" data-testid="nav-signup" class="text-blue-600 dark:text-blue-400 hover:underline">Sign up</a>
       </p>
     </section>
 
     <!-- Authenticated view -->
     <section class="app space-y-4" hidden>
-      <form id="new-note" class="flex gap-2">
-        <input name="title" placeholder="What needs writing down?" autocomplete="off" required
+      <!-- data-testid marks every interactive element for QA: qa_inventory,
+           tests/journeys/*.yaml and browser_batch prefer it over ids/classes,
+           so selectors survive restyling. Keep the convention on new UI. -->
+      <form id="new-note" data-testid="note-form" class="flex gap-2">
+        <input name="title" data-testid="note-title" placeholder="What needs writing down?" autocomplete="off" required
                class="flex-1 px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-blue-500">
-        <button type="submit" class="px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Add</button>
+        <button type="submit" data-testid="note-add" class="px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Add</button>
       </form>
-      <ul id="notes" class="divide-y divide-zinc-200 dark:divide-zinc-800 rounded-md border border-zinc-200 dark:border-zinc-800"></ul>
-      <p class="empty text-sm text-zinc-500" hidden>No notes yet. Add one above.</p>
+      <ul id="notes" data-testid="note-list" class="divide-y divide-zinc-200 dark:divide-zinc-800 rounded-md border border-zinc-200 dark:border-zinc-800"></ul>
+      <p class="empty text-sm text-zinc-500" data-testid="note-empty" hidden>No notes yet. Add one above.</p>
     </section>
   </main>
 
@@ -206,21 +217,22 @@ frontend:
 </head>
 <body class="h-full text-zinc-900 dark:text-zinc-100 antialiased">
   <main class="min-h-full flex items-center justify-center px-6 py-10">
-    <form id="login-form" autocomplete="on" class="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
+    <form id="login-form" data-testid="login-form" autocomplete="on" class="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
       <h1 class="text-2xl font-semibold tracking-tight">Log in</h1>
       <p class="text-sm text-zinc-600 dark:text-zinc-400">Welcome back to `+title+`.</p>
       <div class="error text-sm text-red-600 dark:text-red-400" hidden></div>
       <label class="block space-y-1">
         <span class="text-sm font-medium">Email</span>
-        <input type="email" name="email" required autocomplete="email"
+        <input type="email" name="email" data-testid="login-email" required autocomplete="email"
                class="block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </label>
       <label class="block space-y-1">
         <span class="text-sm font-medium">Password</span>
-        <input type="password" name="password" required autocomplete="current-password"
+        <input type="password" name="password" data-testid="login-password" required autocomplete="current-password"
                class="block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </label>
-      <button type="submit" class="w-full px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Log in</button>
+      <button type="submit" data-testid="login-submit" class="w-full px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Log in</button>
+      <button type="button" id="login-passkey" data-testid="login-passkey" hidden class="w-full px-4 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900">Sign in with a passkey</button>
       <p class="text-sm text-zinc-600 dark:text-zinc-400">No account? <a href="/signup.html" class="text-blue-600 dark:text-blue-400 hover:underline">Sign up</a></p>
     </form>
   </main>
@@ -245,26 +257,26 @@ frontend:
 </head>
 <body class="h-full text-zinc-900 dark:text-zinc-100 antialiased">
   <main class="min-h-full flex items-center justify-center px-6 py-10">
-    <form id="signup-form" autocomplete="on" class="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
+    <form id="signup-form" data-testid="signup-form" autocomplete="on" class="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
       <h1 class="text-2xl font-semibold tracking-tight">Create an account</h1>
       <p class="text-sm text-zinc-600 dark:text-zinc-400">Start using `+title+`.</p>
       <div class="error text-sm text-red-600 dark:text-red-400" hidden></div>
       <label class="block space-y-1">
         <span class="text-sm font-medium">First name</span>
-        <input type="text" name="first_name" required autocomplete="given-name"
+        <input type="text" name="first_name" data-testid="signup-first-name" required autocomplete="given-name"
                class="block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </label>
       <label class="block space-y-1">
         <span class="text-sm font-medium">Email</span>
-        <input type="email" name="email" required autocomplete="email"
+        <input type="email" name="email" data-testid="signup-email" required autocomplete="email"
                class="block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </label>
       <label class="block space-y-1">
         <span class="text-sm font-medium">Password</span>
-        <input type="password" name="password" required autocomplete="new-password" minlength="8"
+        <input type="password" name="password" data-testid="signup-password" required autocomplete="new-password" minlength="8"
                class="block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </label>
-      <button type="submit" class="w-full px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Sign up</button>
+      <button type="submit" data-testid="signup-submit" class="w-full px-4 py-2 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-500">Sign up</button>
       <p class="text-sm text-zinc-600 dark:text-zinc-400">Already have an account? <a href="/login.html" class="text-blue-600 dark:text-blue-400 hover:underline">Log in</a></p>
     </form>
   </main>
@@ -321,6 +333,11 @@ frontend:
 	if err := write("static/styles.css", htmlScaffoldStylesCSS); err != nil {
 		return err
 	}
+	// A first browser journey so `benmore verify` has something real to run
+	// on day one. qa_inventory drafts more of these from the rendered app.
+	if err := write("tests/journeys/home.yaml", htmlScaffoldHomeJourneyYAML); err != nil {
+		return err
+	}
 
 	// TypeScript project config - points the `bm` bare specifier at
 	// src/bm.d.ts (regenerated on every push). With this in place,
@@ -344,7 +361,15 @@ frontend:
 	if err := write("AGENTS.md", scaffoldAgentsGuide(title, name)); err != nil {
 		return err
 	}
+	// Hosted create_app initializes git next; include its protected ignore
+	// rules now so that setup does not change the reviewed source digest.
+	if err := write(".gitignore", gitignoreContents); err != nil {
+		return err
+	}
 
+	if withConnector {
+		return writeAppMCPStarter(dir)
+	}
 	return nil
 }
 
@@ -497,6 +522,23 @@ export function initLogin() {
       if (err) { err.textContent = ex?.message || 'Sign-in failed'; err.hidden = false; }
     }
   });
+  // Passkeys (Face ID, Touch ID, Windows Hello, a phone): shown only where the
+  // browser supports them. Users add one while signed in with
+  // bm.auth.passkey.register().
+  const passkeyBtn = document.getElementById('login-passkey') as HTMLButtonElement | null;
+  if (passkeyBtn && bm.auth.passkey.supported()) {
+    passkeyBtn.hidden = false;
+    passkeyBtn.addEventListener('click', async () => {
+      if (err) err.hidden = true;
+      try {
+        await bm.auth.passkey.signIn();
+        location.href = '/';
+      } catch (ex: any) {
+        if (ex?.name === 'NotAllowedError') return; // the person dismissed the prompt
+        if (err) { err.textContent = ex?.message || 'Passkey sign-in failed'; err.hidden = false; }
+      }
+    });
+  }
 }
 
 // initSignup - same for signup.html. Object.fromEntries forwards every
@@ -550,6 +592,8 @@ export function Button(opts: {
   type?: 'submit' | 'button' | 'reset';
   variant?: ButtonVariant;
   size?: ButtonSize;
+  /** QA selector hook: rendered as data-testid (see tests/journeys/). */
+  testid?: string;
   attrs?: string;
   extraClass?: string;
 }): string {
@@ -560,7 +604,8 @@ export function Button(opts: {
     danger: 'bg-red-600 text-white hover:bg-red-500',
   }[opts.variant ?? 'primary'];
   const size = opts.size === 'sm' ? 'px-3 py-1.5 text-sm' : 'px-4 py-2';
-  return ` + "`<button type=\"${opts.type ?? 'button'}\" class=\"rounded-md font-medium ${size} ${variant} ${opts.extraClass ?? ''}\" ${opts.attrs ?? ''}>${escapeHtml(opts.label)}</button>`" + `;
+  const testid = opts.testid ? ` + "`data-testid=\"${escapeHtml(opts.testid)}\"`" + ` : '';
+  return ` + "`<button type=\"${opts.type ?? 'button'}\" class=\"rounded-md font-medium ${size} ${variant} ${opts.extraClass ?? ''}\" ${testid} ${opts.attrs ?? ''}>${escapeHtml(opts.label)}</button>`" + `;
 }
 
 export function Input(opts: {
@@ -569,12 +614,15 @@ export function Input(opts: {
   placeholder?: string;
   value?: string;
   required?: boolean;
+  /** QA selector hook: rendered as data-testid (see tests/journeys/). */
+  testid?: string;
   attrs?: string;
 }): string {
   // ALWAYS set an explicit text + bg + placeholder color paired by light/dark -
   // a bg without a matching text color is the #1 cause of invisible
   // white-on-white inputs. Never ship an input that relies on inherited color.
-  return ` + "`<input name=\"${opts.name}\" type=\"${opts.type ?? 'text'}\" ${opts.required ? 'required' : ''} ${opts.placeholder ? `placeholder=\"${escapeHtml(opts.placeholder)}\"` : ''} ${opts.value !== undefined ? `value=\"${escapeHtml(opts.value)}\"` : ''} class=\"block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500\" ${opts.attrs ?? ''}>`" + `;
+  const testid = opts.testid ? ` + "`data-testid=\"${escapeHtml(opts.testid)}\"`" + ` : '';
+  return ` + "`<input name=\"${opts.name}\" type=\"${opts.type ?? 'text'}\" ${testid} ${opts.required ? 'required' : ''} ${opts.placeholder ? `placeholder=\"${escapeHtml(opts.placeholder)}\"` : ''} ${opts.value !== undefined ? `value=\"${escapeHtml(opts.value)}\"` : ''} class=\"block w-full px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500\" ${opts.attrs ?? ''}>`" + `;
 }
 
 export function Field(opts: { label: string; input: string; hint?: string }): string {
@@ -697,15 +745,15 @@ async function render() {
   // toggle one item), the rest of the list stays put - no flash, no lost focus,
   // no re-initialised icons. NEVER do "ul.innerHTML = rows.map(...).join('')" on
   // a live list; that rebuilds every row every time.
-  reconcileList(ul, rows, n => n.id, n => ` + "`<li class=\"px-4 py-3 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex items-center justify-between gap-3\">\n      <span>${escapeHtml(n.title)}</span>\n      ${Button({ label: 'Delete', variant: 'ghost', size: 'sm', attrs: `data-id=\"${n.id}\" data-action=\"delete-note\"` })}\n    </li>`" + `);
+  reconcileList(ul, rows, n => n.id, n => ` + "`<li class=\"px-4 py-3 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex items-center justify-between gap-3\">\n      <span>${escapeHtml(n.title)}</span>\n      ${Button({ label: 'Delete', variant: 'ghost', size: 'sm', attrs: `data-id=\"${n.id}\" data-action=\"delete-note\" data-testid=\"note-delete-${n.id}\"` })}\n    </li>`" + `);
 }
 
 export async function initNotes(_me: User) {
   await render();
   // Live SSE - refreshes the list on every CRUD mutation across all tabs.
   // For high-traffic tables use bm.live.scoped(table, refresh, {debounce})
-  // - it debounces, dedupes concurrent fetches, and skips work when the
-  // tab is hidden.
+  // - it debounces and serializes refresh promises per subscription.
+  // Return all fetch/render work; see api(at:"live-scoped") for teardown.
   bm.live('notes', () => render());
 
   $('#new-note')?.addEventListener('submit', async (e: Event) => {
@@ -800,7 +848,7 @@ export const users: {
 export function table<R = Record<string, unknown>>(name: string): TableClient<R>;
 export function live<T = Record<string, unknown>>(table: string, cb: (ev: ChangeEvent<T>) => void): () => void;
 export function room(name: string): {
-  on(kind: string, fn: (payload: any, from: number) => void): any;
+  on(kind: string, fn: (payload: any, from: number | 'server') => void): any;
   send(payload: any): void;
   leave(): void;
 };
@@ -869,4 +917,21 @@ const htmlScaffoldStylesCSS = `/* styles.css - opt-in custom styles.
    anonymous view and the signed-in app. Keep this rule (or delete it only if
    you never use the hidden attribute alongside a display utility class). */
 [hidden] { display: none !important; }
+`
+
+// htmlScaffoldHomeJourneyYAML is the scaffold's starter browser journey
+// (tests/journeys/home.yaml). Journeys run in a real headless browser via
+// browser_batch during `benmore verify`; selectors use the data-testid
+// convention the scaffold pages follow.
+const htmlScaffoldHomeJourneyYAML = `# Browser journey for benmore verify (api(at:"qa") explains the format).
+# Runs in a real headless browser against the dev instance. This starter only
+# checks what every app keeps (the page renders, nothing overflows), so it
+# survives replacing the demo. Add one file per user flow: after changing
+# views, run ` + "`benmore qa draft`" + ` to write fresh drafts from the rendered app.
+name: home
+tags: [smoke]
+path: /
+assertions:
+  - {visible: "main"}
+  - {horizontal_overflow: false}
 `

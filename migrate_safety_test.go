@@ -4,6 +4,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -169,6 +170,80 @@ func TestScheduledBackupPermissionsAllowRouterVerification(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0640 {
 		t.Errorf("scheduled backup permissions = %04o, want 0640", got)
+	}
+}
+
+func TestBackupFilePermissionRepairDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+		want bool
+	}{
+		{name: "canonical router-owned file", mode: 0640, want: false},
+		{name: "group-readable but writable", mode: 0660, want: true},
+		{name: "owner-only", mode: 0600, want: true},
+		{name: "canonical bits plus setgid", mode: 0640 | os.ModeSetgid, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backupFilePermissionNeedsRepair(tc.mode); got != tc.want {
+				t.Fatalf("mode %v needs repair = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnsureBackupFilePermissionSkipsCorrectModeAndFailsClosedOnRepairError(t *testing.T) {
+	chmodCalls := 0
+	chmod := func(string, os.FileMode) error {
+		chmodCalls++
+		return os.ErrPermission
+	}
+	if err := ensureBackupFilePermission("router.db", 0640, chmod); err != nil {
+		t.Fatalf("canonical mode should not require chmod: %v", err)
+	}
+	if chmodCalls != 0 {
+		t.Fatalf("canonical mode invoked chmod %d times", chmodCalls)
+	}
+	if err := ensureBackupFilePermission("app.db", 0600, chmod); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("wrong mode with denied chmod = %v, want permission error", err)
+	}
+	if chmodCalls != 1 {
+		t.Fatalf("wrong mode invoked chmod %d times, want 1", chmodCalls)
+	}
+}
+
+func TestPrepareBackupDirPreservesCanonicalFileAndRepairsWrongMode(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, backupDirName)
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(backupDir, "pre-migrate-router.db")
+	wrong := filepath.Join(backupDir, "pre-migrate-app.db")
+	if err := os.WriteFile(canonical, []byte("router snapshot"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrong, []byte("app snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareBackupDir(backupDir); err != nil {
+		t.Fatalf("prepare backup dir with canonical router-owned file: %v", err)
+	}
+	if after, err := os.ReadFile(canonical); err != nil || string(after) != string(before) {
+		t.Fatalf("canonical backup changed: bytes=%q err=%v", after, err)
+	}
+	for _, path := range []string{canonical, wrong} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != backupPermission {
+			t.Errorf("%s permission = %04o, want %04o", filepath.Base(path), got, backupPermission)
+		}
 	}
 }
 

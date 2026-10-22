@@ -13,8 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // ===== App Test Types =====
@@ -281,7 +279,7 @@ func loadTestFilesFromDisk(dir string) []AppTestFile {
 		}
 
 		var tests map[string]AppTestCase
-		if err := yaml.Unmarshal(data, &tests); err != nil {
+		if err := yamlUnmarshal(data, &tests); err != nil {
 			continue
 		}
 
@@ -822,11 +820,13 @@ func loginTestUser(app *App, email string, role string) ([]*http.Cookie, string,
 	if err != nil {
 		hash, _ := generateBcryptHash([]byte("testpass123"))
 		username := GenerateUniqueUsername(app.DB, strings.Split(email, "@")[0], 0)
-		result, insertErr := app.DB.Exec("INSERT INTO _benmore_users (username, email, password_hash, role) VALUES (?, ?, ?, ?)", username, email, string(hash), role)
+		// Test identities stand for real signed-in users, whose email is
+		// verified: email-keyed memberships and shares need that.
+		result, insertErr := app.DB.Exec("INSERT INTO _benmore_users (username, email, password_hash, role, verified) VALUES (?, ?, ?, ?, 1)", username, email, string(hash), role)
 		if insertErr != nil {
 			// Retry once - database may be locked by concurrent operations
 			time.Sleep(100 * time.Millisecond)
-			result, insertErr = app.DB.Exec("INSERT INTO _benmore_users (username, email, password_hash, role) VALUES (?, ?, ?, ?)", username, email, string(hash), role)
+			result, insertErr = app.DB.Exec("INSERT INTO _benmore_users (username, email, password_hash, role, verified) VALUES (?, ?, ?, ?, 1)", username, email, string(hash), role)
 		}
 		if result != nil {
 			id, _ = result.LastInsertId()

@@ -195,7 +195,7 @@ func TestRequiredPasswordChangeRollsBackOnRevocationFailure(t *testing.T) {
 		t.Fatal("failed transaction changed credential")
 	}
 	var n int
-	if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=?", sid).Scan(&n); err != nil || n != 1 {
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=?", sessionStorageKey(sid)).Scan(&n); err != nil || n != 1 {
 		t.Fatal("session deletion did not roll back")
 	}
 	if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_api_tokens WHERE token_hash=?", hashToken(tok)).Scan(&n); err != nil || n != 1 {
@@ -211,7 +211,7 @@ func TestRequiredPasswordChangeRejectsDelegatedSessions(t *testing.T) {
 			if column == "scopes" {
 				value = "notes:read"
 			}
-			passwordChangeExec(t, app.DB, "UPDATE _benmore_sessions SET "+column+"=? WHERE id=?", value, sid)
+			passwordChangeExec(t, app.DB, "UPDATE _benmore_sessions SET "+column+"=? WHERE id=?", value, sessionStorageKey(sid))
 			w := httptest.NewRecorder()
 			mux.ServeHTTP(w, passwordChangeRequest(sid, "Temporary!123", "Replacement!123", true))
 			if w.Code != 403 {
@@ -249,7 +249,7 @@ func TestRequiredPasswordChangeRecoveryIsAtomic(t *testing.T) {
 			if err := app.DB.QueryRow("SELECT used FROM _benmore_password_resets WHERE token=?", hashResetToken("synthetic-reset")).Scan(&used); err != nil {
 				t.Fatal(err)
 			}
-			if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=?", sid).Scan(&sessions); err != nil {
+			if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=?", sessionStorageKey(sid)).Scan(&sessions); err != nil {
 				t.Fatal(err)
 			}
 			if failRevoke {
@@ -265,6 +265,9 @@ func TestRequiredPasswordChangeRecoveryIsAtomic(t *testing.T) {
 
 func TestRequiredPasswordChangeUpgradesLegacySchema(t *testing.T) {
 	app, _ := auditApp(t)
+	// Simulate a pre-gate database, before the credential-write trigger also
+	// referenced this column. EnsureUsersTable reinstalls the trigger below.
+	passwordChangeExec(t, app.DB, "DROP TRIGGER _benmore_mfa_setup_nonce_reset")
 	passwordChangeExec(t, app.DB, "ALTER TABLE _benmore_users DROP COLUMN password_change_required")
 	if err := EnsureUsersTable(app.DB); err != nil {
 		t.Fatal(err)
@@ -325,7 +328,7 @@ func TestRequiredPasswordChangeAfterOTPVerification(t *testing.T) {
 	passwordChangeExec(t, app.DB, "INSERT INTO _benmore_otp(email,code,expires_at) VALUES (?,'123456',datetime('now','+10 minutes'))", email)
 	r := httptest.NewRequest("POST", app.Paths.VerifyOTP, strings.NewReader("code=123456"))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: "_benmore_otp_uid", Value: signTempCookie(fmt.Sprintf("%d|%s|%s", uid, email, email))})
+	r.AddCookie(&http.Cookie{Name: "_benmore_otp_uid", Value: mintSignInChallenge(app, tempCookieOTP, uid, email, email)})
 	w := httptest.NewRecorder()
 	handleVerifyOTP(w, r, app)
 	var sid string

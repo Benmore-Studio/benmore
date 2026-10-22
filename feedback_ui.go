@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"html"
 	"log"
-	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -81,6 +80,30 @@ func feedbackReadAllowed(app *App, session *Session) bool {
 		return true
 	}
 	return session.IsAdmin()
+}
+
+// feedbackSubmitCSRF gates POST /api/_feedback. Submission is open to
+// anonymous visitors, so there is no credential to demand, but another site
+// must not be able to post through a visitor's browser: a cross-site or
+// same-site (sibling subdomain) browser request is refused by the same origin
+// gate validateCSRF applies. A request riding a signed-in session cookie also
+// needs the CSRF token (the injected widget sends the page's), as every other
+// cookie-authenticated mutation does. Bearer callers carry no ambient
+// credential and are exempt. Writes the 403 and returns false on refusal.
+func feedbackSubmitCSRF(w http.ResponseWriter, r *http.Request, session *Session) bool {
+	if isBearerAuth(r) {
+		return true
+	}
+	ok := false
+	if session != nil {
+		ok = validateCSRF(r)
+	} else {
+		_, ok = csrfOriginReason(r)
+	}
+	if !ok {
+		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+	}
+	return ok
 }
 
 // feedbackSubmission is the decoded body of a POST /api/_feedback, shared by
@@ -208,23 +231,31 @@ func (t *demoAttemptTracker) clearAttempts(ip string) {
 
 // demoSessionToken generates a deterministic token from the password so all
 // valid sessions share the same token (no storage needed).
+// demoSessionToken is the gate cookie value. Keyed with the app's server
+// secret: the previous unkeyed SHA-256 of the password let anyone holding one
+// cookie brute-force the demo password offline at hash speed.
 func demoSessionToken(password string) string {
-	h := sha256.Sum256([]byte("benmore-demo:" + password))
-	return hex.EncodeToString(h[:16])
+	mac := hmac.New(sha256.New, []byte(serverSecret))
+	mac.Write([]byte("benmore-demo-v2\x00" + password))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // DemoGateMiddleware wraps the entire mux to require a demo password.
-func DemoGateMiddleware(password string, next http.Handler) http.Handler {
+func DemoGateMiddleware(app *App, password string, next http.Handler) http.Handler {
 	token := demoSessionToken(password)
+	webhooks := demoGateWebhookRoutes(app)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow static assets, internal routes, API routes, and the gate itself
+		// Allow static assets, internal routes and the gate itself
 		if strings.HasPrefix(r.URL.Path, "/static/") ||
 			strings.HasPrefix(r.URL.Path, "/_internal/") ||
-			strings.HasPrefix(r.URL.Path, "/api/") ||
 			strings.HasPrefix(r.URL.Path, "/auth/") ||
 			r.URL.Path == "/favicon.ico" ||
 			r.URL.Path == "/robots.txt" ||
 			r.URL.Path == "/sw.js" ||
+			// Exact match: the router and fleet release verification read
+			// /health JSON (status/version/instance_id only for anonymous
+			// callers) and cannot present the visitor password.
+			r.URL.Path == "/health" ||
 			r.URL.Path == "/_demo/login" {
 			next.ServeHTTP(w, r)
 			return
@@ -232,8 +263,28 @@ func DemoGateMiddleware(password string, next http.Handler) http.Handler {
 
 		// Check for valid demo session cookie
 		cookie, err := r.Cookie("demo_session")
-		if err == nil && cookie.Value == token {
+		if err == nil && hmac.Equal([]byte(cookie.Value), []byte(token)) {
 			next.ServeHTTP(w, r)
+			return
+		}
+
+		// The API is behind the visitor password too - otherwise anything
+		// an anonymous caller may read was readable without it. Two kinds
+		// of caller can't present the password and authenticate for
+		// themselves: API clients with a valid bearer credential, and
+		// signed inbound webhooks (flows with verify:).
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if isBearerAuth(r) && app != nil && getSession(app, r) != nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if webhooks != nil {
+				if _, pattern := webhooks.Handler(r); pattern != "" {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "visitor password required", "login": "/_demo/login"})
 			return
 		}
 
@@ -242,21 +293,51 @@ func DemoGateMiddleware(password string, next http.Handler) http.Handler {
 	})
 }
 
+// demoGateWebhookRoutes is a mux holding only the app's signature-verified
+// HTTP flows, used to recognise inbound webhook requests the visitor-password
+// gate must let through. nil when the app has none.
+func demoGateWebhookRoutes(app *App) *http.ServeMux {
+	if app == nil {
+		return nil
+	}
+	var mux *http.ServeMux
+	for _, f := range app.Flows {
+		if f.Trigger.Type != "http" || (f.Verify == "" && f.VerifyConfig == nil) {
+			continue
+		}
+		parts := strings.Split(f.Trigger.Path, "/")
+		for i, part := range parts {
+			if strings.HasPrefix(part, ":") {
+				parts[i] = "{" + strings.TrimPrefix(part, ":") + "}"
+			}
+		}
+		pattern := f.Trigger.Method + " " + strings.Join(parts, "/")
+		if mux == nil {
+			mux = http.NewServeMux()
+		}
+		func() {
+			defer func() { recover() }() // a duplicate pattern is already covered
+			mux.HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+		}()
+	}
+	return mux
+}
+
 // RegisterDemoLoginRoute wires POST /_demo/login - the endpoint the
 // gate page posts to. Split out of RegisterDemoRoutes (v2.7.164) so
 // the visitor-password gate works WITHOUT features.testing: the gate
 // middleware excludes /_demo/login from gating, so this route must
 // exist whenever the middleware is armed or the login form 404s and
 // the app bricks for every visitor.
-func RegisterDemoLoginRoute(mux *http.ServeMux, app *App, password string) {
+func RegisterDemoLoginRoute(mux appRouteRegistrar, app *App, password string) {
 	token := demoSessionToken(password)
 	mux.HandleFunc("POST /_demo/login", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
-		// Use RemoteAddr for rate limiting - don't trust X-Forwarded-For (spoofable)
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if ip == "" {
-			ip = r.RemoteAddr
-		}
+		// The trusted client address (router marker or configured proxy
+		// only). The raw RemoteAddr is the router's loopback address for
+		// every hosted visitor, so keying on it let three wrong guesses
+		// from anyone lock every visitor out.
+		ip := clientIP(r)
 
 		if demoTracker.isLocked(ip) {
 			serveDemoGate(w, r, "Too many attempts. Please try again in 15 minutes.")
@@ -295,8 +376,12 @@ func RegisterDemoLoginRoute(mux *http.ServeMux, app *App, password string) {
 }
 
 // RegisterDemoRoutes sets up the demo login + feedback API.
-func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
+func RegisterDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 	EnsureFeedbackTables(app.DB)
+	registerDemoRoutes(mux, app, password)
+}
+
+func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 	token := demoSessionToken(password)
 
 	RegisterDemoLoginRoute(mux, app, password)
@@ -304,57 +389,44 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 	// Webhook config
 	webhookURL := GetAppEnv(app.Dir, "TESTING_WEBHOOK_URL")
 	webhookToken := GetAppEnv(app.Dir, "TESTING_WEBHOOK_TOKEN")
+	intake := newFeedbackIntake(app)
 
 	// POST /api/_feedback - submit feedback (anyone with demo session)
 	mux.HandleFunc("POST /api/_feedback", func(w http.ResponseWriter, r *http.Request) {
 		// Verify demo session
+		session := getSession(app, r)
 		cookie, err := r.Cookie("demo_session")
-		if err != nil || cookie.Value != token {
+		if err != nil || !hmac.Equal([]byte(cookie.Value), []byte(token)) {
 			// Also allow authenticated users
-			session := getSession(app, r)
 			if session == nil {
 				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "access denied"})
 				return
 			}
 		}
-
-		var body feedbackSubmission
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Body) == "" {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "feedback body is required"})
-			return
-		}
-		if len(body.Screenshot) > 2*1024*1024 {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "screenshot too large (2MB max)"})
+		if !feedbackSubmitCSRF(w, r, session) {
 			return
 		}
 
-		host := feedbackOriginHost(body.OriginHost, r)
-		result, err := app.DB.Exec(
-			`INSERT INTO _benmore_feedback (visitor_name, visitor_email, page_url, origin_host, body, element_selector, screenshot)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			strings.TrimSpace(body.Name), strings.TrimSpace(body.Email),
-			body.PageURL, host, strings.TrimSpace(body.Body),
-			body.ElementSelector, body.Screenshot)
-		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to save"})
+		body, ok := intake.decode(w, r, session)
+		if !ok {
 			return
 		}
-		id, _ := result.LastInsertId()
-
+		id, host, ok := intake.submit(w, r, &body)
+		if !ok {
+			return
+		}
 		fireFeedbackWebhook(webhookURL, webhookToken, fmt.Sprintf("feedback.webhook:%d", id),
 			feedbackWebhookPayload(app, id, body, host, r.Host))
-
-		httpJSON(w, http.StatusOK, map[string]any{"id": id, "status": "submitted"})
 	})
 
 	// GET /api/_feedback - list feedback (admin only)
 	mux.HandleFunc("GET /api/_feedback", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
-		rows, _ := QueryRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at
+		rows, _ := queryMetadataRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at
 			FROM _benmore_feedback ORDER BY created_at DESC`)
 		httpJSON(w, http.StatusOK, rows)
 	})
@@ -362,17 +434,17 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 	// GET /api/_feedback/{id} - single feedback with comments
 	mux.HandleFunc("GET /api/_feedback/{id}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
 		id := r.PathValue("id")
-		rows, _ := QueryRows(app.DB, "SELECT * FROM _benmore_feedback WHERE id = ?", id)
+		rows, _ := queryMetadataRows(app.DB, "SELECT * FROM _benmore_feedback WHERE id = ?", id)
 		if len(rows) == 0 {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 			return
 		}
-		comments, _ := QueryRows(app.DB, "SELECT * FROM _benmore_feedback_comments WHERE feedback_id = ? ORDER BY created_at", id)
+		comments, _ := queryMetadataRows(app.DB, "SELECT * FROM _benmore_feedback_comments WHERE feedback_id = ? ORDER BY created_at", id)
 		result := rows[0]
 		result["comments"] = comments
 		httpJSON(w, http.StatusOK, result)
@@ -381,7 +453,7 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 	// PATCH /api/_feedback/{id} - update status (admin)
 	mux.HandleFunc("PATCH /api/_feedback/{id}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -404,7 +476,7 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 	// POST /api/_feedback/{id}/comment - add comment (admin)
 	mux.HandleFunc("POST /api/_feedback/{id}/comment", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -432,7 +504,7 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 	// Test data reset (admin only, testing mode only)
 	mux.HandleFunc("POST /api/_testing/reset", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
@@ -444,7 +516,7 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 		tables, _ := GetTableNames(app.DB)
 		for _, t := range tables {
 			if !strings.HasPrefix(t, "_benmore_") {
-				app.DB.Exec(fmt.Sprintf("DELETE FROM %s", t))
+				app.DB.Exec("DELETE FROM " + quoteIdent(t))
 			}
 		}
 		// Re-run seeds
@@ -479,9 +551,10 @@ func RegisterDemoRoutes(mux *http.ServeMux, app *App, password string) {
 // so reads are admin-only - a regular end-user must not be able to GET other
 // people's feedback. Anonymous reads always return an empty list (not 401) so
 // the widget's own history panel on /login doesn't spam console errors.
-func RegisterFeedbackAPI(mux *http.ServeMux, app *App) {
+func RegisterFeedbackAPI(mux appRouteRegistrar, app *App) {
 	webhookURL := GetAppEnv(app.Dir, "TESTING_WEBHOOK_URL")
 	webhookToken := GetAppEnv(app.Dir, "TESTING_WEBHOOK_TOKEN")
+	intake := newFeedbackIntake(app)
 
 	// POST /api/_feedback - submit. Open to anonymous visitors so people
 	// previewing a draft (e.g., on /login) or using a published app can leave
@@ -489,14 +562,12 @@ func RegisterFeedbackAPI(mux *http.ServeMux, app *App) {
 	// auto-attached.
 	mux.HandleFunc("POST /api/_feedback", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-
-		var body feedbackSubmission
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Body) == "" {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "feedback body is required"})
+		if !feedbackSubmitCSRF(w, r, session) {
 			return
 		}
-		if len(body.Screenshot) > 2*1024*1024 {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "screenshot too large (2MB max)"})
+
+		body, ok := intake.decode(w, r, session)
+		if !ok {
 			return
 		}
 		if session != nil {
@@ -511,23 +582,12 @@ func RegisterFeedbackAPI(mux *http.ServeMux, app *App) {
 				body.Name = "Anonymous"
 			}
 		}
-
-		host := feedbackOriginHost(body.OriginHost, r)
-		result, err := app.DB.Exec(
-			`INSERT INTO _benmore_feedback (visitor_name, visitor_email, page_url, origin_host, body, element_selector, screenshot) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			strings.TrimSpace(body.Name), strings.TrimSpace(body.Email),
-			body.PageURL, host, strings.TrimSpace(body.Body),
-			body.ElementSelector, body.Screenshot)
-		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to save"})
+		id, host, ok := intake.submit(w, r, &body)
+		if !ok {
 			return
 		}
-		id, _ := result.LastInsertId()
-
 		fireFeedbackWebhook(webhookURL, webhookToken, fmt.Sprintf("feedback.webhook:%d", id),
 			feedbackWebhookPayload(app, id, body, host, r.Host))
-
-		httpJSON(w, http.StatusOK, map[string]any{"id": id, "status": "submitted"})
 	})
 
 	// GET /api/_feedback - list. Draft: any session. Published: admin only.
@@ -538,7 +598,7 @@ func RegisterFeedbackAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusOK, []any{})
 			return
 		}
-		rows, _ := QueryRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at FROM _benmore_feedback ORDER BY created_at DESC`)
+		rows, _ := queryMetadataRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at FROM _benmore_feedback ORDER BY created_at DESC`)
 		httpJSON(w, http.StatusOK, rows)
 	})
 
@@ -553,12 +613,12 @@ func RegisterFeedbackAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 			return
 		}
-		rows, _ := QueryRows(app.DB, "SELECT * FROM _benmore_feedback WHERE id = ?", r.PathValue("id"))
+		rows, _ := queryMetadataRows(app.DB, "SELECT * FROM _benmore_feedback WHERE id = ?", r.PathValue("id"))
 		if len(rows) == 0 {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 			return
 		}
-		comments, _ := QueryRows(app.DB, "SELECT * FROM _benmore_feedback_comments WHERE feedback_id = ? ORDER BY created_at", r.PathValue("id"))
+		comments, _ := queryMetadataRows(app.DB, "SELECT * FROM _benmore_feedback_comments WHERE feedback_id = ? ORDER BY created_at", r.PathValue("id"))
 		result := rows[0]
 		result["comments"] = comments
 		httpJSON(w, http.StatusOK, result)
@@ -597,183 +657,6 @@ func serveDemoGate(w http.ResponseWriter, r *http.Request, errMsg string) {
   </form>
 </div>
 </body></html>`, errorHTML)
-}
-
-// FeedbackWidgetHTML returns the floating feedback widget HTML/JS.
-// In demo mode, shows for everyone (no auth check needed - gate handles access).
-// TestingBannerHTML returns a collapsible session info bar for QA testers.
-// TestingBannerHTML returns the auto-injected amber preview banner shown
-// at the top of every page when testing mode is active. Drafts auto-enable
-// testing (App.FeatureEnabled) so this is the unified banner for both:
-//
-//   - Public draft preview - anonymous visitor on a draft-preview URL,
-//     no session, sees just the "Draft Preview" branding + Built with Benmore link
-//   - Logged-in tester/admin - sees the same banner plus their email and role
-//     pinned inline so they know who they're authenticated as
-//   - Demo-password-gated demo on a prod app - same banner, gate is enforced
-//     separately by DemoGateMiddleware
-//
-// Not dismissable on drafts because dismissing would defeat the point -
-// the banner is the entire emotional difference between draft and prod.
-// TestingBannerHTML used to inject a fixed top banner that stole 32px
-// of viewport height - a constant source of clipped 100vh layouts. The
-// banner has been replaced by a popover on the Built-with-Benmore
-// badge (see BuiltWithBadgeHTML), which carries the same metadata
-// without disturbing the page geometry. Function kept as a no-op so
-// existing callers in WrapLayoutWithPage / injectRawPageEssentials
-// don't break.
-func TestingBannerHTML(session *Session, app *App) string { return "" }
-
-// testingBannerHTMLLegacy retains the original implementation -
-// unused at runtime but preserved here so the wire format is easy to
-// reference if we ever bring a different banner back. Marked unused
-// with _ assignment in callers, or remove if Go vet complains.
-func testingBannerHTMLLegacy(session *Session, app *App) string {
-	siteName := ""
-	if app != nil && app.Design != nil && app.Design.SEO != nil {
-		siteName = app.Design.SEO["site_name"]
-	}
-	if siteName == "" {
-		siteName = "this app"
-	}
-
-	// Build the optional session pill (right side of the banner)
-	sessionPill := ""
-	if session != nil {
-		role := session.Role
-		appRole := resolveAppRole(app, session)
-		if appRole != "" && appRole != role {
-			role = role + " / " + appRole
-		}
-		sessionPill = fmt.Sprintf(`<span class="bm-tb-session" style="display:flex;align-items:center;gap:6px;padding:2px 8px;border-radius:9999px;background:rgba(120,53,15,0.12);border:1px solid rgba(120,53,15,0.18);font-size:10.5px;font-weight:600;white-space:nowrap;">%s · %s</span>`, escapeHTMLAttr(session.Email), escapeHTMLAttr(role))
-	}
-
-	label := "Testing Mode"
-
-	return fmt.Sprintf(`<!-- Preview Banner (auto-injected by Benmore) -->
-<style>
-/* The banner is fixed at top:0 with a 32px height. Add matching
-   body padding-top AND expose the height as a CSS variable so apps
-   that compute their own viewport (height: 100vh dashboards, full-
-   screen flex layouts, etc.) can subtract it without hard-coding.
-   Use it like: height: calc(100vh - var(--bm-chrome-top, 0px));
-   Variable is unset when the banner is off, so the fallback 0px
-   keeps non-banner pages working unchanged. */
-:root{--bm-chrome-top:32px}
-body{padding-top:32px}
-#bm-test-banner{position:fixed;top:0;left:0;right:0;z-index:99999;background:linear-gradient(90deg,#fbbf24 0%%,#f59e0b 50%%,#fbbf24 100%%);background-size:200%% 100%%;animation:bm-tb-shimmer 10s linear infinite;border-bottom:1px solid #d97706;padding:0 16px;font-family:system-ui,-apple-system,sans-serif;font-size:12px;color:#78350f;display:flex;align-items:center;justify-content:space-between;height:32px;box-shadow:0 1px 4px rgba(0,0,0,0.08);}
-#bm-test-banner .bm-tb-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1;}
-#bm-test-banner .bm-tb-right{display:flex;align-items:center;gap:10px;flex-shrink:0;}
-#bm-test-banner .bm-tb-pulse{width:8px;height:8px;border-radius:50%%;background:#78350f;box-shadow:0 0 0 0 rgba(120,53,15,0.6);animation:bm-tb-pulse 2s ease-in-out infinite;flex-shrink:0;}
-#bm-test-banner strong{font-weight:700;letter-spacing:0.03em;text-transform:uppercase;font-size:10.5px;}
-#bm-test-banner .bm-tb-msg{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-#bm-test-banner a, #bm-test-banner button.bm-tb-link{color:#78350f;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;font-weight:600;white-space:nowrap;background:none;border:none;cursor:pointer;font-size:12px;font-family:inherit;padding:0;}
-#bm-test-banner a:hover, #bm-test-banner button.bm-tb-link:hover{color:#451a03;}
-@keyframes bm-tb-shimmer{0%%{background-position:200%% 0}100%%{background-position:-200%% 0}}
-@keyframes bm-tb-pulse{0%%,100%%{box-shadow:0 0 0 0 rgba(120,53,15,0.6)}50%%{box-shadow:0 0 0 6px rgba(120,53,15,0)}}
-@media(max-width:680px){#bm-test-banner .bm-tb-extended{display:none}#bm-test-banner .bm-tb-session{display:none}}
-@media(max-width:480px){#bm-test-banner .bm-tb-bwb{display:none}}
-
-/* Testing Guide popover */
-#bm-tg-overlay{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,sans-serif;}
-#bm-tg-overlay.show{display:flex;}
-#bm-tg-card{background:#0a0a0a;border:1px solid #2a2a2a;border-radius:16px;max-width:560px;width:100%%;max-height:85vh;overflow-y:auto;color:#e4e4e7;box-shadow:0 20px 80px rgba(0,0,0,0.6);}
-#bm-tg-head{padding:24px 28px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;}
-#bm-tg-head h3{font-size:18px;font-weight:600;letter-spacing:-0.02em;margin:0 0 4px;color:#fff;}
-#bm-tg-head p{font-size:13px;color:#888;margin:0;}
-#bm-tg-close{background:none;border:none;color:#666;font-size:22px;line-height:1;cursor:pointer;padding:0 4px;flex-shrink:0;}
-#bm-tg-close:hover{color:#fff;}
-#bm-tg-body{padding:0 28px 24px;}
-.bm-tg-section{margin-bottom:18px;}
-.bm-tg-label{font-size:10.5px;font-weight:600;color:#a78bfa;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;}
-.bm-tg-text{font-size:13px;line-height:1.6;color:#ccc;}
-.bm-tg-list{margin:6px 0 0;padding-left:18px;font-size:13px;line-height:1.7;color:#aaa;}
-.bm-tg-list li{margin-bottom:4px;}
-.bm-tg-list code{font-family:ui-monospace,monospace;font-size:11.5px;color:#a78bfa;background:rgba(167,139,250,0.08);padding:1px 6px;border-radius:4px;border:1px solid rgba(167,139,250,0.16);}
-.bm-tg-keys{display:flex;flex-direction:column;gap:8px;margin-top:6px;}
-.bm-tg-key{display:flex;align-items:flex-start;gap:12px;padding:9px 12px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:8px;}
-.bm-tg-key kbd{display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:24px;padding:0 7px;background:linear-gradient(180deg,#1a1a1a,#0a0a0a);border:1px solid #2a2a2a;border-bottom-color:#3a3a3a;border-radius:5px;font-family:ui-monospace,monospace;font-size:11px;font-weight:600;color:#a78bfa;box-shadow:inset 0 -1px 0 rgba(0,0,0,0.4);flex-shrink:0;}
-.bm-tg-key-desc{font-size:12.5px;color:#aaa;line-height:1.5;}
-.bm-tg-key-desc strong{color:#e4e4e7;}
-#bm-tg-foot{padding:16px 28px;border-top:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;}
-#bm-tg-foot .bm-tg-meta{font-size:11px;color:#666;}
-#bm-tg-foot button{background:linear-gradient(180deg,#fff,#ccc);color:#000;border:none;padding:8px 18px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;}
-</style>
-<div id="bm-test-banner">
-  <div class="bm-tb-left">
-    <span class="bm-tb-pulse"></span>
-    <strong>%s</strong>
-    <span class="bm-tb-msg bm-tb-extended">%s · Limited functionality · Not for production use</span>
-  </div>
-  <div class="bm-tb-right">
-    %s
-    <button type="button" class="bm-tb-link" onclick="bmTgShow()">Testing guide</button>
-    <a class="bm-tb-bwb" href="https://benmore.ai" target="_blank" rel="noopener">Built with Benmore</a>
-  </div>
-</div>
-<div id="bm-tg-overlay" onclick="if(event.target.id==='bm-tg-overlay')bmTgHide()">
-  <div id="bm-tg-card">
-    <div id="bm-tg-head">
-      <div>
-        <h3>You're testing %s</h3>
-        <p>This is a draft preview, not a production app. Here's what you can do.</p>
-      </div>
-      <button id="bm-tg-close" onclick="bmTgHide()">&times;</button>
-    </div>
-    <div id="bm-tg-body">
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">What this is</div>
-        <p class="bm-tg-text">A live preview of an app being built. Anyone with the link can view it. The amber bar at the top is permanent - drafts can never be promoted to production accidentally.</p>
-      </div>
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">What works</div>
-        <ul class="bm-tg-list">
-          <li>Sign up, log in, and use every feature like a real app</li>
-          <li>Create, edit, and delete data - your test data lives in the draft database</li>
-          <li>Share the URL with anyone - they can poke at it without an account</li>
-        </ul>
-      </div>
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">What's limited</div>
-        <ul class="bm-tg-list">
-          <li><strong>No real email or webhooks.</strong> Outbound sends are captured to a dashboard inbox, not delivered.</li>
-          <li><strong>No background jobs.</strong> Cron tasks are disabled on drafts.</li>
-          <li><strong>Rate limited.</strong> 60 requests per minute per IP - enough to test, not enough to load-test.</li>
-          <li><strong>Storage capped.</strong> 50 MB per draft branch.</li>
-        </ul>
-      </div>
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">How to give feedback</div>
-        <p class="bm-tg-text">Click the purple <strong>Feedback</strong> tab on the right edge of any page, or use the keyboard shortcuts below. You can leave a comment, attach a screenshot, and pin it to the exact element you're talking about. The app's owner sees your feedback in their dashboard.</p>
-      </div>
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">Keyboard shortcuts</div>
-        <div class="bm-tg-keys">
-          <div class="bm-tg-key"><kbd>F</kbd><div class="bm-tg-key-desc"><strong>Feedback</strong> - open a comment input anywhere on the page</div></div>
-          <div class="bm-tg-key"><kbd>E</kbd><div class="bm-tg-key-desc"><strong>Element selector</strong> - pin a comment to a specific element by clicking it</div></div>
-          <div class="bm-tg-key"><kbd>S</kbd><div class="bm-tg-key-desc"><strong>Screenshot</strong> - capture the current page and attach it to a comment</div></div>
-          <div class="bm-tg-key"><kbd>Esc</kbd><div class="bm-tg-key-desc">Close any open feedback input or this guide</div></div>
-        </div>
-        <p class="bm-tg-text" style="font-size:11px;color:#666;margin-top:8px;">Shortcuts work on every page - just type the letter while not focused on an input field.</p>
-      </div>
-      <div class="bm-tg-section">
-        <div class="bm-tg-label">Found a bug?</div>
-        <p class="bm-tg-text">Hit <kbd style="background:#1a1a1a;border:1px solid #2a2a2a;padding:1px 6px;border-radius:4px;font-family:ui-monospace,monospace;font-size:11px;color:#a78bfa;">S</kbd> to grab a screenshot, then describe what you expected vs what happened. The team will see the URL, the screenshot, and the element you were on automatically.</p>
-      </div>
-    </div>
-    <div id="bm-tg-foot">
-      <span class="bm-tg-meta">Powered by <a href="https://benmore.ai" target="_blank" rel="noopener" style="color:#a78bfa;text-decoration:none;">Benmore</a></span>
-      <button onclick="bmTgHide()">Got it</button>
-    </div>
-  </div>
-</div>
-<script>
-document.body.style.paddingTop='32px';
-function bmTgShow(){var o=document.getElementById('bm-tg-overlay');if(o)o.classList.add('show');}
-function bmTgHide(){var o=document.getElementById('bm-tg-overlay');if(o)o.classList.remove('show');}
-document.addEventListener('keydown',function(e){if(e.key==='Escape')bmTgHide();});
-</script>
-`, label, escapeHTMLAttr(siteName), sessionPill, escapeHTMLAttr(siteName))
 }
 
 // BuiltWithBadgeHTML returns the sticky bottom-right "Built with Benmore"
@@ -854,6 +737,13 @@ func escapeHTMLAttr(s string) string {
 // only the sidebar intro copy: on a draft/QA preview it names "testing mode";
 // on a published app running features.feedback it's neutral ("We'd love your
 // feedback") so the widget doesn't tell real end-users the live app is a test.
+// feedbackEscHJS escapes a feedback row value for HTML text and for a quoted
+// attribute value: the widget and the /_admin/feedback detail modal put the
+// stored screenshot (any visitor's text) in <img src="...">. The old escH
+// (a text node's innerHTML) left '"' alone, and the admin page never defined
+// it at all, so its detail modal threw.
+const feedbackEscHJS = `function escH(s){if(!s)return '';return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}`
+
 func FeedbackWidgetHTML(testing bool) string {
 	intro := `<strong>We'd love your feedback.</strong> Leave a note any of these ways - click one or use the shortcut key:`
 	if testing {
@@ -966,7 +856,7 @@ func FeedbackWidgetHTML(testing bool) string {
   var pendingScreenshot='';
 
   // --- Utility ---
-  function escH(s){if(!s)return '';var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+  ` + feedbackEscHJS + `
 
   function isEditing(){
     var ae=document.activeElement;
@@ -1258,13 +1148,24 @@ func FeedbackWidgetHTML(testing bool) string {
   };
 
   // --- POST feedback ---
-  function postFeedback(payload){
-    fetch('/api/_feedback',{method:'POST',credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
+  // Sends the page's CSRF token (required for a signed-in visitor). A page
+  // left open past the token's lifetime gets a 403; fetch a fresh token once
+  // and retry.
+  function fbSend(payload,tok){
+    return fetch('/api/_feedback',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':tok||''},
       body:JSON.stringify(payload)
+    });
+  }
+  function postFeedback(payload){
+    var m=document.querySelector('meta[name="csrf-token"]');
+    fbSend(payload,m?m.content:'').then(function(r){
+      if(r.status!==403)return r;
+      return fetch('/api/_csrf',{credentials:'same-origin'}).then(function(c){return c.ok?c.json():null})
+        .then(function(d){return d&&d.token?fbSend(payload,d.token):r}).catch(function(){return r});
     }).then(function(r){return r.json().then(function(d){return{ok:r.ok,data:d}})})
     .then(function(res){
-      if(!res.ok)return;
+      if(!res.ok){showToast((res.data&&res.data.error)||'Feedback was not saved');return;}
       closeAllCards();
       showToast('Feedback saved');
       showBadge();
@@ -1339,12 +1240,12 @@ func FeedbackWidgetHTML(testing bool) string {
 // ServeFeedbackAdmin renders the feedback admin page within the admin panel.
 func ServeFeedbackAdmin(w http.ResponseWriter, r *http.Request, app *App) {
 	session := getSession(app, r)
-	if session == nil || !session.IsAdmin() {
+	if session == nil || !session.IsAdminConsole() {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
-	rows, _ := QueryRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at
+	rows, _ := queryMetadataRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at
 		FROM _benmore_feedback ORDER BY created_at DESC LIMIT 100`)
 
 	var openCount, resolvedCount int64
@@ -1456,6 +1357,7 @@ func ServeFeedbackAdmin(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	function updateFbStatus(id,s){fetch('/api/_feedback/'+id,{method:'PATCH',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:s})});}
 	function addFbComment(id){var i=document.getElementById('fb-ci');var b=i.value.trim();if(!b)return;fetch('/api/_feedback/'+id+'/comment',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:b})}).then(function(){showFeedbackDetail(id);i.value='';});}
+	` + feedbackEscHJS + `
 	</script>`)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

@@ -46,7 +46,7 @@ func TestImportTableAllowedExcludesFrameworkTables(t *testing.T) {
 		t.Fatal("products should be importable")
 	}
 	// Framework tables are excluded structurally by GetTableNames
-	// (db.go:508), not by a hand-maintained deny-list.
+	// (db.go), not by a hand-maintained deny-list.
 	for _, forbidden := range []string{"_benmore_users", "_benmore_imports", "_benmore_audit_log", "sqlite_master", "nonexistent"} {
 		if importTableAllowed(app, forbidden) {
 			t.Errorf("%s must not be importable", forbidden)

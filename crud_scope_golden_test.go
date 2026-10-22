@@ -31,8 +31,8 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 		}},
 	}
 
-	groupUser := &Session{Role: "user", UserID: 10, Email: "g@example.com", GroupID: "org-a"}
-	ownerUser := &Session{Role: "user", UserID: 20, Email: "o@example.com"}
+	groupUser := &Session{Role: "user", UserID: 10, Email: "g@example.com", GroupID: "org-a", Verified: true}
+	ownerUser := &Session{Role: "user", UserID: 20, Email: "o@example.com", Verified: true}
 
 	cases := []struct {
 		name      string
@@ -44,13 +44,15 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 		args      []any
 	}{
 		{
-			name:      "group edit",
-			app:       groupApp,
-			table:     "records",
-			session:   groupUser,
-			action:    "edit",
-			predicate: "(org_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('edit','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
-			args:      []any{"org-a", "records", "g@example.com"},
+			name:    "group edit",
+			app:     groupApp,
+			table:   "records",
+			session: groupUser,
+			action:  "edit",
+			// Every tenant member already reaches every tenant row; an ACL
+			// grant is not OR'd in because it would cross tenants.
+			predicate: `("org_id" = ?)`,
+			args:      []any{"org-a"},
 		},
 		{
 			name:      "owner delete",
@@ -58,7 +60,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "notes",
 			session:   ownerUser,
 			action:    "delete",
-			predicate: "(user_id = ? OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
+			predicate: "(user_id = ? OR id IN (SELECT resource_id FROM main._benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{int64(20), "notes", "o@example.com"},
 		},
 		{
@@ -67,7 +69,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "rooms",
 			session:   groupUser,
 			action:    "view",
-			predicate: "(EXISTS (SELECT 1 FROM room_members WHERE room_members.room_id = rooms.id AND room_members.member_id = ?) OR id IN (SELECT resource_id FROM _benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
+			predicate: "(EXISTS (SELECT 1 FROM main.\"room_members\" WHERE main.\"room_members\".\"room_id\" = main.\"rooms\".\"id\" AND main.\"room_members\".\"member_id\" = ?) OR id IN (SELECT resource_id FROM main._benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{int64(10), "rooms", "g@example.com"},
 		},
 	}
@@ -144,6 +146,16 @@ func TestCrudScopeBehavior_CrossTenantIsolation(t *testing.T) {
 	}
 	assertRowExists(t, app.DB, "records", 1, false)
 	assertRowExists(t, app.DB, "records", 2, true)
+
+	// Side effects are scoped too: tenant A's batch calls must not write
+	// audit entries (or run hooks/flows/webhooks) for tenant B's row.
+	var foreignAudit int
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log WHERE table_name = 'records' AND row_id = '2' AND action IN ('update','delete')").Scan(&foreignAudit); err != nil {
+		t.Fatal(err)
+	}
+	if foreignAudit != 0 {
+		t.Fatalf("batch side effects ran for another tenant's row: %d audit entries for record 2", foreignAudit)
+	}
 }
 
 func TestCrudScopeBehavior_OwnerAndAnonIsolation(t *testing.T) {
@@ -160,7 +172,10 @@ func TestCrudScopeBehavior_OwnerAndAnonIsolation(t *testing.T) {
 func newCrudScopeTestApp(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
+	// Open the database the way production does (WAL, busy timeout, BEGIN
+	// IMMEDIATE): the app's background writers share it, and a default DSN
+	// lets a write fail with "database is locked".
+	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +225,7 @@ func createCrudScopeSession(t *testing.T, app *App, email, role, groupID, acting
 	userID, _ := result.LastInsertId()
 	sessionID := CreateSession(app.DB, userID, email, groupID, time.Hour)
 	if actingAsGroup != "" {
-		if _, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = ? WHERE id = ?", actingAsGroup, sessionID); err != nil {
+		if _, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = ? WHERE id = ?", actingAsGroup, sessionStorageKey(sessionID)); err != nil {
 			t.Fatal(err)
 		}
 	}

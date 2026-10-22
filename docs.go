@@ -107,6 +107,9 @@ var docAliases = map[string]string{
 	"websocket":  "build",
 	"realtime":   "build",
 	"auth":       "build",
+	"sdk":        "build",
+	"bm":         "build",
+	"frontend":   "build",
 	"schema":     "build",
 	"prisma":     "build",
 	"migrations": "build",
@@ -120,4 +123,37 @@ var docAliases = map[string]string{
 	"cli":        "build",
 	"tools":      "build",
 	"mcp":        "build",
+}
+
+// docAliasSections names the build-guide section an aliased topic lives in,
+// so `benmore docs auth` says where to look instead of silently printing the
+// whole guide.
+var docAliasSections = map[string]string{
+	"auth":       "Auth, access & server logic",
+	"sec":        "Auth, access & server logic",
+	"security":   "Auth, access & server logic",
+	"hooks":      "Auth, access & server logic",
+	"flow":       "Auth, access & server logic",
+	"flows":      "Auth, access & server logic",
+	"workflow":   "Auth, access & server logic",
+	"workflows":  "Auth, access & server logic",
+	"schema":     "`schema.prisma` - the data model",
+	"prisma":     "`schema.prisma` - the data model",
+	"migrations": "`schema.prisma` - the data model",
+	"migrate":    "`schema.prisma` - the data model",
+	"sdk":        "The frontend - `static/app.tsx` and the `bm` SDK",
+	"bm":         "The frontend - `static/app.tsx` and the `bm` SDK",
+	"frontend":   "The frontend - `static/app.tsx` and the `bm` SDK",
+}
+
+// AgentDocsPointer is the one-line note printed before an aliased topic.
+func AgentDocsPointer(topic string) string {
+	topic = strings.ToLower(strings.TrimSpace(topic))
+	if docAliases[topic] != "build" || topic == "" || topic == "build" {
+		return ""
+	}
+	if section, ok := docAliasSections[topic]; ok {
+		return fmt.Sprintf("(`%s` is covered in the build guide below, section \"%s\". On a deployed app, `benmore api <app> %s` has the live reference.)\n\n", topic, section, topic)
+	}
+	return fmt.Sprintf("(`%s` is part of the build guide below. On a deployed app, `benmore api <app> %s` has the live reference.)\n\n", topic, topic)
 }

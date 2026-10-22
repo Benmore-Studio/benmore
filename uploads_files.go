@@ -21,6 +21,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 // RegisterFileUploadRoute mounts the generic /api/_files endpoint.
@@ -29,34 +30,43 @@ import (
 // app actually wants. Apps that intentionally accept anon uploads can
 // either set up their own /api/<table> multipart flow or grant a
 // public role via roles in app.yaml.
-func RegisterFileUploadRoute(mux *http.ServeMux, app *App) {
+func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 	authRequired := NeedsAuth(app)
 
 	mux.HandleFunc("POST /api/_files", func(w http.ResponseWriter, r *http.Request) {
-		// CSRF first (cheap), then auth (DB hit).
-		if !validateCSRF(r) && !isBearerAuth(r) {
-			httpError(w, "CSRF validation failed", http.StatusForbidden)
+		if !app.FeatureEnabled("uploads") {
+			http.NotFound(w, r)
 			return
 		}
+		// Authenticate before taking one of the process's upload slots (the
+		// session comes from headers and cookies, not the body), as
+		// /api/_upload does: otherwise anonymous slow bodies could hold every
+		// slot and turn all uploads away with 503.
 		if authRequired {
 			if session := getSession(app, r); session == nil {
 				httpError(w, "authentication required", http.StatusUnauthorized)
 				return
 			}
 		}
+		// Cap and parse the body before the CSRF check, which is the first
+		// form access and would otherwise parse an unbounded body.
+		release, ok := limitUploadBody(w, r, uploadClientKey(app, r))
+		if !ok {
+			return
+		}
+		defer release()
+		if !validateCSRF(r) && !isBearerAuth(r) {
+			httpError(w, "CSRF validation failed", http.StatusForbidden)
+			return
+		}
 
-		// Cap the request body BEFORE parsing. ParseMultipartForm's
-		// argument is only the in-memory threshold; anything larger
-		// streams to a temp file with no ceiling. MaxBytesReader makes
-		// the read itself fail closed once the body exceeds the cap, so
-		// an oversized upload can't spill unbounded bytes to disk.
-		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-
-		// Parse multipart up front so we can pull the file header for
-		// the response payload. HandleFileUpload will re-read via
-		// r.FormFile internally - both calls work against the same
-		// parsed form.
-		if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+		// The body was capped and parsed by limitUploadBody above
+		// (ParseMultipartForm's argument is only the in-memory threshold;
+		// without the cap file parts spill to disk with no ceiling). This
+		// call returns the earlier parse result, so we can pull the file
+		// header for the response payload. HandleFileUpload re-reads via
+		// r.FormFile against the same parsed form.
+		if err := r.ParseMultipartForm(uploadMemoryThreshold); err != nil {
 			httpError(w, "multipart parse failed: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -78,7 +88,13 @@ func RegisterFileUploadRoute(mux *http.ServeMux, app *App) {
 			return
 		}
 
-		url := "/" + path
+		// path is either a site-relative "/uploads/..." or an absolute CDN
+		// URL; never prefix another "/" (that produced a protocol-relative
+		// "//uploads/..." or "/https://..." URL).
+		url := path
+		if !strings.HasPrefix(url, "/") && !strings.HasPrefix(url, "https://") {
+			url = "/" + url
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"url":  url,

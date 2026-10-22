@@ -26,7 +26,11 @@ package main
 //   flows.yaml          LoadFlowsGHA (or legacy parser); reject empty
 //                       jobs/triggers; reject step types we don't know
 //
-//   hooks.yaml          basic shape check
+//   hooks.yaml          basic shape check; every `when:` prepared against
+//                       the schema (validators_when.go)
+//
+//   workflows.yaml      parse; every transition / on_transition `when:`
+//                       prepared against the schema
 //
 //   *.yaml              gets a fallback YAML syntax check so a missing
 //                       colon doesn't silently break the app at boot
@@ -35,9 +39,9 @@ package main
 //                       keys, unknown auth.* keys, etc.
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -46,8 +50,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // ValidateOnWrite is the single entry point for write-time validation.
@@ -87,6 +89,46 @@ func AutoFixOnWrite(path, content string) (string, []string) {
 		}
 	}
 	return out, applied
+}
+
+// autoFixOrRefuse is AutoFixOnWrite for server-side writes into an app dir
+// (root = the instance directory). An app with a reviewed mcp.yaml has a sealed
+// execution digest over its source bytes, so a rewrite after review would
+// withhold the connector; the CLI push refuses the same case (cli_thin_clients.go).
+// There it returns a non-empty refusal showing the lines the author must
+// change locally and re-review; other apps get AutoFixOnWrite unchanged.
+func autoFixOrRefuse(root *os.Root, path, content string) (string, []string, string) {
+	fixed, applied := AutoFixOnWrite(path, content)
+	if len(applied) == 0 || fixed == content {
+		return fixed, applied, ""
+	}
+	reviewed := filepath.Base(path) == "mcp.yaml"
+	why := "This app has a reviewed mcp.yaml"
+	if !reviewed {
+		// Only "does not exist" means no manifest. Any other stat failure
+		// (permissions, I/O, a link loop) fails closed: rewriting source under
+		// a manifest we could not see would withhold the connector.
+		_, err := root.Stat("mcp.yaml")
+		if errors.Is(err, os.ErrNotExist) {
+			return fixed, applied, ""
+		}
+		if err != nil {
+			why = "The server could not check for a reviewed mcp.yaml (" + err.Error() + ")"
+		}
+	}
+	have := map[string]int{}
+	for _, l := range strings.Split(content, "\n") {
+		have[l]++
+	}
+	var lines []string
+	for _, l := range strings.Split(fixed, "\n") {
+		if have[l] > 0 {
+			have[l]--
+		} else if len(lines) < 10 {
+			lines = append(lines, "+ "+l)
+		}
+	}
+	return content, nil, fmt.Sprintf("%s needs normalization (%s). %s, so the server will not rewrite its source: apply these changes locally, review them, then write again:\n%s", path, strings.Join(applied, "; "), why, strings.Join(lines, "\n"))
 }
 
 // autoFixPasswordForms injects method="POST" on any <form> containing
@@ -136,8 +178,7 @@ func autoFixMissingWhereTrue(content string) (int, string) {
 			return m
 		}
 		head, tail := parts[1], parts[2]
-		upperHead := strings.ToUpper(head)
-		if strings.Contains(upperHead, "WHERE TRUE") || strings.Contains(upperHead, "WHERE 1") || strings.Contains(upperHead, " WHERE ") {
+		if !upsertSelectNeedsWhere(m) {
 			return m
 		}
 		count++
@@ -159,6 +200,16 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 	// no "right" content for a package.json in a Benmore app.
 	if msg := validateForbiddenPath(path); msg != "" {
 		return msg
+	}
+
+	// Refuse over-budget YAML once before credential scans and the independent
+	// validators below. Each parser keeps its own guard for other callers, but
+	// repeatedly parsing a document that already exceeds the budget makes the
+	// write gate itself expensive. Syntax errors still go to normal validators.
+	if ext == ".yaml" || ext == ".yml" {
+		if err := checkYAMLShape([]byte(content)); err != nil {
+			return fmt.Sprintf("yaml resource limit in %s: %v\n\n%s", path, err, writeRejectionFooter)
+		}
 	}
 
 	var issues []string
@@ -208,8 +259,32 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 		if msg := validateSchemaPrisma(content); msg != "" {
 			issues = append(issues, msg)
 		}
+		if appDir != "" {
+			if msg := validateFulltextEncryptedConflict(content, LoadEncryptedFieldsConfig(appDir), nil); msg != "" {
+				issues = append(issues, msg)
+			}
+			// A schema edit can turn a member-of child into a table the
+			// rule no longer fits (validators_authz.go).
+			if msg := validateMemberOfShape(readAppFileOrNil(appDir, "app.yaml"), []byte(content)); msg != "" {
+				issues = append(issues, msg)
+			}
+		}
 
 	case base == "flows.yaml" || isFlowsSubdirFile(path):
+		if commandDeclarationPresent(content) {
+			commandPath, pathErr := commandWritePath(appDir, path)
+			if pathErr != nil {
+				issues = append(issues, pathErr.Error())
+			} else {
+				definitions, err := appMCPSchemaTableDefinitions(appDir)
+				if err != nil {
+					issues = append(issues, fmt.Sprintf("command schema inventory: %v", err))
+				} else if _, err := parseFlowCommandFileColumns(commandPath, []byte(content), eligibleCRUDTables(definitions), commandColumnInventory(definitions)); err != nil {
+					issues = append(issues, fmt.Sprintf("command declaration: %v", err))
+				}
+			}
+			break
+		}
 		// flows.yaml in the app root OR any *.yaml under flows/ -
 		// agents commonly split flows across multiple files (one flow
 		// per file under flows/) and those need the same validation.
@@ -236,25 +311,105 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 	case base == "hooks.yaml":
 		if msg := validateHooksYAML(content); msg != "" {
 			issues = append(issues, msg)
+		} else if msg := hooksSubKeyViolation(content); msg != "" {
+			// Write gate and `benmore check` only (validateHooksYAML also
+			// runs in the loader; this must not refuse a file at boot).
+			issues = append(issues, msg)
+		} else if msg := validateWhenConditions(appDir, base, content); msg != "" {
+			// Write gate and `benmore check` only: the loader never
+			// refuses a file over a `when:` (warnWhenConditions logs).
+			issues = append(issues, msg)
+		}
+
+	case base == "mcp.yaml":
+		manifest, err := parseAppMCPManifest([]byte(content))
+		if err == nil && appDir != "" {
+			var flows []Flow
+			flows, err = loadFlowsChecked(appDir, true)
+			if err == nil {
+				err = validateAppMCPBindings(appDir, manifest, flows)
+				if err == nil {
+					err = validateAppMCPDigests(appDir, manifest)
+				}
+			}
+		}
+		if err != nil {
+			issues = append(issues, err.Error())
 		}
 
 	case base == "cron.yaml":
 		if _, err := parseCronYAML([]byte(content)); err != nil {
 			issues = append(issues, err.Error())
+		} else if problems := cronShapeProblems(content); len(problems) > 0 {
+			// Write gate and `benmore check` only: a deployed file with
+			// ignored keys still loads (warnCronShape logs them).
+			issues = append(issues, strings.Join(problems, "\n"))
 		}
 
 	case base == "workflows.yaml":
 		if _, err := parseWorkflowsYAML([]byte(content)); err != nil {
 			issues = append(issues, err.Error())
+		} else {
+			// Write gate and `benmore check` only: a deployed file with
+			// these problems still loads (warnWorkflowShape logs them).
+			if msg := validateWorkflowsShape(appDir, content); msg != "" {
+				issues = append(issues, msg)
+			}
+			if msg := validateWhenConditions(appDir, base, content); msg != "" {
+				issues = append(issues, msg)
+			}
 		}
 
 	case base == "app.yaml":
 		if msg := validateAppYAML(content); msg != "" {
 			issues = append(issues, msg)
 		}
+		if msg := validateAuthzAppYAML(content); msg != "" { // validators_authz.go
+			issues = append(issues, msg)
+		}
+		if msg := validateSignupFields(content); msg != "" {
+			issues = append(issues, msg)
+		}
+		if appDir != "" {
+			if msg := validateMemberOfShape([]byte(content), readAppFileOrNil(appDir, "schema.prisma")); msg != "" { // validators_authz.go
+				issues = append(issues, msg)
+			}
+			// Only tables whose encryption comes from this app.yaml
+			// (encrypted.yaml wins per table).
+			diskEnc := readAppFileOrNil(appDir, "encrypted.yaml")
+			fromEncFile := parseEncryptedFieldsConfig(diskEnc, nil)
+			merged := parseEncryptedFieldsConfig(diskEnc, []byte(content))
+			own := map[string]bool{}
+			if merged != nil {
+				for table := range merged.Fields {
+					if fromEncFile == nil || fromEncFile.Fields[table] == nil {
+						own[table] = true
+					}
+				}
+			}
+			if len(own) > 0 {
+				if msg := validateFulltextEncryptedConflict(string(readAppFileOrNil(appDir, "schema.prisma")), merged, own); msg != "" {
+					issues = append(issues, msg)
+				}
+			}
+		}
 
 	case base == "encrypted.yaml":
 		if msg := validateEncryptedYAML(content); msg != "" {
+			issues = append(issues, msg)
+		}
+		if appDir != "" {
+			if enc := parseEncryptedFieldsConfig([]byte(content), nil); enc != nil {
+				if msg := validateFulltextEncryptedConflict(string(readAppFileOrNil(appDir, "schema.prisma")), enc, nil); msg != "" {
+					issues = append(issues, msg)
+				}
+			}
+		}
+
+	case base == "validators.yaml":
+		// Write gate and `benmore check` only: the loader keeps loading
+		// rules this refuses (validators_crossfield.go).
+		if msg := validatorsYAMLViolation(appDir, content); msg != "" {
 			issues = append(issues, msg)
 		}
 
@@ -377,6 +532,12 @@ func validateForbiddenPath(path string) string {
 	clean := filepath.ToSlash(strings.TrimLeft(path, "/"))
 	base := strings.ToLower(filepath.Base(clean))
 
+	// Desktop-metadata sidecars are never app content. The loader ignores
+	// them, so writing one silently does nothing - refuse it instead.
+	if pathHasMetadataSidecar(clean) {
+		return "forbidden path: " + path + " is a desktop metadata sidecar (AppleDouble `._*`, .DS_Store, Thumbs.db), not app content. The runtime ignores these names so the write would have no effect. If this came from `tar` on macOS, rebuild the archive with COPYFILE_DISABLE=1 (or `--no-xattrs --no-mac-metadata`) and upload the real file."
+	}
+
 	// Hard rejects - these files actively break the framework's build.
 	switch base {
 	case "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb":
@@ -475,12 +636,17 @@ func validateEngineMixup(path, content string) string {
 // argument shapes, etc. before render time. Only applies if the file
 // declared engine: gotmpl in frontmatter.
 //
-// Uses the SAME FuncMap shape the runtime registers (gotmplHelpers)
-// so html/template's argument-arity checks match what'll actually
-// run. We pass nil for app and ctx - none of the helpers dereference
-// those at PARSE time (Parse only inspects signatures, not bodies),
-// so the nils never panic. They would at execute time, which is why
-// we never call Execute here.
+// Uses the SAME FuncMap the runtime registers (gotmplHelpers, with
+// app and ctx nil - every helper is nil-safe) so argument-arity
+// checks match what will actually run.
+//
+// This runs in the router on MCP write_file/edit_file, and it DOES
+// execute tenant template code: wrong-arity calls and helper errors
+// (dict with an odd argument count) only surface at execute time.
+// The execution is hermetic and bounded - see validateGotmplExecute
+// (gotmpl_validate.go): no environment/DNS helpers, a step budget and
+// deadline charged on every call, range iteration and template entry,
+// per-call size limits, and a bounded output writer.
 func validateGotmplParseIn(appDir, path, content string) string {
 	fm, body, err := ExtractFrontmatter(content)
 	if err != nil {
@@ -489,7 +655,6 @@ func validateGotmplParseIn(appDir, path, content string) string {
 	if fm == nil || strings.ToLower(strings.TrimSpace(fm.Engine)) != "gotmpl" {
 		return ""
 	}
-	tmpl := template.New(path).Funcs(gotmplHelpers(nil, nil)).Option("missingkey=zero")
 	// Register partials/*.html so `{{template "name" .}}` references
 	// resolve at parse + execute time. Without this, every page that
 	// uses a partial trips a "no such template" false positive.
@@ -499,11 +664,12 @@ func validateGotmplParseIn(appDir, path, content string) string {
 	if resolved == "" {
 		resolved = guessAppDirForPath(path)
 	}
+	var partials map[string]string
 	if resolved != "" {
-		registerPartialsForValidation(tmpl, resolved)
+		partials = partialsForValidation(resolved)
 	}
-	parsed, err := tmpl.Parse(body)
-	if err != nil {
+	// Parse first so a syntax error is reported as such.
+	if _, err := template.New(path).Funcs(gotmplHelpers(nil, nil)).Option("missingkey=zero").Parse(body); err != nil {
 		return formatGotmplError(path, err)
 	}
 	// Stub-execute against nil so wrong-arity and helper errors
@@ -512,7 +678,7 @@ func validateGotmplParseIn(appDir, path, content string) string {
 	// ensures `.notes` and friends silently resolve to the zero value
 	// - those are data-dependent, not template-intrinsic, so they
 	// shouldn't be false-positive errors here.
-	if err := parsed.Execute(io.Discard, nil); err != nil {
+	if err := validateGotmplExecute(path, body, partials); err != nil {
 		// Denylist: errors that depend on real runtime data, NOT on
 		// the template itself. These are false positives at write
 		// time because the runtime will supply real data when the
@@ -568,29 +734,20 @@ func guessAppDirForPath(path string) string {
 	return ""
 }
 
-// registerPartialsForValidation reads partials/*.html and registers
-// each as a named template under the parent. Best-effort: partials
-// that fail to parse are skipped silently (their own validator pass
+// partialsForValidation reads partials/*.html, keyed by template
+// name. Reads go through an os.Root at appDir (readGotmplPartials),
+// so a symlinked partial can't pull a file from outside the app into
+// the router's validation pass. Best-effort: partials that fail to
+// parse are skipped silently by the caller (their own validator pass
 // will surface the error when that file is checked individually).
-func registerPartialsForValidation(parent *template.Template, appDir string) {
-	partialsDir := filepath.Join(appDir, "partials")
-	entries, err := os.ReadDir(partialsDir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".html") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(partialsDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		name := strings.TrimSuffix(e.Name(), ".html")
+func partialsForValidation(appDir string) map[string]string {
+	out := map[string]string{}
+	for file, data := range readGotmplPartials(appDir) {
 		// Strip frontmatter from partials too - they may have it.
-		_, body, _ := ExtractFrontmatter(string(data))
-		_, _ = parent.New(name).Parse(body)
+		_, body, _ := ExtractFrontmatter(data)
+		out[strings.TrimSuffix(file, ".html")] = body
 	}
+	return out
 }
 
 // formatGotmplError wraps a template error with the migration cheat
@@ -617,7 +774,8 @@ func validateSchemaPrisma(content string) string {
 	if strings.TrimSpace(content) == "" {
 		return "schema.prisma is empty. Declare at least one `model X { id Int @id @default(autoincrement()) ... }` block."
 	}
-	if _, err := ParsePrismaSchema(content); err != nil {
+	models, err := ParsePrismaSchema(content)
+	if err != nil {
 		return fmt.Sprintf(
 			"schema.prisma parse error: %s\n\n"+
 				"Reference shape (do NOT declare `model User` - that's framework-reserved):\n"+
@@ -634,6 +792,11 @@ func validateSchemaPrisma(content string) string {
 				"For user_id: just `userId Int @map(\"user_id\")` - NO `@relation` (the framework manages users in `_benmore_users` and auto-injects user_id from the session).\n"+
 				"FK shape between YOUR tables: declare `model Account { ... }`, then on the child `ownerId Int` + `owner Account @relation(fields: [ownerId], references: [id])`.",
 			err)
+	}
+	// Write gate and `benmore check` only: the parser skips these
+	// declarations and a deployed schema keeps loading.
+	if problems := prismaIgnoredSchemaProblems(content, models); len(problems) > 0 {
+		return strings.Join(problems, "\n")
 	}
 	return ""
 }
@@ -668,7 +831,9 @@ func validateFlowsYAML(content string) string {
 	// `on:` and `jobs:` are TOP-LEVEL keys (not nested under a flow
 	// name). Anything else gets a specific, fixable error.
 	var ghaFile FlowFileGHA
-	_ = yaml.Unmarshal([]byte(content), &ghaFile)
+	if err := yamlUnmarshal([]byte(content), &ghaFile); err != nil {
+		return fmt.Sprintf("flows.yaml: invalid typed declaration: %v", err)
+	}
 	if ghaFile.Jobs != nil && (ghaFile.On.Request != nil || ghaFile.On.Schedule != nil || ghaFile.On.Event != nil) {
 		// First, catch the worst silent failure: GHA envelope with
 		// legacy step shorthand (`- sql: ...`, `- respond: ...`). The
@@ -685,7 +850,42 @@ func validateFlowsYAML(content string) string {
 				return msg
 			}
 		}
-		return validateGHAFlowsContents(ghaFile)
+		// Write gate and `benmore check` only (the loader keeps loading
+		// these files and logs them): triggers it reads leniently, keys it
+		// drops (in the file's structure and per step type), values it
+		// can't honor, and conditions that can never be true (they log once
+		// and are false).
+		if problems := flowTriggerProblems(ghaFile); len(problems) > 0 {
+			return strings.Join(problems, "\n")
+		}
+		if msg := validateGHAFlowsContents(ghaFile); msg != "" {
+			return msg
+		}
+		if msg := flowUnknownKeyViolation(content); msg != "" {
+			return msg
+		}
+		if msg := flowTriggerValueViolation(ghaFile); msg != "" {
+			return msg
+		}
+		if msg := expectRowsEmptyViolation(content); msg != "" {
+			return msg
+		}
+		// A step key its step type does not read (validators_flow_step_keys.go).
+		if refused, _ := flowStepKeyProblems(content, ghaFile); len(refused) > 0 {
+			return strings.Join(refused, "\n")
+		}
+		// A step value that would not be sent as written
+		// (validators_flow_step_values.go).
+		if problems := flowStepValueProblems(ghaFile); len(problems) > 0 {
+			return strings.Join(problems, "\n")
+		}
+		if msg := flowUnreachableResponseViolation(ghaFile); msg != "" {
+			return msg
+		}
+		return ghaDeadConditionViolation(ghaFile)
+	}
+	if err := rejectLegacyHandledStatuses([]byte(content)); err != nil {
+		return "flows.yaml: " + err.Error()
 	}
 	// Not valid GHA at the file level. Figure out what the agent
 	// actually wrote and steer them back to GHA shape with a concrete
@@ -702,9 +902,7 @@ var flowInputTypes = map[string]bool{
 }
 
 // validateFlowInputs checks the optional on.request.inputs: block.
-// Inputs are declarative (the runtime ignores them - params bind
-// regardless), but a bad type or a misplaced values: list silently
-// produces a wrong FlowForm, so catch it at write time.
+// Types are enforced before execution and also drive FlowForm controls.
 func validateFlowInputs(inputs map[string]FlowInput) string {
 	for name, in := range inputs {
 		if in.Type == "" {
@@ -745,7 +943,7 @@ func diagnoseFlowsShape(content string) string {
 	// Probe as `map[string]any` so we can introspect what keys live
 	// where without committing to either struct.
 	var raw map[string]any
-	if err := yaml.Unmarshal([]byte(content), &raw); err != nil || len(raw) == 0 {
+	if err := yamlUnmarshal([]byte(content), &raw); err != nil || len(raw) == 0 {
 		return canonicalGHAShapeMessage("flows.yaml is empty or unparseable as a YAML map.")
 	}
 
@@ -787,7 +985,7 @@ func diagnoseFlowsShape(content string) string {
 	// 2. Pure legacy form. Detect by the legacy struct having a
 	//    populated `trigger:` somewhere.
 	var legacy map[string]FlowYAML
-	if err := yaml.Unmarshal([]byte(content), &legacy); err == nil && len(legacy) > 0 {
+	if err := yamlUnmarshal([]byte(content), &legacy); err == nil && len(legacy) > 0 {
 		for name, fy := range legacy {
 			if fy.Trigger != "" {
 				return fmt.Sprintf(
@@ -883,6 +1081,56 @@ func isFlowsSubdirFile(path string) bool {
 	return false
 }
 
+// commandDeclarationPresent recognizes the command discriminator without
+// treating arbitrary YAML syntax errors as command files. Syntax validation
+// remains the responsibility of the normal flow validator.
+func commandDeclarationPresent(content string) bool {
+	var shape map[string]any
+	if err := decodeConfigYAML([]byte(content), &shape); err != nil {
+		return false
+	}
+	_, ok := shape["command"]
+	return ok
+}
+
+// commandWritePath returns the compiler's app-relative source identity only
+// for the one supported placement. In particular, it does not flatten a
+// nested or outside path to its basename before compilation.
+func commandWritePath(appDir, filePath string) (string, error) {
+	if strings.TrimSpace(appDir) == "" {
+		return "", fmt.Errorf("command declarations require an app directory")
+	}
+	root, err := filepath.Abs(appDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve app directory: %w", err)
+	}
+	var rel string
+	if filepath.IsAbs(filePath) {
+		abs, err := filepath.Abs(filePath)
+		if err != nil {
+			return "", fmt.Errorf("resolve command path: %w", err)
+		}
+		rel, err = filepath.Rel(root, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return "", fmt.Errorf("command path must stay inside the app directory")
+		}
+	} else {
+		if filepath.IsAbs(filepath.Clean(filePath)) {
+			return "", fmt.Errorf("command path must stay inside the app directory")
+		}
+		rel = filepath.Clean(filePath)
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("command path must stay inside the app directory")
+		}
+	}
+	rel = filepath.ToSlash(rel)
+	parts := strings.Split(rel, "/")
+	if len(parts) != 2 || parts[0] != "flows" || strings.ToLower(filepath.Ext(rel)) != ".yaml" {
+		return "", fmt.Errorf("command declarations must be written to flows/<safe-name>.yaml")
+	}
+	return rel, nil
+}
+
 // validateLegacyFlowSteps walks the FlowStepYAML list and rejects any
 // step that doesn't declare exactly one action key. The legacy parser
 // silently skips unknown steps; this surfaces the typo upstream so the
@@ -960,7 +1208,15 @@ func validateLegacyFlowSteps(flowName string, steps []FlowStepYAML) string {
 // runtime fell through to its "{\"status\":\"ok\"}" default response.
 // That made the flow look healthy when its steps were all no-ops.
 func validateGHAFlowsContents(file FlowFileGHA) string {
+	if file.On.Request != nil {
+		if err := validateFlowPermissions(file.On.Request.Permissions); err != nil {
+			return "flows.yaml: " + err.Error()
+		}
+	}
 	if msg := validatePurgeCurrentUserContract(file); msg != "" {
+		return msg
+	}
+	if msg := validateRevokeUserSessionsOutsideFlows(file); msg != "" {
 		return msg
 	}
 	// Derive from flowRunTypes (flows_gha.go) - the SINGLE SOURCE the parser
@@ -997,6 +1253,15 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 				"flows.yaml: job %q has no steps. Every job needs at least one step under `steps:`.",
 				jobName)
 		}
+		if err := flowValidateParallelHTTP(&Flow{Name: jobName, Steps: convertGHASteps(job.Steps)}); err != nil {
+			return "flows.yaml: " + err.Error()
+		}
+		if file.On.Request != nil && file.On.Request.Transaction {
+			flow := &Flow{Name: jobName, Trigger: FlowTrigger{Type: "http"}, Transaction: true, Steps: convertGHASteps(job.Steps)}
+			if err := flowValidateTransactionalResponse(flow); err != nil {
+				return "flows.yaml: " + err.Error()
+			}
+		}
 		// `when:` is not a flow-engine key (only `if:` is), so yaml.v3 drops it
 		// and the guard never applies. Catch it on ANY step, including nested
 		// if/for_each/else/on_error branches - an `on_error:` respond branch is
@@ -1004,11 +1269,20 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 		if msg := ghaWhenViolation(jobName, job.Steps); msg != "" {
 			return msg
 		}
+		if msg := ghaBroadcastViolation(jobName, "", job.Steps); msg != "" {
+			return msg
+		}
+		if msg := ghaReservedStepIDViolation(jobName, job.Steps); msg != "" {
+			return msg
+		}
+		if msg := ghaHandledStatusesViolation(jobName, "", job.Steps); msg != "" {
+			return msg
+		}
 		for i, s := range job.Steps {
 			if !knownRun[strings.ToLower(strings.TrimSpace(s.Run))] {
 				return fmt.Sprintf(
 					"flows.yaml: job %q step %d has `run: %s` which isn't a known step type.\n"+
-						"Known: sql, sql_dynamic, api, email, webhook, redirect, respond, parse, set, parallel.\n"+
+						"Known: sql, sql_dynamic, api, email, webhook, redirect, respond, parse, set, parallel, broadcast.\n"+
 						"Shorthand: `query: SELECT ...` (auto-becomes `run: sql`), `if: ${{ ... }}` (conditional wrapper), `for_each: ${{ ... }}` (iteration wrapper).\n"+
 						"`sql_dynamic` is the opt-in escape hatch for AI-generated queries (text-interpolated, not param-bound) - use only for SQL assembled by trusted internal callers.",
 					jobName, i, s.Run)
@@ -1019,9 +1293,235 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 			if msg := validateSQLDynamicSafety(jobName, i, s); msg != "" {
 				return msg
 			}
+			// sql_dynamic nested under if/for_each/parallel/else/on_error
+			// runs exactly like a top-level one, so it gets the same check.
+			if msg := ghaNestedSQLDynamicViolation(jobName, fmt.Sprintf("step %d", i), s); msg != "" {
+				return msg
+			}
 		}
 	}
 	return ""
+}
+
+// ghaHandledStatusesViolation checks the opt-in response-status list at every
+// executable nesting level. Because validateGHAFlowsContents is shared by
+// file writes, `benmore check`, and the loader, malformed values cannot be
+// silently dropped by withToAPI.
+func ghaHandledStatusesViolation(jobName, parent string, steps []FlowStepGHA) string {
+	for i, s := range steps {
+		label := fmt.Sprintf("step %d", i)
+		if parent != "" {
+			label = parent + " > " + label
+		}
+		if strings.EqualFold(strings.TrimSpace(s.Run), "api") {
+			if _, present := s.With["handled_statuses"]; present {
+				if _, err := parseHandledStatuses(s.With["handled_statuses"]); err != nil {
+					return fmt.Sprintf("flows.yaml: job %q %s with.handled_statuses %s", jobName, label, err)
+				}
+				if _, paginated := s.With["paginate"]; paginated {
+					return fmt.Sprintf("flows.yaml: job %q %s cannot combine with.handled_statuses with with.paginate", jobName, label)
+				}
+			}
+		}
+		branches := []struct {
+			name  string
+			steps []FlowStepGHA
+		}{
+			{ghaNestedBodyName(s) + " steps", s.Steps},
+			{"else", s.Else},
+			{"on_error", s.OnError},
+		}
+		for _, branch := range branches {
+			if msg := ghaHandledStatusesViolation(jobName, label+" > "+branch.name, branch.steps); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// ghaNestedSQLDynamicViolation applies validateSQLDynamicSafety to every step
+// nested below s: `steps:` (if / for_each / parallel bodies), `else:` and
+// `on_error:`. These are every nesting key FlowStepGHA carries, and the
+// parser (convertGHASteps) turns each into executable steps. The label is a
+// readable path (`step 2 > for_each steps[0]`) so the author can find the
+// offending step.
+func ghaNestedSQLDynamicViolation(jobName, label string, s FlowStepGHA) string {
+	branches := []struct {
+		name  string
+		steps []FlowStepGHA
+	}{
+		{ghaNestedBodyName(s) + " steps", s.Steps},
+		{"else", s.Else},
+		{"on_error", s.OnError},
+	}
+	for _, b := range branches {
+		for i, child := range b.steps {
+			childLabel := fmt.Sprintf("%s > %s[%d]", label, b.name, i)
+			if msg := validateSQLDynamicSafetyAt(jobName, childLabel, child); msg != "" {
+				return msg
+			}
+			if msg := ghaNestedSQLDynamicViolation(jobName, childLabel, child); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// ghaBroadcastViolation checks every `run: broadcast` step, at any nesting
+// depth: `with.room` must be a non-empty string whose literal characters are
+// legal in a room name, `with.payload` must be present, and no other `with:`
+// key is accepted (yaml would otherwise keep a misspelled `paylod:` and the
+// step would fail only at run time). Shared by the write gate, `benmore check`
+// and the flow loader through validateGHAFlowsContents.
+func ghaBroadcastViolation(jobName, parent string, steps []FlowStepGHA) string {
+	const example = "\n\nExample:\n" +
+		"  - id: notify\n" +
+		"    run: broadcast\n" +
+		"    with:\n" +
+		"      room: \"order-${{ steps.o.outputs.id }}\"\n" +
+		"      payload: { kind: shipped, id: \"${{ steps.o.outputs.id }}\" }"
+	for i, s := range steps {
+		label := fmt.Sprintf("step %d", i)
+		if parent != "" {
+			label = fmt.Sprintf("%s[%d]", parent, i)
+		}
+		if strings.EqualFold(strings.TrimSpace(s.Run), "broadcast") {
+			where := fmt.Sprintf("flows.yaml: job %q %s (run: broadcast)", jobName, label)
+			room, isString := s.With["room"].(string)
+			switch {
+			case s.With["room"] == nil:
+				return where + " requires `with.room` - the WebSocket room to send to." + example
+			case !isString:
+				return where + fmt.Sprintf(": `with.room` must be a string, got %T - quote it (room: \"42\")."+example, s.With["room"])
+			case strings.TrimSpace(room) == "":
+				return where + ": `with.room` is empty." + example
+			}
+			if bad := broadcastRoomLiteralViolation(room); bad != "" {
+				return where + fmt.Sprintf(": `with.room` %q contains %s; a room name is 1-%d characters of a-z A-Z 0-9 _ - . : (`${{ }}` refs are filled in at run time).", room, bad, wsRoomNameMax)
+			}
+			if _, ok := s.With["payload"]; !ok {
+				return where + " requires `with.payload` - the JSON value room members receive (an object, list, string or number; `${{ }}` refs resolve like a respond body)." + example
+			}
+			for key := range s.With {
+				if key != "room" && key != "payload" {
+					return where + fmt.Sprintf(": `with.%s` is not a broadcast option; the step takes only `room` and `payload`.", key)
+				}
+			}
+		}
+		for _, b := range []struct {
+			name  string
+			steps []FlowStepGHA
+		}{{ghaNestedBodyName(s) + " steps", s.Steps}, {"else", s.Else}, {"on_error", s.OnError}} {
+			if msg := ghaBroadcastViolation(jobName, label+" > "+b.name, b.steps); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// ghaDeadConditionViolation refuses an `if:`, api `success_when:` or templated
+// serve_file `disposition:` that can never evaluate true (flowConditionNeverHolds),
+// at any nesting depth. Such a condition is silently false at run time, so a
+// guard written with it never fires: the refusal branch is skipped and the
+// flow carries on. Jobs are visited in name order for a stable message.
+func ghaDeadConditionViolation(file FlowFileGHA) string {
+	const grammar = " Conditions compare values with == != > < >= <=, join comparisons with && || and ! and parentheses, and read refs such as steps.<id>.outputs.<field>, params.<name>, user.<field> and env.<NAME>; functions (contains(), startsWith()), arithmetic and `in` are not supported. See api({at:'flows'})."
+	var walk func(job, parent string, steps []FlowStepGHA) string
+	walk = func(job, parent string, steps []FlowStepGHA) string {
+		for i, s := range steps {
+			label := fmt.Sprintf("step %d", i)
+			if parent != "" {
+				label = fmt.Sprintf("%s[%d]", parent, i)
+			}
+			where := fmt.Sprintf("flows.yaml: job %q %s", job, label)
+			if s.If != "" {
+				if why := flowConditionNeverHolds(ghaIfToFlowCondition(s.If)); why != "" {
+					return fmt.Sprintf("%s: `if: %s` can never be true (%s), so the branch never runs.%s", where, truncate(s.If, 200), why, grammar)
+				}
+			}
+			if v, ok := s.With["success_when"].(string); ok && strings.EqualFold(strings.TrimSpace(s.Run), "api") {
+				if why := flowConditionNeverHolds(normalizeGHARefs(v)); why != "" {
+					return fmt.Sprintf("%s: `success_when: %s` can never be true (%s), so every call fails.%s", where, truncate(v, 200), why, grammar)
+				}
+			}
+			if v, ok := s.With["disposition"].(string); ok && strings.EqualFold(strings.TrimSpace(s.Run), "serve_file") {
+				if why := flowValueTemplateNeverParses(normalizeGHARefs(v)); why != "" {
+					return fmt.Sprintf("%s: `disposition: %s` can't be evaluated (%s), so the file is always served inline.%s", where, truncate(v, 200), why, grammar)
+				}
+			}
+			for _, b := range []struct {
+				name  string
+				steps []FlowStepGHA
+			}{{ghaNestedBodyName(s) + " steps", s.Steps}, {"else", s.Else}, {"on_error", s.OnError}} {
+				if msg := walk(job, label+" > "+b.name, b.steps); msg != "" {
+					return msg
+				}
+			}
+		}
+		return ""
+	}
+	jobs := make([]string, 0, len(file.Jobs))
+	for name := range file.Jobs {
+		jobs = append(jobs, name)
+	}
+	slices.Sort(jobs)
+	for _, name := range jobs {
+		if msg := walk(name, "", file.Jobs[name].Steps); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+// broadcastRoomLiteralViolation describes the first character outside the
+// room-name alphabet in the literal (non-`{{ }}`) part of a room template, or
+// the literal length when it already exceeds the limit.
+func broadcastRoomLiteralViolation(room string) string {
+	literal := room
+	for {
+		start := strings.Index(literal, "{{")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(literal[start:], "}}")
+		if end < 0 {
+			break
+		}
+		cut := start
+		if cut > 0 && literal[cut-1] == '$' {
+			cut--
+		}
+		literal = literal[:cut] + literal[start+end+2:]
+	}
+	literal = strings.TrimSpace(literal)
+	if len(literal) > wsRoomNameMax {
+		return fmt.Sprintf("%d literal characters", len(literal))
+	}
+	for _, r := range literal {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '_' || r == '-' || r == '.' || r == ':'
+		if !ok {
+			return fmt.Sprintf("the character %q", r)
+		}
+	}
+	return ""
+}
+
+// ghaNestedBodyName names the construct that owns a step's `steps:` list,
+// for validator messages.
+func ghaNestedBodyName(s FlowStepGHA) string {
+	switch run := strings.ToLower(strings.TrimSpace(s.Run)); {
+	case run == "parallel":
+		return "parallel"
+	case run == "for_each" || (run == "" && s.ForEach != ""):
+		return "for_each"
+	case s.If != "":
+		return "if"
+	}
+	return "nested"
 }
 
 // validatePurgeCurrentUserContract makes the server-only identity purge a
@@ -1029,6 +1529,28 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 // target parameter: it operates only on the immutable authenticated session.
 // These shape checks prevent an app from accidentally exposing it to an
 // anonymous, async, non-transactional, nested, or retrying execution path.
+func validateRevokeUserSessionsOutsideFlows(file FlowFileGHA) string {
+	var found bool
+	var walk func([]FlowStepGHA)
+	walk = func(steps []FlowStepGHA) {
+		for _, step := range steps {
+			if strings.EqualFold(strings.TrimSpace(step.Run), "revoke_user_sessions") {
+				found = true
+			}
+			walk(step.Steps)
+			walk(step.Else)
+			walk(step.OnError)
+		}
+	}
+	for _, cfg := range file.Jobs {
+		walk(cfg.Steps)
+	}
+	if !found {
+		return ""
+	}
+	return "flows.yaml: run: revoke_user_sessions is available only in the apply phase of an approved MCP command (flows/<name>.yaml with a `command:` block). Ordinary flows end a user's sessions through their own credential change or the admin console."
+}
+
 func validatePurgeCurrentUserContract(file FlowFileGHA) string {
 	type occurrence struct {
 		job    string
@@ -1106,8 +1628,147 @@ func validatePurgeCurrentUserContract(file FlowFileGHA) string {
 	return ""
 }
 
+// readAppFileOrNil returns an app file's bytes, or nil when it is absent.
+func readAppFileOrNil(appDir, name string) []byte {
+	data, err := os.ReadFile(filepath.Join(appDir, name))
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// validateFulltextEncryptedConflict refuses an encrypted column listed in a
+// model's @@fulltext. The FTS5 index is external-content: its sync triggers
+// index the plaintext the INSERT wrote, then the encryption trigger rewrites
+// the column to ciphertext, so the index no longer matches its content and
+// every INSERT fails with "database disk image is malformed". Even if it
+// worked, the index shadow tables would hold the plaintext the column is
+// encrypted to protect. only, when non-nil, restricts the check to those
+// tables (the ones the file being written is responsible for).
+func validateFulltextEncryptedConflict(schema string, enc *EncryptedFieldConfig, only map[string]bool) string {
+	if enc == nil || strings.TrimSpace(schema) == "" {
+		return ""
+	}
+	models, err := ParsePrismaSchema(schema)
+	if err != nil {
+		return ""
+	}
+	var conflicts []string
+	for _, m := range models {
+		if only != nil && !only[m.Table] {
+			continue
+		}
+		encrypted := map[string]bool{}
+		for _, def := range enc.Fields[m.Table] {
+			encrypted[def.Column] = true
+		}
+		if len(encrypted) == 0 {
+			continue
+		}
+		for _, idx := range m.FullText {
+			for _, name := range prismaFullTextColumns(m, idx.Columns) {
+				if encrypted[name] {
+					conflicts = append(conflicts, fmt.Sprintf("%s.%s (model %s)", m.Table, name, m.Name))
+				}
+			}
+		}
+	}
+	if len(conflicts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"antipattern [fulltext-encrypted-column] encrypted column(s) listed in @@fulltext: %s.\n"+
+			"Full-text search cannot index an encrypted column: the FTS5 index is written from the plaintext, then the encryption trigger replaces the value with ciphertext, the index falls out of sync and every INSERT on the table fails (\"database disk image is malformed\"). The index would also store the plaintext you are encrypting.\n"+
+			"Fix one side: remove the column from @@fulltext (keep search on non-sensitive columns such as a title), or stop encrypting it in encrypted.yaml. For exact-match lookup on an encrypted column use `blind_index:` instead.",
+		strings.Join(conflicts, ", "))
+}
+
+// ghaRedirectWarnings flags `run: redirect` steps whose `to:` is templated
+// without being pinned to a same-origin path and without an `allow_hosts:`
+// list. At run time such a target is refused whenever it renders off-origin
+// (flowRedirectTarget), because a request-controlled `to:` is an open
+// redirect. Advisory: the flow still loads, and a target that happens to
+// render same-origin still redirects. Shared by the write path (MCP
+// write_file/edit_file report through RunCompleteCheck) and `benmore check`.
+func ghaRedirectWarnings(content string) []string {
+	var file FlowFileGHA
+	if err := yamlUnmarshal([]byte(content), &file); err != nil || file.Jobs == nil {
+		return nil
+	}
+	var out []string
+	var walk func(job string, steps []FlowStepGHA)
+	walk = func(job string, steps []FlowStepGHA) {
+		for _, s := range steps {
+			if strings.EqualFold(strings.TrimSpace(s.Run), "redirect") {
+				to, _ := s.With["to"].(string)
+				if flowRedirectTemplateUnpinned(to) && len(flowRedirectAllowHosts(s.With["allow_hosts"])) == 0 {
+					label := s.ID
+					if label == "" {
+						label = "redirect"
+					}
+					out = append(out, fmt.Sprintf(
+						"job %q step %q redirects to a templated `to: %s`. A templated target may only stay on this app's origin: it is refused at run time if it renders another host (open-redirect guard). Pin it to a path (`to: /orders/${{ steps.o.outputs.id }}`) or list the external hosts it may reach: `with: { to: ..., allow_hosts: [checkout.example.com] }`.",
+						job, label, to))
+				}
+			}
+			walk(job, s.Steps)
+			walk(job, s.Else)
+			walk(job, s.OnError)
+		}
+	}
+	jobs := make([]string, 0, len(file.Jobs))
+	for name := range file.Jobs {
+		jobs = append(jobs, name)
+	}
+	slices.Sort(jobs)
+	for _, name := range jobs {
+		walk(name, file.Jobs[name].Steps)
+	}
+	return out
+}
+
+// flowRedirectTemplateUnpinned reports whether a redirect `to:` can render
+// an off-origin target from substituted input: it contains a `{{ }}` /
+// `${{ }}` reference or a `:param` token, and its literal prefix is not a
+// same-origin path ("/x..." where the second byte is neither '/' nor '\'
+// nor the start of a template).
+func flowRedirectTemplateUnpinned(to string) bool {
+	to = strings.TrimSpace(to)
+	templated := strings.Contains(to, "{{")
+	for i := 0; !templated && i+1 < len(to); i++ {
+		if to[i] == ':' && isSQLIdentStart(to[i+1]) && (i == 0 || (to[i-1] != ':' && !isSQLIdentChar(to[i-1]))) {
+			templated = true
+		}
+	}
+	if !templated {
+		return false
+	}
+	if len(to) >= 2 && to[0] == '/' && !strings.ContainsRune(`/\{$`, rune(to[1])) {
+		return false
+	}
+	return true
+}
+
 // ghaWhenViolation recursively finds a `when:` key on any flow step, including
 // nested if/for_each/else/on_error branches.
+// ghaReservedStepIDViolation refuses the step id `params`:
+// `${{ steps.params.outputs.x }}` would read as the request field
+// `${{ params.x }}`.
+func ghaReservedStepIDViolation(jobName string, steps []FlowStepGHA) string {
+	for _, s := range steps {
+		switch strings.TrimSpace(s.ID) {
+		case "params":
+			return fmt.Sprintf("flows.yaml: job %q has a step with id %q, which is a reserved template name; rename the step.", jobName, s.ID)
+		}
+		for _, nested := range [][]FlowStepGHA{s.Steps, s.Else, s.OnError} {
+			if msg := ghaReservedStepIDViolation(jobName, nested); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
 func ghaWhenViolation(jobName string, steps []FlowStepGHA) string {
 	for _, s := range steps {
 		if strings.TrimSpace(s.When) != "" {
@@ -1138,10 +1799,9 @@ func ghaWhenViolation(jobName string, steps []FlowStepGHA) string {
 //     program" and the flow halts. Validator says: use an `if:` step
 //     with a `respond` branch instead.
 //
-//  2. INSERT INTO … SELECT … ON CONFLICT … (no `WHERE true` between
-//     them) - SQLite parser ambiguity at the SELECT/ON CONFLICT
-//     boundary returns "near 'DO': syntax error". Validator says:
-//     add `WHERE true` between FROM and ON CONFLICT.
+//  2. INSERT INTO … SELECT … ON CONFLICT … with no outer WHERE or
+//     SELECT-closing clause - SQLite can parse ON as a join constraint.
+//     Keep an existing predicate, or add `WHERE true` before ON CONFLICT.
 //     See https://sqlite.org/lang_upsert.html#parsing_ambiguity.
 //
 // validateSQLDynamicSafety rejects a `run: sql_dynamic` step whose query
@@ -1154,6 +1814,12 @@ func ghaWhenViolation(jobName string, steps []FlowStepGHA) string {
 // request params surface. Request input that must reach SQL belongs in a
 // `run: sql` step, where `${{...}}` / `:param` are bound as ? placeholders.
 func validateSQLDynamicSafety(jobName string, stepIdx int, s FlowStepGHA) string {
+	return validateSQLDynamicSafetyAt(jobName, fmt.Sprintf("step %d", stepIdx), s)
+}
+
+// validateSQLDynamicSafetyAt is validateSQLDynamicSafety with a free-form
+// step label, so nested steps can be reported by their path.
+func validateSQLDynamicSafetyAt(jobName, stepLabel string, s FlowStepGHA) string {
 	if strings.ToLower(strings.TrimSpace(s.Run)) != "sql_dynamic" {
 		return ""
 	}
@@ -1183,10 +1849,10 @@ func validateSQLDynamicSafety(jobName string, stepIdx int, s FlowStepGHA) string
 		tok = strings.TrimPrefix(tok, "$")
 		if tok != "" && !strings.Contains(tok, ".") {
 			return fmt.Sprintf(
-				"flows.yaml: job %q step %d (`run: sql_dynamic`) interpolates a bare `{{%s}}` directly into the query.\n"+
+				"flows.yaml: job %q %s (`run: sql_dynamic`) interpolates a bare `{{%s}}` directly into the query.\n"+
 					"sql_dynamic substitutes values as raw SQL TEXT, not bound parameters - a bare reference fed from request input is a SQL-injection hole.\n"+
 					"For request input, use `run: sql` (or `query:`) where `${{ %s }}` / `:%s` bind as ? placeholders. Reserve sql_dynamic for SQL assembled from server-trusted values (`{{env.X}}`, `{{steps.<id>.<field>}}`).",
-				jobName, stepIdx, tok, tok, tok)
+				jobName, stepLabel, tok, tok, tok)
 		}
 		rest = rest[open+2+close+2:]
 	}
@@ -1224,10 +1890,10 @@ func validateSQLDynamicSafety(jobName string, stepIdx int, s FlowStepGHA) string
 		if j > i+1 { // :identifier
 			name := sql[i+1 : j]
 			return fmt.Sprintf(
-				"flows.yaml: job %q step %d (`run: sql_dynamic`) uses a `:%s` placeholder.\n"+
+				"flows.yaml: job %q %s (`run: sql_dynamic`) uses a `:%s` placeholder.\n"+
 					"sql_dynamic does NOT bind `:params` - it text-substitutes them, so this is injectable from request input.\n"+
 					"Use `run: sql` (or `query:`) where `:%s` binds as a ? placeholder.",
-				jobName, stepIdx, name, name)
+				jobName, stepLabel, name, name)
 		}
 	}
 	return ""
@@ -1262,32 +1928,78 @@ func validateStepSQLPatterns(jobName string, stepIdx int, s FlowStepGHA) string 
 			jobName, stepIdx)
 	}
 
-	// (2) INSERT INTO ... SELECT ... ON CONFLICT without WHERE true.
-	if strings.Contains(upper, "INSERT") &&
-		strings.Contains(upper, "SELECT") &&
-		strings.Contains(upper, "ON CONFLICT") {
-		// Look for a SELECT ... ON CONFLICT pattern (vs. INSERT INTO ... VALUES ... ON CONFLICT which is fine).
-		// Heuristic: if a SELECT-clause precedes ON CONFLICT and there's no `WHERE true` between FROM and ON CONFLICT.
-		selectIdx := strings.Index(upper, "SELECT")
-		conflictIdx := strings.Index(upper, "ON CONFLICT")
-		fromIdx := strings.Index(upper[selectIdx:], "FROM")
-		if fromIdx >= 0 && selectIdx >= 0 && conflictIdx > selectIdx {
-			between := upper[selectIdx+fromIdx : conflictIdx]
-			if !strings.Contains(between, "WHERE TRUE") && !strings.Contains(between, "WHERE 1") {
-				return fmt.Sprintf(
-					"flows.yaml: job %q step %d uses INSERT INTO … SELECT … ON CONFLICT without a `WHERE true` separator. SQLite's parser can't tell where the SELECT ends and the ON CONFLICT begins - the request will fail at runtime with 'near \"DO\": syntax error'.\n\n"+
-						"Fix: add `WHERE true` between the SELECT/FROM and the ON CONFLICT clause:\n\n"+
-						"  INSERT INTO things (id, name)\n"+
-						"  SELECT json_extract(value, '$.id'), json_extract(value, '$.name')\n"+
-						"  FROM json_each(:rows)\n"+
-						"  WHERE true                          ← add this line\n"+
-						"  ON CONFLICT(id) DO UPDATE SET name = excluded.name\n\n"+
-						"See https://sqlite.org/lang_upsert.html#parsing_ambiguity for why this exists.",
-					jobName, stepIdx)
+	// (2) SQLite requires the SELECT to end unambiguously before ON CONFLICT.
+	// Any actual outer WHERE predicate works; a comment/string/subquery does not.
+	if upsertSelectNeedsWhere(sql) {
+		return fmt.Sprintf(
+			"flows.yaml: job %q step %d uses INSERT INTO … SELECT … ON CONFLICT without an outer WHERE clause or another SELECT-closing clause. SQLite may parse ON as a join constraint and fail near DO.\n\n"+
+				"Fix: keep your existing WHERE predicate, or add `WHERE true` between SELECT/FROM and ON CONFLICT. A WHERE inside a subquery, quoted value or comment does not separate the outer SELECT.\n\n"+
+				"See https://sqlite.org/lang_upsert.html#parsing_ambiguity for why this exists.", jobName, stepIdx)
+	}
+	return ""
+}
+
+// upsertSelectNeedsWhere is a syntax hint, not a complete SQL parser. Use the
+// shared SQLite scanner so quoted keywords/comments and nested SELECT clauses
+// cannot stand in for the outer clause that disambiguates an upsert.
+func upsertSelectNeedsWhere(query string) bool {
+	for _, tokens := range sqlTokenStatements(sqlTokenize(query)) {
+		verb := sqlStatementVerbIndex(tokens)
+		keyword := func(i int, word string) bool {
+			return i >= 0 && i < len(tokens) && tokens[i].kind == sqlTokWord && strings.EqualFold(tokens[i].text, word)
+		}
+		if !keyword(verb, "INSERT") && !keyword(verb, "REPLACE") {
+			continue
+		}
+		depth := 0
+		selected, from, closed := false, false, false
+	statementLoop:
+		for i := verb + 1; i < len(tokens); i++ {
+			token := tokens[i]
+			if token.kind == sqlTokPunct {
+				switch token.text {
+				case "(":
+					depth++
+				case ")":
+					if depth > 0 {
+						depth--
+					}
+				}
+				continue
+			}
+			if depth != 0 || token.kind != sqlTokWord {
+				continue
+			}
+			// Named bind parameters are operands, never clause keywords.
+			if i > 0 && tokens[i-1].kind == sqlTokPunct && strings.Contains(":@$", tokens[i-1].text) {
+				continue
+			}
+			switch strings.ToUpper(token.text) {
+			case "SELECT":
+				selected, from, closed = true, false, false
+			case "FROM":
+				if selected {
+					from = true
+				}
+			case "WHERE", "HAVING", "LIMIT":
+				if from {
+					closed = true
+				}
+			case "GROUP", "ORDER":
+				if from && keyword(i+1, "BY") {
+					closed = true
+				}
+			case "ON":
+				if selected && from && keyword(i+1, "CONFLICT") {
+					if !closed {
+						return true
+					}
+					break statementLoop
+				}
 			}
 		}
 	}
-	return ""
+	return false
 }
 
 // reservedPathPrefixes lists framework-owned URL prefixes. Flows that
@@ -1356,7 +2068,7 @@ func detectLegacyShorthandInGHASteps(content string) string {
 		On   any                       `yaml:"on"`
 		Jobs map[string]map[string]any `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(content), &raw); err != nil || raw.Jobs == nil {
+	if err := yamlUnmarshal([]byte(content), &raw); err != nil || raw.Jobs == nil {
 		return ""
 	}
 	legacyShorthand := map[string]bool{
@@ -1410,7 +2122,7 @@ func validateHooksYAML(content string) string {
 		return ""
 	}
 	var top map[string]any
-	if err := yaml.Unmarshal([]byte(content), &top); err != nil {
+	if err := yamlUnmarshal([]byte(content), &top); err != nil {
 		return fmt.Sprintf("hooks.yaml YAML syntax: %s", err)
 	}
 	known := map[string]bool{
@@ -1531,7 +2243,7 @@ func validateEncryptedYAML(content string) string {
 
 	// Parse to the most permissive shape so we can inspect the keys.
 	var raw map[string]any
-	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
+	if err := yamlUnmarshal([]byte(content), &raw); err != nil {
 		return fmt.Sprintf("encrypted.yaml: yaml parse failed - %s", err)
 	}
 
@@ -1567,6 +2279,12 @@ func validateEncryptedYAML(content string) string {
 		if !ok {
 			return fmt.Sprintf("antipattern [encrypted-yaml-shape] in encrypted.yaml: `tables.%s` must be a map with `fields:` and optional `unmask_roles:`, got %T.", tableName, spec)
 		}
+		// The table name is spliced into the encryption/blind-index trigger
+		// SQL, which the connector's trigger check regenerates verbatim, so
+		// it must be a plain identifier.
+		if !membershipIdentRe.MatchString(tableName) {
+			return fmt.Sprintf("antipattern [encrypted-yaml-shape] in encrypted.yaml: table name %q is not a plain identifier (letters, digits and _ only, not starting with a digit).", tableName)
+		}
 		// Known sub-keys: fields, unmask_roles. Everything else is
 		// silently ignored - flag it.
 		for k := range specMap {
@@ -1599,6 +2317,11 @@ func validateEncryptedYAML(content string) string {
 			}
 			if strings.TrimSpace(s) == "" {
 				return fmt.Sprintf("antipattern [encrypted-yaml-shape] in encrypted.yaml: `tables.%s.fields[%d]` is an empty string.", tableName, i)
+			}
+			// Column names go into the trigger SQL the same way the table
+			// name does; a plain identifier only.
+			if !membershipIdentRe.MatchString(strings.TrimSpace(s)) {
+				return fmt.Sprintf("antipattern [encrypted-yaml-shape] in encrypted.yaml: `tables.%s.fields[%d]` (%q) is not a plain column name (letters, digits and _ only, not starting with a digit).", tableName, i, s)
 			}
 		}
 		// unmask_roles: optional, must be a list of strings if present.

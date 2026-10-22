@@ -44,6 +44,16 @@ type queryOrder struct {
 var queryAggFns = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
 var queryOps = map[string]string{"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "like": "LIKE"}
 
+func queryAggregateAlias(a queryAgg) string {
+	if a.As != "" {
+		return a.As
+	}
+	if a.Col == "" {
+		return "count"
+	}
+	return a.Fn + "_" + a.Col
+}
+
 func safeAlias(s string) bool {
 	if s == "" || len(s) > 40 {
 		return false
@@ -95,9 +105,12 @@ func queryScopeFilter(app *App, table string, session *Session) (string, []any) 
 }
 
 // RegisterQueryAPI wires POST /api/_query + the saved-views CRUD.
-func RegisterQueryAPI(mux *http.ServeMux, app *App) {
+func RegisterQueryAPI(mux appRouteRegistrar, app *App) {
 	EnsureSavedViewsTable(app.DB)
+	registerQueryAPI(mux, app)
+}
 
+func registerQueryAPI(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_query", func(w http.ResponseWriter, r *http.Request) {
 		var spec querySpec
 		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
@@ -127,24 +140,44 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 		if hiddenOwner {
 			spec.Select = append(spec.Select, "user_id")
 		}
+		// Standard projections can carry the source tenant internally. This
+		// preserves same-tenant unmask without adding fields to the response.
+		tenantCol := encryptedTenantColumn(app, spec.Table)
+		hiddenTenant := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && tenantCol != "" && cols[tenantCol] && !slices.Contains(spec.Select, tenantCol)
+		if hiddenTenant {
+			spec.Select = append(spec.Select, tenantCol)
+		}
 
 		sqlText, args, err := buildQuery(app, &spec, cols, session)
 		if err != nil {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		rows, err := QueryRows(app.DB, sqlText, args...)
+		sourceTable := spec.Table
+		if len(spec.Aggregates) > 0 || len(spec.GroupBy) > 0 {
+			sourceTable = "" // Aggregate aliases are not source columns.
+		}
+		rows, err := queryNativeRowsWith(app.DB, app, sourceTable, sqlText, args...)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed: " + err.Error()})
+			serverErrorJSON(w, r, app, "_query", err, "query failed")
 			return
 		}
-		MaskEncryptedFields(app.Encrypted, spec.Table, rows, session)
+		// Grouped outputs have already passed source-field authorization.
+		// Their aliases are derived values, not columns of the source table.
+		// Applying source masks by alias would hide or drop valid counts.
+		grouped := len(spec.GroupBy) > 0 || len(spec.Aggregates) > 0
+		if !grouped {
+			MaskEncryptedFields(app, spec.Table, rows, session)
+		}
 		for _, row := range rows {
 			if hiddenOwner {
 				delete(row, "user_id")
 			}
+			if hiddenTenant {
+				delete(row, tenantCol)
+			}
 			for col := range row {
-				if queryHiddenColumn(app, spec.Table, col) {
+				if !grouped && apiHiddenColumn(app, spec.Table, col) {
 					delete(row, col)
 				}
 			}
@@ -162,9 +195,9 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		rows, err := QueryRows(app.DB, "SELECT id, name, spec, created_at FROM _benmore_saved_views WHERE user_id = ? ORDER BY created_at DESC", session.UserID)
+		rows, err := queryMetadataRows(app.DB, "SELECT id, name, spec, created_at FROM _benmore_saved_views WHERE user_id = ? ORDER BY created_at DESC", session.UserID)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_query saved views", err, "query failed")
 			return
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"views": rows})
@@ -189,7 +222,7 @@ func RegisterQueryAPI(mux *http.ServeMux, app *App) {
 		}
 		res, err := app.DB.Exec("INSERT INTO _benmore_saved_views (user_id, name, spec) VALUES (?, ?, ?)", session.UserID, body.Name, string(body.Spec))
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed"})
+			serverErrorJSON(w, r, app, "_query saved views", err, "save failed")
 			return
 		}
 		id, _ := res.LastInsertId()
@@ -215,32 +248,55 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	t := spec.Table
 	// Filtering, sorting and aggregation can disclose protected values even
 	// when the final projection is masked. Reject those uses before SQL runs.
-	if err := validateQueryFieldAccess(app, spec, session); err != nil {
+	fieldScope, fieldArgs, err := queryFieldAccessScope(app, spec, session)
+	if err != nil {
 		return "", nil, err
 	}
 	var selectParts []string
 	grouped := len(spec.GroupBy) > 0 || len(spec.Aggregates) > 0
+	// Every column below is checked against the table's columns (cols) and
+	// written qualified and quoted: a column is named by whoever created it.
+	qt := quoteIdent(t)
+	qcol := func(c string) string { return quoteColumn(t, c) }
+	// SQL sees ciphertext, even when this caller may decrypt the response.
+	// Value operations would return plausible but incorrect results (for
+	// example SUM(ciphertext) = 0). Counting cells and testing NULL remain
+	// meaningful and keep the field authorization applied above.
+	rejectEncryptedValue := func(col string) error {
+		if encryptedDefFor(app, t, col) != nil {
+			return fmt.Errorf("encrypted column %s does not support query value operations; use a non-sensitive derived column or native CRUD blind-index equality filters", col)
+		}
+		return nil
+	}
+	aliases := map[string]bool{}
+	outputs := map[string]bool{}
 
 	for _, g := range spec.GroupBy {
 		if !cols[g] {
 			return "", nil, fmt.Errorf("unknown group_by column: %s", g)
 		}
-		selectParts = append(selectParts, fmt.Sprintf("%s.%s", t, g))
+		if err := rejectEncryptedValue(g); err != nil {
+			return "", nil, err
+		}
+		selectParts = append(selectParts, qcol(g))
+		outputs[sqliteIdentifierFold(g)] = true
 	}
 	for _, a := range spec.Aggregates {
 		if !queryAggFns[a.Fn] {
 			return "", nil, fmt.Errorf("unknown aggregate fn: %s", a.Fn)
 		}
-		alias := a.As
-		if alias == "" {
-			alias = a.Fn + "_" + a.Col
-			if a.Col == "" {
-				alias = "count"
-			}
-		}
+		alias := queryAggregateAlias(a)
 		if !safeAlias(alias) {
 			return "", nil, fmt.Errorf("invalid aggregate alias: %s", alias)
 		}
+		// Rows become JSON objects keyed by output name. A collision would
+		// discard a group key or another aggregate, and case-only aliases
+		// are ambiguous to SQLite's ORDER BY resolution as well.
+		if outputs[sqliteIdentifierFold(alias)] {
+			return "", nil, fmt.Errorf("duplicate query output column: %s", alias)
+		}
+		outputs[sqliteIdentifierFold(alias)] = true
+		aliases[alias] = true
 		var expr string
 		if a.Fn == "count" && a.Col == "" {
 			expr = "COUNT(*)"
@@ -248,9 +304,14 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 			if !cols[a.Col] {
 				return "", nil, fmt.Errorf("unknown aggregate column: %s", a.Col)
 			}
-			expr = fmt.Sprintf("%s(%s.%s)", strings.ToUpper(a.Fn), t, a.Col)
+			if a.Fn != "count" {
+				if err := rejectEncryptedValue(a.Col); err != nil {
+					return "", nil, err
+				}
+			}
+			expr = fmt.Sprintf("%s(%s)", strings.ToUpper(a.Fn), qcol(a.Col))
 		}
-		selectParts = append(selectParts, fmt.Sprintf("%s AS %s", expr, alias))
+		selectParts = append(selectParts, fmt.Sprintf("%s AS %s", expr, quoteIdent(alias)))
 	}
 	if !grouped {
 		if len(spec.Select) > 0 {
@@ -258,24 +319,28 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 				if !cols[c] {
 					return "", nil, fmt.Errorf("unknown column: %s", c)
 				}
-				selectParts = append(selectParts, fmt.Sprintf("%s.%s", t, c))
+				selectParts = append(selectParts, qcol(c))
 			}
 		} else {
-			selectParts = append(selectParts, t+".*")
+			selectParts = append(selectParts, qt+".*")
 		}
 	}
 
-	sqlText := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), t)
+	sqlText := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), qt)
 
-	// WHERE: scope + soft-delete + caller filters.
+	// WHERE: scope + field authorization + soft-delete + caller filters.
 	var conds []string
 	var args []any
+	if fieldScope != "" {
+		conds = append(conds, fieldScope)
+		args = append(args, fieldArgs...)
+	}
 	if scope, sa := queryScopeFilter(app, t, session); scope != "" {
 		conds = append(conds, scope)
 		args = append(args, sa...)
 	}
 	if cols["deleted_at"] {
-		conds = append(conds, fmt.Sprintf("%s.deleted_at IS NULL", t))
+		conds = append(conds, qt+".deleted_at IS NULL")
 	}
 	for col, raw := range spec.Where {
 		if !cols[col] {
@@ -284,13 +349,18 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 		// raw is either a scalar (eq) or {op: value}.
 		if opMap, ok := raw.(map[string]interface{}); ok {
 			for op, val := range opMap {
+				if val != nil || (op != "eq" && op != "ne") {
+					if err := rejectEncryptedValue(col); err != nil {
+						return "", nil, err
+					}
+				}
 				if op == "in" {
 					list, ok := val.([]interface{})
 					if !ok || len(list) == 0 {
 						return "", nil, fmt.Errorf("'in' on %s needs a non-empty array", col)
 					}
 					ph := strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
-					conds = append(conds, fmt.Sprintf("%s.%s IN (%s)", t, col, ph))
+					conds = append(conds, fmt.Sprintf("%s IN (%s)", qcol(col), ph))
 					args = append(args, list...)
 					continue
 				}
@@ -298,16 +368,29 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 				if !ok {
 					return "", nil, fmt.Errorf("unknown operator: %s", op)
 				}
+				if val == nil && (op == "eq" || op == "ne") {
+					nullOp := " IS NULL"
+					if op == "ne" {
+						nullOp = " IS NOT NULL"
+					}
+					conds = append(conds, qcol(col)+nullOp)
+					continue
+				}
 				if op == "like" {
-					conds = append(conds, fmt.Sprintf("%s.%s LIKE ?", t, col))
+					conds = append(conds, qcol(col)+" LIKE ?")
 					args = append(args, fmt.Sprintf("%%%v%%", val))
 				} else {
-					conds = append(conds, fmt.Sprintf("%s.%s %s ?", t, col, sqlOp))
+					conds = append(conds, fmt.Sprintf("%s %s ?", qcol(col), sqlOp))
 					args = append(args, val)
 				}
 			}
+		} else if raw == nil {
+			conds = append(conds, qcol(col)+" IS NULL")
 		} else {
-			conds = append(conds, fmt.Sprintf("%s.%s = ?", t, col))
+			if err := rejectEncryptedValue(col); err != nil {
+				return "", nil, err
+			}
+			conds = append(conds, qcol(col)+" = ?")
 			args = append(args, raw)
 		}
 	}
@@ -318,36 +401,32 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	if len(spec.GroupBy) > 0 {
 		var gb []string
 		for _, g := range spec.GroupBy {
-			gb = append(gb, fmt.Sprintf("%s.%s", t, g))
+			gb = append(gb, qcol(g))
 		}
 		sqlText += " GROUP BY " + strings.Join(gb, ", ")
 	}
 
 	// ORDER BY - column must be a real column or a declared aggregate alias.
-	aliases := map[string]bool{}
-	for _, a := range spec.Aggregates {
-		al := a.As
-		if al == "" {
-			al = a.Fn + "_" + a.Col
-			if a.Col == "" {
-				al = "count"
-			}
-		}
-		aliases[al] = true
-	}
 	if len(spec.OrderBy) > 0 {
 		var obs []string
 		for _, o := range spec.OrderBy {
 			if !cols[o.Col] && !aliases[o.Col] {
 				return "", nil, fmt.Errorf("unknown order_by column: %s", o.Col)
 			}
+			if !aliases[o.Col] {
+				if err := rejectEncryptedValue(o.Col); err != nil {
+					return "", nil, err
+				}
+			}
 			dir := "ASC"
 			if strings.ToLower(o.Dir) == "desc" {
 				dir = "DESC"
 			}
-			ref := o.Col
-			if cols[o.Col] {
-				ref = t + "." + o.Col
+			ref := qcol(o.Col)
+			if aliases[o.Col] {
+				// A selected aggregate takes precedence over a physical column
+				// with the same name: sum(amount) AS amount sorts by the sum.
+				ref = quoteIdent(o.Col)
 			}
 			obs = append(obs, ref+" "+dir)
 		}
@@ -362,56 +441,19 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	return sqlText, args, nil
 }
 
-func queryHiddenColumn(app *App, table, column string) bool {
-	if strings.HasSuffix(column, blindColSuffix) {
-		return true
-	}
-	// Explicit encryption config defines the visibility of an encrypted
-	// column, including intentionally named fields such as secret_note.
-	if app.Encrypted != nil {
-		for _, def := range app.Encrypted.Fields[table] {
-			if def.Column == column {
-				return false
-			}
-		}
-	}
-	return isSensitiveUserColumn(column)
+func validateQueryFieldAccess(app *App, spec *querySpec, session *Session) error {
+	_, _, err := queryFieldAccessScope(app, spec, session)
+	return err
 }
 
-func validateQueryFieldAccess(app *App, spec *querySpec, session *Session) error {
-	protected := func(column string) bool {
-		if queryHiddenColumn(app, spec.Table, column) {
-			return true
-		}
-		if app.Encrypted == nil {
-			return false
-		}
-		for _, def := range app.Encrypted.Fields[spec.Table] {
-			if def.Column != column || len(def.Roles) == 0 || session.IsAdmin() {
-				continue
-			}
-			if session != nil {
-				for _, role := range def.Roles {
-					if role == "self" || role == "owner" {
-						continue
-					}
-					if session.Role == role {
-						return false
-					}
-					for _, held := range session.Roles {
-						if held == role {
-							return false
-						}
-					}
-				}
-			}
-			return true
-		}
-		return false
-	}
+// SQL operations on encrypted columns must use the same row authorization as
+// response masking. Tenant holders keep these operations inside their tenant;
+// owner-only operations retain their existing refusal instead of broadening
+// aggregation access. Selecting a field alone is still allowed and masked.
+func queryFieldAccessScope(app *App, spec *querySpec, session *Session) (string, []any, error) {
 	for _, col := range spec.Select {
-		if queryHiddenColumn(app, spec.Table, col) {
-			return fmt.Errorf("column %s is not available", col)
+		if apiHiddenColumn(app, spec.Table, col) {
+			return "", nil, fmt.Errorf("column %s is not available", col)
 		}
 	}
 	var uses []string
@@ -419,20 +461,47 @@ func validateQueryFieldAccess(app *App, spec *querySpec, session *Session) error
 	for col := range spec.Where {
 		uses = append(uses, col)
 	}
+	aggregateAliases := map[string]bool{}
+	for _, agg := range spec.Aggregates {
+		aggregateAliases[queryAggregateAlias(agg)] = true
+	}
 	for _, order := range spec.OrderBy {
-		uses = append(uses, order.Col)
+		if !aggregateAliases[order.Col] {
+			uses = append(uses, order.Col)
+		}
 	}
 	for _, agg := range spec.Aggregates {
 		if agg.Col != "" {
 			uses = append(uses, agg.Col)
 		}
 	}
+	var scopes []string
+	var args []any
+	seen := map[string]bool{}
 	for _, col := range uses {
-		if protected(col) {
-			return fmt.Errorf("column %s cannot be filtered, ordered or aggregated with your permissions", col)
+		if seen[col] {
+			continue
 		}
+		seen[col] = true
+		if apiHiddenColumn(app, spec.Table, col) {
+			return "", nil, fmt.Errorf("column %s cannot be filtered, ordered or aggregated with your permissions", col)
+		}
+		def := encryptedDefFor(app, spec.Table, col)
+		if def == nil {
+			continue
+		}
+		access := encryptedFieldAccessFor(app, app.DB, spec.Table, *def, session)
+		if access.allRows {
+			continue
+		}
+		if access.tenantColumn == "" {
+			return "", nil, fmt.Errorf("column %s cannot be filtered, ordered or aggregated with your permissions", col)
+		}
+		scope, sa := access.scopePredicate(spec.Table)
+		scopes = append(scopes, scope)
+		args = append(args, sa...)
 	}
-	return nil
+	return strings.Join(scopes, " AND "), args, nil
 }
 
 // EnsureSavedViewsTable creates the saved-views table.

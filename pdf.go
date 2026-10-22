@@ -3,12 +3,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -43,18 +47,41 @@ func findChrome() string {
 }
 
 // RegisterPDFRoutes registers GET /pdf/{page...} for rendering any page to PDF.
-func RegisterPDFRoutes(mux *http.ServeMux, app *App) {
+func RegisterPDFRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /pdf/{page...}", func(w http.ResponseWriter, r *http.Request) {
 		handlePDFRender(w, r, app)
 	})
 }
 
+// pdfServerError keeps a PDF failure in the request log (the PDF ERROR line
+// is the journal's copy) and answers: devText in dev mode, as before; the
+// generic text and the request id otherwise.
+func pdfServerError(w http.ResponseWriter, r *http.Request, app *App, status int, err error, devText string) {
+	id := recordRequestError(r, serverErrorDetail("pdf "+r.URL.Path, err))
+	w.Header().Set(requestIDHeader, id)
+	if serverErrorDevMode(app) && devText != "" {
+		http.Error(w, devText, status)
+		return
+	}
+	public := "Internal Server Error"
+	if status == http.StatusGatewayTimeout {
+		public = "PDF generation timed out"
+	}
+	http.Error(w, publicServerErrorText(public, id), status)
+}
+
 func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
-	// Rate limit: identify by user ID if authenticated, otherwise by IP
-	rateLimitKey := r.RemoteAddr
+	if !app.FeatureEnabled("exports") {
+		http.NotFound(w, r)
+		return
+	}
+	// Rate limit: identify by user ID if authenticated, otherwise by the
+	// client's address bucket (never RemoteAddr: its port changes with every
+	// connection, and behind the router the peer is loopback).
+	rateLimitKey := appLimiterKey(app, "pdf", clientRateBucket(rateLimitClientHost(r)))
 	session := getSession(app, r)
 	if session != nil {
-		rateLimitKey = fmt.Sprintf("user:%d", session.UserID)
+		rateLimitKey = appLimiterKey(app, "pdf", fmt.Sprintf("user:%d", session.UserID))
 	}
 	if !pdfLimiter.Allow(rateLimitKey) {
 		http.Error(w, "Too many PDF requests - try again later", http.StatusTooManyRequests)
@@ -84,14 +111,13 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Role check
-	requiredRole := extractPageRole(page.RawHTML)
+	requiredRole := pageRole(page)
 	if requiredRole != "" {
 		if session == nil {
 			http.Error(w, "Authentication required", http.StatusUnauthorized)
 			return
 		}
-		userRole := getUserRole(app.DB, session.UserID)
-		if !hasRole(userRole, requiredRole) {
+		if !pageRoleAllowed(app, session, requiredRole) {
 			http.Error(w, "Forbidden - insufficient permissions", http.StatusForbidden)
 			return
 		}
@@ -106,6 +132,20 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 		}
 		if !checkRequireFields(page.Require, userMap) {
 			http.Error(w, "Forbidden - requirements not met", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Role-based redirect, as servePage applies it: a page that sends this
+	// caller elsewhere (or is taken offline with redirect="*:/") is not
+	// printed either.
+	if page.Redirect != "" {
+		role := ""
+		if session != nil {
+			role = session.Role
+		}
+		if target := matchRoleRedirect(page.Redirect, role); target != "" {
+			http.Redirect(w, r, target, http.StatusSeeOther)
 			return
 		}
 	}
@@ -160,11 +200,7 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	content, err := RenderTemplate(app, page, ctx)
 	if err != nil {
 		log.Printf("PDF ERROR [%s]: render failed: %s", pagePath, err.Error())
-		if app.DevMode {
-			http.Error(w, fmt.Sprintf("PDF render error: %s", err.Error()), http.StatusInternalServerError)
-		} else {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
+		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("render failed: %w", err), fmt.Sprintf("PDF render error: %s", err.Error()))
 		return
 	}
 
@@ -178,73 +214,54 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 
 	fullHTML := WrapLayoutWithPage(content, title, app, session, page)
 
-	// Harden against local-file exfiltration. Headless Chrome renders this
-	// from a file:// origin, where a `<iframe src="file:///.../env.yaml">`
-	// (or img/object/link) in injected page content would read app-local
-	// files (env.yaml, data.db) INTO the PDF. Inject a print-time CSP that
-	// forbids file: subresources. We deliberately omit 'self' - on a file://
-	// origin 'self' IS file://, which would re-allow the very loads we block.
-	// https:/data:/inline cover legitimate PDF assets; frame/object are off
-	// (PDFs don't need them and they're the primary exfil vector).
-	const pdfCSP = `<meta http-equiv="Content-Security-Policy" content="default-src https: data: 'unsafe-inline'; img-src https: data:; style-src https: 'unsafe-inline'; font-src https: data:; script-src 'unsafe-inline' https:; frame-src 'none'; object-src 'none'; child-src 'none'">`
-	if idx := strings.Index(strings.ToLower(fullHTML), "<head>"); idx >= 0 {
-		fullHTML = fullHTML[:idx+len("<head>")] + pdfCSP + fullHTML[idx+len("<head>"):]
-	} else {
-		fullHTML = pdfCSP + fullHTML
-	}
-
-	// Write HTML to temp file
-	tmpFile, err := os.CreateTemp("", "benmore-pdf-*.html")
+	// Render inside the sandbox (pdf_sandbox.go): the document is served
+	// from an isolated http origin and every request Chrome makes goes
+	// through a proxy that serves only this document and tunnels HTTPS only
+	// to the hosts the page CSP names.
+	csp, hosts := pdfPolicy(app)
+	sandbox, err := newPDFSandbox([]byte(fullHTML), csp, hosts)
 	if err != nil {
-		log.Printf("PDF ERROR: failed to create temp file: %s", err.Error())
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("PDF ERROR: sandbox: %s", err.Error())
+		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("sandbox: %w", err), "")
 		return
 	}
-	defer os.Remove(tmpFile.Name())
+	defer sandbox.Close()
 
-	if _, err := tmpFile.WriteString(fullHTML); err != nil {
-		tmpFile.Close()
-		log.Printf("PDF ERROR: failed to write temp file: %s", err.Error())
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	workDir, err := os.MkdirTemp("", "benmore-pdf-*")
+	if err != nil {
+		log.Printf("PDF ERROR: failed to create work dir: %s", err.Error())
+		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("work dir: %w", err), "")
 		return
 	}
-	tmpFile.Close()
+	defer os.RemoveAll(workDir)
+	pdfPath := filepath.Join(workDir, "out.pdf")
 
 	// Chrome --print-to-pdf with 30-second timeout
-	pdfPath := tmpFile.Name() + ".pdf"
-	defer os.Remove(pdfPath)
-
-	chromeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	chromeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(chromeCtx, chromePath,
-		"--headless=new",
-		"--disable-gpu",
-		"--no-sandbox",
-		"--print-to-pdf="+pdfPath,
-		"file://"+tmpFile.Name(),
-	)
+		pdfChromeArgs(sandbox.ProxyAddr(), sandbox.DocURL(), pdfPath, filepath.Join(workDir, "profile"))...)
+	// Chrome's helper processes can outlive a killed parent and hold the
+	// output pipe open; stop waiting for them shortly after the timeout.
+	cmd.WaitDelay = 5 * time.Second
 
-	output, err := cmd.CombinedOutput()
+	output, err := runPDFChrome(chromeCtx, cmd, pdfPath)
 	if err != nil {
 		if chromeCtx.Err() == context.DeadlineExceeded {
 			log.Printf("PDF ERROR [%s]: Chrome timed out after 30s", pagePath)
-			http.Error(w, "PDF generation timed out", http.StatusGatewayTimeout)
+			pdfServerError(w, r, app, http.StatusGatewayTimeout, errors.New("Chrome timed out after 30s"), "PDF generation timed out")
 			return
 		}
 		log.Printf("PDF ERROR [%s]: Chrome failed: %s\n%s", pagePath, err.Error(), string(output))
-		if app.DevMode {
-			http.Error(w, fmt.Sprintf("PDF generation failed: %s\n%s", err.Error(), string(output)), http.StatusInternalServerError)
-		} else {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
+		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("Chrome failed: %w: %s", err, output), fmt.Sprintf("PDF generation failed: %s\n%s", err.Error(), string(output)))
 		return
 	}
 
 	// Verify the PDF file was actually created
-	if _, err := os.Stat(pdfPath); err != nil {
+	if !pdfOutputComplete(pdfPath) {
 		log.Printf("PDF ERROR [%s]: PDF file not created", pagePath)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		pdfServerError(w, r, app, http.StatusInternalServerError, errors.New("PDF file not created"), "")
 		return
 	}
 
@@ -255,6 +272,102 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.pdf"`, filename))
 	http.ServeFile(w, r, pdfPath)
+}
+
+// Chrome can finish printing while desktop helper processes keep it alive.
+// Reuse the existing process-group cancellation, and stop the private job only
+// after a complete PDF and the same settling period used by the sandbox test.
+func runPDFChrome(ctx context.Context, cmd *exec.Cmd, path string) ([]byte, error) {
+	setTranscribeProcAttrs(cmd)
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = 5 * time.Second
+	}
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	defer cmd.Cancel() // Clean helpers even when the direct child exits first.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			if ctx.Err() != nil {
+				return output.Bytes(), ctx.Err()
+			}
+			return output.Bytes(), err
+		case <-ctx.Done():
+			_ = cmd.Cancel()
+			<-done
+			return output.Bytes(), ctx.Err()
+		case <-ticker.C:
+			if !pdfOutputComplete(path) {
+				continue
+			}
+			settle := time.NewTimer(500 * time.Millisecond)
+			select {
+			case err := <-done:
+				settle.Stop()
+				if ctx.Err() != nil {
+					return output.Bytes(), ctx.Err()
+				}
+				return output.Bytes(), err
+			case <-ctx.Done():
+				_ = cmd.Cancel()
+				settle.Stop()
+				<-done
+				return output.Bytes(), ctx.Err()
+			case <-settle.C:
+			}
+			if !pdfOutputComplete(path) {
+				continue
+			}
+			// Wait always completes before exposing output or removing the
+			// profile; caller WaitDelay bounds inherited pipe cleanup.
+			stopErr := cmd.Cancel()
+			waitErr := <-done
+			if ctx.Err() != nil {
+				return output.Bytes(), ctx.Err()
+			}
+			if stopErr != nil && waitErr != nil {
+				return output.Bytes(), waitErr
+			}
+			var exitErr *exec.ExitError
+			if waitErr != nil && !errors.As(waitErr, &exitErr) {
+				return output.Bytes(), waitErr
+			}
+			return output.Bytes(), nil
+		}
+	}
+}
+
+// Check only the fixed header and tail; polling never rereads a whole report.
+func pdfOutputComplete(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	var header [5]byte
+	if _, err := io.ReadFull(file, header[:]); err != nil || string(header[:]) != "%PDF-" {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 10 {
+		return false
+	}
+	n := info.Size()
+	if n > 1024 {
+		n = 1024
+	}
+	tail := make([]byte, n)
+	if _, err := file.ReadAt(tail, info.Size()-n); err != nil {
+		return false
+	}
+	return bytes.HasSuffix(bytes.TrimSpace(tail), []byte("%%EOF"))
 }
 
 // sanitizePDFFilename produces a safe filename from a page path.
@@ -278,11 +391,16 @@ func sanitizePDFFilename(pagePath string) string {
 // Format: "plan:pro,enterprise verified:1" - space-separated, each is field:val1,val2.
 func checkRequireFields(require string, userMap map[string]any) bool {
 	parts := strings.Fields(require)
+	// A require= made only of malformed parts ("plan=pro", ":pro") used to
+	// check nothing and admit every signed-in user. A gate that names no
+	// field it can check refuses instead.
+	valid := 0
 	for _, part := range parts {
 		kv := strings.SplitN(part, ":", 2)
-		if len(kv) != 2 {
+		if len(kv) != 2 || kv[0] == "" {
 			continue
 		}
+		valid++
 		field := kv[0]
 		allowedVals := strings.Split(kv[1], ",")
 
@@ -298,5 +416,5 @@ func checkRequireFields(require string, userMap map[string]any) bool {
 			return false
 		}
 	}
-	return true
+	return valid > 0
 }

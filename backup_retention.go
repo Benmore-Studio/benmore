@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,13 +18,44 @@ type backupObjectStore interface {
 	Delete(path string) error
 }
 
-func runRetentionSweep(store backupObjectStore) (int, error) {
+// backupAppInventory returns a fresh authoritative production-app inventory.
+// nil is unavailable, never an assertion that all apps have been removed.
+type backupAppInventory func() (map[string]bool, error)
+
+func runRetentionSweep(store backupObjectStore, inventory backupAppInventory) (int, error) {
+	if inventory == nil {
+		return 0, errors.New("backup retention requires an app inventory")
+	}
+	before, err := inventory()
+	if err != nil {
+		return 0, fmt.Errorf("backup retention inventory: %w", err)
+	}
+	if before == nil {
+		return 0, errors.New("backup retention app inventory unavailable")
+	}
 	objs, err := store.List("")
 	if err != nil {
 		return 0, err
 	}
+	// Listing can take time. Preserve apps present at either boundary rather
+	// than treating a route change during enumeration as proof of retirement.
+	after, err := inventory()
+	if err != nil {
+		return 0, fmt.Errorf("backup retention inventory recheck: %w", err)
+	}
+	if after == nil {
+		return 0, errors.New("backup retention app inventory unavailable after listing")
+	}
+	active := make(map[string]bool, len(before)+len(after))
+	for _, snapshot := range []map[string]bool{before, after} {
+		for sub, present := range snapshot {
+			if present {
+				active[sub] = true
+			}
+		}
+	}
 	now := time.Now().UTC()
-	keys := retentionKeysToDelete(objs, now)
+	keys := retentionKeysToDeleteForApps(objs, now, active)
 	// PITR (litestream) objects live under <sub>/litestream/ and are GC'd
 	// separately, by generation - parseBackupSnapshotKey deliberately ignores
 	// them (they have 4-5 path segments, not 2). Without this they accumulate
@@ -42,7 +74,10 @@ func runRetentionSweep(store backupObjectStore) (int, error) {
 	return len(keys), nil
 }
 
-func retentionKeysToDelete(objs []S3Object, now time.Time) []string {
+func retentionKeysToDeleteForApps(objs []S3Object, now time.Time, active map[string]bool) []string {
+	if active == nil {
+		return nil // unknown inventory is never permission to delete
+	}
 	type snap struct {
 		key       string
 		sub       string
@@ -59,9 +94,13 @@ func retentionKeysToDelete(objs []S3Object, now time.Time) []string {
 	}
 
 	keep := map[string]bool{}
+	newest := map[string]snap{}
 	daily := map[string]snap{}
 	weekly := map[string]snap{}
 	for _, s := range snaps {
+		if previous, ok := newest[s.sub]; !ok || s.t.After(previous.t) {
+			newest[s.sub] = s
+		}
 		age := now.Sub(s.t)
 		if age < 0 {
 			keep[s.key] = true
@@ -87,6 +126,14 @@ func retentionKeysToDelete(objs []S3Object, now time.Time) []string {
 			if prev, ok := weekly[bucket]; !ok || s.t.After(prev.t) {
 				weekly[bucket] = s
 			}
+		}
+	}
+	// Preserve an active app's newest candidate, including a predeploy-only
+	// history. Its filename does not certify restorability. Removed apps keep
+	// the documented age windows rather than an indefinite newest-object hold.
+	for _, s := range newest {
+		if active[s.sub] {
+			keep[s.key] = true
 		}
 	}
 	for _, s := range daily {
@@ -206,7 +253,7 @@ func parseLitestreamKey(key string) (sub, gen string, ts time.Time, ok bool) {
 
 func parseBackupSnapshotKey(key string) (sub string, ts time.Time, preDeploy bool, ok bool) {
 	parts := strings.Split(key, "/")
-	if len(parts) != 2 {
+	if len(parts) != 2 || parts[0] == "" || !strings.HasSuffix(parts[1], ".db.gz") {
 		return "", time.Time{}, false, false
 	}
 	name := strings.TrimSuffix(parts[1], ".db.gz")

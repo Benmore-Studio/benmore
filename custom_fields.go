@@ -49,13 +49,16 @@ func EnsureCustomFieldsTable(db *sql.DB) {
 
 // RegisterCustomFieldRoutes adds the dynamic schema API endpoints.
 // All endpoints are admin-only.
-func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
+func RegisterCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	EnsureCustomFieldsTable(app.DB)
+	registerCustomFieldRoutes(mux, app)
+}
 
+func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	// List custom fields for a table
 	mux.HandleFunc("GET /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
 			return
 		}
@@ -82,13 +85,13 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 		// Get all live columns
 		liveCols, err := GetTableColumns(app.DB, table)
 		if err != nil {
-			http.Error(w, `{"error":"failed to read table schema"}`, http.StatusInternalServerError)
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to read table schema")
 			return
 		}
 
 		// Get custom fields from tracking table
 		customMap := make(map[string]map[string]any)
-		rows, err := QueryRows(app.DB, "SELECT column_name, column_type, description, added_by, created_at FROM _benmore_custom_fields WHERE table_name = ?", table)
+		rows, err := queryMetadataRows(app.DB, "SELECT column_name, column_type, description, added_by, created_at FROM _benmore_custom_fields WHERE table_name = ?", table)
 		if err == nil {
 			for _, row := range rows {
 				if name, ok := row["column_name"].(string); ok {
@@ -131,7 +134,7 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 	// Add a custom field to a table
 	mux.HandleFunc("POST /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
 			return
 		}
@@ -204,7 +207,7 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 		// Check if column already exists
 		liveCols, err := GetTableColumns(app.DB, table)
 		if err != nil {
-			http.Error(w, `{"error":"failed to read table schema"}`, http.StatusInternalServerError)
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to read table schema")
 			return
 		}
 		for _, col := range liveCols {
@@ -214,33 +217,56 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 			}
 		}
 
-		// Execute ALTER TABLE ADD COLUMN
-		alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, body.Name, body.Type)
-		if _, err := app.DB.Exec(alterSQL); err != nil {
-			log.Printf("custom_fields: ALTER TABLE failed: %s", err)
-			http.Error(w, `{"error":"failed to add column"}`, http.StatusInternalServerError)
+		// The source column, history schema/triggers, and tracking row commit
+		// together. A failed history repair must not leave a half-added field.
+		key := cryptoKeyForQuerier(app.DB)
+		tx, err := app.DB.Begin()
+		if err != nil {
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to begin schema change")
 			return
 		}
-
-		// If this table is versioned, also add the column to the history table
-		// and reinstall the versioning trigger so it captures the new column
-		historyTable := table + "_history"
-		var historyExists int
-		app.DB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", historyTable).Scan(&historyExists)
-		if historyExists > 0 {
-			app.DB.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", historyTable, body.Name, body.Type))
-			// Reinstall triggers to include the new column
-			installVersioningForTable(app.DB, table)
-			log.Printf("  custom_fields: synced %s to %s and reinstalled versioning triggers", body.Name, historyTable)
+		defer tx.Rollback()
+		alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", quoteIdent(table), quoteIdent(body.Name), body.Type)
+		if _, err := tx.Exec(alterSQL); err != nil {
+			tx.Rollback()
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to add column")
+			return
 		}
-
-		// Record in tracking table
-		_, err = app.DB.Exec(
+		historyExists, err := versionHistoryExists(tx, table+"_history")
+		if err != nil {
+			tx.Rollback()
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to validate history")
+			return
+		}
+		var activeHistory int
+		if historyExists {
+			// Retained snapshots alone do not enable capture. Removing a table
+			// from versioned: removes its triggers while keeping its old history.
+			if err := tx.QueryRow(`SELECT count(*) FROM main.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE AND (name=? COLLATE NOCASE OR name=? COLLATE NOCASE)`, table, "_benmore_ver_"+table+"_update", "_benmore_ver_"+table+"_delete").Scan(&activeHistory); err != nil {
+				tx.Rollback()
+				serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to read history policy")
+				return
+			}
+		}
+		if activeHistory > 0 {
+			if err := installVersioningForTableTx(tx, table, app.Encrypted, key); err != nil {
+				tx.Rollback()
+				serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to update history")
+				return
+			}
+		}
+		if _, err := tx.Exec(
 			"INSERT INTO _benmore_custom_fields (table_name, column_name, column_type, description, added_by) VALUES (?, ?, ?, ?, ?)",
 			table, body.Name, body.Type, body.Description, session.UserID,
-		)
-		if err != nil {
-			log.Printf("custom_fields: tracking insert failed: %s", err)
+		); err != nil {
+			tx.Rollback()
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to record custom field")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to commit custom field")
+			return
 		}
 
 		// Audit log
@@ -264,7 +290,7 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 	// Remove a custom field from a table
 	mux.HandleFunc("DELETE /api/_schema/{table}/fields/{name}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
 			return
 		}
@@ -299,8 +325,7 @@ func RegisterCustomFieldRoutes(mux *http.ServeMux, app *App) {
 
 		// Execute ALTER TABLE DROP COLUMN
 		if err := DropColumn(app.DB, table, name); err != nil {
-			log.Printf("custom_fields: DROP COLUMN failed: %s", err)
-			http.Error(w, `{"error":"failed to remove column"}`, http.StatusInternalServerError)
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to remove column")
 			return
 		}
 

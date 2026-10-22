@@ -57,8 +57,8 @@ func TestBuildAutoMembershipHook_DefaultShape(t *testing.T) {
 		t.Fatal("empty SQL - config rejected unexpectedly")
 	}
 	for _, want := range []string{
-		"INSERT INTO channels_members",
-		"(user_id, channel_id)",
+		`INSERT INTO "channels_members"`,
+		`("user_id", "channel_id")`,
 		"SELECT id, {{id}} FROM _benmore_users",
 		"WHERE deactivated_at IS NULL OR deactivated_at = ''",
 		"ON CONFLICT DO NOTHING",

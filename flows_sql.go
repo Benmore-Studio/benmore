@@ -7,6 +7,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -21,9 +22,11 @@ import (
 // json_extract() without an explicit `| json` pipe in the YAML.
 //
 // The rawExpr is typically a single `{{...}}` placeholder. If it
-// resolves to a primitive (string/number/bool), the rendered form is
-// used as-is. If it resolves to a slice or map, the resolved value
-// (not the rendered string) is JSON-encoded.
+// resolves to a boolean, use SQLite's 0/1 representation so BOOLEAN
+// affinity and subsequent predicates/readback agree with a direct bound
+// reference. Other primitives retain their rendered form. If it resolves
+// to a slice or map, the resolved value (not the rendered string) is
+// JSON-encoded.
 //
 // Returns (rendered, isNil). isNil is true when a single-placeholder
 // expression resolved to Go `nil`; the SQL bind path uses this to
@@ -45,21 +48,24 @@ func resolveSQLParamValue(rawExpr string, ctx *FlowContext) (string, bool) {
 	// Strip any pipe chain - `{{ x | length }}` always produces a
 	// string from ApplyPipe, never nil.
 	key := inner
-	if pipeIdx := strings.Index(inner, "|"); pipeIdx >= 0 {
-		key = strings.TrimSpace(inner[:pipeIdx])
+	if strings.Contains(inner, "|") {
 		// Piped expressions don't go through the nil-checks below.
-		flat := flattenData(ctx.Data)
-		if _, exists := flat[key]; exists {
-			return rendered, false
-		}
 		return rendered, false
 	}
-	flat := flattenData(ctx.Data)
-	if v, ok := flat[key]; ok {
+	// The run's cached lookup table (flatDataForCtx), not a fresh
+	// flattenData per param: inside a for_each that re-flattened all of
+	// ctx.Data for every param of every iteration.
+	flat := flatDataForCtx(ctx)
+	if v, ok := flowLookup(flat, key); ok {
 		if v == nil {
 			return "", true
 		}
-		switch v.(type) {
+		switch value := v.(type) {
+		case bool:
+			if value {
+				return "1", false
+			}
+			return "0", false
 		case []any, []map[string]any, map[string]any:
 			if b, err := json.Marshal(v); err == nil {
 				return string(b), false
@@ -173,20 +179,71 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 	// SQL steps inside a `transaction: true` flow would otherwise race.
 	// The DB pool (ctx.Tx == nil path) is already concurrency-safe, so we
 	// only pay the lock on the transactional path.
-	if ctx.Tx != nil {
-		ctx.TxMu.Lock()
-		defer ctx.TxMu.Unlock()
+	if ctx.Tx != nil || ctx.mcpReadConn != nil {
+		ctx.transactionMutex().Lock()
+		defer ctx.transactionMutex().Unlock()
 	}
-	if startsWithRowProducer || hasReturning {
-		key := cryptoKeyForQuerier(db)
-		sqlRows, err := db.Query(query, args...)
+	if ctx.mcpReadConn != nil {
+		if !isReadOnlyQuery(query) {
+			return fmt.Errorf("connector SQL must be one read-only statement")
+		}
+		startsWithRowProducer = true
+	}
+	// The prefix checks above are the historical routing, and a step without
+	// expect_rows keeps it, so its outputs are what they always were. Two
+	// cases read the statement off the shared lexer instead:
+	//   - a step WITH expect_rows (routeAssertedFlowSQL), so the count it
+	//     compares is always the statement's own;
+	//   - a single `WITH ... INSERT/UPDATE/DELETE` without RETURNING. Its
+	//     WITH prefix sent it through Query, which ran the write, stored an
+	//     empty row list and hid the affected count - the guarded write
+	//     (`INSERT INTO t SELECT ... WHERE <guard>`) written with a CTE. It
+	//     runs through Exec like any other write and exposes rows_affected.
+	rowProducing, shape := startsWithRowProducer || hasReturning, flowSQLShape{}
+	switch {
+	case step.ExpectRows != "":
+		var err error
+		if rowProducing, shape, query, err = routeAssertedFlowSQL(step, query, ctx.mcpReadConn != nil); err != nil {
+			return err
+		}
+	case ctx.mcpReadConn == nil && strings.HasPrefix(upper, "WITH"):
+		if s := classifyFlowSQL(query); s.kind == flowSQLWrite && s.statements == 1 {
+			rowProducing, shape, query = false, s, s.text(query)
+		}
+	}
+	if rowProducing {
+		// Query runs the script's last statement and nothing may follow it: a
+		// comment or a second `;` after the final statement is dropped here.
+		runnable, ok := sqlRunnableText(query)
+		if !ok {
+			return fmt.Errorf("sql: %w", errNoSQLStatement)
+		}
+		query = runnable
+		var key []byte
+		var sqlRows *sql.Rows
+		var err error
+		if ctx.mcpReadConn != nil {
+			key = ctx.mcpReadKey
+			sqlRows, err = ctx.mcpReadConn.QueryContext(ctx.Request.Context(), query, args...)
+		} else {
+			key = cryptoKeyForQuerier(db)
+			sqlRows, err = db.Query(query, args...)
+		}
 		if err != nil {
 			return fmt.Errorf("sql: %w", err)
 		}
-		rows, err := scanRows(sqlRows, key)
+		limit := 0
+		if ctx.mcpReadConn != nil {
+			limit = readOnlyQueryMaxRows + 1
+		}
+		rows, err := scanRowsLimit(sqlRows, key, limit)
+		if ctx.mcpReadConn != nil && len(rows) > readOnlyQueryMaxRows {
+			return fmt.Errorf("connector SQL result limit exceeded")
+		}
 		if err != nil {
 			return fmt.Errorf("sql scan: %w", err)
 		}
+		recordFlowSQLWrites(ctx, query, shape.queryWriteCount(upper, rows))
 		if step.Name != "" {
 			// Always store as a slice. Pre-v2.3.2 we collapsed a
 			// single-row result into a bare map at ctx.Data[step.Name]
@@ -203,12 +260,27 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 			ctx.Data[step.Name] = rows
 			ctx.DataMu.Unlock()
 		}
+		// expect_rows on a statement that returns rows (a SELECT, or a write
+		// with RETURNING, which returns one row per row it changed) compares
+		// the rows returned. Checked after the output is stored, like the
+		// affected count below, so an on_error handler can read it.
+		if err := checkExpectRows(ctx, step, shape, int64(len(rows))); err != nil {
+			return err
+		}
 	} else {
+		// Exec skips a text that holds no statement and reports success, so a
+		// step whose statement never reached it (a missing `query`, `with.sql`
+		// for `with.query`, a text that is only a comment) ran nothing and the
+		// flow went on. The Query path above already refuses such a text.
+		if _, ok := sqlRunnableText(query); !ok {
+			return fmt.Errorf("sql: %w", errNoSQLStatement)
+		}
 		res, err := db.Exec(query, args...)
 		if err != nil {
 			return fmt.Errorf("sql: %w", err)
 		}
 		affected, _ := res.RowsAffected()
+		recordFlowSQLWrites(ctx, query, affected)
 		// Expose the affected count as a step output so authors can branch on
 		// it (`if: ${{ steps.x.outputs.rows_affected }}`) and so the previously
 		// invisible "0 rows" case is observable. Additive: exec steps stored
@@ -220,17 +292,210 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 		}
 		// expect_rows: fail the flow LOUD when a guarded write affected the
 		// wrong number of rows, instead of silently falling through to a 200.
-		if step.ExpectRows != "" {
-			ok, eerr := evalExpectRows(step.ExpectRows, affected)
-			if eerr != nil {
-				return eerr
-			}
-			if !ok {
-				return fmt.Errorf("sql: expect_rows assertion failed on step %q: %d row(s) affected, expected %s (the guard/WHERE matched nothing - the write did NOT happen)", step.Name, affected, step.ExpectRows)
-			}
+		if err := checkExpectRows(ctx, step, shape, affected); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// flowQueryWriteCount is the rows-changed count of a statement that ran
+// through Query, for recordFlowSQLWrites: a RETURNING write returns one row
+// per changed row; anything else (a script of several statements, a
+// sql_dynamic WITH … INSERT without RETURNING, which writes but returns
+// nothing) is unknown (-1).
+func flowQueryWriteCount(upperQuery string, rows []map[string]any) int64 {
+	if hasReturningClause(upperQuery) {
+		return int64(len(rows))
+	}
+	return -1
+}
+
+// flowSQLKind is what a rendered flow SQL script does, read off the shared
+// SQLite lexer (sql_scan.go) rather than guessed from its first characters.
+type flowSQLKind int
+
+const (
+	// flowSQLUnclassified: the script was not tokenized (a step without
+	// expect_rows on the historical routing) or has no row count that
+	// expect_rows could compare (DDL, PRAGMA, EXPLAIN, a mix of statements).
+	flowSQLUnclassified flowSQLKind = iota
+	flowSQLRead                     // one SELECT / VALUES, with or without a WITH prefix
+	flowSQLReturning                // one INSERT / UPDATE / DELETE ... RETURNING
+	flowSQLWrite                    // INSERT / UPDATE / DELETE statement(s), none with RETURNING
+)
+
+// flowSQLShape is classifyFlowSQL's reading of one script.
+type flowSQLShape struct {
+	kind       flowSQLKind
+	statements int // non-empty statements (comments are not statements)
+	start, end int // byte span from the first statement's first token to the last one's last
+}
+
+// classifyFlowSQL tokenizes a rendered script and says which row count it
+// has. Comments, quoting and a WITH prefix cannot hide the verb: it is the
+// statement's first code token, or after a WITH clause the first DML/SELECT
+// keyword outside every parenthesis. A script of several statements has a
+// count only when every one is a write without RETURNING: Exec runs them all
+// and reports the last one's affected rows, whereas Query runs only the last
+// statement of a script.
+func classifyFlowSQL(query string) flowSQLShape {
+	statements := sqlTokenStatements(sqlTokenize(query))
+	shape := flowSQLShape{statements: len(statements)}
+	if n := len(statements); n > 0 {
+		last := statements[n-1]
+		shape.start, shape.end = statements[0][0].start, last[len(last)-1].end
+	}
+	for i, stmt := range statements {
+		kind := flowStatementKind(stmt)
+		switch {
+		case i == 0:
+			shape.kind = kind
+		case shape.kind != flowSQLWrite || kind != flowSQLWrite:
+			shape.kind = flowSQLUnclassified
+		}
+	}
+	return shape
+}
+
+func flowStatementKind(toks []sqlToken) flowSQLKind {
+	i := sqlStatementVerbIndex(toks)
+	kw := func(j int, word string) bool {
+		return j < len(toks) && toks[j].kind == sqlTokWord && strings.EqualFold(toks[j].text, word)
+	}
+	switch {
+	case kw(i, "SELECT"), kw(i, "VALUES"):
+		return flowSQLRead
+	// REPLACE is also an ordinary identifier (a CTE may be named replace),
+	// so it is the verb only as REPLACE INTO.
+	case kw(i, "INSERT"), kw(i, "UPDATE"), kw(i, "DELETE"), kw(i, "REPLACE") && kw(i+1, "INTO"):
+		if sqlStatementReturns(toks) {
+			return flowSQLReturning
+		}
+		return flowSQLWrite
+	}
+	return flowSQLUnclassified
+}
+
+// uncheckable says why a script of this shape has no row count for
+// expect_rows to compare; "" when it has one. Shared by the runtime, which
+// refuses to run such a step, and the write gate (expectRowsViolation).
+func (s flowSQLShape) uncheckable() string {
+	switch {
+	case s.kind != flowSQLUnclassified:
+		return ""
+	case s.statements == 0:
+		return "the step has no SQL statement"
+	case s.statements == 1:
+		return "its statement does not read as a SELECT, INSERT, UPDATE or DELETE, so it has no row count to compare"
+	}
+	return fmt.Sprintf("it holds %d statements and they are not all INSERT/UPDATE/DELETE without RETURNING (a script's row count is its last write's; a SELECT or RETURNING statement in a script is never read)", s.statements)
+}
+
+// expectRowsUncheckableAdvice is the fix that goes with uncheckable().
+const expectRowsUncheckableAdvice = "Put the statement to assert in its own step: one SELECT (rows returned), one INSERT/UPDATE/DELETE ... RETURNING (rows returned), or INSERT/UPDATE/DELETE without RETURNING (rows affected; in a step of several such statements the last one is counted)"
+
+// queryWriteCount is the rows-changed count recordFlowSQLWrites gets for a
+// statement that ran through Query: exact when the lexer classified it,
+// otherwise the keyword scan's answer (flowQueryWriteCount).
+func (s flowSQLShape) queryWriteCount(upperQuery string, rows []map[string]any) int64 {
+	if s.kind == flowSQLReturning {
+		return int64(len(rows))
+	}
+	return flowQueryWriteCount(upperQuery, rows)
+}
+
+// routeAssertedFlowSQL decides how the rendered script of a step WITH
+// expect_rows runs: through Query, so the rows it returns are counted
+// (rowProducing), or through Exec, so the rows it affected are. It returns the
+// text to run.
+//
+// Such a step is routed by classifyFlowSQL alone. The historical routing
+// (Query when the text starts with SELECT or WITH or holds a RETURNING
+// keyword, else Exec) can hand it a count that is not the statement's own: a
+// write the keyword scan took for a RETURNING one (the word inside a string or
+// comment) returns no rows, and a SELECT or RETURNING write sent through Exec
+// reports the affected count of whichever write last finished on that
+// connection. A script with no row count at all is refused before it runs, so
+// an authored assertion is checked or the step fails - it is never skipped.
+//
+// On a connector read (pinnedRead) the statement was already admitted as one
+// read-only statement and must stay on the pinned connection: it is always a
+// Query, and expect_rows compares the rows it returned.
+func routeAssertedFlowSQL(step *FlowStep, query string, pinnedRead bool) (rowProducing bool, shape flowSQLShape, text string, err error) {
+	// A value the runtime cannot parse used to surface only after the
+	// statement had run.
+	if _, err := evalExpectRows(step.ExpectRows, 0); err != nil {
+		return false, shape, query, err
+	}
+	if pinnedRead {
+		return true, flowSQLShape{kind: flowSQLRead, statements: 1}, query, nil
+	}
+	shape = classifyFlowSQL(query)
+	if why := shape.uncheckable(); why != "" {
+		return false, shape, query, fmt.Errorf("sql: expect_rows on step %q cannot be checked: %s. Nothing was run. %s", step.Name, why, expectRowsUncheckableAdvice)
+	}
+	return shape.kind != flowSQLWrite, shape, shape.text(query), nil
+}
+
+// text is the script from its first statement's first token to its last
+// statement's last token: no leading or trailing comment, whitespace or empty
+// statement (`;;`). The driver prepares whatever follows the final `;` as one
+// more, empty, statement: Exec then reports THAT statement's result (zero
+// rows affected for a write that changed rows), and Query cannot run a script
+// that ends in one.
+func (s flowSQLShape) text(query string) string {
+	if s.statements > 0 && s.start < s.end && s.end <= len(query) {
+		return query[s.start:s.end]
+	}
+	return query
+}
+
+// checkExpectRows compares the step's `expect_rows` with n, the count the
+// routing arranged for: rows returned by a SELECT or a RETURNING write, rows
+// affected by a write without RETURNING.
+func checkExpectRows(ctx *FlowContext, step *FlowStep, shape flowSQLShape, n int64) error {
+	if step.ExpectRows == "" {
+		return nil
+	}
+	ok, err := evalExpectRows(step.ExpectRows, n)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	return expectRowsFailure(step, shape, n, ctx.Tx != nil)
+}
+
+// expectRowsFailure words a failed assertion so that it is true for the
+// statement that ran. "The write did NOT happen" holds only for a write that
+// changed nothing; a write that changed the wrong number of rows did happen,
+// and stays applied unless the step runs inside the flow's transaction (inTx;
+// an on_error handler never does).
+func expectRowsFailure(step *FlowStep, shape flowSQLShape, n int64, inTx bool) error {
+	counted := "affected"
+	if shape.kind != flowSQLWrite {
+		counted = "returned"
+	}
+	msg := fmt.Sprintf("sql: expect_rows assertion failed on step %q: %d row(s) %s, expected %s", step.Name, n, counted, step.ExpectRows)
+	fate := "the change stays applied: this step runs outside a `transaction: true` transaction"
+	if inTx {
+		fate = "the flow's `transaction: true` rolls the change back"
+	}
+	switch {
+	case shape.kind == flowSQLRead:
+		// A query changes nothing; the counts say it all.
+	case shape.statements > 1 && n == 0:
+		msg += fmt.Sprintf(" (the step's last statement changed no rows; its earlier statements did run - %s)", fate)
+	case shape.statements > 1:
+		msg += fmt.Sprintf(" (the step's statements DID run - %s)", fate)
+	case n == 0:
+		msg += " (the guard/WHERE matched nothing - the write did NOT happen)"
+	default:
+		msg += fmt.Sprintf(" (the write DID happen - %s)", fate)
+	}
+	return errors.New(msg)
 }
 
 // evalExpectRows evaluates an `expect_rows` assertion (e.g. ">0", ">=1", "=1",
@@ -310,7 +575,7 @@ func hasReturningClause(upperQuery string) bool {
 // generated SQL actually execute: a query string cannot be
 // param-bound into itself.
 //
-// SECURITY: the resolved query is logged and the WHOLE statement is
+// SECURITY: the template (not the resolved text) is logged and the WHOLE statement is
 // inherently injection-shaped - `{{ q }}` becomes literal SQL bytes,
 // not a bound value. Use only when the SQL is assembled by trusted
 // internal callers (LLM agent flow, admin tooling). NEVER funnel
@@ -366,9 +631,9 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 
 	// M-1: sql_dynamic substitutes refs as raw SQL TEXT (no param bind),
 	// so a request-controlled value reaching the query is an injection
-	// sink. Forbid request-sourced refs unless the author explicitly set
-	// `trusted: true`. The comment in the template "never funnel user
-	// input here" is now enforced, not just advisory.
+	// sink. Request-sourced refs are always refused; there is no opt-out.
+	// The comment in the template "never funnel user input here" is
+	// enforced, not just advisory.
 	if err := flowDynamicGuardRequestRefs(step, ctx); err != nil {
 		return err
 	}
@@ -376,9 +641,14 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 	query := interpolateCtx(step.SQL, ctx)
 	db := flowDB(ctx)
 
-	// Log the resolved query - sql_dynamic is high-risk; surfacing the
-	// final SQL into the request log makes audits/reviews tractable.
-	log.Printf("flows: sql_dynamic step=%q query=%q", step.Name, query)
+	// Log the author's template and the resolved length - sql_dynamic is
+	// high-risk, so every run is traceable, but the resolved SQL holds row
+	// values (names, emails, ...) that do not belong in the process log.
+	// (No digest either: a hash of a known template plus one low-entropy
+	// value can be brute-forced back to the value.)
+	if ctx.mcpReadConn == nil {
+		log.Printf("flows: sql_dynamic step=%q template=%q resolved_len=%d", step.Name, step.SQL, len(query))
+	}
 
 	// Same prefix detection as execStepSQL - SELECT, WITH (CTE), or
 	// INSERT/UPDATE/DELETE … RETURNING all produce rows we want to
@@ -388,24 +658,79 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 	startsWithRowProducer := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "WITH")
 	hasReturning := !startsWithRowProducer && hasReturningClause(upper)
-	if startsWithRowProducer || hasReturning {
-		key := cryptoKeyForQuerier(db)
-		sqlRows, err := db.Query(query)
+	if ctx.mcpReadConn != nil {
+		ctx.transactionMutex().Lock()
+		defer ctx.transactionMutex().Unlock()
+		if !isReadOnlyQuery(query) {
+			return fmt.Errorf("connector SQL must be one read-only statement")
+		}
+		startsWithRowProducer = true
+	}
+	// As in execStepSQL: a step with expect_rows is routed off the lexer so
+	// the count it compares is the rendered statement's own; without it the
+	// historical routing and outputs stand (rows on the Query path, nothing
+	// on the Exec path).
+	rowProducing, shape := startsWithRowProducer || hasReturning, flowSQLShape{}
+	if step.ExpectRows != "" {
+		var err error
+		if rowProducing, shape, query, err = routeAssertedFlowSQL(step, query, ctx.mcpReadConn != nil); err != nil {
+			return err
+		}
+	}
+	if rowProducing {
+		// As in execStepSQL: nothing may follow the statement Query runs.
+		runnable, ok := sqlRunnableText(query)
+		if !ok {
+			return fmt.Errorf("sql_dynamic: %w", errNoSQLStatement)
+		}
+		query = runnable
+		var key []byte
+		var sqlRows *sql.Rows
+		var err error
+		if ctx.mcpReadConn != nil {
+			key = ctx.mcpReadKey
+			sqlRows, err = ctx.mcpReadConn.QueryContext(ctx.Request.Context(), query)
+		} else {
+			key = cryptoKeyForQuerier(db)
+			sqlRows, err = db.Query(query)
+		}
 		if err != nil {
 			return fmt.Errorf("sql_dynamic: %w", err)
 		}
-		rows, err := scanRows(sqlRows, key)
+		limit := 0
+		if ctx.mcpReadConn != nil {
+			limit = readOnlyQueryMaxRows + 1
+		}
+		rows, err := scanRowsLimit(sqlRows, key, limit)
+		if ctx.mcpReadConn != nil && len(rows) > readOnlyQueryMaxRows {
+			return fmt.Errorf("connector SQL result limit exceeded")
+		}
 		if err != nil {
 			return fmt.Errorf("sql scan: %w", err)
 		}
+		recordFlowSQLWrites(ctx, query, shape.queryWriteCount(upper, rows))
 		if step.Name != "" {
 			ctx.DataMu.Lock()
 			ctx.Data[step.Name] = rows
 			ctx.DataMu.Unlock()
 		}
+		if err := checkExpectRows(ctx, step, shape, int64(len(rows))); err != nil {
+			return err
+		}
 	} else {
-		if _, err := db.Exec(query); err != nil {
+		// As in execStepSQL: a template that rendered no statement (an empty
+		// generated query) is an error, not a step that did nothing.
+		if _, ok := sqlRunnableText(query); !ok {
+			return fmt.Errorf("sql_dynamic: %w", errNoSQLStatement)
+		}
+		res, err := db.Exec(query)
+		if err != nil {
 			return fmt.Errorf("sql_dynamic: %w", err)
+		}
+		affected, _ := res.RowsAffected()
+		recordFlowSQLWrites(ctx, query, affected)
+		if err := checkExpectRows(ctx, step, shape, affected); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -415,37 +740,38 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 // interpolates references as RAW SQL TEXT, so any request-sourced value
 // reaching the query string is a SQL-injection sink. Reject the step at
 // run time when its query template references a request-tainted key
-// (path/query/form/JSON-body param) unless the author has explicitly
-// opted in with `trusted: true`.
+// (path/query/form/JSON-body param).
 //
 // Invariant: request-controlled data MUST NOT be funnelled into a
-// sql_dynamic query body without an explicit trusted acknowledgement.
-// The previous behavior relied on a code comment ("never funnel user
-// input here") that nothing enforced.
-//
-// trusted:true preserves the documented escape hatch (AI-agent /
-// admin-tooling flows that assemble SQL from server-side values) for
-// backward compatibility - it just makes the dangerous case opt-in
-// instead of the default.
+// sql_dynamic query body. There is deliberately no per-step opt-out: an
+// earlier error message advertised `trusted: true`, but no parser ever
+// set it, and an escape hatch that bypasses the only injection guard on
+// raw-text SQL is exactly the wrong default. Request values belong in a
+// `run: sql` step, where `:name` / `${{ }}` bind as ? placeholders; a
+// request-chosen identifier (sort column, direction) is selected from
+// fixed literals with `if:` branches or `CASE :sort WHEN 'name' THEN
+// name END` inside that parameterized query.
 func flowDynamicGuardRequestRefs(step *FlowStep, ctx *FlowContext) error {
-	if step == nil || ctx == nil || len(ctx.RequestKeys) == 0 {
+	if step == nil || ctx == nil {
 		return nil
 	}
-	if step.Trusted {
-		return nil // author explicitly accepted raw-text interpolation risk
+	// Taint also arrives through `run: set` outputs, for_each loop
+	// variables, parsed request bodies and enqueued job payloads (see
+	// flows_taint.go), and through every `||` operand of an expression,
+	// not just its leading identifier.
+	if key := ctx.taintedRef(step.SQL); key != "" {
+		return fmt.Errorf("sql_dynamic: step %q references request-sourced value %q as raw SQL text (injection risk); move it to a `run: sql` step where `:%s` binds as a ? placeholder, and choose any request-selected identifier (sort column/direction) from fixed literals with `if:` branches or `CASE :%s WHEN 'name' THEN name END`. A value computed from request input by an earlier sql, compute, api, set or for_each step is still request-sourced: bind it with `:name` in a parameterized `run: sql` step instead of a `{{ref}}` in sql_dynamic text", step.Name, key, key, key)
 	}
-	for key := range ctx.RequestKeys {
-		if key == "" {
-			continue
+	// Also guard any `with.params:` overlay: its values are written into
+	// ctx.Data/ctx.Params and substituted as text, so an overlay named after
+	// a request key or computed from one is the same sink.
+	for name, expr := range step.SQLParams {
+		key := ctx.taintedRef(expr)
+		if key == "" && ctx.isTainted(name) {
+			key = name
 		}
-		if flowSQLReferencesKey(step.SQL, key) {
-			return fmt.Errorf("sql_dynamic: step %q references request-sourced value %q as raw SQL text (injection risk); use a `run: sql` step with `:%s` param binding, or set `trusted: true` if this SQL is assembled only from trusted internal callers", step.Name, key, key)
-		}
-		// Also guard any `with.params:` overlay feeding the same key,
-		// since those values are written into ctx.Data/ctx.Params and may
-		// be derived from request input before reaching the query.
-		if _, ok := step.SQLParams[key]; ok {
-			return fmt.Errorf("sql_dynamic: step %q binds request-sourced value %q via with.params into raw SQL text (injection risk); set `trusted: true` only if assembled from trusted internal callers", step.Name, key)
+		if key != "" {
+			return fmt.Errorf("sql_dynamic: step %q binds request-sourced value %q via with.params into raw SQL text (injection risk); bind it in a `run: sql` step with `:%s` instead", step.Name, key, key)
 		}
 	}
 	return nil
@@ -453,47 +779,11 @@ func flowDynamicGuardRequestRefs(step *FlowStep, ctx *FlowContext) error {
 
 // flowSQLReferencesKey reports whether a sql_dynamic template references
 // `key` either as a `:key` placeholder (substituted as text by
-// interpolateCtx) or inside a `{{ ... }}` expression (including dotted
-// `{{key.sub}}` and piped `{{ key | ... }}` forms). Match boundaries are
-// checked so `:user` doesn't spuriously match `:user_id`.
+// interpolateCtx) or inside a `{{ ... }}` expression (dotted, indexed,
+// piped and `||`-fallback forms). Match boundaries are checked so `:user`
+// doesn't spuriously match `:user_id`.
 func flowSQLReferencesKey(sql, key string) bool {
-	// `:key` form - require a non-identifier char (or end) after the key.
-	for idx := 0; ; {
-		at := strings.Index(sql[idx:], ":"+key)
-		if at < 0 {
-			break
-		}
-		pos := idx + at
-		after := pos + 1 + len(key)
-		if after >= len(sql) || !flowIsIdentChar(sql[after]) {
-			return true
-		}
-		idx = after
-	}
-	// `{{ ... key ... }}` form.
-	for i := 0; i+1 < len(sql); i++ {
-		if sql[i] != '{' || sql[i+1] != '{' {
-			continue
-		}
-		end := strings.Index(sql[i+2:], "}}")
-		if end < 0 {
-			break
-		}
-		expr := strings.TrimSpace(sql[i+2 : i+2+end])
-		// Leading identifier of the expression (before a pipe / dot /
-		// space) is the bound name.
-		head := expr
-		for _, sep := range []string{"|", ".", " ", "["} {
-			if j := strings.Index(head, sep); j >= 0 {
-				head = head[:j]
-			}
-		}
-		if strings.TrimSpace(head) == key {
-			return true
-		}
-		i = i + 2 + end + 1
-	}
-	return false
+	return flowTemplateRefsKey(sql, key)
 }
 
 // flowIsIdentChar reports whether b can appear inside a `:param` name

@@ -94,7 +94,9 @@ production for a missing dev instance. See `api(at:"environments")`.
 Credentials are per account; app runtime sessions and platform CLI credentials
 are different. `BENMORE_TOKEN` is an ephemeral process credential. Use the existing
 credential store or a secret environment variable instead of copying a token into
-source, chat, or command examples. See `api(at:"cli-auth")`.
+source, chat, or command examples. When the token is rejected (`benmore whoami`
+exits 4) and this machine has no browser, run `benmore login --device` and give the
+person the printed link and code to approve. See `api(at:"cli-auth")`.
 
 ## Read the smallest authoritative contract
 
@@ -142,6 +144,8 @@ an unreadable or malformed existing file is an error.
 Rejected reloads retain the active handler, configuration, and workers. This does
 not make all loaders strict or undo already committed migrations/external effects.
 Unchanged full-text indexes are reused; changed definitions rebuild transactionally.
+Full-text update triggers ignore changes to unrelated encrypted, blind-index and
+timestamp columns; existing unconditional triggers upgrade during initialization.
 Read `api(at:"recovery")`, `api(at:"workflows")`, and `api(at:"search")` for limits.
 
 ## Prove the result

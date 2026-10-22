@@ -3,12 +3,10 @@
 package main
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -37,6 +35,22 @@ func notFoundHandler(app *App) http.HandlerFunc {
 			return
 		}
 
+		// A trailing-slash variant of a registered page (`/docs/` for
+		// `/docs`) is the same resource with a different URL. Send crawlers
+		// and pasted links to the canonical form instead of a 404. Only
+		// exact page routes qualify - never `/api/`, never unknown paths.
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && len(r.URL.Path) > 1 && strings.HasSuffix(r.URL.Path, "/") {
+			trimmed := strings.TrimRight(r.URL.Path, "/")
+			if _, ok := app.Pages[trimmed]; ok {
+				target := trimmed
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusMovedPermanently)
+				return
+			}
+		}
+
 		// HTML-stack apps put their frontend in `static/*.html` and
 		// expect clean URLs (`/contacts` → `static/contacts.html`). Try
 		// that fallback BEFORE returning 404 so vanilla-HTML apps work
@@ -62,43 +76,7 @@ func notFoundHandler(app *App) http.HandlerFunc {
 	}
 }
 
-// ===== Gzip Compression =====
-
-type gzipResponseWriter struct {
-	io.Writer
-	http.ResponseWriter
-}
-
-func (w gzipResponseWriter) Write(b []byte) (int, error) {
-	return w.Writer.Write(b)
-}
-
-func gzipMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip gzip for SSE / streaming responses + WebSocket upgrades.
-		// WS hijacks the raw TCP connection - a gzip wrapper would
-		// (a) make the wrapper lose Hijacker support and (b) corrupt
-		// any control frames the framework writes post-upgrade.
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
-			strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
-			strings.HasPrefix(r.URL.Path, "/sse/") ||
-			strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		gz, err := gzip.NewWriterLevel(w, gzip.DefaultCompression)
-		if err != nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		defer gz.Close()
-
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Del("Content-Length") // length changes after compression
-		next.ServeHTTP(gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
-	})
-}
+// Gzip compression lives in gzip_middleware.go.
 
 // ===== CORS =====
 
@@ -130,6 +108,9 @@ func corsMiddleware(next http.Handler, app *App) http.Handler {
 			}
 		}
 
+		// The response varies by Origin whenever CORS is configured, so a
+		// shared cache must not serve one origin's answer to another.
+		w.Header().Add("Vary", "Origin")
 		if allowed {
 			w.Header().Set("Access-Control-Allow-Origin", requestOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
@@ -173,7 +154,9 @@ func healthHandler(app *App) http.HandlerFunc {
 		if err != nil {
 			status = "unhealthy"
 			httpStatus = http.StatusServiceUnavailable
-			checks["database"] = map[string]any{"status": "down", "error": err.Error()}
+			id := noteServerError(r, "health", err)
+			w.Header().Set(requestIDHeader, id)
+			checks["database"] = map[string]any{"status": "down", "error": serverErrorAnswerText(app, id, err, "database query failed")}
 		} else {
 			dbStatus := "ok"
 			if dbLatency > 100*time.Millisecond {
@@ -211,7 +194,7 @@ func healthHandler(app *App) http.HandlerFunc {
 		}
 
 		// 4. Circuit breakers
-		cbStats := CircuitBreakerStats()
+		cbStats := CircuitBreakerStats(app)
 		if len(cbStats) > 0 {
 			checks["circuits"] = cbStats
 		}
@@ -315,15 +298,59 @@ func isValidColumnName(s string) bool {
 // count needs the same WHERE clauses as the data fetch but no ORDER
 // or LIMIT.
 func applyAPIWhere(baseSQL string, r *http.Request, table string, validCols ...map[string]bool) (string, []any) {
-	return applyAPIWhereWithApp(baseSQL, r, table, nil, validCols...)
+	return applyAPIWhereWithApp(baseSQL, r, table, nil, nil, validCols...)
+}
+
+// apiFilterReservedParam reports whether a query key is a pagination / sort /
+// projection control rather than a column filter.
+func apiFilterReservedParam(key string) bool {
+	switch key {
+	case "page", "per_page", "sort", "order", "fields", "limit", "offset", "include", "cursor", "q", "order_by", "orderBy", "as_of":
+		return true
+	}
+	return false
+}
+
+// apiFilterOps maps the `__<op>` filter suffixes onto SQL operators (`__in`
+// is handled separately as IN).
+var apiFilterOps = map[string]string{
+	"__gt":   ">",
+	"__gte":  ">=",
+	"__lt":   "<",
+	"__lte":  "<=",
+	"__ne":   "!=",
+	"__like": "LIKE",
+}
+
+// splitAPIFilterKey unwraps `where[col]` → `col` and splits an operator
+// suffix: `price__gte` → ("price", ">="). col is "" for an unknown operator
+// (the filter is skipped). orderBy=col:dir is handled by the sort step; the
+// where[] form is purely filter syntax.
+func splitAPIFilterKey(key string) (col, op string) {
+	if strings.HasPrefix(key, "where[") && strings.HasSuffix(key, "]") {
+		key = key[len("where[") : len(key)-1]
+	}
+	i := strings.Index(key, "__")
+	if i <= 0 {
+		return key, "="
+	}
+	suffix := key[i:]
+	if op, ok := apiFilterOps[suffix]; ok {
+		return key[:i], op
+	}
+	if suffix == "__in" {
+		return key[:i], "IN"
+	}
+	return "", ""
 }
 
 // applyAPIWhereWithApp is the App-aware variant. The App reference
 // is used solely for blind-index lookup (v2.7.55+) - equality
 // filters on encrypted columns flagged `blind_index: true` rewrite to
 // `<col>_blind = HMAC(value)` so the query hits the deterministic
-// sibling column instead of useless ciphertext.
-func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *App, validCols ...map[string]bool) (string, []any) {
+// sibling column instead of useless ciphertext. session decides how far a
+// blind-index probe may reach (blindFilterAccessFor).
+func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *App, session *Session, validCols ...map[string]bool) (string, []any) {
 	var args []any
 	query := baseSQL
 
@@ -387,41 +414,18 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 	// emits, and what the agent in an earlier app build naturally
 	// reached for. Pre-v2.5.12 the wrapper was silently dropped (raw
 	// "where[col]" failed isValidColumnName → no filter applied).
-	opSQL := map[string]string{
-		"__gt":   ">",
-		"__gte":  ">=",
-		"__lt":   "<",
-		"__lte":  "<=",
-		"__ne":   "!=",
-		"__like": "LIKE",
-	}
 	var conditions []string
 	for key, values := range r.URL.Query() {
 		if len(values) == 0 {
 			continue
 		}
 		// Skip pagination/sort params
-		if key == "page" || key == "per_page" || key == "sort" || key == "order" || key == "fields" || key == "limit" || key == "offset" || key == "include" || key == "cursor" || key == "q" || key == "order_by" || key == "orderBy" || key == "as_of" {
+		if apiFilterReservedParam(key) {
 			continue
 		}
-		// Unwrap `where[col]` → `col`. orderBy=col:dir is handled
-		// further down; the where[] form is purely filter syntax.
-		if strings.HasPrefix(key, "where[") && strings.HasSuffix(key, "]") {
-			key = key[len("where[") : len(key)-1]
-		}
-		// Split operator suffix.
-		col := key
-		op := "="
-		if i := strings.Index(key, "__"); i > 0 {
-			suffix := key[i:]
-			col = key[:i]
-			if op2, ok := opSQL[suffix]; ok {
-				op = op2
-			} else if suffix == "__in" {
-				op = "IN"
-			} else {
-				continue // unknown operator → silently skip
-			}
+		col, op := splitAPIFilterKey(key)
+		if col == "" {
+			continue // unknown operator → silently skip
 		}
 		// Validate column name against schema allowlist. fail closed: a
 		// column not on the allowlist is dropped unconditionally (an
@@ -468,6 +472,23 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 		// the encrypted column is unsupported (no range / prefix /
 		// substring search on blind indexes) and passes through to
 		// hit the ciphertext, which deliberately fails to match.
+		//
+		// A blind-index probe is an equality oracle, so it is honored only
+		// where the caller would see the plaintext (blindFilterAccessFor):
+		// refused callers are rejected up front by handleList (and dropped
+		// here as defense in depth); `self`/`owner`-unmask callers have the
+		// probe restricted to rows they own.
+		var encryptedScope string
+		var encryptedScopeArgs []any
+		if base, probe := blindFilterColumn(blindCols, col, op); probe {
+			if blindFilterAccessFor(app, table, base, session) == blindFilterRefused {
+				continue
+			}
+			if def := encryptedDefFor(app, table, base); def != nil {
+				access := encryptedFieldAccessFor(app, app.DB, table, *def, session)
+				encryptedScope, encryptedScopeArgs = access.scopePredicate(table)
+			}
+		}
 		if blindCols[col] {
 			if op == "=" {
 				h, err := blindIndexForApp(app, values[0])
@@ -493,6 +514,7 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 				}
 			}
 		}
+		var cond string
 		if op == "IN" {
 			parts := strings.Split(values[0], ",")
 			placeholders := make([]string, len(parts))
@@ -500,11 +522,16 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 				placeholders[i] = "?"
 				args = append(args, p)
 			}
-			conditions = append(conditions, fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ",")))
+			cond = fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ","))
 		} else {
-			conditions = append(conditions, fmt.Sprintf("%s %s ?", col, op))
+			cond = fmt.Sprintf("%s %s ?", col, op)
 			args = append(args, values[0])
 		}
+		if encryptedScope != "" {
+			cond = "(" + cond + " AND " + encryptedScope + ")"
+			args = append(args, encryptedScopeArgs...)
+		}
+		conditions = append(conditions, cond)
 	}
 
 	if len(conditions) > 0 {
@@ -523,11 +550,11 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 // path in handleList; the COUNT(*) path uses applyAPIWhere directly
 // since it neither orders nor paginates.
 func applyAPIFilters(baseSQL string, r *http.Request, table string, validCols ...map[string]bool) (string, []any) {
-	return applyAPIFiltersWithApp(baseSQL, r, table, nil, validCols...)
+	return applyAPIFiltersWithApp(baseSQL, r, table, nil, nil, validCols...)
 }
 
-func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *App, validCols ...map[string]bool) (string, []any) {
-	query, args := applyAPIWhereWithApp(baseSQL, r, table, app, validCols...)
+func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *App, session *Session, validCols ...map[string]bool) (string, []any) {
+	query, args := applyAPIWhereWithApp(baseSQL, r, table, app, session, validCols...)
 
 	// M-7: sorting honors the same mandatory, fail-closed allowlist as
 	// filtering. Without an explicit allowlist we never emit a
@@ -557,6 +584,12 @@ func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *
 			sortOrder = parts[1]
 		}
 	}
+	// Sorting by a blind-index sibling orders rows by the HMAC, grouping
+	// equal plaintexts - only for callers who may see the column unmasked.
+	if base := strings.TrimSuffix(sortField, blindColSuffix); base != sortField && app != nil &&
+		BlindIndexColumnsForTable(app.Encrypted, table)[base] && blindFilterAccessFor(app, table, base, session) != blindFilterAllRows {
+		sortField = ""
+	}
 	if sortField != "" && isValidColumnName(sortField) && allowed[sortField] {
 		if sortOrder == "" {
 			sortOrder = "asc"
@@ -575,16 +608,76 @@ func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *
 		// worth the round-trip when the caller can specify orderBy.
 	}
 
-	// Pagination: ?page=2&per_page=20
-	page := queryParamInt(r, "page", 1)
-	perPage := queryParamInt(r, "per_page", 50)
-	if perPage > 500 {
-		perPage = 500
-	}
-	offset := (page - 1) * perPage
+	// Pagination: ?page=2&per_page=20. Keep this normalization shared with
+	// the response envelope so its metadata describes the emitted query.
+	perPage, offset := apiOffsetWindow(r)
 	query += fmt.Sprintf(" LIMIT %d OFFSET %d", perPage, offset)
 
 	return query, args
+}
+
+// maxAPIOffsetRows caps ?page= offset pagination. SQLite has no way to skip
+// rows: OFFSET N reads and discards N rows, so ?page=2000000&per_page=500
+// made one request walk (and with ?page= also COUNT) the whole table, and a
+// loop of them pinned the tenant's pool. Keyset pagination (?cursor=) costs
+// the same at any depth.
+const maxAPIOffsetRows = 100000
+
+// apiOffsetTooDeepError returns the 400 message for an offset beyond
+// maxAPIOffsetRows, or "" when the request is within bounds.
+func apiOffsetTooDeepError(r *http.Request) string {
+	if r.URL.Query().Get("cursor") != "" {
+		return ""
+	}
+	_, offset := apiOffsetWindow(r)
+	if offset <= maxAPIOffsetRows {
+		return ""
+	}
+	return fmt.Sprintf("offset pagination skips more than %d rows and is capped there. Use keyset pagination instead: ?cursor=<last id>&limit=N (start with ?cursor=0) returns next_cursor for the following page.", maxAPIOffsetRows)
+}
+
+// apiOffsetWindow supports the SDK's limit/offset pair without changing the
+// established page/per_page contract. Explicit legacy controls win together;
+// aliases otherwise keep the same default, size cap and maximum skipped rows.
+func apiOffsetWindow(r *http.Request) (limit, offset int) {
+	if r.URL.Query().Get("page") != "" || r.URL.Query().Get("per_page") != "" {
+		page, perPage := apiOffsetPagination(r)
+		return perPage, (page - 1) * perPage
+	}
+	limit = queryParamInt(r, "limit", 50)
+	if limit > 500 {
+		limit = 500
+	}
+	raw := r.URL.Query().Get("offset")
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		// Do not let an overflowing positive offset bypass the depth guard.
+		if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange && !strings.HasPrefix(raw, "-") {
+			return limit, maxAPIOffsetRows + 1
+		}
+		return limit, 0
+	}
+	if n > maxAPIOffsetRows {
+		return limit, maxAPIOffsetRows + 1
+	}
+	if n > 0 {
+		offset = int(n)
+	}
+	return limit, offset
+}
+
+func apiOffsetPagination(r *http.Request) (page, perPage int) {
+	page = queryParamInt(r, "page", 1)
+	perPage = queryParamInt(r, "per_page", 50)
+	if perPage > 500 {
+		perPage = 500
+	}
+	maxInt := int(^uint(0) >> 1)
+	maxOffsetPage := maxInt / perPage
+	if page-1 > maxOffsetPage {
+		page = maxOffsetPage + 1
+	}
+	return page, perPage
 }
 
 // selectFields limits returned fields: ?fields=name,email

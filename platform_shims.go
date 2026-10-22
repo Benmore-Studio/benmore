@@ -24,78 +24,16 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
-	"os"
 	"strings"
 )
 
 // ---- generic helpers (mirrors of the platform-build originals) ----
 
-// authTrustProxyHeaders reports whether forwarded client-IP headers
-// (CF-Connecting-IP / X-Forwarded-For / X-Real-IP) may be trusted.
-// LOWER finding: these headers are attacker-controlled on a direct
-// connection, so blindly honoring them lets a client spoof its source IP
-// and dodge per-IP lockouts / audit attribution. We trust them ONLY when
-// the deployment explicitly opts in via BENMORE_TRUST_PROXY (the operator
-// asserting "I sit behind a proxy that sets these"), OR when the request
-// carries the X-Benmore-App marker injected by the in-fabric app proxy
-// (a request that reached us with that header necessarily traversed the
-// trusted router). Otherwise we fall back to RemoteAddr.
-func authTrustProxyHeaders(r *http.Request) bool {
-	// The in-fabric router injects X-Benmore-App and connects to the app over
-	// loopback. Only honor that marker when the peer is ACTUALLY loopback -
-	// otherwise a direct client on a self-hosted deployment could send
-	// `X-Benmore-App: 1` plus a forged X-Forwarded-For to spoof its IP and
-	// defeat the per-IP login lockout / poison audit attribution (round-2 #M).
-	// For a front proxy on a non-loopback address, operators opt in explicitly
-	// via BENMORE_TRUST_PROXY.
-	if r.Header.Get("X-Benmore-App") != "" && remoteAddrIsLoopback(r) {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("BENMORE_TRUST_PROXY"))) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}
-
-// remoteAddrIsLoopback reports whether the transport-level peer is a loopback
-// address (the only place the trusted in-fabric router connects from).
-func remoteAddrIsLoopback(r *http.Request) bool {
-	host := r.RemoteAddr
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-// clientIP extracts the originating client IP. Forwarded headers
-// (CF-Connecting-IP / X-Forwarded-For / X-Real-IP) are honored ONLY when
-// the request is from a trusted proxy (authTrustProxyHeaders); otherwise
-// the transport-level RemoteAddr is used so a direct client cannot spoof
-// its IP. (Mirror of host.go.)
+// clientIP returns the request's client address. No router exists in this
+// edition, so its X-Benmore-App marker is never trusted; see client_ip.go.
 func clientIP(r *http.Request) string {
-	if authTrustProxyHeaders(r) {
-		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-			return strings.TrimSpace(cf)
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.Index(xff, ","); i >= 0 {
-				return strings.TrimSpace(xff[:i])
-			}
-			return strings.TrimSpace(xff)
-		}
-		if xr := r.Header.Get("X-Real-IP"); xr != "" {
-			return strings.TrimSpace(xr)
-		}
-	}
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		return addr[:i]
-	}
-	return addr
+	return resolveClientIP(r, false)
 }
 
 // protoOf returns the public-facing scheme, proxy-correct. (Mirror of router.go.)
@@ -251,6 +189,22 @@ func syncPlatformUserFromDashboard(app *App, email, passwordHash string) {}
 // table. No platform → no-op.
 func syncPlatformUserFromOAuth(app *App, email string) {}
 
+// platformDashboardApp reports whether app is the platform dashboard app.
+// Without the platform engine no app is.
+func platformDashboardApp(app *App) bool { return false }
+
+// platformEmailProved records an email proof made on the dashboard app. No
+// platform → no-op.
+func platformEmailProved(app *App, email string, passwordProved bool) {}
+
+// platformPasswordChanged mirrors a dashboard password change or reset and
+// revokes platform credentials. No platform → no-op.
+func platformPasswordChanged(app *App, email, passwordHash string, emailProved bool) {}
+
+// platformAccountDeleted revokes platform credentials of a deleted dashboard
+// account. No platform → no-op.
+func platformAccountDeleted(app *App, email string) {}
+
 // edgeBridgeUserID resolves a trusted edge-proxy user header. Edges are a
 // platform feature, so there is never such a header here → 0 (no bridge).
 func edgeBridgeUserID(r *http.Request) int64 { return 0 }
@@ -260,7 +214,7 @@ func sessionForEdgeBridge(app *App, userID int64) *Session { return nil }
 
 // RegisterEdgeAuthOnApp mounts the edge consent routes on an app. No edges →
 // nothing to mount.
-func RegisterEdgeAuthOnApp(mux *http.ServeMux, app *App) {}
+func RegisterEdgeAuthOnApp(mux appRouteRegistrar, app *App) {}
 
 // loadAppBuildState hydrates build-time accounting from the platform DB. No
 // platform → no-op (App.BuildSeconds stays zero).
@@ -275,9 +229,20 @@ func StartWALShipper(app *App) {}
 // this is a no-op (never blocked).
 func checkStorageCap(app *App, projectedBytes int64) (string, bool) { return "", false }
 
+// storageLimitRemedy follows a storage refusal. Without plan limits the only
+// way to reach one is a full disk.
+func storageLimitRemedy() string { return "Delete data or free disk space, then retry." }
+
+// revokeEdgeGrantsForUser revokes a user's edge grants. Edges are a platform
+// feature, so there are none to revoke here.
+func revokeEdgeGrantsForUser(app *App, userID int64) error { return nil }
+
 // oauthMintCLIToken issues a hosted-platform CLI api_token after OAuth. There
 // is no platform here, so it never issues a token - OAuth just creates the
 // session and falls through to the normal redirect.
-func oauthMintCLIToken(w http.ResponseWriter, r *http.Request, email, cliPort string) bool {
+func oauthMintCLIToken(w http.ResponseWriter, r *http.Request, app *App, email, cliPort string) bool {
 	return false
 }
+
+// registerCLIDeviceRoutes serves CLI device login in the platform build only.
+func registerCLIDeviceRoutes(mux appRouteRegistrar, app *App) {}

@@ -52,7 +52,7 @@ func TestParseMemberOf(t *testing.T) {
 
 func TestAllowed_MemberOf(t *testing.T) {
 	app := memberOfTestApp()
-	user := &Session{Role: "user", UserID: 2, Email: "u@x"}
+	user := &Session{Role: "user", UserID: 2, Email: "u@x", Verified: true}
 	if app.Access.Allowed("member-of:room_members(room_id, member_id)", nil, 0) {
 		t.Error("member-of must require authentication")
 	}
@@ -68,14 +68,14 @@ func TestAllowed_MemberOf(t *testing.T) {
 
 func TestRowScopeClause_MemberOf(t *testing.T) {
 	app := memberOfTestApp()
-	user := &Session{Role: "user", UserID: 2, Email: "u@x"}
+	user := &Session{Role: "user", UserID: 2, Email: "u@x", Verified: true}
 
 	// Child table: joins on its own room_id column.
 	pred, args, bypass := rowScopeClause(app, "messages", user, "view")
 	if bypass {
 		t.Fatal("member-of user must not bypass")
 	}
-	if !strings.Contains(pred, "EXISTS (SELECT 1 FROM room_members WHERE room_members.room_id = messages.room_id AND room_members.member_id = ?)") {
+	if !strings.Contains(pred, `EXISTS (SELECT 1 FROM main."room_members" WHERE main."room_members"."room_id" = main."messages"."room_id" AND main."room_members"."member_id" = ?)`) {
 		t.Errorf("child table should join on its room_id column: %q", pred)
 	}
 	if len(args) == 0 || args[0] != int64(2) {
@@ -89,7 +89,7 @@ func TestRowScopeClause_MemberOf(t *testing.T) {
 
 	// Parent table: no room_id column → joins on id.
 	pred, _, _ = rowScopeClause(app, "rooms", user, "view")
-	if !strings.Contains(pred, "room_members.room_id = rooms.id") {
+	if !strings.Contains(pred, `main."room_members"."room_id" = main."rooms"."id"`) {
 		t.Errorf("parent table should join on id: %q", pred)
 	}
 
@@ -106,7 +106,7 @@ func TestMemberOf_TenantClauseANDed(t *testing.T) {
 	groupUser := &Session{Role: "user", UserID: 2, Email: "u@x", GroupID: "5"}
 
 	pred, args, _ := rowScopeClause(app, "tenant_msgs", groupUser, "view")
-	if !strings.Contains(pred, "company_id = ? AND") {
+	if !strings.Contains(pred, `"company_id" = ? AND`) {
 		t.Errorf("group-keyed member-of table must AND the tenant clause (membership widens within a tenant, never across): %q", pred)
 	}
 	if args[0] != "5" || args[1] != int64(2) {
@@ -119,7 +119,7 @@ func TestMemberOf_TenantClauseANDed(t *testing.T) {
 	if bypass {
 		t.Fatal("stepped-in admin must not bypass member-of scoping")
 	}
-	if !strings.Contains(pred, "company_id = ?") || args[0] != "7" {
+	if !strings.Contains(pred, `"company_id" = ?`) || args[0] != "7" {
 		t.Errorf("stepped-in admin should scope to acted-as tenant 7: pred=%q args=%v", pred, args)
 	}
 }
@@ -156,7 +156,7 @@ func TestMemberOf_EmailUserCol(t *testing.T) {
 			"channels": {"all": "member-of:channel_members(channel_id, email)"},
 		}},
 	}
-	user := &Session{Role: "user", UserID: 2, Email: "u@x"}
+	user := &Session{Role: "user", UserID: 2, Email: "u@x", Verified: true}
 	_, args, _ := rowScopeClause(app, "channels", user, "view")
 	if args[0] != "u@x" {
 		t.Errorf("a user column containing \"email\" should compare against the session email: %v", args)

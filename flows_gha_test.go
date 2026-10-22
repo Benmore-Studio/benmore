@@ -47,7 +47,7 @@ func TestNormalizeGHARefs(t *testing.T) {
 		`${{ user.org_id }}`:   `{{user_group_id}}`,
 		`${{ user.group_id }}`: `{{user_group_id}}`,
 		// params
-		`${{ params.id }}`: `{{id}}`,
+		`${{ params.id }}`: `{{params.id}}`,
 		// Whitespace tolerance.
 		`${{   env.X   }}`: `{{env.X}}`,
 		// Multiple refs in one string.
@@ -426,18 +426,75 @@ func TestResolveComputeArgsNative(t *testing.T) {
 	}
 }
 
+// TestResolveComputeArgsEnv pins that compute args resolve the app's env.
+// Before the fix a whole-string env ref looked up only the step data, so
+// `${{ env.X }}` and `{{env.X}}` reached the module as null and
+// `${{ env.X | default:” }}` silently took the default - a compute module
+// could never receive a configured secret (found signing a Sign in with
+// Apple client secret: every spelling arrived empty).
+func TestResolveComputeArgsEnv(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	SetAppEnv(app.Dir, "COMPUTE_ENV_KEY", "configured-value")
+	ctx := &FlowContext{App: app, Data: map[string]any{}, Params: map[string]string{}}
+	args := map[string]any{
+		"gha":      "${{ env.COMPUTE_ENV_KEY }}",
+		"bare":     "{{env.COMPUTE_ENV_KEY}}",
+		"piped":    "${{ env.COMPUTE_ENV_KEY | default:'' }}",
+		"missing":  "${{ env.COMPUTE_ENV_MISSING | default:'fallback' }}",
+		"embedded": "k=${{ env.COMPUTE_ENV_KEY }}",
+	}
+	got, ok := resolveComputeArgsValue(args, ctx).(map[string]any)
+	if !ok {
+		t.Fatal("args did not resolve to a map")
+	}
+	for _, k := range []string{"gha", "bare", "piped"} {
+		if got[k] != "configured-value" {
+			t.Errorf("%s: got %#v, want the env value", k, got[k])
+		}
+	}
+	if got["missing"] != "fallback" {
+		t.Errorf("missing env should take the default, got %#v", got["missing"])
+	}
+	if got["embedded"] != "k=configured-value" {
+		t.Errorf("embedded: got %#v", got["embedded"])
+	}
+}
+
+// TestEvaluateFlowConditionEnv: a bare `if:` on an env value sees the env.
+func TestEvaluateFlowConditionEnv(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	SetAppEnv(app.Dir, "COND_FEATURE", "on")
+	ctx := &FlowContext{App: app, Data: map[string]any{}, Params: map[string]string{}}
+	// Through the same translation a flow's `if:` gets at load time.
+	for _, tc := range []struct {
+		expr string
+		want bool
+	}{
+		{"${{ env.COND_FEATURE }} == 'on'", true},
+		{"${{ env.COND_FEATURE }} == 'off'", false},
+		{"${{ env.COND_FEATURE }}", true},
+		{"${{ env.COND_MISSING }}", false},
+	} {
+		if got := evaluateFlowCondition(ghaIfToFlowCondition(tc.expr), ctx); got != tc.want {
+			t.Errorf("if: %s -> %v, want %v", tc.expr, got, tc.want)
+		}
+	}
+}
+
 // v2.7.139: `.outputs.first[.col]` is sugar for row 0. Pre-fix it had no
 // handler and silently resolved to nothing on SELECT (only `.rows[0]` worked),
 // which bound NULLs / halted template_unresolved despite the docs promising it.
 func TestTranslateGHAExpr_FirstAlias(t *testing.T) {
 	cases := map[string]string{
-		"steps.q.outputs.first.group_id": "q.0.group_id", // the bug: now resolves to row 0
-		"steps.q.outputs.first":          "q.0",          // bare .first → row 0
-		"steps.q.outputs.rows[0].id":     "q.0.id",       // the workaround still works
-		"steps.q.outputs.firstname":      "q.firstname",  // word-boundary: real column, NOT mangled
-		"steps.q.outputs.email":          "q.email",      // generic single-row sugar unaffected
-		"steps.q.outputs.rows":           "q",            // result set unaffected
-		"params.invite_token":            "invite_token", // unrelated branch unaffected
+		"steps.q.outputs.first.group_id": "q.0.group_id",        // the bug: now resolves to row 0
+		"steps.q.outputs.first":          "q.0",                 // bare .first → row 0
+		"steps.q.outputs.rows[0].id":     "q.0.id",              // the workaround still works
+		"steps.q.outputs.firstname":      "q.firstname",         // word-boundary: real column, NOT mangled
+		"steps.q.outputs.email":          "q.email",             // generic single-row sugar unaffected
+		"steps.q.outputs.rows":           "q",                   // result set unaffected
+		"params.invite_token":            "params.invite_token", // request field namespace kept
 	}
 	for in, want := range cases {
 		if got := translateGHAExpr(in); got != want {

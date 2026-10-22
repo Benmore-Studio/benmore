@@ -21,7 +21,9 @@ package main
 //      Reuses the dispatcher that runs in write_file/edit_file. Each
 //      file type gets its dedicated validator: Prisma parser, GHA
 //      flow parser, gotmpl template parser, hooks key set, app.yaml
-//      key set.
+//      key set, and every hooks/workflows `when:` prepared against the
+//      current schema.prisma - so a schema edit that breaks a `when:`
+//      surfaces here even though the schema write itself passed.
 //
 //   2. Cross-file orphan-ref validation (CrossFileWarnings)
 //      Walks hooks.yaml / workflows.yaml / flows.yaml inline SQL and
@@ -87,13 +89,57 @@ func (r CheckReport) Clean() bool { return r.Errors == 0 }
 // touched - that file's syntactic validators get priority in the report
 // ordering so the agent sees their feedback first.
 func RunCompleteCheck(dir, writtenPath string) CheckReport {
+	return runCheck(dir, writtenPath, true)
+}
+
+// RunSourceCheck is the write-path variant used by write_file / edit_file.
+// It runs only the layers that read source files (1, 2, 2.5) and never
+// opens the app's live data.db. Layers 3 + 4 (app load, drift) open the
+// tenant database from the ROUTER process and re-run every migration and
+// trigger install against it; on a large hosted app that work raced the
+// per-app process's own SIGHUP reload for the SQLite write lock
+// (_txlock=immediate, 10s busy_timeout), stalled every write response
+// past the CLI deadline and surfaced in the app as
+// `[locks] cleanup error: database is locked`. Those layers remain
+// available on demand through the `check` tool / `benmore check`.
+func RunSourceCheck(dir, writtenPath string) CheckReport {
+	return runCheck(dir, writtenPath, false)
+}
+
+// sourceCheckFiles picks the layer-1 inputs for a check. The full check
+// and a write of a file other files depend on (schema, app.yaml, the
+// flows map) re-validate everything: a schema edit can break every hook
+// `when:`. Any other write re-validates only the written file - the
+// pre-write gate already ran its validator, and re-walking ~200 flow and
+// page files on every .tsx push cost ~3.5s on a large app, which alone
+// kept pushes slower than the 5s reload debounce.
+func sourceCheckFiles(dir, writtenPath string, liveDB bool) []fileCheck {
+	if liveDB || writtenPath == "" || writeAffectsOtherFiles(writtenPath) {
+		return walkAppFiles(dir)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, writtenPath))
+	if err != nil {
+		return nil
+	}
+	return []fileCheck{{relPath: writtenPath, content: string(data)}}
+}
+
+func writeAffectsOtherFiles(writtenPath string) bool {
+	switch strings.ToLower(filepath.Base(filepath.ToSlash(writtenPath))) {
+	case "schema.prisma", "schema.sql", "schema.yaml", "app.yaml", "flows.yaml", "mcp.yaml":
+		return true
+	}
+	return false
+}
+
+func runCheck(dir, writtenPath string, liveDB bool) CheckReport {
 	var findings []CheckFinding
 
 	// Layer 1: per-file syntactic validation. Walk every file the
 	// dispatcher knows about; each gets its validator. Threading the
 	// app dir through gives the gotmpl validator partial-loading and
 	// any future cross-file syntactic check the context it needs.
-	for _, fileCheck := range walkAppFiles(dir) {
+	for _, fileCheck := range sourceCheckFiles(dir, writtenPath, liveDB) {
 		if msg := ValidateOnWriteIn(dir, fileCheck.relPath, fileCheck.content); msg != "" {
 			findings = append(findings, CheckFinding{
 				Severity: "error",
@@ -129,13 +175,24 @@ func RunCompleteCheck(dir, writtenPath string) CheckReport {
 	// PII exposed via a world/anon-readable table - confirm it's intentional.
 	findings = append(findings, piiExposureWarnings(dir)...)
 
-	// Dead respond:/redirect: in an async flow (the 202 already went out).
-	findings = append(findings, asyncRespondWarnings(dir)...)
+	// Authorization shapes that widen access (validators_authz.go).
+	findings = append(findings, authzWarnings(dir)...)
+
+	// Flow-shape warnings re-parse every flow (~1.2s on a large app); a
+	// write that is not a flow or a shared config file cannot change them.
+	if liveDB || writtenPath == "" || writeAffectsOtherFiles(writtenPath) || isFlowsSubdirFile(writtenPath) {
+		// Dead respond:/redirect: in an async flow (the 202 already went out).
+		findings = append(findings, asyncRespondWarnings(dir)...)
+
+		// Templated redirect targets that can render off-origin (refused at run
+		// time unless the host is in allow_hosts).
+		findings = append(findings, redirectWarnings(dir)...)
+	}
 
 	// If we already have syntax errors there's no point trying to
 	// load the app - the load will just rediscover them with worse
 	// error messages.
-	if countErrors(findings) == 0 {
+	if liveDB && countErrors(findings) == 0 {
 		// Layer 3: app load. Catches schema errors, flow runtime
 		// rejections, etc.
 		if loadErr := tryLoadApp(dir); loadErr != "" {
@@ -174,7 +231,8 @@ func RunCompleteCheck(dir, writtenPath string) CheckReport {
 		// path, and agents that hit "unfamiliar table in describe"
 		// reach for hallucinated explanations ("framework template
 		// inference") instead of cleanup. Surface them as warnings
-		// with a prescriptive fix (prisma_prune).
+		// with a prescriptive fix (keep it as a model, or drop it in a
+		// migrations/ SQL file).
 		if drifts := tryDriftCheck(dir); len(drifts) > 0 {
 			for _, d := range drifts {
 				// extra_column stays suppressed - really is benign.
@@ -426,6 +484,40 @@ func asyncRespondWarnings(dir string) []CheckFinding {
 	return findings
 }
 
+// redirectWarnings runs the advisory flow-file warners - ghaRedirectWarnings
+// (validators_write.go) and ghaStepShadowWarnings (validators_step_shadow.go)
+// - over flows.yaml and every flows/*.yaml file the runtime loads.
+func redirectWarnings(dir string) []CheckFinding {
+	paths := []string{"flows.yaml"}
+	if entries, err := os.ReadDir(filepath.Join(dir, "flows")); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+				paths = append(paths, filepath.Join("flows", e.Name()))
+			}
+		}
+	}
+	var findings []CheckFinding
+	for _, rel := range paths {
+		data, err := os.ReadFile(filepath.Join(dir, rel))
+		if err != nil {
+			continue
+		}
+		msgs := ghaRedirectWarnings(string(data))
+		// Step ids that shadow a request field (advisory; v2.7.248 made a
+		// bare ref to such a name read the step).
+		msgs = append(msgs, ghaStepShadowWarnings(string(data))...)
+		for _, msg := range msgs {
+			findings = append(findings, CheckFinding{
+				Severity: "warning",
+				Source:   "flows",
+				File:     rel,
+				Message:  msg,
+			})
+		}
+	}
+	return findings
+}
+
 // flowHasRespondStep reports whether any step (including nested if/for_each
 // branches) responds or redirects.
 func flowHasRespondStep(steps []FlowStep) bool {
@@ -442,12 +534,15 @@ func flowHasRespondStep(steps []FlowStep) bool {
 
 func walkAppFiles(dir string) []fileCheck {
 	candidates := []string{
+		"mcp.yaml",
 		"schema.prisma",
 		"schema.sql",
 		"app.yaml",
 		"flows.yaml",
 		"hooks.yaml",
 		"workflows.yaml",
+		"cron.yaml",
+		"validators.yaml",
 		"computed.yaml",
 		"encrypted.yaml",
 		"retention.yaml",
@@ -456,6 +551,21 @@ func walkAppFiles(dir string) []fileCheck {
 	for _, rel := range candidates {
 		if data, err := os.ReadFile(filepath.Join(dir, rel)); err == nil {
 			out = append(out, fileCheck{relPath: rel, content: string(data)})
+		}
+	}
+	// flows/*.yaml - the loader merges these with flows.yaml and the write
+	// gate validates them (isFlowsSubdirFile), so check them here too;
+	// otherwise a step error in one (e.g. a `run: broadcast` without a room)
+	// surfaced only as an app_load failure, and only when nothing else failed.
+	if entries, err := os.ReadDir(filepath.Join(dir, "flows")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+				continue
+			}
+			rel := filepath.Join("flows", e.Name())
+			if data, err := os.ReadFile(filepath.Join(dir, rel)); err == nil {
+				out = append(out, fileCheck{relPath: rel, content: string(data)})
+			}
 		}
 	}
 	// HTML pages - scan the top-level directory only (the page loader
@@ -598,7 +708,7 @@ func isTransientDBPingError(dir, loadErr string) bool {
 // tests run inside t.TempDir() anyway; CLI users hit the real db
 // which is the right behavior for `benmore check`).
 func tryLoadApp(dir string) string {
-	app, err := loadApp(dir)
+	app, err := loadAppWithOptions(dir, appLoadOptions{checkOnly: true})
 	if err != nil {
 		return err.Error()
 	}

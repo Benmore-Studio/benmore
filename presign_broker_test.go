@@ -104,3 +104,35 @@ func TestPresignS3PutURL_NoCreds(t *testing.T) {
 		t.Error("expected error when no credentials resolvable")
 	}
 }
+
+// The broker ignores the tenant's Content-Type and Content-Disposition: a
+// compromised tenant process must not be able to publish inline HTML or
+// script on the shared media origin.
+func TestPresignBrokerDerivesObjectMetaFromPath(t *testing.T) {
+	s3 := &S3Storage{Bucket: "b", Region: "us-east-1", Key: "AKIDEXAMPLE", Secret: "secret"}
+	put := func(p, ct, disp string) (*presignResp, error) {
+		return executePresignBrokerRequest(presignReq{Path: p, ContentType: ct, Disposition: disp}, "tenant", false, s3)
+	}
+	resp, err := put("uploads/files/abc.png", "text/html", "inline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ct := resp.Headers["Content-Type"]; ct != "image/png" {
+		t.Fatalf("tenant-chosen content type used: %q", ct)
+	}
+	if d := resp.Headers["Content-Disposition"]; d != "" {
+		t.Fatalf("image forced to download: %q", d)
+	}
+	resp, err = put("uploads/files/abc.zip", "text/html", "inline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := resp.Headers["Content-Disposition"]; !strings.HasPrefix(d, "attachment") {
+		t.Fatalf("unknown type not forced to download: %q", d)
+	}
+	for _, p := range []string{"uploads/files/x.html", "uploads/files/x.svg", "uploads/files/x.js", "uploads/files/noext"} {
+		if _, err := put(p, "image/png", ""); err == nil {
+			t.Errorf("broker presigned an active or untyped object: %s", p)
+		}
+	}
+}

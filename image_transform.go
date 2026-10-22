@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"image"
+	"image/color"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -56,6 +57,87 @@ const uploadsMaxImagePixels = 40 * 1000 * 1000 // ~40 MP
 // purpose - transforms are cached after the first hit, so steady-state
 // concurrency is low.
 var uploadsTransformSem = make(chan struct{}, 4)
+
+// imageTransformMemoryBudget bounds what all in-flight transforms may hold
+// at once: the decoded source, the resampler's scratch buffer, which
+// x/image/draw sizes dstWidth x srcHeight x 32 bytes, and the encoded output. The pixel cap alone
+// left that buffer unbounded by shape (a 1000x40000 source scaled to 999 px
+// needs ~1.3 GB). A transform whose own estimate exceeds the budget is
+// refused; others wait until enough of it is free.
+const imageTransformMemoryBudget = 512 << 20
+
+var imageTransformMem = struct {
+	sync.Mutex
+	used  int64
+	freed chan struct{} // closed and replaced on every release
+}{freed: make(chan struct{})}
+
+// acquireImageTransformMemory reserves n bytes of the budget, waiting for
+// running transforms to release theirs. It returns false when n alone is
+// over the budget or the request ends first.
+func acquireImageTransformMemory(done <-chan struct{}, n int64) bool {
+	if n > imageTransformMemoryBudget {
+		return false
+	}
+	for {
+		imageTransformMem.Lock()
+		if imageTransformMem.used+n <= imageTransformMemoryBudget {
+			imageTransformMem.used += n
+			imageTransformMem.Unlock()
+			return true
+		}
+		freed := imageTransformMem.freed
+		imageTransformMem.Unlock()
+		select {
+		case <-freed:
+		case <-done:
+			return false
+		}
+	}
+}
+
+func releaseImageTransformMemory(n int64) {
+	imageTransformMem.Lock()
+	imageTransformMem.used -= n
+	close(imageTransformMem.freed)
+	imageTransformMem.freed = make(chan struct{})
+	imageTransformMem.Unlock()
+}
+
+// imageTransformWorkingBytes estimates the memory a transform holds: the
+// decoded source (by its color model); when it is resized, the kernel
+// scaler's float64 buffer and the destination image; and the encoded output,
+// buffered whole (twice its raw size: the buffer doubles as it grows).
+func imageTransformWorkingBytes(cfg image.Config, maxW, maxH int, ext string) int64 {
+	bpp := int64(4)
+	switch cfg.ColorModel {
+	case color.GrayModel, color.AlphaModel:
+		bpp = 1
+	case color.Gray16Model, color.Alpha16Model:
+		bpp = 2
+	case color.YCbCrModel:
+		bpp = 3
+	case color.RGBA64Model, color.NRGBA64Model:
+		bpp = 8
+	}
+	if _, ok := cfg.ColorModel.(color.Palette); ok {
+		bpp = 1
+	}
+	total := int64(cfg.Width) * int64(cfg.Height) * bpp
+	outW, outH, outBpp := int64(cfg.Width), int64(cfg.Height), max(bpp, 4)
+	if dw, dh, ok := resizeFitDims(cfg.Width, cfg.Height, maxW, maxH); ok {
+		total += int64(dw)*int64(cfg.Height)*32 + int64(dw)*int64(dh)*4
+		outW, outH, outBpp = int64(dw), int64(dh), 4
+	}
+	switch ext {
+	case "gif":
+		outBpp = 1
+	case "png":
+	default:
+		outBpp = 3
+	}
+	return total + 2*outW*outH*outBpp
+}
 
 const imageTransformCacheBytes = 64 << 20
 const imageTransformCacheEntries = 256
@@ -107,7 +189,7 @@ func cacheImageTransform(root *os.Root, name string, data []byte) {
 
 // RegisterImageTransformRoute applies source authorization before every cache
 // lookup. Private derivatives are never persisted or shared through HTTP caches.
-func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
+func RegisterImageTransformRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_images/transform", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		src := r.URL.Query().Get("src")
@@ -146,50 +228,29 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 		}
 
 		uploadsRoot := filepath.Join(app.Dir, "uploads")
-		sourcePath, ok := resolveServableFile(uploadsRoot, filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
-		if !ok || strings.HasPrefix(src, "/uploads/_transforms/") {
+		if strings.HasPrefix(src, "/uploads/_transforms/") {
 			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
-		realRoot, err := filepath.EvalSymlinks(uploadsRoot)
-		if err != nil {
+		f, ok := openServableFile(uploadsRoot, filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
+		if !ok {
 			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
-		realRoot, err = filepath.Abs(realRoot)
-		if err != nil {
+		defer f.Close()
+		rel := filepath.ToSlash(f.relative)
+		if strings.HasPrefix(rel, "_transforms/") {
 			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
-		rel, err := filepath.Rel(realRoot, sourcePath)
-		if err != nil || strings.HasPrefix(filepath.ToSlash(rel), "_transforms/") {
-			httpError(w, "source not found", http.StatusNotFound)
-			return
-		}
-		if isPrivateUploadPath("uploads/" + filepath.ToSlash(rel)) {
+		if isPrivateUploadPath("uploads/" + rel) {
 			private = true
 			if !ValidateSignedURL(strings.TrimPrefix(src, "/uploads/"), r) {
 				httpError(w, "forbidden - invalid or expired signed URL", http.StatusForbidden)
 				return
 			}
 		}
-		root, err := os.OpenRoot(realRoot)
-		if err != nil {
-			httpError(w, "source not found", http.StatusNotFound)
-			return
-		}
-		defer root.Close()
-		f, err := root.Open(rel)
-		if err != nil {
-			httpError(w, "source not found", http.StatusNotFound)
-			return
-		}
-		defer f.Close()
-		st, err := f.Stat()
-		if err != nil || !st.Mode().IsRegular() {
-			httpError(w, "source not found", http.StatusNotFound)
-			return
-		}
+		st := f.info
 
 		// Use a new non-public cache namespace: old uploads/_transforms files
 		// may contain private derivatives produced by older versions.
@@ -230,9 +291,18 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 			httpError(w, "source image too large to transform", http.StatusUnsupportedMediaType)
 			return
 		}
+		need := imageTransformWorkingBytes(cfg, w_, h_, ext)
+		if need > imageTransformMemoryBudget {
+			httpError(w, "transform needs too much memory: use a smaller width or a shorter source image", http.StatusUnsupportedMediaType)
+			return
+		}
+		if !acquireImageTransformMemory(r.Context().Done(), need) {
+			return
+		}
+		defer releaseImageTransformMemory(need)
 		// Rewind: DecodeConfig consumed the header bytes.
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			httpError(w, "source not seekable", http.StatusInternalServerError)
+			serverError(w, r, app, "_images transform", err, "source not seekable")
 			return
 		}
 
@@ -266,7 +336,7 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 			err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
 		}
 		if err != nil {
-			httpError(w, "encode failed: "+err.Error(), http.StatusInternalServerError)
+			serverError(w, r, app, "_images transform", err, "encode failed")
 			return
 		}
 
@@ -288,7 +358,17 @@ func RegisterImageTransformRoute(mux *http.ServeMux, app *App) {
 // from x/image/draw.
 func resizeFit(src image.Image, maxW, maxH int) image.Image {
 	srcBounds := src.Bounds()
-	srcW, srcH := srcBounds.Dx(), srcBounds.Dy()
+	newW, newH, ok := resizeFitDims(srcBounds.Dx(), srcBounds.Dy(), maxW, maxH)
+	if !ok {
+		return src // already smaller than the box
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
+	return dst
+}
+
+// resizeFitDims is resizeFit's target size; ok=false means no resize.
+func resizeFitDims(srcW, srcH, maxW, maxH int) (newW, newH int, ok bool) {
 	if maxW == 0 {
 		maxW = srcW
 	}
@@ -304,15 +384,11 @@ func resizeFit(src image.Image, maxW, maxH int) image.Image {
 		scale = float64(maxH) / float64(srcH)
 	}
 	if scale >= 1.0 {
-		return src // already smaller than the box
+		return srcW, srcH, false
 	}
-	newW := int(float64(srcW) * scale)
-	newH := int(float64(srcH) * scale)
-	newW = max(1, newW)
-	newH = max(1, newH)
-	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	draw.CatmullRom.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
-	return dst
+	newW = max(1, int(float64(srcW)*scale))
+	newH = max(1, int(float64(srcH)*scale))
+	return newW, newH, true
 }
 
 func imageCacheKey(src string, w, h int, fmt_ string, q int) string {

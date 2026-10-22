@@ -130,7 +130,11 @@ func GenerateBMTypes(app *App) string {
 	b.WriteString(`export interface ListOpts {
   limit?: number;
   offset?: number;
-  cursor?: string;
+  cursor?: string | number;
+  q?: string;
+  /** Column to order by (snake_case, as stored). */
+  sort?: string;
+  order?: 'asc' | 'desc';
   where?: Record<string, string | number | boolean>;
 }
 
@@ -138,6 +142,11 @@ export interface ApiResult<T = unknown> {
   ok: boolean;
   status: number;
   data: T | null;
+}
+
+export interface ApiRequestOptions {
+  headers?: HeadersInit;
+  signal?: AbortSignal;
 }
 
 /**
@@ -174,12 +183,41 @@ interface CountOpts {
   q?: string;
 }
 
+export interface UpdateReceipt {
+  status: 'updated';
+}
+export interface VersionMetadata {
+  _version: number;
+  _valid_from: string;
+  _valid_to: string | null;
+  _changed_by: number | null;
+  _change_type: string;
+}
+export interface VersionHistory {
+  id: string;
+  versions: VersionMetadata[];
+}
+export interface RevertReceipt {
+  status: 'reverted';
+  id: string;
+  reverted_to_version: string;
+  owned_fields_kept: string[] | null;
+}
+export interface RecordPermissionGrant {
+  id: number;
+  /** Stored recipient: email for a user share; identifier for an authored role grant. */
+  grantee_id: string;
+  permission: string;
+  granted_at: string;
+  expires_at: string | null;
+}
+
 interface BaseTableClient<Row> {
   readonly name: string;
   list(opts?: ListOpts): Promise<Row[]>;
   get(id: number | string): Promise<Row>;
   create(body: Partial<Row>): Promise<Row>;
-  update(id: number | string, body: Partial<Row>): Promise<Row>;
+  update(id: number | string, body: Partial<Row>): Promise<UpdateReceipt>;
   delete(id: number | string): Promise<void>;
   /** TRUE row count, ignoring the LIMIT / per_page cap. Honors WHERE
    * filters + 'q'. Use this instead of (await list()).length when you
@@ -195,8 +233,8 @@ interface SoftDeleteTable<Row> {
   restore(id: number | string): Promise<Row>;
 }
 interface VersionedTable<Row> {
-  versions(id: number | string): Promise<Array<{ version: number; data: Row; created_at: string }>>;
-  revertTo(id: number | string, version: number): Promise<Row>;
+  versions(id: number | string): Promise<VersionHistory>;
+  revertTo(id: number | string, version: number): Promise<RevertReceipt>;
 }
 
 /** TableClient<Row, Features> - methods conditional on the table's feature flags. */
@@ -208,8 +246,9 @@ export type TableClient<Row, Features extends { softDelete: boolean; fulltext: b
 
 export interface RoomClient {
   readonly name: string;
-  on(kind: string, fn: (payload: any, from: number) => void): this;
-  onAny(fn: (payload: any, from: number, kind: string) => void): this;
+  // from: the sender's user id, or 'server' for a flow's run: broadcast.
+  on(kind: string, fn: (payload: any, from: number | 'server') => void): this;
+  onAny(fn: (payload: any, from: number | 'server', kind: string) => void): this;
   off(kind: string, fn: Function): this;
   send(payload: any): void;
   leave(): void;
@@ -258,15 +297,15 @@ export interface RoomClient {
 	b.WriteString("// ─── bm SDK surface ────────────────────────────────────────\n\n")
 	b.WriteString(`export interface ApiCalls {
     raw: {
-      get<T = any>(path: string): Promise<ApiResult<T>>;
-      post<T = any>(path: string, body?: unknown): Promise<ApiResult<T>>;
-      patch<T = any>(path: string, body?: unknown): Promise<ApiResult<T>>;
-      delete<T = any>(path: string): Promise<ApiResult<T>>;
+      get<T = any>(path: string, options?: ApiRequestOptions): Promise<ApiResult<T>>;
+      post<T = any>(path: string, body?: unknown, options?: ApiRequestOptions): Promise<ApiResult<T>>;
+      patch<T = any>(path: string, body?: unknown, options?: ApiRequestOptions): Promise<ApiResult<T>>;
+      delete<T = any>(path: string, options?: ApiRequestOptions): Promise<ApiResult<T>>;
     };
-    get<T = any>(path: string): Promise<T>;
-    post<T = any>(path: string, body?: unknown): Promise<T>;
-    patch<T = any>(path: string, body?: unknown): Promise<T>;
-    delete(path: string): Promise<void>;
+    get<T = any>(path: string, options?: ApiRequestOptions): Promise<T>;
+    post<T = any>(path: string, body?: unknown, options?: ApiRequestOptions): Promise<T>;
+    patch<T = any>(path: string, body?: unknown, options?: ApiRequestOptions): Promise<T>;
+    delete(path: string, options?: ApiRequestOptions): Promise<void>;
     /** Optimistic mutation + reconcile. apply() runs immediately
      *  (instant UI), request() races, revert(snapshot) runs on rejection.
      *  Returns the server response or throws after revert. Replaces
@@ -288,6 +327,26 @@ export interface RoomClient {
     signIn(identifier: string, password: string): Promise<User | null>;
     /** Sign up. Pass 'email' + 'password' plus any auth.signup_fields configured in app.yaml. Throws on failure. */
     signUp(fields: { email: string; password: string; [extraField: string]: unknown }): Promise<User | null>;
+    /** Passkeys (WebAuthn): Face ID, Touch ID, Windows Hello, a phone. */
+    passkey: PasskeyCalls;
+  }
+
+  export interface Passkey {
+    id: number;
+    name: string;
+    created_at: string;
+    last_used_at: string | null;
+  }
+
+  export interface PasskeyCalls {
+    /** False where the browser has no WebAuthn. */
+    supported(): boolean;
+    /** Signed in: create a passkey on this device and save it. Re-confirms the account with its current password (or an authenticator code). */
+    register(name?: string, proof?: { password?: string; mfa_code?: string }): Promise<{ id: number; name: string }>;
+    /** Signed out: sign in with any passkey saved for this site. */
+    signIn(): Promise<User | null>;
+    list(): Promise<Passkey[]>;
+    remove(id: number): Promise<void>;
   }
 
   export interface UsersCalls {
@@ -358,10 +417,12 @@ export interface RoomClient {
        *  this many ms after the LAST event. */
       debounce?: number;
     }
-    /** live() with the production-grade plumbing baked in:
-     *  generation-counter dedupe, trailing-edge debounce, visibility
-     *  refresh on tab return, primed-on-mount. Replaces the ~60-line
-     *  pattern an earlier app build re-derived for racing refetches. */
+    /** Debounced live refresh, primed on mount and on tab return.
+     *  Callbacks are serialized per subscription, with one trailing
+     *  refresh for changes arriving while a callback is pending.
+     *  Return the promise covering all fetch/render work; detached work
+     *  is not guarded. Unsubscribe cancels queued work, not an already
+     *  running callback. See api(at:"live-scoped") for lifecycle limits. */
     function scoped(
       table: keyof TableTypeMap | '*',
       fetchAndRender: () => unknown | Promise<unknown>,
@@ -409,6 +470,9 @@ export interface RoomClient {
   //
   // null and undefined render as empty string (matches lit / Preact).
   // The five HTML-meaningful characters are escaped: & < > " '
+  // A value that starts a URL attribute (href/src/action/...) and would
+  // run as script (javascript:, vbscript:, non-image data:) renders as
+  // #blocked-unsafe-url.
   type SafeHtml = string & { readonly __brand: 'SafeHtml' };
   export function html(strings: TemplateStringsArray, ...values: any[]): SafeHtml;
   /** Mark a string as already-safe HTML; bypasses escaping in the
@@ -601,7 +665,7 @@ export interface RoomClient {
       expires_at?: string,
     ): Promise<void>;
     revoke(table: TableName, id: number | string, email: string): Promise<void>;
-    list(table: TableName, id: number | string): Promise<{ permissions: Array<{ email: string; permission: string }> | null; resource_id: string; resource_type: string }>;
+    list(table: TableName, id: number | string): Promise<{ permissions: RecordPermissionGrant[] | null; resource_id: string; resource_type: string }>;
   };
 
   // ── signedUrl (time-limited file URL) ────────────────────────────────
@@ -620,7 +684,8 @@ export interface RoomClient {
 
   // ── mfa (TOTP enrollment + verification) ─────────────────────────────
   export const mfa: {
-    enroll(): Promise<{ qr_data_url: string; secret: string; backup_codes: string[] }>;
+    /** From a signed-in session pass the current password (required). */
+    enroll(password?: string): Promise<{ qr_data_url: string; secret: string; backup_codes: string[] }>;
     verify(code: string): Promise<{ ok: boolean }>;
     disable(password: string): Promise<{ ok: boolean }>;
   };
@@ -806,7 +871,7 @@ declare module 'sdui' {
   // ─── Wave 2: auth · governance · files · workflow · realtime · ops ─
   export interface Handle { destroy: () => void; refresh?: () => Promise<void>; }
   export interface SignupField { name: string; label?: string; type?: string; required?: boolean; }
-  /** Email+password sign-in form (bm.auth.signIn). */
+  /** Email+password sign-in form (bm.auth.signIn). The redirect option is followed only on this origin (else "/"). */
   export function Login(target: string | HTMLElement, opts?: { onSuccess?: (user: any) => void; redirect?: string | false }): Handle;
   /** Registration form (bm.auth.signUp). Pass fields[] to collect signup_fields. */
   export function Signup(target: string | HTMLElement, opts?: { fields?: SignupField[]; onSuccess?: (user: any) => void; redirect?: string | false }): Handle;
@@ -816,7 +881,7 @@ declare module 'sdui' {
   export function Reset(target: string | HTMLElement, opts?: { token?: string }): Handle;
   /** Edit the current user's profile (GET/PATCH /api/_auth/profile); protected fields filtered. */
   export function ProfileForm(target: string | HTMLElement, opts?: { onSaved?: (user: any) => void }): Promise<Handle>;
-  /** TOTP enrollment + verify + disable (bm.mfa). */
+  /** TOTP enrollment (asks for the current password, shows secret, otpauth URI and backup codes) + verify + disable (bm.mfa). */
   export function MfaSetup(target: string | HTMLElement, opts?: {}): Promise<Handle>;
   /** OAuth connection controls. Configuration, sign-in semantics, and limits: api(at:"oauth"). */
   export function OAuthConnect(target: string | HTMLElement, opts?: { providers?: string[] }): Promise<Handle>;
@@ -1012,7 +1077,7 @@ declare module 'sdui' {
   export function PermissionMatrix(target: string | HTMLElement, opts?: {}): Promise<{ destroy: () => void }>;
   /** Users + grant/revoke roles (RBAC join-table endpoints). */
   export function TeamManager(target: string | HTMLElement, opts?: {}): Promise<Handle>;
-  /** Re-auth confirm before a sensitive action (verifies password). Resolves true if confirmed. */
+  /** Re-auth confirm before a sensitive action (verifies password; the session that check mints is revoked at once). Resolves true if confirmed. */
   export function StepUp(opts?: { title?: string; message?: string }): Promise<boolean>;
   /** Masked field that reveals on click (optionally behind StepUp). The reveal callback supplies the real value. */
   export function SensitiveReveal(target: string | HTMLElement, opts: { label?: string; value?: any; reveal?: () => Promise<any> | any; stepUp?: boolean; stepUpMessage?: string; log?: () => void }): Promise<{ destroy: () => void }>;
@@ -1382,7 +1447,7 @@ func writeTableFeatures(b *strings.Builder, tables []Table, app *App) {
 // writeAggregatesType emits the AggregateName union + AggregateMap.
 func writeAggregatesType(b *strings.Builder, app *App) {
 	b.WriteString("// ─── Aggregates (from app.yaml aggregates:) ─────────────────\n")
-	configs := LoadAggregateConfig(app.Dir)
+	configs := app.aggregateConfig()
 	if len(configs) == 0 {
 		b.WriteString("export type AggregateName = never;\n")
 		b.WriteString("export interface AggregateMap {}\n\n")
@@ -1546,12 +1611,16 @@ func flowInputTS(in FlowInput) string {
 // writeI18nType emits the I18nKey union from translation files.
 func writeI18nType(b *strings.Builder, app *App) {
 	b.WriteString("// ─── I18n keys (from i18n/*.yaml) ───────────────────────────\n")
-	if i18n == nil || len(i18n.Translations) == 0 {
+	var translations *I18n
+	if app != nil {
+		translations = app.i18nConfig()
+	}
+	if translations == nil || len(translations.Translations) == 0 {
 		b.WriteString("export type I18nKey = string;\n\n")
 		return
 	}
 	keys := map[string]bool{}
-	for _, dict := range i18n.Translations {
+	for _, dict := range translations.Translations {
 		for k := range dict {
 			keys[k] = true
 		}
@@ -1649,33 +1718,51 @@ func extractPathParams(path string) []string {
 	return out
 }
 
+// setPrivateMetadataCacheHeaders marks both authorized and refused metadata
+// responses as private and non-reusable. Origin headers cannot override a CDN
+// cache rule or remove previously stored objects; deployment rules must bypass
+// these routes and any existing cached metadata must be purged separately.
+func setPrivateMetadataCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Vary", "*")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+}
+
 // RegisterBMTypesRoute serves the generated .d.ts at /_internal/types.d.ts,
 // plus a flows.json registry the runtime SDK uses to route bm.flows.<name>
 // calls to the right URL.
-func RegisterBMTypesRoute(mux *http.ServeMux, app *App) {
+func RegisterBMTypesRoute(mux appRouteRegistrar, app *App) {
 	serveTypes := func(w http.ResponseWriter, r *http.Request) {
-		// Cloudflare ignores plain Cache-Control: no-store on static-looking
-		// paths and applies its own max-age=86400 default. Sending the full
-		// no-cache headerset + Pragma + Expires + private makes the edge
-		// honor "do not cache" reliably.
+		setPrivateMetadataCacheHeaders(w)
+		// The full schema + flow surface: app admins and the platform's
+		// push/types credential only (bm_types_access.go).
+		if !typesRequestAuthorized(app, r) {
+			httpJSON(w, http.StatusForbidden, map[string]any{
+				"error": "generated types are served to app admins and to `benmore types` / `benmore push` only",
+			})
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
-		w.Header().Set("CDN-Cache-Control", "no-store")
-		w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 		w.Write([]byte(GenerateBMTypes(app)))
 	}
 	mux.HandleFunc("GET /_internal/types.d.ts", serveTypes)
 	mux.HandleFunc("GET /_internal/bm.d.ts", serveTypes)
 	// /_internal/flows.json - runtime registry for the bm.flows proxy.
-	// Maps flow name → { method, path, async }.
+	// Maps flow name → { method, path, async }, filtered to the flows the
+	// caller may call (flowListedFor), so the response varies per caller.
 	mux.HandleFunc("GET /_internal/flows.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
+		setPrivateMetadataCacheHeaders(w)
+		session := getSession(app, r)
 		entries := make(map[string]map[string]any)
 		for _, f := range app.Flows {
 			if f.Trigger.Type != "http" && f.Trigger.Type != "" {
+				continue
+			}
+			if !flowListedFor(f, session) {
 				continue
 			}
 			method := f.Trigger.Method

@@ -173,6 +173,11 @@ func TestReviewRevertUsesMutationPolicy(t *testing.T) {
 			sid := createCrudScopeSession(t, app, "reverter@example.com", "user", "", "")
 			uid := GetSessionFromDB(app.DB, sid).UserID
 			mustExec(t, app.DB, "INSERT INTO notes(id,user_id,title) VALUES(1,999,'old')")
+			// Version 1 is the pre-transfer snapshot (owner 999). Snapshots
+			// are only served to callers who could read them, so the reverter
+			// holds an explicit record grant - which is what keeps the
+			// protected-owner case meaningful (owner 999 must not be restored).
+			mustExec(t, app.DB, "INSERT INTO _benmore_permissions(resource_type,resource_id,grant_type,grantee_id,permission) VALUES('notes','1','user','reverter@example.com','edit')")
 			cfg := &VersionedConfig{Tables: []string{"notes"}}
 			InstallVersioningTriggers(app.DB, cfg)
 			if _, err := app.DB.Exec("UPDATE notes SET user_id=?, title='current' WHERE id=1", uid); err != nil {
@@ -304,7 +309,7 @@ func TestReviewDataExportHonorsReadPolicy(t *testing.T) {
 func TestReviewExpiredSessionRejected(t *testing.T) {
 	app, _ := auditApp(t)
 	sid := createCrudScopeSession(t, app, "expired@example.com", "user", "", "")
-	if _, err := app.DB.Exec("UPDATE _benmore_sessions SET expires_at=? WHERE id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), sid); err != nil {
+	if _, err := app.DB.Exec("UPDATE _benmore_sessions SET expires_at=? WHERE id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), sessionStorageKey(sid)); err != nil {
 		t.Fatal(err)
 	}
 	if GetSessionFromDB(app.DB, sid) != nil {

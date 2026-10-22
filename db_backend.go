@@ -27,19 +27,30 @@ type DBOpenConfig struct {
 }
 
 func resolveDatabaseURL(dir string) string {
+	return resolveDatabaseURLWithEnv(dir, nil)
+}
+
+func resolveDatabaseURLWithEnv(dir string, appEnv map[string]string) string {
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		return dbURL
+	}
+	if appEnv != nil {
+		return appEnv["DATABASE_URL"]
 	}
 	return GetEnv(dir, "DATABASE_URL")
 }
 
 func buildDBOpenConfig(dir, dbURL string) DBOpenConfig {
+	return buildDBOpenConfigWithEnv(dir, dbURL, nil)
+}
+
+func buildDBOpenConfigWithEnv(dir, dbURL string, appEnv map[string]string) DBOpenConfig {
 	if dbURL == "" {
 		dbPath := filepath.Join(dir, "data.db")
 		return DBOpenConfig{
 			Backend:     DatabaseBackendSQLite,
 			DriverName:  "sqlite3_benmore",
-			DSN:         sqliteAppDSN(dbPath, dir),
+			DSN:         sqliteAppDSNWithEnv(dbPath, dir, appEnv),
 			LocalSQLite: true,
 		}
 	}
@@ -63,7 +74,11 @@ func buildDBOpenConfig(dir, dbURL string) DBOpenConfig {
 }
 
 func sqliteAppDSN(dbPath, dir string) string {
-	synchronous := sqliteSynchronousMode(dir)
+	return sqliteAppDSNWithEnv(dbPath, dir, nil)
+}
+
+func sqliteAppDSNWithEnv(dbPath, dir string, appEnv map[string]string) string {
+	synchronous := sqliteSynchronousModeWithEnv(dir, appEnv)
 	return dbPath + "?_journal_mode=WAL" +
 		"&_foreign_keys=on" +
 		// 10s (was 5s): under _txlock=immediate writers QUEUE on the write lock
@@ -88,15 +103,25 @@ func sqliteAppDSN(dbPath, dir string) string {
 		// use plain Query (WAL, no txn). Read-only opens (mode=ro) must NOT set this.
 		"&_txlock=immediate" +
 		"&_synchronous=" + synchronous +
-		"&_cache_size=-64000" +
+		// Per-connection page cache; 16 MB in hosted tenants, 64 MB
+		// self-hosted, BENMORE_DB_CACHE_KIB to override (db_pool.go).
+		"&_cache_size=" + sqliteAppCacheSizeParam() +
 		"&_mmap_size=268435456" +
 		"&_temp_store=MEMORY"
 }
 
 func sqliteSynchronousMode(dir string) string {
+	return sqliteSynchronousModeWithEnv(dir, nil)
+}
+
+func sqliteSynchronousModeWithEnv(dir string, appEnv map[string]string) string {
 	raw := os.Getenv("DB_SYNCHRONOUS")
 	if raw == "" {
-		raw = GetEnv(dir, "DB_SYNCHRONOUS")
+		if appEnv != nil {
+			raw = appEnv["DB_SYNCHRONOUS"]
+		} else {
+			raw = GetEnv(dir, "DB_SYNCHRONOUS")
+		}
 	}
 	switch strings.ToUpper(strings.TrimSpace(raw)) {
 	case "", "NORMAL":

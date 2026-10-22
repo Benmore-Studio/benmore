@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -25,8 +26,25 @@ func init() {
 // OpenDB opens the app database. Uses DATABASE_URL env var if set (for remote SQLite/Turso),
 // otherwise creates a local data.db in the app directory.
 func OpenDB(dir string) (*sql.DB, error) {
-	dbURL := resolveDatabaseURL(dir)
-	cfg := buildDBOpenConfig(dir, dbURL)
+	return openDBWithEnv(dir, nil)
+}
+
+func openDBWithEnv(dir string, appEnv map[string]string) (*sql.DB, error) {
+	return openDBWithPolicyLock(dir, appEnv, nil, false)
+}
+
+// openDBWithPolicyLease is used by loadApp while it already owns the per-app
+// policy/file lease. Corruption recovery reuses that held lease.
+func openDBWithPolicyLease(dir string, appEnv map[string]string, lease *appMCPAuthorityLease) (*sql.DB, error) {
+	return openDBWithPolicyLock(dir, appEnv, lease, true)
+}
+
+func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAuthorityLease, policyHeld bool) (*sql.DB, error) {
+	if foreignAppDirs.Load() {
+		return openForeignAppDB(dir, appEnv)
+	}
+	dbURL := resolveDatabaseURLWithEnv(dir, appEnv)
+	cfg := buildDBOpenConfigWithEnv(dir, dbURL, appEnv)
 	if cfg.Backend == DatabaseBackendPostgres {
 		return nil, unsupportedPostgresRuntimeError(detectedPostgresScheme(dbURL))
 	}
@@ -49,7 +67,14 @@ func OpenDB(dir string) (*sql.DB, error) {
 		// data.db. Logged loudly so the operator knows recovery
 		// happened.
 		if cfg.LocalSQLite && isCorruptDBErr(err) {
-			if recovered, rErr := autoRestoreFromBackup(dir, err); rErr == nil && recovered {
+			var recovered bool
+			var rErr error
+			if policyHeld {
+				recovered, rErr = autoRestoreFromBackupInternal(dir, err, lease, true)
+			} else {
+				recovered, rErr = autoRestoreFromBackup(dir, err)
+			}
+			if rErr == nil && recovered {
 				log.Printf("DB AUTO-RECOVERY: %s - restored from most recent pre-migrate backup, original moved to data.db.corrupt-*", dir)
 				_ = db.Close()
 				// Re-open with the same DSN; the file underneath is now the backup.
@@ -97,7 +122,14 @@ func OpenDB(dir string) (*sql.DB, error) {
 			if !repaired {
 				log.Printf("DB CORRUPTION in %s not fixable by REINDEX - attempting backup auto-recovery", dir)
 				_ = db.Close()
-				if recovered, rErr := autoRestoreFromBackup(dir, qcErr); rErr == nil && recovered {
+				var recovered bool
+				var rErr error
+				if policyHeld {
+					recovered, rErr = autoRestoreFromBackupInternal(dir, qcErr, lease, true)
+				} else {
+					recovered, rErr = autoRestoreFromBackup(dir, qcErr)
+				}
+				if rErr == nil && recovered {
 					log.Printf("DB AUTO-RECOVERY: %s - restored from most recent valid backup; corrupt original moved to data.db.corrupt-*", dir)
 				} else {
 					// No usable backup. Reopen the original rather than returning
@@ -116,9 +148,8 @@ func OpenDB(dir string) (*sql.DB, error) {
 		}
 	}
 
-	// Connection pool settings
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
+	// Connection pool settings: smaller for hosted tenants (db_pool.go).
+	applyAppDBPoolLimits(db, currentAppDBPoolLimits())
 
 	// Tighten file modes on the local DB + WAL/SHM siblings. Mode 0660
 	// (owner+group RW, others none): the per-app user owns the file, and a
@@ -159,31 +190,38 @@ func OpenDB(dir string) (*sql.DB, error) {
 // push of a schema that added a column AND an index on it failed the index
 // ("no such column") and only converged on the second push.
 func LoadSchema(db *sql.DB, dir string) ([]Table, []string, error) {
-	prismaPath := filepath.Join(dir, "schema.prisma")
+	return loadSchemaWithReader(db, dir, func(name string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(dir, name))
+	}, false)
+}
+
+func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byte, error), runtimeJournal bool) ([]Table, []string, error) {
 	schemaSQL := ""
-	if data, err := os.ReadFile(prismaPath); err == nil {
+	var prismaModels []PrismaModel
+	if data, err := readSource("schema.prisma"); err == nil {
 		models, perr := ParsePrismaSchema(string(data))
 		if perr != nil {
 			return nil, nil, fmt.Errorf("schema.prisma: %w", perr)
 		}
+		prismaModels = models
 		schemaSQL = EmitSQL(models)
-		// Generate + persist a migration file if the parsed schema
-		// changed since the last apply. This is best-effort; if the
-		// migrations directory or _benmore_migrations table can't
-		// be written, we log + continue (the in-memory schema still
-		// loads via the executor below).
-		if name, err := ApplyPrismaMigration(db, dir, string(data)); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: migration generation failed: %s\n", err)
+		// Generation, its safety backup, execution and the ledger must all
+		// succeed before the candidate schema can be published.
+		if name, err := applyPrismaMigration(db, dir, string(data), runtimeJournal); err != nil {
+			return nil, nil, fmt.Errorf("Prisma migration: %w", err)
 		} else if name != "" {
-			fmt.Fprintf(os.Stderr, "migration: wrote migrations/%s\n", name)
+			if runtimeJournal {
+				fmt.Fprintf(os.Stderr, "migration: recorded DB journal %s\n", name)
+			} else {
+				fmt.Fprintf(os.Stderr, "migration: wrote migrations/%s\n", name)
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, nil, fmt.Errorf("read schema.prisma: %w", err)
 	}
 
 	if schemaSQL == "" {
-		schemaPath := filepath.Join(dir, "schema.sql")
-		data, err := os.ReadFile(schemaPath)
+		data, err := readSource("schema.sql")
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil, nil, nil
@@ -195,6 +233,24 @@ func LoadSchema(db *sql.DB, dir string) ([]Table, []string, error) {
 
 	// Parse tables from CREATE TABLE statements before executing
 	tables := ParseCreateTables(schemaSQL)
+	// Carry the accepted source contract with the immutable schema generation;
+	// request validation must not reread pending source edits or infer Prisma
+	// declarations from SQLite's permissive physical column affinities.
+	for ti := range tables {
+		for _, model := range prismaModels {
+			if model.Table != tables[ti].Name {
+				continue
+			}
+			for ci := range tables[ti].Columns {
+				for _, field := range model.Fields {
+					if field.Column == tables[ti].Columns[ci].Name {
+						tables[ti].Columns[ci].prismaScalar = true
+						break
+					}
+				}
+			}
+		}
+	}
 
 	// Execute schema. Auto-inject IF NOT EXISTS into CREATE TABLE / INDEX /
 	// VIEW / TRIGGER statements so hot-reloads are idempotent. Without this,
@@ -241,6 +297,9 @@ func isDeferredDDL(stmt string) bool {
 // (ensureIfNotExists already applied). Return the first error after attempting
 // all statements so reload can retain its current configuration on failure.
 func ApplyDeferredDDL(db *sql.DB, deferred []string) error {
+	if err := reconcilePrismaUpdatedAtTriggers(db, deferred); err != nil {
+		return err
+	}
 	var firstErr error
 	for _, stmt := range deferred {
 		if _, err := db.Exec(stmt); err != nil {
@@ -339,21 +398,89 @@ type mutationQuerier interface {
 type sqlExecutor interface {
 	Exec(string, ...any) (sql.Result, error)
 }
+type mutationTx interface {
+	mutationQuerier
+	sqlExecutor
+}
 
 func QueryRows(db *sql.DB, query string, args ...any) ([]map[string]any, error) {
 	return queryRowsWith(db, query, args...)
 }
 
 func queryRowsWith(db mutationQuerier, query string, args ...any) ([]map[string]any, error) {
-	key := cryptoKeyForQuerier(db)
+	return queryRowsWithKey(db, cryptoKeyForQuerier(db), query, args...)
+}
+
+func queryRowsWithMainKey(db mutationQuerier, query string, args ...any) ([]map[string]any, error) {
+	if bound, ok := db.(appMCPContextTx); !ok || !bound.private {
+		return queryRowsWith(db, query, args...)
+	}
+	key, err := cryptoKeyForQuerierMainChecked(db)
+	if err != nil {
+		return nil, err
+	}
+	return queryRowsWithKey(db, key, query, args...)
+}
+
+func queryRowsWithKey(db mutationQuerier, key []byte, query string, args ...any) ([]map[string]any, error) {
+	return queryRowsWithKeyContext(context.Background(), db, key, query, args...)
+}
+
+// QueryRowsContext is QueryRows bound to ctx (typically r.Context()), so a
+// client that disconnects cancels its query; the default statement deadline
+// (queryDeadline) still applies on top.
+func QueryRowsContext(ctx context.Context, db *sql.DB, query string, args ...any) ([]map[string]any, error) {
+	return queryRowsWithKeyContext(ctx, db, cryptoKeyForQuerier(db), query, args...)
+}
+
+// queryRowsWithKeyContext runs the query and scans it. On a *sql.DB (the
+// auto-CRUD, flow and admin read path, where request input shapes the SQL)
+// the statement gets the default deadline: mattn/go-sqlite3 interrupts the
+// running statement when the context ends, so a pathological ?sort= or
+// filter over a large table returns "context deadline exceeded" instead of
+// pinning a pool connection indefinitely. Transactions are left alone: an
+// interrupted write inside an explicit transaction makes SQLite roll the
+// whole transaction back, and their lock time is bounded by the
+// transaction's own context.
+//
+// Every QueryRows variant ends here, and many of them carry SQL the framework
+// did not write (flow, hook and template SQL, tool input, filters): the text
+// is run in the form the driver can run (sqlRunnableText).
+func queryRowsWithKeyContext(ctx context.Context, db mutationQuerier, key []byte, query string, args ...any) ([]map[string]any, error) {
+	return queryRowsWithKeyContextDecrypt(ctx, db, key, nil, query, args...)
+}
+
+// A non-nil decoder is an explicit policy supplied by a framework-authored
+// projection. nil retains the existing generic authored-SQL compatibility.
+func queryRowsWithKeyContextDecrypt(ctx context.Context, db mutationQuerier, key []byte, decrypt rowDecryptFunc, query string, args ...any) ([]map[string]any, error) {
+	query, ok := sqlRunnableText(query)
+	if !ok {
+		return nil, errNoSQLStatement
+	}
 	start := time.Now()
-	rows, err := db.Query(query, args...)
+	if _, ok := db.(*sql.DB); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = withQueryDeadline(ctx)
+		defer cancel() // after scanning: the rows stay bound to ctx while read
+	}
+	var rows *sql.Rows
+	var err error
+	var step *firstStepContext
+	cq, hasCtx := db.(interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	})
+	if hasCtx && ctx.Done() != nil {
+		step = newFirstStepContext(ctx)
+		rows, err = cq.QueryContext(step, query, args...)
+	} else {
+		rows, err = db.Query(query, args...)
+	}
 	incDBQuery()
 	metricDBLatency.Observe(time.Since(start).Seconds())
 	if err != nil {
 		return nil, err
 	}
-	return scanRows(rows, key)
+	return scanRowsLimitHookDecrypt(rows, key, 0, step.disarm, decrypt)
 }
 
 // scanRows converts *sql.Rows into a slice of maps. Closes rows when done.
@@ -376,6 +503,18 @@ func scanRows(rows *sql.Rows, key []byte) ([]map[string]any, error) {
 
 // scanRowsLimit stops reading after limit rows; zero preserves unbounded callers.
 func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, error) {
+	return scanRowsLimitHook(rows, key, limit, nil)
+}
+
+// scanRowsLimitHook is scanRowsLimit with afterFirst called once, right after
+// the first row arrives (firstStepContext.disarm).
+func scanRowsLimitHook(rows *sql.Rows, key []byte, limit int, afterFirst func()) ([]map[string]any, error) {
+	return scanRowsLimitHookDecrypt(rows, key, limit, afterFirst, nil)
+}
+
+type rowDecryptFunc func(map[string]any, []byte)
+
+func scanRowsLimitHookDecrypt(rows *sql.Rows, key []byte, limit int, afterFirst func(), decrypt rowDecryptFunc) ([]map[string]any, error) {
 	defer rows.Close()
 
 	cols, err := rows.Columns()
@@ -386,7 +525,7 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 	// Per-column type metadata derived once per result set. SQLite's
 	// DatabaseTypeName() returns the schema-declared type (from CREATE
 	// TABLE), which is what we want to drive both:
-	//   - BOOLEAN coercion of 0/1 → true/false (pre-existing behavior)
+	//   - BOOLEAN coercion of 0/1 → false/true, including decrypted strings
 	//   - INTEGER/REAL coercion of decrypted ciphertext strings back
 	//     to numeric (v2.7.57+ for encrypted-integer support)
 	//
@@ -421,11 +560,18 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 	}
 
 	results := make([]map[string]any, 0)
+	// One scan buffer per result set: Scan into *any copies []byte values
+	// (database/sql clones them for interface destinations) and every value
+	// is moved into the row map below, so reusing the slots is safe.
+	values := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
 	for rows.Next() {
-		values := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range values {
-			ptrs[i] = &values[i]
+		if afterFirst != nil {
+			afterFirst()
+			afterFirst = nil
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
@@ -435,18 +581,6 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 			v := values[i]
 			if b, ok := v.([]byte); ok {
 				v = string(b)
-			}
-			if isBool[i] {
-				switch x := v.(type) {
-				case int64:
-					v = x != 0
-				case float64:
-					v = x != 0
-				case bool:
-					// already bool
-				case nil:
-					// leave nil - column is NULL, not false
-				}
 			}
 			// time.Time normalisation (v2.7.60+): some go-sqlite3
 			// connection configurations auto-parse DATETIME columns
@@ -462,7 +596,7 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 			// Normalise here so EVERY scan path returns:
 			//   zero time.Time   → nil  (JSON null - matches the
 			//                       NULL semantic of the source row)
-			//   non-zero time.Time → RFC3339 string (matches the
+			//   non-zero time.Time → RFC3339Nano string (matches the
 			//                       coerceSQLValue convention used by
 			//                       loadInsertedRow, so a fresh GET
 			//                       and a post-insert read see the
@@ -471,13 +605,17 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 				if tv.IsZero() {
 					v = nil
 				} else {
-					v = tv.UTC().Format(time.RFC3339)
+					v = tv.UTC().Format(time.RFC3339Nano)
 				}
 			}
 			row[col] = v
 		}
-		DecryptRowFields(row, key)
-		// Numeric coercion runs AFTER decryption - that's the whole
+		if decrypt == nil {
+			DecryptRowFields(row, key)
+		} else {
+			decrypt(row, key)
+		}
+		// Declared-type coercion runs AFTER decryption - that's the whole
 		// point: the ciphertext lived as TEXT in a column declared
 		// INTEGER/REAL, and after decryption the plaintext is a
 		// string we need to coerce back to its declared type.
@@ -489,6 +627,23 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 		// caller sees the text" and is safer than dropping the
 		// value or panicking.
 		for i, col := range cols {
+			if isBool[i] {
+				// Encryption stores even BOOLEAN values as ciphertext TEXT.
+				// Decode after decryption so false cannot escape as truthy "0".
+				switch v := row[col].(type) {
+				case int64:
+					row[col] = v != 0
+				case float64:
+					row[col] = v != 0
+				case string:
+					if b, err := strconv.ParseBool(v); err == nil {
+						row[col] = b
+					}
+				}
+				// bool and NULL are already canonical. Invalid plaintext and
+				// decryption-failure masks remain unchanged, never false.
+				continue
+			}
 			if numericKind[i] == 0 {
 				continue
 			}
@@ -517,6 +672,10 @@ func scanRowsLimit(rows *sql.Rows, key []byte, limit int) ([]map[string]any, err
 
 // QuerySingle executes a query expected to return a single scalar value.
 func QuerySingle(db *sql.DB, query string, args ...any) (any, error) {
+	query, ok := sqlRunnableText(query)
+	if !ok {
+		return nil, errNoSQLStatement
+	}
 	var result any
 	err := db.QueryRow(query, args...).Scan(&result)
 	if err != nil {
@@ -529,37 +688,154 @@ func QuerySingle(db *sql.DB, query string, args ...any) (any, error) {
 }
 
 // GetTableNames returns all user table names from the database.
-func GetTableNames(db *sql.DB) ([]string, error) {
-	// Generated history belongs to the source table's version API. Exposing
-	// it as an independent CRUD table loses the source's access and field gates.
-	// Match the actual version metadata, not arbitrary business *_history names.
-	rows, err := db.Query(`SELECT m.name FROM sqlite_master m
-		WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_benmore_%'
-		AND NOT (substr(m.name, -8) = '_history' AND
-			(SELECT COUNT(*) FROM pragma_table_info(m.name)
-			 WHERE name IN ('_version','_valid_from','_valid_to','_changed_by','_change_type')) = 5)
-		ORDER BY m.name`)
+type crudTableDefinition struct {
+	name       string
+	virtual    bool
+	columns    map[string]bool
+	allColumns map[string]bool
+}
+
+var crudInternalName = regexp.MustCompile(`(?s)^(?:sqlite.|.benmore.)`)
+var versionMetadataColumns = []string{"_version", "_valid_from", "_valid_to", "_changed_by", "_change_type"}
+
+// Retained framework history is not an ordinary user table, even after its
+// source model or versioning configuration is removed. A suffix alone is not
+// enough: apps may legitimately own tables named something_history.
+func isVersionHistoryDefinition(definition crudTableDefinition) bool {
+	if !strings.HasSuffix(definition.name, "_history") {
+		return false
+	}
+	for _, column := range versionMetadataColumns {
+		if !definition.columns[column] {
+			return false
+		}
+	}
+	return true
+}
+
+// Shared eligibility for source preflight and the actual SQLite CRUD inventory.
+func eligibleCRUDTables(definitions []crudTableDefinition) map[string]bool {
+	virtuals := map[string]bool{}
+	for _, definition := range definitions {
+		if definition.virtual {
+			virtuals[definition.name] = true
+		}
+	}
+	eligible := map[string]bool{}
+	for _, definition := range definitions {
+		// SQLite LIKE folds ASCII only; preserve its eligibility semantics.
+		internalName := sqliteIdentifierFold(definition.name)
+		if crudInternalName.MatchString(internalName) || definition.virtual {
+			continue
+		}
+		// A migration can create a table with any name. Auto-CRUD serves
+		// only plain names: the name becomes a route pattern, a URL segment
+		// and part of every statement the handlers build. Any other table
+		// stays reachable from the app's own SQL and from the tools that
+		// list every table (GetAllTableNames).
+		if !membershipIdentRe.MatchString(definition.name) {
+			continue
+		}
+		shadow := false
+		for virtual := range virtuals {
+			if strings.HasPrefix(definition.name, virtual+"_") {
+				shadow = true
+				break
+			}
+		}
+		if shadow {
+			continue
+		}
+		if isVersionHistoryDefinition(definition) {
+			continue
+		}
+		eligible[definition.name] = true
+	}
+	return eligible
+}
+
+func readCRUDTableDefinitions(db *sql.DB) ([]crudTableDefinition, error) {
+	rows, err := db.Query("SELECT name,COALESCE(sql,'') FROM sqlite_master WHERE type='table' ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var names []string
+	var definitions []crudTableDefinition
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var name, statement string
+		if err := rows.Scan(&name, &statement); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		names = append(names, name)
+		definitions = append(definitions, crudTableDefinition{name: name, virtual: strings.HasPrefix(strings.ToUpper(statement), "CREATE VIRTUAL TABLE")})
 	}
-	return names, rows.Err()
+	scanErr := rows.Err()
+	rows.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	for i := range definitions {
+		definition := &definitions[i]
+		if !strings.HasSuffix(definition.name, "_history") {
+			continue
+		}
+		columns, err := db.Query("SELECT name,hidden FROM pragma_table_xinfo(?)", definition.name)
+		if err != nil {
+			return nil, err
+		}
+		definition.columns = map[string]bool{}
+		definition.allColumns = map[string]bool{}
+		for columns.Next() {
+			var name string
+			var hidden int
+			if err := columns.Scan(&name, &hidden); err != nil {
+				columns.Close()
+				return nil, err
+			}
+			definition.allColumns[name] = true
+			if hidden == 0 {
+				definition.columns[name] = true
+			}
+		}
+		scanErr := columns.Err()
+		columns.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+	}
+	return definitions, nil
+}
+func sqliteIdentifierFold(name string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, name)
+}
+func GetTableNames(db *sql.DB) ([]string, error) {
+	definitions, err := readCRUDTableDefinitions(db)
+	if err != nil {
+		return nil, err
+	}
+	eligible := eligibleCRUDTables(definitions)
+	var names []string
+	for _, definition := range definitions {
+		if eligible[definition.name] {
+			names = append(names, definition.name)
+		}
+	}
+	return names, nil
 }
 
 // GetAllTableNames returns every table including _benmore_* system tables.
 // Used by the context graph extractor and dashboard schema browser which
 // need to show user-facing system tables like _benmore_users.
 func GetAllTableNames(db *sql.DB) ([]string, error) {
-	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	return allTableNamesWith(db)
+}
+
+func allTableNamesWith(db mutationQuerier) ([]string, error) {
+	rows, err := db.Query("SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -581,7 +857,37 @@ func GetTableColumns(db *sql.DB, table string) ([]Column, error) {
 	return tableColumnsWith(db, table)
 }
 func tableColumnsWith(db mutationQuerier, table string) ([]Column, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	return tableColumnsQuery(db.Query, table)
+}
+
+func mainTableColumnsWith(db mutationQuerier, table string) ([]Column, error) {
+	if !isValidColumnName(table) {
+		return nil, fmt.Errorf("invalid table name %q", table)
+	}
+	rows, err := db.Query("PRAGMA main.table_info(" + quoteIdent(table) + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := make([]Column, 0)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		cols = append(cols, Column{Name: name, Type: colType, NotNull: notNull == 1, Default: defaultValue.String, PK: pk > 0})
+	}
+	return cols, rows.Err()
+}
+func tableColumnsQuery(query func(string, ...any) (*sql.Rows, error), table string) ([]Column, error) {
+	// Callers pass names from routes and tool arguments; only a plain
+	// identifier may reach the PRAGMA text.
+	if !isValidColumnName(table) {
+		return nil, fmt.Errorf("invalid table name %q", table)
+	}
+	rows, err := query("PRAGMA table_info(" + quoteIdent(table) + ")")
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +916,10 @@ func tableColumnsWith(db mutationQuerier, table string) ([]Column, error) {
 
 // GetForeignKeys returns foreign key info for a table.
 func GetForeignKeys(db *sql.DB, table string) (map[string]ForeignKey, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", table))
+	if !isValidColumnName(table) {
+		return nil, fmt.Errorf("invalid table name %q", table)
+	}
+	rows, err := db.Query("PRAGMA foreign_key_list(" + quoteIdent(table) + ")")
 	if err != nil {
 		return nil, err
 	}
@@ -675,6 +984,13 @@ func EnsureUsersTable(db *sql.DB) error {
 			}
 		}
 	}
+	if err := ensureMFASetupNonce(db); err != nil {
+		return err
+	}
+	if err := ensureSignInChallenges(db); err != nil {
+		return err
+	}
+	ensureEmailGrandfathering(db)
 	// Backfill usernames for existing users that predate the username column
 	BackfillUsernames(db)
 	// Case-insensitive uniqueness on email (2026-06-11 audit): the plain
@@ -865,6 +1181,49 @@ func EnsureAuditLogTable(db *sql.DB) {
 		new_values TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
+	// The admin behind a support-impersonation session. user_id/user_email
+	// stay the impersonated account (whose data changed); these name who
+	// actually acted. Zero / empty for every other row.
+	db.Exec("ALTER TABLE _benmore_audit_log ADD COLUMN impersonator_user_id INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE _benmore_audit_log ADD COLUMN impersonator_email TEXT DEFAULT ''")
+	// The audit log only grows, and every reader filtered or counted it with
+	// a full scan: per-record history (versioning, admin row view) by
+	// (table_name, row_id), a user's trail by user_id newest first, and the
+	// dashboards' "last 24h" counts by created_at.
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_audit_log_row ON _benmore_audit_log(table_name, row_id)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_audit_log_user ON _benmore_audit_log(user_id, id)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_audit_log_time ON _benmore_audit_log(created_at)")
+}
+
+// insertAuditRow writes one audit row, adding the impersonating admin when
+// the session is a support-impersonation session.
+func insertAuditRow(db *sql.DB, action, table, rowID string, session *Session, oldJSON, newJSON string) {
+	if err := insertAuditRowChecked(db, action, table, rowID, session, oldJSON, newJSON); err != nil {
+		log.Printf("audit: %s on %s could not be recorded: %v", action, table, err)
+	}
+}
+
+func insertAuditRowChecked(exec sqlExecutor, action, table, rowID string, session *Session, oldJSON, newJSON string) error {
+	var userID int64
+	var email string
+	if session != nil {
+		userID = session.UserID
+		email = session.Email
+	}
+	if session != nil && session.ImpersonatorUserID != 0 {
+		if _, err := exec.Exec(
+			"INSERT INTO main._benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values, impersonator_user_id, impersonator_email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			action, table, rowID, userID, email, oldJSON, newJSON, session.ImpersonatorUserID, session.ImpersonatorEmail,
+		); err != nil {
+			return err
+		}
+		return nil
+	}
+	_, err := exec.Exec(
+		"INSERT INTO main._benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		action, table, rowID, userID, email, oldJSON, newJSON,
+	)
+	return err
 }
 
 // LogAudit records a CRUD mutation in the audit log.
@@ -876,17 +1235,16 @@ func EnsureAuditLogTable(db *sql.DB) {
 // the `old_<col>` change-delta keys the framework includes inside
 // `newRow` (so `new_values` JSON doesn't leak prior values either).
 //
+// Hidden columns (apiHiddenColumn: `*_secret`, `*_token`, credential
+// hashes, blind indexes) are recorded as changed but never by value
+// (redactAuditHiddenFields): the audit log is served to admins
+// (/api/_audit, get_audit_log) and shipped to audit sinks, and a copy
+// of a secret there outlives its rotation.
+//
 // Backward-compatible variant LogAuditDB exists for the few callers
 // that don't have an *App in scope (the retention worker logs only
 // metadata - counts, TTLs - so no encryption is needed).
 func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, newRow map[string]any) {
-	var userID int64
-	var email string
-	if session != nil {
-		userID = session.UserID
-		email = session.Email
-	}
-
 	var config *EncryptedFieldConfig
 	if app != nil {
 		config = app.Encrypted
@@ -895,8 +1253,8 @@ func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, n
 	if app != nil && config != nil {
 		auditKey = cryptoKeyForQuerier(app.DB)
 	}
-	oldForAudit := encryptAuditFieldsCopy(config, table, oldRow, auditKey)
-	newForAudit := encryptAuditFieldsCopy(config, table, newRow, auditKey)
+	oldForAudit := redactAuditHiddenFields(app, table, encryptAuditFieldsCopy(config, table, oldRow, auditKey))
+	newForAudit := redactAuditHiddenFields(app, table, encryptAuditFieldsCopy(config, table, newRow, auditKey))
 
 	var oldJSON, newJSON string
 	if oldForAudit != nil {
@@ -911,22 +1269,81 @@ func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, n
 	if app == nil || app.DB == nil {
 		return
 	}
-	app.DB.Exec(
-		"INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		action, table, rowID, userID, email, oldJSON, newJSON,
-	)
+	insertAuditRow(app.DB, action, table, rowID, session, oldJSON, newJSON)
+}
+
+// LogAuditTx writes the same encrypted audit representation through the
+// mutation transaction, returning serialization and insert failures so the
+// caller can roll back the mutation.
+func LogAuditTx(tx mutationTx, app *App, action, table, rowID string, session *Session, oldRow, newRow map[string]any) error {
+	var key []byte
+	var config *EncryptedFieldConfig
+	if app != nil {
+		config = app.Encrypted
+	}
+	if config != nil {
+		var err error
+		key, err = cryptoKeyForQuerierMainChecked(tx)
+		if err != nil {
+			return fmt.Errorf("resolve audit encryption key: %w", err)
+		}
+	}
+	oldForAudit := redactAuditHiddenFields(app, table, encryptAuditFieldsCopy(config, table, oldRow, key))
+	newForAudit := redactAuditHiddenFields(app, table, encryptAuditFieldsCopy(config, table, newRow, key))
+	var oldJSON, newJSON string
+	if oldForAudit != nil {
+		b, err := json.Marshal(oldForAudit)
+		if err != nil {
+			return fmt.Errorf("serialize old audit values: %w", err)
+		}
+		oldJSON = string(b)
+	}
+	if newForAudit != nil {
+		b, err := json.Marshal(newForAudit)
+		if err != nil {
+			return fmt.Errorf("serialize new audit values: %w", err)
+		}
+		newJSON = string(b)
+	}
+	return insertAuditRowChecked(tx, action, table, rowID, session, oldJSON, newJSON)
+}
+
+// auditHiddenValue replaces a hidden column's value in audit old/new values.
+const auditHiddenValue = "[hidden]"
+
+// redactAuditHiddenFields returns row with the values of hidden columns, and
+// of their `old_<col>` change-delta keys, replaced by auditHiddenValue. The
+// caller's map is never modified (hooks and webhooks share it).
+func redactAuditHiddenFields(app *App, table string, row map[string]any) map[string]any {
+	if row == nil || app == nil {
+		return row
+	}
+	var out map[string]any
+	for k, v := range row {
+		if v == nil {
+			continue
+		}
+		if !hiddenEventKey(app, table, k) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(row))
+			for k2, v2 := range row {
+				out[k2] = v2
+			}
+		}
+		out[k] = auditHiddenValue
+	}
+	if out == nil {
+		return row
+	}
+	return out
 }
 
 // LogAuditDB is the backwards-compat shim for callers that log
 // metadata-only audit events without any row values to encrypt
 // (e.g. the retention sweep, which logs counts + TTLs).
 func LogAuditDB(db *sql.DB, action, table, rowID string, session *Session, oldRow, newRow map[string]any) {
-	var userID int64
-	var email string
-	if session != nil {
-		userID = session.UserID
-		email = session.Email
-	}
 	var oldJSON, newJSON string
 	if oldRow != nil {
 		b, _ := json.Marshal(oldRow)
@@ -939,17 +1356,14 @@ func LogAuditDB(db *sql.DB, action, table, rowID string, session *Session, oldRo
 	if db == nil {
 		return
 	}
-	db.Exec(
-		"INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		action, table, rowID, userID, email, oldJSON, newJSON,
-	)
+	insertAuditRow(db, action, table, rowID, session, oldJSON, newJSON)
 }
 
 // RegisterAuditAPI adds the audit trail query endpoint.
-func RegisterAuditAPI(mux *http.ServeMux, app *App) {
+func RegisterAuditAPI(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_audit", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() {
+		if session == nil || !session.IsAdminConsole() {
 			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
 			return
 		}
@@ -976,9 +1390,9 @@ func RegisterAuditAPI(mux *http.ServeMux, app *App) {
 
 		query += " ORDER BY created_at DESC LIMIT 100"
 
-		rows, err := QueryRows(app.DB, query, args...)
+		rows, err := queryMetadataRows(app.DB, query, args...)
 		if err != nil {
-			http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+			serverErrorJSON(w, r, app, "_audit", err, "query failed")
 			return
 		}
 
@@ -1002,14 +1416,31 @@ func EnsureDevicesTable(db *sql.DB) {
 }
 
 // RegisterDeviceRoutes adds device registration endpoints for push notifications.
-func RegisterDeviceRoutes(mux *http.ServeMux, app *App) {
+func RegisterDeviceRoutes(mux appRouteRegistrar, app *App) {
 	EnsureDevicesTable(app.DB)
+	registerDeviceRoutes(mux, app)
+}
 
+func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 	// Register/update a device token
 	mux.HandleFunc("POST /api/_devices", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
 			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			return
+		}
+		// A registered device receives the account's push notifications from
+		// then on. A support or delegated session is someone else's browser
+		// or phone: registering it would keep delivering the customer's
+		// notifications there after the session ends.
+		if delegatedIdentitySession(app, session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": delegatedIdentityRefusal})
+			return
+		}
+		// Cookie sessions need CSRF: the JSON body is decoded whatever the
+		// content type, so a plain cross-site POST could otherwise register
+		// a device token on the visitor's account. Bearer (native) is exempt.
+		if !requireCSRF(w, r) {
 			return
 		}
 
@@ -1038,6 +1469,15 @@ func RegisterDeviceRoutes(mux *http.ServeMux, app *App) {
 		session := getSession(app, r)
 		if session == nil {
 			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			return
+		}
+		// Nor may it unregister the owner's devices (an empty body removes
+		// every one).
+		if delegatedIdentitySession(app, session) {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": delegatedIdentityRefusal})
+			return
+		}
+		if !requireCSRF(w, r) {
 			return
 		}
 
@@ -1099,109 +1539,212 @@ func EnsureIdempotencyTable(db *sql.DB) {
 // ParseCreateTables extracts table definitions from SQL.
 func ParseCreateTables(schema string) []Table {
 	var tables []Table
-	lines := strings.Split(schema, "\n")
-	var currentTable *Table
-	var inCreate bool
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-
-		if strings.HasPrefix(upper, "CREATE TABLE") {
-			name := extractTableName(trimmed)
-			if name != "" {
-				currentTable = &Table{Name: name}
-				inCreate = true
+	_ = splitSQLStatements(strings.NewReader(schema), func(statement string) error {
+		statement = stripSQLComments(statement)
+		start, end, depth, offset := -1, -1, 0, 0
+		_ = scanSQLBytes(statement, func(b byte, kind sqlByteKind) error {
+			i := offset
+			offset++
+			if kind != sqlCode {
+				return nil
 			}
-			continue
+			if b == '(' {
+				if depth == 0 && start < 0 {
+					start = i
+				}
+				depth++
+			}
+			if b == ')' {
+				depth--
+				if depth == 0 && start >= 0 && end < 0 {
+					end = i
+				}
+			}
+			return nil
+		})
+		if start < 0 || end < start {
+			return nil
 		}
-
-		if inCreate && currentTable != nil {
-			if strings.Contains(trimmed, ");") || trimmed == ")" {
-				tables = append(tables, *currentTable)
-				currentTable = nil
-				inCreate = false
+		name := extractTableName(statement[:start])
+		if name == "" {
+			return nil
+		}
+		table := Table{Name: name}
+		definitions := splitSchemaParts(statement[start+1 : end])
+		for _, definition := range definitions {
+			if col := parseColumnDef(definition); col != nil {
+				table.Columns = append(table.Columns, *col)
+			}
+		}
+		for _, definition := range definitions {
+			tokens := sqlTokenize(definition)
+			if len(tokens) > 2 && tokens[0].kind == sqlTokWord && strings.EqualFold(tokens[0].text, "CONSTRAINT") {
+				tokens = tokens[2:]
+			}
+			if len(tokens) < 4 || tokens[0].kind != sqlTokWord || !strings.EqualFold(tokens[0].text, "PRIMARY") || !strings.EqualFold(tokens[1].text, "KEY") || tokens[2].text != "(" {
 				continue
 			}
-
-			col := parseColumnDef(trimmed)
-			if col != nil {
-				currentTable.Columns = append(currentTable.Columns, *col)
+			for i := 3; i < len(tokens); i++ {
+				if tokens[i].kind == sqlTokPunct && tokens[i].text == ")" {
+					break
+				}
+				if i != 3 && !(tokens[i-1].kind == sqlTokPunct && tokens[i-1].text == ",") {
+					continue
+				}
+				for j := range table.Columns {
+					if sqliteIdentifierFold(table.Columns[j].Name) == sqliteIdentifierFold(tokens[i].text) {
+						table.Columns[j].PK = true
+					}
+				}
 			}
 		}
-	}
-
+		tables = append(tables, table)
+		return nil
+	})
 	return tables
 }
 
 func extractTableName(line string) string {
-	// Handle: CREATE TABLE [IF NOT EXISTS] name (
-	upper := strings.ToUpper(line)
-	idx := strings.Index(upper, "TABLE")
-	if idx < 0 {
+	tokens := sqlTokenize(line)
+	if len(tokens) < 3 || tokens[0].kind != sqlTokWord || !strings.EqualFold(tokens[0].text, "CREATE") || tokens[1].kind != sqlTokWord || !strings.EqualFold(tokens[1].text, "TABLE") {
 		return ""
 	}
-	rest := strings.TrimSpace(line[idx+5:])
-
-	// Skip IF NOT EXISTS
-	if strings.HasPrefix(strings.ToUpper(rest), "IF NOT EXISTS") {
-		rest = strings.TrimSpace(rest[13:])
+	i := 2
+	if len(tokens) > i+2 && strings.EqualFold(tokens[i].text, "IF") && strings.EqualFold(tokens[i+1].text, "NOT") && strings.EqualFold(tokens[i+2].text, "EXISTS") {
+		i += 3
 	}
+	if i >= len(tokens) || tokens[i].kind == sqlTokPunct {
+		return ""
+	}
+	if i+2 < len(tokens) && tokens[i+1].text == "." {
+		i += 2
+	}
+	if tokens[i].kind == sqlTokPunct {
+		return ""
+	}
+	if i+1 < len(tokens) && tokens[i+1].text != "(" {
+		return ""
+	}
+	return tokens[i].text
+}
 
-	// Extract name (up to parenthesis or whitespace)
-	name := strings.FieldsFunc(rest, func(r rune) bool {
-		return r == '(' || r == ' ' || r == '\t'
+// splitSchemaParts shares the SQL scanner so quoted text and nested expressions
+// remain intact when splitting column declarations.
+func splitSchemaParts(s string) []string {
+	var parts []string
+	start, offset, depth := 0, 0, 0
+	_ = scanSQLBytes(s, func(b byte, kind sqlByteKind) error {
+		i := offset
+		offset++
+		if kind != sqlCode {
+			return nil
+		}
+		if b == '(' {
+			depth++
+		}
+		if b == ')' {
+			depth--
+		}
+		if depth == 0 && b == ',' {
+			if part := strings.TrimSpace(s[start:i]); part != "" {
+				parts = append(parts, part)
+			}
+			start = i + 1
+		}
+		return nil
 	})
-	if len(name) > 0 {
-		return strings.Trim(name[0], "\"'`")
+	if part := strings.TrimSpace(s[start:]); part != "" {
+		parts = append(parts, part)
 	}
-	return ""
+	return parts
 }
 
 func parseColumnDef(line string) *Column {
-	line = strings.TrimRight(line, ",")
-	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, "--") {
+	line = strings.TrimSpace(strings.TrimRight(stripSQLComments(line), ", \t\r\n"))
+	tokens := sqlTokenize(line)
+	if len(tokens) == 0 {
 		return nil
 	}
-
-	upper := strings.ToUpper(line)
-	// Skip constraints
-	for _, prefix := range []string{"PRIMARY KEY", "FOREIGN KEY", "UNIQUE", "CHECK", "CONSTRAINT"} {
-		if strings.HasPrefix(upper, prefix) {
+	wordAt := func(i int, word string) bool {
+		return i < len(tokens) && tokens[i].kind == sqlTokWord && strings.EqualFold(tokens[i].text, word)
+	}
+	if tokens[0].kind == sqlTokWord {
+		switch strings.ToUpper(tokens[0].text) {
+		case "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT":
 			return nil
 		}
 	}
-
-	parts := strings.Fields(line)
-	if len(parts) < 1 {
-		return nil
-	}
-
-	col := &Column{
-		Name: strings.Trim(parts[0], "\"'`"),
-	}
-	if len(parts) > 1 {
-		col.Type = parts[1]
-	}
-
-	if strings.Contains(upper, "PRIMARY KEY") {
-		col.PK = true
-	}
-	if strings.Contains(upper, "NOT NULL") {
-		col.NotNull = true
-	}
-
-	// Extract DEFAULT value
-	if idx := strings.Index(upper, "DEFAULT "); idx >= 0 {
-		rest := strings.TrimSpace(line[idx+8:])
-		// Get the default value (up to next keyword or end)
-		defaultVal := strings.Fields(rest)
-		if len(defaultVal) > 0 {
-			col.Default = defaultVal[0]
+	col := &Column{Name: tokens[0].text}
+	typeEnd, depth := len(line), 0
+	for i := 1; i < len(tokens); i++ {
+		token := tokens[i]
+		if token.kind == sqlTokPunct {
+			if token.text == "(" {
+				depth++
+			}
+			if token.text == ")" {
+				depth--
+			}
+			continue
 		}
+		if depth != 0 || token.kind != sqlTokWord {
+			continue
+		}
+		word := strings.ToUpper(token.text)
+		switch word {
+		case "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS", "CONSTRAINT":
+			if typeEnd == len(line) {
+				typeEnd = token.start
+			}
+		}
+		if word == "PRIMARY" && wordAt(i+1, "KEY") {
+			col.PK = true
+		}
+		if word == "NOT" && wordAt(i+1, "NULL") {
+			col.NotNull = true
+		}
+		// SET DEFAULT belongs to a foreign-key action, not the column default.
+		if word != "DEFAULT" || wordAt(i-1, "SET") || i+1 >= len(tokens) {
+			continue
+		}
+		start := i + 1
+		end := start
+		if tokens[end].kind == sqlTokPunct && (tokens[end].text == "+" || tokens[end].text == "-") && end+1 < len(tokens) {
+			end++
+		}
+		value := tokens[end]
+		if wordAt(end, "X") && end+1 < len(tokens) && tokens[end+1].kind == sqlTokLiteral && value.end == tokens[end+1].start {
+			end++ // SQLite blob literal X'...'
+		} else if value.kind == sqlTokPunct && value.text == "(" {
+			valueDepth := 1
+			for end+1 < len(tokens) && valueDepth > 0 {
+				end++
+				if tokens[end].kind == sqlTokPunct {
+					if tokens[end].text == "(" {
+						valueDepth++
+					}
+					if tokens[end].text == ")" {
+						valueDepth--
+					}
+				}
+			}
+		} else if value.kind == sqlTokWord && len(value.text) > 0 && value.text[0] >= '0' && value.text[0] <= '9' || value.kind == sqlTokPunct && value.text == "." {
+			// The shared tokenizer separates decimal/exponent punctuation. Keep its
+			// numeric tokens together; SQLite validates the resulting declaration.
+			for end+1 < len(tokens) {
+				next := tokens[end+1]
+				numericWord := next.kind == sqlTokWord && len(next.text) > 0 && (next.text[0] >= '0' && next.text[0] <= '9' || next.text[0] == 'e' || next.text[0] == 'E')
+				numericPunct := next.kind == sqlTokPunct && (next.text == "." || next.text == "+" || next.text == "-")
+				if !numericWord && !numericPunct {
+					break
+				}
+				end++
+			}
+		}
+		col.Default = line[tokens[start].start:tokens[end].end]
+		i = end
 	}
-
+	col.Type = strings.TrimSpace(line[tokens[0].end:typeEnd])
 	return col
 }
 
@@ -1271,15 +1814,15 @@ func truncate(s string, n int) string {
 // Forced TRUNCATE checkpoints work alongside readers (they keep their old
 // snapshot until they complete) and reset the WAL once free.
 //
-// IMPORTANT: this MUST run from inside the same process that holds the
-// app.DB pool. Running checkpoint from an external sqlite3 invocation
-// against an open DB corrupts the running process's connection state
-// (data.db-shm mmap goes bad → 'disk I/O error: no such file or directory').
+// With PITR enabled this worker only backfills. The shipper owns generation
+// rotation and its SQLite read pins prevent discarding required history.
+// External SQLite connections use the same locking protocol; replacing live
+// database/sidecar files outside that protocol remains unsafe.
 //
 // Issue #1.
 func StartAppWALMaintenance(app *App) {
+	stop := app.workerStopGeneration()
 	safeGo("db.walMaintenance", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -1318,14 +1861,14 @@ func appWALSize(app *App) int64 {
 	return fi.Size()
 }
 
-func walCheckpointMode(app *App, walSize int64) string {
+func walCheckpointMode(app *App, _ int64) string {
 	if !walShippingEnabledForApp(app) {
 		return "TRUNCATE"
 	}
-	if walSize > app.walShippedOffset.Load() {
-		return "PASSIVE"
-	}
-	return "TRUNCATE"
+	// Physical length includes rollback/spill tails, and a new commit can land
+	// between a coverage check and TRUNCATE. The shipper owns generation
+	// rotation under SQLite coordination; ordinary maintenance only backfills.
+	return "PASSIVE"
 }
 
 func walShippingEnabledForApp(app *App) bool {
@@ -1336,7 +1879,7 @@ func walShippingEnabledForApp(app *App) bool {
 	// prevent. Gate on BACKUP_S3_BUCKET (what backupS3Store keys off) so a
 	// half-configured deployment still truncates. Inlined as an env check
 	// rather than calling backupS3Store(), which is platform-only.
-	return app != nil &&
+	return platformBuild && app != nil &&
 		os.Getenv("BENMORE_WAL_SHIP") == "1" &&
 		!IsDevSubdomain(filepath.Base(app.Dir)) &&
 		os.Getenv("BACKUP_S3_BUCKET") != ""

@@ -88,8 +88,29 @@ func checkSMSRateLimit(phone string) error {
 	}
 
 	smsRateLimit.sends[phone] = append(recent, time.Now())
+	// A number's entry is otherwise pruned only when that number is used
+	// again, so a caller naming a new number each time grows the map for
+	// the life of the process. Past the bound, drop every expired entry.
+	if len(smsRateLimit.sends) > smsRateLimitSweepAt {
+		for k, times := range smsRateLimit.sends {
+			live := times[:0]
+			for _, t := range times {
+				if t.After(cutoff) {
+					live = append(live, t)
+				}
+			}
+			if len(live) == 0 {
+				delete(smsRateLimit.sends, k)
+			} else {
+				smsRateLimit.sends[k] = live
+			}
+		}
+	}
 	return nil
 }
+
+// smsRateLimitSweepAt is the map size past which expired entries are swept.
+const smsRateLimitSweepAt = 4096
 
 // SendSMS sends a text message using the configured SMS provider.
 // Provider is configured via environment variables:
@@ -150,7 +171,7 @@ func SendSMS(appDir, to, body string) error {
 	}
 	// Rate limit: max 5 SMS per phone per 10 minutes
 	if err := checkSMSRateLimit(to); err != nil {
-		log.Printf("SMS BLOCKED: %s", err)
+		log.Printf("SMS BLOCKED: %s", logSendError(err, to))
 		return err
 	}
 
@@ -185,10 +206,10 @@ func SendSMS(appDir, to, body string) error {
 				App:  os.Getenv("BENMORE_APP_NAME"),
 			})
 			if gerr != nil {
-				log.Printf("SMS [platform gateway failed] to=%s: %s", to, gerr)
+				log.Printf("SMS [platform gateway failed] to=%s: %s", logAddressRef(to), logSendError(gerr, to))
 				return gerr
 			}
-			log.Printf("SMS [sent via platform] to=%s from=%s id=%s", to, resp.From, resp.MessageID)
+			log.Printf("SMS [sent via platform] to=%s from=%s id=%s", logAddressRef(to), resp.From, resp.MessageID)
 			return nil
 		}
 		if provider == "" {
@@ -198,7 +219,7 @@ func SendSMS(appDir, to, body string) error {
 			// user to /verify-otp with no code in their inbox. The
 			// hooks/flows path made the same call look like a no-op
 			// when in fact nothing went out the door.
-			log.Printf("SMS [not sent - no provider configured] to=%s", to)
+			log.Printf("SMS [not sent - no provider configured] to=%s", logAddressRef(to))
 			return fmt.Errorf("SMS not delivered: no provider configured. " +
 				"Set SMS_ACCOUNT_SID + SMS_AUTH_TOKEN (Twilio - buy a number at " +
 				"https://www.twilio.com/console; trial accounts can only send to " +
@@ -244,7 +265,7 @@ func sendSMSTwilio(appDir, to, body, from string) error {
 		return fmt.Errorf("twilio error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	log.Printf("SMS: sent to %s via Twilio", to)
+	log.Printf("SMS: sent to %s via Twilio", logAddressRef(to))
 	return nil
 }
 
@@ -289,6 +310,6 @@ func sendSMSWebhook(appDir, to, body, from string) error {
 		return fmt.Errorf("SMS webhook error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	log.Printf("SMS: sent to %s via webhook", to)
+	log.Printf("SMS: sent to %s via webhook", logAddressRef(to))
 	return nil
 }

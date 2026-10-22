@@ -43,7 +43,7 @@ for a in "$@"; do
   if [ "$prev" = "-i" ]; then in="$a"; fi
   prev="$a"; last="$a"
 done
-cp "$in" "$last"`
+cp "${in#file:}" "$last"`
 
 // fakeWhisperScript writes a known transcript into <--output-file value>.txt.
 const fakeWhisperScript = `out=""; prev=""
@@ -190,27 +190,38 @@ func TestTranscribeTimeoutKillsProcessGroup(t *testing.T) {
 		fmt.Sprintf("sleep 60 &\necho $! > %q\nwait", pidFile))
 	setFakePATH(t, binDir)
 	seedModel(t, "small.en")
-	t.Setenv("TRANSCRIBE_TIMEOUT", "1s")
+	upload := seedUpload(t, app, "a.webm")
 
-	start := time.Now()
-	_, err := RunTranscribe(context.Background(), app, seedUpload(t, app, "a.webm"), "", "")
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-	if elapsed > 10*time.Second {
-		t.Errorf("timeout took %s - subprocess was not killed promptly", elapsed)
-	}
-	if !strings.Contains(err.Error(), "TRANSCRIBE_TIMEOUT") {
-		t.Errorf("timeout error %q should name TRANSCRIBE_TIMEOUT (the remedy)", err)
+	// The timeout covers the whole pipeline, and the grandchild exists only
+	// once the fake whisper has started. On a loaded machine the fake
+	// ffmpeg alone can outlast a 1s budget, which says nothing about the
+	// kill: give the pipeline a longer budget until whisper got to run.
+	var raw []byte
+	var readErr error
+	for _, budget := range []time.Duration{time.Second, 4 * time.Second, 15 * time.Second} {
+		t.Setenv("TRANSCRIBE_TIMEOUT", budget.String())
+		start := time.Now()
+		_, err := RunTranscribe(context.Background(), app, upload, "", "")
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+		if elapsed > budget+10*time.Second {
+			t.Errorf("timeout took %s (budget %s) - subprocess was not killed promptly", elapsed, budget)
+		}
+		if !strings.Contains(err.Error(), "TRANSCRIBE_TIMEOUT") {
+			t.Errorf("timeout error %q should name TRANSCRIBE_TIMEOUT (the remedy)", err)
+		}
+		if raw, readErr = os.ReadFile(pidFile); readErr == nil {
+			break
+		}
 	}
 
 	// No orphan: the GRANDCHILD must be gone. It is two forks below the
 	// exec'd process (nice → sh → sleep), so only the process-group kill
 	// can have reached it.
-	raw, readErr := os.ReadFile(pidFile)
 	if readErr != nil {
-		t.Fatalf("fake whisper never ran: %v", readErr)
+		t.Fatalf("fake whisper never ran within a 15s budget: %v", readErr)
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if pid <= 0 {

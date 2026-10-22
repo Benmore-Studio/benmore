@@ -3,247 +3,315 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 )
 
-// uniqueIndexRe captures `CREATE UNIQUE INDEX [IF NOT EXISTS] <idx>
-// ON <table> (<col1>, <col2>, …)`. Group 1: table. Group 2: column list.
-var uniqueIndexRe = regexp.MustCompile(
-	`(?is)\bCREATE\s+UNIQUE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+ON\s+(\w+)\s*\(([^)]+)\)`,
-)
-
-// precheckUniqueIndex queries the target table for rows that would
-// violate the proposed unique constraint. If any are found, returns a
-// structured error listing up to 10 example duplicate values so the
-// caller can dedupe before re-running. nil on no duplicates / non-
-// unique-index statements (passes through).
-//
-// The original failure mode: CREATE UNIQUE INDEX on a table with
-// existing duplicates threw "UNIQUE constraint failed" with zero hint
-// at which rows. The migration kept retrying on every app restart,
-// blocking the entire app from booting. This precheck surfaces the
-// data problem before the constraint applies.
-func precheckUniqueIndex(db *sql.DB, stmt string) error {
-	m := uniqueIndexRe.FindStringSubmatch(stmt)
-	if len(m) < 3 {
-		return nil // not a CREATE UNIQUE INDEX, nothing to precheck
-	}
-	table := strings.TrimSpace(m[1])
-	colList := m[2]
-	cols := []string{}
-	for _, c := range strings.Split(colList, ",") {
-		c = strings.TrimSpace(c)
-		// Strip any DESC / ASC / COLLATE suffix.
-		if i := strings.IndexAny(c, " \t"); i >= 0 {
-			c = c[:i]
-		}
-		if c != "" {
-			cols = append(cols, c)
-		}
-	}
-	if len(cols) == 0 {
-		return nil
-	}
-	colSQL := strings.Join(cols, ", ")
-	query := fmt.Sprintf(
-		"SELECT %s, COUNT(*) AS n FROM %s GROUP BY %s HAVING n > 1 LIMIT 10",
-		colSQL, table, colSQL,
-	)
-	rows, err := db.Query(query)
-	if err != nil {
-		// If the table doesn't exist yet (CREATE INDEX before CREATE
-		// TABLE in the same migration file), let the actual exec run
-		// and surface its own error - precheck shouldn't block valid
-		// migrations.
-		return nil
-	}
-	defer rows.Close()
-	type dup struct {
-		Values []any
-		Count  int64
-	}
-	var dups []dup
-	colCount := len(cols)
-	for rows.Next() {
-		raw := make([]any, colCount+1)
-		ptrs := make([]any, colCount+1)
-		for i := range raw {
-			ptrs[i] = &raw[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		count, _ := raw[colCount].(int64)
-		dups = append(dups, dup{Values: raw[:colCount], Count: count})
-	}
-	if len(dups) == 0 {
-		return nil
-	}
-	// Format the error. Each dup line shows column=value pairs + count.
-	var b strings.Builder
-	fmt.Fprintf(&b,
-		"CREATE UNIQUE INDEX on %s(%s) would fail - existing data has %d duplicate row group(s):\n\n",
-		table, colSQL, len(dups),
-	)
-	for _, d := range dups {
-		b.WriteString("  ")
-		for i, c := range cols {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			fmt.Fprintf(&b, "%s=%v", c, d.Values[i])
-		}
-		fmt.Fprintf(&b, "  (%d rows)\n", d.Count)
-	}
-	b.WriteString(
-		"\nResolution: dedupe before re-running the migration. Options:\n" +
-			fmt.Sprintf("  • Keep most recent: DELETE FROM %s WHERE rowid NOT IN (SELECT MAX(rowid) FROM %s GROUP BY %s)\n", table, table, colSQL) +
-			"  • Or rename the constraint so duplicates are allowed.\n" +
-			"  • Or rename the column to make the existing values distinct.\n\n" +
-			"The migration is aborted - no partial state was applied. Once dedupe completes, the next app start picks up the migration cleanly.",
-	)
-	return fmt.Errorf("%s", b.String())
-}
-
-// AdvancedMigration handles column renames, type changes, and data migrations.
-// SQLite doesn't support ALTER TABLE RENAME COLUMN in older versions,
-// so we use the "create new table, copy data, drop old, rename" pattern.
-
-// RenameColumn renames a column in a table.
+// RenameColumn and DropColumn use SQLite's native schema transformations. A
+// dependency error is not evidence of an old SQLite version: rebuilding after
+// any such error used to drop constraints and cascade-delete dependent rows.
 func RenameColumn(db *sql.DB, table, oldName, newName string) error {
-	// SQLite 3.25.0+ supports ALTER TABLE RENAME COLUMN
-	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", table, oldName, newName))
-	if err == nil {
-		log.Printf("MIGRATE: renamed %s.%s → %s", table, oldName, newName)
-		return nil
+	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", quoteIdent(table), quoteIdent(oldName), quoteIdent(newName)))
+	if err != nil {
+		return fmt.Errorf("rename %s.%s: %w", table, oldName, err)
 	}
-
-	// Fallback: rebuild table
-	return rebuildTable(db, table, func(col Column) *Column {
-		if col.Name == oldName {
-			col.Name = newName
-			return &col
-		}
-		return &col
-	})
+	log.Printf("MIGRATE: renamed %s.%s → %s", table, oldName, newName)
+	return nil
 }
 
-// AlterColumnType changes a column's type (SQLite is flexible about types, but this rebuilds for strictness).
+func DropColumn(db *sql.DB, table, column string) error {
+	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", quoteIdent(table), quoteIdent(column)))
+	if err != nil {
+		return fmt.Errorf("drop %s.%s (remove dependent indexes or triggers explicitly first): %w", table, column, err)
+	}
+	log.Printf("MIGRATE: dropped %s.%s", table, column)
+	return nil
+}
+
 func AlterColumnType(db *sql.DB, table, column, newType string) error {
 	return rebuildTable(db, table, func(col Column) *Column {
 		if col.Name == column {
 			col.Type = newType
-			return &col
 		}
 		return &col
 	})
 }
 
-// DropColumn removes a column from a table.
-func DropColumn(db *sql.DB, table, column string) error {
-	// SQLite 3.35.0+ supports ALTER TABLE DROP COLUMN
-	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", table, column))
-	if err == nil {
-		log.Printf("MIGRATE: dropped %s.%s", table, column)
-		return nil
-	}
-
-	// Fallback: rebuild without the column
-	return rebuildTable(db, table, func(col Column) *Column {
-		if col.Name == column {
-			return nil // exclude this column
-		}
-		return &col
-	})
-}
-
-// rebuildTable recreates a table with modified schema (SQLite table rebuild pattern).
+// rebuildTable changes column types/nullability while preserving the original
+// table constraints/options, every index and every trigger. Referenced parent
+// tables require an explicit migration: DROP TABLE can execute ON DELETE
+// actions even inside a transaction, so refuse before any DDL or copying.
 func rebuildTable(db *sql.DB, table string, transform func(Column) *Column) error {
-	cols, err := GetTableColumns(db, table)
-	if err != nil {
-		return err
-	}
-
-	// Build new schema
-	var newCols []Column
-	var oldNames []string
-	var newNames []string
-	for _, col := range cols {
-		result := transform(col)
-		if result == nil {
-			continue // column dropped
-		}
-		newCols = append(newCols, *result)
-		oldNames = append(oldNames, col.Name)
-		newNames = append(newNames, result.Name)
-	}
-
-	if len(newCols) == 0 {
-		return fmt.Errorf("rebuild: would result in empty table")
-	}
-
-	tmpTable := table + "_migrate_tmp"
-
-	// Create new table
-	var colDefs []string
-	for _, c := range newCols {
-		def := c.Name + " " + c.Type
-		if c.PK {
-			def += " PRIMARY KEY"
-			if c.Type == "INTEGER" {
-				def += " AUTOINCREMENT"
-			}
-		}
-		if c.NotNull && !c.PK {
-			def += " NOT NULL"
-		}
-		if c.Default != "" {
-			def += " DEFAULT " + c.Default
-		}
-		colDefs = append(colDefs, def)
-	}
-
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
-	// Create temp table
-	createSQL := fmt.Sprintf("CREATE TABLE %s (%s)", tmpTable, strings.Join(colDefs, ", "))
-	if _, err := tx.Exec(createSQL); err != nil {
-		return fmt.Errorf("create temp: %w", err)
+	_, err = rebuildTableInTx(tx, table, func(original, temporary string, cols []Column) (string, error) {
+		oldCols, nextCols := map[string]Column{}, map[string]Column{}
+		for _, col := range cols {
+			next := transform(col)
+			if next == nil || next.Name != col.Name || next.PK != col.PK || next.Default != col.Default {
+				return "", fmt.Errorf("only column type and nullability changes are supported")
+			}
+			key := sqliteIdentifierFold(col.Name)
+			oldCols[key], nextCols[key] = col, *next
+		}
+		return rebuildCreateSQL(original, temporary, oldCols, nextCols)
+	})
+	if err != nil {
+		return err
 	}
-
-	// Copy data
-	copySQL := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s",
-		tmpTable, strings.Join(newNames, ", "), strings.Join(oldNames, ", "), table)
-	if _, err := tx.Exec(copySQL); err != nil {
-		return fmt.Errorf("copy data: %w", err)
-	}
-
-	// Drop old table
-	if _, err := tx.Exec(fmt.Sprintf("DROP TABLE %s", table)); err != nil {
-		return fmt.Errorf("drop old: %w", err)
-	}
-
-	// Rename new table
-	if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s RENAME TO %s", tmpTable, table)); err != nil {
-		return fmt.Errorf("rename: %w", err)
-	}
-
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return fmt.Errorf("commit rebuild: %w", err)
 	}
-
 	log.Printf("MIGRATE: rebuilt table %s", table)
 	return nil
+}
+
+// rebuildTableInTx shares the preservation and refusal rules with Prisma
+// relation repairs. The caller owns the transaction; returned SQL is the exact
+// rebuild journal, including statements attempted before an error.
+func rebuildTableInTx(tx *sql.Tx, table string, rewrite func(string, string, []Column) (string, error)) (statements []string, err error) {
+	exec := func(statement string) error {
+		statements = append(statements, statement+";")
+		_, err := tx.Exec(statement)
+		return err
+	}
+	if err := checkTableRebuildReferences(tx, table); err != nil {
+		return statements, err
+	}
+
+	cols, err := tableColumnsWith(tx, table)
+	if err != nil {
+		return statements, err
+	}
+	if len(cols) == 0 {
+		return statements, fmt.Errorf("rebuild: table %s has no ordinary columns", table)
+	}
+	oldCols := map[string]Column{}
+	var names []string
+	for _, col := range cols {
+		key := sqliteIdentifierFold(col.Name)
+		oldCols[key] = col
+		names = append(names, col.Name)
+	}
+	// Hidden rowids are observable (including by external-content FTS). Copy
+	// them too, even when the primary key is TEXT or rows have gaps.
+	var withoutRowID int
+	if err := tx.QueryRow("SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?", table).Scan(&withoutRowID); err != nil {
+		return statements, fmt.Errorf("inspect rebuild table options: %w", err)
+	}
+	if withoutRowID == 0 {
+		rowID := ""
+		for _, candidate := range []string{"rowid", "_rowid_", "oid"} {
+			if _, shadowed := oldCols[candidate]; !shadowed {
+				rowID = candidate
+				break
+			}
+		}
+		if rowID == "" {
+			return statements, fmt.Errorf("rebuild %s: all hidden rowid aliases are shadowed; use an explicit migration", table)
+		}
+		names = append([]string{rowID}, names...)
+	}
+	var original string
+	if err := tx.QueryRow("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", table).Scan(&original); err != nil {
+		return statements, fmt.Errorf("read rebuild schema: %w", err)
+	}
+	tmpTable := table + "_migrate_tmp"
+	createSQL, err := rewrite(original, tmpTable, cols)
+	if err != nil {
+		return statements, fmt.Errorf("rebuild %s: %w", table, err)
+	}
+
+	rows, err := tx.Query(`SELECT name, sql FROM sqlite_schema
+		WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL
+		ORDER BY type, name`, table)
+	if err != nil {
+		return statements, fmt.Errorf("read rebuild dependencies: %w", err)
+	}
+	var dependencies [][2]string
+	for rows.Next() {
+		var name, ddl string
+		if err := rows.Scan(&name, &ddl); err != nil {
+			rows.Close()
+			return statements, err
+		}
+		dependencies = append(dependencies, [2]string{name, ddl})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return statements, err
+	}
+	// Preserve AUTOINCREMENT's high-water mark even if the largest rows were
+	// deleted before this migration; recreating it from MAX(id) reuses IDs.
+	var sequence sql.NullInt64
+	if dbTableExists(tx, "sqlite_sequence") {
+		err := tx.QueryRow("SELECT seq FROM sqlite_sequence WHERE name=?", table).Scan(&sequence)
+		if err != nil && err != sql.ErrNoRows {
+			return statements, err
+		}
+	}
+
+	if err := exec(createSQL); err != nil {
+		return statements, fmt.Errorf("create rebuild table: %w", err)
+	}
+	columns := strings.Join(quoteIdents(names), ", ")
+	if err := exec(fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s", quoteIdent(tmpTable), columns, columns, quoteIdent(table))); err != nil {
+		return statements, fmt.Errorf("copy rebuild data: %w", err)
+	}
+	// Validate even if a caller opened SQLite with foreign_keys disabled.
+	if err := validateTableForeignKeys(tx, tmpTable); err != nil {
+		return statements, err
+	}
+	if err := exec("DROP TABLE " + quoteIdent(table)); err != nil {
+		return statements, fmt.Errorf("drop old: %w", err)
+	}
+	if err := exec(fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteIdent(tmpTable), quoteIdent(table))); err != nil {
+		return statements, fmt.Errorf("rename rebuild table: %w", err)
+	}
+	for _, dependency := range dependencies {
+		if err := exec(dependency[1]); err != nil {
+			return statements, fmt.Errorf("restore rebuild dependency %s: %w", dependency[0], err)
+		}
+	}
+	if sequence.Valid {
+		if err := exec(fmt.Sprintf("UPDATE sqlite_sequence SET seq=MAX(seq, %d) WHERE name='%s'", sequence.Int64, strings.ReplaceAll(table, "'", "''"))); err != nil {
+			return statements, err
+		}
+	}
+	return statements, nil
+}
+
+// Shared with read-only upgrade preflight: DROP TABLE may run ON DELETE
+// actions, so automatic rebuilds refuse incoming references before any DDL.
+func checkTableRebuildReferences(q mutationQuerier, table string) error {
+	var child string
+	err := q.QueryRow(`SELECT m.name FROM sqlite_schema AS m
+		JOIN pragma_foreign_key_list(m.name) AS f
+		WHERE m.type='table' AND f."table" = ? COLLATE NOCASE LIMIT 1`, table).Scan(&child)
+	if err == nil {
+		return fmt.Errorf("rebuild %s: referenced by foreign key in %s; use an explicit migration that preserves related rows", table, child)
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("inspect rebuild foreign keys: %w", err)
+	}
+	return nil
+}
+
+// Rewrite only the requested column attributes in the catalog DDL. Building
+// from PRAGMA table_info alone loses UNIQUE/CHECK/FK/COLLATE, generated columns,
+// composite keys, WITHOUT ROWID and STRICT. All untouched SQL is retained.
+func rebuildCreateSQL(original, temporary string, oldCols, nextCols map[string]Column) (string, error) {
+	tokens := sqlTokenize(original)
+	if len(tokens) < 4 || !strings.EqualFold(tokens[0].text, "CREATE") || !strings.EqualFold(tokens[1].text, "TABLE") {
+		return "", fmt.Errorf("unsupported table declaration")
+	}
+	start, end, depth := -1, -1, 0
+	for _, token := range tokens {
+		if token.kind != sqlTokPunct {
+			continue
+		}
+		if token.text == "(" {
+			if start < 0 {
+				start = token.start
+			}
+			depth++
+		} else if token.text == ")" {
+			depth--
+			if depth == 0 && start >= 0 {
+				end = token.start
+				break
+			}
+		}
+	}
+	if start < 0 || end < 0 {
+		return "", fmt.Errorf("unsupported table declaration")
+	}
+	parts := splitSchemaParts(original[start+1 : end])
+	for i, part := range parts {
+		parsed := parseColumnDef(part)
+		if parsed == nil {
+			continue
+		} // table constraint, retained verbatim
+		key := sqliteIdentifierFold(parsed.Name)
+		old, exists := oldCols[key]
+		if !exists {
+			continue
+		} // generated column, not copied or changed
+		var err error
+		parts[i], err = rebuildColumnSQL(part, old, nextCols[key])
+		if err != nil {
+			return "", err
+		}
+	}
+	return "CREATE TABLE " + quoteIdent(temporary) + " (" + strings.Join(parts, ", ") + ")" + original[end+1:], nil
+}
+
+func rebuildColumnSQL(definition string, old, next Column) (string, error) {
+	tokens := sqlTokenize(definition)
+	type edit struct {
+		start, end int
+		text       string
+	}
+	var edits []edit
+	depth, typeEnd, removed := 0, len(definition), false
+	for i := 1; i < len(tokens); i++ {
+		token := tokens[i]
+		if token.kind == sqlTokPunct {
+			if token.text == "(" {
+				depth++
+			}
+			if token.text == ")" {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || token.kind != sqlTokWord {
+			continue
+		}
+		switch strings.ToUpper(token.text) {
+		case "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS", "CONSTRAINT":
+			if typeEnd == len(definition) {
+				typeEnd = token.start
+			}
+		}
+		if old.NotNull && !next.NotNull && strings.EqualFold(token.text, "NOT") && i+1 < len(tokens) && tokens[i+1].kind == sqlTokWord && strings.EqualFold(tokens[i+1].text, "NULL") {
+			start, end := token.start, tokens[i+1].end
+			if i >= 3 && tokens[i-2].kind == sqlTokWord && strings.EqualFold(tokens[i-2].text, "CONSTRAINT") {
+				start = tokens[i-2].start
+			}
+			if i+4 < len(tokens) && strings.EqualFold(tokens[i+2].text, "ON") && strings.EqualFold(tokens[i+3].text, "CONFLICT") {
+				end = tokens[i+4].end
+			}
+			edits = append(edits, edit{start, end, ""})
+			removed = true
+		}
+	}
+	if old.Type != next.Type {
+		edits = append(edits, edit{tokens[0].end, typeEnd, " " + quoteDeclType(next.Type) + " "})
+	}
+	if old.NotNull && !next.NotNull && !removed {
+		return "", fmt.Errorf("cannot remove implicit NOT NULL from %s", old.Name)
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
+	for _, e := range edits {
+		definition = definition[:e.start] + e.text + definition[e.end:]
+	}
+	if !old.NotNull && next.NotNull {
+		definition += " NOT NULL"
+	}
+	return definition, nil
 }
 
 // RunMigrationFile executes a .sql migration file.
@@ -332,11 +400,20 @@ func isRenameAlreadyApplied(q sqlQuerier, stmt string, err error) bool {
 }
 
 func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
+	return runMigrationFileCtx(context.Background(), db, path, name, recordSQL)
+}
+
+// runMigrationFileCtx applies one migration file; the context bounds every
+// statement (an interrupted statement rolls the whole file back).
+func runMigrationFileCtx(ctx context.Context, db *sql.DB, path, name, recordSQL string) error {
 	data, err := readFileBytes(path)
 	if err != nil {
 		return err
 	}
+	return runMigrationDataCtx(ctx, db, data, name, recordSQL)
+}
 
+func runMigrationDataCtx(ctx context.Context, db *sql.DB, data []byte, name, recordSQL string) error {
 	// Files generated by ApplyPrismaMigration carry both UP and DOWN
 	// sections separated by `-- DOWN --`. We only run the UP block
 	// here. Without this guard, on a fresh deploy where the data.db
@@ -358,7 +435,7 @@ func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
 	// unrecorded, so the next boot re-ran from the top and the already-applied
 	// prefix errored ("duplicate column") forever - a wedged, half-migrated
 	// schema. Rolling back on failure means a retry always starts clean.
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin migration tx: %w", err)
 	}
@@ -373,18 +450,13 @@ func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
 		}
-		// Precheck: CREATE UNIQUE INDEX on a table with existing
-		// duplicates fails at runtime with a useless "UNIQUE constraint
-		// failed" error and leaves the app stuck in a restart loop
-		// (router keeps retrying the migration, every retry fails the
-		// same way). Surface the actual duplicate values instead so the
-		// agent/user can decide whether to dedupe or rename the
-		// constraint. (Reads committed state via db - a freshly-created
-		// table in this same file is empty, so no false positive.)
-		if dupErr := precheckUniqueIndex(db, stmt); dupErr != nil {
-			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), dupErr)
+		// SQLite itself checks UNIQUE in this transaction. A separate GROUP BY
+		// preflight treats NULL as duplicate, misses partial/collated semantics,
+		// and cannot see a dedupe performed by preceding migration statements.
+		if err := dropFrameworkIndexesForStatement(tx, stmt); err != nil { // scoping_indexes.go
+			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)
 		}
-		if _, err := tx.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			// Idempotency: if the desired change is ALREADY present (the column /
 			// table / index was created by an earlier schema sync or a prior
 			// partial run), skip the statement instead of failing the file. A
@@ -413,7 +485,7 @@ func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
 	}
 	// Record inside the SAME tx: apply + record are atomic, so a crash between
 	// them can no longer leave an applied-but-unrecorded file that re-runs.
-	if _, err := tx.Exec(recordSQL, name); err != nil {
+	if _, err := tx.ExecContext(ctx, recordSQL, name); err != nil {
 		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -429,18 +501,25 @@ func RunMigrations(db *sql.DB, dir string) error {
 	return runMigrations(db, dir, nil)
 }
 
+func runMigrations(db *sql.DB, dir string, beforeApply func() error) error {
+	return runMigrationsCtx(context.Background(), db, dir, beforeApply)
+}
+
 // beforeApply runs once, immediately before the first pending migration. Keep
 // backup selection next to the authoritative ledger check so an unchanged
 // startup/reload never copies the entire database just to discover no work.
-func runMigrations(db *sql.DB, dir string, beforeApply func() error) error {
-	migrationsDir := filepath.Join(dir, "migrations")
-	entries, err := os.ReadDir(migrationsDir)
+func runMigrationsCtx(ctx context.Context, db *sql.DB, dir string, beforeApply func() error) error {
+	return runMigrationsCtxFromSources(ctx, db, dir, beforeApply, nil)
+}
+func runMigrationsCtxFromSources(ctx context.Context, db *sql.DB, dir string, beforeApply func() error, captured map[string][]byte) error {
+	names, err := migrationSourceNames(dir, captured)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return fmt.Errorf("read migrations: %w", err)
 	}
+	if names == nil {
+		return nil
+	}
+	migrationsDir := filepath.Join(dir, "migrations")
 
 	// Legacy (schema.sql-only) apps: ensure a tracking table. On schema.prisma
 	// apps ApplyPrismaMigration already created a richer 5-column table
@@ -458,11 +537,7 @@ func runMigrations(db *sql.DB, dir string, beforeApply func() error) error {
 		recordSQL = "INSERT INTO _benmore_migrations (name, source, source_hash) VALUES (?, '', '')"
 	}
 
-	for _, entry := range entries {
-		n := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(n, ".sql") || strings.HasSuffix(n, ".failed.sql") {
-			continue
-		}
+	for _, n := range names {
 
 		// Check if already applied
 		var count int
@@ -479,13 +554,26 @@ func runMigrations(db *sql.DB, dir string, beforeApply func() error) error {
 			beforeApply = nil
 		}
 
-		if err := RunMigrationFile(db, filepath.Join(migrationsDir, n), n, recordSQL); err != nil {
+		data, err := readMigrationSource(dir, n, captured)
+		if err == nil {
+			err = runMigrationDataCtx(ctx, db, data, n, recordSQL)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				// Out of time is not a defect in the file: leave it in place for the
+				// app's own boot, which has no deadline.
+				return fmt.Errorf("migration %s did not finish within the validation time limit (it is applied when the app itself starts): %w", n, err)
+			}
 			// Rename so a persistently-failing file does not re-attempt every
 			// reload/boot (mirrors ApplyPrismaMigration's .failed handling).
 			// Fixing = the user renames it back.
-			failed := filepath.Join(migrationsDir, n+".failed.sql")
-			if rnErr := os.Rename(filepath.Join(migrationsDir, n), failed); rnErr != nil {
-				log.Printf("  migration: could not rename failed file %s: %v", n, rnErr)
+			// A captured failure cannot rename a file which may now contain
+			// unrelated replacement bytes. Ordinary disk loads keep their behavior.
+			if captured == nil {
+				failed := filepath.Join(migrationsDir, n+".failed.sql")
+				if rnErr := os.Rename(filepath.Join(migrationsDir, n), failed); rnErr != nil {
+					log.Printf("  migration: could not rename failed file %s: %v", n, rnErr)
+				}
 			}
 			return fmt.Errorf("migration %s: %w", n, err)
 		}
@@ -499,10 +587,34 @@ func runMigrations(db *sql.DB, dir string, beforeApply func() error) error {
 // migrations/*.sql. Used on both cold boot and the SIGHUP reload path so a
 // deploy-triggered reload applies newly shipped migrations with a safety net.
 func runUserMigrationsWithBackup(db *sql.DB, dir string) error {
-	return runMigrations(db, dir, func() error {
+	return runUserMigrationsCtx(context.Background(), db, dir, false)
+}
+
+// checkMigrationTimeout bounds user migrations applied by a validation load in
+// the router. The migration SQL is tenant-authored, and a statement that never
+// finishes (a recursive CTE with no end) would otherwise pin a router core,
+// and be retried by every subsequent edit. The app's own boot has no deadline.
+var checkMigrationTimeout = 30 * time.Second
+
+// runUserMigrationsCtx applies pending migrations. checkOnly (a router-side
+// validation load) bounds the run by checkMigrationTimeout and reuses a recent
+// snapshot instead of copying the database again.
+func runUserMigrationsCtx(ctx context.Context, db *sql.DB, dir string, checkOnly bool) error {
+	return runUserMigrationsFromSources(ctx, db, dir, checkOnly, nil)
+}
+func runUserMigrationsFromSources(ctx context.Context, db *sql.DB, dir string, checkOnly bool, captured map[string][]byte) error {
+	if checkOnly {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, checkMigrationTimeout)
+		defer cancel()
+	}
+	return runMigrationsCtxFromSources(ctx, db, dir, func() error {
+		if checkOnly && recentPreMigrateBackup(dir, checkBackupMinInterval) {
+			return nil
+		}
 		_, err := preparePreMigrationBackup(dir, true)
 		return err
-	})
+	}, captured)
 }
 
 // pendingUserMigrations reports migrations/*.sql not yet recorded as applied
@@ -533,4 +645,46 @@ func pendingUserMigrations(db *sql.DB, dir string) (pending, failed []string) {
 
 func readFileBytes(path string) ([]byte, error) {
 	return os.ReadFile(path)
+}
+
+// The same ordered migration inputs drive candidate routing and execution.
+func migrationSourceNames(dir string, captured map[string][]byte) ([]string, error) {
+	var names []string
+	if captured != nil {
+		for name := range captured {
+			if filepath.Base(name) != name || name == "." || name == ".." {
+				return nil, fmt.Errorf("invalid captured migration name")
+			}
+			if strings.HasSuffix(name, ".sql") && !strings.HasSuffix(name, ".failed.sql") {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		return names, nil
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "migrations"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	names = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasSuffix(name, ".sql") && !strings.HasSuffix(name, ".failed.sql") {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+func readMigrationSource(dir, name string, captured map[string][]byte) ([]byte, error) {
+	if captured == nil {
+		return readFileBytes(filepath.Join(dir, "migrations", name))
+	}
+	data, exists := captured[name]
+	if !exists || data == nil {
+		return nil, fmt.Errorf("missing captured migration input")
+	}
+	return data, nil
 }

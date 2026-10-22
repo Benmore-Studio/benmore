@@ -15,18 +15,25 @@
 
 const CSRF_META = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 
-async function request(method, path, body) {
-  const headers = { Accept: 'application/json' };
+async function request(method, path, body, options) {
+  const headers = new Headers({ Accept: 'application/json' });
+  if (options?.headers) {
+    new Headers(options.headers).forEach((value, name) => headers.set(name, value));
+  }
   const init = { method, credentials: 'same-origin', headers };
+  if (options?.signal !== undefined) init.signal = options.signal;
   if (body !== undefined && body !== null) {
-    headers['Content-Type'] = 'application/json';
+    headers.set('Content-Type', 'application/json');
     init.body = JSON.stringify(body);
   }
   if (method !== 'GET' && method !== 'HEAD') {
-    headers['X-CSRF-Token'] = CSRF_META();
+    headers.set('X-CSRF-Token', CSRF_META());
   }
   const res = await fetch(path, init);
-  if (res.status === 204) return { ok: true, status: 204, data: null };
+  if (res.status === 204) {
+    observeSessionResponse(method, path, true, null);
+    return { ok: true, status: 204, data: null };
+  }
   const text = await res.text();
   const ct = (res.headers.get('content-type') || '').toLowerCase();
   let data = null;
@@ -37,6 +44,7 @@ async function request(method, path, body) {
       data = { error: text };
     }
   }
+  observeSessionResponse(method, path, res.ok, data);
   return { ok: res.ok, status: res.status, data };
 }
 
@@ -56,16 +64,16 @@ async function unwrap(res) {
 export const api = {
   // Raw forms - return { ok, status, data }, never throw on HTTP errors.
   raw: {
-    get:    (p)    => request('GET',    p),
-    post:   (p, b) => request('POST',   p, b),
-    patch:  (p, b) => request('PATCH',  p, b),
-    delete: (p)    => request('DELETE', p),
+    get:    (p, o)    => request('GET',    p, undefined, o),
+    post:   (p, b, o) => request('POST',   p, b, o),
+    patch:  (p, b, o) => request('PATCH',  p, b, o),
+    delete: (p, o)    => request('DELETE', p, undefined, o),
   },
   // Convenience forms - throw on !ok, return data directly.
-  get:    async (p)    => unwrap(await request('GET',    p)),
-  post:   async (p, b) => unwrap(await request('POST',   p, b)),
-  patch:  async (p, b) => unwrap(await request('PATCH',  p, b)),
-  delete: async (p)    => unwrap(await request('DELETE', p)),
+  get:    async (p, o)    => unwrap(await request('GET',    p, undefined, o)),
+  post:   async (p, b, o) => unwrap(await request('POST',   p, b, o)),
+  patch:  async (p, b, o) => unwrap(await request('PATCH',  p, b, o)),
+  delete: async (p, o)    => unwrap(await request('DELETE', p, undefined, o)),
 
   /**
    * Optimistic mutation + reconcile. Applies the change to local
@@ -119,23 +127,56 @@ export const api = {
 // =================================================================
 
 let _meCache = undefined; // distinguish "never fetched" (undefined) from "fetched, no session" (null)
+let _authRevision = 0;
+const _sessionListeners = new Set();
+
+function resetSessionState(profile = undefined) {
+  _authRevision++;
+  _meCache = profile;
+  resetSessionQueries();
+  const bus = _liveConns.get('__bus__');
+  if (bus) bus.reconnect(profile !== null);
+  _sessionListeners.forEach(reset => reset(profile !== null));
+}
+
+// These native endpoints change the cookie session or its active tenant. A
+// successful password/passkey proof that still needs OTP/MFA is not a session.
+// Custom auth routes can explicitly finish with auth.refreshMe().
+function observeSessionResponse(method, path, ok, data) {
+  if (!ok || typeof path !== 'string') return;
+  const route = path.split(/[?#]/, 1)[0];
+  if (route === '/api/_auth/act_as' && (method === 'POST' || method === 'DELETE')) {
+    resetSessionState();
+    return;
+  }
+  if (method !== 'POST') return;
+  if (route === '/logout') resetSessionState(null);
+  else if (['/login', '/signup', '/api/_auth/passkeys/login'].includes(route)) {
+    if (data?.user?.id != null) resetSessionState();
+  } else if (route === '/api/_auth/mfa/verify') {
+    if (data?.token && data?.user_id != null) resetSessionState();
+  } else if (['/api/_switch_group', '/api/_groups/create', '/api/_auth/impersonate', '/api/_auth/end-impersonation', '/verify-mfa', '/verify-otp'].includes(route)) {
+    if (!data?.otp_required && !data?.mfa_required && !data?.mfa_setup_required) resetSessionState();
+  }
+}
 
 async function me() {
   if (_meCache !== undefined) return _meCache;
+  const revision = _authRevision;
   const res = await request('GET', '/api/_auth/profile');
+  if (revision !== _authRevision) return me();
   _meCache = res.ok ? res.data : null;
   return _meCache;
 }
 
 async function signOut() {
   // Framework's logout endpoint is registered at app.Paths.Logout (default /logout).
-  await request('POST', '/logout');
-  _meCache = null;
+  await unwrap(await request('POST', '/logout'));
 }
 
 // Force-refresh the profile cache (useful right after signup).
 async function refreshMe() {
-  _meCache = undefined;
+  resetSessionState();
   return me();
 }
 
@@ -150,7 +191,6 @@ async function signIn(identifier, password) {
     err.body = res.data;
     throw err;
   }
-  _meCache = undefined; // force next me() to refetch with new session
   return res.data?.user || null;
 }
 
@@ -165,11 +205,94 @@ async function signUp(fields) {
     err.body = res.data;
     throw err;
   }
-  _meCache = undefined;
   return res.data?.user || null;
 }
 
-export const auth = { me, signOut, refreshMe, signIn, signUp };
+// =================================================================
+//  Passkeys - sign in with Face ID, Touch ID, Windows Hello or a phone.
+// =================================================================
+//   await bm.auth.passkey.register('MacBook', { password })   // signed in: add a passkey
+//   await bm.auth.passkey.signIn()              // signed out: sign in
+//   await bm.auth.passkey.list(); await bm.auth.passkey.remove(id)
+// bm.auth.passkey.supported() is false where the browser has no WebAuthn.
+
+function _b64uToBuf(s) {
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const bin = atob((s + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+function _bufToB64u(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function _passkeyCall(method, path, body, fallback) {
+  const res = await request(method, path, body);
+  if (!res.ok) {
+    const err = new Error(res.data?.error || fallback);
+    err.status = res.status;
+    err.body = res.data;
+    throw err;
+  }
+  return res.data;
+}
+
+const passkey = {
+  supported() {
+    return typeof window !== 'undefined' && !!window.PublicKeyCredential && !!navigator.credentials;
+  },
+  async register(name, proof) {
+    // proof: { password } or { mfa_code } - adding a passkey re-confirms the account.
+    // Optional within 10 minutes of signing in on this browser (e.g. with Google).
+    const o = await _passkeyCall('POST', '/api/_auth/passkeys/register/options', proof || {}, 'Could not start passkey setup');
+    const cred = await navigator.credentials.create({ publicKey: {
+      ...o,
+      challenge: _b64uToBuf(o.challenge),
+      user: { ...o.user, id: _b64uToBuf(o.user.id) },
+      excludeCredentials: (o.excludeCredentials || []).map((c) => ({ ...c, id: _b64uToBuf(c.id) })),
+    } });
+    const r = cred.response;
+    return (await _passkeyCall('POST', '/api/_auth/passkeys/register', {
+      id: cred.id, rawId: _bufToB64u(cred.rawId), type: cred.type, name: name || '',
+      response: {
+        clientDataJSON: _bufToB64u(r.clientDataJSON),
+        attestationObject: _bufToB64u(r.attestationObject),
+      },
+    }, 'Could not save the passkey')).passkey;
+  },
+  async signIn() {
+    const o = await _passkeyCall('POST', '/api/_auth/passkeys/login/options', {}, 'Could not start passkey sign-in');
+    const cred = await navigator.credentials.get({ publicKey: {
+      ...o,
+      challenge: _b64uToBuf(o.challenge),
+      allowCredentials: (o.allowCredentials || []).map((c) => ({ ...c, id: _b64uToBuf(c.id) })),
+    } });
+    const r = cred.response;
+    const data = await _passkeyCall('POST', '/api/_auth/passkeys/login', {
+      id: cred.id, rawId: _bufToB64u(cred.rawId), type: cred.type,
+      response: {
+        clientDataJSON: _bufToB64u(r.clientDataJSON),
+        authenticatorData: _bufToB64u(r.authenticatorData),
+        signature: _bufToB64u(r.signature),
+        userHandle: r.userHandle ? _bufToB64u(r.userHandle) : '',
+      },
+    }, 'Passkey sign-in failed');
+    return data.user || null;
+  },
+  async list() {
+    return (await _passkeyCall('GET', '/api/_auth/passkeys', undefined, 'Could not list passkeys')).passkeys || [];
+  },
+  async remove(id) {
+    await _passkeyCall('DELETE', '/api/_auth/passkeys/' + _seg(id), undefined, 'Could not remove the passkey');
+  },
+};
+
+export const auth = { me, signOut, refreshMe, signIn, signUp, passkey };
 
 // =================================================================
 //  3. Users - public user-lookup (v2.7.11+, default-private)
@@ -185,7 +308,7 @@ export const users = {
     return r.users || [];
   },
   async get(id) {
-    return api.get(`/api/_auth/users/${id}`);
+    return api.get(`/api/_auth/users/${_rowRef(id)}`);
   },
 };
 
@@ -222,6 +345,29 @@ const _runHooks = (kind, opts, ctx) => {
   return cur;
 };
 
+// A row id goes into the path as written (apps pass `id + '?include=...'`),
+// so an id taken from a URL param such as `../_auth/tokens/7` aimed the
+// CSRF-bearing PATCH/DELETE/POST at another endpoint once the browser
+// resolved the dot segments. Refuse dot segments and backslashes, judged
+// after removing tab, LF and CR the way the URL parser does (`.\t.` is `..`).
+function _rowRef(id) {
+  const s = String(id);
+  const path = s.split(/[?#]/, 1)[0].replace(/[\t\n\r]/g, '');
+  if (path.includes('\\') || /(^|\/)(\.|%2e){1,2}(\/|$)/i.test(path)) {
+    throw new Error('bm.table: invalid row id ' + JSON.stringify(s));
+  }
+  return s;
+}
+
+// One encoded path segment. encodeURIComponent leaves '.' alone, so an id of
+// '..' still removed the segment before it (DELETE /api/docs/../permissions/x
+// is DELETE /api/permissions/x).
+function _seg(v) {
+  const e = encodeURIComponent(String(v));
+  if (e === '.' || e === '..') throw new Error('bm: invalid path segment ' + JSON.stringify(String(v)));
+  return e;
+}
+
 export function table(name) {
   if (!name || typeof name !== 'string') {
     throw new Error('bm.table(name) requires a string table name');
@@ -236,19 +382,22 @@ export function table(name) {
       const qs = new URLSearchParams();
       if (opts.limit)  qs.set('limit',  String(opts.limit));
       if (opts.offset) qs.set('offset', String(opts.offset));
-      if (opts.cursor) qs.set('cursor', String(opts.cursor));
+      if (opts.cursor != null) qs.set('cursor', String(opts.cursor));
       if (opts.q)      qs.set('q',      String(opts.q));
+      if (opts.sort)   qs.set('sort',   String(opts.sort));
+      if (opts.order)  qs.set('order',  String(opts.order));
       if (opts.where) {
         for (const [k, v] of Object.entries(opts.where)) qs.set(k, String(v));
       }
       const path = base + (qs.toString() ? '?' + qs : '');
       const r = await api.get(path);
-      // Auto-CRUD returns a bare array OR { rows: [...] } depending on path.
-      return Array.isArray(r) ? r : (r.rows || []);
+      // Offset lists are bare arrays; cursor/page lists use { data: [...] }.
+      // Retain { rows: [...] } compatibility for existing table adapters.
+      return Array.isArray(r) ? r : (r.rows || r.data || []);
     },
     get(id) {
       _runHooks('read', { id }, { table: t, op: 'get' });
-      return api.get(`${base}/${id}`);
+      return api.get(`${base}/${_rowRef(id)}`);
     },
     create(body) {
       const opts = _runHooks('write', { body }, { table: t, op: 'create' });
@@ -256,11 +405,11 @@ export function table(name) {
     },
     update(id, body) {
       const opts = _runHooks('write', { id, body }, { table: t, op: 'update' });
-      return api.patch(`${base}/${opts.id ?? id}`, opts.body ?? body);
+      return api.patch(`${base}/${_rowRef(opts.id ?? id)}`, opts.body ?? body);
     },
     delete(id) {
       _runHooks('write', { id }, { table: t, op: 'delete' });
-      return api.delete(`${base}/${id}`);
+      return api.delete(`${base}/${_rowRef(id)}`);
     },
     // bm.table('x').count({ where, q }) - TRUE row count, no LIMIT cap.
     //
@@ -283,9 +432,9 @@ export function table(name) {
     // Feature methods - TS gates them at compile time per TableFeatures.
     // At runtime they always exist; the server returns 4xx when the
     // table doesn't actually support the operation.
-    restore:  (id)               => api.post(`${base}/${id}/restore`),
-    versions: (id)               => api.get(`${base}/${id}/versions`),
-    revertTo: (id, version)      => api.post(`${base}/${id}/revert/${version}`),
+    restore:  (id)               => api.post(`${base}/${_rowRef(id)}/restore`),
+    versions: (id)               => api.get(`${base}/${_rowRef(id)}/versions`),
+    revertTo: (id, version)      => api.post(`${base}/${_rowRef(id)}/revert/${_rowRef(version)}`),
   };
 }
 
@@ -336,18 +485,30 @@ table.clearHooks = function () {
 const _liveConns = new Map(); // share one EventSource per page
 
 function liveBus() {
-  if (_liveConns.has('__bus__')) return _liveConns.get('__bus__');
+  if (_liveConns.has('__bus__')) {
+    const bus = _liveConns.get('__bus__');
+    bus.ensure();
+    return bus;
+  }
   const subs = new Set();
-  const es = new EventSource('/sse/events');
-  const fire = (raw) => {
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
-    subs.forEach(fn => { try { fn(data); } catch (e) { console.error(e); } });
+  let es = null;
+  const reconnect = (connect = true) => {
+    if (es) es.close();
+    es = null;
+    if (!connect) return;
+    const current = es = new EventSource('/sse/events');
+    const fire = (raw) => {
+      if (es !== current) return; // queued event from a previous session
+      let data;
+      try { data = JSON.parse(raw); } catch { return; }
+      subs.forEach(fn => { try { fn(data); } catch (e) { console.error(e); } });
+    };
+    current.addEventListener('change', e => fire(e.data));
+    current.onmessage = e => fire(e.data);
+    current.onerror = () => { /* EventSource auto-reconnects */ };
   };
-  es.addEventListener('change', e => fire(e.data));
-  es.onmessage = e => fire(e.data);
-  es.onerror = () => { /* EventSource auto-reconnects */ };
-  const bus = { subs, close: () => es.close() };
+  const bus = { subs, reconnect, ensure: () => { if (!es) reconnect(); }, close: () => reconnect(false) };
+  reconnect();
   _liveConns.set('__bus__', bus);
   return bus;
 }
@@ -373,12 +534,10 @@ export function live(tableOrStar, cb) {
 // bm.live.scoped(table, fetchAndRender, opts) - `live()` with the
 // production-grade plumbing baked in:
 //
-//   - **Generation counter**: only the freshest fetch can write to
-//     state. When SSE fires a burst (insert + membership + conv update
-//     in ~30ms, an earlier app build's exact pattern), older in-flight
-//     fetches that resolve later are dropped instead of overwriting
-//     the freshest one. Pre-2.7.37 every app re-derived this counter
-//     pattern manually.
+//   - **Serialized callbacks**: one fetchAndRender runs at a time per
+//     subscription. Events during a pending callback queue one trailing
+//     refresh, so an older callback cannot overwrite a newer callback's
+//     render. The returned promise must cover all fetch and render work.
 //
 //   - **Trailing-edge debounce**: bursts of events coalesce into a
 //     single fetch fired `debounce` ms after the LAST event. Avoids
@@ -388,10 +547,13 @@ export function live(tableOrStar, cb) {
 //
 // `fetchAndRender` is called with no args; it should read whatever
 // data it needs (auto-CRUD list, custom flow, whatever) and update
-// the DOM. Return value ignored. Errors caught + logged.
+// the DOM. Its returned promise is awaited; other values are ignored.
+// Errors are caught + logged. Detached work and separate subscriptions
+// are not serialized. A callback that never settles blocks its queue.
 //
 // Returns an unsubscribe function. Calling it stops the SSE
-// subscription AND cancels any pending debounced fetch.
+// subscription AND cancels pending/queued fetches. An already-running
+// callback cannot be cancelled; callers must guard its teardown effects.
 //
 //   const unsub = bm.live.scoped('messages', refreshChat, { debounce: 60 });
 //   // ... later
@@ -401,12 +563,14 @@ live.scoped = function liveScoped(tableOrStar, fetchAndRender, opts) {
     throw new Error('bm.live.scoped(table, fetchAndRender, opts) requires a function');
   }
   const debounceMs = (opts && typeof opts.debounce === 'number') ? opts.debounce : 60;
-  let generation = 0;
+  let running = false, queued = false, stopped = false;
   let pendingTimer = null;
 
   const runFetch = async () => {
-    const my = ++generation;
     pendingTimer = null;
+    if (stopped) return;
+    if (running) { queued = true; return; }
+    running = true;
     try {
       const result = fetchAndRender();
       if (result && typeof result.then === 'function') {
@@ -414,22 +578,22 @@ live.scoped = function liveScoped(tableOrStar, fetchAndRender, opts) {
       }
     } catch (err) {
       console.warn('[bm.live.scoped] fetchAndRender threw:', err);
+    } finally {
+      running = false;
+      if (queued && !stopped) {
+        queued = false;
+        schedule();
+      }
     }
-    // If newer fetches kicked off while we were awaiting, ours is
-    // stale - caller doesn't care, the newer one wins. The generation
-    // counter is the discriminator; we don't actually need to do
-    // anything here since fetchAndRender is responsible for its own
-    // state updates (which we hope are also generation-guarded for
-    // user-side render correctness).
-    void my;
   };
 
   const schedule = () => {
+    if (stopped) return;
     if (pendingTimer != null) clearTimeout(pendingTimer);
     pendingTimer = setTimeout(runFetch, debounceMs);
   };
 
-  // Fire immediately on subscribe so the caller doesn't need to
+  // Prime through the debounce window so the caller doesn't need to
   // double-call: `bm.live.scoped('x', refresh); refresh();`. Just
   // pass the renderer and we'll prime the view on mount.
   schedule();
@@ -449,6 +613,8 @@ live.scoped = function liveScoped(tableOrStar, fetchAndRender, opts) {
   }
 
   return () => {
+    stopped = true;
+    queued = false;
     unsub();
     if (pendingTimer != null) {
       clearTimeout(pendingTimer);
@@ -544,7 +710,7 @@ let _flowsRegistry = null;
 async function loadFlowsRegistry() {
   if (_flowsRegistry !== null) return _flowsRegistry;
   try {
-    const r = await fetch('/_internal/flows.json', { credentials: 'same-origin' });
+    const r = await fetch('/_internal/flows.json', { credentials: 'same-origin', cache: 'no-store' });
     if (r.ok) _flowsRegistry = await r.json();
     else _flowsRegistry = {};
   } catch { _flowsRegistry = {}; }
@@ -563,8 +729,16 @@ export const flows = new Proxy({}, {
   get(_target, flowName) {
     if (typeof flowName !== 'string') return undefined;
     return async (params = {}, body) => {
-      const reg = await loadFlowsRegistry();
-      const entry = reg[flowName] || reg[camelizeFlowName(flowName)];
+      let reg = await loadFlowsRegistry();
+      let entry = reg[flowName] || reg[camelizeFlowName(flowName)];
+      if (!entry) {
+        // The registry lists only flows THIS caller may call, so one loaded
+        // before sign-in (or before a role grant) can be missing the flow.
+        // Refetch once before reporting it as undeclared.
+        _flowsRegistry = null;
+        reg = await loadFlowsRegistry();
+        entry = reg[flowName] || reg[camelizeFlowName(flowName)];
+      }
       if (!entry) {
         const available = Object.keys(reg).sort();
         const listing = available.length
@@ -576,10 +750,10 @@ export const flows = new Proxy({}, {
           `(file name, camelCased) - snake/kebab spellings of the same name also resolve.`
         );
       }
-      // Substitute :path params.
+      // Substitute :path params, each one encoded segment (never '.'/'..').
       let path = entry.path;
       for (const [k, v] of Object.entries(params)) {
-        path = path.replace(`:${k}`, encodeURIComponent(String(v)));
+        if (path.includes(`:${k}`)) path = path.replace(`:${k}`, _seg(v));
       }
       const method = (entry.method || 'POST').toUpperCase();
       const res = await request(method, path, body);
@@ -608,7 +782,7 @@ export function workflow(table, id) {
   if (!table || id === undefined || id === null) {
     throw new Error('bm.workflow(table, id) requires both args');
   }
-  const base = `/api/${encodeURIComponent(table)}/${encodeURIComponent(String(id))}`;
+  const base = `/api/${_seg(table)}/${_seg(id)}`;
   return {
     table,
     id,
@@ -616,7 +790,7 @@ export function workflow(table, id) {
     transitionTo: (state) => api.post(`${base}/transition`, { to: state }),
     available:    () => api.get(`${base}/transitions`),
     current:      async () => {
-      const row = await api.get(`/api/${encodeURIComponent(table)}/${encodeURIComponent(String(id))}`);
+      const row = await api.get(base);
       return row.state ?? row.status;
     },
   };
@@ -658,7 +832,7 @@ export const aggregates = {
 // =================================================================
 
 function makeJob(jobId, statusUrl) {
-  const statusPath = statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`;
+  const statusPath = statusUrl || `/api/_jobs/${_seg(jobId)}/status`;
   return {
     job_id: jobId,
     status_url: statusUrl,
@@ -668,7 +842,7 @@ function makeJob(jobId, statusUrl) {
 }
 
 async function waitForJob(jobId, { intervalMs = 1000, timeoutMs = 5 * 60 * 1000, statusUrl = '' } = {}) {
-  const statusPath = statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`;
+  const statusPath = statusUrl || `/api/_jobs/${_seg(jobId)}/status`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const status = await api.get(statusPath);
@@ -689,7 +863,7 @@ export const jobs = {
   // always pass through the server-issued status_url when polling outside an
   // admin session.
   status: (jobId, statusUrl) =>
-    api.get(statusUrl || `/api/_jobs/${encodeURIComponent(jobId)}/status`),
+    api.get(statusUrl || `/api/_jobs/${_seg(jobId)}/status`),
   wait: waitForJob,
 };
 
@@ -707,13 +881,65 @@ export const notifications = {
     const r = await api.get(path);
     return Array.isArray(r) ? r : (r.notifications || []);
   },
-  markRead:    (id) => api.patch(`/api/_notifications/${encodeURIComponent(id)}/read`),
+  markRead:    (id) => api.patch(`/api/_notifications/${_seg(id)}/read`),
   markAllRead: ()   => api.post('/api/_notifications/read-all'),
-  delete:      (id) => api.delete(`/api/_notifications/${encodeURIComponent(id)}`),
+  delete:      (id) => api.delete(`/api/_notifications/${_seg(id)}`),
+  // Events carry no rows. Drain an ID cursor (including rows already marked
+  // read by another tab), coalescing insert events into one paginated fetch.
   onNew(cb) {
-    return live('_benmore_notifications', (ev) => {
-      if (ev.action === 'insert') cb(ev.row);
+    let active = true, current;
+    const isCurrent = state => active && current === state && state.revision === _authRevision;
+    const initialize = state => api.get('/api/_notifications?limit=1')
+      .then((result) => {
+        if (isCurrent(state) && Number.isSafeInteger(result.latest_id) && result.latest_id >= 0) {
+          state.lastSeen = result.latest_id;
+        }
+      })
+      .catch(() => {});
+    // Each session owns its baseline, cursor and pending drain. A delayed old
+    // response must neither publish private rows nor stall the next account.
+    const reset = (enabled = true) => {
+      const state = current = { revision: _authRevision, enabled, lastSeen: null, pending: false, running: false };
+      state.ready = enabled ? initialize(state) : Promise.resolve();
+    };
+    _sessionListeners.add(reset);
+    reset();
+    const drain = async state => {
+      if (state.running || !isCurrent(state)) return;
+      state.running = true;
+      try {
+        await state.ready;
+        if (!isCurrent(state)) return;
+        if (state.lastSeen === null) {
+          state.ready = initialize(state);
+          await state.ready;
+          if (!isCurrent(state) || state.lastSeen === null) return;
+        }
+        while (isCurrent(state) && state.pending) {
+          state.pending = false;
+          while (isCurrent(state)) {
+            const result = await api.get(`/api/_notifications?limit=100&after_id=${state.lastSeen}`);
+            if (!isCurrent(state)) return;
+            const rows = result.notifications || [];
+            let advanced = false;
+            for (const n of rows) {
+              if (!isCurrent(state)) return;
+              if (!Number.isSafeInteger(n.id) || n.id <= state.lastSeen) continue;
+              state.lastSeen = n.id; advanced = true;
+              try { cb(n); } catch (e) { console.error(e); }
+            }
+            if (rows.length < 100 || !advanced) break;
+          }
+        }
+      } catch (_) { /* Retry from the last delivered ID on the next event. */ }
+      finally { state.running = false; }
+    };
+    const stop = live('_benmore_notifications', (ev) => {
+      if (ev.action !== 'insert' || !current.enabled) return;
+      current.pending = true;
+      void drain(current);
     });
+    return () => { active = false; _sessionListeners.delete(reset); stop(); };
   },
 };
 
@@ -769,12 +995,12 @@ export const audit = {
 // Body shape: { email, permission, expires_at? }.
 export const permissions = {
   share:  (table, id, email, permission = 'view', expires_at) =>
-    api.post(`/api/${encodeURIComponent(table)}/${encodeURIComponent(String(id))}/share`,
+    api.post(`/api/${_seg(table)}/${_seg(id)}/share`,
              { email, permission, ...(expires_at ? { expires_at } : {}) }),
   revoke: (table, id, email) =>
-    api.delete(`/api/${encodeURIComponent(table)}/${encodeURIComponent(String(id))}/permissions/${encodeURIComponent(email)}`),
+    api.delete(`/api/${_seg(table)}/${_seg(id)}/permissions/${_seg(email)}`),
   list:   (table, id) =>
-    api.get(`/api/${encodeURIComponent(table)}/${encodeURIComponent(String(id))}/permissions`),
+    api.get(`/api/${_seg(table)}/${_seg(id)}/permissions`),
 };
 
 // =================================================================
@@ -818,13 +1044,13 @@ export async function signedUrl(path, opts = 300) {
 
 export function t(key, vars) {
   const dict = (typeof window !== 'undefined' && window.__bm_i18n?.strings) || {};
-  let out = dict[key] ?? key;
-  if (vars) {
-    for (const [k, v] of Object.entries(vars)) {
-      out = out.replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, 'g'), String(v));
-    }
-  }
-  return out;
+  const out = Object.prototype.hasOwnProperty.call(dict, key) ? (dict[key] ?? key) : key;
+  if (!vars) return out;
+  // Match the original placeholders once. Variable names and inserted values
+  // are literal data: no regex metacharacters, replacement-dollar semantics,
+  // inherited keys, or recursive expansion of newly inserted placeholders.
+  return out.replace(/\{\{\s*([^{}]*?)\s*\}\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match);
 }
 
 // =================================================================
@@ -1031,6 +1257,11 @@ export const broadcast = {
     await pc.setRemoteDescription({ type: 'answer', sdp });
 
     let stopped = false;
+    // Keep the slug claimed while live: a publisher that stops
+    // heartbeating is treated as crashed and its slug can be taken over.
+    const heartbeat = setInterval(() => {
+      if (!stopped) request('POST', '/api/_broadcast/heartbeat', { slug }).catch(() => {});
+    }, 60000);
     return {
       slug,
       sessionId: session_id,
@@ -1038,6 +1269,7 @@ export const broadcast = {
       async stop() {
         if (stopped) return;
         stopped = true;
+        clearInterval(heartbeat);
         try { pc.close(); } catch {}
         try { await request('POST', '/api/_broadcast/stop', { slug }); } catch {}
       },
@@ -1097,7 +1329,7 @@ export const broadcast = {
    * Safe to poll; cheap (one indexed lookup).
    */
   async stats(slug) {
-    const res = await request('GET', `/api/_broadcast/stats/${encodeURIComponent(slug)}`);
+    const res = await request('GET', `/api/_broadcast/stats/${_seg(slug)}`);
     return res.data || { live: false, viewers: 0 };
   },
 };
@@ -1139,7 +1371,9 @@ export const webrtc = {
 };
 
 export const mfa = {
-  enroll:  ()         => api.post('/api/_auth/mfa/setup'),
+  // Signed-in enrollment re-proves the current password; the login-issued
+  // setup token path (require_mfa_for_roles) needs none.
+  enroll:  (password) => api.post('/api/_auth/mfa/setup', password ? { password } : {}),
   verify:  (code)     => api.post('/api/_auth/mfa/verify', { code }),
   disable: (password) => api.post('/api/_auth/mfa/disable', { password }),
 };
@@ -1220,10 +1454,29 @@ function _interpolate(v) {
   return _escForHtml(v);
 }
 
+// A value that starts a URL attribute can't be made safe by escaping:
+// href="javascript:..." still runs. Same rule as server-rendered pages
+// (template_context.go dangerousURL): javascript:, vbscript:, livescript:
+// and data: other than a raster image become #blocked-unsafe-url, with the
+// scheme read as the URL parser reads it (leading control characters and any
+// tab or newline ignored). bm.raw(url) opts out.
+const _urlAttrOpen = /\s(?:href|src|action|formaction|xlink:href|poster|data|cite|background)\s*=\s*["']?$/i;
+const _rasterDataURL = /^data:\s*image\/(png|gif|jpe?g|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i;
+function _scriptURL(v) {
+  const u = String(v).replace(/^[\x00-\x20]+/, '').replace(/[\t\n\r]/g, '');
+  const m = /^([^:/?#]+):/.exec(u);
+  if (!m) return false;
+  const scheme = m[1].toLowerCase();
+  return scheme === 'javascript' || scheme === 'vbscript' || scheme === 'livescript' ||
+    (scheme === 'data' && !_rasterDataURL.test(u));
+}
+
 export function html(strings, ...values) {
   let out = strings[0];
   for (let i = 0; i < values.length; i++) {
-    out += _interpolate(values[i]) + strings[i + 1];
+    let v = values[i];
+    if (v != null && typeof v !== 'object' && _urlAttrOpen.test(strings[i]) && _scriptURL(v)) v = '#blocked-unsafe-url';
+    out += _interpolate(v) + strings[i + 1];
   }
   // Tag the result so it can be nested into another bm.html`...`
   // without being escaped a second time.
@@ -1591,13 +1844,50 @@ const _queryLiveTimers = new Map();
 function queryEntry(key) {
   const k = queryKey(key);
   if (!_queryCache.has(k)) {
-    _queryCache.set(k, { key: k, rawKey: key, data: undefined, error: null, updatedAt: 0, promise: null, fetcher: null, staleTime: 0, subs: new Set() });
+    _queryCache.set(k, { key: k, rawKey: key, data: undefined, error: null, updatedAt: 0, promise: null, revision: 0, rollbackOwner: null, fetcher: null, staleTime: 0, subs: new Set() });
   }
   return _queryCache.get(k);
 }
 
 function notifyQuery(e) {
   e.subs.forEach((fn) => { try { fn({ data: e.data, error: e.error, updatedAt: e.updatedAt, pending: !!e.promise }); } catch (err) { console.warn('[bm.query] subscriber threw:', err); } });
+}
+
+// A fetcher may not support cancellation. Let its caller settle normally, but
+// revoke its right to publish data/errors or clear a newer request's pending state.
+function supersedeQueryFetch(e) {
+  e.revision++;
+  e.promise = null;
+}
+
+function resetSessionQueries() {
+  if (_queryLiveStop) _queryLiveStop();
+  _queryTableKeys.clear();
+  const entries = [..._queryCache.values()];
+  // Clear every entry before notifying: a subscriber may read another key.
+  // Retain entries/subscriptions so old promises cannot find a fresh entry and
+  // existing views can render the empty state before requesting their new data.
+  for (const e of entries) {
+    supersedeQueryFetch(e);
+    e.rollbackOwner = null;
+    e.data = undefined;
+    e.error = null;
+    e.updatedAt = 0;
+    e.fetcher = null;
+    e.staleTime = 0;
+  }
+  for (const e of entries) notifyQuery(e);
+}
+
+function setQueryValue(e, data, owner = null) {
+  supersedeQueryFetch(e);
+  e.rollbackOwner = owner;
+  if (owner) owner.revision = e.revision;
+  e.data = data;
+  e.error = null;
+  e.updatedAt = Date.now();
+  notifyQuery(e);
+  return data;
 }
 
 function rememberTableKey(tableName, key) {
@@ -1610,13 +1900,24 @@ function rememberTableKey(tableName, key) {
 function ensureQueryLiveInvalidation() {
   if (_queryLiveStop || typeof live !== 'function' || typeof EventSource === 'undefined') return;
   const stop = live('*', (ev) => {
-    if (!ev || !ev.table) return;
-    const table = ev.table;
-    // Coalesce bursts of events for the same table into a single invalidation.
-    if (_queryLiveTimers.has(table)) return;
+    if (!ev || (!ev.table && ev.action !== 'refresh')) return;
+    // Private/member-of events may hide the table name. That refresh hint
+    // covers every registered live query, but not unrelated custom caches.
+    const table = ev.table || '';
+    if (_queryLiveTimers.has('') || _queryLiveTimers.has(table)) return;
+    // A generic refresh subsumes already queued table-specific refreshes.
+    if (!table) {
+      for (const timer of _queryLiveTimers.values()) clearTimeout(timer);
+      _queryLiveTimers.clear();
+    }
     const t = setTimeout(() => {
       _queryLiveTimers.delete(table);
-      query.invalidateTable(table, { refetch: _queryLiveConfig.refetch });
+      const opts = { refetch: _queryLiveConfig.refetch };
+      if (table) query.invalidateTable(table, opts);
+      else {
+        const keys = new Set([..._queryTableKeys.values()].flatMap(keys => [...keys]));
+        query.invalidate((_raw, stable) => keys.has(stable), opts);
+      }
     }, _queryLiveConfig.debounceMs);
     if (typeof t.unref === 'function') t.unref();
     _queryLiveTimers.set(table, t);
@@ -1637,12 +1938,7 @@ export const query = {
     return queryEntry(key).data;
   },
   set(key, data) {
-    const e = queryEntry(key);
-    e.data = data;
-    e.error = null;
-    e.updatedAt = Date.now();
-    notifyQuery(e);
-    return data;
+    return setQueryValue(queryEntry(key), data);
   },
   subscribe(key, fn) {
     if (typeof fn !== 'function') throw new Error('bm.query.subscribe(key, fn) requires a function');
@@ -1663,24 +1959,35 @@ export const query = {
     if (e.promise) return e.promise;
     e.fetcher = fetcher;
     e.staleTime = staleTime;
-    e.promise = Promise.resolve()
+    const revision = e.revision;
+    const pending = Promise.resolve()
       .then(fetcher)
       .then((data) => {
-        e.data = data;
-        e.error = null;
-        e.updatedAt = Date.now();
+        if (e.revision === revision) {
+          e.revision++;
+          e.rollbackOwner = null;
+          e.data = data;
+          e.error = null;
+          e.updatedAt = Date.now();
+        }
         return data;
       })
       .catch((err) => {
-        e.error = err;
+        if (e.revision === revision) {
+          e.revision++;
+          e.error = err;
+        }
         throw err;
       })
       .finally(() => {
-        e.promise = null;
-        notifyQuery(e);
+        if (e.promise === pending) {
+          e.promise = null;
+          notifyQuery(e);
+        }
       });
+    e.promise = pending;
     notifyQuery(e);
-    return e.promise;
+    return pending;
   },
   async refetch(key) {
     const e = queryEntry(key);
@@ -1709,6 +2016,8 @@ export const query = {
       : (raw, stable) => stable === matchExact || (matchPrefix !== null && isArrayPrefix(matchPrefix, raw));
     for (const [stable, e] of _queryCache.entries()) {
       if (!predicate(e.rawKey, stable)) continue;
+      supersedeQueryFetch(e);
+      e.rollbackOwner = null;
       e.updatedAt = 0;
       keys.push(stable);
       notifyQuery(e);
@@ -1750,34 +2059,69 @@ export const query = {
     return query.invalidate((_raw, stable) => keys.has(stable), opts);
   },
   async mutate(opts = {}) {
+    const authRevision = _authRevision;
     if (typeof opts.request !== 'function') throw new Error('bm.query.mutate({ request }) requires request');
     const keys = Array.isArray(opts.keys) ? opts.keys : (opts.key ? [opts.key] : []);
     // Snapshot the full prior entry (data + updatedAt + error), not just data,
     // so a failed mutation can be restored exactly without stamping a fresh
     // updatedAt or clearing a pre-existing error the way set() would.
-    const snapshots = keys.map((key) => {
+    const snapshots = [...new Map(keys.map(key => [queryKey(key), key])).values()].map((key) => {
       const e = queryEntry(key);
-      return { key, data: e.data, updatedAt: e.updatedAt, error: e.error };
+      return { key, data: e.data, updatedAt: e.updatedAt, error: e.error,
+        revision: e.revision, previous: e.rollbackOwner, state: 'pending', applied: false };
     });
     try {
       if (typeof opts.apply === 'function') {
-        for (const snap of snapshots) query.set(snap.key, opts.apply(snap.data, snap.key));
+        for (const snap of snapshots) {
+          const data = opts.apply(snap.data, snap.key);
+          snap.applied = true;
+          setQueryValue(queryEntry(snap.key), data, snap);
+        }
       }
       const result = await opts.request();
+      if (authRevision !== _authRevision) return result;
+      for (const snap of snapshots) {
+        snap.state = 'succeeded';
+        snap.previous = null;
+        const e = queryEntry(snap.key);
+        if (e.rollbackOwner === snap) e.rollbackOwner = null;
+      }
       if (opts.invalidate) query.invalidate(opts.invalidate, { refetch: opts.refetch !== false });
       return result;
     } catch (err) {
-      if (typeof opts.rollback === 'function') {
-        for (const snap of snapshots) query.set(snap.key, opts.rollback(snap.data, err, snap.key));
-      } else {
-        // Restore the exact prior snapshot (data + updatedAt + error) rather
-        // than routing through set(), which would overwrite updatedAt and clear
-        // error, making restored data look freshly fetched to subscribers.
-        for (const snap of snapshots) {
-          const e = queryEntry(snap.key);
-          e.data = snap.data;
-          e.updatedAt = snap.updatedAt;
-          e.error = snap.error;
+      if (authRevision !== _authRevision) throw err;
+      for (const snap of snapshots) snap.state = 'failed';
+      for (const snap of snapshots) {
+        const e = queryEntry(snap.key);
+        // A later set, fetch, invalidation or edit owns its state. Neither a
+        // default nor an application rollback may overwrite that newer work.
+        if (snap.applied ? e.rollbackOwner !== snap : e.revision !== snap.revision) continue;
+        // A newer failed edit may have snapshotted another pending edit. Skip
+        // ancestors that also failed; restore a still-pending ancestor's
+        // ownership so it can unwind if its own request subsequently fails.
+        let prior = snap;
+        while (prior.previous && prior.previous.state === 'failed') prior = prior.previous;
+        const owner = prior.previous?.state === 'pending' ? prior.previous : null;
+        if (typeof opts.rollback === 'function') {
+          const data = opts.rollback(prior.data, err, snap.key);
+          // The callback itself may publish a newer cache value.
+          if (snap.applied ? e.rollbackOwner !== snap : e.revision !== snap.revision) continue;
+          // A read begun after the optimistic edit can still supply its
+          // authoritative result. Rolling back data must not cancel that read.
+          if (!e.promise) supersedeQueryFetch(e);
+          e.rollbackOwner = owner;
+          if (owner) owner.revision = e.revision;
+          e.data = data;
+          e.updatedAt = Date.now();
+          notifyQuery(e);
+        } else if (snap.applied) {
+          // Preserve the original timestamp and error, including stale state.
+          if (!e.promise) supersedeQueryFetch(e);
+          e.rollbackOwner = owner;
+          if (owner) owner.revision = e.revision;
+          e.data = prior.data;
+          e.updatedAt = prior.updatedAt;
+          if (e.error === null) e.error = prior.error;
           notifyQuery(e);
         }
       }

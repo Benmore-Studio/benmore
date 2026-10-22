@@ -422,7 +422,12 @@ func buildRecipeBeforeRequest(env *recipeEnv, r *RecipeBeforeRequest) (*http.Req
 		body = strings.NewReader(rendered)
 	}
 
-	req, err := http.NewRequest(method, urlStr, body)
+	var req *http.Request
+	if env != nil && env.req != nil {
+		req, err = http.NewRequestWithContext(env.req.Context(), method, urlStr, body)
+	} else {
+		req, err = http.NewRequest(method, urlStr, body)
+	}
 	if err != nil {
 		return nil, err
 	}

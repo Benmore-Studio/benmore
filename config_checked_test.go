@@ -12,6 +12,7 @@ import (
 
 func TestConfigRejectedBeforeStartupAndReloadMutation(t *testing.T) {
 	cases := []struct{ name, path, source string }{
+		{"mcp unknown field", "mcp.yaml", "version: 1\nunknown: true"},
 		{"app syntax", "app.yaml", "auth: ["},
 		{"app documents", "app.yaml", "theme: blue\n---\nauth: ["},
 		{"auth shape", "app.yaml", "auth: [required]"},

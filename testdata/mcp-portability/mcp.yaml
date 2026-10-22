@@ -1,0 +1,83 @@
+version: 1
+connector: {id: notify-hub-fixture, name: Notify Hub fixture, version: '1'}
+contract_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+execution_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+connections:
+  - name: provider
+    base_url: https://example.com/api
+    auth: {kind: bearer, env: STATUS_API_KEY}
+    openapi: openapi/status.yaml
+tools:
+  - name: message_status
+    description: Read the signed-in user's message delivery status.
+    handler: {kind: native, operation: flow.call, flow: message_status}
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: {type: integer}
+    output_schema:
+      type: object
+      additionalProperties: false
+      required: [id, status, sent_at, delivered_at]
+      properties:
+        id: {type: integer}
+        status: {type: string}
+        sent_at: {type: string}
+        delivered_at: {type: string}
+    permissions: [messages:read]
+    effect: read
+    approval: none
+    idempotency: none
+    reconciliation: none
+    output: {include: [id, status, sent_at, delivered_at]}
+    component: ui://notify/status
+  - name: remote_message_status
+    description: Read the signed-in user's message delivery status from the provider.
+    handler: {kind: external, connection: provider, operation_id: getMessageStatus}
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [path]
+      properties:
+        path:
+          type: object
+          additionalProperties: false
+          required: [id]
+          properties:
+            id: {type: integer}
+    output_schema:
+      type: object
+      additionalProperties: false
+      required: [id, status, sent_at, delivered_at]
+      properties:
+        id: {type: integer}
+        status: {type: string}
+        sent_at: {type: string}
+        delivered_at: {type: string}
+    permissions: [messages:read]
+    effect: read
+    approval: none
+    idempotency: none
+    reconciliation: none
+    output: {include: [id, status, sent_at, delivered_at]}
+    component: ui://notify/status
+resources:
+  - name: message_status_card
+    uri: ui://notify/status
+    mime_type: text/html
+    component: status_card
+    entrypoint: static/status-card.tsx
+    tools: [message_status, remote_message_status]
+    schema_version: 1
+    data_schema:
+      type: object
+      additionalProperties: false
+      required: [id, status, sent_at, delivered_at]
+      properties:
+        id: {type: integer}
+        status: {type: string}
+        sent_at: {type: string}
+        delivered_at: {type: string}
+    deep_link: /messages/{id}

@@ -4,7 +4,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -26,6 +28,8 @@ type sseClient struct {
 	userID    int64
 	groupID   string
 	isAdmin   bool
+	appDir    string // per-user cap is per app (one process may host many)
+	remoteIP  string // anonymous per-IP cap (realtimeAnonClientKey)
 }
 
 // LOWER (sse.go): SSE connections previously had no connection cap and no
@@ -38,7 +42,17 @@ type sseClient struct {
 const (
 	realtimeSSEMaxConnsGlobal  = 5000
 	realtimeSSEMaxConnLifetime = 30 * time.Minute
+	// realtimeSSEMaxConnsPerUser mirrors wsMaxConnsPerUser: one signed-in
+	// account may not hold every slot of the global pool.
+	realtimeSSEMaxConnsPerUser = 10
+	// realtimeSSEMaxConnsPerAnonIP mirrors realtimeWSMaxConnsPerAnonIP.
+	realtimeSSEMaxConnsPerAnonIP = 30
 )
+
+// sseWriteTimeout bounds each write to a stream (an event or a keepalive).
+// A client that stops reading fills its receive window; the blocked write
+// then fails and the handler releases the stream instead of waiting forever.
+var sseWriteTimeout = 30 * time.Second
 
 // SSEHub manages SSE connections with per-client scoping.
 type SSEHub struct {
@@ -49,7 +63,7 @@ type SSEHub struct {
 var sseHub = &SSEHub{clients: make(map[*sseClient]bool)}
 
 // RegisterSSERoutes sets up the SSE endpoint.
-func RegisterSSERoutes(mux *http.ServeMux, app *App) {
+func RegisterSSERoutes(mux appRouteRegistrar, app *App) {
 	needsAuth := NeedsAuth(app)
 
 	mux.HandleFunc("GET /sse/events", func(w http.ResponseWriter, r *http.Request) {
@@ -65,10 +79,14 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		// Auth: require authentication if app has auth. Dev mode skips
 		// the gate so HMR reload events reach pre-auth pages (the SPA
 		// auth screen, for instance). Data events still respect scope
-		// because broadcastToSSE filters anonymous clients out - only
+		// because deliverRealtimeChange filters anonymous clients out - only
 		// framework-level reload events deliver to them.
 		var client sseClient
-		client.principal = realtimePrincipal{app: app, request: r}
+		// Anonymous streams end when the app stops admitting them (the
+		// same gate as below, re-read at each credential check).
+		client.principal = realtimePrincipal{app: app, request: r, anonAdmitted: func() bool {
+			return !NeedsAuth(app) || devReloadClientEnabled(app) || broadcastAllowAnon(app)
+		}}
 		// Allow anonymous SSE wherever the dev reload client is injected so
 		// the injected EventSource is never rejected with 401. This must
 		// track devReloadClientEnabled (DevMode || testing) exactly - the
@@ -106,22 +124,37 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			http.Error(w, "SSE not supported", http.StatusInternalServerError)
+			serverError(w, r, app, "sse", errors.New("the response writer cannot flush"), "SSE not supported")
 			return
 		}
 
 		// The HTTP server has a 30s WriteTimeout, which would otherwise
 		// cut every SSE connection at exactly 30s and trigger Chrome's
-		// ERR_INCOMPLETE_CHUNKED_ENCODING. Clear the deadline for this
-		// response so the stream can stay open indefinitely; the 25s
-		// heartbeat below keeps proxies happy. The middleware wrappers
-		// (statusCapture, responseWriter, gzipResponseWriter) all need
-		// to implement Unwrap() http.ResponseWriter for this to walk
+		// ERR_INCOMPLETE_CHUNKED_ENCODING. Each write instead sets its own
+		// deadline (sseWriteTimeout from now), so the stream can stay open
+		// while a client that stops reading still releases the handler;
+		// the 25s heartbeat below keeps proxies happy. The middleware
+		// wrappers (statusCapture, responseWriter, gzipResponseWriter) all
+		// need to implement Unwrap() http.ResponseWriter for this to walk
 		// down to the underlying net.Conn - otherwise the call returns
-		// ErrNotSupported silently.
+		// ErrNotSupported.
 		rc := http.NewResponseController(w)
-		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
-			log.Printf("  sse: could not clear write deadline (%v) - connection will be cut by server WriteTimeout", err)
+		if err := rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout)); err != nil {
+			log.Printf("  sse: could not set write deadline (%v) - connection will be cut by server WriteTimeout", err)
+		}
+		// send writes one frame under a fresh deadline; false ends the stream.
+		send := func(frame string) bool {
+			_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+			if _, err := io.WriteString(w, frame); err != nil {
+				return false
+			}
+			if err := rc.Flush(); err != nil {
+				if !errors.Is(err, http.ErrNotSupported) {
+					return false
+				}
+				flusher.Flush()
+			}
+			return true
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -130,6 +163,7 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 		w.Header().Set("X-Accel-Buffering", "no") // for nginx
 
 		client.ch = make(chan string, 10)
+		remoteIP := realtimeAnonClientKey(r)
 		// LOWER: enforce the global SSE connection cap under the write
 		// lock so the hub size can never exceed realtimeSSEMaxConnsGlobal,
 		// even under a flood of concurrent connects.
@@ -139,18 +173,51 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 			http.Error(w, "too many connections", http.StatusServiceUnavailable)
 			return
 		}
+		if client.userID != 0 && !client.isAdmin {
+			perUser := 0
+			for c := range sseHub.clients {
+				if c.userID == client.userID && c.appDir == app.Dir {
+					perUser++
+				}
+			}
+			if perUser >= realtimeSSEMaxConnsPerUser {
+				sseHub.mu.Unlock()
+				http.Error(w, "too many connections for this account", http.StatusTooManyRequests)
+				return
+			}
+		}
+		if client.userID == 0 {
+			perIP := 0
+			for c := range sseHub.clients {
+				if c.userID == 0 && c.remoteIP == remoteIP {
+					perIP++
+				}
+			}
+			if perIP >= realtimeSSEMaxConnsPerAnonIP {
+				sseHub.mu.Unlock()
+				http.Error(w, "too many connections", http.StatusTooManyRequests)
+				return
+			}
+		}
+		client.appDir = app.Dir
+		client.remoteIP = remoteIP
+		// Fan-out reads the cached credential check (realtimePrincipalTTL).
+		client.principal = client.principal.withCache()
 		sseHub.clients[&client] = true
 		sseHub.mu.Unlock()
 
+		// client.ch is never closed: the dispatcher sends to a snapshot of
+		// the hub after releasing its lock, so a send may land after this
+		// handler unregisters. A buffered, unread channel is just collected.
 		defer func() {
 			sseHub.mu.Lock()
 			delete(sseHub.clients, &client)
 			sseHub.mu.Unlock()
-			close(client.ch)
 		}()
 
-		fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
+		if !send(": connected\n\n") {
+			return
+		}
 
 		// Heartbeat under the typical 30s proxy/idle timeout. Comments
 		// (lines starting with ":") are ignored by EventSource clients
@@ -184,14 +251,16 @@ func RegisterSSERoutes(mux *http.ServeMux, app *App) {
 					event = msg[:idx]
 					data = msg[idx+1:]
 				}
-				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
-				flusher.Flush()
-			case <-ticker.C:
-				if _, valid := client.principal.current(); !valid {
+				if !send(fmt.Sprintf("event: %s\ndata: %s\n\n", event, data)) {
 					return
 				}
-				fmt.Fprintf(w, ": keepalive\n\n")
-				flusher.Flush()
+			case <-ticker.C:
+				if _, valid := client.principal.refresh(); !valid {
+					return
+				}
+				if !send(": keepalive\n\n") {
+					return
+				}
 			case <-r.Context().Done():
 				return
 			}
@@ -217,6 +286,11 @@ func BroadcastChange(app *App, table, action string) {
 func BroadcastReload(app *App, reason string) {
 	if reason == "" {
 		reason = "src-changed"
+	}
+	// The reloaded page must version its scripts from the files on disk,
+	// not from a tree version memoized a moment before the change.
+	if app != nil {
+		invalidateStaticTreeVersion(app.Dir)
 	}
 	data, _ := json.Marshal(map[string]string{"reason": reason})
 	payload := `reload|` + string(data)
@@ -266,8 +340,7 @@ func isEventName(s string) bool {
 // handle cluster vs single-instance routing.
 func BroadcastChangeScoped(app *App, table, action string, groupID string, userID int64) {
 	InvalidateQueryCacheForTable(table)
-	broadcastToSSE(app, table, action, groupID, userID)
-	BroadcastWSChange(app, table, action, groupID, userID)
+	dispatchRealtimeChange(app, realtimeChange{table: table, action: action, groupID: groupID, userID: userID})
 }
 
 // SSEClientScript returns the JavaScript that auto-refreshes live components.
@@ -283,12 +356,22 @@ const SSEClientScript = `
   source.addEventListener('change', function(e) {
     try {
       var data = JSON.parse(e.data);
-      document.querySelectorAll('[data-live-table="' + data.table + '"]').forEach(function(el) {
+      var selector;
+      if (data.table) {
+        selector = '[data-live-table="' + data.table + '"]';
+      } else if (data.action === 'refresh') {
+        // Scoped and opaque writes may invalidate without naming a table.
+        selector = '[data-live], [data-live-table]';
+      } else {
+        return;
+      }
+      document.querySelectorAll(selector).forEach(function(el) {
         htmx.trigger(el, 'refresh');
       });
     } catch(err) {}
   });
-  source.onerror = function() { source.close(); };
+  // Let EventSource reconnect after stream rotation or a network interruption.
+  // Non-200 responses (including 401/403) already stop native reconnection.
 })();
 `
 
@@ -310,11 +393,7 @@ const DevReloadClientScript = `
     // coalesced reload events settle before we navigate away.
     setTimeout(function() { window.location.reload(); }, 25);
   });
-  // Without this, a 401 (auth app outside DevMode/testing) or a disabled
-  // sse feature makes EventSource reconnect roughly every 3s forever,
-  // flooding the server with failing requests. Close on error to match
-  // SSEClientScript.
-  source.onerror = function() { source.close(); };
+  // Preserve the shared stream's native reconnect behavior, as above.
 })();
 `
 

@@ -28,3 +28,21 @@ func TestEmbeddedBMSDKBehavior(t *testing.T) {
 		t.Fatalf("bm SDK behavioral tests did not report success:\n%s", out)
 	}
 }
+
+// TestEmbeddedSDUIRowDataEscaping mounts every sdui component against rows
+// an attacker wrote (element and attribute-breakout text, javascript: URLs)
+// and fails if any of it reaches markup unescaped or lands in an href, form
+// action or iframe src (embedded/sdui_xss_test.mjs). Skipped without Node.
+func TestEmbeddedSDUIRowDataEscaping(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; skipping sdui escaping tests")
+	}
+	out, err := exec.Command(node, "embedded/sdui_xss_test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("sdui row-data escaping failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "all sdui row-data escaping assertions passed") {
+		t.Fatalf("sdui escaping test did not report success:\n%s", out)
+	}
+}

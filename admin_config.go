@@ -5,8 +5,6 @@ package main
 import (
 	"log"
 	"os"
-
-	"gopkg.in/yaml.v3"
 )
 
 // AdminConfig is Django-ModelAdmin-style customisation of the auto-admin
@@ -51,8 +49,12 @@ func LoadAdminConfig(dir string) *AdminConfig {
 	if err != nil {
 		return nil
 	}
+	return parseAdminConfig(data)
+}
+
+func parseAdminConfig(data []byte) *AdminConfig {
 	var cfg AdminConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yamlUnmarshal(data, &cfg); err != nil {
 		log.Printf("WARN: admin.yaml parse error: %s", err)
 		return nil
 	}

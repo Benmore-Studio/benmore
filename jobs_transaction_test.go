@@ -674,3 +674,27 @@ func TestJobTxCommitGuardNoOpAfterMarkHandled(t *testing.T) {
 		t.Fatalf("count after rollback = %d, want 1 (only the earlier commit)", count)
 	}
 }
+
+// `idempotent: true` at the top of an async flow file opts its jobs into
+// requeue after a worker crash. The key was never read, so the opt-in did
+// nothing and every such job was marked failed.
+func TestAsyncFlowIdempotentKeyReachesRecovery(t *testing.T) {
+	src := func(extra string) []byte {
+		return []byte("on:\n  request:\n    method: POST\n    path: /api/sync\n    mode: async\n" + extra + "jobs:\n  run:\n    steps:\n      - run: sql\n        query: \"SELECT 1\"\n")
+	}
+	for _, c := range []struct {
+		extra string
+		want  bool
+	}{{"idempotent: true\n", true}, {"", false}, {"idempotent: false\n", false}} {
+		flows, err := parseGHAFlowFile("flows/sync.yaml", src(c.extra))
+		if err != nil {
+			t.Fatalf("%q: %v", c.extra, err)
+		}
+		if len(flows) != 1 || flows[0].Idempotent != c.want || !flows[0].Async {
+			t.Errorf("%q: flows = %+v, want Idempotent=%v", c.extra, flows, c.want)
+		}
+	}
+	if _, err := parseGHAFlowFile("flows/sync.yaml", src("idempotent: sometimes\n")); err == nil {
+		t.Error("a non-boolean idempotent was accepted")
+	}
+}

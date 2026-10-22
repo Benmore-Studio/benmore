@@ -6,8 +6,11 @@ package main
 
 import (
 	"database/sql"
+	"hash/fnv"
 	"log"
 	"strings"
+	"sync"
+	"time"
 )
 
 // EnsureLoginAttemptsTable creates the login attempts tracking table.
@@ -18,6 +21,26 @@ func EnsureLoginAttemptsTable(db *sql.DB) {
 		success BOOLEAN DEFAULT 0
 	)`)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON _benmore_login_attempts(email, attempted_at)")
+	// The age sweep filters on attempted_at alone, which the (email, ...)
+	// index can't serve.
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_login_attempts_time ON _benmore_login_attempts(attempted_at)")
+}
+
+// loginAttemptSweeps records when each database last dropped old attempts.
+// The sweep only bounds the table's size (every lockout query has its own
+// 15-minute window), so running it once a minute instead of on every
+// attempt changes no decision.
+var loginAttemptSweeps sync.Map // *sql.DB -> time.Time
+
+const loginAttemptSweepEvery = time.Minute
+
+func sweepLoginAttempts(db *sql.DB) {
+	now := time.Now()
+	if last, ok := loginAttemptSweeps.Load(db); ok && now.Sub(last.(time.Time)) < loginAttemptSweepEvery {
+		return
+	}
+	loginAttemptSweeps.Store(db, now)
+	db.Exec("DELETE FROM _benmore_login_attempts WHERE attempted_at < datetime('now', '-1 hour')")
 }
 
 // normalizeEmail lower-cases + trims an email-shaped identifier so
@@ -34,7 +57,7 @@ func recordLoginAttempt(db *sql.DB, email string, success bool) {
 	if _, err := db.Exec("INSERT INTO _benmore_login_attempts (email, success) VALUES (?, ?)", normalizeEmail(email), success); err != nil {
 		log.Printf("ERROR recording login attempt: %s", err)
 	}
-	db.Exec("DELETE FROM _benmore_login_attempts WHERE attempted_at < datetime('now', '-1 hour')")
+	sweepLoginAttempts(db)
 }
 
 // isAccountLocked checks if an account has too many failed attempts since last success (within 15 min window).
@@ -59,9 +82,12 @@ func isAccountLocked(db *sql.DB, email string) bool {
 // _benmore_login_attempts table so per-IP throttling reuses the same
 // rolling-window machinery as the per-account lockout without a second
 // table. The "ip:" prefix can never collide with a normalized email
-// (emails always contain "@" and never a leading "ip:").
+// (emails always contain "@" and never a leading "ip:"). An IPv6 client is
+// counted by its /64 (clientRateBucket), like the rate limits: one subscriber
+// is routinely handed a whole /64, and keying on the full address let a spray
+// take a fresh address for every guess and never reach the cap.
 func authIPLockKey(ip string) string {
-	return "ip:" + strings.ToLower(strings.TrimSpace(ip))
+	return "ip:" + strings.ToLower(clientRateBucket(strings.TrimSpace(ip)))
 }
 
 // authIsIPLocked reports whether a single source IP has accumulated too
@@ -93,3 +119,20 @@ func authIsIPLocked(db *sql.DB, ip string) bool {
 // window. Higher than the per-account limit (5) so shared egress IPs
 // tolerate a handful of unrelated bad logins before throttling.
 const authIPLoginLimit = 25
+
+// attemptLocks serializes credential checks per account key. The lockout
+// is check → verify → record; without serialization a burst of parallel
+// guesses all passed the check before any failure was recorded and got far
+// more than the allowed tries (password, TOTP, change-password). A fixed set
+// of striped locks bounds memory no matter how many keys are sprayed.
+var attemptLocks [256]sync.Mutex
+
+// lockAttempt blocks until no other check for key is in flight in this
+// process and returns the unlock func. Use: defer lockAttempt(key)().
+func lockAttempt(key string) func() {
+	h := fnv.New32a()
+	h.Write([]byte(normalizeEmail(key)))
+	m := &attemptLocks[h.Sum32()%uint32(len(attemptLocks))]
+	m.Lock()
+	return m.Unlock
+}

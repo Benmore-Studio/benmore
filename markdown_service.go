@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -133,7 +132,7 @@ func markdownCacheKey(text string, inline bool) string {
 
 // registerMarkdownRoutes adds the Markdown render endpoints + static assets to
 // a mux. Called from RegisterLibRoutes (shared by app + edge origins).
-func registerMarkdownRoutes(mux *http.ServeMux) {
+func registerMarkdownRoutes(mux appRouteRegistrar) {
 	mux.HandleFunc("POST /_internal/markdown", handleMarkdownRender)
 	mux.HandleFunc("POST /_internal/markdown/batch", handleMarkdownBatch)
 
@@ -203,17 +202,14 @@ func handleMarkdownBatch(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string][]string{"html": out})
 }
 
-// markdownRateLimited enforces the given limiter, keyed by source IP (same
-// approach as RateLimitMiddleware in ratelimit.go: RemoteAddr's host only,
-// never the raw ip:port pair, since the ephemeral port differs every TCP
-// connection). Writes a 429 + Retry-After and returns true when the caller
-// is over budget; the handler must return immediately in that case.
+// markdownRateLimited enforces the given limiter, keyed by the client
+// address from clientIP (client_ip.go) in its rate bucket (an IPv6 /64), the
+// same resolution RateLimitMiddleware uses. Behind the router every request arrives from
+// loopback, so keying on RemoteAddr put every visitor of every hosted app
+// in one shared bucket. Writes a 429 + Retry-After and returns true when the
+// caller is over budget; the handler must return immediately in that case.
 func markdownRateLimited(w http.ResponseWriter, r *http.Request, rl *RateLimiter, scope string) bool {
-	host := r.RemoteAddr
-	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		host = h
-	}
-	if rl.Allow("md:" + scope + ":" + host) {
+	if rl.Allow("md:" + scope + ":" + clientRateBucket(clientIP(r))) {
 		return false
 	}
 	w.Header().Set("Retry-After", "60")

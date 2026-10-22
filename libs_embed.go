@@ -114,7 +114,7 @@ var markdownJS []byte
 //	/_internal/libavoid.js  - Libavoid for graph routing
 //	/_internal/libavoid.wasm - Libavoid WASM module
 //	/_internal/bm.js        - Benmore frontend SDK (special handling)
-func RegisterLibRoutes(mux *http.ServeMux) {
+func RegisterLibRoutes(mux appRouteRegistrar) {
 	serve := func(path string, data []byte) {
 		mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/javascript")
@@ -156,15 +156,16 @@ func RegisterLibRoutes(mux *http.ServeMux) {
 	// framework's own SDK and changes every framework deploy. With the
 	// 24h cache, CF would happily serve a stale bm.js for a day after
 	// every deploy - agents push new code, browsers run old SDK,
-	// `bm.broadcast is undefined` symptoms surface. Same trick we use
-	// for TSX-compiled output: strong ETag + CDN-Cache-Control: no-store
-	// so CF goes back to origin on every request, browser revalidates
-	// against the ETag (304 ~50 bytes when unchanged).
+	// `bm.broadcast is undefined` symptoms surface. ETag and no-store
+	// directives request fresh delivery; Vary: * forbids response reuse.
+	// Origin headers cannot override an edge cache rule or clear old
+	// objects: deployment must bypass these SDK paths and purge separately.
 	bmETag := bmJSETag()
 	mux.HandleFunc("GET /_internal/bm.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Header().Set("ETag", bmETag)
 		w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate")
+		w.Header().Set("Vary", "*")
 		w.Header().Set("CDN-Cache-Control", "no-store")
 		w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 		if match := r.Header.Get("If-None-Match"); match != "" {
@@ -181,12 +182,13 @@ func RegisterLibRoutes(mux *http.ServeMux) {
 
 	// sdui.js - schema-driven component library. Same no-store + ETag
 	// treatment as bm.js (it's framework-own code that changes every
-	// deploy, so CF must revalidate or agents get a stale component layer).
+	// deploy, so the same deployment bypass and cleanup requirements apply).
 	sduiETag := sduiJSETag()
 	mux.HandleFunc("GET /_internal/sdui.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Header().Set("ETag", sduiETag)
 		w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate")
+		w.Header().Set("Vary", "*")
 		w.Header().Set("CDN-Cache-Control", "no-store")
 		w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 		if match := r.Header.Get("If-None-Match"); match != "" {

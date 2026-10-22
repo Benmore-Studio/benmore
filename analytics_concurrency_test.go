@@ -3,12 +3,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAnalyticsConcurrentBeacons(t *testing.T) {
@@ -25,7 +28,7 @@ func TestAnalyticsConcurrentBeacons(t *testing.T) {
 			defer workers.Done()
 			req := httptest.NewRequest("POST", "/api/_analytics", strings.NewReader(`{"p":"/concurrent"}`))
 			req.AddCookie(&http.Cookie{Name: "bm_cookie_consent", Value: "accepted"})
-			req.AddCookie(&http.Cookie{Name: "_bm_vid", Value: fmt.Sprintf("visitor-%d", i)})
+			req.AddCookie(&http.Cookie{Name: "_bm_vid", Value: fmt.Sprintf("%016x", i)})
 			rec := httptest.NewRecorder()
 			<-start
 			mux.ServeHTTP(rec, req)
@@ -56,7 +59,7 @@ func TestAnalyticsFailedWriteRollsBackBeacon(t *testing.T) {
 			mux := http.NewServeMux()
 			RegisterAnalyticsRoutes(mux, app)
 			mustExec(t, app.DB, "CREATE TRIGGER reject_beacon BEFORE INSERT ON "+target+" BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
-			rec := analyticsTestBeacon(mux, "visitor", `{"p":"/atomic"}`)
+			rec := analyticsTestBeacon(mux, "00000000000000aa", `{"p":"/atomic"}`)
 			if rec.Code != http.StatusServiceUnavailable {
 				t.Errorf("failed write returned %d, want 503: %s", rec.Code, rec.Body.String())
 			}
@@ -86,7 +89,7 @@ func TestAnalyticsConcurrentSingleVisitor(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			if rec := analyticsTestBeacon(mux, "same-visitor", `{"p":"/concurrent"}`); rec.Code != 204 {
+			if rec := analyticsTestBeacon(mux, "00000000000000bb", `{"p":"/concurrent"}`); rec.Code != 204 {
 				t.Errorf("beacon returned %d: %s", rec.Code, rec.Body.String())
 			}
 		}()
@@ -101,7 +104,7 @@ func TestAnalyticsConcurrentSingleVisitor(t *testing.T) {
 		t.Fatalf("events=%d sessions=%d entries=%d exits=%d bounces=%d", events, sessions, entries, exits, bounces)
 	}
 	var views, sessionCount int
-	if err := app.DB.QueryRow("SELECT pageview_count, session_count FROM _benmore_visitors WHERE visitor_id='same-visitor'").Scan(&views, &sessionCount); err != nil {
+	if err := app.DB.QueryRow("SELECT pageview_count, session_count FROM _benmore_visitors WHERE visitor_id='00000000000000bb'").Scan(&views, &sessionCount); err != nil {
 		t.Fatal(err)
 	}
 	if views != requests || sessionCount != 1 {
@@ -126,7 +129,7 @@ func TestAnalyticsFinalBeaconAndSessionExpiry(t *testing.T) {
 	RegisterAnalyticsRoutes(mux, app)
 	post := func(body string, want int) {
 		t.Helper()
-		if rec := analyticsTestBeacon(mux, "visitor", body); rec.Code != want {
+		if rec := analyticsTestBeacon(mux, "00000000000000aa", body); rec.Code != want {
 			t.Fatalf("beacon status=%d want=%d body=%s", rec.Code, want, rec.Body.String())
 		}
 	}
@@ -151,4 +154,37 @@ func TestAnalyticsFinalBeaconAndSessionExpiry(t *testing.T) {
 	}
 	mustExec(t, app.DB, "CREATE TRIGGER reject_duration BEFORE UPDATE OF duration_ms ON _benmore_analytics BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
 	post(`{"p":"/page","fin":1,"d":200}`, 503)
+}
+
+// The admin summary's days window is parsed as an integer; the raw
+// parameter never reaches the SQL text.
+func TestAnalyticsSummaryDaysIsAnInteger(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	EnsureSessionsTable(app.DB)
+	if err := EnsureUsersTable(app.DB); err != nil {
+		t.Fatal(err)
+	}
+	EnsureAnalyticsTables(app.DB)
+	mustExec(t, app.DB, `INSERT INTO _benmore_analytics (visitor_id, session_id, path, created_at) VALUES
+		('v1', 's1', '/today', datetime('now')),
+		('v2', 's2', '/old', datetime('now', '-30 days'))`)
+	res, err := app.DB.Exec("INSERT INTO _benmore_users (username, email, role, verified) VALUES ('admin', 'admin@example.com', 'admin', 1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, _ := res.LastInsertId()
+	sid := CreateSession(app.DB, uid, "admin@example.com", "", time.Hour)
+	mux := http.NewServeMux()
+	RegisterAnalyticsRoutes(mux, app)
+	for days, want := range map[string]float64{"7": 1, "7'": 1, "100000": 2} {
+		r := httptest.NewRequest("GET", "/api/_analytics/summary?days="+url.QueryEscape(days), nil)
+		r.Header.Set("Authorization", "Bearer "+sid)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		var out map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out["pageviews"] != want {
+			t.Fatalf("days=%q: status %d pageviews=%v want %v (%v)", days, w.Code, out["pageviews"], want, err)
+		}
+	}
 }

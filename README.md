@@ -72,8 +72,8 @@ Everything below is handled by the runtime - no app code required:
 - **Frontend**: on-the-fly TSX→JS via embedded esbuild, a typed `bm` SDK,
   Tailwind/HTMX/Alpine/Chart.js/Lucide served from the binary. Optional Go
   `html/template` SSR mode for SEO pages.
-- **Ops niceties**: PDF generation, XLSX export, signed URLs, rate limiting,
-  circuit breaker, scheduled backups, per-app git history.
+- **Ops niceties**: PDF generation, signed URLs, rate limiting, circuit
+  breaker, scheduled backups, per-app git history.
 
 See `docs/agent/build.md` and `benmore docs` for the full app-builder guide.
 

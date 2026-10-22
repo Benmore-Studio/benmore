@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeApp(t *testing.T, files map[string]string) string {
@@ -71,8 +72,8 @@ func TestRunCompleteCheck_OrphanedTableSurfacedAsWarning(t *testing.T) {
 			if f.Severity != "warning" {
 				t.Errorf("orphan table should be warning, got severity=%q", f.Severity)
 			}
-			if !strings.Contains(f.Message, "prisma_prune") {
-				t.Errorf("orphan warning should suggest prisma_prune, got: %s", f.Message)
+			if !strings.Contains(f.Message, "migrations/") {
+				t.Errorf("orphan warning should suggest a migrations/ drop, got: %s", f.Message)
 			}
 		}
 	}
@@ -217,7 +218,7 @@ func TestAgentDocs_TopicsList(t *testing.T) {
 	// The public framework export ships build and harness; the private monorepo also
 	// carries the cloud-only `deploy` guide. A new topic is a deliberate act.
 	topics := AgentDocsTopics()
-	want := []string{"build"}
+	want := []string{"build", "connector"}
 	if _, err := os.Stat("docs/agent/deploy.md"); err == nil {
 		want = append(want, "deploy")
 	} else if !os.IsNotExist(err) {
@@ -231,5 +232,88 @@ func TestAgentDocs_TopicsList(t *testing.T) {
 		if topics[i] != want[i] {
 			t.Fatalf("expected topics %v, got %v", want, topics)
 		}
+	}
+}
+
+// The write-path check must never open the app's live database: on a hosted
+// app it runs in the router while the per-app process may be mid-reload on the
+// same data.db, and the migration/trigger work in the app-load layer contends
+// for SQLite's write lock (_txlock=immediate, 10s busy_timeout). Hold the write
+// lock from another connection and prove the source check neither blocks nor
+// reports app-load/drift findings; the full check still does.
+func TestRunSourceCheck_NeverTouchesLiveDB(t *testing.T) {
+	dir := writeApp(t, map[string]string{
+		"app.yaml": `seo:
+  site_name: T
+theme: zinc`,
+		"schema.prisma": `model Note {
+  id    Int    @id @default(autoincrement())
+  title String
+}`,
+		// Valid file, invalid SQL: only the app-load layer can see it.
+		"migrations/001_bad.sql": "CREATE TABLEX nope (id INTEGER);\n",
+	})
+	full := RunCompleteCheck(dir, "")
+	sawAppLoad := false
+	for _, f := range full.Findings {
+		if f.Source == "app_load" {
+			sawAppLoad = true
+		}
+	}
+	if !sawAppLoad {
+		t.Fatalf("full check should still surface the app-load failure:\n%s", FormatReport(full))
+	}
+
+	// Hold the SQLite write lock the way a mid-reload app process does.
+	holder, err := sql.Open("sqlite3", filepath.Join(dir, "data.db")+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	start := time.Now()
+	src := RunSourceCheck(dir, "schema.prisma")
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("source check blocked on the live DB write lock for %s", took)
+	}
+	for _, f := range src.Findings {
+		if f.Source == "app_load" || f.Source == "drift" {
+			t.Fatalf("source check ran a live-DB layer: %+v", f)
+		}
+	}
+	if !src.Clean() {
+		t.Fatalf("source check should be clean for valid source:\n%s", FormatReport(src))
+	}
+}
+
+// A write that no other file depends on re-validates only itself; a write to
+// a shared file (schema.prisma) re-validates the whole tree. The pre-write gate
+// already validated the written file, so the post-write walk exists only for
+// cross-file effects.
+func TestRunSourceCheck_ScopesToWrittenFile(t *testing.T) {
+	dir := writeApp(t, map[string]string{
+		"app.yaml": `seo:
+  site_name: T
+theme: zinc`,
+		"schema.prisma": `model Note {
+  id    Int    @id @default(autoincrement())
+  title String
+}`,
+		"flows/broken.yaml": "name: broken\nsteps: [\n",
+		"static/app.tsx":    "export const x = 1;\n",
+	})
+	if rpt := RunSourceCheck(dir, "static/app.tsx"); rpt.Errors != 0 {
+		t.Fatalf("a .tsx write re-validated unrelated files:\n%s", FormatReport(rpt))
+	}
+	if rpt := RunSourceCheck(dir, "schema.prisma"); rpt.Errors == 0 {
+		t.Fatalf("a schema write must re-validate the whole tree:\n%s", FormatReport(rpt))
+	}
+	if rpt := RunCompleteCheck(dir, ""); rpt.Errors == 0 {
+		t.Fatalf("the full check must re-validate the whole tree:\n%s", FormatReport(rpt))
 	}
 }

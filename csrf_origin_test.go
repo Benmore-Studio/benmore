@@ -47,7 +47,7 @@ func TestSecurityLinkBaseURL(t *testing.T) {
 	r := httptest.NewRequest("POST", "http://attacker.example/forgot", nil)
 	r.Host = "attacker.example"
 	app := &App{Design: &DesignConfig{SEO: map[string]string{"url": "https://app.real"}}}
-	if got := securityLinkBaseURL(app, r); got != "https://app.real" {
+	if got, ok := securityLinkBaseURL(app, r); !ok || got != "https://app.real" {
 		t.Fatalf("with seo.url: got %q, want https://app.real (not the request Host)", got)
 	}
 }

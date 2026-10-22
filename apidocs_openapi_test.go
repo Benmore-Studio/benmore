@@ -159,8 +159,7 @@ func TestOpenAPIListResponseMatchesRuntime(t *testing.T) {
 }
 
 // TestOpenAPIListParamsMatchRuntime asserts the list params describe the real
-// page/per_page/cursor/limit/count/include/q surface and never the
-// non-existent ?offset param.
+// page/per_page and SDK limit/offset aliases, plus cursor/count/include/q.
 func TestOpenAPIListParamsMatchRuntime(t *testing.T) {
 	app := &App{Tables: []Table{{Name: "notes", Columns: []Column{{Name: "id", Type: "INTEGER", PK: true}}}}}
 	spec := generateRuntimeOpenAPI(app)
@@ -169,13 +168,10 @@ func TestOpenAPIListParamsMatchRuntime(t *testing.T) {
 	for _, p := range params {
 		names[p["name"].(string)] = true
 	}
-	for _, want := range []string{"page", "per_page", "cursor", "limit", "count", "include", "q"} {
+	for _, want := range []string{"page", "per_page", "cursor", "limit", "offset", "count", "include", "q"} {
 		if !names[want] {
 			t.Fatalf("list params missing %q; got %v", want, names)
 		}
-	}
-	if names["offset"] {
-		t.Fatal("list params advertise a non-existent ?offset parameter")
 	}
 }
 

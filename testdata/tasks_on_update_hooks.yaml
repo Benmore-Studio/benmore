@@ -1,0 +1,108 @@
+  tasks:
+    # Keep assignee_id in sync when the assignee email changes — the
+    # client form only sends the email, but the notify step downstream
+    # gates on assignee_id, so we re-resolve here on every update.
+    # Reject a foreign assignee_id at the WRITE — the on_update twin of the
+    # sanitiser in the on_insert block. Same reasoning: an UPDATE can introduce a
+    # foreign id exactly as an INSERT can, and leaving it stored drops the task
+    # out of task-due-cadence's membership INNER JOIN silently.
+    - sql: |
+        UPDATE tasks
+           SET assignee_id = NULL
+         WHERE id = {{id}}
+           AND tasks.assignee_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM org_memberships m
+                            WHERE m.member_user_id = tasks.assignee_id
+                              AND m.group_id = tasks.group_id
+                              AND m.status = 'active')
+    # TENANT-SCOPED (#341) — same membership guard as the on_insert twin above.
+    # An unscoped resolve here is the same hole: re-assigning a task to an email
+    # that exists in another org bound this row to a foreign user id.
+    # A non-member email now resolves to NULL, which is the correct outcome —
+    # `assignee` (the email) is the address of record and `assignee_id` is a
+    # best-effort in-org resolution, exactly as resolveAssigneeId documents it.
+    - when: assignee != '' AND assignee != old_assignee
+      sql: |
+        UPDATE tasks
+           SET assignee_id = (
+                 SELECT u.id FROM _benmore_users u
+                  WHERE u.email = '{{assignee}}'
+                    AND EXISTS (SELECT 1 FROM org_memberships m
+                                 WHERE m.member_user_id = u.id
+                                   AND m.group_id = {{group_id}}
+                                   AND m.status = 'active'))
+         WHERE id = {{id}}
+    - when: assignee = '' AND old_assignee != ''
+      sql: UPDATE tasks SET assignee_id = NULL WHERE id = {{id}}
+    - when: status = 'done'
+      sql: |
+        INSERT INTO activities
+          (group_id, project_id, actor_user_id, actor_email, kind, target_type, target_id, target_label, description, user_id)
+        SELECT
+           {{group_id}}, {{project_id}}, {{user_id}},
+           (SELECT email FROM _benmore_users WHERE id = {{user_id}}),
+           'task_completed', 'task', {{id}}, '{{name}}',
+           'completed task ' || '{{name}}', {{user_id}}
+        WHERE NOT EXISTS (SELECT 1 WHERE '{{old_status}}' = 'done')
+    # The changed-assignee test lives in the WHERE (quoted on both sides, as
+    # in the notify hook below): a compound `when:` is not a condition the
+    # framework evaluates.
+    # KEEP the simple `when: assignee_id IS NOT NULL` (that family DOES gate).
+    # The statement reads `u.id = {{assignee_id}}` unquoted, so without it a
+    # task with no assignee renders `WHERE u.id =` and fails to parse: SQLite
+    # rejects the whole statement before the WHERE guard is ever evaluated.
+    # Found on dev and prod 2026-09-30 with this line removed, which broke the
+    # hook on every edit of an unassigned task.
+    - when: assignee_id IS NOT NULL
+      sql: |
+        INSERT INTO activities
+          (group_id, project_id, actor_user_id, actor_email, kind, target_type, target_id, target_label, description, user_id)
+        SELECT
+           {{group_id}}, {{project_id}}, {{user_id}},
+           (SELECT email FROM _benmore_users WHERE id = {{user_id}}),
+           'task_assigned', 'task', {{id}}, '{{name}}',
+           'assigned task ' || '{{name}}' || ' to ' ||
+             -- TENANT-SCOPED (#341). This read is the INBOUND half of the leak:
+             -- with a foreign assignee_id it wrote another org's email into THIS
+             -- org's activity feed. COALESCE keeps the description non-null when
+             -- the id is not a member, because in SQLite `'x' || NULL` is NULL —
+             -- an unguarded subquery here would blank the whole description.
+             COALESCE((SELECT u.email FROM _benmore_users u
+                        WHERE u.id = {{assignee_id}}
+                          AND EXISTS (SELECT 1 FROM org_memberships m
+                                       WHERE m.member_user_id = u.id
+                                         AND m.group_id = {{group_id}}
+                                         AND m.status = 'active')), '{{assignee}}'),
+           {{user_id}}
+         WHERE '{{assignee_id}}' != '' AND '{{assignee_id}}' != '{{old_assignee_id}}'
+    # Ping the new assignee — direct INSERT so title/body actually persist.
+    #
+    # TENANT-SCOPED (#341), guard in the STATEMENT for the same two reasons as
+    # the on_insert twin: `assignee_id` is client-writable so the resolve hook
+    # can be bypassed entirely, and `col != x` in `when:` does not gate on
+    # v2.7.203. The two `!=` comparisons that were doing the real work here —
+    # `old_assignee_id != assignee_id` and `assignee_id != user_id` — were both
+    # of that non-gating shape, so this hook was firing far more often than it
+    # reads. Both are now real conditions in the WHERE.
+    - when: assignee_id IS NOT NULL
+      sql: |
+        INSERT INTO _benmore_notifications
+          (user_id, title, body, type, link, read, created_at)
+        SELECT {{assignee_id}}, 'Task assigned', '{{name}}', 'info',
+               '/task?id=' || CAST({{id}} AS INTEGER), 0, CURRENT_TIMESTAMP
+         WHERE {{assignee_id}} != {{user_id}}
+           -- Quoted on BOTH sides on purpose: old_assignee_id is nullable and
+           -- substitutes to an empty string, so an UNQUOTED comparison becomes
+           -- `5 != ` and fails to PARSE. As text it covers all three cases —
+           -- (and note: never write a doubled-brace placeholder inside a SQL
+           -- comment here — the substituter scans comments too, same family as
+           -- the named-param-in-a-comment trap CLAUDE.md documents.)
+           -- newly assigned ('5' != ''), re-assigned ('5' != '4'), and unchanged
+           -- ('5' != '5' → no ping). assignee_id itself needs no such care: its
+           -- `when:` uses IS NOT NULL, which is in the family that does gate.
+           AND '{{assignee_id}}' != '{{old_assignee_id}}'
+           AND EXISTS (SELECT 1 FROM org_memberships m
+                        WHERE m.member_user_id = {{assignee_id}}
+                          AND m.group_id = {{group_id}}
+                          AND m.status = 'active')
+

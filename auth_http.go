@@ -11,19 +11,27 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 // isSafeNext returns true only if next is a same-origin relative path.
 // Rejects "//evil.com" and "/\evil.com" - browsers treat both as
-// protocol-relative URLs and would redirect off-site.
+// protocol-relative URLs and would redirect off-site. Control characters are
+// rejected too: browsers delete tab/CR/LF before parsing, so "/\t/evil.com"
+// is followed as "//evil.com", and net/http emits it into Location unchanged.
 func isSafeNext(next string) bool {
 	if len(next) < 1 || next[0] != '/' {
 		return false
 	}
 	if len(next) >= 2 && (next[1] == '/' || next[1] == '\\') {
 		return false
+	}
+	for i := 0; i < len(next); i++ {
+		if next[i] < 0x20 || next[i] == 0x7f {
+			return false
+		}
 	}
 	return true
 }
@@ -56,6 +64,32 @@ func authRedirect(w http.ResponseWriter, r *http.Request, path, errMsg string) {
 		path += sep + "error=" + url.QueryEscape(errMsg)
 	}
 	http.Redirect(w, r, path, http.StatusSeeOther)
+}
+
+// denyFraming forbids every site from framing the response. The app-wide
+// headers allow the platform workspace and the desktop app to frame an app,
+// and an app can widen that to anyone with csp.frame_ancestors (embed
+// pages). The framework's own confirmation pages must not inherit that: a
+// page whose one button approves something can be driven by clickjacking
+// from whatever may frame it. A second Content-Security-Policy header only
+// ever narrows, so the app's other directives stay as they are.
+func denyFraming(w http.ResponseWriter) {
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Add("Content-Security-Policy", "frame-ancestors 'none'")
+}
+
+// authCSRFRefused answers a sign-in or sign-up POST without a valid CSRF
+// token. It used to say only "Invalid request", which left scripted callers
+// guessing; a form whose page went stale gets a reload hint instead.
+func authCSRFRefused(w http.ResponseWriter, r *http.Request, path string) {
+	if wantsJSON(r) {
+		httpJSON(w, http.StatusForbidden, map[string]any{
+			"ok":    false,
+			"error": "missing or expired CSRF token: GET /api/_csrf and send its token as the X-CSRF-Token header (or the _csrf form field). bm.auth.signIn/signUp do this; to create users from a script use `benmore users <app> create`.",
+		})
+		return
+	}
+	authRedirect(w, r, path, "This form expired. Reload the page and try again.")
 }
 
 // mergeJSONBodyIntoForm reads a JSON request body and copies each
@@ -163,9 +197,15 @@ func authSuccessJSON(w http.ResponseWriter, r *http.Request, app *App, userID in
 // a defensive net so a developer who adds e.g. `payment_token` or
 // `internal_notes` doesn't accidentally leak it through loadUserForJSON
 // or GET /api/_auth/profile. Defense in depth - apps that genuinely need
-// to expose such a column should rename it.
+// to expose such a column should rename it (a `public_` / `publishable_`
+// prefix marks a name as intentionally client-visible, e.g.
+// `publishable_key`), or return it from a flow. apiHiddenColumn applies the
+// same predicate to every app-table response.
 func isSensitiveUserColumn(col string) bool {
 	c := strings.ToLower(col)
+	if strings.HasPrefix(c, "public_") || strings.HasPrefix(c, "publishable_") {
+		return false
+	}
 	switch c {
 	case "password_hash", "password", "totp_secret", "mfa_backup_codes",
 		"backup_codes", "recovery_codes", "salt", "session_id", "csrf_token",
@@ -250,16 +290,35 @@ func baseURL(app *App, r *http.Request) string {
 // origin exists: a host-header-poisoning attacker could otherwise make the
 // genuine reset email point the token at their domain (round-2 #5 - pre-auth
 // account takeover). Preference: configured seo.url -> BENMORE_PUBLIC_URL /
-// CORS_ORIGIN -> request host (logged, so operators see the unsafe fallback).
-func securityLinkBaseURL(app *App, r *http.Request) string {
+// CORS_ORIGIN -> the request host only where something trustworthy already
+// vetted it (dev mode, or the platform router, which serves only hosts it
+// has matched to this app). Otherwise ok=false: the caller must not send
+// the link, and the operator error names the setting to add.
+func securityLinkBaseURL(app *App, r *http.Request) (base string, ok bool) {
 	if app.Design != nil {
 		if seoURL, ok := app.Design.SEO["url"]; ok && seoURL != "" {
-			return strings.TrimRight(seoURL, "/")
+			return strings.TrimRight(seoURL, "/"), true
 		}
 	}
 	if origin := uploadsCanonicalOrigin(app); origin != "" {
-		return strings.TrimRight(origin, "/")
+		return strings.TrimRight(origin, "/"), true
 	}
-	log.Printf("SECURITY: building a credential link (reset/verify) from the request Host %q - set BENMORE_PUBLIC_URL or seo.url so a host-header-poisoning attacker can't redirect the token", r.Host)
-	return fmt.Sprintf("%s://%s", protoOf(r), r.Host)
+	if app.DevMode || routerVettedHost(r) {
+		return fmt.Sprintf("%s://%s", protoOf(r), r.Host), true
+	}
+	log.Printf("SECURITY: not sending a credential email (password reset / email verification / email change) for app %s: no public origin is configured and the request Host %q is client-controlled. Set seo.url in app.yaml or BENMORE_PUBLIC_URL in env.yaml to the app's public https origin.", filepath.Base(app.Dir), r.Host)
+	return "", false
+}
+
+// routerVettedHost reports whether the platform router delivered r: it only
+// proxies hosts registered to an app (subdomain or verified custom domain),
+// sets X-Forwarded-Proto itself, and reaches the app over loopback with its
+// X-Benmore-App marker. Unlike clientIP it always requires the router's
+// signature, even with BENMORE_REQUIRE_ROUTER_SIG turned off for a rollout:
+// another tenant on the host can reach this app's loopback port, and an
+// unsigned marker would let it pick the origin of a password-reset link.
+// Self-hosted builds have no router, so the Host header stays
+// client-controlled there.
+func routerVettedHost(r *http.Request) bool {
+	return platformBuild && routerMarkerSigned(r)
 }

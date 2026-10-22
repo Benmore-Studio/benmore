@@ -66,27 +66,43 @@ trap 'rm -rf "$tmp"' EXIT
 
 dlo "$BASE/$ASSET" "$tmp/$ASSET" || err "download failed: $BASE/$ASSET"
 
-if dlo "$BASE/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
-  expected="$(grep " $ASSET\$" "$tmp/checksums.txt" | awk '{print $1}')"
-  if [ -n "$expected" ]; then
-    if have sha256sum; then
-      actual="$(sha256sum "$tmp/$ASSET" | awk '{print $1}')"
-    elif have shasum; then
-      actual="$(shasum -a 256 "$tmp/$ASSET" | awk '{print $1}')"
-    else
-      actual=""
-    fi
-    if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
-      err "checksum mismatch for $ASSET (expected $expected, got $actual)"
-    fi
-    [ -n "$actual" ] && say "✓ checksum verified"
-  fi
+# Verification is mandatory: a missing checksums.txt, a missing entry or a
+# missing hash tool must stop the install, not silently skip the check (an
+# attacker who can 404 one URL would otherwise choose the unverified path).
+dlo "$BASE/checksums.txt" "$tmp/checksums.txt" 2>/dev/null || err "checksums.txt unavailable: $BASE/checksums.txt"
+# checksums.txt only proves the archive matches a file published beside it in
+# the same release. When the release carries a keyless Sigstore bundle and
+# cosign is installed, also prove checksums.txt came from this repository's
+# release workflow on a v* tag. BENMORE_REQUIRE_SIGNATURE=1 makes a missing
+# cosign or bundle fatal.
+REQUIRE_SIG="${BENMORE_REQUIRE_SIGNATURE:-}"
+if ! have cosign; then
+  [ "$REQUIRE_SIG" != 1 ] || err "BENMORE_REQUIRE_SIGNATURE=1 but cosign is not installed"
+  say "note: cosign not installed; skipped signature verification (checksum still enforced)"
+elif ! dlo "$BASE/checksums.txt.sigstore.json" "$tmp/checksums.txt.sigstore.json" 2>/dev/null; then
+  [ "$REQUIRE_SIG" != 1 ] || err "release $VERSION has no checksums.txt.sigstore.json"
+  say "warning: release $VERSION has no Sigstore bundle; skipped signature verification"
 else
-  say "! checksums.txt unavailable - skipping verification"
+  cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp "^https://github\\.com/$REPO/\\.github/workflows/release\\.yml@refs/tags/v" \
+    "$tmp/checksums.txt" >/dev/null 2>&1 || err "signature verification of checksums.txt failed"
+  say "✓ checksums.txt signature verified"
 fi
+expected="$(awk -v name="$ASSET" '$2 == name { print $1; exit }' "$tmp/checksums.txt")"
+[ -n "$expected" ] || err "checksums.txt has no entry for $ASSET"
+if have sha256sum; then
+  actual="$(sha256sum "$tmp/$ASSET" | awk '{print $1}')"
+elif have shasum; then
+  actual="$(shasum -a 256 "$tmp/$ASSET" | awk '{print $1}')"
+else
+  err "sha256sum or shasum is required to verify the download"
+fi
+[ "$actual" = "$expected" ] || err "checksum mismatch for $ASSET (expected $expected, got $actual)"
+say "✓ checksum verified"
 
-tar -xzf "$tmp/$ASSET" -C "$tmp"
-[ -f "$tmp/$BINARY" ] || err "archive did not contain $BINARY"
+tar -xzf "$tmp/$ASSET" -C "$tmp" "$BINARY" || err "archive did not contain $BINARY"
+[ -f "$tmp/$BINARY" ] && [ ! -L "$tmp/$BINARY" ] || err "archive did not contain a safe $BINARY"
 chmod +x "$tmp/$BINARY"
 
 # --- choose install dir ------------------------------------------------------

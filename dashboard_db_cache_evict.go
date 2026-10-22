@@ -2,6 +2,8 @@
 
 package main
 
+import "path/filepath"
+
 // dbFileReplacedHook is invoked whenever a live `data.db` is replaced by raw
 // file I/O rather than through its own connection — a backup restore, a
 // boot-time auto-recovery swap, or a dev-data refresh.
@@ -16,8 +18,18 @@ package main
 // notifyDBFileReplaced, never directly.
 var dbFileReplacedHook func(dbPath string)
 
+// dbRestoredAppHook is invoked with the app directory after the same swap,
+// for state kept OUTSIDE the app database that names its rows. The platform's
+// edge grants carry the app's local user ids, and a replaced database can
+// hand an id to a different account, so the platform build revokes them here
+// (edge_auth.go). Nil when the platform is not part of the build.
+var dbRestoredAppHook func(appDir string)
+
 func notifyDBFileReplaced(dbPath string) {
 	if dbFileReplacedHook != nil {
 		dbFileReplacedHook(dbPath)
+	}
+	if dbRestoredAppHook != nil {
+		dbRestoredAppHook(filepath.Dir(dbPath))
 	}
 }

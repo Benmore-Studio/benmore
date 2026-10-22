@@ -46,11 +46,17 @@ func emailGatewaySocketPath() string {
 type emailGatewayReq struct {
 	From           string   `json:"from,omitempty"`
 	To             []string `json:"to"`
+	CC             []string `json:"cc,omitempty"`
+	BCC            []string `json:"bcc,omitempty"`
 	ReplyTo        string   `json:"reply_to,omitempty"`
 	Subject        string   `json:"subject"`
 	HTML           string   `json:"html,omitempty"`
 	Text           string   `json:"text,omitempty"`
 	UnsubscribeURL string   `json:"unsubscribe_url,omitempty"`
+	// OneClick asks for the RFC 8058 List-Unsubscribe-Post header too
+	// (EmailOpts.UnsubscribeOneClick). A router older than this field sends
+	// it with every unsubscribe_url.
+	OneClick bool `json:"unsubscribe_one_click,omitempty"`
 	// Attachments ride the socket as base64; the broker caps the total
 	// request size (see handleEmailConn) so a large payload can't wedge it.
 	Attachments []EmailAttachment `json:"attachments,omitempty"`

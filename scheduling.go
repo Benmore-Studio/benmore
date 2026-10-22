@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -41,6 +43,10 @@ func EnsureSchedulingTables(db *sql.DB) {
 	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN claimed_at DATETIME`)
 	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN authorization TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`)
+	// recoveries counts how often a task was found orphaned in 'running' and
+	// put back; sweepScheduledTasks fails a task that keeps killing its worker
+	// instead of re-firing it forever.
+	db.Exec(`ALTER TABLE _benmore_scheduled_tasks ADD COLUMN recoveries INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_approvals (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		table_name TEXT NOT NULL,
@@ -57,12 +63,27 @@ func EnsureSchedulingTables(db *sql.DB) {
 	)`)
 }
 
+// approvalRequestLimiter caps approval requests per account (each one can
+// notify the named approver): approvalRequestBurst per approvalRequestWindow,
+// per app. Any signed-in account may name any user as approver, so without a
+// cap one account could flood that user's notifications.
+const (
+	approvalRequestBurst  = 30
+	approvalRequestWindow = 10 * time.Minute
+)
+
+var approvalRequestLimiter = NewRateLimiter(approvalRequestBurst, approvalRequestWindow)
+
 // RegisterSchedulingAPI wires the scheduled-tasks + approvals endpoints
 // and starts the per-app sweeper.
-func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
+func RegisterSchedulingAPI(mux appRouteRegistrar, app *App) {
 	EnsureSchedulingTables(app.DB)
 	StartSchedulerSweeper(app)
 
+	registerSchedulingAPI(mux, app)
+}
+
+func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 	// ── Scheduled tasks ──
 	mux.HandleFunc("POST /api/_scheduled", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
@@ -129,7 +150,7 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			session.UserID, kind, title, b.Message, b.Flow, string(b.Body), b.Table, b.RowID, when.UTC().Format(time.RFC3339), authorization,
 		)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "schedule failed"})
+			serverErrorJSON(w, r, app, "_schedule", err, "schedule failed")
 			return
 		}
 		id, _ := res.LastInsertId()
@@ -152,9 +173,9 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			args = append(args, rid)
 		}
 		q += " ORDER BY run_at ASC LIMIT 200"
-		rows, err := QueryRows(app.DB, q, args...)
+		rows, err := queryMetadataRows(app.DB, q, args...)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_schedule", err, "query failed")
 			return
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"tasks": rows})
@@ -194,6 +215,30 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "table and row_id required"})
 			return
 		}
+		// An approval on an app record joins that record's approval history,
+		// which every reader of the record sees (GET below), so only a caller
+		// who can read the record may request one. A table name that is not
+		// an app table is a free-form label and stays private to the
+		// requester and approver.
+		if appHasTable(app, b.Table) && !canAccessRow(app, b.Table, b.RowID, session) {
+			httpJSON(w, http.StatusNotFound, map[string]any{"error": "record not found"})
+			return
+		}
+		// The same request while it is still pending returns that approval
+		// rather than storing and notifying again (a double submit, or a
+		// loop aimed at the approver's notifications).
+		var existing int64
+		if app.DB.QueryRow(`SELECT id FROM _benmore_approvals WHERE table_name = ? AND row_id = ? AND requested_by = ?
+			AND approver_email = ? AND title = ? AND status = 'pending' ORDER BY id LIMIT 1`,
+			b.Table, b.RowID, session.UserID, b.ApproverEmail, b.Title).Scan(&existing) == nil {
+			httpJSON(w, http.StatusOK, map[string]any{"id": existing, "status": "pending"})
+			return
+		}
+		if ok, retry, _ := approvalRequestLimiter.Check(appLimiterKey(app, "approval", strconv.FormatInt(session.UserID, 10))); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+			httpJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many approval requests; try again later"})
+			return
+		}
 		var approverID sql.NullInt64
 		if b.ApproverEmail != "" {
 			app.DB.QueryRow("SELECT id FROM _benmore_users WHERE email = ?", b.ApproverEmail).Scan(&approverID)
@@ -203,7 +248,7 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 			b.Table, b.RowID, session.UserID, session.Email, nullableInt(approverID), b.ApproverEmail, b.Title,
 		)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "request failed"})
+			serverErrorJSON(w, r, app, "_approvals", err, "request failed")
 			return
 		}
 		id, _ := res.LastInsertId()
@@ -220,23 +265,43 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 		}
 		q := "SELECT id, table_name, row_id, requested_by, requested_email, approver_email, title, status, note, created_at, decided_at FROM _benmore_approvals WHERE 1=1"
 		args := []any{}
-		if t := r.URL.Query().Get("table"); t != "" {
+		t, rid := r.URL.Query().Get("table"), r.URL.Query().Get("row_id")
+		if t != "" {
 			q += " AND table_name = ?"
 			args = append(args, t)
 		}
-		if rid := r.URL.Query().Get("row_id"); rid != "" {
+		if rid != "" {
 			q += " AND row_id = ?"
 			args = append(args, rid)
 		}
+		// Approvals name people (emails), carry titles and decision notes,
+		// and have no tenant column. Besides an admin, a caller sees the
+		// approvals they requested or are asked to decide, and every approval
+		// on a record they can read (the Approval component's history).
+		if !session.IsAdminBypass() && !(t != "" && rid != "" && canAccessRow(app, t, rid, session)) {
+			q += " AND (requested_by = ? OR approver_id = ?"
+			args = append(args, session.UserID, session.UserID)
+			if email := sessionGrantEmail(session); email != "" {
+				q += " OR approver_email = ?"
+				args = append(args, email)
+			}
+			q += ")"
+		}
 		// "mine" = pending approvals assigned to me (to act on).
 		if r.URL.Query().Get("mine") == "1" {
-			q += " AND (approver_id = ? OR approver_email = ?)"
-			args = append(args, session.UserID, session.Email)
+			// An approval addressed by email belongs to a verified address.
+			if email := sessionGrantEmail(session); email != "" {
+				q += " AND (approver_id = ? OR approver_email = ?)"
+				args = append(args, session.UserID, email)
+			} else {
+				q += " AND approver_id = ?"
+				args = append(args, session.UserID)
+			}
 		}
 		q += " ORDER BY created_at DESC LIMIT 200"
-		rows, err := QueryRows(app.DB, q, args...)
+		rows, err := queryMetadataRows(app.DB, q, args...)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_approvals", err, "query failed")
 			return
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"approvals": rows})
@@ -266,18 +331,22 @@ func RegisterSchedulingAPI(mux *http.ServeMux, app *App) {
 		var requestedBy int64
 		app.DB.QueryRow("SELECT approver_id, approver_email, requested_by, requested_email, title FROM _benmore_approvals WHERE id = ?", r.PathValue("id")).
 			Scan(&approverID, &approverEmail, &requestedBy, &requestedEmail, &title)
-		isApprover := (approverID.Valid && approverID.Int64 == session.UserID) || (approverEmail != "" && approverEmail == session.Email)
+		isApprover := (approverID.Valid && approverID.Int64 == session.UserID) || (approverEmail != "" && approverEmail == sessionGrantEmail(session))
 		if !isApprover && !session.IsAdmin() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "not the assigned approver"})
 			return
 		}
-		_, err := app.DB.Exec("UPDATE _benmore_approvals SET status=?, note=?, decided_at=? WHERE id=? AND status='pending'",
+		res, err := app.DB.Exec("UPDATE _benmore_approvals SET status=?, note=?, decided_at=? WHERE id=? AND status='pending'",
 			b.Decision, b.Note, time.Now().UTC().Format(time.RFC3339), r.PathValue("id"))
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "update failed"})
+			serverErrorJSON(w, r, app, "_approvals", err, "update failed")
 			return
 		}
-		CreateNotification(app.DB, requestedBy, "Approval "+b.Decision, title, map[string]string{"approved": "success", "rejected": "warning"}[b.Decision], "")
+		// Only the decision that changed the approval notifies the
+		// requester; repeating it changes nothing and stays quiet.
+		if n, _ := res.RowsAffected(); n == 1 {
+			CreateNotification(app.DB, requestedBy, "Approval "+b.Decision, title, map[string]string{"approved": "success", "rejected": "warning"}[b.Decision], "")
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": b.Decision})
 	})
 }
@@ -311,12 +380,9 @@ func StartSchedulerSweeper(app *App) {
 	if app == nil || app.DB == nil {
 		return
 	}
-	// H-14: launch via safeGo (panic-recovering) instead of a raw `go`, so a
-	// panic inside the sweep logs + dies in isolation instead of crashing the
-	// whole process and taking down every hosted app. Lifecycle is already
-	// bound to app.Stop below.
-	safeGo("scheduling.sweeper", func() {
-		stop := app.Stop // capture once: hot reload reassigns app.Stop; reading the field in the loop would race the swap and could miss the close (goroutine leak)
+	// Tracked, so a `serve` process's Shutdown lets a sweep in progress (a
+	// scheduled flow mid-run) finish before it closes the database.
+	app.startJobRunner("scheduling.sweeper", func(stop <-chan struct{}) {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -324,16 +390,50 @@ func StartSchedulerSweeper(app *App) {
 			case <-stop:
 				return
 			case <-ticker.C:
+				select {
+				case <-stop:
+					return
+				default:
+				}
 				sweepScheduledTasks(app)
 			}
 		}
 	})
 }
 
-// schedTaskRecoveryTTL bounds how long a task may sit 'running' before it's
-// treated as orphaned by a crashed worker and re-queued. Sweeps complete tasks
-// synchronously, so a live process never legitimately holds one this long.
+// schedTaskRecoveryTTL bounds how long a task may sit 'running' without its
+// claim being refreshed before it's treated as orphaned by a crashed worker
+// and re-queued. The sweeper refreshes claimed_at while a task runs
+// (startScheduledTaskHeartbeat), so a slow flow is not mistaken for an orphan
+// and fired a second time by the next generation's sweeper after a reload.
 const schedTaskRecoveryTTL = 5 * time.Minute
+
+// schedTaskHeartbeatInterval is how often a running task's claim is refreshed.
+var schedTaskHeartbeatInterval = time.Minute
+
+// schedTaskMaxRecoveries is how many times an orphaned task is put back
+// before it is failed: a task whose run kills the process every time would
+// otherwise be re-fired forever.
+const schedTaskMaxRecoveries = 3
+
+// startScheduledTaskHeartbeat refreshes a claimed task's claimed_at until the
+// returned stop function is called.
+func startScheduledTaskHeartbeat(app *App, id any) func() {
+	done := make(chan struct{})
+	safeGo("scheduling.heartbeat", func() {
+		ticker := time.NewTicker(schedTaskHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				app.DB.Exec("UPDATE _benmore_scheduled_tasks SET claimed_at=? WHERE id=? AND status='running'", time.Now().UTC().Format(time.RFC3339), id)
+			}
+		}
+	})
+	return func() { close(done) }
+}
 
 var errScheduledFlowRateLimited = errors.New("flow rate limit reached; task will retry before executing any steps")
 
@@ -342,11 +442,15 @@ func sweepScheduledTasks(app *App) {
 	// Recover orphans: a task stuck 'running' past the TTL belongs to a worker
 	// that died mid-fire (the sweeper would otherwise have set it done/failed).
 	// Reset to pending so it fires again instead of being stranded forever.
+	cutoff := now.Add(-schedTaskRecoveryTTL).Format(time.RFC3339)
 	app.DB.Exec(
-		"UPDATE _benmore_scheduled_tasks SET status='pending', claimed_at=NULL WHERE status='running' AND claimed_at IS NOT NULL AND claimed_at <= ?",
-		now.Add(-schedTaskRecoveryTTL).Format(time.RFC3339))
+		"UPDATE _benmore_scheduled_tasks SET status='failed', claimed_at=NULL, fired_at=?, last_error=? WHERE status='running' AND claimed_at IS NOT NULL AND claimed_at <= ? AND recoveries >= ?",
+		now.Format(time.RFC3339), fmt.Sprintf("worker died while running this task %d times; not run again", schedTaskMaxRecoveries+1), cutoff, schedTaskMaxRecoveries)
+	app.DB.Exec(
+		"UPDATE _benmore_scheduled_tasks SET status='pending', claimed_at=NULL, recoveries = recoveries + 1 WHERE status='running' AND claimed_at IS NOT NULL AND claimed_at <= ?",
+		cutoff)
 
-	rows, err := QueryRows(app.DB,
+	rows, err := queryMetadataRows(app.DB,
 		"SELECT id, user_id, kind, title, message, flow, body, authorization, last_error FROM _benmore_scheduled_tasks WHERE status IN ('pending','blocked') AND run_at <= ? ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, COALESCE(claimed_at,''), run_at ASC LIMIT 50",
 		now.Format(time.RFC3339))
 	if err != nil {
@@ -392,7 +496,10 @@ func sweepScheduledTasks(app *App) {
 		status := "done"
 		lastError := ""
 		if kind, _ := t["kind"].(string); kind == "flow" {
-			if err := executeScheduledFlow(app, t); err != nil {
+			stopHeartbeat := startScheduledTaskHeartbeat(app, id)
+			err := executeScheduledFlow(app, t)
+			stopHeartbeat()
+			if err != nil {
 				if errors.Is(err, errScheduledFlowRateLimited) {
 					status, lastError = "blocked", err.Error()
 				} else {
@@ -438,6 +545,9 @@ func schedulableFlow(app *App, name string, actor *Session) (*Flow, error) {
 		}
 		if flow.Role != "" && !HasAnyRole(actor, []string{flow.Role}) {
 			return nil, fmt.Errorf("task owner no longer has the flow's required role")
+		}
+		if len(flow.Permissions) > 0 && !scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " ")) {
+			return nil, fmt.Errorf("task owner lacks the flow's required permissions")
 		}
 		// The scheduler is already a durable worker. Execute async HTTP definitions
 		// inline here so request taint and actor permissions survive every step.

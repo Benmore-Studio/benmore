@@ -3,9 +3,17 @@
 package main
 
 // Batch record creation, updates, and deletion.
+//
+// Every item goes through the same per-row pipeline /api/_transaction uses
+// (txInsertWithPlan, applyCanonicalUpdateTx, txDeleteRow) inside ONE
+// transaction, so a batch enforces exactly what the single-row endpoints
+// enforce: validators, before-hooks on the merged row, protected and computed
+// columns, foreign-key visibility, record locks, and audit rows that commit
+// with the data. All-or-nothing: a refused item rolls the whole batch back.
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,18 +32,14 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 	}
 
 	var items []map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&items); err != nil {
 		httpError(w, "Expected JSON array", http.StatusBadRequest)
 		return
 	}
 	if len(items) == 0 {
 		httpError(w, "Empty array", http.StatusBadRequest)
-		return
-	}
-
-	cols, err := GetTableColumns(app.DB, table)
-	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -46,159 +50,95 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 			return
 		}
 	}
-	protected := map[string]bool{
-		"user_id": true, "created_at": true, "updated_at": true,
-		"password_hash": true, "role": true,
-		"password_change_required": true,
-	}
-	if app.Group != nil && app.Group.Key != "" {
-		protected[app.Group.Key] = true
-	}
-	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
-	// on the membership table so a member cannot self-elevate via CRUD.
-	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
-		protected[app.Group.RoleField] = true
+	// Command-owned columns: refuse the whole batch before the transaction opens.
+	ownedCheck := ownedFieldChecker(app, table)
+	for _, item := range items {
+		if v := ownedCheck(mapKeys(item)...); v != nil {
+			writeOwnedFieldRefusal(w, v)
+			return
+		}
 	}
 
-	// Wrap entire batch in a transaction
 	tx, err := app.DB.Begin()
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, table+" batch create", err, "Server error")
+		return
+	}
+	defer tx.Rollback()
+
+	plan, err := newInsertPlan(tx, app, table)
+	if err != nil {
+		serverError(w, r, app, table+" batch create", err, "Server error")
 		return
 	}
 
-	// Extract validation rules once for the table
-	validationRules := ExtractValidationRules(app, table)
-
-	isUUID := app.IsUUIDTable(table)
 	var ids []any
+	var created []map[string]any
 	for _, item := range items {
 		// member-of: every batch item must land in a parent the caller is
 		// a member of - same gate as single-row create (M5). All-or-
 		// nothing: one bad item rolls the whole batch back.
-		if d := memberOfCreateDenial(app, table, session, func(col string) string {
+		if d := memberOfCreateDenialWith(tx, app, table, session, func(col string) string {
 			if v, ok := item[col]; ok && v != nil {
 				return fmt.Sprintf("%v", v)
 			}
 			return ""
 		}); d != nil {
-			tx.Rollback()
 			writeMemberOfDenial(w, r, d)
 			return
 		}
 
-		var fields []string
-		var placeholders []string
-		var values []any
-
-		for _, col := range cols {
-			if col.PK {
-				continue
-			}
-			if col.Name == "user_id" {
-				if session != nil {
-					fields = append(fields, col.Name)
-					placeholders = append(placeholders, "?")
-					values = append(values, session.UserID)
-				}
-				continue
-			}
-			if app.Group != nil && col.Name == app.Group.Key && session != nil && session.EffectiveHasGroup() {
-				fields = append(fields, col.Name)
-				placeholders = append(placeholders, "?")
-				values = append(values, session.EffectiveGroupID())
-				continue
-			}
-			if protected[col.Name] {
-				continue
-			}
-
-			if val, ok := item[col.Name]; ok && val != nil {
-				fields = append(fields, col.Name)
-				placeholders = append(placeholders, "?")
-				values = append(values, fmt.Sprintf("%v", val))
-			}
+		data := prepareJSONCreateData(item, plan.schemaCols)
+		id, err := txInsertWithPlan(tx, app, table, data, session, plan)
+		if errors.Is(err, errNoValidFields) {
+			continue // an item naming no writable column is skipped, as before
 		}
-
-		if len(fields) == 0 {
-			continue
-		}
-
-		// Validate fields against rules
-		if len(validationRules) > 0 {
-			for field, rule := range validationRules {
-				if val, ok := item[field]; ok {
-					valStr := fmt.Sprintf("%v", val)
-					for _, r := range strings.Split(rule, ",") {
-						r = strings.TrimSpace(r)
-						if r == "required" && valStr == "" {
-							tx.Rollback()
-							httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": fmt.Sprintf("Field '%s' is required", field)})
-							return
-						}
-					}
-				} else if strings.Contains(rule, "required") {
-					tx.Rollback()
-					httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": fmt.Sprintf("Field '%s' is required", field)})
-					return
-				}
-			}
-		}
-
-		// Build before-hook row and fire before-hooks
-		beforeRow := make(map[string]any)
-		for i, f := range fields {
-			beforeRow[f] = values[i]
-		}
-		injectSessionContext(beforeRow, session)
-		if err := FireBeforeHooks(app, "insert", table, beforeRow); err != nil {
-			tx.Rollback()
-			httpError(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-
-		sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-			table, strings.Join(fields, ", "), strings.Join(placeholders, ", "))
-		result, err := tx.Exec(sqlStr, values...)
 		if err != nil {
-			tx.Rollback()
-			httpError(w, fmt.Sprintf("Batch insert failed: %s", err.Error()), http.StatusBadRequest)
-			return
-		}
-
-		var id any
-		if isUUID {
-			var uuidID string
-			err := tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE rowid = last_insert_rowid()", table)).Scan(&uuidID)
-			if err != nil {
-				tx.Rollback()
-				httpError(w, "Batch insert failed: could not retrieve UUID", http.StatusInternalServerError)
+			if respondOwnedField(w, err) || respondStorageFull(w, app, err) {
 				return
 			}
-			id = uuidID
-		} else {
-			intID, _ := result.LastInsertId()
-			id = intID
+			status, msg := mutationErrorResponse(app, "batch insert "+table, err)
+			if status == http.StatusBadRequest {
+				msg = "Batch insert failed: " + msg
+			}
+			httpJSON(w, status, map[string]any{"error": msg})
+			return
+		}
+		rows, err := queryNativeRowsWith(tx, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id)
+		if err != nil || len(rows) != 1 {
+			if err == nil {
+				err = fmt.Errorf("inserted row %v read back %d rows", id, len(rows))
+			}
+			serverError(w, r, app, table+" batch create", err, "Batch insert failed: could not read inserted row")
+			return
+		}
+		if err := LogAuditTx(tx, app, "create", table, fmt.Sprintf("%v", id), session, nil, rows[0]); err != nil {
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			serverError(w, r, app, table+" batch create", err, "Batch insert failed: audit write failed")
+			return
 		}
 		ids = append(ids, id)
-
-		// Collect row data for post-commit hooks
-		row := make(map[string]any)
-		for i, f := range fields {
-			row[f] = values[i]
-		}
-		row["id"] = id
-		injectSessionContext(row, session)
+		created = append(created, rows[0])
 	}
 
 	if err := tx.Commit(); err != nil {
-		httpError(w, "Commit failed", http.StatusInternalServerError)
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverError(w, r, app, table+" batch create", err, "Commit failed")
 		return
 	}
 
-	// Fire hooks and audit AFTER commit - hooks write to DB and would deadlock inside the tx
-	for _, id := range ids {
-		LogAudit(app, "create", table, fmt.Sprintf("%v", id), session, nil, nil)
+	// After-hooks, flows and webhooks run after commit (hooks write through
+	// the pool and would deadlock against the open transaction), per row
+	// exactly as the single-row create fires them.
+	for _, row := range created {
+		injectSessionContext(row, session)
+		FireHooks(app, "insert", table, row)
+		FireFlowsForEvent(app, "on_insert", table, row)
+		FireWebhookSubscriptions(app, "insert", table, row, session)
 	}
 
 	Broadcast(app, table, "insert", session)
@@ -206,6 +146,24 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ids": ids, "count": len(ids), "status": "created"})
+}
+
+// batchLockedBy reports the first of ids that a record lock held by someone
+// else covers. Same rule as PATCH and /api/_transaction; an anonymous caller
+// holds no lock, so any lock blocks it. Only rows in the caller's aclAction
+// scope count: the rest are skipped as not found, so a lock never confirms
+// that an invisible row exists.
+func batchLockedBy(app *App, table string, ids []any, session *Session, aclAction string) (bool, string) {
+	var uid int64
+	if session != nil {
+		uid = session.UserID
+	}
+	for _, id := range ids {
+		if locked, by := CheckLock(app.DB, table, fmt.Sprint(id), uid); locked && canAccessRowScoped(app, table, fmt.Sprint(id), session, aclAction) {
+			return true, by
+		}
+	}
+	return false, ""
 }
 
 func handleBatchUpdate(w http.ResponseWriter, r *http.Request, app *App, table string) {
@@ -227,132 +185,134 @@ func handleBatchUpdate(w http.ResponseWriter, r *http.Request, app *App, table s
 	}
 
 	var body struct {
-		IDs    []any             `json:"ids"`
-		Fields map[string]string `json:"fields"`
+		IDs    []any          `json:"ids"`
+		Fields map[string]any `json:"fields"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
 		httpError(w, "Expected JSON with ids and fields", http.StatusBadRequest)
 		return
+	}
+	for i, id := range body.IDs {
+		body.IDs[i] = canonicalJSONNumberID(id)
 	}
 	if len(body.IDs) == 0 || len(body.Fields) == 0 {
 		httpError(w, "ids and fields required", http.StatusBadRequest)
 		return
 	}
-
-	// member-of: a batch update that re-points the join column must
-	// verify membership in the NEW parent - same gate as single-row
-	// update (M5). The per-row WHERE below only proves membership in
-	// each row's CURRENT parent.
-	if d := memberOfRepointDenial(app, table, session, func(col string) string { return body.Fields[col] }); d != nil {
-		writeMemberOfDenial(w, r, d)
+	if v := ownedFieldViolation(app, table, mapKeys(body.Fields)...); v != nil {
+		writeOwnedFieldRefusal(w, v)
 		return
 	}
 
-	// Build allowlist
+	// Refuse up front when nothing submitted is a writable column (the
+	// canonical pipeline would otherwise skip every row as not found).
 	cols, _ := GetTableColumns(app.DB, table)
-	validCols := make(map[string]bool)
+	protected := protectedFields(protectedUpdateFields(app, table))
+	writable := false
 	for _, c := range cols {
-		validCols[c.Name] = true
-	}
-	protected := map[string]bool{
-		"id": true, "user_id": true, "created_at": true,
-		"updated_at": true, "password_hash": true, "role": true, "_csrf": true,
-		"password_change_required": true,
-	}
-	if app.Group != nil && app.Group.Key != "" {
-		protected[app.Group.Key] = true
-	}
-	// H-10: same self-escalation guard as the single-row update path - the
-	// configurable in-tenant RoleField must be protected on the membership
-	// table so a batch update can't elevate a member's role.
-	// invariant: a member must never self-set their in-tenant role via CRUD.
-	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
-		protected[app.Group.RoleField] = true
-	}
-	for _, f := range workflowProtectedFields(app, table) {
-		protected[f] = true
-	}
-
-	var sets []string
-	var values []any
-	for k, v := range body.Fields {
-		if protected[k] || !validCols[k] {
-			continue
+		if _, ok := body.Fields[c.Name]; ok && !protected.has(c.Name) {
+			writable = true
+			break
 		}
-		sets = append(sets, fmt.Sprintf("%s = ?", k))
-		values = append(values, v)
 	}
-	if len(sets) == 0 {
+	if !writable {
 		httpError(w, "No valid fields", http.StatusBadRequest)
 		return
 	}
 
-	placeholders := make([]string, len(body.IDs))
-	for i, id := range body.IDs {
-		placeholders[i] = "?"
-		values = append(values, id)
-	}
-
-	// Fire before-hooks per row - fetch existing rows first
-	idPlaceholders := make([]string, len(body.IDs))
-	idArgs := make([]any, len(body.IDs))
-	for i, id := range body.IDs {
-		idPlaceholders[i] = "?"
-		idArgs[i] = id
-	}
-	oldRows, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id IN (%s)", table, strings.Join(idPlaceholders, ",")), idArgs...)
-	oldRowIndex := make(map[string]map[string]any)
-	for _, row := range oldRows {
-		if id, ok := row["id"]; ok {
-			oldRowIndex[fmt.Sprintf("%v", id)] = row
-		}
-	}
-
-	for _, id := range body.IDs {
-		beforeRow := make(map[string]any)
-		beforeRow["id"] = id
-		for k, v := range body.Fields {
-			beforeRow[k] = v
-		}
-		injectSessionContext(beforeRow, session)
-		if err := FireBeforeHooks(app, "update", table, beforeRow); err != nil {
-			httpError(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-	}
-
-	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE id IN (%s)",
-		table, strings.Join(sets, ", "), strings.Join(placeholders, ","))
-
-	// SECURITY: enforce org/owner scoping + ACL on batch update
-	if pred, pargs, bypass := rowScopeClause(app, table, session, "edit"); !bypass && pred != "" {
-		sqlStr += " AND " + pred
-		values = append(values, pargs...)
-	}
-
-	result, err := app.DB.Exec(sqlStr, values...)
-	if err != nil {
-		httpError(w, fmt.Sprintf("Batch update failed: %s", err.Error()), http.StatusBadRequest)
+	if locked, by := batchLockedBy(app, table, body.IDs, session, "edit"); locked {
+		httpJSON(w, http.StatusConflict, lockErrorResponse(app.DevMode, by))
 		return
 	}
-	affected, _ := result.RowsAffected()
 
-	// Fire after-hooks and audit per row
-	updatedRows, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id IN (%s)", table, strings.Join(idPlaceholders, ",")), idArgs...)
-	for _, row := range updatedRows {
-		idStr := fmt.Sprintf("%v", row["id"])
-		injectSessionContext(row, session)
-		FireHooks(app, "update", table, row)
-		FireFlowsForEvent(app, "on_update", table, row)
-		FireWebhookSubscriptions(app, "update", table, row, session)
-		LogAudit(app, "update", table, idStr, session, oldRowIndex[idStr], row)
+	tx, err := app.DB.Begin()
+	if err != nil {
+		serverError(w, r, app, table+" batch update", err, "Server error")
+		return
+	}
+	defer tx.Rollback()
+
+	type updated struct{ before, after map[string]any }
+	var done []updated
+	var refreshTables []string
+	schemaCols := prismaWriteColumns(app, table)
+	for _, rawID := range body.IDs {
+		values := make(map[string]any, len(body.Fields))
+		for k, v := range body.Fields {
+			if _, declared := schemaCols[k]; declared {
+				values[k] = v
+			} else {
+				values[k] = jsonToUpdateValue(v)
+			}
+		}
+		// The canonical one-row pipeline: scoped edit read, member-of
+		// re-point gate, validators and before-hooks on the current row
+		// merged with the change, protected/computed/workflow columns,
+		// foreign-key visibility, after-hooks, webhooks and audit - all
+		// on this transaction.
+		before, after, refresh, err := applyCanonicalUpdateTx(tx, app, session, table, fmt.Sprint(rawID), values, "")
+		if err != nil {
+			var requestErr *updateRequestError
+			if errors.As(err, &requestErr) && (requestErr.noopEcho || errors.Is(err, errUpdateTarget)) {
+				// Rows the caller may not edit (or that don't exist) are
+				// skipped, as the scoped UPDATE always did.
+				continue
+			}
+			if respondOwnedField(w, err) {
+				return
+			}
+			var denied *memberOfUpdateError
+			if errors.As(err, &denied) {
+				writeMemberOfDenial(w, r, denied.denial)
+				return
+			}
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			if errors.As(err, &requestErr) {
+				writeUpdateRequestError(w, r, app, table+" batch update", requestErr)
+				return
+			}
+			if respondDatabaseBusy(w, err) {
+				return
+			}
+			httpError(w, "Batch update failed: "+publicConstraintMessage(app, "batch update "+table, err), http.StatusBadRequest)
+			return
+		}
+		done = append(done, updated{before: before, after: after})
+		refreshTables = append(refreshTables, refresh...)
+	}
+
+	if err := tx.Commit(); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverError(w, r, app, table+" batch update", err, "Commit failed")
+		return
+	}
+
+	// After-hooks and webhooks already ran inside the transaction; flows
+	// fire after commit, as for a single PATCH.
+	for _, u := range done {
+		eventRow := make(map[string]any, len(u.after)+len(u.before))
+		for k, v := range u.after {
+			eventRow[k] = v
+		}
+		for k, v := range u.before {
+			eventRow["old_"+k] = v
+		}
+		injectSessionContext(eventRow, session)
+		FireFlowsForEvent(app, "on_update", table, eventRow)
 	}
 
 	Broadcast(app, table, "update", session)
+	broadcastHookRefreshes(app, refreshTables, []transactionResult{{Table: table, Action: "update"}})
 	appendHXTrigger(w, "benmore:changed")
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"updated": affected, "status": "updated"})
+	json.NewEncoder(w).Encode(map[string]any{"updated": int64(len(done)), "status": "updated"})
 }
 
 func handleBatchDelete(w http.ResponseWriter, r *http.Request, app *App, table string) {
@@ -385,70 +345,78 @@ func handleBatchDelete(w http.ResponseWriter, r *http.Request, app *App, table s
 		return
 	}
 
-	placeholders := make([]string, len(body.IDs))
-	values := make([]any, len(body.IDs))
-	for i, id := range body.IDs {
-		placeholders[i] = "?"
-		values[i] = id
-	}
-
-	// Fetch rows before delete (for before-hooks and audit)
-	prefetchRows, _ := QueryRows(app.DB, fmt.Sprintf("SELECT * FROM %s WHERE id IN (%s)", table, strings.Join(placeholders, ",")), values...)
-
-	// Fire before-hooks per row
-	for _, row := range prefetchRows {
-		injectSessionContext(row, session)
-		if err := FireBeforeHooks(app, "delete", table, row); err != nil {
-			httpError(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-	}
-
-	// Soft delete if table has deleted_at, otherwise hard delete
-	var sql string
-	if hasColumn(app, table, "deleted_at") {
-		sql = fmt.Sprintf("UPDATE %s SET deleted_at = datetime('now') WHERE id IN (%s) AND deleted_at IS NULL",
-			table, strings.Join(placeholders, ","))
-	} else {
-		sql = fmt.Sprintf("DELETE FROM %s WHERE id IN (%s)",
-			table, strings.Join(placeholders, ","))
-	}
-
-	// SECURITY: enforce org/owner scoping + ACL on batch delete
-	if pred, pargs, bypass := rowScopeClause(app, table, session, "delete"); !bypass && pred != "" {
-		sql += " AND " + pred
-		values = append(values, pargs...)
-	}
-
-	result, err := app.DB.Exec(sql, values...)
-	if err != nil {
-		httpError(w, fmt.Sprintf("Batch delete failed: %s", err.Error()), http.StatusBadRequest)
+	if locked, by := batchLockedBy(app, table, body.IDs, session, "delete"); locked {
+		httpJSON(w, http.StatusConflict, lockErrorResponse(app.DevMode, by))
 		return
 	}
-	affected, _ := result.RowsAffected()
+
+	tx, err := app.DB.Begin()
+	if err != nil {
+		serverError(w, r, app, table+" batch delete", err, "Server error")
+		return
+	}
+	defer tx.Rollback()
+
+	// Hooks, cascades, flows, webhooks and audit only ever see rows this
+	// caller may delete: txDeleteRow reads each row with the delete scope.
+	var deleted []map[string]any
+	for _, rawID := range body.IDs {
+		idStr := fmt.Sprint(rawID)
+		row, err := txDeleteRow(tx, app, table, idStr, session)
+		if errors.Is(err, errUpdateTarget) {
+			continue
+		}
+		if err != nil {
+			var validationErr *mutationValidationError
+			switch {
+			case writeMembershipManageDenial(w, err):
+			case errors.As(err, &validationErr):
+				httpError(w, validationErr.Error(), http.StatusUnprocessableEntity)
+			case strings.Contains(err.Error(), "FOREIGN KEY"):
+				httpError(w, fmt.Sprintf("Cannot delete: other records reference this %s. Delete those first.", table), http.StatusConflict)
+			case respondStorageFull(w, app, err):
+			case respondDatabaseBusy(w, err):
+			default:
+				httpError(w, "Batch delete failed: "+publicConstraintMessage(app, "batch delete "+table, err), http.StatusBadRequest)
+			}
+			return
+		}
+		if err := LogAuditTx(tx, app, "delete", table, idStr, session, row, nil); err != nil {
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			serverError(w, r, app, table+" batch delete", err, "Batch delete failed: audit write failed")
+			return
+		}
+		deleted = append(deleted, row)
+	}
+
+	if err := tx.Commit(); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverError(w, r, app, table+" batch delete", err, "Commit failed")
+		return
+	}
 
 	// Cascade soft deletes for each deleted row
 	if hasColumn(app, table, "deleted_at") {
-		for _, row := range prefetchRows {
-			if id, ok := row["id"]; ok {
-				cascadeSoftDelete(app, table, fmt.Sprintf("%v", id))
-			}
+		for _, row := range deleted {
+			cascadeSoftDelete(app, table, row, session)
 		}
 	}
 
-	// Fire after-hooks and audit per row
-	for _, row := range prefetchRows {
-		idStr := fmt.Sprintf("%v", row["id"])
+	// Fire after-hooks per row
+	for _, row := range deleted {
 		injectSessionContext(row, session)
 		FireHooks(app, "delete", table, row)
 		FireFlowsForEvent(app, "on_delete", table, row)
 		FireWebhookSubscriptions(app, "delete", table, row, session)
-		LogAudit(app, "delete", table, idStr, session, row, nil)
 	}
 
 	Broadcast(app, table, "delete", session)
 	appendHXTrigger(w, "benmore:changed")
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"deleted": affected, "status": "deleted"})
+	json.NewEncoder(w).Encode(map[string]any{"deleted": int64(len(deleted)), "status": "deleted"})
 }

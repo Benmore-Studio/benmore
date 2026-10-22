@@ -4,8 +4,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"strings"
+	"unicode"
 )
 
 // --- shared SQL quoting/comment grammar ---
@@ -366,4 +368,578 @@ func stripSQLComments(sql string) string {
 		b.WriteByte(' ')
 	}
 	return b.String()
+}
+
+// --- write-target extraction ---
+//
+// sqlWriteTargets reports which table each INSERT / REPLACE / UPDATE /
+// DELETE statement in a script writes, so flow SQL steps can announce the
+// same realtime table events auto-CRUD does (flows_realtime.go). It walks
+// tokens produced over scanSQLBytes: a quoted region becomes one identifier
+// or string token, comments separate tokens, and ';' outside every quoting
+// form ends a statement - the boundaries splitSQLStatements uses.
+
+type sqlTokenKind int
+
+const (
+	sqlTokWord    sqlTokenKind = iota // bare keyword or identifier
+	sqlTokIdent                       // "..." / [...] / `...` identifier, delimiters removed
+	sqlTokLiteral                     // '...' string; SQLite also accepts one as a table name
+	sqlTokPunct                       // any other single code byte
+)
+
+type sqlToken struct {
+	kind       sqlTokenKind
+	text       string
+	start, end int // byte span in the original SQL, preserving executable expressions
+}
+
+// sqlWrite is one statement's write target: the table as written (schema
+// qualifier removed) and "insert", "update" or "delete".
+type sqlWrite struct {
+	Table  string
+	Action string
+}
+
+func sqlIdentByte(b byte) bool {
+	return b == '_' || b == '$' || b >= 0x80 ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// sqlTokenize splits s into tokens. Consecutive bytes of one quoting kind
+// form one token, which is what SQLite's doubled-delimiter escape ("a""b")
+// means.
+func sqlTokenize(s string) []sqlToken {
+	var toks []sqlToken
+	var word, quoted strings.Builder
+	qkind := sqlCode
+	offset, wordStart, quoteStart := 0, 0, 0
+	flushWord := func() {
+		if word.Len() > 0 {
+			toks = append(toks, sqlToken{kind: sqlTokWord, text: word.String(), start: wordStart, end: wordStart + word.Len()})
+			word.Reset()
+		}
+	}
+	flushQuoted := func() {
+		if quoted.Len() == 0 {
+			return
+		}
+		raw := quoted.String()
+		quoted.Reset()
+		qkind = sqlCode
+		open, closing := raw[0], raw[0]
+		if open == '[' {
+			closing = ']'
+		}
+		body := raw[1:]
+		if n := len(body); n > 0 && body[n-1] == closing {
+			body = body[:n-1]
+		}
+		if open != '[' { // brackets have no escape form
+			body = strings.ReplaceAll(body, string([]byte{closing, closing}), string(closing))
+		}
+		kind := sqlTokIdent
+		if open == '\'' {
+			kind = sqlTokLiteral
+		}
+		toks = append(toks, sqlToken{kind: kind, text: body, start: quoteStart, end: quoteStart + len(raw)})
+	}
+	_ = scanSQLBytes(s, func(b byte, kind sqlByteKind) error {
+		i := offset
+		offset++
+		if kind.quoted() {
+			flushWord()
+			if kind != qkind {
+				flushQuoted()
+				qkind = kind
+			}
+			if quoted.Len() == 0 {
+				quoteStart = i
+			}
+			quoted.WriteByte(b)
+			return nil
+		}
+		flushQuoted()
+		if kind == sqlInLineComment || kind == sqlInBlockComment {
+			flushWord()
+			return nil
+		}
+		if sqlIdentByte(b) {
+			if word.Len() == 0 {
+				wordStart = i
+			}
+			word.WriteByte(b)
+			return nil
+		}
+		flushWord()
+		switch b {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+		default:
+			toks = append(toks, sqlToken{kind: sqlTokPunct, text: string(b), start: i, end: i + 1})
+		}
+		return nil
+	})
+	flushQuoted()
+	flushWord()
+	return toks
+}
+
+// sqlWriteTargets returns the write target of every statement in s, in order,
+// and the number of non-empty statements. Statements that write nothing
+// (SELECT, VALUES, DDL, PRAGMA, ...) and writes to a schema other than main
+// (temp or attached tables) contribute no target.
+func sqlWriteTargets(s string) ([]sqlWrite, int) {
+	var writes []sqlWrite
+	statements := 0
+	var cur []sqlToken
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		statements++
+		if w, ok := sqlStatementWrite(cur); ok {
+			writes = append(writes, w)
+		}
+		cur = cur[:0]
+	}
+	for _, t := range sqlTokenize(s) {
+		if t.kind == sqlTokPunct && t.text == ";" {
+			flush()
+			continue
+		}
+		cur = append(cur, t)
+	}
+	flush()
+	return writes, statements
+}
+
+// sqlStatementVerbIndex returns the position of a tokenized statement's own
+// verb: token 0, or for a WITH statement the first SELECT / VALUES / INSERT /
+// REPLACE / UPDATE / DELETE outside every parenthesis (CTE bodies are
+// parenthesized and may only hold a SELECT). len(toks) when a WITH statement
+// has none.
+func sqlStatementVerbIndex(toks []sqlToken) int {
+	kw := func(i int, word string) bool {
+		return i < len(toks) && toks[i].kind == sqlTokWord && strings.EqualFold(toks[i].text, word)
+	}
+	if !kw(0, "WITH") {
+		return 0
+	}
+	depth := 0
+	i := 1
+	for ; i < len(toks); i++ {
+		if toks[i].kind == sqlTokPunct {
+			switch toks[i].text {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			}
+			continue
+		}
+		if depth == 0 && (kw(i, "SELECT") || kw(i, "VALUES") || kw(i, "INSERT") ||
+			kw(i, "REPLACE") || kw(i, "UPDATE") || kw(i, "DELETE")) {
+			break
+		}
+	}
+	return i
+}
+
+// sqlTokenStatements splits a token stream into its non-empty statements at
+// every ';' outside a quoting form - the boundaries sqlWriteTargets counts.
+func sqlTokenStatements(toks []sqlToken) [][]sqlToken {
+	var statements [][]sqlToken
+	start := 0
+	for i, t := range toks {
+		if t.kind == sqlTokPunct && t.text == ";" {
+			if i > start {
+				statements = append(statements, toks[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(toks) {
+		statements = append(statements, toks[start:])
+	}
+	return statements
+}
+
+// sqlStatementReturns reports whether a tokenized statement carries a
+// RETURNING clause. RETURNING is a reserved word in SQLite: outside a quoting
+// form it can only be the clause keyword, never a column, alias or table name
+// (`SELECT returning FROM t` is a syntax error), so a bare word is the clause.
+// Only a bind parameter spelled `:returning` / `@returning` looks the same to
+// the lexer, and is skipped.
+func sqlStatementReturns(toks []sqlToken) bool {
+	for i, t := range toks {
+		if t.kind != sqlTokWord || !strings.EqualFold(t.text, "RETURNING") {
+			continue
+		}
+		if i > 0 {
+			if p := toks[i-1]; p.kind == sqlTokPunct && (p.text == ":" || p.text == "@") && p.end == t.start {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func sqlStatementWrite(toks []sqlToken) (sqlWrite, bool) {
+	kw := func(i int, word string) bool {
+		return i < len(toks) && toks[i].kind == sqlTokWord && strings.EqualFold(toks[i].text, word)
+	}
+	i := sqlStatementVerbIndex(toks)
+	var action string
+	switch {
+	case kw(i, "INSERT"):
+		i++
+		if kw(i, "OR") {
+			i += 2 // OR REPLACE / IGNORE / ABORT / FAIL / ROLLBACK
+		}
+		if !kw(i, "INTO") {
+			return sqlWrite{}, false
+		}
+		i++
+		action = "insert"
+	case kw(i, "REPLACE"):
+		i++
+		if !kw(i, "INTO") {
+			return sqlWrite{}, false
+		}
+		i++
+		action = "insert"
+	case kw(i, "UPDATE"):
+		i++
+		if kw(i, "OR") {
+			i += 2
+		}
+		action = "update"
+	case kw(i, "DELETE"):
+		i++
+		if !kw(i, "FROM") {
+			return sqlWrite{}, false
+		}
+		i++
+		action = "delete"
+	default:
+		return sqlWrite{}, false
+	}
+	name := func(j int) (string, bool) {
+		if j >= len(toks) || toks[j].kind == sqlTokPunct || toks[j].text == "" {
+			return "", false
+		}
+		return toks[j].text, true
+	}
+	table, ok := name(i)
+	if !ok {
+		return sqlWrite{}, false
+	}
+	if i+1 < len(toks) && toks[i+1].kind == sqlTokPunct && toks[i+1].text == "." {
+		if !strings.EqualFold(table, "main") {
+			return sqlWrite{}, false // temp.* or an attached database
+		}
+		if table, ok = name(i + 2); !ok {
+			return sqlWrite{}, false
+		}
+	}
+	return sqlWrite{Table: table, Action: action}, true
+}
+
+// --- text the driver can run ---
+//
+// A text handed to the driver's Query or Prepare must hold a statement in
+// every part the driver compiles. Its Query path compiles the text one
+// statement at a time: SQLite skips whitespace, comments and stray `;`,
+// compiles up to the next `;`, and the driver goes on with what is left
+// (strings.TrimSpace of it) until that is empty. A part that holds no statement
+// at all - a comment after the last `;`, a second `;`, a text that is only a
+// comment - compiles to nothing. Exec skips such a part. Query runs only the
+// last part of a text, so when that part is empty it answers with an empty
+// result that has no columns and the statement before it never runs: its rows
+// are lost, a write does not happen, and no error says so. A prepared
+// statement that is run on nothing takes the process down inside the driver
+// (go-sqlite3 v1.14.52; up to v1.14.42 Query did the same). Prepare compiles
+// only the first part.
+//
+// Text the framework did not write itself (tool and API input, SQL and SQL
+// conditions from app files, and framework SQL with such a fragment inside)
+// goes through sqlRunnableText before Query, QueryRow or Prepare.
+
+// errNoSQLStatement is what a caller returns for a text in which
+// sqlRunnableText finds no statement.
+var errNoSQLStatement = errors.New("no SQL statement")
+
+// sqlRunnableText returns the text the driver can run in place of query, and
+// false when query holds no statement at all (the caller returns
+// errNoSQLStatement and never calls the driver).
+//
+// A text every part of which holds a statement is returned as it is, so a
+// working query keeps its statements, their order, their parameters and its
+// result column names (SQLite names an unaliased column after its source text,
+// trailing comment included). Otherwise the text ends where its last
+// statement does: `SELECT 1; -- note`, `SELECT 1; /* note */` and `SELECT 1;;`
+// become `SELECT 1;`. An empty statement between two statements
+// (`SELECT 1;; SELECT 2`) needs nothing: SQLite skips a leading `;`.
+//
+// The walk follows the driver, not the shared lexer above: parts are split
+// where SQLite's own tokenizer sees a `;` (sqliteTokenLen), and each remainder
+// is trimmed the way the driver trims it. Every `;` outside a token counts as
+// the end of a statement. The one statement that holds such a `;`, CREATE
+// TRIGGER, is therefore read as several parts; each of them still starts with a
+// token, so a complete trigger is left alone, and a text cut inside an
+// unfinished one was an error before and stays one.
+func sqlRunnableText(query string) (string, bool) {
+	text := query
+	if i := strings.IndexByte(text, 0); i >= 0 {
+		text = text[:i] // SQLite reads a C string and never sees what follows a NUL
+	}
+	if strings.IndexByte(text, ';') < 0 {
+		// No `;`, so one statement at most: the usual case, decided at the
+		// first token.
+		if _, ok := sqliteStatementLen(text, true); !ok {
+			return "", false
+		}
+		return query, true
+	}
+	start := 0 // where the part the driver compiles next begins
+	cut := 0   // where the last statement found ends, after its `;`
+	for {
+		n, ok := sqliteStatementLen(text[start:], false)
+		if !ok {
+			if cut == 0 {
+				return "", false
+			}
+			return query[:cut], true
+		}
+		cut = start + n
+		rest := text[cut:]
+		part := strings.TrimSpace(rest)
+		if part == "" {
+			return query, true
+		}
+		// The driver trims both ends of what is left; the trimmed end is
+		// never compiled again.
+		start = cut + len(rest) - len(strings.TrimLeftFunc(rest, unicode.IsSpace))
+		text = text[:start+len(part)]
+	}
+}
+
+// sqliteStatementLen is how much of text SQLite consumes to compile one
+// statement: leading whitespace, comments and `;`, then every token up to and
+// including the next `;` (or the end of text). ok is false when text holds
+// nothing but whitespace, comments and `;`, which compiles to no statement.
+// With firstOnly it stops at the first token and only ok is meaningful.
+func sqliteStatementLen(text string, firstOnly bool) (n int, ok bool) {
+	for n < len(text) {
+		size, class := sqliteTokenLen(text[n:])
+		n += size
+		switch class {
+		case sqliteTokenSkipped:
+		case sqliteTokenSemi:
+			if ok {
+				return n, true
+			}
+		default:
+			if firstOnly {
+				return n, true
+			}
+			ok = true
+		}
+	}
+	return n, ok
+}
+
+type sqliteTokenClass int
+
+const (
+	sqliteTokenParsed  sqliteTokenClass = iota // handed to the parser, or refused by it as illegal
+	sqliteTokenSkipped                         // whitespace, a comment, a byte-order mark
+	sqliteTokenSemi                            // `;`
+)
+
+// sqliteTokenLen is the length and class of the token at the start of z
+// (non-empty, no NUL): SQLite's sqlite3GetToken, kept only as far as where a
+// token ends and whether the parser ever sees it. It differs from the shared
+// lexer above where SQLite does: a parameter may carry a parenthesized suffix
+// that holds quotes, `;` and `--` (`$name(...)`), a byte-order mark is
+// whitespace, and `/*` as the last two bytes is not a comment. The gates built
+// on the shared lexer are not changed by this.
+func sqliteTokenLen(z string) (int, sqliteTokenClass) {
+	at := func(i int) byte {
+		if i < len(z) {
+			return z[i]
+		}
+		return 0
+	}
+	c := z[0]
+	switch {
+	case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r':
+		i := 1
+		for sqliteIsSpace(at(i)) {
+			i++
+		}
+		return i, sqliteTokenSkipped
+	case c == ';':
+		return 1, sqliteTokenSemi
+	case c == '-':
+		switch at(1) {
+		case '-':
+			i := 2
+			for i < len(z) && z[i] != '\n' {
+				i++
+			}
+			return i, sqliteTokenSkipped
+		case '>':
+			if at(2) == '>' {
+				return 3, sqliteTokenParsed
+			}
+			return 2, sqliteTokenParsed
+		}
+		return 1, sqliteTokenParsed
+	case c == '/':
+		if at(1) != '*' || at(2) == 0 {
+			return 1, sqliteTokenParsed
+		}
+		// The `*` that opens the comment does not also close it; a comment
+		// without an end runs to the end of the text.
+		i, ch := 3, at(2)
+		for ch != '*' || at(i) != '/' {
+			if ch = at(i); ch == 0 {
+				break
+			}
+			i++
+		}
+		if ch != 0 {
+			i++
+		}
+		return i, sqliteTokenSkipped
+	case c == '\'' || c == '"' || c == '`':
+		i := 1
+		for ; i < len(z); i++ {
+			if z[i] == c {
+				if at(i+1) != c {
+					return i + 1, sqliteTokenParsed
+				}
+				i++ // a doubled delimiter is the delimiter itself
+			}
+		}
+		return len(z), sqliteTokenParsed // no end: an illegal token
+	case c == '[':
+		i := 1
+		for i < len(z) {
+			i++
+			if z[i-1] == ']' {
+				break
+			}
+		}
+		return i, sqliteTokenParsed
+	case c == '.' && !sqliteIsDigit(at(1)):
+		return 1, sqliteTokenParsed
+	case c == '.' || sqliteIsDigit(c):
+		i := 0
+		digits := func(digit func(byte) bool) {
+			for digit(at(i)) || at(i) == '_' {
+				i++
+			}
+		}
+		if c == '0' && (at(1) == 'x' || at(1) == 'X') && sqliteIsHexDigit(at(2)) {
+			i = 3
+			digits(sqliteIsHexDigit)
+		} else {
+			digits(sqliteIsDigit)
+			if at(i) == '.' {
+				i++
+				digits(sqliteIsDigit)
+			}
+			if (at(i) == 'e' || at(i) == 'E') && (sqliteIsDigit(at(i+1)) ||
+				((at(i+1) == '+' || at(i+1) == '-') && sqliteIsDigit(at(i+2)))) {
+				i += 2
+				digits(sqliteIsDigit)
+			}
+		}
+		for sqliteIdentByte(at(i)) {
+			i++
+		}
+		return i, sqliteTokenParsed
+	case c == '?':
+		i := 1
+		for sqliteIsDigit(at(i)) {
+			i++
+		}
+		return i, sqliteTokenParsed
+	case c == '$' || c == '@' || c == ':' || c == '#':
+		i, named := 1, false
+		for ; i < len(z); i++ {
+			ch := z[i]
+			if sqliteIdentByte(ch) {
+				named = true
+				continue
+			}
+			if ch == '(' && named {
+				for {
+					i++
+					if ch = at(i); ch == 0 || sqliteIsSpace(ch) || ch == ')' {
+						break
+					}
+				}
+				if ch == ')' {
+					i++
+				}
+				break
+			}
+			if ch == ':' && at(i+1) == ':' {
+				i++
+				continue
+			}
+			break
+		}
+		return i, sqliteTokenParsed
+	case (c == 'x' || c == 'X') && at(1) == '\'':
+		i := 2
+		for sqliteIsHexDigit(at(i)) {
+			i++
+		}
+		if at(i) != '\'' || i%2 != 0 {
+			for i < len(z) && z[i] != '\'' {
+				i++
+			}
+		}
+		if i < len(z) {
+			i++
+		}
+		return i, sqliteTokenParsed
+	case c == 0xEF && at(1) == 0xBB && at(2) == 0xBF:
+		return 3, sqliteTokenSkipped
+	case sqliteIdentByte(c): // a keyword or identifier; `$` and digits start other tokens above
+		i := 1
+		for sqliteIdentByte(at(i)) {
+			i++
+		}
+		return i, sqliteTokenParsed
+	case c == '=' && at(1) == '=',
+		c == '<' && (at(1) == '=' || at(1) == '>' || at(1) == '<'),
+		c == '>' && (at(1) == '=' || at(1) == '>'),
+		c == '!' && at(1) == '=',
+		c == '|' && at(1) == '|':
+		return 2, sqliteTokenParsed
+	}
+	return 1, sqliteTokenParsed // one-byte punctuation, or a byte SQLite refuses
+}
+
+func sqliteIsSpace(b byte) bool { return b == ' ' || (b >= '\t' && b <= '\r') }
+
+func sqliteIsDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func sqliteIsHexDigit(b byte) bool {
+	return sqliteIsDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// sqliteIdentByte is SQLite's IdChar: what a keyword, identifier or parameter
+// name continues with.
+func sqliteIdentByte(b byte) bool {
+	return b == '_' || b == '$' || b >= 0x80 || sqliteIsDigit(b) ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }

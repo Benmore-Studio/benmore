@@ -73,11 +73,14 @@ func TestHookSMSFromNotifyHubYAML(t *testing.T) {
 func TestHookSMSRetainsWhenGuard(t *testing.T) {
 	cfg := LoadHooksYAML(writeHooks(t, notifyHubHooksYAML))
 	h := cfg.OnInsert["messages"][0]
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	mustExec(t, app.DB, "CREATE TABLE messages (id INTEGER PRIMARY KEY, channel TEXT, recipient TEXT, sms_body TEXT)")
 
-	if !evaluateCondition(h.When, map[string]any{"channel": "sms"}) {
+	if !whenHolds(app.DB, app, "messages", h.When, map[string]any{"channel": "sms"}) {
 		t.Error("when-guard should match channel=sms")
 	}
-	if evaluateCondition(h.When, map[string]any{"channel": "email"}) {
+	if whenHolds(app.DB, app, "messages", h.When, map[string]any{"channel": "email"}) {
 		t.Error("when-guard matched channel=email - an SMS hook would fire on email rows")
 	}
 }
@@ -180,7 +183,7 @@ func TestWSHookSurvivesJobPayloadRoundTrip(t *testing.T) {
 		WS:  &WSHook{Room: "order-{{id}}", Payload: `{"status":"{{status}}"}`},
 		SMS: &SMSHook{To: "{{recipient}}", Body: "{{sms_body}}"},
 	}
-	payload := hookJobPayload(in, map[string]any{"id": 7})
+	payload := hookJobPayload(in, "orders", map[string]any{"id": 7})
 	hookData, _ := payload["_hook"].(map[string]any)
 	if hookData == nil {
 		t.Fatal("payload missing _hook")

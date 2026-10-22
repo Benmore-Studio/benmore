@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -27,9 +28,15 @@ func recoverMiddleware(next http.Handler) http.Handler {
 				// Best-effort 500. If headers are already written, this is a
 				// no-op and the client just sees a truncated response - which
 				// is still better than a process crash.
+				// The request log middleware has set the request id its log
+				// line carries; quote it so the visitor can too.
+				reference := ""
+				if id := w.Header().Get(requestIDHeader); id != "" {
+					reference = `<p style="color:#666">Request id: ` + html.EscapeString(id) + `</p>`
+				}
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprint(w, `<!doctype html><html><head><title>Error</title></head><body style="font-family:system-ui,sans-serif;padding:40px;text-align:center"><h1>Something went wrong</h1><p style="color:#666">A server error occurred. The team has been notified.</p></body></html>`)
+				fmt.Fprint(w, `<!doctype html><html><head><title>Error</title></head><body style="font-family:system-ui,sans-serif;padding:40px;text-align:center"><h1>Something went wrong</h1><p style="color:#666">A server error occurred. The team has been notified.</p>`+reference+`</body></html>`)
 			}
 		}()
 		next.ServeHTTP(w, r)

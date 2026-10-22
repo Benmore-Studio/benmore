@@ -3,13 +3,13 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +22,44 @@ import (
 )
 
 const maxUploadSize = 50 << 20 // 50MB default max
+
+// uploadBodyOverhead is headroom for multipart framing and small form fields
+// (_csrf, kind) on top of the per-file cap, so a file of exactly
+// maxUploadSize still fits.
+const uploadBodyOverhead = 1 << 20
+
+// limitUploadBody caps a single-file upload request body and parses it before
+// any other form access. The CSRF check and FormValue parse the multipart
+// body on first use, so a cap installed after them (as in HandleFileUpload)
+// never applied: file parts spilled to temporary disk in full before the
+// per-file size check ran. Writes 413 and returns false when the body is over
+// the cap; other parse errors are left to the existing handling.
+//
+// It also takes one of the process's upload slots, charged to client
+// (uploadClientKey; 503 + Retry-After when none frees up), and parses with a
+// small in-memory threshold, so file parts spill to temporary files instead
+// of RAM. The caller must call release when the request is done; release
+// also removes the temporary files.
+func limitUploadBody(w http.ResponseWriter, r *http.Request, client string) (release func(), ok bool) {
+	releaseSlot, ok := acquireUploadSlot(w, r, client)
+	if !ok {
+		return nil, false
+	}
+	release = func() {
+		removeMultipartTemp(r)
+		releaseSlot()
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+uploadBodyOverhead)
+	if err := r.ParseMultipartForm(uploadMemoryThreshold); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			release()
+			httpJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": fmt.Sprintf("file too large (max %dMB)", maxUploadSize/(1<<20))})
+			return nil, false
+		}
+	}
+	return release, true
+}
 
 // StorageBackend is the interface for file storage.
 // Default: local disk. Apps can configure S3-compatible storage via env vars.
@@ -138,17 +176,55 @@ func (s3 *S3Storage) Save(path string, data io.Reader) (string, error) {
 // even when unsigned). contentType "" → application/octet-stream;
 // disposition "" → omitted (inline).
 func (s3 *S3Storage) SaveWithMeta(path string, data io.Reader, contentType, disposition string) (string, error) {
-	body, err := io.ReadAll(data)
+	size, openBody, err := uploadBodyWithSize(data)
 	if err != nil {
 		return "", err
 	}
+	// A caller may already be past EOF; ReadAll previously uploaded an empty
+	// body without rewinding it. Keep that behavior without changing the
+	// broker's shared reader factory.
+	size = max(size, 0)
+	var hashBody io.Reader
+	if _, ok := data.(interface {
+		io.ReaderAt
+		io.Seeker
+	}); ok {
+		// Consume the original cursor as ReadAll did, even when HTTP later
+		// fails. Transmission/replay uses independent readers over exactly
+		// the same range, and never closes the caller's file.
+		hashBody = io.LimitReader(data, size)
+	} else if hashBody, err = openBody(); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, hashBody)
+	if err != nil {
+		return "", err
+	}
+	if n != size {
+		return "", io.ErrUnexpectedEOF
+	}
+	payloadHash := hex.EncodeToString(hash.Sum(nil))
 
 	awsNative := s3.Endpoint == "" || strings.Contains(s3.Endpoint, "amazonaws.com")
 	url := s3.objectURL(path)
 
-	req, err := http.NewRequest("PUT", url, bytes.NewReader(body))
+	req, err := http.NewRequest("PUT", url, http.NoBody)
 	if err != nil {
 		return "", err
+	}
+	if size > 0 {
+		req.GetBody = func() (io.ReadCloser, error) {
+			body, err := openBody()
+			if err != nil {
+				return nil, err
+			}
+			return io.NopCloser(body), nil
+		}
+		if req.Body, err = req.GetBody(); err != nil {
+			return "", err
+		}
+		req.ContentLength = size
 	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -175,14 +251,14 @@ func (s3 *S3Storage) SaveWithMeta(path string, data io.Reader, contentType, disp
 			if token != "" {
 				req.Header.Set("X-Amz-Security-Token", token)
 			}
-			signAWSv4(req, body, key, secret, s3.Region, "s3")
+			signAWSv4PayloadHash(req, payloadHash, key, secret, s3.Region, "s3")
 		} else {
 			// DO Spaces / R2 / MinIO accept basic auth as a fallback
 			req.SetBasicAuth(key, secret)
 		}
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := s3HTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -201,11 +277,16 @@ func (s3 *S3Storage) SaveWithMeta(path string, data io.Reader, contentType, disp
 // Stdlib-only - no AWS SDK. Standard recipe from the AWS docs:
 // https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html
 func signAWSv4(req *http.Request, body []byte, key, secret, region, service string) {
+	signAWSv4PayloadHash(req, sha256Hex(body), key, secret, region, service)
+}
+
+// signAWSv4PayloadHash also supports file uploads without materializing the
+// payload in memory. The digest is computed over the exact transmitted range.
+func signAWSv4PayloadHash(req *http.Request, payloadHash, key, secret, region, service string) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
 
-	payloadHash := sha256Hex(body)
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	req.Header.Set("Host", req.URL.Host)
@@ -283,7 +364,7 @@ func (s3 *S3Storage) Delete(path string) error {
 		}
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := s3HTTPClient(10 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -303,76 +384,26 @@ type S3Object struct {
 	LastModified string
 }
 
-// List enumerates objects under a key prefix via S3 ListObjectsV2. Returns up
-// to 1000 objects (a single page) - enough for any one app's retained
-// snapshots. Used by the platform Backups view.
-func (s3 *S3Storage) List(prefix string) ([]S3Object, error) {
-	endpoint := s3.Endpoint
-	awsNative := endpoint == "" || strings.Contains(endpoint, "amazonaws.com")
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s3.Region)
-	}
-	vals := neturl.Values{}
-	vals.Set("list-type", "2")
-	vals.Set("max-keys", "1000")
-	if prefix != "" {
-		vals.Set("prefix", prefix)
-	}
-	// vals.Encode() sorts keys and percent-encodes (slashes → %2F), which is
-	// exactly the canonical query form signAWSv4 signs from req.URL.RawQuery.
-	reqURL := fmt.Sprintf("%s/%s?%s", endpoint, s3.Bucket, vals.Encode())
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	key, secret, token := s3.resolveCreds()
-	if key != "" {
-		if awsNative {
-			if token != "" {
-				req.Header.Set("X-Amz-Security-Token", token)
-			}
-			signAWSv4(req, nil, key, secret, s3.Region, "s3")
-		} else {
-			req.SetBasicAuth(key, secret)
-		}
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("S3 list failed: %d: %s", resp.StatusCode, string(body))
-	}
-	var parsed struct {
-		Contents []struct {
-			Key          string `xml:"Key"`
-			Size         int64  `xml:"Size"`
-			LastModified string `xml:"LastModified"`
-		} `xml:"Contents"`
-	}
-	if err := xml.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("S3 list parse: %w", err)
-	}
-	out := make([]S3Object, 0, len(parsed.Contents))
-	for _, c := range parsed.Contents {
-		out = append(out, S3Object{Key: c.Key, Size: c.Size, LastModified: c.LastModified})
-	}
-	return out, nil
-}
-
 // Fetch GETs an object and returns the live response for streaming. Caller
 // MUST close resp.Body. Used by the backups download proxy.
 func (s3 *S3Storage) Fetch(path string) (*http.Response, error) {
+	return s3.FetchContext(context.Background(), path)
+}
+
+// FetchContext reads one object from the configured S3-compatible backend.
+// Redirects are refused so private object reads cannot leave the configured
+// endpoint or forward an authenticated request to another origin.
+func (s3 *S3Storage) FetchContext(ctx context.Context, path string) (*http.Response, error) {
+	if ctx == nil || path == "" || strings.ContainsAny(path, "\\\x00?#%") {
+		return nil, errors.New("S3 fetch path is invalid")
+	}
 	endpoint := s3.Endpoint
 	awsNative := endpoint == "" || strings.Contains(endpoint, "amazonaws.com")
 	if endpoint == "" {
 		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s3.Region)
 	}
 	reqURL := fmt.Sprintf("%s/%s/%s", endpoint, s3.Bucket, path)
-	req, err := http.NewRequest("GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -387,14 +418,18 @@ func (s3 *S3Storage) Fetch(path string) (*http.Response, error) {
 			req.SetBasicAuth(key, secret)
 		}
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := s3HTTPClient(60 * time.Second)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("S3 fetch failed: 404: %w", os.ErrNotExist)
+		}
 		return nil, fmt.Errorf("S3 fetch failed: %d: %s", resp.StatusCode, string(b))
 	}
 	return resp, nil
@@ -522,6 +557,10 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	// Check file type
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	ext = strings.TrimPrefix(ext, ".")
+	// The extension becomes part of the storage key and the served URL.
+	if !safeUploadExt(ext) {
+		return "", fmt.Errorf("file extension not allowed (letters and digits only, at most 10)")
+	}
 	if len(allowedTypes) > 0 {
 		allowed := false
 		for _, t := range allowedTypes {
@@ -577,6 +616,13 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	contentType, disposition := uploadContentMeta(ext, mimeType, safeName)
 
 	backend := storageBackendForApp(app)
+	// Record ownership before storing private bytes. A failed DB write must
+	// not leave a new file looking like an unowned legacy upload. If storage
+	// fails later, retain this harmless reservation: a remote failure may
+	// have persisted bytes even when it returned an error.
+	if err := recordPrivateUploadOwner(app, r, destPath); err != nil {
+		return "", fmt.Errorf("record upload owner: %w", err)
+	}
 
 	if backend != nil {
 		if ms, ok := backend.(metaSaver); ok {
@@ -634,8 +680,12 @@ func generateShortID() string {
 // 200 on success, 401 if anonymous + auth required, 403 on CSRF mismatch,
 // 413 (Payload Too Large) when the file exceeds the per-app cap,
 // 415 (Unsupported Media Type) when the MIME-type sniff rejects it.
-func RegisterUploadRoute(mux *http.ServeMux, app *App) {
+func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_upload", func(w http.ResponseWriter, r *http.Request) {
+		if !app.FeatureEnabled("uploads") {
+			http.NotFound(w, r)
+			return
+		}
 		// Auth: require a session when the app has auth: configured.
 		if NeedsAuth(app) {
 			if session := getSession(app, r); session == nil {
@@ -643,6 +693,11 @@ func RegisterUploadRoute(mux *http.ServeMux, app *App) {
 				return
 			}
 		}
+		release, ok := limitUploadBody(w, r, uploadClientKey(app, r))
+		if !ok {
+			return
+		}
+		defer release()
 		// CSRF - bypass for bearer.
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
@@ -751,6 +806,16 @@ func ParseUploadDirective(html string) (folder string, maxSize int64, types []st
 // gets Content-Disposition: attachment so browsers download instead of
 // rendering. Also sets X-Content-Type-Options to defeat MIME sniffing.
 func applyUploadDispositionHeaders(w http.ResponseWriter, fullPath string) {
+	applyUploadDispositionWithSniff(w, fullPath, func() bool { return uploadsSniffActive(fullPath) })
+}
+
+// applyUploadFileDispositionHeaders sniffs the same pinned file that the
+// caller will serve. ReadAt leaves its position unchanged for streaming.
+func applyUploadFileDispositionHeaders(w http.ResponseWriter, fullPath string, file io.ReaderAt) {
+	applyUploadDispositionWithSniff(w, fullPath, func() bool { return uploadsReaderSniffActive(file) })
+}
+
+func applyUploadDispositionWithSniff(w http.ResponseWriter, fullPath string, sniffActive func() bool) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	ext := strings.ToLower(filepath.Ext(fullPath))
 	inlineOK := false
@@ -766,7 +831,7 @@ func applyUploadDispositionHeaders(w http.ResponseWriter, fullPath string) {
 	// polyglot SVG saved as "logo.png") can still sniff to an
 	// active/scriptable type; force attachment whenever the bytes look
 	// like HTML/XML/SVG/script regardless of the extension allowlist.
-	if inlineOK && uploadsSniffActive(fullPath) {
+	if inlineOK && sniffActive() {
 		inlineOK = false
 	}
 	if inlineOK {
@@ -788,8 +853,12 @@ func uploadsSniffActive(fullPath string) bool {
 		return false
 	}
 	defer f.Close()
+	return uploadsReaderSniffActive(f)
+}
+
+func uploadsReaderSniffActive(f io.ReaderAt) bool {
 	buf := make([]byte, 512)
-	n, _ := f.Read(buf)
+	n, _ := f.ReadAt(buf, 0)
 	sniff := strings.ToLower(http.DetectContentType(buf[:n]))
 	if strings.HasPrefix(sniff, "text/html") ||
 		strings.HasPrefix(sniff, "text/xml") ||

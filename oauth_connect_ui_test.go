@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	esbuild "github.com/benmore-studio/benmore/third_party/esbuild/pkg/api"
 	"github.com/dop251/goja"
-	esbuild "github.com/evanw/esbuild/pkg/api"
 )
 
 // Execute the shipped component with the existing embedded JS toolchain. The

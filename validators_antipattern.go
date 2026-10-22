@@ -4,10 +4,10 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // knownAppYAMLKeys is the canonical set of top-level keys the
@@ -35,6 +35,7 @@ var knownAppYAMLKeys = map[string]bool{
 	"pwa":              true,
 	"recording":        true,
 	"backup":           true,
+	"versioned":        true, // table list for history/revert; checked by parseVersionedSection
 	"aggregates":       true,
 	"database":         true,
 	"head":             true,
@@ -44,7 +45,12 @@ var knownAppYAMLKeys = map[string]bool{
 	"access":           true, // v2.7.12 declarative per-table per-op access control
 	"auto_memberships": true, // v2.7.35 shorthand: synthesize on_insert hooks for "every active user → parent's join table"
 	"csp":              true, // per-directive CSP allowlist extensions: script_src, style_src, img_src, font_src, connect_src, frame_src
+	"table_scopes":     true, // `access`: auto-CRUD table access comes from access: alone; roles: scopes gate capabilities (bindRoleTableScopes)
 	"ws_rooms":         true, // v2.7.164 WS room-name patterns bound to membership tables (join-time authorization)
+	// Legacy inline encryption (encryption.go EncryptedYAML): runtime reads
+	// it and api(at:"encryption") documents it, but this list refused it.
+	// Its shape is checked by appEncryptedSectionError.
+	"encrypted": true,
 }
 
 // knownCSPKeys is the set of directives accepted under `csp:` in
@@ -69,7 +75,12 @@ var knownAuthKeys = map[string]bool{
 	"identifier":            true,
 	"session_duration":      true,
 	"signup_fields":         true,
+	"signup":                true, // disable public self-service account creation
+	"password_reset":        true, // disable end-user forgot/reset-password flows
+	"api_tokens":            true, // disable bearer exchange and persistent token minting
+	"profile_fields":        true, // comma-separated extra _benmore_users columns PATCH /api/_auth/profile may write (settings.go)
 	"otp":                   true,
+	"passkeys":              true, // passkey sign-in (default on; false turns /api/_auth/passkeys/* off)
 	"domain":                true, // comma-separated allowed email domains (domain-lock)
 	"allow_emails":          true, // comma-separated EXACT allowed addresses (closed allowlist; auth_login.go emailMatchesGate)
 	"redirect":              true,
@@ -81,26 +92,44 @@ var knownAuthKeys = map[string]bool{
 	"require_mfa_for_roles": true, // comma-separated roles that must enroll MFA before a session is issued
 	"mfa_setup_redirect":    true, // form-login redirect target when enrollment is required (default /mfa-setup)
 	"read_audit_sync":       true,
+	// Read by the runtime but missing here, so the write gate refused a
+	// documented key (read_audit: api(at:"audit"); edge_scopes: edges).
+	"read_audit":                  true, // '*' or comma-separated tables (read_audit.go IsReadAudited)
+	"edge_scopes":                 true, // scopes an edge may request via signIn (edge_auth_handlers.go)
+	"signup_redirect":             true, // post-signup destination (auth_login.go)
+	"signup_rate_limit":           true, // "<count>/<window>" sign-ups per client address (auth_signup_limits.go; default 30/10m)
+	"public_api":                  true, // legacy comma-separated anon tables (crud.go requireAPIAuth)
+	"billing_provider":            true, // billing.go
+	"billing_api_key_env":         true,
+	"billing_publishable_key_env": true,
+	"billing_webhook_secret_env":  true,
 }
 
-// yamlTopLevelKeyRe captures top-level YAML keys (no leading whitespace).
-var yamlTopLevelKeyRe = regexp.MustCompile(`(?m)^([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
+// deadAuthKeys were accepted by this validator but are read by nothing, so
+// an author who wrote them believed a control was on. Refused with the key
+// that does the job.
+var deadAuthKeys = map[string]string{
+	"mfa":   "`auth.mfa` has no effect - every user can already enroll MFA (api(at:\"mfa\")). To REQUIRE it, list the roles: `require_mfa_for_roles: \"admin,staff\"`.",
+	"oauth": "`auth.oauth` has no effect - social login is configured by provider credentials and the top-level `oauth:` block (api(at:\"oauth\")); `auth.oauth_only: true` makes it the only sign-in path.",
+}
 
-// yamlNestedAuthKeyRe captures keys nested under `auth:` (two-space indent).
-var yamlNestedAuthKeyRe = regexp.MustCompile(`(?m)^  ([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
+// authFlagKeys are the auth keys the runtime reads as booleans (compared to
+// "true"). designFromAppYAML canonicalizes the usual spellings; anything
+// else can never switch the flag on, so the write gate refuses it.
+var authFlagKeys = []string{"require_verified", "verify_email", "otp", "oauth_only", "read_audit_sync", "passkeys", "signup", "password_reset", "api_tokens"}
 
 // validateAppYAML scans app.yaml for fabricated top-level and auth.* keys
 // that the framework doesn't recognize. Returns the first violation's
 // error string, empty if clean.
 func validateAppYAML(content string) string {
-	if _, _, err := parseAppConfigDocument([]byte(content)); err != nil {
+	doc, _, err := parseAppConfigDocument([]byte(content))
+	if err != nil {
 		return err.Error()
 	}
-	for _, m := range yamlTopLevelKeyRe.FindAllStringSubmatch(content, -1) {
-		if len(m) < 2 {
-			continue
-		}
-		key := m[1]
+	// Keys come from the parsed document, not a line regex: a quoted key,
+	// a flow mapping (`auth: { ... }`), a comment after `auth:` or a
+	// four-space indent all escaped the old scan.
+	for _, key := range slices.Sorted(maps.Keys(doc)) {
 		if knownAppYAMLKeys[key] {
 			continue
 		}
@@ -112,91 +141,89 @@ func validateAppYAML(content string) string {
 	// `resource:action` (or `*`) scope. `scopes: ["own"]` parses
 	// cleanly but every CRUD call 403s
 	// because "own" isn't a real scope. Catch it at write time.
-	if strings.Contains(content, "\nroles:\n") || strings.HasPrefix(content, "roles:\n") {
-		var parsed map[string]any
-		if err := yaml.Unmarshal([]byte(content), &parsed); err == nil {
-			if rolesRaw, ok := parsed["roles"].(map[string]any); ok {
-				for roleName, v := range rolesRaw {
-					var entries []string
-					switch val := v.(type) {
-					case map[string]any:
-						switch s := val["scopes"].(type) {
-						case string:
-							entries = strings.Fields(s)
-						case []any:
-							for _, item := range s {
-								if str, ok := item.(string); ok && str != "" {
-									entries = append(entries, str)
-								}
-							}
-						}
-					case string:
-						entries = strings.Fields(val)
-					case []any:
-						for _, item := range val {
-							if str, ok := item.(string); ok && str != "" {
-								entries = append(entries, str)
-							}
+	if v, ok := doc["table_scopes"]; ok && v != "access" {
+		return fmt.Sprintf("app.yaml: table_scopes must be `access` (auto-CRUD table access follows access: rules; roles: scopes gate only capabilities) or be omitted; got %v.", v)
+	}
+	if rolesRaw, ok := doc["roles"].(map[string]any); ok {
+		for _, roleName := range slices.Sorted(maps.Keys(rolesRaw)) {
+			var entries []string
+			switch val := rolesRaw[roleName].(type) {
+			case map[string]any:
+				switch s := val["scopes"].(type) {
+				case string:
+					entries = strings.Fields(s)
+				case []any:
+					for _, item := range s {
+						if str, ok := item.(string); ok && str != "" {
+							entries = append(entries, str)
 						}
 					}
-					for _, e := range entries {
-						if e == "*" {
-							continue
-						}
-						parts := strings.SplitN(e, ":", 2)
-						if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-							return fmt.Sprintf("app.yaml: role %q has invalid scope %q. Scopes must be \"*\" for full access, or \"resource:action\" pairs (e.g. \"customers:read\", \"shipments:write\"). The framework's CRUD gate checks every API call against this list, so a malformed scope means every call 403s with `scope denied: token does not have <table>:read permission`.\n\nFix:\n  roles:\n    %s:\n      scopes: [\"*\"]                     # full access (admins)\n  or\n  roles:\n    %s:\n      scopes: [\"customers:read\", \"shipments:read\", \"invites:read\"]\n\nNote: tenant scoping (each user only sees their own data) is automatic via the `groups:` config + ownership columns - scopes are about WHICH tables, not which rows.",
-								roleName, e, roleName, roleName)
-						}
-						// `read`, `write`, `delete`, `*` are framework CRUD
-						// verbs. Anything else is an app-defined custom verb
-						// the developer uses in their own flows.yaml
-						// (e.g. `reviews:approve`, `orders:approve`). Allow any
-						// well-formed identifier - runtime hasScope() handles
-						// exact-match against checkScope(session, t, action)
-						// regardless of which set the verb came from. Pre-
-						// 2.7.31 we rejected custom verbs here, which forced
-						// agents to either invent fake `read/write` mappings
-						// or fall back to admin-only - exactly the wrong
-						// outcome for fine-grained app-defined RBAC.
-						action := parts[1]
-						if !isScopeIdentifier(action) {
-							return fmt.Sprintf("app.yaml: role %q scope %q has invalid action %q. Action must be a non-empty identifier (a-z, A-Z, 0-9, _, *).", roleName, e, action)
-						}
+				}
+			case string:
+				entries = strings.Fields(val)
+			case []any:
+				for _, item := range val {
+					if str, ok := item.(string); ok && str != "" {
+						entries = append(entries, str)
 					}
+				}
+			}
+			for _, e := range entries {
+				if e == "*" {
+					continue
+				}
+				parts := strings.SplitN(e, ":", 2)
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					return fmt.Sprintf("app.yaml: role %q has invalid scope %q. Scopes must be \"*\" for full access, or \"resource:action\" pairs (e.g. \"customers:read\", \"shipments:write\"). The framework's CRUD gate checks every API call against this list, so a malformed scope means every call 403s with `scope denied: token does not have <table>:read permission`.\n\nFix:\n  roles:\n    %s:\n      scopes: [\"*\"]                     # full access (admins)\n  or\n  roles:\n    %s:\n      scopes: [\"customers:read\", \"shipments:read\", \"invites:read\"]\n\nNote: tenant scoping (each user only sees their own data) is automatic via the `groups:` config + ownership columns - scopes are about WHICH tables, not which rows.",
+						roleName, e, roleName, roleName)
+				}
+				// `read`, `write`, `delete`, `*` are framework CRUD
+				// verbs. Anything else is an app-defined custom verb
+				// the developer uses in their own flows.yaml
+				// (e.g. `reviews:approve`, `orders:approve`). Allow any
+				// well-formed identifier - runtime hasScope() handles
+				// exact-match against checkScope(session, t, action)
+				// regardless of which set the verb came from. Pre-
+				// 2.7.31 we rejected custom verbs here, which forced
+				// agents to either invent fake `read/write` mappings
+				// or fall back to admin-only - exactly the wrong
+				// outcome for fine-grained app-defined RBAC.
+				action := parts[1]
+				if !isScopeIdentifier(action) {
+					return fmt.Sprintf("app.yaml: role %q scope %q has invalid action %q. Action must be a non-empty identifier (a-z, A-Z, 0-9, _, *).", roleName, e, action)
 				}
 			}
 		}
 	}
 	// access: block sanity - validates that each mode value is in the
-	// known enum (anon / everyone / self / group / admin / role:<X> / off).
-	// Typo'd modes (`read: anonn`, `read: everyone:read`, `read: pubic`)
-	// parse as YAML strings cleanly and then crash the access enforcer
-	// at runtime with `unknown access mode` - but only when the first
-	// request to that table arrives, by which point the agent has
-	// already moved on. Catch at write time.
-	if strings.Contains(content, "\naccess:") || strings.HasPrefix(content, "access:") {
-		var parsed map[string]any
-		if err := yaml.Unmarshal([]byte(content), &parsed); err == nil {
-			if accessRaw, ok := parsed["access"].(map[string]any); ok {
-				for tableName, v := range accessRaw {
-					// Two shapes: `posts: admin` (string applied to all
-					// ops) or `posts: { read: anon, write: self, ... }` (per-op map).
-					switch val := v.(type) {
-					case string:
-						if msg := validateAccessMode(tableName, "all", val); msg != "" {
-							return msg
-						}
-					case map[string]any:
-						for op, mode := range val {
-							modeStr, ok := mode.(string)
-							if !ok {
-								return fmt.Sprintf("app.yaml: access.%s.%s must be a string mode name, got %T. Allowed: anon, everyone, self, group, admin, role:<name>, perm:<resource>.<action>, member-of:<table>(<join_col>,<user_col>), off.", tableName, op, mode)
-							}
-							if msg := validateAccessMode(tableName, op, modeStr); msg != "" {
-								return msg
-							}
-						}
+	// known enum (anon / everyone / self / group / admin / role:<X> / off)
+	// and each op key is one the access loader reads. Typo'd modes
+	// (`read: anonn`, `read: everyone:read`, `read: pubic`) parse as YAML
+	// strings cleanly and then fail closed at runtime - but only when the
+	// first request to that table arrives, by which point the agent has
+	// already moved on. A typo'd OP (`create:`, `raed:`) is worse: it is
+	// never read, so that op silently keeps the broader default.
+	if accessRaw, ok := doc["access"].(map[string]any); ok {
+		for _, tableName := range slices.Sorted(maps.Keys(accessRaw)) {
+			// Two shapes: `posts: admin` (string applied to all
+			// ops) or `posts: { read: anon, write: self, ... }` (per-op map).
+			switch val := accessRaw[tableName].(type) {
+			case string:
+				if msg := validateAccessMode(tableName, "all", val); msg != "" {
+					return msg
+				}
+			case map[string]any:
+				for _, op := range slices.Sorted(maps.Keys(val)) {
+					mode := val[op]
+					if msg := accessOpKeyViolation(tableName, op); msg != "" {
+						return msg
+					}
+					modeStr, ok := mode.(string)
+					if !ok {
+						return fmt.Sprintf("app.yaml: access.%s.%s must be a string mode name, got %T. Allowed: anon, everyone, self, group, admin, role:<name>, perm:<resource>.<action>, member-of:<table>(<join_col>,<user_col>), off.", tableName, op, mode)
+					}
+					if msg := validateAccessMode(tableName, op, modeStr); msg != "" {
+						return msg
 					}
 				}
 			}
@@ -207,92 +234,66 @@ func validateAppYAML(content string) string {
 	// membership rule. A typo'd rule is DROPPED at load time (the room
 	// stays unprotected), so catch it at write time where the agent can
 	// act on it.
-	if strings.Contains(content, "\nws_rooms:") || strings.HasPrefix(content, "ws_rooms:") {
-		var parsed map[string]any
-		if err := yaml.Unmarshal([]byte(content), &parsed); err == nil {
-			if wsRaw, ok := parsed["ws_rooms"].(map[string]any); ok {
-				for pattern, v := range wsRaw {
-					ruleStr, ok := v.(string)
-					if !ok || parseMemberOf("member-of:"+strings.ToLower(strings.TrimSpace(ruleStr))) == nil {
-						return fmt.Sprintf("app.yaml: ws_rooms.%q = %v is malformed. Syntax: `<membership_table>(<join_col>, <user_col>)`, e.g.\n\nws_rooms:\n  \"room-:id\": room_members(room_id, member_id)\n\nThe `:id` placeholder captures the room's numeric/uuid id from the WS room name and requires a membership row (join_col = captured id, user_col = session user id, or email when the column name contains \"email\") before `join` succeeds.", pattern, v)
-					}
-				}
+	if wsRaw, ok := doc["ws_rooms"].(map[string]any); ok {
+		for _, pattern := range slices.Sorted(maps.Keys(wsRaw)) {
+			v := wsRaw[pattern]
+			ruleStr, ok := v.(string)
+			if !ok || parseMemberOf("member-of:"+strings.ToLower(strings.TrimSpace(ruleStr))) == nil {
+				return fmt.Sprintf("app.yaml: ws_rooms.%q = %v is malformed. Syntax: `<membership_table>(<join_col>, <user_col>)`, e.g.\n\nws_rooms:\n  \"room-:id\": room_members(room_id, member_id)\n\nThe `:id` placeholder captures the room's numeric/uuid id from the WS room name and requires a membership row (join_col = captured id, user_col = session user id, or email when the column name contains \"email\") before `join` succeeds.", pattern, v)
 			}
 		}
 	}
 
-	// Auth sub-keys
-	if strings.Contains(content, "\nauth:\n") || strings.HasPrefix(content, "auth:\n") {
-		// Find the auth: block and scan its children
-		idx := strings.Index(content, "auth:\n")
-		if idx >= 0 {
-			tail := content[idx:]
-			// Read until next top-level key (line starting with non-space)
-			end := len(tail)
-			lines := strings.Split(tail, "\n")
-			authBlock := ""
-			for i, line := range lines {
-				if i == 0 { // "auth:"
-					authBlock += line + "\n"
-					continue
-				}
-				// Empty line OR top-level key (no leading space) breaks the block
-				if line == "" {
-					authBlock += line + "\n"
-					continue
-				}
-				if !strings.HasPrefix(line, " ") {
-					break
-				}
-				authBlock += line + "\n"
-				_ = end
+	// Auth sub-keys and boolean values.
+	if authRaw, ok := doc["auth"].(map[string]any); ok {
+		for _, key := range slices.Sorted(maps.Keys(authRaw)) {
+			if msg, dead := deadAuthKeys[key]; dead {
+				return "antipattern [dead-auth-key] in app.yaml: " + msg
 			}
-			for _, m := range yamlNestedAuthKeyRe.FindAllStringSubmatch(authBlock, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				key := m[1]
-				if knownAuthKeys[key] {
-					continue
-				}
-				return fmt.Sprintf("antipattern [unknown-auth-key] in app.yaml: `auth.%s` is not recognized. Real auth keys: %s. Common fabrications: `auth.enabled: true` (the framework auto-enables auth when `auth:` is present), `auth.providers: [...]` (use per-app provider credentials and top-level `oauth:` metadata; see `api(at: \"oauth\")`), `auth.signup_enabled: true` (always-on, no flag), `auth.redirect_unauthenticated_to:` (use `auth.redirect:` for post-login destination). Read `help(topic: \"auth\")` for the real schema.", key, knownAuthKeysList())
+			if knownAuthKeys[key] {
+				continue
+			}
+			return fmt.Sprintf("antipattern [unknown-auth-key] in app.yaml: `auth.%s` is not recognized. Real auth keys: %s. Common fabrications: `auth.enabled: true` (the framework auto-enables auth when `auth:` is present), `auth.providers: [...]` (use per-app provider credentials and top-level `oauth:` metadata; see `api(at: \"oauth\")`), `auth.signup_enabled: true` (always-on, no flag), `auth.redirect_unauthenticated_to:` (use `auth.redirect:` for post-login destination). Read `help(topic: \"auth\")` for the real schema.", key, knownAuthKeysList())
+		}
+		// A limit that doesn't parse would silently leave the default in
+		// force; say so at write time, like a flow's rate_limit.
+		if v, present := authRaw["signup_rate_limit"]; present {
+			if _, _, ok := parseSignupRateLimit(anyToString(v)); !ok {
+				return fmt.Sprintf("app.yaml: auth.signup_rate_limit = %v is malformed. Use \"<count>/<window>\" - e.g. \"100/hour\", \"30/10m\". Windows: s/sec, m/min, h/hour, d/day or a Go duration. It is the number of sign-ups one client address may make per window (default 30/10m).", v)
+			}
+		}
+		for _, key := range authFlagKeys {
+			v, present := authRaw[key]
+			if !present {
+				continue
+			}
+			if _, ok := canonicalAuthFlag(anyToString(v)); !ok {
+				return fmt.Sprintf("app.yaml: auth.%s = %v is not a boolean. Use `true` or `false` (yes/no, on/off and 1/0 are read the same way). Any other value leaves the setting OFF.", key, v)
 			}
 		}
 	}
 
 	// CSP sub-keys - same shape, different known-set + error message.
-	if strings.Contains(content, "\ncsp:\n") || strings.HasPrefix(content, "csp:\n") {
-		idx := strings.Index(content, "csp:\n")
-		if idx >= 0 {
-			tail := content[idx:]
-			cspBlock := ""
-			for i, line := range strings.Split(tail, "\n") {
-				if i == 0 {
-					cspBlock += line + "\n"
-					continue
+	if cspRaw, ok := doc["csp"].(map[string]any); ok {
+		for _, key := range slices.Sorted(maps.Keys(cspRaw)) {
+			if knownCSPKeys[key] {
+				if key == "frame_ancestors" {
+					value := strings.Fields(anyToString(cspRaw[key]))
+					for _, source := range value {
+						if strings.EqualFold(source, "'none'") && (source != "'none'" || len(value) != 1) {
+							return "app.yaml: csp.frame_ancestors uses `'none'` as a standalone value; CSP does not allow it to be combined with other sources. Use exactly `frame_ancestors: \"'none'\"` to deny all framing, or remove `'none'` from the origin list."
+						}
+					}
 				}
-				if line == "" {
-					cspBlock += line + "\n"
-					continue
-				}
-				if !strings.HasPrefix(line, " ") {
-					break
-				}
-				cspBlock += line + "\n"
+				continue
 			}
-			for _, m := range yamlNestedAuthKeyRe.FindAllStringSubmatch(cspBlock, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				key := m[1]
-				if knownCSPKeys[key] {
-					continue
-				}
-				return fmt.Sprintf("antipattern [unknown-csp-key] in app.yaml: `csp.%s` is not a recognised CSP directive. Real directives: script_src, style_src, img_src, font_src, connect_src, frame_src, frame_ancestors (each value is a space-separated origin list, appended to the framework defaults; frame_ancestors widens who may iframe the app - '*' allows any embedder). Example: `csp:\\n  script_src: \"https://maps.googleapis.com\"\\n  img_src: \"https://*.tile.openstreetmap.org\"`. Read `help(topic: \"csp\")` for the full schema.", key)
-			}
+			return fmt.Sprintf("antipattern [unknown-csp-key] in app.yaml: `csp.%s` is not a recognised CSP directive. Real directives: script_src, style_src, img_src, font_src, connect_src, frame_src, frame_ancestors (each value is a space-separated origin list, appended to the framework defaults; frame_ancestors widens who may iframe the app - '*' allows any embedder). Example: `csp:\\n  script_src: \"https://maps.googleapis.com\"\\n  img_src: \"https://*.tile.openstreetmap.org\"`. Read `help(topic: \"csp\")` for the full schema.", key)
 		}
 	}
 
+	if msg := appYAMLSectionKeyViolation(doc); msg != "" {
+		return msg
+	}
 	return ""
 }
 
@@ -358,21 +359,9 @@ func validateAccessMode(table, op, mode string) string {
 	return fmt.Sprintf("app.yaml: access.%s.%s = %q is not a known access mode.\n\nAllowed modes:\n  anon      - no auth required (truly public)\n  everyone  - any authenticated user\n  self      - owner only (table needs user_id column)\n  group     - same-group only (table needs groups: config + group key column)\n  admin     - only role=admin\n  role:NAME - only users with that named role; admin bypasses\n  perm:RESOURCE.ACTION - users whose role scopes include the permission\n  member-of:TABLE(JOIN_COL, USER_COL) - members of the row's room/channel/project (membership table EXISTS)\n  off       - endpoint returns 404 to everyone\n\nMost common typos: `anonn` → `anon`, `every` → `everyone`, `own` → `self`, `groups` → `group`. For chat / public feeds set `read: anon` (anon viewers see history) + `write: everyone` (only authed users post) + `delete: self` (authors delete their own). For private rooms/channels use `member-of:` - it replaces hand-written EXISTS guards in flows.", table, op, mode)
 }
 
-func knownYAMLKeysList() string {
-	var keys []string
-	for k := range knownAppYAMLKeys {
-		keys = append(keys, k)
-	}
-	return strings.Join(keys, ", ")
-}
+func knownYAMLKeysList() string { return sortedKeyList(knownAppYAMLKeys) }
 
-func knownAuthKeysList() string {
-	var keys []string
-	for k := range knownAuthKeys {
-		keys = append(keys, k)
-	}
-	return strings.Join(keys, ", ")
-}
+func knownAuthKeysList() string { return sortedKeyList(knownAuthKeys) }
 
 func validatePageContract(path, content string) string {
 	if !strings.HasSuffix(strings.ToLower(path), ".html") {

@@ -274,7 +274,11 @@ func runSQLRestore(app *App, sess *importSession) error {
 		}
 		importProgress.Delete(sess.ID)
 		if err != nil {
-			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, err.Error())
+			reason := err.Error()
+			if isStorageFullError(err) {
+				reason = storageFullMessage(app) + " (" + reason + "; the restore was rolled back)"
+			}
+			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, reason)
 			if serr != nil {
 				log.Printf("IMPORT %s: failed to persist failed state: %v", sess.ID, serr)
 			}

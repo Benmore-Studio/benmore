@@ -9,8 +9,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Data retention / TTL: declarative data lifecycle management.
@@ -23,6 +21,14 @@ type RetentionPolicy struct {
 	Table  string
 	TTL    time.Duration
 	Column string // timestamp column to check (default: created_at)
+}
+
+type retentionFileConfig struct {
+	Policies []struct {
+		Table  string `yaml:"table"`
+		TTL    string `yaml:"ttl"`
+		Column string `yaml:"column"`
+	} `yaml:"policies"`
 }
 
 // LoadRetentionConfig reads retention policies from either a dedicated
@@ -46,19 +52,19 @@ type RetentionPolicy struct {
 // Both sources are merged - dedicated file takes precedence on table
 // name conflicts.
 func LoadRetentionConfig(dir string) []RetentionPolicy {
+	retentionData, _ := os.ReadFile(dir + "/retention.yaml")
+	appData, _ := os.ReadFile(dir + "/app.yaml")
+	return parseRetentionConfig(retentionData, appData)
+}
+
+func parseRetentionConfig(retentionData, appData []byte) []RetentionPolicy {
 	var policies []RetentionPolicy
 	seen := map[string]bool{}
 
 	// 1. Dedicated retention.yaml (preferred)
-	if data, err := os.ReadFile(dir + "/retention.yaml"); err == nil {
-		var wrapper struct {
-			Policies []struct {
-				Table  string `yaml:"table"`
-				TTL    string `yaml:"ttl"`
-				Column string `yaml:"column"`
-			} `yaml:"policies"`
-		}
-		if yaml.Unmarshal(data, &wrapper) == nil {
+	{
+		var wrapper retentionFileConfig
+		if yamlUnmarshal(retentionData, &wrapper) == nil {
 			for _, p := range wrapper.Policies {
 				ttl := parseTTLDuration(p.TTL)
 				if ttl == 0 {
@@ -77,9 +83,9 @@ func LoadRetentionConfig(dir string) []RetentionPolicy {
 	}
 
 	// 2. app.yaml inline retention: map (fallback/legacy)
-	if data, err := os.ReadFile(dir + "/app.yaml"); err == nil {
+	{
 		var raw map[string]any
-		if yaml.Unmarshal(data, &raw) == nil {
+		if yamlUnmarshal(appData, &raw) == nil {
 			if retentionRaw, ok := raw["retention"].(map[string]any); ok {
 				for table, v := range retentionRaw {
 					if seen[table] {
@@ -147,34 +153,54 @@ func StartRetentionWorker(app *App, policies []RetentionPolicy) {
 		log.Printf("  retention: %s → %s (column: %s)", p.Table, formatDuration(p.TTL), p.Column)
 	}
 
-	safeGo("retention.sweep", func() {
-		// Run once on startup after a short delay
-		time.Sleep(5 * time.Second)
-		enforceRetention(app.DB, policies)
-
-		// Then every hour
+	app.startWorker("retention.sweep", func(stop <-chan struct{}) {
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
 		for {
-			time.Sleep(1 * time.Hour)
+			select {
+			case <-stop:
+				return
+			case <-timer.C:
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			enforceRetention(app.DB, policies)
+			timer.Reset(time.Hour)
 		}
 	})
 }
 
 // enforceRetention processes all retention policies.
 func enforceRetention(db *sql.DB, policies []RetentionPolicy) {
-	for _, p := range policies {
-		cutoff := time.Now().Add(-p.TTL).UTC().Format(time.RFC3339)
+	enforceRetentionAt(db, policies, time.Now())
+}
 
-		// Hard-delete rows where the timestamp column is older than TTL
+func enforceRetentionAt(db *sql.DB, policies []RetentionPolicy, now time.Time) {
+	for _, p := range policies {
+		cutoff := now.Add(-p.TTL).UTC().Format(time.RFC3339Nano)
+
+		// Compare instants, not text: SQLite CURRENT_TIMESTAMP uses a space,
+		// while API timestamps use T and may carry an offset. Invalid timestamps
+		// yield NULL and are retained rather than guessed to be expired.
+		// The column is qualified (quoteColumn), so a policy naming a column
+		// the table lacks is logged; written as a lone quoted name SQLite
+		// read it as a string and the policy deleted nothing without a word.
+		// Such a policy still purges soft-deleted rows below, as it did.
+		var affected int64
 		result, err := db.Exec(
-			fmt.Sprintf("DELETE FROM \"%s\" WHERE \"%s\" < ?", p.Table, p.Column),
+			"DELETE FROM "+quoteIdent(p.Table)+" WHERE julianday("+quoteColumn(p.Table, p.Column)+") < julianday(?)",
 			cutoff)
 		if err != nil {
 			log.Printf("RETENTION ERROR [%s]: %s", p.Table, err)
-			continue
+			if !strings.Contains(err.Error(), "no such column") {
+				continue
+			}
+		} else {
+			affected, _ = result.RowsAffected()
 		}
-
-		affected, _ := result.RowsAffected()
 		if affected > 0 {
 			log.Printf("RETENTION: deleted %d rows from %s (older than %s)", affected, p.Table, formatDuration(p.TTL))
 			// Compliance proof: log deletion to audit trail
@@ -191,10 +217,10 @@ func enforceRetention(db *sql.DB, policies []RetentionPolicy) {
 		// Also purge soft-deleted rows beyond TTL (if table has deleted_at)
 		// These are rows the user already "deleted" but are still on disk
 		var hasDeletedAt int
-		db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name='deleted_at'", p.Table)).Scan(&hasDeletedAt)
+		db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='deleted_at'", p.Table).Scan(&hasDeletedAt)
 		if hasDeletedAt > 0 {
 			purgeResult, err := db.Exec(
-				fmt.Sprintf("DELETE FROM \"%s\" WHERE deleted_at IS NOT NULL AND deleted_at < ?", p.Table),
+				"DELETE FROM "+quoteIdent(p.Table)+" WHERE deleted_at IS NOT NULL AND julianday(deleted_at) < julianday(?)",
 				cutoff)
 			if err == nil {
 				purged, _ := purgeResult.RowsAffected()
@@ -216,7 +242,7 @@ func enforceRetention(db *sql.DB, policies []RetentionPolicy) {
 // RunRetentionNow executes retention policies synchronously. Used in tests
 // via `flush: retention` to ensure TTL deletions happen before assertions.
 func RunRetentionNow(app *App) {
-	policies := LoadRetentionConfig(app.Dir)
+	policies := app.retentionConfig()
 	if len(policies) > 0 {
 		enforceRetention(app.DB, policies)
 	}

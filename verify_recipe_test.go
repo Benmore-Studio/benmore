@@ -431,6 +431,47 @@ func TestExecuteFlowHTTP_VerifyBodyLimitRejectsWithoutSteps(t *testing.T) {
 	}
 }
 
+func TestExecuteFlowHTTP_LegacyVerifyBodyLimit(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	SetAppEnv(app.Dir, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+	mustExec(t, app.DB, `CREATE TABLE webhook_log (event TEXT)`)
+	flow := Flow{
+		Name:    "stripe_webhook",
+		Trigger: FlowTrigger{Type: "http", Method: http.MethodPost, Path: "/api/stripe-webhook"},
+		Verify:  "stripe",
+		Secret:  "{{env.STRIPE_WEBHOOK_SECRET}}",
+		Steps: []FlowStep{
+			{Type: "sql", SQL: "INSERT INTO webhook_log (event) VALUES ('ran')"},
+			{Type: "respond", Respond: &FlowRespond{Status: http.StatusOK, JSON: map[string]any{"ok": true}}},
+		},
+	}
+	mux := http.NewServeMux()
+	RegisterFlows(mux, app, []Flow{flow})
+	send := func(body []byte) int {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		r := httptest.NewRequest(http.MethodPost, "/api/stripe-webhook", bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Stripe-Signature", "t="+ts+",v1="+hmacHex(t, "whsec_test", append([]byte(ts+"."), body...)))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, r)
+		return rr.Code
+	}
+	if code := send(bytes.Repeat([]byte("x"), int(flowVerifyBodyMaxBytes)+1)); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized legacy-verified body status = %d, want 413", code)
+	}
+	var count int
+	if err := app.DB.QueryRow(`SELECT COUNT(*) FROM webhook_log`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("oversized body must reject before SQL; count=%d err=%v", count, err)
+	}
+	if code := send([]byte(`{"type":"invoice.paid"}`)); code != http.StatusOK {
+		t.Fatalf("signed body within the limit status = %d, want 200", code)
+	}
+	if err := app.DB.QueryRow(`SELECT COUNT(*) FROM webhook_log`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("signed body within the limit must run the flow; count=%d err=%v", count, err)
+	}
+}
+
 func TestExecuteFlowHTTP_PathBearerRejectsBeforeSteps(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()

@@ -90,7 +90,7 @@ func TestAuditSchedulerDelegationRevocation(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			app, mux := auditApp(t)
 			sid := createCrudScopeSession(t, app, "delegate@example.com", "editor", "a", "")
-			auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:read' WHERE id=?", sid)
+			auditExec(t, app.DB, "UPDATE _benmore_sessions SET scopes='notes:read' WHERE id=?", sessionStorageKey(sid))
 			uid := GetSessionFromDB(app.DB, sid).UserID
 			auditExec(t, app.DB, "INSERT INTO members(org_id,email) VALUES ('a','delegate@example.com')")
 			app.Roles = &RolesConfig{Roles: map[string]RoleDef{"editor": {Scopes: "notes:read"}, "admin": {Scopes: "*"}}}

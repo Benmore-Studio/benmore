@@ -30,7 +30,7 @@ import (
 // RegisterInstallRoute adds the per-app mobile install landing page.
 // This is registered inside buildAppMux so each app has its own
 // themed install screen (title, colors, icon from app.yaml).
-func RegisterInstallRoute(mux *http.ServeMux, app *App) {
+func RegisterInstallRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /install", func(w http.ResponseWriter, r *http.Request) {
 		renderInstallPage(w, r, app)
 	})
@@ -290,7 +290,7 @@ const installPageTemplate = `<!DOCTYPE html>
 // a PNG QR code of the given URL. Used by both the /install desktop view
 // (to show a QR hopping to mobile) and the builder modal (for the
 // "Open on phone" button).
-func RegisterInstallQRRoute(mux *http.ServeMux) {
+func RegisterInstallQRRoute(mux appRouteRegistrar) {
 	mux.HandleFunc("GET /install/qr", func(w http.ResponseWriter, r *http.Request) {
 		target := r.URL.Query().Get("url")
 		if target == "" {
@@ -305,7 +305,7 @@ func RegisterInstallQRRoute(mux *http.ServeMux) {
 		}
 		png, err := qrcode.Encode(target, qrcode.Medium, 400)
 		if err != nil {
-			http.Error(w, "encode failed", 500)
+			serverError(w, r, nil, "install qr", err, "encode failed")
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")

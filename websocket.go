@@ -52,6 +52,11 @@ const (
 	realtimeWSMaxConnsPerAnonIP = 30
 )
 
+// wsMaxRoomsPerConn bounds the rooms one connection holds: each joined name
+// stays in client.rooms until left, so an unbounded join loop grew memory at
+// the message rate. bm.room() joins one room per connection.
+const wsMaxRoomsPerConn = 256
+
 // Frame opcodes (RFC 6455 §5.2)
 const (
 	wsOpText  = 1
@@ -71,14 +76,19 @@ type wsConn struct {
 type wsClient struct {
 	principal realtimePrincipal
 	ws        *wsConn
-	send      chan []byte
-	appID     string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
-	userID    int64
-	email     string // session email - ws_rooms membership checks against email-shaped user columns
-	groupID   string
-	isAdmin   bool
-	// remoteIP is the connecting client's source host (no port), captured
-	// at connect time for the H-16 per-anonymous-IP connection cap.
+	// send is never closed: broadcasters send to a hub snapshot after
+	// releasing its lock, so a send may land after the client unregisters.
+	// done (closed on disconnect) stops the write loop instead.
+	send    chan []byte
+	done    chan struct{}
+	appID   string // app identity (set to app.Name on connect - prevents cross-app room collision in host mode)
+	userID  int64
+	email   string // session email - ws_rooms membership checks against email-shaped user columns
+	groupID string
+	isAdmin bool
+	// remoteIP is the connecting client's source host (no port; an IPv6
+	// client's /64), captured at connect time for the H-16
+	// per-anonymous-IP connection cap.
 	remoteIP string
 	// wsAnonShared signals that this app has features.ws_anonymous: true
 	// AND no groups: scoping - i.e. the developer explicitly opted in to
@@ -304,7 +314,7 @@ func (ws *wsConn) close() {
 
 // ===== Hub + Routes =====
 
-func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
+func RegisterWebSocketRoutes(mux appRouteRegistrar, app *App) {
 	needsAuth := NeedsAuth(app)
 
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
@@ -321,7 +331,11 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		var email string
 		var groupID string
 		var isAdmin bool
-		principal := realtimePrincipal{app: app, request: r}
+		// Anonymous streams end when the app stops admitting them (the
+		// same gate, re-read at each credential check).
+		principal := realtimePrincipal{app: app, request: r, anonAdmitted: func() bool {
+			return !NeedsAuth(app) || broadcastAllowAnon(app)
+		}}
 		if needsAuth && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
@@ -355,10 +369,11 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		// (not X-Forwarded-For, which is spoofable) so an attacker can't
 		// evade the per-IP ceiling by forging a header. Drop the ephemeral
 		// port so reconnects from the same host count together.
-		remoteIP := r.RemoteAddr
-		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			remoteIP = h
-		}
+		// rateLimitClientHost: behind the platform router every RemoteAddr
+		// is loopback, which pooled ALL anonymous visitors of an app into
+		// one 30-connection bucket; use the router-forwarded client. An
+		// IPv6 client counts by its /64 (realtimeAnonClientKey).
+		remoteIP := realtimeAnonClientKey(r)
 
 		// Connection caps. H-16: the per-user cap below keys on userID,
 		// which is 0 for every anonymous client - so without a global cap
@@ -370,7 +385,7 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		globalCount := len(wsHub.clients)
 		var userCount, anonIPCount int
 		for c := range wsHub.clients {
-			if needsAuth && !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
+			if !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
 				userCount++
 			}
 			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
@@ -390,8 +405,10 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
 		}
-		// Per-user connection limit (authenticated, non-admin clients).
-		if needsAuth && !isAdmin && userID != 0 && userCount >= wsMaxConnsPerUser {
+		// Per-user connection limit (signed-in, non-admin clients), also in
+		// an app without an auth: block, where a signed-in user (OAuth) is
+		// outside the anonymous per-address cap too.
+		if !isAdmin && userID != 0 && userCount >= wsMaxConnsPerUser {
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
 		}
@@ -410,9 +427,11 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		anonShared := wsAnonymous && (app.Group == nil || app.Group.Key == "")
 
 		client := &wsClient{
-			ws:            ws,
-			principal:     principal,
+			ws: ws,
+			// Fan-out reads the cached credential check (realtimePrincipalTTL).
+			principal:     principal.withCache(),
 			send:          make(chan []byte, wsSendBufferSize),
+			done:          make(chan struct{}),
 			appID:         realtimeAppID(app.Dir),
 			userID:        userID,
 			email:         email,
@@ -433,14 +452,14 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		lockedGlobal := len(wsHub.clients)
 		lockedUser, lockedAnonIP := 0, 0
 		for c := range wsHub.clients {
-			if needsAuth && !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
+			if !isAdmin && userID != 0 && c.userID == userID && c.appID == realtimeAppID(app.Dir) {
 				lockedUser++
 			}
 			if isAnon && c.userID == 0 && c.remoteIP == remoteIP {
 				lockedAnonIP++
 			}
 		}
-		overUser := needsAuth && !isAdmin && userID != 0 && lockedUser >= wsMaxConnsPerUser
+		overUser := !isAdmin && userID != 0 && lockedUser >= wsMaxConnsPerUser
 		overAnon := isAnon && lockedAnonIP >= realtimeWSMaxConnsPerAnonIP
 		if lockedGlobal >= realtimeWSMaxConnsGlobal || overUser || overAnon {
 			wsHub.mu.Unlock()
@@ -464,7 +483,7 @@ func RegisterWebSocketRoutes(mux *http.ServeMux, app *App) {
 		wsHub.mu.Lock()
 		delete(wsHub.clients, client)
 		wsHub.mu.Unlock()
-		close(client.send)
+		close(client.done)
 		ws.close()
 		<-done
 	})
@@ -482,20 +501,22 @@ func wsReadLoop(client *wsClient, app *App) {
 			return
 		}
 
+		// Rate limit every frame: a ping is answered with a pong, so control
+		// frames cost work too. Browsers send none of their own and reply to
+		// the server's 30s ping with one pong.
+		now := time.Now()
+		if now.Sub(windowStart) > time.Second {
+			msgCount = 0
+			windowStart = now
+		}
+		msgCount++
+		if msgCount > wsClientMsgRateLimit {
+			client.ws.writeClose(1008, "rate limit exceeded")
+			return
+		}
+
 		switch opcode {
 		case wsOpText:
-			// Rate limit
-			now := time.Now()
-			if now.Sub(windowStart) > time.Second {
-				msgCount = 0
-				windowStart = now
-			}
-			msgCount++
-			if msgCount > wsClientMsgRateLimit {
-				client.ws.writeClose(1008, "rate limit exceeded")
-				return
-			}
-
 			var msg wsClientMsg
 			if err := json.Unmarshal(payload, &msg); err != nil {
 				continue
@@ -540,8 +561,19 @@ func wsReadLoop(client *wsClient, app *App) {
 				// actually reach each other - the v2.7.10 fix).
 				if scoped := scopedRoomID(client, msg.Room); scoped != "" {
 					client.subMu.Lock()
-					client.rooms[scoped] = true
+					full := !client.rooms[scoped] && len(client.rooms) >= wsMaxRoomsPerConn
+					if !full {
+						client.rooms[scoped] = true
+					}
 					client.subMu.Unlock()
+					if full {
+						refused, _ := json.Marshal(wsServerMsg{Type: "error", Room: msg.Room, Body: "too many rooms on this connection"})
+						select {
+						case client.send <- refused:
+						default:
+						}
+						break
+					}
 					// Notify others in the room. Lightweight; the
 					// payload is just the joining user_id so clients
 					// can update presence lists.
@@ -598,31 +630,47 @@ func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
 	if !valid {
 		return false
 	}
-	if app == nil || len(app.WSRooms) == 0 || room == "" {
+	return roomMembershipAllowed(app, session, client.userID, room)
+}
+
+// roomMembershipAllowed applies the app's ws_rooms rules to a named room for
+// a caller: rooms matching no rule are open; a matching rule requires a live
+// membership row (admins bypass, anonymous callers never pass). Shared by
+// WebSocket joins and bm.broadcast slugs, which are room names too.
+func roomMembershipAllowed(app *App, session *Session, userID int64, room string) bool {
+	if app == nil || room == "" {
 		return true
 	}
-	for _, wr := range app.WSRooms {
+	for _, wr := range app.wsRoomRules() {
 		val, ok := matchWSRoomPattern(wr.Pattern, room)
 		if !ok {
 			continue
 		}
-		if client.userID == 0 {
+		if userID == 0 {
 			return false // membership rooms require authentication
 		}
 		if session != nil && session.IsAdminBypass() {
 			return true
 		}
-		userVal := any(client.userID)
-		if strings.Contains(wr.Rule.UserCol, "email") {
-			userVal = client.email
+		userVal := any(userID)
+		if emailKeyedColumn(wr.Rule.UserCol) {
+			// Email-keyed rooms admit a verified address only.
+			email := sessionGrantEmail(session)
+			if email == "" {
+				return false
+			}
+			userVal = email
 		}
-		q := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? AND %s = ? LIMIT 1",
-			wr.Rule.Table, wr.Rule.JoinCol, wr.Rule.UserCol)
+		// Only live membership rows admit (groups_membership.go).
+		live := membershipLiveConds(app.Group, wr.Rule.Table, "", appColumnChecker(app, wr.Rule.Table))
+		table, userCol := quoteIdent(wr.Rule.Table), quoteColumn(wr.Rule.Table, wr.Rule.UserCol)
+		q := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? AND %s = ?%s LIMIT 1",
+			table, quoteColumn(wr.Rule.Table, wr.Rule.JoinCol), userCol, live)
 		var x int
 		if val == "" {
 			// Literal pattern (no placeholder): membership in ANY row
 			// of the membership table grants the room.
-			q = fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? LIMIT 1", wr.Rule.Table, wr.Rule.UserCol)
+			q = fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ?%s LIMIT 1", table, userCol, live)
 			return app.DB.QueryRow(q, userVal).Scan(&x) == nil
 		}
 		return app.DB.QueryRow(q, val, userVal).Scan(&x) == nil
@@ -631,20 +679,23 @@ func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
 }
 
 func wsWriteLoop(client *wsClient) {
+	// A write failure can leave the read side open. Unblock wsReadLoop so
+	// the handler unregisters this client and releases its connection slot.
+	// Close the transport directly; another frame write could block again.
+	defer client.ws.conn.Close()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case msg, ok := <-client.send:
-			if !ok {
-				return
-			}
+		case <-client.done:
+			return
+		case msg := <-client.send:
 			if err := client.ws.writeText(msg); err != nil {
 				return
 			}
 		case <-ticker.C:
-			if _, valid := client.principal.current(); !valid {
+			if _, valid := client.principal.refresh(); !valid {
 				client.ws.close()
 				return
 			}
@@ -658,54 +709,32 @@ func wsWriteLoop(client *wsClient) {
 
 // ===== Broadcasting =====
 
-func BroadcastWSChange(app *App, table, action string, groupID string, userID int64) {
-	msg, _ := json.Marshal(wsServerMsg{Type: "change", Table: table, Action: action})
-	genericMsg, _ := json.Marshal(wsServerMsg{Type: "change", Action: "refresh"})
+// Table change events are delivered by deliverRealtimeChange
+// (realtime_dispatch.go), which serves SSE and WebSocket clients together.
 
+// wsHubSnapshot copies the clients matching keep under the hub's read lock,
+// so callers authorize and send with the lock released. keep must be cheap
+// and do no I/O.
+func wsHubSnapshot(keep func(*wsClient) bool) []*wsClient {
 	wsHub.mu.RLock()
 	defer wsHub.mu.RUnlock()
-
-	for client := range wsHub.clients {
-		if !realtimeSameApp(app, client.principal.app) || !client.principal.canRead(table, userID) {
-			continue
-		}
-		// Same scoping rules as broadcastToSSE in pubsub.go - group-
-		// scoped events drop non-group clients, owner-scoped events
-		// send a generic refresh to non-owners, unscoped events go to
-		// everyone. The operator-precedence bug that was here pre-
-		// v2.7.5 (missing parens around the OR) meant the owner
-		// themselves never got detailed events for their own
-		// mutations - see the comment in broadcastToSSE for the
-		// failure mode.
-		if groupID != "" && groupID != "0" && !client.isAdmin && client.groupID != groupID {
-			continue
-		}
-		ownerScoped := (groupID == "" || groupID == "0") && userID > 0
-		if ownerScoped && !client.isAdmin && client.userID != userID {
-			select {
-			case client.send <- genericMsg:
-			default:
-			}
-			continue
-		}
-		if !wsClientSubscribed(client, table) {
-			continue
-		}
-		select {
-		case client.send <- msg:
-		default:
+	out := make([]*wsClient, 0, len(wsHub.clients))
+	for c := range wsHub.clients {
+		if keep(c) {
+			out = append(out, c)
 		}
 	}
+	return out
 }
 
 func BroadcastWSNotification(app *App, userID int64, title, body string) {
 	msg, _ := json.Marshal(wsServerMsg{Type: "notification", Title: title, Body: body})
 
-	wsHub.mu.RLock()
-	defer wsHub.mu.RUnlock()
-
-	for client := range wsHub.clients {
-		if realtimeSameApp(app, client.principal.app) && client.principal.canRead(notificationsTable, userID) && client.userID == userID {
+	targets := wsHubSnapshot(func(c *wsClient) bool {
+		return c.userID == userID && realtimeSameApp(app, c.principal.app)
+	})
+	for _, client := range targets {
+		if client.principal.canRead(notificationsTable, userID) {
 			select {
 			case client.send <- msg:
 			default:
@@ -761,19 +790,8 @@ func wsTableExists(app *App, name string) bool {
 // Returns empty if the room ID itself is empty or contains unsafe
 // characters (only [a-zA-Z0-9_:.-] allowed).
 func scopedRoomID(c *wsClient, raw string) string {
-	if raw == "" {
+	if !validWSRoomName(raw) {
 		return ""
-	}
-	if len(raw) > 128 {
-		return ""
-	}
-	for i := 0; i < len(raw); i++ {
-		b := raw[i]
-		ok := (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
-			b == '_' || b == '-' || b == '.' || b == ':'
-		if !ok {
-			return ""
-		}
 	}
 	// appID is set on connect from app.Name; in standalone mode or
 	// tests where it isn't populated, fall back to "_" so the rest of
@@ -802,41 +820,112 @@ func scopedRoomID(c *wsClient, raw string) string {
 	}
 }
 
+// wsRoomNameMax and validWSRoomName define a legal room name: 1-128 bytes of
+// [a-zA-Z0-9_:.-]. Client joins/broadcasts and flow `run: broadcast` share it.
+const wsRoomNameMax = 128
+
+func validWSRoomName(raw string) bool {
+	if raw == "" || len(raw) > wsRoomNameMax {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		b := raw[i]
+		ok := (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+			b == '_' || b == '-' || b == '.' || b == ':'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// wsServerFrom is the `from` a flow's `run: broadcast` message carries. A
+// client relay stamps the sender's numeric user id (and omits `from` for an
+// anonymous sender), so a string can never be mistaken for either.
+const wsServerFrom = "server"
+
+// wsServerRoomMsg is the room-message frame with a string `from`
+// (wsServerMsg.From is the numeric user id). Same type and field names as a
+// client relay, so bm.room() handlers receive it unchanged.
+type wsServerRoomMsg struct {
+	Type    string          `json:"type"`
+	Room    string          `json:"room"`
+	From    string          `json:"from"`
+	Payload json.RawMessage `json:"payload"`
+}
+
 // BroadcastWSToRoom delivers server messages only to this app and tenant.
 // An absent tenant is an error for grouped apps; it never means all tenants.
 func BroadcastWSToRoom(app *App, groupID, rawRoom, payload string) error {
-	if app == nil || app.Dir == "" || rawRoom == "" {
-		return errors.New("ws broadcast requires an app and room")
-	}
-	grouped := app.Group != nil && app.Group.Key != ""
-	if grouped && (groupID == "" || groupID == "0") {
-		return errors.New("ws broadcast requires a tenant in grouped apps")
+	if err := wsServerRoomTarget(app, groupID, rawRoom); err != nil {
+		return err
 	}
 	msg, err := json.Marshal(wsServerMsg{Type: "message", Room: rawRoom, Payload: json.RawMessage(payload)})
 	if err != nil {
 		return err
 	}
-	wsHub.mu.RLock()
-	defer wsHub.mu.RUnlock()
-	for c := range wsHub.clients {
-		if c.appID != realtimeAppID(app.Dir) || (grouped && c.groupID != groupID) {
-			continue
-		}
-		if !wsRoomAuthorized(app, c, rawRoom) {
-			continue
+	deliverWSRoomMessage(app, groupID, rawRoom, msg)
+	return nil
+}
+
+// BroadcastWSToRoomFromServer sends a flow's `run: broadcast` message
+// ({type:"message", room, from:"server", payload}) under the same app, tenant,
+// membership and joined-room checks as BroadcastWSToRoom, and reports how many
+// connections it was queued for. Rooms live in this process's hub only:
+// cluster peers do not relay room messages (client relays behave the same).
+func BroadcastWSToRoomFromServer(app *App, groupID, rawRoom string, payload json.RawMessage) (int, error) {
+	if err := wsServerRoomTarget(app, groupID, rawRoom); err != nil {
+		return 0, err
+	}
+	if !validWSRoomName(rawRoom) {
+		return 0, fmt.Errorf("room %q is not a valid room name (1-%d characters of a-z A-Z 0-9 _ - . :)", rawRoom, wsRoomNameMax)
+	}
+	msg, err := json.Marshal(wsServerRoomMsg{Type: "message", Room: rawRoom, From: wsServerFrom, Payload: payload})
+	if err != nil {
+		return 0, err
+	}
+	return deliverWSRoomMessage(app, groupID, rawRoom, msg), nil
+}
+
+func wsServerRoomTarget(app *App, groupID, rawRoom string) error {
+	if app == nil || app.Dir == "" || rawRoom == "" {
+		return errors.New("ws broadcast requires an app and room")
+	}
+	if app.Group != nil && app.Group.Key != "" && (groupID == "" || groupID == "0") {
+		return errors.New("ws broadcast requires a tenant in grouped apps")
+	}
+	return nil
+}
+
+// deliverWSRoomMessage queues msg for every connection of this app (and this
+// tenant, in grouped apps) that has joined rawRoom and still passes the room's
+// ws_rooms membership check. A full send buffer drops the frame, as for
+// client relays. Returns the number of connections it was queued for.
+func deliverWSRoomMessage(app *App, groupID, rawRoom string, msg []byte) int {
+	grouped := app.Group != nil && app.Group.Key != ""
+	appID := realtimeAppID(app.Dir)
+	queued := 0
+	// Joined members of this app and tenant first; only they pay for the
+	// membership check, and none of it runs under the hub lock.
+	members := wsHubSnapshot(func(c *wsClient) bool {
+		if c.appID != appID || (grouped && c.groupID != groupID) {
+			return false
 		}
 		c.subMu.RLock()
-		joined := c.rooms[scopedRoomID(c, rawRoom)]
-		c.subMu.RUnlock()
-		if !joined {
+		defer c.subMu.RUnlock()
+		return c.rooms[scopedRoomID(c, rawRoom)]
+	})
+	for _, c := range members {
+		if !wsRoomAuthorized(app, c, rawRoom) {
 			continue
 		}
 		select {
 		case c.send <- msg:
+			queued++
 		default:
 		}
 	}
-	return nil
+	return queued
 }
 
 // broadcastToRoom relays a typed message to every wsHub client that
@@ -873,16 +962,18 @@ func broadcastToRoom(sender *wsClient, rawRoom, msgType string, payload json.Raw
 	if err != nil {
 		return
 	}
-	wsHub.mu.RLock()
-	defer wsHub.mu.RUnlock()
-	for c := range wsHub.clients {
-		if c == sender || !wsRoomAuthorized(c.principal.app, c, rawRoom) {
-			continue
+	// Joined receivers first; only they pay for the membership check, and
+	// none of it runs under the hub lock.
+	members := wsHubSnapshot(func(c *wsClient) bool {
+		if c == sender {
+			return false
 		}
 		c.subMu.RLock()
-		joined := c.rooms[senderScoped]
-		c.subMu.RUnlock()
-		if !joined {
+		defer c.subMu.RUnlock()
+		return c.rooms[senderScoped]
+	})
+	for _, c := range members {
+		if !wsRoomAuthorized(c.principal.app, c, rawRoom) {
 			continue
 		}
 		select {

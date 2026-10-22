@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"weak"
 )
 
 // inferColumnValidation generates validation rules from column name and type.
@@ -45,6 +49,10 @@ var (
 	emailRe        = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
 	phoneRe        = regexp.MustCompile(`^[\d\s\-\+\(\)]{7,20}$`)
 	urlRe          = regexp.MustCompile(`^https?://[^\s/$.?#].[^\s]*$`)
+
+	// A field's name and its :validate rules, in either attribute order.
+	validateNameFirstRe = regexp.MustCompile(`name="([^"]+)"[^>]*:validate="([^"]+)"`)
+	validateNameLastRe  = regexp.MustCompile(`:validate="([^"]+)"[^>]*name="([^"]+)"`)
 )
 
 // ValidationError represents a single field validation failure.
@@ -53,48 +61,171 @@ type ValidationError struct {
 	Message string `json:"message"`
 }
 
+type validationMetadataError struct{ cause error }
+
+func (e *validationMetadataError) Error() string {
+	return "field validation metadata could not be read"
+}
+func (e *validationMetadataError) Unwrap() error { return e.cause }
+
 // ExtractValidationRules parses :validate attributes from page HTML for a given table.
 func ExtractValidationRules(app *App, table string) map[string]string {
-	rules := make(map[string]string)
+	rules, _ := ExtractValidationRulesWith(app, table, app.DB)
+	return rules
+}
 
-	for _, page := range app.Pages {
-		// Check for auto-generated forms: <crud :model="table" /> or <form :create="table" auto />
-		if strings.Contains(page.RawHTML, fmt.Sprintf(`:model="%s"`, table)) && strings.Contains(page.RawHTML, "<crud") ||
-			strings.Contains(page.RawHTML, fmt.Sprintf(`:create="%s"`, table)) && strings.Contains(page.RawHTML, "auto") {
-			// Generate rules from schema
-			cols, _ := GetTableColumns(app.DB, table)
-			for _, col := range cols {
-				if col.PK || col.Name == "user_id" || col.Name == "created_at" || col.Name == "updated_at" {
-					continue
-				}
-				v := inferColumnValidation(col)
-				if v != "" {
-					// Extract just the rules from :validate="rules"
-					v = strings.TrimPrefix(v, ` :validate="`)
-					v = strings.TrimSuffix(v, `"`)
-					rules[col.Name] = v
-				}
+// ExtractValidationRulesWith uses the caller's query connection so a mutation
+// transaction never borrows the application pool while holding its only slot.
+//
+// Scanning every page's HTML used to run on every create/batch/ingest; the
+// page-derived part is now computed once per table per loaded page set
+// (pageValidationRulesFor). Schema-inferred rules for auto forms still read
+// the columns through q on every call.
+func ExtractValidationRulesWith(app *App, table string, q mutationQuerier) (map[string]string, error) {
+	pr := pageValidationRulesFor(app, table)
+	rules := make(map[string]string, len(pr.attrs))
+	if pr.auto {
+		// Generate rules from schema
+		cols, err := mainTableColumnsWith(q, table)
+		if err != nil {
+			return nil, &validationMetadataError{cause: err}
+		}
+		for _, col := range cols {
+			if col.PK || col.Name == "user_id" || col.Name == "created_at" || col.Name == "updated_at" {
+				continue
 			}
+			v := inferColumnValidation(col)
+			if v != "" {
+				// Extract just the rules from :validate="rules"
+				v = strings.TrimPrefix(v, ` :validate="`)
+				v = strings.TrimSuffix(v, `"`)
+				rules[col.Name] = v
+			}
+		}
+	}
+	// Explicit :validate attributes win over schema-inferred rules.
+	for field, r := range pr.attrs {
+		rules[field] = r
+	}
+	return rules, nil
+}
+
+// pageValidationRules is what the app's pages say about one table's
+// validation: whether some page renders an auto form for it (schema rules
+// apply), and the :validate rules declared on fields of its :create forms.
+// Read-only once built.
+type pageValidationRules struct {
+	auto  bool
+	attrs map[string]string
+}
+
+// validationRulesCacheEntry holds pageValidationRules for one app, built
+// from one generation of app.Pages (a load or reload assigns a new map).
+// The entry keeps that map itself, not just its address: once a collected
+// generation's address is reused by a later map, an address-only key would
+// match it and serve the old generation's rules.
+type validationRulesCacheEntry struct {
+	mu     sync.Mutex
+	pages  map[string]*Page
+	tables map[string]*pageValidationRules
+}
+
+// validationRulesMaxTables bounds the per-app cache: table names come from
+// request paths, and a miss past the bound is computed without caching.
+const validationRulesMaxTables = 1024
+
+// validationRulesCache maps a weak *App to its entry; the entry is dropped
+// when the App is collected.
+var validationRulesCache sync.Map // weak.Pointer[App] -> *validationRulesCacheEntry
+
+func pageValidationRulesFor(app *App, table string) *pageValidationRules {
+	if app.DevMode {
+		// Dev mode re-reads a page's source in place on each request
+		// (server.go), which the map identity below can't see.
+		return scanPageValidationRules(app.Pages, table)
+	}
+	// Read app.Pages once: a concurrent reload must not pair one
+	// generation's identity with another's scan.
+	pages := app.Pages
+	key := weak.Make(app)
+	v, loaded := validationRulesCache.Load(key)
+	if !loaded {
+		v, loaded = validationRulesCache.LoadOrStore(key, &validationRulesCacheEntry{})
+		if !loaded {
+			runtime.AddCleanup(app, func(k weak.Pointer[App]) { validationRulesCache.Delete(k) }, key)
+		}
+	}
+	entry := v.(*validationRulesCacheEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.tables == nil || reflect.ValueOf(entry.pages).Pointer() != reflect.ValueOf(pages).Pointer() {
+		entry.pages, entry.tables = pages, map[string]*pageValidationRules{}
+	}
+	if pr, ok := entry.tables[table]; ok {
+		return pr
+	}
+	pr := scanPageValidationRules(pages, table)
+	if len(entry.tables) < validationRulesMaxTables {
+		entry.tables[table] = pr
+	}
+	return pr
+}
+
+func scanPageValidationRules(pages map[string]*Page, table string) *pageValidationRules {
+	pr := &pageValidationRules{attrs: map[string]string{}}
+	modelAttr, createAttr := fmt.Sprintf(`:model="%s"`, table), fmt.Sprintf(`:create="%s"`, table)
+	for _, page := range pages {
+		// Check for auto-generated forms: <crud :model="table" /> or <form :create="table" auto />
+		if strings.Contains(page.RawHTML, modelAttr) && strings.Contains(page.RawHTML, "<crud") ||
+			strings.Contains(page.RawHTML, createAttr) && strings.Contains(page.RawHTML, "auto") {
+			pr.auto = true
 			continue
 		}
 
 		// Find all inputs with :validate that are inside a :create="table" form
-		if !strings.Contains(page.RawHTML, fmt.Sprintf(`:create="%s"`, table)) {
+		if !strings.Contains(page.RawHTML, createAttr) {
 			continue
 		}
 
 		// Extract all :validate attributes with their field names
-		nameRe := regexp.MustCompile(`name="([^"]+)"[^>]*:validate="([^"]+)"`)
-		for _, m := range nameRe.FindAllStringSubmatch(page.RawHTML, -1) {
-			rules[m[1]] = m[2]
+		for _, m := range validateNameFirstRe.FindAllStringSubmatch(page.RawHTML, -1) {
+			pr.attrs[m[1]] = m[2]
 		}
-		nameRe2 := regexp.MustCompile(`:validate="([^"]+)"[^>]*name="([^"]+)"`)
-		for _, m := range nameRe2.FindAllStringSubmatch(page.RawHTML, -1) {
-			rules[m[2]] = m[1]
+		for _, m := range validateNameLastRe.FindAllStringSubmatch(page.RawHTML, -1) {
+			pr.attrs[m[2]] = m[1]
 		}
 	}
+	return pr
+}
 
-	return rules
+// validateRegexCache holds compiled `regex:` rule patterns (nil for an
+// invalid pattern). Patterns come from page HTML, so the set is small; the
+// bound only stops an unexpected stream of distinct patterns from growing
+// it, and patterns past it are compiled per use.
+var (
+	validateRegexMu    sync.Mutex
+	validateRegexCache = map[string]*regexp.Regexp{}
+)
+
+const validateRegexCacheMax = 512
+
+func validateRuleRegex(pattern string) *regexp.Regexp {
+	validateRegexMu.Lock()
+	re, ok := validateRegexCache[pattern]
+	validateRegexMu.Unlock()
+	if ok {
+		return re
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		re = nil
+	}
+	validateRegexMu.Lock()
+	if len(validateRegexCache) < validateRegexCacheMax {
+		validateRegexCache[pattern] = re
+	}
+	validateRegexMu.Unlock()
+	return re
 }
 
 // ValidateFields checks form values against validation rules.
@@ -208,8 +339,7 @@ func validateRule(field, value, rule string) *ValidationError {
 
 	case "regex":
 		if value != "" && ruleParam != "" {
-			re, err := regexp.Compile(ruleParam)
-			if err == nil && !re.MatchString(value) {
+			if re := validateRuleRegex(ruleParam); re != nil && !re.MatchString(value) {
 				return &ValidationError{Field: field, Message: fmt.Sprintf("%s format is invalid", label)}
 			}
 		}

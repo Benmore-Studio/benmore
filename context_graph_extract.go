@@ -76,7 +76,7 @@ func RebuildContextGraph(app *App) {
 	// Collect every relevant table - user-defined tables plus user-facing
 	// system tables like _benmore_users, _benmore_notifications, etc.
 	// Internal plumbing tables (sessions, locks, jobs, etc.) are excluded.
-	allTables, _ := GetAllTableNames(app.DB)
+	allTables, _ := allTableNamesWith(tx)
 	var userTables []string
 	for _, t := range allTables {
 		if strings.HasPrefix(t, "sqlite_") {
@@ -112,7 +112,7 @@ func RebuildContextGraph(app *App) {
 
 func extractTables(tx *sql.Tx, app *App, userTables []string) {
 	for _, t := range userTables {
-		cols, _ := GetTableColumns(app.DB, t)
+		cols, _ := mainTableColumnsWith(tx, t)
 		var colNames, pks []string
 		for _, c := range cols {
 			colNames = append(colNames, c.Name)
@@ -121,7 +121,7 @@ func extractTables(tx *sql.Tx, app *App, userTables []string) {
 			}
 		}
 		var rowCount int64
-		app.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %q", t)).Scan(&rowCount)
+		_ = tx.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM main.%s", quoteIdent(t))).Scan(&rowCount)
 		meta := map[string]any{
 			"columns":         colNames,
 			"primary_key":     pks,
@@ -369,7 +369,7 @@ func extractWorkflows(tx *sql.Tx, app *App) {
 func extractAggregates(tx *sql.Tx, app *App, userTables []string) {
 	// Aggregates live in app.yaml, loaded on demand here (not cached on
 	// the App struct). Cheap to re-parse for a graph rebuild.
-	configs := LoadAggregateConfig(app.Dir)
+	configs := app.aggregateConfig()
 	for _, agg := range configs {
 		ref := "aggregate:" + agg.Name
 		meta := map[string]any{
@@ -392,10 +392,11 @@ func extractAggregates(tx *sql.Tx, app *App, userTables []string) {
 // --- Computed fields ---
 
 func extractComputedFields(tx *sql.Tx, app *App) {
-	if app.Computed == nil || app.Computed.Fields == nil {
+	computed := app.computedConfig()
+	if computed == nil || computed.Fields == nil {
 		return
 	}
-	for table, cols := range app.Computed.Fields {
+	for table, cols := range computed.Fields {
 		for col, def := range cols {
 			ref := "computed_field:" + table + "." + col
 			meta := map[string]any{
@@ -437,7 +438,7 @@ func extractEncryptedFields(tx *sql.Tx, app *App) {
 // --- Retention policies ---
 
 func extractRetention(tx *sql.Tx, app *App) {
-	policies := LoadRetentionConfig(app.Dir)
+	policies := app.retentionConfig()
 	for _, p := range policies {
 		ref := "retention:" + p.Table
 		insertNode(tx, "retention", ref, p.Table, map[string]any{
@@ -479,7 +480,7 @@ func extractGroup(tx *sql.Tx, app *App, userTables []string) {
 		"user_field": app.Group.UserField,
 	})
 	for _, t := range userTables {
-		cols, _ := GetTableColumns(app.DB, t)
+		cols, _ := mainTableColumnsWith(tx, t)
 		if hasColumnInList(cols, app.Group.Key) {
 			insertEdge(tx, "table:"+t, ref, "scoped_by", nil)
 		}
@@ -489,10 +490,11 @@ func extractGroup(tx *sql.Tx, app *App, userTables []string) {
 // --- Validators ---
 
 func extractValidators(tx *sql.Tx, app *App) {
-	if app.Validators == nil || app.Validators.Rules == nil {
+	validators := app.validatorConfig()
+	if validators == nil || validators.Rules == nil {
 		return
 	}
-	for table, rules := range app.Validators.Rules {
+	for table, rules := range validators.Rules {
 		for i, r := range rules {
 			// ValidatorRule is a cross-field expression on the table
 			// (e.g. "end_date >= start_date"). One node per rule,

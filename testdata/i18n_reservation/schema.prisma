@@ -1,0 +1,24 @@
+model Booking {
+ id Int @id @default(autoincrement())
+ userId Int @map("user_id")
+ requestKey String @map("request_key")
+ title String
+ seats Int
+ status String @default("pending")
+ createdAt DateTime @default(now()) @map("created_at")
+ @@unique([userId, requestKey])
+ @@map("bookings")
+}
+model Slot {
+ id Int @id @default(autoincrement())
+ label String
+ remaining Int
+ @@map("slots")
+}
+model ApprovalJournal {
+ id Int @id @default(autoincrement())
+ bookingId Int @map("booking_id")
+ userId Int @map("user_id")
+ phase String
+ @@map("approval_journals")
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
+	"path"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,13 +29,15 @@ import (
 //
 // The broker keeps the ONE durable, least-privilege media key in the router
 // process only (the router runs no tenant code) and hands each per-app
-// process a short-lived, prefix-scoped presigned PUT URL or executes a scoped
-// delete over a unix socket.
+// process a short-lived, prefix-scoped presigned PUT URL, executes a scoped
+// delete, or signs a CloudFront URL for a private object over a unix socket.
 // The router authenticates the caller by the socket's peer-uid (SO_PEERCRED),
-// derives the app from that uid, and refuses to presign outside that app's
-// own <visibility>/<app>/ key prefix - so a fully-compromised per-app process
-// can only mutate its own namespace. No root process, no IMDS exposure, no
-// durable credential in any tenant-executing process.
+// derives the app from that uid, and refuses to presign, delete or sign
+// outside that app's own <visibility>/<app>/ key prefix - so a
+// fully-compromised per-app process can only mutate, or mint read access to,
+// its own namespace. No root process, no IMDS exposure, no durable
+// credential (storage key or CloudFront signing key) in any tenant-executing
+// process.
 
 // presignBrokerSocketPath returns the unix socket the router listens on and
 // per-app processes dial. Overridable for tests / alternate layouts.
@@ -44,16 +48,29 @@ func presignBrokerSocketPath() string {
 	return "/run/benmore/presign.sock"
 }
 
-// presignReq is the per-app → router request. The client sends only its own
-// prefix + the logical upload path; the broker derives visibility from the
-// path and validates the prefix against the connection's peer-uid.
+// presignReq is the per-app → router request. For put/delete the client
+// sends its own prefix + the logical upload path; the broker derives
+// visibility from the path and validates the prefix against the connection's
+// peer-uid. For sign, Path is the full bucket key (private/<prefix>/...) and
+// ExpiresIn the requested lifetime in seconds.
 type presignReq struct {
-	Operation   string `json:"operation,omitempty"` // empty/put (back-compat) or delete
+	Operation   string `json:"operation,omitempty"` // empty/put (back-compat), delete or sign
 	Prefix      string `json:"prefix"`
 	Path        string `json:"path"`
 	ContentType string `json:"content_type"`
 	Disposition string `json:"disposition"`
+	ExpiresIn   int64  `json:"expires_in,omitempty"`
 }
+
+// mediaSignMaxTTL caps the lifetime of a broker-signed CloudFront URL: the
+// same ceiling bm.signedUrl applies (a signed URL is a replayable bearer
+// credential; see signCloudFrontURL).
+const mediaSignMaxTTL = oauthMaxSignedURLTTL
+
+// mediaSignSlots bounds concurrent RSA signatures in the router, so a tenant
+// flooding the broker with sign requests cannot take every core from the
+// proxy path.
+var mediaSignSlots = make(chan struct{}, max(1, runtime.NumCPU()/2))
 
 // presignResp is the router → per-app reply.
 type presignResp struct {
@@ -64,13 +81,18 @@ type presignResp struct {
 }
 
 // StartPresignBroker starts the router-side presign listener. No-op (returns
-// nil) when the platform media config or the scoped key is absent - i.e. off
-// the platform host, where CDNStorage falls back to direct signing. Called
-// once from router boot; the listener runs for the process lifetime.
+// nil) when the platform media config is absent or this process holds
+// neither the scoped storage key nor the CloudFront signing key - i.e. off
+// the platform host, where CDNStorage and signPrivateMediaURL work
+// directly. Called once from router boot; the listener runs for the process
+// lifetime.
 func StartPresignBroker(sockPath string) error {
 	cfg := getPlatformMedia()
-	if cfg == nil || cfg.S3Key == "" {
-		return nil // broker disabled: no media CDN, or no scoped key in this process
+	if cfg == nil || (cfg.S3Key == "" && !cfg.canSign()) {
+		return nil // broker disabled: no media CDN, or no media credential in this process
+	}
+	if !cfg.canSign() {
+		log.Printf("  WARN: presign broker: no CloudFront signing key (BENMORE_PLATFORM_MEDIA_KEYPAIR_ID + PRIVATE_KEY*); hosted apps cannot sign private media URLs")
 	}
 	if err := os.MkdirAll(sockPathDir(sockPath), 0o750); err != nil {
 		return fmt.Errorf("presign broker: mkdir socket dir: %w", err)
@@ -95,7 +117,7 @@ func StartPresignBroker(sockPath string) error {
 				conn.Close()
 				continue
 			}
-			go handlePresignConn(uconn, cfg)
+			presignBrokerGate.serve("presign broker", uconn, func() { handlePresignConn(uconn, cfg) })
 		}
 	}()
 	return nil
@@ -103,6 +125,13 @@ func StartPresignBroker(sockPath string) error {
 
 // brokerSocketReachable reports whether the presign broker socket exists. The
 // per-app upload path uses this to decide between broker and direct signing.
+// Presign requests are tiny (16 KiB cap); the gate bounds fan-out per tenant
+// uid and keeps 32 slots for the router's own uid (_platform uploads).
+var presignBrokerGate = &brokerConnGate{perUID: map[int]int{}, maxTotal: 288, maxPerUID: 32, reserved: 32, ownUID: os.Getuid()}
+
+// presignRequestReadTimeout bounds delivery of the (16 KiB) request.
+const presignRequestReadTimeout = 2 * time.Second
+
 func brokerSocketReachable(sock string) bool {
 	fi, err := os.Stat(sock)
 	return err == nil && fi.Mode()&os.ModeSocket != 0
@@ -120,6 +149,8 @@ func sockPathDir(p string) string {
 func handlePresignConn(conn *net.UnixConn, cfg *PlatformMediaConfig) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// The request is 16 KiB at most: anything slower is holding a slot.
+	beginBrokerRead(conn, presignRequestReadTimeout)
 
 	uid, err := peerUID(conn)
 	if err != nil {
@@ -133,14 +164,14 @@ func handlePresignConn(conn *net.UnixConn, cfg *PlatformMediaConfig) {
 		writePresignErr(conn, "bad request")
 		return
 	}
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// Derive the caller's allowed prefix from its uid. A per-tenant uid is
 	// named benmore-app-<sub>; its key namespace is exactly <sub>. The shared
 	// first-party user (router / _platform, "benmore") is trusted to name its
 	// own prefix. Anything else is rejected.
 	allowedPrefix, firstParty := prefixForUID(uid)
-	s3 := &S3Storage{Bucket: cfg.Bucket, Region: cfg.Region, Key: cfg.S3Key, Secret: cfg.S3Secret}
-	resp, err := executePresignBrokerRequest(req, allowedPrefix, firstParty, s3)
+	resp, err := dispatchPresignBrokerRequest(req, allowedPrefix, firstParty, cfg, time.Now())
 	if err != nil {
 		writePresignErr(conn, err.Error())
 		return
@@ -149,38 +180,80 @@ func handlePresignConn(conn *net.UnixConn, cfg *PlatformMediaConfig) {
 	conn.Write(b)
 }
 
+// dispatchPresignBrokerRequest routes one authenticated request: sign goes
+// to the CloudFront signer, everything else to the storage presigner.
+func dispatchPresignBrokerRequest(req presignReq, allowedPrefix string, firstParty bool, cfg *PlatformMediaConfig, now time.Time) (*presignResp, error) {
+	if strings.EqualFold(strings.TrimSpace(req.Operation), "sign") {
+		return executeMediaSignRequest(req, allowedPrefix, firstParty, cfg, now)
+	}
+	s3 := &S3Storage{Bucket: cfg.Bucket, Region: cfg.Region, Key: cfg.S3Key, Secret: cfg.S3Secret}
+	return executePresignBrokerRequest(req, allowedPrefix, firstParty, s3)
+}
+
+// brokerCallerPrefix is the key prefix a request may act on: the peer uid's
+// own app for a tenant (whatever prefix the tenant claims), or the prefix
+// the trusted first-party user names.
+func brokerCallerPrefix(req presignReq, allowedPrefix string, firstParty bool) (string, error) {
+	prefix := req.Prefix
+	if !firstParty {
+		if allowedPrefix == "" {
+			return "", fmt.Errorf("unmapped caller")
+		}
+		prefix = allowedPrefix
+	}
+	if prefix == "" {
+		return "", fmt.Errorf("no prefix")
+	}
+	return prefix, nil
+}
+
+// executeMediaSignRequest signs a CloudFront URL for one private object under
+// the caller's own prefix, for at most mediaSignMaxTTL. The key must pass the
+// same containment rule the app process applies (mediaKeyVisibility), and
+// the resource is checked again by signCloudFrontURL before it enters the
+// policy.
+func executeMediaSignRequest(req presignReq, allowedPrefix string, firstParty bool, cfg *PlatformMediaConfig, now time.Time) (*presignResp, error) {
+	prefix, err := brokerCallerPrefix(req, allowedPrefix, firstParty)
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.canSign() {
+		return nil, fmt.Errorf("media signing not configured")
+	}
+	if vis, ok := mediaKeyVisibility(req.Path, prefix); !ok || vis != "private" {
+		return nil, fmt.Errorf("path outside caller's private media")
+	}
+	if req.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("bad expiry")
+	}
+	ttl := mediaSignMaxTTL
+	if req.ExpiresIn < int64(mediaSignMaxTTL/time.Second) {
+		ttl = time.Duration(req.ExpiresIn) * time.Second
+	}
+	select {
+	case mediaSignSlots <- struct{}{}:
+		defer func() { <-mediaSignSlots }()
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("signer busy")
+	}
+	signed, err := signCloudFrontURL("https://"+cfg.CDNDomain+"/"+req.Path, now.Add(ttl).Unix(), cfg.KeyPairID, cfg.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign failed")
+	}
+	return &presignResp{URL: signed, Key: req.Path}, nil
+}
+
 func writePresignErr(conn *net.UnixConn, msg string) {
 	b, _ := json.Marshal(presignResp{Error: msg})
 	conn.Write(b)
 }
 
-// prefixForUID maps a connecting uid to its app key prefix. Returns
-// (prefix, firstParty). firstParty=true for the shared "benmore" user (the
-// router and the _platform app), which is trusted to supply its own prefix.
-func prefixForUID(uid int) (prefix string, firstParty bool) {
-	u, err := user.LookupId(strconv.Itoa(uid))
-	if err != nil {
-		return "", false
-	}
-	if u.Username == "benmore" {
-		return "", true
-	}
-	if sub := strings.TrimPrefix(u.Username, "benmore-app-"); sub != u.Username && sub != "" {
-		return sub, false
-	}
-	return "", false
-}
+// prefixForUID (uid → app prefix, cached) lives in broker_limits.go.
 
 func executePresignBrokerRequest(req presignReq, allowedPrefix string, firstParty bool, s3 *S3Storage) (*presignResp, error) {
-	prefix := req.Prefix
-	if !firstParty {
-		if allowedPrefix == "" {
-			return nil, fmt.Errorf("unmapped caller")
-		}
-		prefix = allowedPrefix
-	}
-	if prefix == "" {
-		return nil, fmt.Errorf("no prefix")
+	prefix, err := brokerCallerPrefix(req, allowedPrefix, firstParty)
+	if err != nil {
+		return nil, err
 	}
 
 	operation := strings.ToLower(strings.TrimSpace(req.Operation))
@@ -212,16 +285,42 @@ func executePresignBrokerRequest(req presignReq, allowedPrefix string, firstPart
 	if vis == "private" {
 		cacheControl = "no-store"
 	}
-	url, headers, err := presignS3PutURL(s3, key, req.ContentType, req.Disposition, cacheControl, 90*time.Second)
+	contentType, disposition, err := brokerObjectMeta(logical)
+	if err != nil {
+		return nil, err
+	}
+	url, headers, err := presignS3PutURL(s3, key, contentType, disposition, cacheControl, 90*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("presign failed")
 	}
 	return &presignResp{URL: url, Headers: headers, Key: key}, nil
 }
 
+// brokerObjectMeta decides an object's Content-Type and Content-Disposition
+// from its path alone. The broker is the trust boundary for tenant writes to
+// the shared media origin, so a tenant-supplied type (text/html, say, with
+// an inline disposition) is never used: the same extension policy as the
+// upload path applies, and the active types that path refuses are refused
+// here too.
+func brokerObjectMeta(logical string) (contentType, disposition string, err error) {
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(logical), "."))
+	switch ext {
+	case "svg", "svgz", "xml", "xhtml", "html", "htm", "shtml", "js", "mjs", "":
+		return "", "", fmt.Errorf("file type not allowed")
+	}
+	contentType, disposition = uploadContentMeta(ext, "", path.Base(logical))
+	switch strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0])) {
+	case "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+		"application/javascript", "text/javascript", "application/ecmascript", "text/ecmascript":
+		contentType = "application/octet-stream"
+	}
+	return contentType, disposition, nil
+}
+
 // ─── Per-app client ─────────────────────────────────────────────────────────
 
-// requestPresignBroker dials the broker for a presigned PUT or scoped delete.
+// requestPresignBroker dials the broker for a presigned PUT, scoped delete or
+// signed CloudFront URL.
 func requestPresignBroker(sockPath string, req presignReq) (*presignResp, error) {
 	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
 	if err != nil {
@@ -385,7 +484,11 @@ func awsURIEncode(s string, encodeSlash bool) string {
 // PUT the bytes straight to S3. Used by the per-app process, which holds no
 // durable AWS credential and cannot reach IMDS.
 func (c *CDNStorage) saveViaBroker(sockPath, path string, data io.Reader, contentType, disposition string) (string, error) {
-	body, err := io.ReadAll(data)
+	// Stream a seekable body (the spooled multipart file, a bytes.Reader)
+	// with its exact length: reading a 50 MB upload whole and copying it
+	// into a string held over 100 MB per upload, enough for the process's
+	// eight upload slots to exceed a hosted app's memory limit.
+	size, openBody, err := uploadBodyWithSize(data)
 	if err != nil {
 		return "", err
 	}
@@ -398,9 +501,20 @@ func (c *CDNStorage) saveViaBroker(sockPath, path string, data io.Reader, conten
 	if err != nil {
 		return "", fmt.Errorf("save upload: %w", err)
 	}
-	req, err := http.NewRequest("PUT", resp.URL, strings.NewReader(string(body)))
+	req, err := http.NewRequest("PUT", resp.URL, http.NoBody)
 	if err != nil {
 		return "", err
+	}
+	if size > 0 {
+		// GetBody lets a 307/308 replay the body, as the in-memory reader did.
+		req.GetBody = func() (io.ReadCloser, error) {
+			b, err := openBody()
+			return io.NopCloser(b), err
+		}
+		if req.Body, err = req.GetBody(); err != nil {
+			return "", err
+		}
+		req.ContentLength = size
 	}
 	for k, v := range resp.Headers {
 		req.Header.Set(k, v)
@@ -416,6 +530,36 @@ func (c *CDNStorage) saveViaBroker(sockPath, path string, data io.Reader, conten
 		return "", fmt.Errorf("save upload: S3 PUT via presign failed: %d: %s", r.StatusCode, string(rb))
 	}
 	return "https://" + c.CDNDomain + "/" + resp.Key, nil
+}
+
+// uploadBodyWithSize returns the length of the rest of data and a function
+// that opens an independent reader over exactly those bytes. A file or
+// bytes.Reader (io.ReaderAt + io.Seeker: the spooled multipart file is
+// either) is read in place, never buffered; anything else is read into
+// memory once.
+func uploadBodyWithSize(data io.Reader) (int64, func() (io.Reader, error), error) {
+	if ra, ok := data.(interface {
+		io.ReaderAt
+		io.Seeker
+	}); ok {
+		start, err := ra.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0, nil, err
+		}
+		end, err := ra.Seek(0, io.SeekEnd)
+		if err != nil {
+			return 0, nil, err
+		}
+		if _, err := ra.Seek(start, io.SeekStart); err != nil {
+			return 0, nil, err
+		}
+		return end - start, func() (io.Reader, error) { return io.NewSectionReader(ra, start, end-start), nil }, nil
+	}
+	b, err := io.ReadAll(data)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int64(len(b)), func() (io.Reader, error) { return bytes.NewReader(b), nil }, nil
 }
 
 func (c *CDNStorage) deleteViaBroker(sockPath, path string) error {

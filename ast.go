@@ -123,12 +123,10 @@ func BuildPageAST(page *Page) (*ASTPage, error) {
 // This preserves the page body for AST parsing while removing the query wrappers.
 func stripQueryTags(content string) string {
 	// Self-closing: <query ... /> - remove entirely (no inner content)
-	selfClose := regexp.MustCompile(`<query\s+[^>]*/>\s*`)
-	content = selfClose.ReplaceAllString(content, "")
+	content = astQuerySelfCloseRe.ReplaceAllString(content, "")
 
 	// Opening tags: <query ...> - remove the tag, keep what follows
-	openTag := regexp.MustCompile(`<query\s+[^>]*>\s*`)
-	content = openTag.ReplaceAllString(content, "")
+	content = astQueryOpenRe.ReplaceAllString(content, "")
 
 	// Closing tags: </query> - remove
 	content = strings.ReplaceAll(content, "</query>", "")
@@ -165,6 +163,20 @@ var (
 	mustacheSectionRe  = regexp.MustCompile(`\{\{#(\w[\w.]*)\}\}`)
 	mustacheInvertedRe = regexp.MustCompile(`\{\{\^(\w[\w.]*)\}\}`)
 	mustacheEndRe      = regexp.MustCompile(`\{\{/(\w[\w.]*)\}\}`)
+
+	// <query> wrappers stripped before AST parsing (stripQueryTags).
+	astQuerySelfCloseRe = regexp.MustCompile(`<query\s+[^>]*/>\s*`)
+	astQueryOpenRe      = regexp.MustCompile(`<query\s+[^>]*>\s*`)
+
+	// {{#if ...}}, {{else if ...}}, {{else}}, {{/if}} (stripIfBlocks).
+	astIfOpenRe  = regexp.MustCompile(`\{\{#if\s[^}]*\}\}`)
+	astElseIfRe  = regexp.MustCompile(`\{\{else\s+if\s[^}]*\}\}`)
+	astElseRe    = regexp.MustCompile(`\{\{else\}\}`)
+	astIfCloseRe = regexp.MustCompile(`\{\{/if\}\}`)
+
+	// Mustache sections inside attribute values (cleanMustacheInAttrs).
+	astSetToggleRe       = regexp.MustCompile(`:set="(\w+)=\{\{#\w+\}\}[^"]*\{\{/\w+\}\}"`)
+	astAttrWithSectionRe = regexp.MustCompile(`="([^"]*\{\{[#^/][^}]*\}\}[^"]*)"`)
 )
 
 // stripIfBlocks removes {{#if ...}}...{{else}}...{{/if}} blocks from body HTML.
@@ -172,15 +184,11 @@ var (
 // statically resolved for native compilation. If no else, keeps the first branch.
 func stripIfBlocks(content string) string {
 	// Match {{#if ...}}, {{else if ...}}, {{else}}, {{/if}}
-	ifOpenRe := regexp.MustCompile(`\{\{#if\s[^}]*\}\}`)
-	elseIfRe := regexp.MustCompile(`\{\{else\s+if\s[^}]*\}\}`)
-	elseRe := regexp.MustCompile(`\{\{else\}\}`)
-	ifCloseRe := regexp.MustCompile(`\{\{/if\}\}`)
 
 	// Process iteratively - handle innermost blocks first
 	for {
 		// Find the first {{#if that has a matching {{/if}} without nested {{#if}} between them
-		openLocs := ifOpenRe.FindAllStringIndex(content, -1)
+		openLocs := astIfOpenRe.FindAllStringIndex(content, -1)
 		if len(openLocs) == 0 {
 			break
 		}
@@ -195,8 +203,8 @@ func stripIfBlocks(content string) string {
 			pos := 0
 			closeEnd := -1
 			for pos < len(rest) {
-				nextOpen := ifOpenRe.FindStringIndex(rest[pos:])
-				nextClose := ifCloseRe.FindStringIndex(rest[pos:])
+				nextOpen := astIfOpenRe.FindStringIndex(rest[pos:])
+				nextClose := astIfCloseRe.FindStringIndex(rest[pos:])
 
 				if nextClose == nil {
 					break // unmatched - bail
@@ -227,9 +235,9 @@ func stripIfBlocks(content string) string {
 			}
 
 			block := content[openLoc[1]:closeEnd]
-			block = strings.TrimSuffix(block, ifCloseRe.FindString(block))
+			block = strings.TrimSuffix(block, astIfCloseRe.FindString(block))
 			// Remove the {{/if}} at the end
-			if loc := ifCloseRe.FindStringIndex(content[start:closeEnd]); loc != nil {
+			if loc := astIfCloseRe.FindStringIndex(content[start:closeEnd]); loc != nil {
 				block = content[openLoc[1] : start+loc[0]]
 			}
 
@@ -237,13 +245,13 @@ func stripIfBlocks(content string) string {
 			// Find the outermost {{else}} (not inside nested if blocks)
 			elseBranch := ""
 			firstBranch := block
-			if loc := findOuterElse(block, elseRe, elseIfRe, ifOpenRe, ifCloseRe); loc >= 0 {
+			if loc := findOuterElse(block, astElseRe, astElseIfRe, astIfOpenRe, astIfCloseRe); loc >= 0 {
 				firstBranch = block[:loc]
 				// Find where the else marker ends
 				remaining := block[loc:]
-				if m := elseRe.FindStringIndex(remaining); m != nil && m[0] == 0 {
+				if m := astElseRe.FindStringIndex(remaining); m != nil && m[0] == 0 {
 					elseBranch = remaining[m[1]:]
-				} else if m := elseIfRe.FindStringIndex(remaining); m != nil && m[0] == 0 {
+				} else if m := astElseIfRe.FindStringIndex(remaining); m != nil && m[0] == 0 {
 					// else if - treat remaining as another conditional, just take it as-is
 					elseBranch = remaining[m[1]:]
 				}
@@ -335,15 +343,13 @@ func findOuterElse(block string, elseRe, elseIfRe, ifOpenRe, ifCloseRe *regexp.R
 // For class attrs, keeps the conditional classes as static (can't be dynamic in RN anyway).
 func cleanMustacheInAttrs(content string) string {
 	// Handle :set toggle pattern first: :set="done={{#done}}0{{/done}}{{^done}}1{{/done}}"
-	setToggleRe := regexp.MustCompile(`:set="(\w+)=\{\{#\w+\}\}[^"]*\{\{/\w+\}\}"`)
-	content = setToggleRe.ReplaceAllStringFunc(content, func(m string) string {
-		parts := setToggleRe.FindStringSubmatch(m)
+	content = astSetToggleRe.ReplaceAllStringFunc(content, func(m string) string {
+		parts := astSetToggleRe.FindStringSubmatch(m)
 		return fmt.Sprintf(`:set="%s=__toggle__"`, parts[1])
 	})
 
 	// Strip remaining mustache sections from all attribute values
-	attrWithSectionRe := regexp.MustCompile(`="([^"]*\{\{[#^/][^}]*\}\}[^"]*)"`)
-	content = attrWithSectionRe.ReplaceAllStringFunc(content, func(m string) string {
+	content = astAttrWithSectionRe.ReplaceAllStringFunc(content, func(m string) string {
 		val := m[2 : len(m)-1] // strip =" and trailing "
 		val = mustacheSectionRe.ReplaceAllString(val, "")
 		val = mustacheInvertedRe.ReplaceAllString(val, "")

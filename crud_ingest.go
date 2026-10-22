@@ -6,8 +6,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -15,7 +18,12 @@ import (
 )
 
 // handleStreamingIngest accepts NDJSON (newline-delimited JSON) for bulk data ingestion.
-// Single transaction, no after-hooks (performance), before-hooks fire per row.
+// Single transaction, no after-hooks (performance). Each row goes through the
+// shared create pipeline (txInsertWithPlan): validators, before-hooks on the
+// transaction, protected/computed columns and foreign-key visibility. A
+// refused row is skipped and counted; the rest of the stream continues.
+// A read failure commits the valid prefix but returns a non-2xx partial result.
+// Ingested always counts committed rows; errors includes a terminal read error.
 // Returns: {"ingested": N, "errors": N, "duration_ms": N, "status": "completed"}
 func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, table string) {
 	start := time.Now()
@@ -43,7 +51,7 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	}
 
 	// Rate limit: 5 ingestions per minute per user
-	rateLimitKey := fmt.Sprintf("ingest:user:%d", session.UserID)
+	rateLimitKey := appLimiterKey(app, "ingest", fmt.Sprintf("user:%d", session.UserID))
 	if !ingestLimiter.Allow(rateLimitKey) {
 		http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
 		return
@@ -53,43 +61,20 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	const maxBodySize = 100 * 1024 * 1024
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
-	// Get table columns once for validation
-	cols, err := GetTableColumns(app.DB, table)
-	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Build column allowlist and detect which columns exist
-	validCols := make(map[string]bool)
-	colMap := make(map[string]Column)
-	for _, col := range cols {
-		validCols[col.Name] = true
-		colMap[col.Name] = col
-	}
-
-	// Protected fields
-	protected := map[string]bool{
-		"user_id": true, "created_at": true, "updated_at": true,
-		"password_hash": true, "role": true,
-		"password_change_required": true,
-	}
-	if app.Group != nil && app.Group.Key != "" {
-		protected[app.Group.Key] = true
-	}
-	// H-10: protect the configurable in-tenant RoleField (e.g. member_role)
-	// on the membership table so a member cannot self-elevate via CRUD.
-	if app.Group != nil && app.Group.RoleField != "" && app.Group.Table != "" && table == app.Group.Table {
-		protected[app.Group.RoleField] = true
-	}
-
-	// Extract validation rules once
-	validationRules := ExtractValidationRules(app, table)
+	ownedCheck := ownedFieldChecker(app, table)
 
 	// Begin transaction
 	tx, err := app.DB.Begin()
 	if err != nil {
-		httpError(w, "Server error", http.StatusInternalServerError)
+		serverError(w, r, app, table+" ingest", err, "Server error")
+		return
+	}
+	defer tx.Rollback()
+
+	// Columns, protected set and :validate rules are resolved once.
+	plan, err := newInsertPlan(tx, app, table)
+	if err != nil {
+		serverError(w, r, app, table+" ingest", err, "Server error")
 		return
 	}
 
@@ -113,19 +98,22 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 
 		// Enforce max row limit
 		if ingested+errCount >= maxRows {
-			tx.Rollback()
 			httpJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
-				"error":    fmt.Sprintf("exceeded maximum of %d rows per request", maxRows),
-				"ingested": ingested,
-				"errors":   errCount,
-				"line":     lineNum,
+				"error":       fmt.Sprintf("exceeded maximum of %d rows per request", maxRows),
+				"ingested":    0, // The deferred rollback discards every row.
+				"errors":      errCount + 1,
+				"line":        lineNum,
+				"duration_ms": time.Since(start).Milliseconds(),
+				"status":      "failed",
 			})
 			return
 		}
 
 		// Parse JSON line
 		var item map[string]any
-		if err := json.Unmarshal(line, &item); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.UseNumber()
+		if err := decoder.Decode(&item); err != nil || decoder.Decode(new(any)) != io.EOF {
 			errCount++
 			continue
 		}
@@ -134,7 +122,7 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 		// member of - same gate as single-row create (M5). Ingest's
 		// per-row error semantics apply: the row is skipped and counted,
 		// the rest of the stream continues.
-		if d := memberOfCreateDenial(app, table, session, func(col string) string {
+		if d := memberOfCreateDenialWith(tx, app, table, session, func(col string) string {
 			if v, ok := item[col]; ok && v != nil {
 				return fmt.Sprintf("%v", v)
 			}
@@ -144,125 +132,96 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 			continue
 		}
 
-		// Strip protected fields silently (same as handleCreate) and reject truly unknown columns
-		for key := range item {
-			if protected[key] {
-				delete(item, key) // strip, don't reject
+		// Command-owned columns refuse the whole stream (nothing commits).
+		if v := ownedCheck(mapKeys(item)...); v != nil {
+			writeOwnedFieldRefusal(w, v)
+			return
+		}
+
+		// Protected fields are stripped silently (same as handleCreate);
+		// a truly unknown column rejects the row.
+		data := make(map[string]any, len(item))
+		unknown := false
+		for key, val := range item {
+			if plan.protected.has(key) {
 				continue
 			}
-			if !validCols[key] {
-				errCount++
-				item = nil
+			if !plan.validCols[key] {
+				unknown = true
 				break
 			}
-		}
-		if item == nil {
-			continue
-		}
-
-		// Build INSERT fields
-		var fields []string
-		var placeholders []string
-		var values []any
-
-		for _, col := range cols {
-			if col.PK {
-				continue
-			}
-			if col.Name == "user_id" {
-				fields = append(fields, col.Name)
-				placeholders = append(placeholders, "?")
-				values = append(values, session.UserID)
-				continue
-			}
-			if app.Group != nil && col.Name == app.Group.Key && session.EffectiveHasGroup() {
-				fields = append(fields, col.Name)
-				placeholders = append(placeholders, "?")
-				values = append(values, session.EffectiveGroupID())
-				continue
-			}
-			if protected[col.Name] {
-				continue
-			}
-
-			if val, ok := item[col.Name]; ok && val != nil {
-				fields = append(fields, col.Name)
-				placeholders = append(placeholders, "?")
-				values = append(values, fmt.Sprintf("%v", val))
+			if _, declared := plan.schemaCols[key]; declared {
+				data[key] = val
+			} else if val != nil {
+				data[key] = jsonToFormValue(val)
 			}
 		}
-
-		if len(fields) == 0 {
+		if unknown {
 			errCount++
 			continue
 		}
 
-		// Validate fields against rules
-		skipRow := false
-		if len(validationRules) > 0 {
-			for field, rule := range validationRules {
-				if val, ok := item[field]; ok {
-					valStr := fmt.Sprintf("%v", val)
-					for _, r := range strings.Split(rule, ",") {
-						r = strings.TrimSpace(r)
-						if r == "required" && valStr == "" {
-							skipRow = true
-							break
-						}
-					}
-				} else if strings.Contains(rule, "required") {
-					skipRow = true
-				}
-				if skipRow {
-					break
-				}
+		// A savepoint per row: a refusal after the INSERT (the founder
+		// membership auto-join) must not leave half a row behind while the
+		// stream carries on.
+		if _, err := tx.Exec("SAVEPOINT benmore_ingest_row"); err != nil {
+			serverError(w, r, app, table+" ingest", err, "Server error")
+			return
+		}
+		if _, err := txInsertWithPlan(tx, app, table, data, session, plan); err != nil {
+			// SQLite may end the whole transaction on SQLITE_FULL; any later
+			// statement would then commit on its own. Stop and roll back.
+			if isStorageFullError(err) {
+				respondStorageFull(w, app, err)
+				return
 			}
-		}
-		if skipRow {
+			var metadataErr *validationMetadataError
+			if errors.As(err, &metadataErr) {
+				serverError(w, r, app, table+" ingest", err, "Server error")
+				return
+			}
+			if _, rbErr := tx.Exec("ROLLBACK TO benmore_ingest_row"); rbErr != nil {
+				serverError(w, r, app, table+" ingest", rbErr, "Server error")
+				return
+			}
+			tx.Exec("RELEASE benmore_ingest_row")
 			errCount++
 			continue
 		}
-
-		// Fire before-hooks (can abort individual rows)
-		beforeRow := make(map[string]any)
-		for i, f := range fields {
-			beforeRow[f] = values[i]
-		}
-		injectSessionContext(beforeRow, session)
-		if err := FireBeforeHooks(app, "insert", table, beforeRow); err != nil {
-			errCount++
-			continue
-		}
-
-		// Execute parameterized INSERT
-		sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-			table, strings.Join(fields, ", "), strings.Join(placeholders, ", "))
-		_, err := tx.Exec(sqlStr, values...)
-		if err != nil {
-			errCount++
-			continue
+		if _, err := tx.Exec("RELEASE benmore_ingest_row"); err != nil {
+			serverError(w, r, app, table+" ingest", err, "Server error")
+			return
 		}
 
 		ingested++
 	}
 
-	// Check for scanner errors (including MaxBytesReader)
-	if err := scanner.Err(); err != nil {
+	// A truncated stream must not look complete, even when its valid prefix
+	// is committed. Count the terminal failure separately from rejected rows.
+	readErr := scanner.Err()
+	readStatus := http.StatusBadRequest
+	if readErr != nil {
+		errCount++
+		var sizeErr *http.MaxBytesError
+		if errors.Is(readErr, bufio.ErrTooLong) || errors.As(readErr, &sizeErr) {
+			readStatus = http.StatusRequestEntityTooLarge
+		}
 		if ingested == 0 {
-			tx.Rollback()
-			httpJSON(w, http.StatusBadRequest, map[string]any{
-				"error":    "read error: " + err.Error(),
-				"ingested": 0,
-				"errors":   errCount,
+			httpJSON(w, readStatus, map[string]any{
+				"error":       "read error: " + readErr.Error(),
+				"ingested":    0,
+				"errors":      errCount,
+				"line":        lineNum + 1,
+				"duration_ms": time.Since(start).Milliseconds(),
+				"status":      "failed",
 			})
 			return
 		}
 		// Partial read - commit what we have
-		log.Printf("ingest: scanner error after %d rows: %v", ingested, err)
+		log.Printf("ingest: scanner error after %d rows: %v", ingested, readErr)
 	}
 
 	if ingested == 0 {
-		tx.Rollback()
 		httpJSON(w, http.StatusBadRequest, map[string]any{
 			"error":    "no rows ingested",
 			"ingested": 0,
@@ -271,21 +230,34 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 		return
 	}
 
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{
-			"error":    "commit failed",
+	// Single audit log entry for the batch, committed with the rows.
+	if err := LogAuditTx(tx, app, "ingest", table, fmt.Sprintf("batch:%d", ingested), session, nil, map[string]any{
+		"ingested": ingested,
+		"errors":   errCount,
+	}); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverErrorJSONBody(w, r, app, http.StatusInternalServerError, table+" ingest", err, map[string]any{
+			"error":    "audit write failed",
 			"ingested": 0,
 			"errors":   errCount,
 		})
 		return
 	}
 
-	// Single audit log entry for the batch
-	LogAudit(app, "ingest", table, fmt.Sprintf("batch:%d", ingested), session, nil, map[string]any{
-		"ingested": ingested,
-		"errors":   errCount,
-	})
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverErrorJSONBody(w, r, app, http.StatusInternalServerError, table+" ingest", err, map[string]any{
+			"error":    "commit failed",
+			"ingested": 0,
+			"errors":   errCount,
+		})
+		return
+	}
 
 	// SSE broadcast
 	Broadcast(app, table, "insert", session)
@@ -295,10 +267,18 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	Increment(app, meterScope(session), "ingest_rows")
 
 	durationMs := time.Since(start).Milliseconds()
-	httpJSON(w, http.StatusOK, map[string]any{
+	result := map[string]any{
 		"ingested":    ingested,
 		"errors":      errCount,
 		"duration_ms": durationMs,
 		"status":      "completed",
-	})
+	}
+	status := http.StatusOK
+	if readErr != nil {
+		status = readStatus
+		result["status"] = "partial"
+		result["error"] = "read error: " + readErr.Error()
+		result["line"] = lineNum + 1
+	}
+	httpJSON(w, status, result)
 }

@@ -69,6 +69,28 @@ jobs:
 	}
 }
 
+func TestDeleteUploadRefusesConnectorArtifactStorage(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	artifact := filepath.Join(app.Dir, "uploads", "private", "mcp-artifacts", "receipt.pdf")
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("%PDF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/uploads/private/mcp-artifacts/receipt.pdf", "uploads/private/MCP-Artifacts/receipt.pdf"} {
+		step := FlowStep{Type: "delete_upload", DeleteUpload: path}
+		ctx := &FlowContext{App: app, Data: map[string]any{}, Params: map[string]string{}}
+		if err := executeStep(ctx, &step); err == nil {
+			t.Fatalf("delete_upload %q removed connector artifact storage", path)
+		}
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("artifact bytes were deleted: %v", err)
+	}
+}
+
 func TestDeletePrivateUploadLocalIsStrictAndIdempotent(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()

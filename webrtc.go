@@ -33,7 +33,9 @@ package main
 // Credential resolution order (first match wins):
 //
 //   a. Per-app env (TURN_PROVIDER / TURN_* in the app's env). Use this
-//      when an app needs its own credential isolation.
+//      when an app needs its own credential isolation. The Cloudflare app
+//      id and token are taken as a pair from one scope
+//      (cloudflareCredentialPair): an app sets both or neither.
 //
 //   b. Host-wide env (BENMORE_PLATFORM_TURN_*), set once on the host (e.g.
 //      via a systemd EnvironmentFile or the process environment). Every app
@@ -71,8 +73,13 @@ type turnCacheEntry struct {
 
 var (
 	turnCacheMu sync.Mutex
-	turnCache   = map[string]*turnCacheEntry{} // key: app.Dir
+	turnCache   = map[string]*turnCacheEntry{} // key: scope|app.Dir|principal
+	// turnMintLimiter bounds provider mint calls per app; a caller past it
+	// gets STUN only rather than a shared credential.
+	turnMintLimiter = NewRateLimiter(120, time.Minute)
 )
+
+const turnCacheMaxEntries = 10000
 
 // iceServer mirrors the WebRTC RTCIceServer dictionary shape.
 type iceServer struct {
@@ -95,14 +102,18 @@ func defaultSTUN() iceServer {
 }
 
 // RegisterWebRTCRoute wires GET /api/_webrtc/ice into the app's mux.
-// Same-origin only; no auth required (the credentials returned are
-// already scoped and time-limited by the upstream provider). When no
-// TURN env vars are set, the response is just STUN - agents can still
-// rely on the endpoint existing and won't have to special-case the
-// "no TURN configured" path.
-func RegisterWebRTCRoute(mux *http.ServeMux, app *App) {
+// TURN credentials relay arbitrary traffic on the provider's (often the
+// platform's) account, so they go only to signed-in callers - or to anyone
+// when the app opts into anonymous realtime with features.ws_anonymous, the
+// same flag that admits anonymous room and broadcast viewers. Other callers
+// get the STUN-only list, so the endpoint always answers with a usable
+// shape. Credentials are minted per app and caller, never shared.
+func RegisterWebRTCRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_webrtc/ice", func(w http.ResponseWriter, r *http.Request) {
-		ice := buildICEServers(app)
+		ice := []iceServer{defaultSTUN()}
+		if principal := turnPrincipal(app, r); principal != "" {
+			ice = buildICEServers(app, principal)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		// Cache headers: a thin no-cache so browsers always check
 		// freshness (creds expire within an hour). The server-side
@@ -118,13 +129,13 @@ func RegisterWebRTCRoute(mux *http.ServeMux, app *App) {
 // STUN by default; layers TURN on top when env vars present (per-app
 // first, platform-wide fallback). Agents never need to know which
 // path supplied the credentials - the SDK surface is identical.
-func buildICEServers(app *App) []iceServer {
+func buildICEServers(app *App, principal string) []iceServer {
 	ice := []iceServer{defaultSTUN()}
 
 	provider, scope := resolveTURNProvider(app)
 	switch provider {
 	case "cloudflare", "cf", "cf_calls":
-		if servers := cloudflareTURNCreds(app, scope); len(servers) > 0 {
+		if servers := cloudflareTURNCreds(app, scope, principal); len(servers) > 0 {
 			ice = append(ice, servers...)
 		}
 	case "static":
@@ -177,6 +188,37 @@ func resolveTURNVar(app *App, key string) string {
 	return ""
 }
 
+// cloudflareCredentialPair returns a Cloudflare app id and token from ONE
+// scope: the app's own pair when it sets both, otherwise the platform's
+// BENMORE_PLATFORM_* pair. A tenant-set id never pairs with the platform
+// token, which would send the platform's credential to a Cloudflare path the
+// tenant chose. The id is placed in the request path, so it must be hex (as
+// Cloudflare's app and key ids are); a pair whose id isn't is unusable.
+func cloudflareCredentialPair(app *App, idKey, tokenKey string) (id, token string, ok bool) {
+	id, token = strings.TrimSpace(getAppEnv(app, idKey)), strings.TrimSpace(getAppEnv(app, tokenKey))
+	if id == "" || token == "" {
+		id = strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_" + idKey))
+		token = strings.TrimSpace(os.Getenv("BENMORE_PLATFORM_" + tokenKey))
+	}
+	if id == "" || token == "" || !cloudflareIDValid(id) {
+		return "", "", false
+	}
+	return id, token, true
+}
+
+func cloudflareIDValid(id string) bool {
+	if len(id) == 0 || len(id) > 128 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // cloudflareTURNCreds mints - or returns a cached - Cloudflare Calls
 // TURN credential bundle. CF's API:
 //
@@ -191,11 +233,10 @@ func resolveTURNVar(app *App, key string) string {
 // per-app overrides ("app:<dir>") from platform-shared creds
 // ("platform") - same APP_ID + APP_TOKEN can mint per-session creds
 // for every app in the deployment safely.
-func cloudflareTURNCreds(app *App, scope string) []iceServer {
-	cacheKey := scope
-	if cacheKey == "" {
-		cacheKey = app.Dir
-	}
+func cloudflareTURNCreds(app *App, scope, principal string) []iceServer {
+	// One credential per app and caller: a platform-scoped credential used
+	// to be shared by every app on the host and every caller of each.
+	cacheKey := scope + "|" + app.Dir + "|" + principal
 
 	turnCacheMu.Lock()
 	if entry, ok := turnCache[cacheKey]; ok && time.Now().Before(entry.expires) {
@@ -203,11 +244,14 @@ func cloudflareTURNCreds(app *App, scope string) []iceServer {
 		return entry.iceServers
 	}
 	turnCacheMu.Unlock()
+	if !turnMintLimiter.Allow(app.Dir) {
+		log.Printf("webrtc: TURN mint rate limit reached for %s - serving STUN only", app.Dir)
+		return nil
+	}
 
-	appID := resolveTURNVar(app, "TURN_CF_APP_ID")
-	token := resolveTURNVar(app, "TURN_CF_APP_TOKEN")
-	if appID == "" || token == "" {
-		log.Printf("webrtc: cloudflare TURN configured but TURN_CF_APP_ID / TURN_CF_APP_TOKEN missing (scope=%s) - falling back to STUN-only", scope)
+	appID, token, ok := cloudflareCredentialPair(app, "TURN_CF_APP_ID", "TURN_CF_APP_TOKEN")
+	if !ok {
+		log.Printf("webrtc: cloudflare TURN configured but no usable TURN_CF_APP_ID / TURN_CF_APP_TOKEN pair (scope=%s) - falling back to STUN-only", scope)
 		return nil
 	}
 
@@ -262,12 +306,37 @@ func cloudflareTURNCreds(app *App, scope string) []iceServer {
 	}}
 
 	turnCacheMu.Lock()
-	turnCache[cacheKey] = &turnCacheEntry{
-		iceServers: servers,
-		expires:    time.Now().Add(50 * time.Minute),
+	if len(turnCache) >= turnCacheMaxEntries {
+		now := time.Now()
+		for k, e := range turnCache {
+			if !now.Before(e.expires) {
+				delete(turnCache, k)
+			}
+		}
+	}
+	if len(turnCache) < turnCacheMaxEntries {
+		turnCache[cacheKey] = &turnCacheEntry{
+			iceServers: servers,
+			expires:    time.Now().Add(50 * time.Minute),
+		}
 	}
 	turnCacheMu.Unlock()
 	return servers
+}
+
+// turnPrincipal names who a TURN credential is for: the signed-in user, or
+// the client address when the app admits anonymous realtime (an IPv6 client
+// by its /64, so rotating through its addresses can't mint a credential per
+// address and spend the app's turnMintLimiter budget). "" means the caller
+// gets STUN only.
+func turnPrincipal(app *App, r *http.Request) string {
+	if sess := getSession(app, r); sess != nil && sess.UserID > 0 {
+		return fmt.Sprintf("user:%d", sess.UserID)
+	}
+	if broadcastAllowAnon(app) {
+		return "ip:" + clientRateBucket(clientIP(r))
+	}
+	return ""
 }
 
 // getAppEnv reads an env var via the per-app store (set via

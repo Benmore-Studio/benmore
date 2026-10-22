@@ -110,6 +110,22 @@ func LogicalSubdomain(instanceSub string) string {
 	return strings.TrimSuffix(instanceSub, devSubdomainSuffix)
 }
 
+// devSuffixedLogicalApps returns the logical (platform_apps) subdomains that
+// break the invariant above by ending in -dev. Today's creation paths cannot
+// produce one (the random suffix has no hyphen), but an app created before
+// that suffix existed could be named like this, and LogicalSubdomain would
+// then map it - its routing, ownership and per-app user - onto ANOTHER app
+// ("shop-dev" resolves to "shop"). The router reports these at startup.
+func devSuffixedLogicalApps(logicalSubs []string) []string {
+	var bad []string
+	for _, s := range logicalSubs {
+		if IsDevSubdomain(s) {
+			bad = append(bad, s)
+		}
+	}
+	return bad
+}
+
 // IsDevSubdomain reports whether an instance subdomain names the dev
 // instance. Relies on the no-hyphen-in-suffix invariant documented on
 // devSubdomainSuffix.

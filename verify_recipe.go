@@ -268,8 +268,8 @@ func runVerifyRecipe(v *FlowVerify, r *http.Request, appDir string) error {
 }
 
 func resolveVerifySecret(ref, appDir, field string) (string, error) {
-	secret := InterpolateEnv(ref, appDir)
-	if secret == "" || strings.Contains(secret, "{{env.") {
+	secret := InterpolateEnv(normVerifyEnv(ref), appDir)
+	if secret == "" || verifySecretUnresolved(secret) {
 		return "", fmt.Errorf("verify: %s resolved empty (check app environment)", field)
 	}
 	return secret, nil

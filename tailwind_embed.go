@@ -38,7 +38,7 @@ func init() {
 // that sets its own tailwind.config later (gotmpl layout) still wins.
 var tailwindDarkModeClass = []byte("\n;try{window.tailwind&&(window.tailwind.config=Object.assign({},window.tailwind.config,{darkMode:'class'}));}catch(e){}\n")
 
-func RegisterTailwindRoute(mux *http.ServeMux) {
+func RegisterTailwindRoute(mux appRouteRegistrar) {
 	mux.HandleFunc("GET /_internal/tailwind.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Header().Set("Cache-Control", "public, max-age=86400")

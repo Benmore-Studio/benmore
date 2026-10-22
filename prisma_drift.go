@@ -55,19 +55,17 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 		declaredTables[m.Table] = m
 	}
 
-	// Live tables from sqlite_master.
-	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+	// Share native CRUD's history shape recognition. Generated and retained
+	// history must not be presented as an orphan or handed to destructive prune.
+	definitions, err := readCRUDTableDefinitions(db)
 	if err != nil {
-		return nil, fmt.Errorf("query sqlite_master: %w", err)
+		return nil, fmt.Errorf("read live table definitions: %w", err)
 	}
-	defer rows.Close()
 	liveTables := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		liveTables[name] = true
+	historyTables := map[string]bool{}
+	for _, definition := range definitions {
+		liveTables[definition.name] = true
+		historyTables[definition.name] = isVersionHistoryDefinition(definition)
 	}
 
 	var drifts []SchemaDrift
@@ -98,11 +96,14 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 		if isFTSShadowTable(table, declaredTables) {
 			continue
 		}
+		if historyTables[table] {
+			continue
+		}
 		if _, ok := declaredTables[table]; !ok {
 			drifts = append(drifts, SchemaDrift{
 				Kind:   "extra_table",
 				Table:  table,
-				Detail: "exists in the database but isn't declared in schema.prisma - likely a remnant from a previous schema version (Prisma migrations are additive; tables removed from the model don't get dropped automatically). This can cause confusing route collisions: auto-CRUD still mounts /api/" + table + " against the orphaned table, which can shadow or panic against a flow at the same path. Fix: add a `model` block to schema.prisma to keep it, or call `prisma_prune` (drops orphaned tables + columns in one migration).",
+				Detail: "exists in the database but isn't declared in schema.prisma - usually created by SQL outside the model (a migrations/ file, schema.sql, an older runtime) or left behind after a model mapped to another table. This can cause confusing route collisions: auto-CRUD still mounts /api/" + table + " against the orphaned table, which can shadow or panic against a flow at the same path. Fix: add a `model` block to schema.prisma to keep it, or drop it with a SQL file in migrations/ (`DROP TABLE " + table + ";`) after checking its rows.",
 			})
 		}
 	}
@@ -110,7 +111,8 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 	// Per-table column drift. Only for tables present in BOTH -
 	// missing/extra-table cases above cover the table-level case.
 	for table, model := range declaredTables {
-		if !liveTables[table] {
+		// An explicit model must not make retained history metadata disposable.
+		if !liveTables[table] || historyTables[table] {
 			continue
 		}
 		liveCols, err := getLiveColumns(db, table)
@@ -205,7 +207,7 @@ type LiveColumn struct {
 }
 
 func getLiveColumns(db *sql.DB, table string) (map[string]LiveColumn, error) {
-	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	rows, err := db.Query("PRAGMA table_info(" + quoteIdent(table) + ")")
 	if err != nil {
 		return nil, err
 	}

@@ -268,7 +268,7 @@ func DeletePlatformObject(objectKey string) error {
 		req.Header.Set("X-Amz-Security-Token", tk)
 	}
 	signAWSv4(req, nil, ak, sk, region, "s3")
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := s3HTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		return err
 	}
@@ -303,7 +303,7 @@ func s3HeadObject(bucket, objectKey string) (size int64, contentType string, err
 	}
 	signAWSv4(req, nil, ak, sk, region, "s3")
 
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := s3HTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		return 0, "", err
 	}

@@ -30,6 +30,14 @@ var (
 
 	// :target="selector" for HTMX target override
 	targetDirectiveRe = regexp.MustCompile(`:target="([^"]+)"`)
+
+	// :validate="rules" on a form field, and the patterns that place each
+	// validated field's error <div> (compileValidateDirectives).
+	validateFieldRe              = regexp.MustCompile(`(<(?:input|select|textarea)\s[^>]*?)(\s*):validate="([^"]+)"([^>]*>)`)
+	nameAttrRe                   = regexp.MustCompile(`name="([^"]+)"`)
+	textareaValidateBeforeNameRe = regexp.MustCompile(`(<textarea\s[^>]*data-validate="[^"]*"[^>]*name="([^"]+)"[^>]*>[\s\S]*?</textarea>)`)
+	textareaNameBeforeValidateRe = regexp.MustCompile(`(<textarea\s[^>]*name="([^"]+)"[^>]*data-validate="[^"]*"[^>]*>[\s\S]*?</textarea>)`)
+	formCloseRe                  = regexp.MustCompile(`</form>`)
 )
 
 // CompileDirectives transforms :create, :delete, :patch directives into HTMX attributes.
@@ -204,14 +212,13 @@ func buildHxVals(set string) string {
 // 3. Injects per-form validation JS that runs on submit + blur
 // 4. Strips :validate from the output HTML
 func compileValidateDirectives(content string) string {
-	fieldValRe := regexp.MustCompile(`(<(?:input|select|textarea)\s[^>]*?)(\s*):validate="([^"]+)"([^>]*>)`)
 	formIDCounter := 0
 
 	// Track which forms have validated fields (by position)
 	// First pass: find all validated fields and their containing forms
 	// Replace :validate with HTML5 attrs + error divs
-	content = fieldValRe.ReplaceAllStringFunc(content, func(match string) string {
-		m := fieldValRe.FindStringSubmatch(match)
+	content = validateFieldRe.ReplaceAllStringFunc(content, func(match string) string {
+		m := validateFieldRe.FindStringSubmatch(match)
 		if m == nil {
 			return match
 		}
@@ -220,7 +227,7 @@ func compileValidateDirectives(content string) string {
 		suffix := m[4]
 
 		// Extract field name
-		nameMatch := regexp.MustCompile(`name="([^"]+)"`).FindStringSubmatch(prefix + suffix)
+		nameMatch := nameAttrRe.FindStringSubmatch(prefix + suffix)
 		fieldName := ""
 		if nameMatch != nil {
 			fieldName = nameMatch[1]
@@ -281,9 +288,8 @@ func compileValidateDirectives(content string) string {
 	})
 
 	// Inject error divs after </textarea> for validated textareas
-	textareaErrRe := regexp.MustCompile(`(<textarea\s[^>]*data-validate="[^"]*"[^>]*name="([^"]+)"[^>]*>[\s\S]*?</textarea>)`)
-	content = textareaErrRe.ReplaceAllStringFunc(content, func(match string) string {
-		m := textareaErrRe.FindStringSubmatch(match)
+	content = textareaValidateBeforeNameRe.ReplaceAllStringFunc(content, func(match string) string {
+		m := textareaValidateBeforeNameRe.FindStringSubmatch(match)
 		if m == nil {
 			return match
 		}
@@ -292,9 +298,8 @@ func compileValidateDirectives(content string) string {
 		return m[1] + errorDiv
 	})
 	// Also handle case where name comes before data-validate
-	textareaErrRe2 := regexp.MustCompile(`(<textarea\s[^>]*name="([^"]+)"[^>]*data-validate="[^"]*"[^>]*>[\s\S]*?</textarea>)`)
-	content = textareaErrRe2.ReplaceAllStringFunc(content, func(match string) string {
-		m := textareaErrRe2.FindStringSubmatch(match)
+	content = textareaNameBeforeValidateRe.ReplaceAllStringFunc(content, func(match string) string {
+		m := textareaNameBeforeValidateRe.FindStringSubmatch(match)
 		if m == nil {
 			return match
 		}
@@ -309,8 +314,7 @@ func compileValidateDirectives(content string) string {
 	})
 
 	// Second pass: inject validation JS after each form that has data-validate fields
-	formRe := regexp.MustCompile(`</form>`)
-	content = formRe.ReplaceAllStringFunc(content, func(match string) string {
+	content = formCloseRe.ReplaceAllStringFunc(content, func(match string) string {
 		formIDCounter++
 		return match + fmt.Sprintf(`<script>(function(){
 var f=document.currentScript.previousElementSibling;

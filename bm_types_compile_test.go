@@ -48,6 +48,10 @@ import bm, { table, type Message } from 'bm';
 async function validUses() {
   const msg = await table('messages').get(1);
   msg.body.toUpperCase();
+  await bm.api.raw.post('/api/refer', {}, { headers: { 'Idempotency-Key': 'retry-key' }, signal: new AbortController().signal });
+  await bm.api.get('/api/referrals', { headers: new Headers({ Accept: 'application/json' }) });
+  // @ts-expect-error request credentials remain controlled by the SDK
+  await bm.api.post('/api/refer', {}, { credentials: 'omit' });
   // NOTE: create(body) is typed Partial<Row>, so create({ body: 'hello' })
   // compiles even though user_id/created_at are NOT NULL. The missing-required-
   // field looseness is a pre-existing SDK type-design gap, not enforced here.
@@ -56,6 +60,20 @@ async function validUses() {
   // ts-expect-error token in this comment - tsc would treat it as a directive.)
   const msg2: Message = await bm.table('messages').create({ body: 'hello' });
   msg2.created_at.toUpperCase();
+  const grants = await bm.permissions.list('messages', msg.id);
+  for (const grant of grants.permissions ?? []) {
+    const grantId: number = grant.id;
+    const recipient: string = grant.grantee_id;
+    const grantedAt: string = grant.granted_at;
+    const expiresAt: string | null = grant.expires_at;
+    await bm.permissions.revoke('messages', msg.id, recipient);
+    // The wire response names the recipient grantee_id, never email.
+    // @ts-expect-error phantom email fields must not compile
+    grant.email;
+    // @ts-expect-error permanent grants have a null expiry
+    const requiredExpiry: string = grant.expires_at;
+    void [grantId, grantedAt, expiresAt, requiredExpiry];
+  }
 }
 
 async function invalidUses() {

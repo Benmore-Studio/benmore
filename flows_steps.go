@@ -5,11 +5,22 @@ package main
 // Flow step dispatch, retries, failure handling, and bounded parallel execution.
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 )
+
+// A nested handler may end the transaction before its enclosing step returns.
+// Preserve that terminal boundary through wrapped errors so an enclosing retry
+// cannot repeat effects or replace the original cause with sql.ErrTxDone.
+type flowTransactionRolledBackError struct{ cause error }
+
+func (e *flowTransactionRolledBackError) Error() string { return e.cause.Error() }
+func (e *flowTransactionRolledBackError) Unwrap() error { return e.cause }
 
 // quoteForHint returns `"name"` for non-empty names, or `(unnamed)` so
 // the hint sentence reads cleanly when the step had no id/name.
@@ -38,6 +49,8 @@ func stepFailureHint(name, stepType, errMsg string) string {
 			return prefix + "json_each() / json_extract() got a value that isn't valid JSON. Most common cause: passing a complex `${{ X }}` reference through a pipe that string-coerces. v2.7.35+ JSON-encodes typed slices/maps automatically; if you're still seeing this, the value is probably literal text that doesn't parse - log the param value via a debug `respond:` step to inspect."
 		case strings.Contains(em, "not null constraint failed"):
 			return prefix + "A column was declared NOT NULL but the INSERT didn't supply it. Either provide the value, add a `@default(...)` to the Prisma field, or make the field nullable with `?`."
+		case strings.Contains(em, "no sql statement"):
+			return prefix + "The step has no SQL statement to run. Write it as `with.query` (or `query:` at the step root); `with.sql` is not read, and a text that is only a comment is not a statement."
 		case strings.Contains(em, "unique constraint failed"):
 			return prefix + "Duplicate-key violation. Add `ON CONFLICT (...) DO NOTHING` or `ON CONFLICT (...) DO UPDATE SET ...` to make the upsert idempotent, OR pre-check existence before the INSERT."
 		}
@@ -66,6 +79,8 @@ func stepFailureHint(name, stepType, errMsg string) string {
 		return prefix + "SMS send failed. On the hosted platform every app can text via the shared number - check `benmore sms <app>` for quota/pause state, that `to:` is E.164 (+1...) and within the allowed calling prefixes, and that the per-recipient velocity cap (5 / 10 min) isn't tripped. Self-hosted: set SMS_ACCOUNT_SID/SMS_AUTH_TOKEN (Twilio) or SMS_WEBHOOK_URL."
 	case "webhook":
 		return prefix + "Webhook delivery failed. Same diagnostics as `run: api` (network, status code, SSRF guard). If the receiver requires HMAC, use `run: api` with a `sign:` recipe instead - `run: webhook` is the legacy unsigned path."
+	case "broadcast":
+		return prefix + "`run: broadcast` couldn't send. Check that `with.room` renders a valid room name (1-128 characters of a-z A-Z 0-9 _ - . :), that the JSON payload is at most 64 KiB, and - in an app with `groups:` - that the flow runs with a signed-in session (`auth: required`), because a server room message needs the caller's tenant."
 	case "enqueue":
 		return prefix + "Couldn't enqueue the background job. Check the target flow name exists and the job-worker table (`_benmore_jobs`) is writable."
 	case "if", "for_each", "parallel":
@@ -85,10 +100,15 @@ func executeSteps(ctx *FlowContext, steps []FlowStep) {
 		if retries == 0 {
 			retries = 1
 		}
+		if ctx.command != nil && retries != 1 {
+			ctx.Error = fmt.Errorf("command runtime refuses retries")
+			return
+		}
 
 		for attempt := 0; attempt < retries; attempt++ {
 			err = executeStep(ctx, &step)
-			if err == nil {
+			var rolledBack *flowTransactionRolledBackError
+			if err == nil || errors.As(err, &rolledBack) || ctx.Stopped && ctx.errorResponse || ctx.mcpReadConn != nil && ctx.Request.Context().Err() != nil {
 				break
 			}
 			if attempt < retries-1 {
@@ -96,11 +116,25 @@ func executeSteps(ctx *FlowContext, steps []FlowStep) {
 				if delay == 0 {
 					delay = 2 * time.Second
 				}
-				time.Sleep(delay)
+				if ctx.mcpReadConn != nil {
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Request.Context().Done():
+					case <-timer.C:
+					}
+					timer.Stop()
+				} else {
+					time.Sleep(delay)
+				}
 			}
 		}
 
 		ctx.StepsRun++
+		if ctx.Stopped && ctx.errorResponse {
+			// A nested handler answered the request. Preserve its original
+			// error without running an enclosing handler or resuming steps.
+			return
+		}
 		if err != nil {
 			ctx.Error = err
 			if step.Name != "" {
@@ -110,10 +144,42 @@ func executeSteps(ctx *FlowContext, steps []FlowStep) {
 			}
 			ctx.FailedType = step.Type
 			// Run on_error steps
-			if len(step.OnError) > 0 {
+			if ctx.command == nil && len(step.OnError) > 0 {
+				// The handler writes outside the failed transaction. Release its
+				// connection and SQLite write lock first, or the handler blocks on
+				// our own transaction and loses its independent failure journal.
+				if ctx.Tx != nil {
+					ctx.transactionMutex().Lock()
+					rollbackErr := ctx.Tx.Rollback()
+					ctx.transactionMutex().Unlock()
+					if rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+						ctx.Error = &flowTransactionRolledBackError{cause: fmt.Errorf("%w (rollback before error handler: %v)", err, rollbackErr)}
+						return
+					}
+					ctx.Error = &flowTransactionRolledBackError{cause: err}
+				}
 				ctx.Data["error"] = err.Error()
-				errCtx := &FlowContext{App: ctx.App, Session: ctx.Session, Data: ctx.Data, Params: ctx.Params}
+				// A handler shares HTTP and value/security state but starts
+				// with fresh error/control state. It still runs outside Tx:
+				// handler writes are durable independently of the failed run.
+				// The HTTP writer may be the transaction's private buffer.
+				errCtx := &FlowContext{
+					App: ctx.App, Session: ctx.Session, Request: ctx.Request, Writer: ctx.Writer,
+					privateResponse: ctx.privateResponse, apiClient: ctx.apiClient,
+					Data: ctx.Data, Params: ctx.Params, NullParams: ctx.NullParams,
+					RequestKeys: ctx.RequestKeys, SecretKeys: ctx.SecretKeys, requestStepSources: ctx.requestStepSources,
+					Writes: ctx.Writes, lazyShadow: ctx.lazyShadow, parallelOutputs: ctx.parallelOutputs, reachedSteps: ctx.reachedSteps,
+					mcpReadConn: ctx.mcpReadConn, mcpReadKey: ctx.mcpReadKey,
+				}
 				executeSteps(errCtx, step.OnError)
+				ctx.StepsRun += errCtx.StepsRun
+				ctx.RequestKeys, ctx.SecretKeys, ctx.requestStepSources = errCtx.RequestKeys, errCtx.SecretKeys, errCtx.requestStepSources
+				ctx.NullParams = errCtx.NullParams
+				ctx.privateResponse = ctx.privateResponse || errCtx.privateResponse
+				ctx.flatCache.invalidate()
+				if errCtx.Stopped && (errCtx.Error == nil || errCtx.errorResponse) {
+					ctx.Stopped, ctx.errorResponse = true, true
+				}
 			}
 			return
 		}
@@ -121,6 +187,32 @@ func executeSteps(ctx *FlowContext, steps []FlowStep) {
 }
 
 func executeStep(ctx *FlowContext, step *FlowStep) error {
+	if ctx != nil && ctx.command != nil {
+		if err := ctx.command.guardStep(step); err != nil {
+			return err
+		}
+	}
+	if err := appMCPFlowStepGuard(ctx, step); err != nil {
+		return err
+	}
+	ctx.markStepsReached(step)
+	// Two different guards on one statement: running it under either would
+	// silently drop the other, so the step does not run (ghaStepExpectRows).
+	if step.ExpectRowsConflict != "" {
+		return fmt.Errorf("sql: step %q was not run: %s. Keep one; the step-root key is the canonical position", step.Name, step.ExpectRowsConflict)
+	}
+	// Execution has reached this step, so request fields named like what it
+	// defines are shadowed from here on (shadowStepNamedRequestKeys). An if
+	// block and a loop decide their nested steps themselves (execStepIf,
+	// execStepForEach); any other step owns its whole subtree, including
+	// a parallel block's children. An on_error handler's names are decided
+	// when its step is reached, whether or not the handler runs.
+	switch step.Type {
+	case "if", "for_each":
+		shadowReachedSteps(ctx, step.OnError, true)
+	default:
+		shadowReachedSteps(ctx, []FlowStep{*step}, true)
+	}
 	// Reset the per-step missing-ref tally. Interpolators called by the
 	// concrete step handler will append any unresolved `${{ ... }}`
 	// expressions; we check after the step runs and halt the flow if
@@ -135,10 +227,29 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 	//      the first one and re-running to find the next.
 	ctx.takeMissingRefs()
 
+	// Outputs derived from request input stay request input (flows_taint.go).
+	// Computed from the taint state before the step runs, so an on_error
+	// handler and any retry see the same set.
+	ctx.taintStepOutputs(step)
+
+	var restoreCommandDeadline func()
+	if ctx.command != nil && step.Timeout > 0 {
+		parent := ctx.command.capability.ctx
+		stepCtx, cancel := context.WithTimeout(parent, step.Timeout)
+		ctx.command.capability.ctx = stepCtx
+		restoreCommandDeadline = func() {
+			ctx.command.capability.ctx = parent
+			cancel()
+		}
+	}
 	var err error
 	switch step.Type {
 	case "sql":
-		err = execStepSQL(ctx, step)
+		if ctx.command != nil {
+			err = ctx.command.executeSQL(ctx, step)
+		} else {
+			err = execStepSQL(ctx, step)
+		}
 	case "sql_dynamic":
 		err = execStepSQLDynamic(ctx, step)
 	case "api":
@@ -147,6 +258,8 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 		err = execStepWebhook(ctx, step)
 	case "ws":
 		err = execStepWS(ctx, step)
+	case "broadcast":
+		err = execStepBroadcast(ctx, step)
 	case "enqueue":
 		err = execStepEnqueue(ctx, step)
 	case "email":
@@ -156,29 +269,65 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 	case "redirect":
 		err = execStepRedirect(ctx, step)
 	case "respond":
-		err = execStepRespond(ctx, step)
+		if ctx.command != nil {
+			err = ctx.command.respond(ctx, step)
+		} else {
+			err = execStepRespond(ctx, step)
+		}
 	case "serve_file":
 		err = execStepServeFile(ctx, step)
 	case "delete_upload":
 		err = execStepDeleteUpload(ctx, step)
+	case "inspect_private_upload":
+		err = execStepInspectPrivateUpload(ctx, step)
+	case "render_pdf_signatures":
+		err = execStepRenderPDFSignatures(ctx, step)
 	case "purge_current_user":
 		err = execStepPurgeCurrentUser(ctx, step)
 	case "transcribe":
 		err = execStepTranscribe(ctx, step)
+	case "revoke_user_sessions":
+		if ctx.command == nil {
+			err = errors.New("revoke_user_sessions runs only in an approved MCP command")
+		} else {
+			err = ctx.command.revokeUserSessions(ctx, step)
+		}
 	case "if":
-		err = execStepIf(ctx, step)
+		if ctx.command != nil {
+			err = execStepCommandIf(ctx, step)
+		} else {
+			err = execStepIf(ctx, step)
+		}
 	case "for_each":
-		err = execStepForEach(ctx, step)
+		if ctx.command != nil {
+			err = execStepCommandForEach(ctx, step)
+		} else {
+			err = execStepForEach(ctx, step)
+		}
 	case "set":
-		err = execStepSet(ctx, step)
+		if ctx.command != nil {
+			err = execStepCommandSet(ctx, step)
+		} else {
+			err = execStepSet(ctx, step)
+		}
 	case "parse":
 		err = execStepParse(ctx, step)
 	case "parallel":
 		err = execStepParallel(ctx, step)
 	case "compute":
-		err = execStepCompute(ctx, step)
+		if ctx.command != nil {
+			err = execStepCommandCompute(ctx, step)
+		} else {
+			err = execStepCompute(ctx, step)
+		}
 	default:
+		if restoreCommandDeadline != nil {
+			restoreCommandDeadline()
+		}
 		return fmt.Errorf("unknown step type: %s", step.Type)
+	}
+	if restoreCommandDeadline != nil {
+		restoreCommandDeadline()
 	}
 
 	// If the step itself errored, preserve that error - the caller's
@@ -187,6 +336,7 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 	if err != nil {
 		return err
 	}
+	ctx.noteParallelOutputs(step)
 
 	// Surface any unresolved templates the step's interpolations left
 	// behind. Composite steps (parallel / for_each / if) call
@@ -223,14 +373,18 @@ func executeStep(ctx *FlowContext, step *FlowStep) error {
 // the dominant cost in a live demo; parallel cuts the
 // load time from sum-of-latencies to max-of-latencies.
 //
-// Each child's output still lands at ctx.Data[step.Name] like any
-// sequential step. Concurrent writes to ctx.Data are serialized by
-// ctx.dataMu (added below). Errors from any branch fail the whole
-// parallel block - the first error wins; remaining branches finish
-// then results are discarded.
+// Each child sees the same input snapshot and publishes its changes at the
+// join, in declaration order. The first error in that order fails the block;
+// every sibling still finishes, and failed-block outputs are discarded.
 func execStepParallel(ctx *FlowContext, step *FlowStep) error {
 	if len(step.Steps) == 0 {
 		return nil
+	}
+	if err := flowValidateParallelHTTP(&Flow{Steps: []FlowStep{*step}}); err != nil {
+		return err
+	}
+	if ctx.command != nil || ctx.mcpReadConn != nil {
+		return fmt.Errorf("parallel: connector executions do not support parallel steps")
 	}
 	// H-4 runtime backstop: a *sql.Tx is NOT safe for concurrent use, so
 	// parallel children must never share ctx.Tx. flowValidateParallelTx
@@ -242,28 +396,47 @@ func execStepParallel(ctx *FlowContext, step *FlowStep) error {
 		return fmt.Errorf("parallel: SQL steps are not allowed inside a parallel block of a transaction:true flow (a *sql.Tx cannot be shared across goroutines); move the SQL out of the parallel block or drop transaction:true")
 	}
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(step.Steps))
+	before := newParallelFlowContext(ctx)
+	children := make([]*FlowContext, len(step.Steps))
+	errs := make([]error, len(step.Steps))
 	for i := range step.Steps {
+		children[i] = newParallelFlowContext(before)
 		wg.Add(1)
 		child := step.Steps[i]
 		go func() {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					errCh <- fmt.Errorf("parallel branch %q panicked: %v", child.Name, r)
+					errs[i] = fmt.Errorf("parallel branch %q panicked: %v", child.Name, r)
 				}
 			}()
-			if err := executeStep(ctx, &child); err != nil {
-				errCh <- err
-			}
+			errs[i] = executeStep(children[i], &child)
 		}()
 	}
 	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return err
+	for _, child := range children {
+		ctx.StepsRun += child.StepsRun
+	}
+	var firstErr error
+	var transactionRolledBack bool
+	for _, err := range errs {
+		if firstErr == nil && err != nil {
+			firstErr = err
 		}
+		var rolledBack *flowTransactionRolledBackError
+		transactionRolledBack = transactionRolledBack || errors.As(err, &rolledBack)
+	}
+	if firstErr != nil {
+		// A later sibling can have ended the shared transaction. Preserve
+		// declaration-order diagnostics without letting that earlier error
+		// hide the terminal boundary from an enclosing retry.
+		if transactionRolledBack {
+			return &flowTransactionRolledBackError{cause: firstErr}
+		}
+		return firstErr
+	}
+	for _, child := range children {
+		mergeParallelFlowContext(ctx, before, child)
 	}
 	return nil
 }

@@ -27,6 +27,28 @@ migration work or worker replacement. A rejected reload retains the previous app
 previously committed database changes and external effects are not automatically
 rolled back. Check the resulting behavior, not just a successful upload message.
 
+## App MCP compatibility
+
+The platform MCP builds and manages apps; this app's connector serves its users.
+Read ` + "`" + `benmore docs connector` + "`" + ` for the offline manifest example and
+` + "`" + `api(at:"connector")` + "`" + ` for the hosted contract. No framework source is needed. Server-created HTML starters include
+a read-only ` + "`" + `mcp.yaml` + "`" + `. Hosted CLI ` + "`" + `benmore new` + "`" + ` omits it so the first deploy can succeed;
+deploy and pull the complete source before authoring and reviewing a connector.
+Exposure and approved writes require owner opt-in. When
+replacing the Notes demo, replace its connector declarations too. After reviewing
+source changes, run ` + "`" + `benmore mcp review <appdir> --reviewed` + "`" + ` and
+` + "`" + `benmore mcp check <appdir>` + "`" + ` before pushing the reviewed files together.
+Never re-attest unreviewed source to bypass a digest failure. Source attestation
+does not grant access or approve an operation.
+
+## QA selectors and journeys
+
+Give every interactive element a ` + "`" + `data-testid` + "`" + ` (the scaffold pages, ` + "`" + `Button` + "`" + ` and
+` + "`" + `Input` + "`" + ` helpers already do). ` + "`" + `qa_inventory` + "`" + ` surfaces every page, button, form and
+declared access rule and drafts ` + "`" + `tests/journeys/*.yaml` + "`" + `; ` + "`" + `browser_batch` + "`" + ` and
+` + "`" + `benmore verify` + "`" + ` replay those journeys in a real browser without an agent in the
+loop. Read ` + "`" + `api(at:"qa")` + "`" + ` before writing or repairing a journey.
+
 ## Delivery evidence
 
 Exercise the changed user journey, including authorized/unauthorized cases when

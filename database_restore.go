@@ -146,6 +146,17 @@ func (r *restoreContextReader) Read(p []byte) (int, error) {
 // the original main/WAL/SHM bundle for recovery and never truncates the live file.
 // On a pre-install failure, attempt to put every moved original member back.
 func installRestoreSnapshot(dir, candidate string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	release, lease, err := beginAppMCPRestorePolicy(ctx, dir)
+	if err != nil {
+		return "", fmt.Errorf("connector restore lease: %w", err)
+	}
+	defer release()
+	return installRestoreSnapshotWithLease(dir, candidate, lease)
+}
+
+func installRestoreSnapshotWithLease(dir, candidate string, lease *appMCPAuthorityLease) (string, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return "", err

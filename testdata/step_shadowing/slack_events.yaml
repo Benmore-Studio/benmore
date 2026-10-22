@@ -1,0 +1,30 @@
+# Minimal shape of an inbound events webhook as written before 2.7.248:
+# the URL-verification step is named after the request field it reads, so
+# `${{ challenge }}` resolves to the step (nothing yet) instead of the body.
+on:
+  request:
+    method: POST
+    path: /api/flows/slack-events
+    auth: none
+    verify: slack
+    secret: "{{env.SLACK_SIGNING_SECRET}}"
+
+jobs:
+  ingest:
+    steps:
+      - id: challenge
+        if: ${{ challenge }}
+        run: respond
+        with:
+          json:
+            challenge: "${{ challenge }}"
+
+      - id: drop_non_message
+        if: ${{ event.type | default:'' }} != 'message'
+        run: respond
+        with:
+          json: { ok: true, dropped: "non-message" }
+
+      - run: respond
+        with:
+          json: { ok: true }

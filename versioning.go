@@ -3,7 +3,7 @@
 package main
 
 import (
-	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -22,153 +22,63 @@ func LoadVersionedConfig(dir string) *VersionedConfig {
 	if err != nil {
 		return nil
 	}
+	return parseVersionedConfig(data)
+}
 
-	lines := strings.Split(string(data), "\n")
-	inVersioned := false
-	var tables []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "versioned:" {
-			inVersioned = true
-			continue
-		}
-		if inVersioned {
-			if trimmed == "" || (!strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t")) {
-				break
-			}
-			if strings.HasPrefix(trimmed, "- ") {
-				tables = append(tables, strings.TrimPrefix(trimmed, "- "))
-			}
-		}
-	}
-
-	if len(tables) == 0 {
+func parseVersionedConfig(data []byte) *VersionedConfig {
+	var raw map[string]any
+	if err := decodeConfigYAML(data, &raw); err != nil {
 		return nil
 	}
-	return &VersionedConfig{Tables: tables}
+	config, _ := parseVersionedSection(raw["versioned"])
+	return config
 }
 
-// InstallVersioningTriggers creates history tables and SQLite triggers for versioned tables.
-// The history table mirrors the source table's schema plus version metadata.
-// Triggers fire BEFORE UPDATE and BEFORE DELETE to capture the outgoing row state.
-func InstallVersioningTriggers(db *sql.DB, config *VersionedConfig) {
-	if config == nil {
-		return
+// Startup/reload and write validation use the same section parser as on-demand
+// consumers, so a malformed replacement cannot silently disable history.
+func parseVersionedSection(value any) (*VersionedConfig, error) {
+	if value == nil {
+		return nil, nil
 	}
-
-	var installed int
-	for _, table := range config.Tables {
-		n, err := installVersioningForTable(db, table)
-		if err != nil {
-			log.Printf("VERSIONING ERROR [%s]: %s", table, err)
-			continue
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("app.yaml: versioned must be a list of table names")
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	config := &VersionedConfig{Tables: make([]string, 0, len(items))}
+	seen := make(map[string]bool, len(items))
+	for i, item := range items {
+		table, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("app.yaml: versioned[%d] must be a table name", i)
 		}
-		installed += n
-	}
-
-	if installed > 0 {
-		log.Printf("  versioning: %d triggers installed across %d tables", installed, len(config.Tables))
-	}
-}
-
-func installVersioningForTable(db *sql.DB, table string) (int, error) {
-	// Get the source table's columns
-	cols, err := GetTableColumns(db, table)
-	if err != nil {
-		return 0, fmt.Errorf("cannot read schema for %s: %w", table, err)
-	}
-
-	historyTable := table + "_history"
-
-	// Build CREATE TABLE for history - same columns + version metadata
-	var colDefs []string
-	var colNames []string
-	for _, col := range cols {
-		colDefs = append(colDefs, fmt.Sprintf("%s %s", col.Name, col.Type))
-		colNames = append(colNames, col.Name)
-	}
-
-	// Add version metadata columns
-	colDefs = append(colDefs,
-		"_version INTEGER NOT NULL",
-		"_valid_from DATETIME NOT NULL",
-		"_valid_to DATETIME NOT NULL DEFAULT (datetime('now'))",
-		"_changed_by INTEGER",
-		"_change_type TEXT NOT NULL", // 'update' or 'delete'
-	)
-
-	createSQL := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", historyTable, strings.Join(colDefs, ", "))
-	if _, err := db.Exec(createSQL); err != nil {
-		return 0, fmt.Errorf("cannot create %s: %w", historyTable, err)
-	}
-
-	// Create index on (id, _version) for efficient lookups
-	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_id_version ON %s (id, _version)", historyTable, historyTable))
-
-	// Drop existing versioning triggers for this table
-	db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS _benmore_ver_%s_update", table))
-	db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS _benmore_ver_%s_delete", table))
-
-	// Build column reference list for OLD.col1, OLD.col2, ...
-	var oldRefs []string
-	for _, name := range colNames {
-		oldRefs = append(oldRefs, "OLD."+name)
-	}
-
-	// BEFORE UPDATE trigger: copy outgoing row to history
-	// _version is auto-incremented: SELECT COALESCE(MAX(_version), 0) + 1
-	// _valid_from is the original row's updated_at (or created_at if never updated)
-	versionSubquery := fmt.Sprintf("(SELECT COALESCE(MAX(_version), 0) + 1 FROM %s WHERE id = OLD.id)", historyTable)
-	validFromExpr := "OLD.updated_at"
-	if !hasColumnInList(cols, "updated_at") {
-		validFromExpr = "OLD.created_at"
-		if !hasColumnInList(cols, "created_at") {
-			validFromExpr = "datetime('now')"
+		if err := configIdentError(fmt.Sprintf("app.yaml: versioned[%d]", i), table); err != nil {
+			return nil, err
 		}
+		identity := sqliteIdentifierFold(table)
+		if seen[identity] {
+			return nil, fmt.Errorf("app.yaml: versioned repeats table %q", table)
+		}
+		seen[identity] = true
+		config.Tables = append(config.Tables, table)
 	}
-
-	triggerCount := 0
-
-	updateTriggerSQL := fmt.Sprintf(
-		"CREATE TRIGGER IF NOT EXISTS _benmore_ver_%s_update BEFORE UPDATE ON %s FOR EACH ROW BEGIN INSERT INTO %s (%s, _version, _valid_from, _valid_to, _change_type) VALUES (%s, %s, %s, datetime('now'), 'update'); END",
-		table, table, historyTable,
-		strings.Join(colNames, ", "),
-		strings.Join(oldRefs, ", "),
-		versionSubquery,
-		validFromExpr,
-	)
-	if _, err := db.Exec(updateTriggerSQL); err != nil {
-		log.Printf("VERSIONING TRIGGER ERROR [%s update]: %s", table, err)
-	} else {
-		triggerCount++
-	}
-
-	// BEFORE DELETE trigger: same pattern
-	deleteTriggerSQL := fmt.Sprintf(
-		"CREATE TRIGGER IF NOT EXISTS _benmore_ver_%s_delete BEFORE DELETE ON %s FOR EACH ROW BEGIN INSERT INTO %s (%s, _version, _valid_from, _valid_to, _change_type) VALUES (%s, %s, %s, datetime('now'), 'delete'); END",
-		table, table, historyTable,
-		strings.Join(colNames, ", "),
-		strings.Join(oldRefs, ", "),
-		versionSubquery,
-		validFromExpr,
-	)
-	if _, err := db.Exec(deleteTriggerSQL); err != nil {
-		log.Printf("VERSIONING TRIGGER ERROR [%s delete]: %s", table, err)
-	} else {
-		triggerCount++
-	}
-
-	return triggerCount, nil
+	return config, nil
 }
 
 // RegisterVersioningAPI sets up version history and revert endpoints.
-func RegisterVersioningAPI(mux *http.ServeMux, app *App, config *VersionedConfig) {
+func RegisterVersioningAPI(mux appRouteRegistrar, app *App, config *VersionedConfig) {
 	if config == nil {
 		return
 	}
 
 	for _, table := range config.Tables {
 		t := table
+		// The name becomes a route pattern; InstallVersioningTriggers logged it.
+		if !membershipIdentRe.MatchString(t) {
+			continue
+		}
 
 		// GET /api/{table}/{id}/versions - list all versions
 		mux.HandleFunc(fmt.Sprintf("GET /api/%s/{id}/versions", t), func(w http.ResponseWriter, r *http.Request) {
@@ -212,15 +122,19 @@ func handleListVersions(w http.ResponseWriter, r *http.Request, app *App, table 
 		return
 	}
 
-	historyTable := table + "_history"
-
-	rows, err := QueryRows(app.DB,
-		fmt.Sprintf("SELECT _version, _valid_from, _valid_to, _changed_by, _change_type FROM %s WHERE id = ? ORDER BY _version DESC", historyTable),
-		id,
+	scope, scopeArgs := versionSnapshotScope(app, table, session)
+	rows, err := queryNativeRowsWith(app.DB, app, table,
+		fmt.Sprintf("SELECT _version, _valid_from, _valid_to, _changed_by, _change_type FROM %s WHERE id = ?%s ORDER BY _version DESC", historyFrom(table), scope),
+		append([]any{id}, scopeArgs...)...,
 	)
 	if err != nil {
-		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "version query failed"})
+		serverErrorJSON(w, r, app, table+" versions", err, "version query failed")
 		return
+	}
+	// The listing reveals who changed the row and when; audited tables
+	// record it.
+	if IsReadAudited(app, table) {
+		LogReadAccess(app, table, id, "versions", session)
 	}
 
 	httpJSON(w, http.StatusOK, map[string]any{
@@ -258,16 +172,17 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	historyCols, _ := GetTableColumns(app.DB, historyTable)
 	var colNames []string
 	for _, col := range historyCols {
-		colNames = append(colNames, col.Name)
+		colNames = append(colNames, quoteColumn(table, col.Name)) // historyFrom aliases the history table as table
 	}
 	if len(colNames) == 0 {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": "version not found"})
 		return
 	}
 
-	rows, err := QueryRows(app.DB,
-		fmt.Sprintf("SELECT %s FROM %s WHERE id = ? AND _version = ?", strings.Join(colNames, ", "), historyTable),
-		id, version,
+	scope, scopeArgs := versionSnapshotScope(app, table, session)
+	rows, err := queryNativeRowsWith(app.DB, app, table,
+		fmt.Sprintf("SELECT %s FROM %s WHERE id = ? AND _version = ?%s", strings.Join(colNames, ", "), historyFrom(table), scope),
+		append([]any{id, version}, scopeArgs...)...,
 	)
 	if err != nil || len(rows) == 0 {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": "version not found"})
@@ -280,11 +195,11 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	// caller who can read the row but is NOT in the column's unmask_roles would
 	// recover the plaintext through version history. The history table shares
 	// the source table's encrypted-field config (same column names).
-	MaskEncryptedFields(app.Encrypted, table, rows, session)
-	for key := range rows[0] {
-		if isSensitiveUserColumn(key) || strings.HasSuffix(key, blindColSuffix) {
-			delete(rows[0], key)
-		}
+	sanitizeResponseRows(app, table, rows, session)
+	// A version snapshot is the row's past content: an audited table
+	// records the read like a live GET.
+	if IsReadAudited(app, table) {
+		LogReadAccess(app, table, id, "version", session)
 	}
 	httpJSON(w, http.StatusOK, rows[0])
 }
@@ -313,7 +228,6 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 		return
 	}
 	version := r.PathValue("version")
-	historyTable := table + "_history"
 
 	// Get the source table columns (what to restore)
 	cols, _ := GetTableColumns(app.DB, table)
@@ -322,14 +236,18 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 		if col.PK {
 			continue // don't overwrite id
 		}
-		colNames = append(colNames, col.Name)
+		colNames = append(colNames, quoteColumn(table, col.Name)) // historyFrom aliases the history table as table
 	}
 
 	// Fetch the historical version
+	// A snapshot the caller could not have read (pre-transfer owner or
+	// tenant) is "not found": reverting to it would copy that content into
+	// the row the caller now reads.
 	selectCols := strings.Join(colNames, ", ")
-	rows, err := QueryRows(app.DB,
-		fmt.Sprintf("SELECT %s FROM %s WHERE id = ? AND _version = ?", selectCols, historyTable),
-		id, version,
+	scope, scopeArgs := versionSnapshotScope(app, table, session)
+	rows, err := queryNativeRowsWith(app.DB, app, table,
+		fmt.Sprintf("SELECT %s FROM %s WHERE id = ? AND _version = ?%s", selectCols, historyFrom(table), scope),
+		append([]any{id, version}, scopeArgs...)...,
 	)
 	if err != nil || len(rows) == 0 {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": "version not found"})
@@ -337,6 +255,9 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 
 	versionRow := rows[0]
+	// A revert restores every column except command-owned ones, which only
+	// their command may change; they keep their current value.
+	skippedOwned := stripOwnedFields(app, table, versionRow)
 
 	// Reverts are updates, including write policy, edit ACLs, locks, validators,
 	// protected columns, membership, before/after hooks, audit and broadcasts.
@@ -357,7 +278,31 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 		"status":              "reverted",
 		"id":                  id,
 		"reverted_to_version": version,
+		"owned_fields_kept":   skippedOwned,
 	})
+}
+
+// historyFrom names a table's history table ALIASED AS the source table, so
+// a rowScopeClause predicate written for the source (unqualified columns, and
+// member-of's `<table>.<col>` correlation) evaluates against each snapshot.
+func historyFrom(table string) string {
+	return quoteIdent(table+"_history") + " AS " + quoteIdent(table)
+}
+
+// versionSnapshotScope restricts history rows to snapshots the caller could
+// have read: the canonical row scope (owner, tenant, membership, ACL grant)
+// evaluated on the SNAPSHOT's own columns. Version history follows the row
+// id, so without this a row moved to a new owner or tenant handed its whole
+// pre-transfer history to the new owner. Returns an " AND ..." suffix, empty
+// for an admin who bypasses row scope (and for tables with no scope
+// columns, where the current-row gate already decided). A history table that
+// lacks a scope column fails the query - closed, not open.
+func versionSnapshotScope(app *App, table string, session *Session) (string, []any) {
+	pred, args, bypass := rowScopeClause(app, table, session, "view")
+	if bypass || pred == "" {
+		return "", nil
+	}
+	return " AND " + pred, args
 }
 
 // hasColumnInList checks if a column name exists in a slice of Column structs.
@@ -397,24 +342,115 @@ func canAccessRow(app *App, table string, id string, session *Session) bool {
 // handlePointInTime returns the state of a row at a specific point in time.
 // GET /api/{table}/{id}?as_of=2026-03-01T00:00:00Z
 // Searches the version history for the version that was active at that timestamp.
-func handlePointInTime(app *App, table string, id string, asOf string, session *Session) (map[string]any, error) {
+func handlePointInTime(app *App, r *http.Request, table string, id string, asOf string, session *Session) (map[string]any, error) {
+	var err error
+	asOf, err = normalizePointInTime(asOf)
+	if err != nil {
+		return nil, err
+	}
 	historyTable := table + "_history"
 
-	// Find the version that was valid at the given time
-	rows, err := QueryRows(app.DB,
-		fmt.Sprintf("SELECT * FROM %s WHERE id = ? AND _valid_from <= ? AND _valid_to > ? ORDER BY _version DESC LIMIT 1", historyTable),
-		id, asOf, asOf,
-	)
-	if err != nil || len(rows) == 0 {
-		// If no history entry, maybe the current row was created before as_of and never updated
-		currentRows, err := QueryRows(app.DB,
-			fmt.Sprintf("SELECT * FROM %s WHERE id = ? AND created_at <= ?", table),
-			id, asOf,
+	// A missing history table retains the native current-row fallback. Other
+	// private query failures must not turn into a successful fallback read.
+	tables, err := appMCPReadRows(app, r, "", "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name=? COLLATE NOCASE", historyTable)
+	if err != nil {
+		return nil, err
+	}
+	historyPresent := len(tables) > 0
+	var rows []map[string]any
+	if historyPresent {
+		// Find the version that was valid at the given time
+		rows, err = appMCPReadRows(app, r, table,
+			"SELECT _version FROM "+quoteIdent(historyTable)+" WHERE id = ? AND _valid_from <= ? AND _valid_to > ? ORDER BY _version DESC LIMIT 1",
+			id, asOf, asOf,
 		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err == nil && len(rows) == 1 {
+		// The state at as_of is a snapshot; it is returned only when the
+		// caller could have read it then (same owner/tenant scope). Not
+		// found otherwise - never the current row in its place.
+		scope, scopeArgs := versionSnapshotScope(app, table, session)
+		visible, verr := appMCPReadRows(app, r, table,
+			fmt.Sprintf("SELECT * FROM %s WHERE id = ? AND _version = ? AND _valid_from <= ? AND _valid_to > ?%s", historyFrom(table), scope),
+			append([]any{id, rows[0]["_version"], asOf, asOf}, scopeArgs...)...)
+		if verr != nil || len(visible) == 0 {
+			return nil, fmt.Errorf("no version found at %s", asOf)
+		}
+		rows = visible
+	}
+	if len(rows) == 0 {
+		// If no history entry, maybe the current row was created before as_of and never updated
+		scope, scopeArgs := versionSnapshotScope(app, table, session)
+		if hasColumn(app, table, "deleted_at") {
+			scope += " AND deleted_at IS NULL"
+		}
+		// Missing/pruned/inverted history is not evidence that today's value
+		// existed earlier. Require the current state's latest known boundary.
+		// Capture payload and raw boundaries in one SQLite snapshot. The driver
+		// decodes malformed DATETIME values as zero time, so validation needs
+		// raw text without changing the normal response representation.
+		updated := "NULL"
+		if hasColumn(app, table, "updated_at") {
+			updated = "CAST(updated_at AS TEXT)"
+		}
+		expressions := []string{"CAST(created_at AS TEXT)", updated}
+		if historyPresent {
+			for _, column := range []string{"_valid_from", "_valid_to"} {
+				expressions = append(expressions, "(SELECT CAST("+column+" AS TEXT) FROM "+quoteIdent(historyTable)+" WHERE id="+quoteIdent(table)+".id ORDER BY _version DESC LIMIT 1)")
+			}
+		}
+		projection := "*"
+		aliases := make([]string, len(expressions))
+		for i, expression := range expressions {
+			alias := fmt.Sprintf("_benmore_asof_boundary_%d", i)
+			for hasColumn(app, table, alias) {
+				alias += "_"
+			}
+			aliases[i] = alias
+			projection += ", " + expression + " AS " + quoteIdent(alias)
+		}
+		currentRows, err := appMCPReadRows(app, r, table,
+			fmt.Sprintf("SELECT %s FROM %s WHERE id = ? AND created_at <= ?%s", projection, quoteIdent(table), scope),
+			append([]any{id, asOf}, scopeArgs...)...)
 		if err != nil || len(currentRows) == 0 {
+			return nil, fmt.Errorf("no version found at %s", asOf)
+		}
+		boundaries := make([]any, len(aliases))
+		for i, alias := range aliases {
+			boundaries[i] = currentRows[0][alias]
+			delete(currentRows[0], alias)
+		}
+		for _, boundary := range boundaries {
+			if versionedValueIsNull(boundary) {
+				continue
+			}
+			if _, valid := parseUpdateTimestamp(stringifyForCrypto(boundary)); !valid {
+				return nil, fmt.Errorf("no version found at %s", asOf)
+			}
+		}
+		start, known := versionLatestInstant(boundaries...)
+		instant, valid := parseUpdateTimestamp(asOf)
+		if !known || !valid || instant.Before(start) {
 			return nil, fmt.Errorf("no version found at %s", asOf)
 		}
 		return currentRows[0], nil
 	}
 	return rows[0], nil
+}
+
+var errInvalidPointInTime = errors.New("invalid as_of timestamp: use RFC3339 or a SQLite date/time")
+
+// normalizePointInTime matches SQLite's UTC timestamp text used by the
+// versioning triggers. Comparing RFC3339 directly puts 'T' after the stored
+// space separator and can select today's row in place of a historical one.
+// Keep fractions: truncating or rounding a query could cross a version boundary.
+func normalizePointInTime(value string) (string, error) {
+	instant, ok := crossFieldInstant(value)
+	if !ok {
+		return "", errInvalidPointInTime
+	}
+	return instant.UTC().Format("2006-01-02 15:04:05.999999999"), nil
 }

@@ -128,28 +128,38 @@ func importRunning(app *App) bool { return importFlagFor(app).Load() }
 
 // importableColumns returns the columns a bulk import may write: every
 // column except the primary key and the mass-assignment-protected set.
-// The protected set matches handleCreate and handleStreamingIngest, plus
-// the configured tenant key and in-tenant role field.
+// The protected set is auto-CRUD create's (protectedCreateFields: owner,
+// timestamps, credentials, in-tenant role field, computed columns) plus
+// deleted_at and workflow state columns, matched case-insensitively.
+//
+// The tenant key IS importable: only a platform admin (not stepped in) or
+// the owner token can import, and auto-CRUD create honors an explicit tenant
+// from exactly that caller. Without it every imported row of a tenant-keyed
+// table landed with a NULL tenant, visible to no tenant at all. The owner
+// column is never read from the file; runImportInner fills it like create.
 func importableColumns(db *sql.DB, table string, app *App) ([]Column, error) {
 	cols, err := GetTableColumns(db, table)
 	if err != nil {
 		return nil, err
 	}
-	protected := map[string]bool{
-		"user_id": true, "created_at": true, "updated_at": true,
-		"password_hash": true, "role": true,
+	protected := protectedCreateFields(app, table)
+	protected.add("deleted_at")
+	if app != nil {
+		protected.add(workflowProtectedFields(app, table)...)
 	}
-	if app != nil && app.Group != nil && app.Group.Key != "" {
-		protected[app.Group.Key] = true
+	isTenantKey := func(name string) bool {
+		return app != nil && app.Group != nil && identIs(name, app.Group.Key)
 	}
-	if app != nil && app.Group != nil && app.Group.RoleField != "" &&
-		app.Group.Table != "" && table == app.Group.Table {
-		protected[app.Group.RoleField] = true
+
+	// Command-owned columns are never importable through Mode A.
+	var owned map[string]string
+	if app != nil {
+		owned = commandOwnedColumns(app, table)
 	}
 
 	var out []Column
 	for _, c := range cols {
-		if c.PK || protected[c.Name] {
+		if _, isOwned := owned[sqliteIdentifierFold(c.Name)]; isOwned || c.PK || (protected.has(c.Name) && !isTenantKey(c.Name)) {
 			continue
 		}
 		out = append(out, c)
@@ -178,6 +188,15 @@ func importableColumns(db *sql.DB, table string, app *App) ([]Column, error) {
 // third-party client posting raw header names directly - without it, such
 // a caller got a spurious 400 for a file the loader itself would accept.
 func validateImportColumns(db *sql.DB, table string, app *App, want []string) error {
+	normalized := make([]string, len(want))
+	for i, name := range want {
+		normalized[i] = normalizeImportHeaderName(name)
+	}
+	if app != nil {
+		if v := ownedFieldViolation(app, table, normalized...); v != nil {
+			return v
+		}
+	}
 	cols, err := importableColumns(db, table, app)
 	if err != nil {
 		return err
@@ -221,7 +240,7 @@ func startImport(app *App, sess *importSession) error {
 }
 
 func startImportWithGuard(app *App, sess *importSession, flag *atomic.Bool) {
-	sess.stop = app.Stop
+	sess.stop = app.workerStopGeneration()
 
 	safeGo("import:"+sess.ID, func() {
 		defer flag.Store(false)
@@ -261,7 +280,11 @@ func runImport(app *App, sess *importSession) error {
 		}
 		importProgress.Delete(sess.ID)
 		if err != nil {
-			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, err.Error())
+			reason := err.Error()
+			if isStorageFullError(err) {
+				reason = storageFullMessage(app) + " (" + reason + "; the import was rolled back)"
+			}
+			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, reason)
 			if serr != nil {
 				log.Printf("IMPORT %s: failed to persist failed state: %v", sess.ID, serr)
 			}
@@ -407,6 +430,18 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// NDJSON silently ignores keys that are not importable columns; a command-owned
+	// key must instead fail the load.
+	if ns, ok := src.(*ndjsonSource); ok {
+		if err := ns.refuseKeys(func(keys []string) error {
+			if v := ownedFieldViolation(app, sess.TableName, keys...); v != nil {
+				return v
+			}
+			return nil
+		}); err != nil {
+			return 0, err
+		}
+	}
 
 	names := make([]string, len(effective))
 	marks := make([]string, len(effective))
@@ -414,10 +449,45 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 		names[i] = c.Name
 		marks[i] = "?"
 	}
-	// Column names come from GetTableColumns, never from user input, so
-	// this interpolation cannot carry injected SQL. Values are always bound.
+	// The owner column is filled like an auto-CRUD create: the importing
+	// admin owns the rows. An owner-token import has no user in this app
+	// (CreatedBy is 0), so its rows stay unowned, as an anonymous create's do.
+	ownerCol := ""
+	all, err := GetTableColumns(app.DB, sess.TableName)
+	if err != nil {
+		return 0, err
+	}
+	if sess.CreatedBy != 0 {
+		for _, c := range all {
+			if identIs(c.Name, "user_id") {
+				ownerCol = c.Name
+			}
+		}
+	}
+	if ownerCol != "" {
+		names = append(names, ownerCol)
+		marks = append(marks, "?")
+	}
+	// Mode A has its own prepared INSERT path. Omitted Prisma UUID defaults
+	// use the same compatibility rule as CRUD, evaluated separately per row.
+	for _, name := range prismaUUIDDefaultColumns(prismaWriteColumns(app, sess.TableName), all) {
+		present := false
+		for _, provided := range names {
+			if identIs(provided, name) {
+				present = true
+				break
+			}
+		}
+		if !present {
+			names = append(names, name)
+			marks = append(marks, SQLiteUUID4Default)
+		}
+	}
+	// Column names come from GetTableColumns and the table from the import
+	// session; both are written quoted so a name a migration created with
+	// SQL punctuation addresses the right table and column. Values are bound.
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		sess.TableName, strings.Join(names, ", "), strings.Join(marks, ", "))
+		quoteIdent(sess.TableName), strings.Join(quoteIdents(names), ", "), strings.Join(marks, ", "))
 
 	tx, err := app.DB.Begin()
 	if err != nil {
@@ -449,7 +519,38 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("row %d: %w", parsed+1, err)
 		}
-		if _, err := stmt.Exec(vals...); err != nil {
+		if ownerCol != "" {
+			// Full slice expression: never write into a source's reused buffer.
+			vals = append(vals[:len(vals):len(vals)], sess.CreatedBy)
+		}
+		// Source values precede any generated UUID SQL expressions in names.
+		// Prefix-looking encrypted inputs are plaintext, just as native CRUD.
+		if len(vals) > len(names) {
+			return 0, fmt.Errorf("row %d: source returned too many values", parsed+1)
+		}
+		sealedFields, sealedValues, err := sealNativeCiphertextLiterals(tx, app, sess.TableName, names[:len(vals)], vals)
+		if err != nil {
+			return 0, fmt.Errorf("row %d: %w", parsed+1, err)
+		}
+		changed := len(sealedValues) != len(vals)
+		for i, value := range vals {
+			if text, ok := value.(string); ok && sealedValues[i] != text {
+				changed = true
+				break
+			}
+		}
+		if changed {
+			boundMarks := make([]string, len(sealedFields))
+			for i := range boundMarks {
+				boundMarks[i] = "?"
+			}
+			boundMarks = append(boundMarks, marks[len(vals):]...)
+			sealedFields = append(sealedFields, names[len(vals):]...)
+			_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(sess.TableName), strings.Join(quoteIdents(sealedFields), ", "), strings.Join(boundMarks, ", ")), sealedValues...)
+		} else {
+			_, err = stmt.Exec(vals...)
+		}
+		if err != nil {
 			return 0, fmt.Errorf("row %d: %w", parsed+1, err)
 		}
 		parsed++

@@ -63,11 +63,30 @@ func LoadEnv(dir string) error {
 }
 
 func readAppEnv(dir string) (map[string]string, error) {
-	vars := make(map[string]string)
 	data, err := readOptionalConfig(dir, "env.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("read env.yaml: %w", err)
 	}
+	return readAppEnvFromSource(dir, data)
+}
+
+// Runtime loads privately stage env.yaml once for both merged credentials and
+// the YAML-only Go-template helper. Source-only inspection never calls this.
+func (c *runtimeConfig) stageEnvironment(dir string) (map[string]string, error) {
+	data, err := readOptionalConfig(dir, "env.yaml")
+	if err != nil {
+		return nil, err
+	}
+	vars, err := readAppEnvFromSource(dir, data)
+	if err != nil {
+		return nil, err
+	}
+	c.templateEnvSource = data
+	return appVisibleEnvironment(vars), nil
+}
+
+func readAppEnvFromSource(dir string, data []byte) (map[string]string, error) {
+	vars := make(map[string]string)
 	if len(data) > 0 {
 		if err := decodeConfigYAML(data, &vars); err != nil {
 			return nil, fmt.Errorf("invalid env.yaml; expected a mapping of environment keys to string values")
@@ -82,11 +101,11 @@ func readAppEnv(dir string) (map[string]string, error) {
 		}
 	}
 	systemdFilePresent := false
-	data, err = os.ReadFile(filepath.Join(dir, ".benmore", "env"))
-	if err != nil && !os.IsNotExist(err) {
+	data, err := readOptionalConfig(dir, ".benmore/env")
+	if err != nil {
 		return nil, fmt.Errorf("read environment file: %w", err)
 	}
-	if err == nil {
+	if data != nil {
 		systemdFilePresent = true
 		generated, err := parseAppEnvironmentFile(string(data))
 		if err != nil {
@@ -132,18 +151,45 @@ func readAppEnv(dir string) (map[string]string, error) {
 		}
 		vars[key] = value
 	}
-	return vars, nil
+	return appVisibleEnvironment(vars), nil
+}
+
+// These credentials authenticate the runtime/operator, never app-authored
+// templates or flows. ENCRYPTION_KEY and app provider keys remain app settings.
+func runtimePrivateEnvKey(key string) bool {
+	switch strings.ToUpper(key) {
+	case "BENMORE_SERVER_SECRET", "BENMORE_MASTER_KEY", "BENMORE_PPROF_TOKEN", "BENMORE_METRICS_TOKEN",
+		"BENMORE_AUDIT_WEBHOOK_SECRET", "BENMORE_AUDIT_WEBHOOK_TOKEN",
+		"BENMORE_UPLOADS_S3_KEY", "BENMORE_UPLOADS_S3_SECRET",
+		"BENMORE_MEDIA_S3_KEY", "BENMORE_MEDIA_S3_SECRET",
+		"BENMORE_BUILDER_UPLOADS_KEY", "BENMORE_BUILDER_UPLOADS_SECRET":
+		return true
+	}
+	return strings.HasPrefix(strings.ToUpper(key), "BENMORE_PLATFORM_") || strings.HasPrefix(strings.ToUpper(key), "BACKUP_S3_")
+}
+
+func appVisibleEnvironment(values map[string]string) map[string]string {
+	visible := make(map[string]string, len(values))
+	for key, value := range values {
+		if !runtimePrivateEnvKey(key) {
+			visible[key] = value
+		}
+	}
+	return visible
 }
 
 func storeAppEnv(dir string, vars map[string]string) {
 	absDir, _ := filepath.Abs(dir)
 	appEnvStore.mu.Lock()
-	appEnvStore.apps[absDir] = vars
+	appEnvStore.apps[absDir] = appVisibleEnvironment(vars)
 	appEnvStore.mu.Unlock()
 }
 
 // SetAppEnv sets a single env var for a specific app.
 func SetAppEnv(dir, key, value string) {
+	if runtimePrivateEnvKey(key) {
+		return
+	}
 	absDir, _ := filepath.Abs(dir)
 	appEnvStore.mu.Lock()
 	defer appEnvStore.mu.Unlock()
@@ -201,18 +247,26 @@ func processCredential(key string) string {
 
 // AppEnvSnapshot returns a copy so callers never iterate a concurrently edited map.
 func AppEnvSnapshot(dir string) map[string]string {
-	absDir, _ := filepath.Abs(dir)
+	return appEnvSnapshot(dir, nil)
+}
+
+// Caller holds app.mu when passing its bound generation. Cold replacement
+// may replace the directory store while the older App is still serving.
+func appEnvSnapshot(dir string, generation map[string]string) map[string]string {
 	appEnvStore.mu.RLock()
 	defer appEnvStore.mu.RUnlock()
-	vars := make(map[string]string, len(appEnvStore.apps[absDir]))
-	for k, v := range appEnvStore.apps[absDir] {
-		vars[k] = v
+	if generation == nil {
+		absDir, _ := filepath.Abs(dir)
+		generation = appEnvStore.apps[absDir]
 	}
-	return vars
+	return appVisibleEnvironment(generation)
 }
 
 // GetAppEnv returns an env var for a specific app directory.
 func GetAppEnv(dir, key string) string {
+	if runtimePrivateEnvKey(key) {
+		return ""
+	}
 	absDir, _ := filepath.Abs(dir)
 	appEnvStore.mu.RLock()
 	defer appEnvStore.mu.RUnlock()
@@ -226,7 +280,27 @@ func GetAppEnv(dir, key string) string {
 
 // InterpolateEnv replaces compact env references using only the caller's app.
 func InterpolateEnv(s string, appDir string) string {
-	for key, val := range AppEnvSnapshot(appDir) {
+	return interpolateEnvValues(s, AppEnvSnapshot(appDir))
+}
+
+func interpolateEnvForApp(s string, app *App) string {
+	if app == nil {
+		return s
+	}
+	app.mu.RLock()
+	env := app.environment
+	app.mu.RUnlock()
+	if env != nil {
+		return interpolateEnvValues(s, env)
+	}
+	return InterpolateEnv(s, app.Dir)
+}
+
+func interpolateEnvValues(s string, values map[string]string) string {
+	for key, val := range values {
+		if runtimePrivateEnvKey(key) {
+			continue
+		}
 		s = strings.ReplaceAll(s, "{{env."+key+"}}", val)
 	}
 	return s

@@ -77,3 +77,44 @@ func TestPagedTotal_HonorsWhereFilters(t *testing.T) {
 		t.Fatalf("operator-filtered page: data=%d total=%d, want data=1 total=1", dataLen, total)
 	}
 }
+
+func TestPagedMetadataMatchesDefaultAndCappedPageSize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	mustExec(t, db, `CREATE TABLE docs (id INTEGER PRIMARY KEY, filename TEXT)`)
+	mustExec(t, db, `WITH RECURSIVE rows(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM rows WHERE id<501) INSERT INTO docs SELECT id, printf('doc-%03d.pdf', id) FROM rows`)
+
+	app := &App{
+		Dir: dir, DB: db, SessionDuration: time.Hour, Stop: make(chan struct{}),
+		Access: &AccessConfig{rules: map[string]map[AccessOp]string{"docs": {OpRead: "everyone"}}},
+		Tables: []Table{{Name: "docs", Columns: []Column{{Name: "id"}, {Name: "filename"}}}},
+	}
+	defer app.Shutdown()
+	mux := buildAppMux(app, true, "http://localhost")
+	tok := createCrudScopeSession(t, app, "paged-size@example.com", "user", "", "")
+
+	check := func(path string, wantRows, wantPerPage int) {
+		t.Helper()
+		rec := crudScopeRequest(t, mux, http.MethodGet, path, tok, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data    []map[string]any `json:"data"`
+			PerPage int              `json:"per_page"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("GET %s: invalid page envelope: %v (%s)", path, err, rec.Body.String())
+		}
+		if len(envelope.Data) != wantRows || envelope.PerPage != wantPerPage {
+			t.Fatalf("GET %s: rows=%d per_page=%d, want rows=%d per_page=%d", path, len(envelope.Data), envelope.PerPage, wantRows, wantPerPage)
+		}
+	}
+
+	check("/api/docs?page=1", 50, 50)
+	check("/api/docs?page=1&per_page=999", 500, 500)
+}

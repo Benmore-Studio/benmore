@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // SchemaShorthand parses schema.yaml (terse format) and generates SQL.
@@ -45,18 +43,21 @@ func LoadSchemaShorthand(dir string) string {
 	if err != nil {
 		return ""
 	}
+	return parseSchemaShorthand(data)
+}
 
+func parseSchemaShorthand(data []byte) string {
 	// Try structured YAML first (models: section in app.yaml)
 	var structured struct {
 		Models map[string]string `yaml:"models"`
 	}
-	if err := yaml.Unmarshal(data, &structured); err == nil && len(structured.Models) > 0 {
+	if err := yamlUnmarshal(data, &structured); err == nil && len(structured.Models) > 0 {
 		return generateSQL(structured.Models)
 	}
 
 	// Try flat YAML (just table: columns)
 	var flat map[string]string
-	if err := yaml.Unmarshal(data, &flat); err == nil && len(flat) > 0 {
+	if err := yamlUnmarshal(data, &flat); err == nil && len(flat) > 0 {
 		return generateSQL(flat)
 	}
 
@@ -255,5 +256,5 @@ func WriteSchemaSQL(dir string) error {
 		}
 	}
 
-	return os.WriteFile(outPath, []byte(sql), 0644)
+	return writeAppSourceFile(outPath, []byte(sql))
 }

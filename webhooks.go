@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -32,10 +33,27 @@ func EnsureWebhooksTable(db *sql.DB) {
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_webhooks_active ON _benmore_webhooks(active)")
 }
 
-// RegisterWebhookRoutes sets up webhook subscription API endpoints.
-func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
-	EnsureWebhooksTable(app.DB)
+// webhookHintMinLen is the shortest secret that gets a last-4 hint: four
+// characters of a short secret are most of it.
+const webhookHintMinLen = 16
 
+// webhookSecretHint is how the subscription list shows a signing secret:
+// masked, with its last four characters when it is long enough for those to
+// identify it without giving it away.
+func webhookSecretHint(secret string) string {
+	if len(secret) < webhookHintMinLen {
+		return "****"
+	}
+	return "****" + secret[len(secret)-4:]
+}
+
+// RegisterWebhookRoutes sets up webhook subscription API endpoints.
+func RegisterWebhookRoutes(mux appRouteRegistrar, app *App) {
+	EnsureWebhooksTable(app.DB)
+	registerWebhookRoutes(mux, app)
+}
+
+func registerWebhookRoutes(mux appRouteRegistrar, app *App) {
 	// POST /api/_webhooks - register a new webhook
 	mux.HandleFunc("POST /api/_webhooks", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
@@ -47,6 +65,14 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 		// CSRF check (skip for Bearer auth)
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+			return
+		}
+
+		// A subscription receives every matching row change in the app,
+		// across all users and tenants, so creating one is an admin
+		// capability (a stepped-in/act-as admin does not qualify).
+		if !session.IsAdminBypass() || !session.IsAdminConsole() {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "webhook subscriptions receive every row change in the app; only app admins can create them"})
 			return
 		}
 
@@ -115,8 +141,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 		// ENCRYPTION_KEY is configured, so this stays backward-compatible.
 		encSecret, encErr := fieldEncryptForDB(app.DB, req.Secret)
 		if encErr != nil {
-			log.Printf("WEBHOOK ERROR: failed to encrypt secret: %s", encErr)
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create webhook"})
+			serverErrorJSON(w, r, app, "_webhooks", fmt.Errorf("encrypt secret: %w", encErr), "failed to create webhook")
 			return
 		}
 
@@ -125,8 +150,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 			session.UserID, req.URL, encSecret, req.Tables, req.Events,
 		)
 		if err != nil {
-			log.Printf("WEBHOOK ERROR: failed to create webhook: %s", err)
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create webhook"})
+			serverErrorJSON(w, r, app, "_webhooks", err, "failed to create webhook")
 			return
 		}
 
@@ -147,13 +171,13 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 
 		var rows []map[string]any
 		var err error
-		if session.IsAdmin() {
-			rows, err = QueryRows(app.DB, "SELECT id, user_id, url, secret, tables, events, active, created_at FROM _benmore_webhooks ORDER BY created_at DESC")
+		if session.IsAdminConsole() {
+			rows, err = queryMetadataRows(app.DB, "SELECT id, user_id, url, secret, tables, events, active, created_at FROM _benmore_webhooks ORDER BY created_at DESC")
 		} else {
-			rows, err = QueryRows(app.DB, "SELECT id, user_id, url, secret, tables, events, active, created_at FROM _benmore_webhooks WHERE user_id = ? ORDER BY created_at DESC", session.UserID)
+			rows, err = queryMetadataRows(app.DB, "SELECT id, user_id, url, secret, tables, events, active, created_at FROM _benmore_webhooks WHERE user_id = ? ORDER BY created_at DESC", session.UserID)
 		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to list webhooks"})
+			serverErrorJSON(w, r, app, "_webhooks", err, "failed to list webhooks")
 			return
 		}
 
@@ -164,11 +188,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 		for _, row := range rows {
 			if secret, ok := row["secret"].(string); ok {
 				secret, _ = fieldDecryptForDB(app.DB, secret)
-				if len(secret) > 4 {
-					row["secret"] = "****" + secret[len(secret)-4:]
-				} else {
-					row["secret"] = "****"
-				}
+				row["secret"] = webhookSecretHint(secret)
 			}
 		}
 
@@ -193,13 +213,13 @@ func RegisterWebhookRoutes(mux *http.ServeMux, app *App) {
 
 		var result sql.Result
 		var err error
-		if session.IsAdmin() {
+		if session.IsAdminConsole() {
 			result, err = app.DB.Exec("DELETE FROM _benmore_webhooks WHERE id = ?", id)
 		} else {
 			result, err = app.DB.Exec("DELETE FROM _benmore_webhooks WHERE id = ? AND user_id = ?", id, session.UserID)
 		}
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete webhook"})
+			serverErrorJSON(w, r, app, "_webhooks", err, "failed to delete webhook")
 			return
 		}
 		affected, _ := result.RowsAffected()
@@ -221,17 +241,30 @@ func FireWebhookSubscriptions(app *App, event string, table string, row map[stri
 	}
 
 	// Query active webhooks that match this table and event
-	rows, err := QueryRows(app.DB,
-		"SELECT id, user_id, url, secret, tables, events FROM _benmore_webhooks WHERE active = 1",
+	rows, err := queryMetadataRows(app.DB,
+		"SELECT id, user_id, url, tables, events FROM _benmore_webhooks WHERE active = 1",
 	)
 	if err != nil || len(rows) == 0 {
 		return
 	}
+	payloadRow := webhookPayloadRow(app, table, row)
 
+	// Deliver only for subscribers who are STILL active global admins: a
+	// subscription created before this check existed, or by a user since
+	// demoted or deactivated, must stop receiving other users' data.
+	adminCache := map[string]bool{}
 	for _, wh := range rows {
+		ownerKey := fmt.Sprintf("%v", wh["user_id"])
+		allowed, seen := adminCache[ownerKey]
+		if !seen {
+			allowed = webhookOwnerIsActiveAdmin(app, wh["user_id"])
+			adminCache[ownerKey] = allowed
+		}
+		if !allowed {
+			continue
+		}
 		whID := fmt.Sprintf("%v", wh["id"])
 		whURL := fmt.Sprintf("%v", wh["url"])
-		whSecret := fmt.Sprintf("%v", wh["secret"])
 		whTables := fmt.Sprintf("%v", wh["tables"])
 		whEvents := fmt.Sprintf("%v", wh["events"])
 
@@ -264,17 +297,100 @@ func FireWebhookSubscriptions(app *App, event string, table string, row map[stri
 		}
 
 		// Enqueue webhook delivery as a job (async, never blocks the CRUD response)
-		EnqueueWebhookSubscriptionJob(app.DB, whID, whURL, whSecret, event, table, row, session)
+		EnqueueWebhookSubscriptionJob(app, whID, whURL, event, table, payloadRow, session)
 	}
 }
 
+// enqueueWebhookSubscriptionsTx stores matching deliveries with the mutation,
+// so a committed update cannot lose its webhook intent on a process crash.
+func enqueueWebhookSubscriptionsTx(tx mutationTx, app *App, event, table string, row map[string]any, session *Session) error {
+	if strings.HasPrefix(table, "_benmore_") {
+		return nil
+	}
+	rows, err := queryMetadataRows(tx, "SELECT id, user_id, url, tables, events FROM main._benmore_webhooks WHERE active = 1")
+	if err != nil {
+		return fmt.Errorf("read webhook subscriptions: %w", err)
+	}
+	payloadRow := webhookPayloadRow(app, table, row)
+	adminCache := map[string]bool{}
+	for _, wh := range rows {
+		ownerKey := fmt.Sprint(wh["user_id"])
+		allowed, seen := adminCache[ownerKey]
+		if !seen {
+			var checkErr error
+			allowed, checkErr = webhookOwnerIsActiveAdminChecked(tx, wh["user_id"])
+			if checkErr != nil {
+				return fmt.Errorf("check webhook subscription owner: %w", checkErr)
+			}
+			adminCache[ownerKey] = allowed
+		}
+		if !allowed || !webhookSubscriptionMatches(wh, table, event) {
+			continue
+		}
+		// No signing secret in the job (see EnqueueWebhookSubscriptionJob):
+		// delivery reads it from the subscription row.
+		payload := map[string]any{"_webhook_subscription": map[string]any{
+			"webhook_id": fmt.Sprint(wh["id"]), "url": fmt.Sprint(wh["url"]),
+			"event": event, "table": table,
+		}, "_row": payloadRow}
+		if session != nil {
+			meta := payload["_webhook_subscription"].(map[string]any)
+			meta["user_email"], meta["user_id"] = session.Email, session.UserID
+		}
+		if err := sealJobPayloadRow(tx, app, table, payload); err != nil {
+			return fmt.Errorf("enqueue webhook subscription: %w", err)
+		}
+		if err := enqueueMutationJob(tx, "webhook", table, event, "webhook_subscription", "webhook_subscription", payload); err != nil {
+			return fmt.Errorf("enqueue webhook subscription: %w", err)
+		}
+	}
+	return nil
+}
+
+// webhookPayloadRow is the row a subscription delivery carries. A delivery is
+// a response leaving the app: it has the columns an API read would
+// (apiHiddenColumn), not `*_secret`/`*_token` values or their old_* deltas.
+func webhookPayloadRow(app *App, table string, row map[string]any) map[string]any {
+	payloadRow := make(map[string]any, len(row))
+	for k, v := range row {
+		if !hiddenEventKey(app, table, k) {
+			payloadRow[k] = v
+		}
+	}
+	return payloadRow
+}
+
+func webhookSubscriptionMatches(wh map[string]any, table, event string) bool {
+	for key, wanted := range map[string]string{"tables": table, "events": event} {
+		value := fmt.Sprint(wh[key])
+		if value == "" || value == "<nil>" {
+			continue
+		}
+		matched := false
+		for _, candidate := range strings.Split(value, ",") {
+			if strings.TrimSpace(candidate) == wanted {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
 // EnqueueWebhookSubscriptionJob adds a webhook subscription delivery to the job queue.
-func EnqueueWebhookSubscriptionJob(db *sql.DB, webhookID, webhookURL, secret, event, table string, row map[string]any, session *Session) {
+// The signing secret is not copied into the job: admins can read job payloads
+// (GET /api/_jobs/{id}), while the subscription list shows only its last four
+// characters. Delivery reads it from the subscription row. The row's
+// encrypted.yaml values are sealed (sealJobPayloadRow); a delivery whose row
+// can't be sealed is not queued.
+func EnqueueWebhookSubscriptionJob(app *App, webhookID, webhookURL, event, table string, row map[string]any, session *Session) {
 	payload := map[string]any{
 		"_webhook_subscription": map[string]any{
 			"webhook_id": webhookID,
 			"url":        webhookURL,
-			"secret":     secret,
 			"event":      event,
 			"table":      table,
 		},
@@ -284,9 +400,13 @@ func EnqueueWebhookSubscriptionJob(db *sql.DB, webhookID, webhookURL, secret, ev
 		payload["_webhook_subscription"].(map[string]any)["user_email"] = session.Email
 		payload["_webhook_subscription"].(map[string]any)["user_id"] = session.UserID
 	}
+	if err := sealJobPayloadRow(app.DB, app, table, payload); err != nil {
+		log.Printf("WEBHOOK SUBSCRIPTION #%s not queued: %s", webhookID, err)
+		return
+	}
 
 	data, _ := json.Marshal(payload)
-	db.Exec(
+	app.DB.Exec(
 		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at) VALUES ('webhook_subscription', 'webhook_subscription', ?, datetime('now'))",
 		string(data),
 	)
@@ -299,19 +419,50 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	if !ok {
 		return fmt.Errorf("missing _webhook_subscription in payload")
 	}
-	rowData, _ := data["_row"].(map[string]any)
-	if rowData == nil {
-		rowData = make(map[string]any)
+	// Re-check the subscription at delivery, including every retry: one
+	// deleted or deactivated after this job was queued, pointed elsewhere,
+	// or whose owner is no longer an active admin gets nothing. The check
+	// at enqueue alone left queued and backing-off deliveries (and crash
+	// requeues) sending rows to an endpoint the admin had just removed.
+	var (
+		subURL, subSecret string
+		subActive         int
+		subOwner          int64
+	)
+	webhookID := fmt.Sprintf("%v", whData["webhook_id"])
+	// A delivery that is dropped sent nothing. An ordinary job still completes
+	// (the subscriber asked for nothing more); a connector-command effect fails,
+	// so its status never reads delivered.
+	_, commandEffect := data[appMCPEffectKey]
+	dropped := func(reason string) error {
+		if commandEffect {
+			return jobNotRetryable{errors.New("dropped: " + reason)}
+		}
+		return nil
 	}
-
-	whURL := fmt.Sprintf("%v", whData["url"])
-	secret := fmt.Sprintf("%v", whData["secret"])
-	// M-6: the secret was stored encrypted in the webhooks table and
-	// carried through the job payload still encrypted, so decrypt it here
-	// at the only point it's actually needed (HMAC signing). fieldDecrypt
-	// is a pass-through for cleartext (pre-encryption) values, keeping
-	// in-flight jobs created before this change working.
-	secret, decryptErr := fieldDecryptForDB(app.DB, secret)
+	lookupErr := app.DB.QueryRow("SELECT url, secret, active, user_id FROM _benmore_webhooks WHERE id = ?", webhookID).
+		Scan(&subURL, &subSecret, &subActive, &subOwner)
+	switch {
+	case lookupErr == sql.ErrNoRows:
+		log.Printf("WEBHOOK SUBSCRIPTION #%s removed before delivery; dropped", webhookID)
+		return dropped("subscription removed")
+	case lookupErr != nil:
+		return fmt.Errorf("webhook subscription lookup: %w", lookupErr)
+	case subActive != 1:
+		log.Printf("WEBHOOK SUBSCRIPTION #%s inactive; delivery dropped", webhookID)
+		return dropped("subscription inactive")
+	case !webhookOwnerIsActiveAdmin(app, subOwner):
+		log.Printf("WEBHOOK SUBSCRIPTION #%s owner is no longer an active admin; delivery dropped", webhookID)
+		return dropped("subscription owner is no longer an active admin")
+	case fmt.Sprintf("%v", whData["url"]) != subURL:
+		log.Printf("WEBHOOK SUBSCRIPTION #%s URL changed after the delivery was queued; dropped", webhookID)
+		return dropped("subscription URL changed")
+	}
+	whURL := subURL
+	// M-6: the secret is stored encrypted in the webhooks table; decrypt it
+	// here at the only point it's actually needed (HMAC signing).
+	// fieldDecrypt is a pass-through for cleartext (pre-encryption) values.
+	secret, decryptErr := fieldDecryptForDB(app.DB, subSecret)
 	if decryptErr != nil {
 		return fmt.Errorf("webhook secret decryption failed")
 	}
@@ -320,14 +471,23 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 
 	// SSRF protection: re-validate at delivery time (URL could have been modified)
 	if isPrivateURL(whURL) {
-		log.Printf("SECURITY: blocked webhook subscription delivery to private URL: %s", whURL)
-		return fmt.Errorf("blocked private URL: %s", whURL)
+		log.Printf("SECURITY: blocked webhook subscription delivery to private host: %s", webhookHostForLog(whURL))
+		return jobNotRetryable{errors.New(appMCPEffectBlockedPrefix + "private webhook destination")}
 	}
 
 	// Circuit breaker: skip if endpoint is known-dead
-	host := extractHost(whURL)
+	host := circuitKey(app, whURL)
 	if err := CheckCircuit(host); err != nil {
 		return fmt.Errorf("circuit open: %s", err)
+	}
+
+	// The row as it was queued, with sealed encrypted.yaml values opened.
+	rowData, err := openJobPayloadRow(app, data, table)
+	if err != nil {
+		return err
+	}
+	if rowData == nil {
+		rowData = make(map[string]any)
 	}
 
 	// Build the payload
@@ -372,7 +532,7 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	req, err := http.NewRequest("POST", whURL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		RecordFailure(host)
-		return fmt.Errorf("failed to create request: %s", err)
+		return jobNotRetryable{errors.New("webhook request could not be built")}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Stripe-style combined header so receivers can pick the version they
@@ -389,19 +549,43 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	req.Header.Set("X-Webhook-Table", table)
 
 	client := safeHTTPClientStrict(10 * time.Second)
-	resp, err := client.Do(req)
+	status, err := postWebhook(client, req)
 	if err != nil {
 		RecordFailure(host)
-		return fmt.Errorf("webhook delivery failed: %s", err)
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		RecordFailure(host)
-		return fmt.Errorf("webhook returned %d", resp.StatusCode)
+		return webhookDeliveryError(err, commandEffect)
 	}
 
 	RecordSuccess(host)
-	log.Printf("WEBHOOK SUBSCRIPTION [%s/%s] %s -> %d", event, table, whURL, resp.StatusCode)
+	log.Printf("WEBHOOK SUBSCRIPTION [%s/%s] %s -> %d", event, table, webhookHostForLog(whURL), status)
 	return nil
+}
+
+// webhookOwnerIsActiveAdmin mirrors Session.IsAdmin for a stored subscriber:
+// the primary role column or an unexpired global admin grant, on an account
+// that is not deactivated.
+func webhookOwnerIsActiveAdmin(app *App, userID any) bool {
+	allowed, _ := webhookOwnerIsActiveAdminChecked(app.DB, userID)
+	return allowed
+}
+
+func webhookOwnerIsActiveAdminChecked(db rowQuerier, userID any) (bool, error) {
+	uid := toInt64(userID)
+	if uid <= 0 {
+		return false, nil
+	}
+	var role string
+	var deactivated sql.NullString
+	if err := db.QueryRow("SELECT COALESCE(role,''), deactivated_at FROM main._benmore_users WHERE id = ?", uid).Scan(&role, &deactivated); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	if deactivated.Valid && deactivated.String != "" {
+		return false, nil
+	}
+	if role == "admin" {
+		return true, nil
+	}
+	return userHasGlobalAdminGrantWithSchema(db, uid, "main")
 }

@@ -5,12 +5,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +28,29 @@ type Hook struct {
 	Notify  *NotifyHook // notification to create
 	WS      *WSHook     // broadcast over WebSocket to a room
 	SMS     *SMSHook    // text message via the configured SMS provider
-	When    string      // conditional: "stage = 'won'"
+	When    string      // SQL condition over the event row: "stage = 'won'" (hook_when.go)
+}
+
+type canonicalPrivateHookFailure struct {
+	message string
+	cause   error
+}
+
+func (e canonicalPrivateHookFailure) Error() string { return e.message }
+func (e canonicalPrivateHookFailure) Unwrap() error { return e.cause }
+
+func beforeHookFailure(db mutationQuerier, cause error) error {
+	if bound, ok := db.(appMCPContextTx); ok && bound.private {
+		return canonicalPrivateHookFailure{message: "validation check could not be evaluated", cause: cause}
+	}
+	return fmt.Errorf("validation check could not be evaluated")
+}
+
+func afterHookConditionFailure(tx mutationTx, cause error) error {
+	if bound, ok := tx.(appMCPContextTx); ok && bound.private {
+		return canonicalPrivateHookFailure{message: "after-hook condition could not be evaluated", cause: cause}
+	}
+	return fmt.Errorf("after-hook condition could not be evaluated")
 }
 
 // SMSHook sends a text message when a data event fires. Delivery goes
@@ -73,6 +98,29 @@ type EmailHook struct {
 	To       string
 	Subject  string
 	Template string
+	Body     string // inline body, used when Template is empty
+}
+
+// hookEmailBody renders an email hook's body: emails/<template>.html, a
+// literal template, or the inline `body:`. The YAML loader used to drop
+// `body:`, so a hook written that way (the documented-looking shape) sent an
+// empty email.
+//
+// The body is sent as HTML, so row values are escaped for where they land
+// (interpolateRowHTML); `{{{col}}}` and `{{{{col}}}}` ask for markup.
+func hookEmailBody(e *EmailHook, row map[string]any, appDir string) string {
+	if e.Template != "" {
+		// emails/ is part of the digested source; a name that climbs out of it
+		// (../docs/x) is not read as a file.
+		if name := e.Template + ".html"; filepath.IsLocal(name) {
+			if data, err := os.ReadFile(filepath.Join(appDir, "emails", name)); err == nil {
+				return interpolateRowHTML(stripEmailFrontmatter(string(data)), row, appDir)
+			}
+		}
+		// Fall back to a literal template treated as the body.
+		return interpolateRowHTML(e.Template, row, appDir)
+	}
+	return interpolateRowHTML(e.Body, row, appDir)
 }
 
 // HookConfig holds all hooks for the app.
@@ -222,6 +270,33 @@ func addHook(config *HookConfig, section, table string, hook *Hook) {
 
 // injectSessionContext adds user session data to a row map for hook/flow interpolation.
 // Provides {{user_email}}, {{user_id}}, {{user_role}}, {{user_group_id}} in hook SQL and webhook body templates.
+// submittedFieldsKey names the before-hook row value that lists the fields
+// the request submitted, as ",a,b," so a guard can test membership with
+// instr('{{_submitted}}', ',weight,') > 0. An unsubmitted {{field}} renders
+// as its literal placeholder text (submittedHookRow), which a caller could
+// also send as a value; this list is the unambiguous signal.
+const submittedFieldsKey = "_submitted"
+
+// markSubmittedFields records on a before-hook row the columns the request
+// is writing. names must be the request's own values that pass the column
+// and protected-field filters: never a column the framework fills in
+// (user_id, the tenant key) or a key the write drops (_csrf, query
+// parameters, unknown names). Listing a dropped key would let a request
+// make an unsubmitted field look submitted, e.g. with a key named "x,title".
+func markSubmittedFields(row map[string]any, names []string) {
+	list := make([]string, 0, len(names))
+	seen := map[string]bool{}
+	for _, k := range names {
+		if k == "id" || k == submittedFieldsKey || seen[k] {
+			continue
+		}
+		seen[k] = true
+		list = append(list, k)
+	}
+	sort.Strings(list)
+	row[submittedFieldsKey] = "," + strings.Join(list, ",") + ","
+}
+
 func injectSessionContext(row map[string]any, session *Session) {
 	if session == nil {
 		return
@@ -235,8 +310,14 @@ func injectSessionContext(row map[string]any, session *Session) {
 	// template scalar - flows and webhook templates can pipe-split if
 	// they want the slice form.
 	row["user_roles"] = strings.Join(session.Roles, ",")
-	if session.HasGroup() {
-		row["user_group_id"] = session.GroupID
+	// The tenant is session context like the keys above: the EFFECTIVE
+	// group (an admin's act-as tenant), never a value the request carried.
+	// Update rows start from every submitted key, so without a tenant the
+	// key is removed rather than left as whatever the body named.
+	if session.EffectiveHasGroup() {
+		row["user_group_id"] = session.EffectiveGroupID()
+	} else {
+		delete(row, "user_group_id")
 	}
 }
 
@@ -262,6 +343,45 @@ func FireBeforeHooks(app *App, event string, table string, row map[string]any) e
 	return fireBeforeHooksWith(app.DB, app, event, table, row)
 }
 func fireBeforeHooksWith(db mutationQuerier, app *App, event string, table string, row map[string]any) error {
+	return fireBeforeHooksRows(db, app, event, table, row, row)
+}
+
+// submittedHookRow is what a before_update hook's SQL placeholders resolve
+// against on a generic CRUD update: the request's own values. row is the
+// stored row merged with the change (validators and `when:` judge the row as
+// it will be), but `{{col}}` in hook SQL has always meant the value the
+// request sent, with an unsubmitted column left as its literal text; a guard
+// such as `'{{status}}' = 'approved'` must not fire for a request that never
+// named status because the stored row already holds it. Kept: id, the
+// submitted columns, {{_submitted}} and, for a signed-in caller, the session
+// keys. A hook reads stored values with a subquery on {{id}}.
+func submittedHookRow(row map[string]any, session *Session) map[string]any {
+	list, ok := row[submittedFieldsKey].(string)
+	if !ok {
+		return row
+	}
+	out := map[string]any{submittedFieldsKey: list}
+	if id, ok := row["id"]; ok {
+		out["id"] = id
+	}
+	for _, k := range strings.Split(strings.Trim(list, ","), ",") {
+		if v, ok := row[k]; ok && k != "" {
+			out[k] = v
+		}
+	}
+	if session != nil {
+		for _, k := range []string{"user_email", "user_id", "user_role", "user_roles", "user_group_id"} {
+			if v, ok := row[k]; ok {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// fireBeforeHooksRows runs the before-hooks with `when:` judged over row and
+// the hook SQL's placeholders resolved against sqlRow.
+func fireBeforeHooksRows(db mutationQuerier, app *App, event string, table string, row, sqlRow map[string]any) error {
 	if app.Hooks == nil {
 		return nil
 	}
@@ -277,8 +397,18 @@ func fireBeforeHooksWith(db mutationQuerier, app *App, event string, table strin
 	}
 
 	for _, hook := range hooks {
-		if hook.When != "" && !evaluateCondition(hook.When, row) {
-			continue
+		if hook.When != "" {
+			// A before-hook is a gate and `when:` decides whether it
+			// applies. A condition that can't be evaluated refuses the
+			// write, like hook SQL that can't be (below).
+			met, err := evaluateWhen(db, app, table, hook.When, row)
+			if err != nil {
+				logWhenFailure(app, table, hook.When, err)
+				return beforeHookFailure(db, err)
+			}
+			if !met {
+				continue
+			}
 		}
 		if hook.SQL != "" {
 			// Translate the documented `RAISE(ABORT,'msg')` idiom into the
@@ -291,8 +421,16 @@ func fireBeforeHooksWith(db mutationQuerier, app *App, event string, table strin
 			//   SELECT 'msg' AS error WHERE <cond>
 			// which returns the abort row exactly when <cond> holds.
 			raw := translateRaiseAbort(hook.SQL)
-			sql, args := interpolateRowSafe(raw, row, app.Dir)
-			rows, err := queryRowsWith(db, sql, args...)
+			sql, args := interpolateRowSafeForApp(raw, sqlRow, app)
+			if bound, ok := db.(appMCPContextTx); ok && bound.private {
+				if err := bound.cleanMain(); err != nil {
+					return beforeHookFailure(db, err)
+				}
+				if !isReadOnlyQuery(sql) {
+					return beforeHookFailure(db, fmt.Errorf("before-hook query is not read-only"))
+				}
+			}
+			rows, err := queryRowsWithAppMCP(db, sql, args...)
 			if err != nil {
 				// FAIL CLOSED. A before-hook is a gate (auth / business-rule
 				// enforcement). If it can't be evaluated - typo, bad column,
@@ -302,7 +440,7 @@ func fireBeforeHooksWith(db mutationQuerier, app *App, event string, table strin
 				// landed with a 200. The client gets a generic 422; the real
 				// SQL error is logged server-side (never leaked).
 				log.Printf("BEFORE-HOOK ERROR [%s %s] %s: %s - REJECTING mutation (fail-closed)", event, table, truncate(sql, 80), err)
-				return fmt.Errorf("validation check could not be evaluated")
+				return beforeHookFailure(db, err)
 			}
 			// If the query returns a row with an "error" field, abort the operation
 			if len(rows) > 0 {
@@ -355,8 +493,9 @@ func FireHooks(app *App, event string, table string, row map[string]any) {
 	}
 
 	for _, hook := range hooks {
-		// Check conditional
-		if hook.When != "" && !evaluateCondition(hook.When, row) {
+		// `when:` is SQL over the row (hook_when.go); a condition that
+		// can't be evaluated doesn't fire the hook.
+		if hook.When != "" && !whenHolds(app.DB, app, table, hook.When, row) {
 			continue
 		}
 
@@ -367,71 +506,250 @@ func FireHooks(app *App, event string, table string, row map[string]any) {
 		for k, v := range row {
 			r[k] = v
 		}
-		EnqueueHookJob(app.DB, hook, r)
+		EnqueueHookJob(app, hook, table, r)
 	}
 }
 
-func executeHook(app *App, hook Hook, row map[string]any) {
+// fireAfterHooksTx runs SQL-only after-hooks in the mutation transaction and
+// records every other hook as a durable job in that same transaction. Delivery
+// remains the job worker's responsibility after commit.
+func fireAfterHooksTx(tx mutationTx, app *App, event, table string, row map[string]any) ([]string, error) {
+	if app.Hooks == nil {
+		return nil, nil
+	}
+	var hooks []Hook
+	switch event {
+	case "insert":
+		hooks = app.Hooks.OnInsert[table]
+	case "update":
+		hooks = app.Hooks.OnUpdate[table]
+	case "delete":
+		hooks = app.Hooks.OnDelete[table]
+	}
+	return fireHookListTx(tx, app, event, table, row, hooks)
+}
+
+// fireHookListTx shares the canonical transactional SQL/job behavior with
+// workflow transition hooks. No external delivery occurs before commit.
+func fireHookListTx(tx mutationTx, app *App, event, table string, row map[string]any, hooks []Hook) ([]string, error) {
+	var refreshTables []string
+	for _, hook := range hooks {
+		if hook.When != "" {
+			met, err := evaluateWhen(tx, app, table, hook.When, row)
+			if err != nil {
+				logWhenFailure(app, table, hook.When, err)
+				return nil, afterHookConditionFailure(tx, err)
+			}
+			if !met {
+				continue
+			}
+		}
+		if hook.SQL != "" && hook.Webhook == "" && hook.Email == nil && hook.Notify == nil && hook.WS == nil && hook.SMS == nil {
+			sqlText, args := interpolateRowSafeForApp(hook.SQL, row, app)
+			if bound, ok := tx.(appMCPContextTx); ok && bound.private {
+				if err := bound.cleanMain(); err != nil {
+					return nil, err
+				}
+				if err := validateCanonicalHookScript(sqlText); err != nil {
+					return nil, err
+				}
+			}
+			if _, err := tx.Exec(sqlText, args...); err != nil {
+				return nil, fmt.Errorf("after-hook SQL failed: %w", err)
+			}
+			for _, target := range canonicalHookRefreshTargets(app, sqlText, table) {
+				refreshTables = append(refreshTables, target)
+			}
+			continue
+		}
+		payload := hookJobPayload(hook, table, row)
+		if err := sealJobPayloadRow(tx, app, table, payload); err != nil {
+			return nil, fmt.Errorf("enqueue after-hook job: %w", err)
+		}
+		if err := enqueueMutationJob(tx, "hook", table, event, "hook", "hook", payload); err != nil {
+			return nil, fmt.Errorf("enqueue after-hook job: %w", err)
+		}
+	}
+	return refreshTables, nil
+}
+
+func canonicalHookRefreshTargets(app *App, executedSQL, primaryTable string) []string {
+	targets, _ := sqlWriteTargets(executedSQL)
+	seen := make(map[string]bool, len(targets))
+	var refresh []string
+	for _, target := range targets {
+		name := target.Table
+		folded := sqliteIdentifierFold(name)
+		if folded == "" || folded == sqliteIdentifierFold(primaryTable) || strings.HasPrefix(folded, "_benmore_") || seen[folded] {
+			continue
+		}
+		canonicalName := ""
+		for _, appTable := range app.Tables {
+			if sqliteIdentifierFold(appTable.Name) == folded {
+				canonicalName = appTable.Name
+				break
+			}
+		}
+		if canonicalName != "" {
+			seen[folded] = true
+			refresh = append(refresh, canonicalName)
+		}
+	}
+	return refresh
+}
+
+func queryRowsWithAppMCP(db mutationQuerier, query string, args ...any) ([]map[string]any, error) {
+	if bound, ok := db.(appMCPContextTx); ok && bound.private {
+		return queryRowsWithMainKey(bound, query, args...)
+	}
+	return queryRowsWith(db, query, args...)
+}
+
+func validateCanonicalHookScript(script string) error {
+	statements := 0
+	err := splitSQLStatements(strings.NewReader(script), func(statement string) error {
+		tokens := sqlTokenize(statement)
+		if len(tokens) == 0 {
+			return nil
+		}
+		statements++
+		if tokens[0].kind != sqlTokWord {
+			return fmt.Errorf("hook statement is malformed")
+		}
+		switch strings.ToUpper(tokens[0].text) {
+		case "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH":
+		default:
+			return fmt.Errorf("hook statement type is unsupported")
+		}
+		lower := strings.ToLower(statement)
+		if strings.Contains(lower, "load_extension") || canonicalHookForbiddenSQL.MatchString(statement) {
+			return fmt.Errorf("hook statement contains a forbidden SQL construct")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if statements == 0 {
+		return fmt.Errorf("hook must contain a statement")
+	}
+	return nil
+}
+
+var canonicalHookForbiddenSQL = regexp.MustCompile(`(?i)\b(?:PRAGMA|ATTACH|DETACH)\b`)
+
+// postWebhook treats only 2xx as delivered. A transport error is ambiguous: the
+// receiver may have processed the POST before the response was lost, so callers
+// must not replay it. 408, 429 and 5xx responses remain retryable for ordinary
+// subscriptions; command-stamped effects are sealed after any delivery error.
+func postWebhook(client *http.Client, req *http.Request) (int, error) {
+	// Webhook POSTs must not be transformed into GETs or sent to another host
+	// by net/http's redirect policy. The 3xx response is classified below.
+	requestClient := *client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := requestClient.Do(req)
+	if err != nil {
+		return 0, jobNotRetryable{errors.New("unknown: webhook response was not confirmed")}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp.StatusCode, nil
+	}
+	if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return resp.StatusCode, fmt.Errorf("webhook returned %d", resp.StatusCode)
+	}
+	return resp.StatusCode, jobNotRetryable{fmt.Errorf("webhook returned permanent status %d", resp.StatusCode)}
+}
+
+func webhookHostForLog(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return "unknown"
+	}
+	return u.Hostname()
+}
+
+func webhookDeliveryError(err error, commandEffect bool) error {
+	if err != nil && commandEffect {
+		return jobNotRetryable{err}
+	}
+	return err
+}
+
+func executeHook(app *App, hook Hook, table string, row map[string]any) {
+	// Best effort, as before: failures are logged, never retried.
+	_ = executeHookResult(app, hook, table, row)
+}
+
+// executeHookResult runs one hook and reports the first action that did not
+// complete. A connector-command effect job turns that into a failed (not
+// retried, not "delivered") effect; every other caller keeps the historic
+// log-only behavior through executeHook.
+func executeHookResult(app *App, hook Hook, table string, row map[string]any) (err error) {
 	db, appDir := app.DB, app.Dir
+	// firstErr records a failure the historic flow carried on past (email, sms,
+	// notify); a failure it returned on is returned the same way.
+	var firstErr error
+	note := func(failure error) {
+		if firstErr == nil {
+			firstErr = failure
+		}
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("HOOK PANIC: %v", r)
+			err = fmt.Errorf("hook panicked")
 		}
 	}()
 
 	// Webhook
 	if hook.Webhook != "" {
-		webhookURL := InterpolateEnv(hook.Webhook, appDir)
+		webhookURL := interpolateEnvForApp(hook.Webhook, app)
+		webhookHost := webhookHostForLog(webhookURL)
 
 		// SSRF protection: block requests to private/internal IPs
 		if isPrivateURL(webhookURL) {
-			log.Printf("SECURITY: blocked webhook to private URL: %s", webhookURL)
-			return
+			log.Printf("SECURITY: blocked webhook to private host: %s", webhookHost)
+			return errors.New("hook webhook blocked: private URL")
 		}
 
-		body := interpolateRow(hook.Body, row, appDir)
+		body := interpolateRowJSONForApp(hook.Body, row, app)
 		if body == "" {
-			data, _ := json.Marshal(row)
-			body = string(data)
+			body = hookDefaultBody(app, table, row)
 		}
 
 		// Circuit breaker: skip if endpoint is known-dead
-		host := extractHost(webhookURL)
+		host := circuitKey(app, webhookURL)
 		if err := CheckCircuit(host); err != nil {
-			log.Printf("HOOK SKIPPED [webhook] %s: %s", webhookURL, err)
-			return
+			log.Printf("HOOK SKIPPED [webhook] %s: %s", webhookHost, err)
+			return errors.New("hook webhook skipped: circuit open")
 		}
 
 		req, err := http.NewRequest("POST", webhookURL, bytes.NewBufferString(body))
 		if err != nil {
-			log.Printf("HOOK ERROR [webhook] %s: %s", webhookURL, err)
+			log.Printf("HOOK ERROR [webhook] %s: request could not be built", webhookHost)
 			RecordFailure(host)
-			return
+			return errors.New("hook webhook request could not be built")
 		}
 		req.Header.Set("Content-Type", "application/json")
 
 		client := safeHTTPClientStrict(10 * time.Second)
-		resp, err := client.Do(req)
+		status, err := postWebhook(client, req)
 		if err != nil {
-			log.Printf("HOOK ERROR [webhook] %s: %s", webhookURL, err)
+			log.Printf("HOOK ERROR [webhook] %s: %s", webhookHost, err)
 			RecordFailure(host)
-			return
+			return err
 		}
-		resp.Body.Close()
-		if resp.StatusCode >= 500 {
-			RecordFailure(host)
-		} else {
-			RecordSuccess(host)
-		}
-		log.Printf("HOOK [webhook] %s → %d", webhookURL, resp.StatusCode)
+		RecordSuccess(host)
+		log.Printf("HOOK [webhook] %s → %d", webhookHost, status)
 	}
 
 	// SQL - use parameterized interpolation to prevent injection from row data
 	if hook.SQL != "" {
-		sql, args := interpolateRowSafe(hook.SQL, row, appDir)
+		sql, args := interpolateRowSafeForApp(hook.SQL, row, app)
 		if _, err := db.Exec(sql, args...); err != nil {
 			log.Printf("HOOK ERROR [sql] %s: %s", truncate(sql, 80), err)
-			return
+			return errors.New("hook SQL failed")
 		}
 		log.Printf("HOOK [sql] executed: %s", truncate(sql, 60))
 	}
@@ -440,22 +758,17 @@ func executeHook(app *App, hook Hook, row map[string]any) {
 	// Template is loaded from emails/<name>.html if specified; row
 	// values are mustache-interpolated into both subject + body.
 	if hook.Email != nil {
-		to := interpolateRow(hook.Email.To, row, appDir)
+		// Part by part: a row value is one recipient (email_recipients.go).
+		to, toErr := hookEmailRecipients(hook.Email.To, row, appDir)
 		subject := interpolateRow(hook.Email.Subject, row, appDir)
-		body := ""
-		if hook.Email.Template != "" {
-			tmplPath := filepath.Join(appDir, "emails", hook.Email.Template+".html")
-			if data, err := os.ReadFile(tmplPath); err == nil {
-				body = interpolateRow(stripEmailFrontmatter(string(data)), row, appDir)
-			} else {
-				// Fall back to a literal template treated as the body.
-				body = interpolateRow(hook.Email.Template, row, appDir)
-			}
-		}
-		if err := SendEmail(appDir, to, subject, body); err != nil {
-			log.Printf("HOOK [email] send failed: %s", err)
+		if toErr != nil {
+			log.Printf("HOOK [email] send failed: %s", toErr)
+			note(errors.New("hook email was not sent"))
+		} else if err := SendEmail(appDir, to, subject, hookEmailBody(hook.Email, row, appDir)); err != nil {
+			log.Printf("HOOK [email] send failed: %s", logSendErrorRecipients(err, to))
+			note(errors.New("hook email was not sent"))
 		} else {
-			log.Printf("HOOK [email] sent to=%s subject=%s", to, subject)
+			log.Printf("HOOK [email] sent to=%s subject=%s", logRecipientsRef(to), subject)
 		}
 	}
 
@@ -469,20 +782,25 @@ func executeHook(app *App, hook Hook, row map[string]any) {
 		switch {
 		case to == "":
 			log.Printf("HOOK [sms] skipped: `to` resolved empty from template %q - check the column exists on the row", hook.SMS.To)
+			note(errors.New("hook sms skipped: empty recipient"))
 		case body == "":
 			log.Printf("HOOK [sms] skipped: `body` resolved empty from template %q - check the column exists on the row", hook.SMS.Body)
+			note(errors.New("hook sms skipped: empty body"))
 		default:
 			if err := SendSMS(appDir, to, body); err != nil {
-				log.Printf("HOOK [sms] send failed to=%s: %s", to, err)
+				log.Printf("HOOK [sms] send failed to=%s: %s", logAddressRef(to), logSendError(err, to))
+				note(errors.New("hook sms was not sent"))
 			} else {
-				log.Printf("HOOK [sms] sent to=%s", to)
+				log.Printf("HOOK [sms] sent to=%s", logAddressRef(to))
 			}
 		}
 	}
 
 	// Notification
 	if hook.Notify != nil {
-		executeNotifyHook(db, hook.Notify, row, appDir)
+		if err := executeNotifyHook(db, hook.Notify, row, appDir); err != nil {
+			note(err)
+		}
 	}
 
 	// WebSocket broadcast
@@ -490,10 +808,9 @@ func executeHook(app *App, hook Hook, row map[string]any) {
 		room := interpolateRow(hook.WS.Room, row, appDir)
 		payload := hook.WS.Payload
 		if payload == "" {
-			data, _ := json.Marshal(row)
-			payload = string(data)
+			payload = hookDefaultWSPayload(table)
 		} else {
-			payload = interpolateRow(payload, row, appDir)
+			payload = interpolateRowJSONWithEnv(payload, row, nil, appDir)
 		}
 		groupID := ""
 		if app.Group != nil && app.Group.Key != "" {
@@ -503,71 +820,89 @@ func executeHook(app *App, hook Hook, row map[string]any) {
 		}
 		if err := BroadcastWSToRoom(app, groupID, room, payload); err != nil {
 			log.Printf("HOOK ERROR [ws]: %s", err)
-			return
+			note(errors.New("hook ws broadcast failed"))
+			return firstErr
 		}
 		log.Printf("HOOK [ws] broadcast to %s (%d bytes)", room, len(payload))
 	}
+	return firstErr
 }
 
-// evaluateCondition checks a simple condition like "stage = 'won'" against row data.
-func evaluateCondition(condition string, row map[string]any) bool {
-	// Support: field = 'value', field != 'value', field > N, field < N
-	condition = strings.TrimSpace(condition)
+// hookDefaultBody is what a hook `webhook:` without `body:` posts: the event
+// row with the columns an API read would carry, like a webhook subscription
+// delivery (webhookPayloadRow). A job queued without its table strips by
+// column name.
+func hookDefaultBody(app *App, table string, row map[string]any) string {
+	data, _ := json.Marshal(webhookPayloadRow(app, table, row))
+	return string(data)
+}
 
-	// Try equality: field = 'value'
-	for _, op := range []string{"!=", "=", ">=", "<=", ">", "<"} {
-		parts := strings.SplitN(condition, op, 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		field := strings.TrimSpace(parts[0])
-		expected := strings.TrimSpace(parts[1])
-		expected = strings.Trim(expected, `"'`)
-
-		// Format the row value as a string for comparison. Critical
-		// detail: when the key is MISSING OR NIL, format as the empty
-		// string - not the Go default `"<nil>"`. Pre-v2.7.6, missing
-		// keys formatted as `"<nil>"`, so `field != ''` was always
-		// true (even when the agent meant "field has a non-empty
-		// value"). An earlier app build hit this every time it
-		// gated on an optional column. Mirrors what most SQL engines
-		// do: NULL compared as if it were "" for the purposes of
-		// equality against the empty string literal.
-		rawVal, present := row[field]
-		var actual string
-		if !present || rawVal == nil {
-			actual = ""
-		} else {
-			actual = fmt.Sprintf("%v", rawVal)
-		}
-
-		switch op {
-		case "=":
-			return actual == expected
-		case "!=":
-			return actual != expected
-		case ">":
-			return actual > expected
-		case "<":
-			return actual < expected
-		case ">=":
-			return actual >= expected
-		case "<=":
-			return actual <= expected
-		}
+// hookDefaultWSPayload is what a hook `ws:` without `payload:` broadcasts:
+// only the table that changed. Room members are clients and an undeclared
+// room is open to any signed-in user of the app or tenant, so the row (which
+// row scoping and encrypted-field masking would otherwise filter) is sent
+// only when the payload names its columns.
+func hookDefaultWSPayload(table string) string {
+	if table == "" {
+		return "{}"
 	}
-
-	return false
+	data, _ := json.Marshal(map[string]string{"table": table})
+	return string(data)
 }
 
+// interpolateRow replaces `{{column}}` with the row's value and
+// `{{env.X}}` with the app's env value in ONE pass over the author's
+// template. Substituted values are never scanned again: row values are
+// user input, and re-expanding them let a submitted `{{env.SECRET}}` (or
+// another column's `{{name}}`) reach a webhook, email or notification.
 func interpolateRow(template string, row map[string]any, appDir string) string {
-	result := template
-	for key, val := range row {
-		result = strings.ReplaceAll(result, "{{"+key+"}}", fmt.Sprintf("%v", val))
+	return interpolateRowWithEnv(template, row, nil, appDir)
+}
+
+func interpolateRowForApp(template string, row map[string]any, app *App) string {
+	if app == nil {
+		return interpolateRowWithEnv(template, row, map[string]string{}, "")
 	}
-	result = InterpolateEnv(result, appDir)
-	return result
+	app.mu.RLock()
+	env := app.environment
+	app.mu.RUnlock()
+	if env != nil {
+		return interpolateRowWithEnv(template, row, env, "")
+	}
+	return interpolateRowWithEnv(template, row, nil, app.Dir)
+}
+
+func interpolateRowWithEnv(template string, row map[string]any, env map[string]string, appDir string) string {
+	if !strings.Contains(template, "{{") {
+		return template
+	}
+	var b strings.Builder
+	i := 0
+	for i < len(template) {
+		if strings.HasPrefix(template[i:], "{{") {
+			if end := strings.Index(template[i+2:], "}}"); end >= 0 {
+				name := template[i+2 : i+2+end]
+				if val, ok := row[name]; ok {
+					fmt.Fprintf(&b, "%v", val)
+					i += end + 4
+					continue
+				}
+				if key, ok := strings.CutPrefix(name, "env."); ok {
+					if env == nil {
+						env = AppEnvSnapshot(appDir)
+					}
+					if val, ok := env[key]; ok {
+						b.WriteString(val)
+						i += end + 4
+						continue
+					}
+				}
+			}
+		}
+		b.WriteByte(template[i])
+		i++
+	}
+	return b.String()
 }
 
 // interpolateRowSafe replaces {{key}} AND :name with ? placeholders and
@@ -582,7 +917,15 @@ func interpolateRow(template string, row map[string]any, appDir string) string {
 // Now hooks accept either syntax; one consistent surface across SQL
 // steps + hooks.
 func interpolateRowSafe(template string, row map[string]any, appDir string) (string, []any) {
-	result := InterpolateEnv(template, appDir)
+	result := interpolateEnvValues(template, AppEnvSnapshot(appDir))
+	return interpolateRowSafeValues(result, row)
+}
+
+func interpolateRowSafeForApp(template string, row map[string]any, app *App) (string, []any) {
+	return interpolateRowSafeValues(interpolateEnvForApp(template, app), row)
+}
+
+func interpolateRowSafeValues(result string, row map[string]any) (string, []any) {
 	var args []any
 	var output strings.Builder
 	inString := false // track if we're inside a SQL string literal

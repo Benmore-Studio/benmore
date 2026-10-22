@@ -149,7 +149,7 @@ func runServerNew() {
 	if _, err := os.Stat(dir); err == nil {
 		log.Fatalf("refusing to scaffold: %s already exists", dir)
 	}
-	if err := WriteHTMLScaffoldFiles(dir, ""); err != nil {
+	if err := writeHTMLScaffoldFiles(dir, "", editionName == "framework"); err != nil {
 		log.Fatalf("scaffold failed: %s", err)
 	}
 	absDir, err := filepath.Abs(dir)
@@ -163,14 +163,13 @@ func scaffoldNextSteps(absDir string) string {
 	if editionName == "framework" {
 		return fmt.Sprintf("Created %s\n\nNext:\n  benmore serve %q --port 8080\n  open http://localhost:8080\n", absDir, absDir)
 	}
-	return fmt.Sprintf("Created %s\n\nNext:\n  cd %q\n  benmore deploy\n  benmore open .\n", absDir, absDir)
+	return fmt.Sprintf("Created %s\n\nNext:\n  cd %q\n  benmore deploy\n  benmore open .\n\nOptional app connector: after deploying, pull the complete source before authoring and reviewing mcp.yaml. See `benmore docs connector`.\n", absDir, absDir)
 }
 
-// runServerServe boots a single app on a single port.
-func runServerServe() {
-	dir := getAppDir(2)
-	port, _ := strconv.Atoi(getFlag("port", "8080"))
-
+// startServedApp is the start of a served process: the boot check, the start-up
+// load and the one-shot resume of approved connector writes, in that order.
+// Tests restart through it so they cannot skip a step the real process takes.
+func startServedApp(dir string) (*App, error) {
 	// Run the unified validators before boot (v2.7.164). The platform's
 	// write-time gate is what catches broken flows / malformed YAML on
 	// hosted apps; local serve historically skipped it entirely, so a
@@ -178,11 +177,33 @@ func runServerServe() {
 	// surfaced at push time. Findings print as warnings - serve still
 	// boots so a stale finding can't brick local dev.
 	serveBootCheck(dir)
+	app, err := loadAppWithOptions(dir, appLoadOptions{startup: true})
+	if err != nil {
+		return nil, err
+	}
+	resumeAppMCPApprovedWrites(app)
+	return app, nil
+}
 
-	app, err := loadApp(dir)
+// runServerServe boots a single app on a single port.
+func runServerServe() {
+	dir := getAppDir(2)
+	port, _ := strconv.Atoi(getFlag("port", "8080"))
+
+	mcpLocal := hasFlag("mcp-local") || hasFlag("mcp-writes")
+	if mcpLocal {
+		authority, err := prepareMCPLocalAuthority(dir)
+		if err != nil {
+			log.Fatalf("--mcp-local: %s", err)
+		}
+		log.Printf("  MCP local: authority directory %s", authority)
+	}
+
+	app, err := startServedApp(dir)
 	if err != nil {
 		log.Fatalf("Error loading app: %s", err)
 	}
+	app.MCPLocal, app.MCPLocalWrites = mcpLocal, hasFlag("mcp-writes")
 	// app.Shutdown() does the WAL checkpoint + DB.Close pair, plus
 	// signals every goroutine listening on app.Stop. Pre-2.7.32 only
 	// app.DB.Close() ran here, which skipped the wal_checkpoint and
@@ -191,6 +212,9 @@ func runServerServe() {
 	// the deferred call runs even when graceful shutdown took the
 	// full TimeoutStopSec window.
 	defer app.Shutdown()
+	// Let a job or scheduled flow in progress finish when systemd stops the
+	// unit; past serveJobDrainTimeout the database closes under it.
+	app.jobDrainTimeout = serveJobDrainTimeout
 
 	if err := StartServer(app, port, false); err != nil {
 		log.Fatalf("Server error: %s", err)

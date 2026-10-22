@@ -6,9 +6,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -25,7 +27,7 @@ import (
 // formatted the zero value verbatim and shipped
 // "0001-01-01T00:00:00Z" to API callers - a clear-as-day bug for
 // any nullable DateTime column. Non-zero times still format to
-// RFC3339 in UTC.
+// RFC3339Nano in UTC, preserving optimistic-concurrency version precision.
 func coerceSQLValue(v any) any {
 	switch t := v.(type) {
 	case []byte:
@@ -34,7 +36,7 @@ func coerceSQLValue(v any) any {
 		if t.IsZero() {
 			return nil
 		}
-		return t.UTC().Format(time.RFC3339)
+		return t.UTC().Format(time.RFC3339Nano)
 	case *time.Time:
 		// Defensive: a *time.Time scan destination would yield
 		// either nil (NULL column) or a pointer to a populated
@@ -43,7 +45,7 @@ func coerceSQLValue(v any) any {
 		if t == nil || t.IsZero() {
 			return nil
 		}
-		return t.UTC().Format(time.RFC3339)
+		return t.UTC().Format(time.RFC3339Nano)
 	}
 	return v
 }
@@ -51,16 +53,16 @@ func coerceSQLValue(v any) any {
 // crudSelectFields resolves the `?fields=` projection for a list/read
 // request, but - unlike the bare selectFields helper - intersects the
 // requested columns with this table's real schema AND drops any column
-// the sensitive-field denylist (isSensitiveUserColumn) would mask on a
-// write-back.
+// apiHiddenColumn hides from every response (secrets, tokens, blind
+// indexes).
 //
 // M-5: without this, `?fields=password_hash` projected secret columns
 // directly even though the same columns are stripped from write
 // responses and user-object payloads. fail closed: an unknown or
 // sensitive requested column is dropped, and a projection that resolves
 // to NOTHING falls back to the default ("*") rather than emitting an
-// empty/invalid SELECT - "*" itself is still masked downstream by
-// MaskEncryptedFields, so this never widens exposure.
+// empty/invalid SELECT - "*" itself is still sanitized downstream by
+// sanitizeResponseRows, so this never widens exposure.
 func crudSelectFields(r *http.Request, app *App, table, defaultFields string) string {
 	raw := r.URL.Query().Get("fields")
 	if raw == "" {
@@ -71,7 +73,7 @@ func crudSelectFields(r *http.Request, app *App, table, defaultFields string) st
 	// the schema, fall back to the default rather than trusting client
 	// input.
 	allowed := make(map[string]bool)
-	cols, err := GetTableColumns(app.DB, table)
+	cols, err := crudTableColumns(r, app, table)
 	if err != nil {
 		return defaultFields
 	}
@@ -86,9 +88,8 @@ func crudSelectFields(r *http.Request, app *App, table, defaultFields string) st
 			continue
 		}
 		// Must be a real column on this table (allowlist) and must not be
-		// a sensitive/secret column (denylist) - same denylist used to
-		// mask write-backs and user payloads.
-		if !allowed[f] || isSensitiveUserColumn(f) {
+		// a hidden column - the same predicate every response applies.
+		if !allowed[f] || apiHiddenColumn(app, table, f) {
 			continue
 		}
 		safe = append(safe, f)
@@ -99,7 +100,101 @@ func crudSelectFields(r *http.Request, app *App, table, defaultFields string) st
 	return strings.Join(safe, ", ")
 }
 
+// Retain the row identity needed by encrypted-field policy inside a controlled
+// projection. These columns are removed after masking unless requested by the
+// caller; a projection must not either bypass masking or hide authorized data.
+func crudMaskingProjection(app *App, table, fields string) (string, []string) {
+	if fields == "*" || app == nil || app.Encrypted == nil {
+		return fields, nil
+	}
+	selected := strings.Split(fields, ", ")
+	needsIdentity := false
+	for _, def := range app.Encrypted.Fields[table] {
+		if len(def.Roles) > 0 && slices.Contains(selected, def.Column) {
+			needsIdentity = true
+			break
+		}
+	}
+	if !needsIdentity {
+		return fields, nil
+	}
+	var hidden []string
+	for _, col := range []string{encryptedTenantColumn(app, table), "user_id"} {
+		if col != "" && hasColumn(app, table, col) && !slices.Contains(selected, col) {
+			selected = append(selected, col)
+			hidden = append(hidden, col)
+		}
+	}
+	return strings.Join(selected, ", "), hidden
+}
+
+func stripMaskingProjection(rows []map[string]any, hidden []string) {
+	for _, row := range rows {
+		for _, col := range hidden {
+			delete(row, col)
+		}
+	}
+}
+
+// listColumnAllowlist is the set of columns a list request may filter or sort
+// on. Hidden columns (apiHiddenColumn) are excluded: they are stripped from
+// every response, but a `?share_token__like=ab%` or `?sort=share_token` still
+// answers match/no-match per row, which recovers the secret a character at a
+// time. Blind-index siblings stay in the set on purpose - their probe is gated
+// separately by blindFilterAccessFor.
+func listColumnAllowlist(app *App, table string, cols []Column) map[string]bool {
+	allow := make(map[string]bool)
+	for _, c := range cols {
+		if strings.HasSuffix(c.Name, blindColSuffix) || !apiHiddenColumn(app, table, c.Name) {
+			allow[c.Name] = true
+		}
+	}
+	return allow
+}
+
+// hiddenListParam returns the first hidden column a list request filters or
+// sorts on, or "". The allowlist drops such a parameter, and a dropped filter
+// silently widens the result (`?invite_token=X` would return every invite), so
+// handleList refuses the request instead of answering with rows the caller
+// did not ask for.
+func hiddenListParam(r *http.Request, app *App, table string) string {
+	cols, err := crudTableColumns(r, app, table)
+	allow := listColumnAllowlist(app, table, cols)
+	real := map[string]bool{}
+	if err == nil {
+		for _, c := range cols {
+			real[c.Name] = true
+		}
+	}
+	hidden := func(col string) bool { return real[col] && !allow[col] }
+	q := r.URL.Query()
+	keys := make([]string, 0, len(q))
+	for key := range q {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if apiFilterReservedParam(key) {
+			continue
+		}
+		if col, _ := splitAPIFilterKey(key); col != "" && hidden(col) {
+			return col
+		}
+	}
+	sortCol := q.Get("sort")
+	if ob := q.Get("orderBy"); sortCol == "" && ob != "" {
+		sortCol = strings.SplitN(ob, ":", 2)[0]
+	}
+	if sortCol != "" && hidden(sortCol) {
+		return sortCol
+	}
+	return ""
+}
+
 func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) {
+	if !appMCPReadOperationAllowed(w, r, "table.list") {
+		return
+	}
 	// Declarative access gate (v2.7.12). Decides whether the request
 	// can hit this endpoint AT ALL. Also drives the per-row filter
 	// below: when mode is `anon`/`everyone`, we skip the implicit
@@ -114,6 +209,9 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	allowBroaderRows := app.Access.ReadAllowsBroaderRows(readMode)
 
 	session := getSession(app, r)
+	if !appMCPReadSessionAvailable(w, r, session) {
+		return
+	}
 
 	// Scope enforcement
 	if session != nil {
@@ -121,6 +219,26 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
 			return
 		}
+	}
+
+	// A blind-index filter (`?ssn=<guess>`) confirms plaintexts even when
+	// the column comes back masked, so callers who may not see the column
+	// unmasked get a 403 (not a silently widened result they'd misread).
+	if col := blindFilterRefusal(r, app, table, session); col != "" {
+		writeBlindFilterRefusal(w, table, col)
+		return
+	}
+
+	if col := hiddenListParam(r, app, table); col != "" {
+		httpJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("%s.%s is a hidden column and cannot be filtered or sorted on; the filter would be ignored and return unfiltered rows. Look the row up by another column or a flow.", table, col),
+		})
+		return
+	}
+	include, err := normalizeIncludeSpec(r.URL.Query().Get("include"))
+	if err != nil {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
 	}
 
 	// Read audit logging (batched, non-blocking)
@@ -133,7 +251,8 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// like ?fields=password_hash can't bypass the masking applied to
 	// write-backs (M-5).
 	fields := crudSelectFields(r, app, table, "*")
-	baseSQL := fmt.Sprintf("SELECT %s FROM %s", fields, table)
+	fields, hiddenMasking := crudMaskingProjection(app, table, fields)
+	baseSQL := fmt.Sprintf("SELECT %s FROM %s", fields, quoteIdent(table))
 
 	// Soft delete filter: exclude deleted rows if table has deleted_at
 	hasWhere := false
@@ -210,13 +329,37 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// special chars literal while preserving multi-word AND-search.
 	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
 		ftsTable, ftsCols := FTSTableFor(app.Tables, table)
+		// A hidden column in @@fulltext would make ?q= a substring oracle
+		// for a value no response returns (the round-9 filter/sort rule),
+		// so search only the columns a response carries.
+		searchCols := ftsSearchColumns(app, table, ftsCols)
+		if ftsTable != "" && len(searchCols) == 0 {
+			httpJSON(w, http.StatusBadRequest, map[string]any{
+				"error": fmt.Sprintf("%s: every @@fulltext column is a hidden column, so ?q= cannot search it. Index a column responses return, or search in a flow.", table),
+			})
+			return
+		}
 		if ftsTable != "" {
 			var clause string
 			if ftsTrigramUsable(q) {
 				// Trigram MATCH: indexed substring search (contains).
-				clause = fmt.Sprintf("%s.id IN (SELECT rowid FROM %s WHERE %s MATCH ?)", table, ftsTable, ftsTable)
-				scopeArgs = append(scopeArgs, escapeFTS5Query(q))
-			} else if lc, largs := buildFTSLikeFallback(table, ftsCols, q); lc != "" {
+				match := escapeFTS5Query(q)
+				if len(searchCols) < len(ftsCols) {
+					match = "{" + strings.Join(searchCols, " ") + "} : (" + match + ")"
+				}
+				columns, err := crudTableColumns(r, app, table)
+				if err != nil {
+					serverErrorJSON(w, r, app, "search columns", err, "search failed")
+					return
+				}
+				rowID, err := ftsSourceRowID(columns)
+				if err != nil {
+					serverErrorJSON(w, r, app, "search identity", err, "search failed")
+					return
+				}
+				clause = fmt.Sprintf("%s IN (SELECT rowid FROM %s WHERE %s MATCH ?)", quoteColumn(table, rowID), quoteIdent(ftsTable), quoteIdent(ftsTable))
+				scopeArgs = append(scopeArgs, match)
+			} else if lc, largs := buildFTSLikeFallback(table, searchCols, q); lc != "" {
 				// Sub-3-char query - trigram can't tokenize it; LIKE fallback.
 				clause = lc
 				scopeArgs = append(scopeArgs, largs...)
@@ -234,14 +377,10 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Cursor pagination: ?cursor=X&limit=N (keyset, fast for large datasets)
 	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
-		colAllowlist := make(map[string]bool)
-		if cols, err := GetTableColumns(app.DB, table); err == nil {
-			for _, col := range cols {
-				colAllowlist[col.Name] = true
-			}
-		}
+		cols, _ := crudTableColumns(r, app, table)
+		colAllowlist := listColumnAllowlist(app, table, cols)
 		// Apply the same filters as offset/count before adding the keyset.
-		cursorSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, colAllowlist)
+		cursorSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, session, colAllowlist)
 		cursorArgs := append(append([]any{}, scopeArgs...), whereArgs...)
 		hiddenID := fields != "*" && !slices.Contains(strings.Split(fields, ", "), "id")
 		if hiddenID {
@@ -258,20 +397,20 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		}
 		cursorSQL += fmt.Sprintf(" ORDER BY id ASC LIMIT %d", limit)
 		cursorArgs = append(cursorArgs, cursor)
-		rows, err := QueryRows(app.DB, cursorSQL, cursorArgs...)
+		rows, err := appMCPReadRows(app, r, table, cursorSQL, cursorArgs...)
 		if err != nil {
-			httpError(w, err.Error(), http.StatusInternalServerError)
+			serverError(w, r, app, table+" list", err, "list failed")
 			return
 		}
 		// Relationship includes on cursor-paginated results
-		if inc := r.URL.Query().Get("include"); inc != "" {
-			ResolveIncludes(app, table, rows, inc, session)
+		if include != "" {
+			ResolveIncludes(app, table, rows, include, session)
 		}
 		// Mask encrypted columns on the PRIMARY rows, same as the offset-
 		// pagination path below. The keyset (cursor) branch returns early with
 		// its own encode, so without this a non-unmask-role caller recovers the
 		// plaintext just by paging with ?cursor= instead of ?page=.
-		MaskEncryptedFields(app.Encrypted, table, rows, session)
+		sanitizeResponseRows(app, table, rows, session)
 		var nextCursor any
 		if len(rows) == limit {
 			nextCursor = rows[len(rows)-1]["id"]
@@ -281,6 +420,7 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 				delete(row, "id")
 			}
 		}
+		stripMaskingProjection(rows, hiddenMasking)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"data":        rows,
@@ -291,12 +431,8 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	}
 
 	// Apply filtering, sorting, pagination from query params
-	colAllowlist := make(map[string]bool)
-	if cols, err := GetTableColumns(app.DB, table); err == nil {
-		for _, c := range cols {
-			colAllowlist[c.Name] = true
-		}
-	}
+	cols, _ := crudTableColumns(r, app, table)
+	colAllowlist := listColumnAllowlist(app, table, cols)
 
 	// `?count=true` (alias: `?count_only=true`) short-circuits the row
 	// fetch and returns just `{count: N}` - the true total of rows that
@@ -309,12 +445,12 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// filters (`?where[col]=val`, `?col__op=val`, `?q=…`) ARE honored
 	// - pass them to count a filtered subset.
 	if isTruthyQuery(r, "count") || isTruthyQuery(r, "count_only") {
-		whereSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, colAllowlist)
+		whereSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, session, colAllowlist)
 		countSQL := "SELECT COUNT(*) FROM (" + whereSQL + ")"
 		countArgs := append(scopeArgs, whereArgs...)
 		var total int64
-		if err := app.DB.QueryRow(countSQL, countArgs...).Scan(&total); err != nil {
-			httpError(w, "count failed: "+err.Error(), http.StatusInternalServerError)
+		if err := appMCPReadCount(app, r, countSQL, countArgs, &total); err != nil {
+			serverError(w, r, app, table+" count", err, "count failed")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -322,24 +458,29 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		return
 	}
 
-	sql, filterArgs := applyAPIFiltersWithApp(baseSQL, r, table, app, colAllowlist)
+	if msg := apiOffsetTooDeepError(r); msg != "" {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+		return
+	}
+	sql, filterArgs := applyAPIFiltersWithApp(baseSQL, r, table, app, session, colAllowlist)
 	allArgs := append(scopeArgs, filterArgs...)
 
-	rows, err := QueryRows(app.DB, sql, allArgs...)
+	rows, err := appMCPReadRows(app, r, table, sql, allArgs...)
 	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
+		serverError(w, r, app, table+" list", err, "list failed")
 		return
 	}
 
 	// Relationship includes: ?include=contact,tasks (batched, no N+1)
-	if inc := r.URL.Query().Get("include"); inc != "" {
-		ResolveIncludes(app, table, rows, inc, session)
+	if include != "" {
+		ResolveIncludes(app, table, rows, include, session)
 	}
 
 	// Mask encrypted fields for unauthorized roles (v2.7.58+: pass
 	// the full session so the multi-role / join-table grants are
 	// honored, not just the primary _benmore_users.role column).
-	MaskEncryptedFields(app.Encrypted, table, rows, session)
+	sanitizeResponseRows(app, table, rows, session)
+	stripMaskingProjection(rows, hiddenMasking)
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -356,13 +497,18 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		// or fails closed — a client app's Roadmap tab died on exactly
 		// this on 2026-08-05. The `?count=true` branch above always
 		// filtered correctly; the two branches now agree.
-		countWhereSQL, countWhereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, colAllowlist)
+		countWhereSQL, countWhereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, session, colAllowlist)
 		countSQL := "SELECT COUNT(*) FROM (" + countWhereSQL + ")"
 		countArgs := append(append([]any{}, scopeArgs...), countWhereArgs...)
 		var total int
-		app.DB.QueryRow(countSQL, countArgs...).Scan(&total)
-		page := queryInt(r, "page", 1)
-		perPage := queryInt(r, "per_page", 20)
+		if err := appMCPReadCount(app, r, countSQL, countArgs, &total); err != nil {
+			serverError(w, r, app, table+" count", err, "count failed")
+			return
+		}
+		page, perPage := apiOffsetPagination(r)
+		if rows == nil {
+			rows = []map[string]any{}
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"data":     rows,
 			"total":    total,
@@ -380,7 +526,33 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	}
 }
 
+// readRowFilter turns rowScopeClause's result into handleList's per-row
+// filter for a single-row read: none for a bypassing admin or an
+// `anon`/`everyone` read mode, otherwise the scope predicate OR'd with the
+// table's scopes.public_read_when.
+func readRowFilter(app *App, table, pred string, args []any, bypass bool) (string, []any) {
+	hasUID := hasColumn(app, table, "user_id")
+	hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
+	if bypass || app.Access.ReadAllowsBroaderRows(app.Access.ModeFor(table, OpRead, hasUID, hasGroupKey)) {
+		return "", nil
+	}
+	filter := pred
+	if app.Scopes != nil {
+		if sc, ok := app.Scopes[table]; ok && sc.PublicReadWhen != "" {
+			if filter != "" {
+				filter = "(" + filter + " OR (" + sc.PublicReadWhen + "))"
+			} else {
+				filter = "(" + sc.PublicReadWhen + ")"
+			}
+		}
+	}
+	return filter, args
+}
+
 func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) {
+	if !appMCPReadOperationAllowed(w, r, "table.read") {
+		return
+	}
 	// Coarse access gate (v2.7.12). Per-row owner/group filtering still
 	// runs below - this just blocks listing modes the caller can't
 	// touch at all (e.g. `read: admin` on `system_logs`).
@@ -392,10 +564,22 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		httpError(w, "Missing ID", http.StatusBadRequest)
 		return
 	}
+	if !rowIDCanonical(app, table, id) {
+		http.NotFound(w, r)
+		return
+	}
+	include, err := normalizeIncludeSpec(r.URL.Query().Get("include"))
+	if err != nil {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 
 	// Point-in-time query: ?as_of=2026-03-01T00:00:00Z
 	if asOf := r.URL.Query().Get("as_of"); asOf != "" {
 		session := getSession(app, r)
+		if !appMCPReadSessionAvailable(w, r, session) {
+			return
+		}
 		if session != nil {
 			if err := checkScope(session, table, "read"); err != nil {
 				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
@@ -406,30 +590,48 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 			httpError(w, "Not found", http.StatusNotFound)
 			return
 		}
-		row, err := handlePointInTime(app, table, id, asOf, session)
+		row, err := handlePointInTime(app, r, table, id, asOf, session)
 		if err != nil {
+			if errors.Is(err, errInvalidPointInTime) {
+				httpError(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			httpError(w, err.Error(), http.StatusNotFound)
 			return
+		}
+		// A historical snapshot is a read of the row like any other: an
+		// audited table records it (this branch returns before the live
+		// read's LogReadAccess below).
+		if IsReadAudited(app, table) {
+			LogReadAccess(app, table, id, "as_of", session)
 		}
 		// Mask encrypted columns exactly as the live read path below does
 		// (v2.7 parity). The point-in-time row is either a decrypted history
 		// snapshot or the decrypted current row; without this a caller who can
 		// READ the row but is NOT in the column's unmask_roles would get the
 		// plaintext through `?as_of=` that a plain GET masks.
-		MaskEncryptedFields(app.Encrypted, table, []map[string]any{row}, session)
+		sanitizeResponseRows(app, table, []map[string]any{row}, session)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(row)
 		return
 	}
 
 	// SECURITY: enforce scoping on reads
-	readSQL := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
+	fields := "*"
+	if _, private := r.Context().Value(appMCPPrivateKey{}).(*appMCPPrivateRead); private {
+		fields = crudSelectFields(r, app, table, "*")
+	}
+	fields, hiddenMasking := crudMaskingProjection(app, table, fields)
+	readSQL := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", fields, quoteIdent(table))
 	readArgs := []any{id}
 	// Soft delete filter
 	if hasColumn(app, table, "deleted_at") {
 		readSQL += " AND deleted_at IS NULL"
 	}
 	session := getSession(app, r)
+	if !appMCPReadSessionAvailable(w, r, session) {
+		return
+	}
 	if session != nil {
 		if err := checkScope(session, table, "read"); err != nil {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
@@ -440,25 +642,36 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	if IsReadAudited(app, table) {
 		LogReadAccess(app, table, id, "read", session)
 	}
-	if pred, pargs, bypass := rowScopeClause(app, table, session, "view"); !bypass && pred != "" {
-		readSQL += " AND " + pred
-		readArgs = append(readArgs, pargs...)
+	// Same row filter handleList applies, so a row the list shows can be
+	// fetched by id and nothing else can: `anon`/`everyone` read modes
+	// read broadly, other modes take rowScopeClause widened by
+	// scopes.public_read_when.
+	pred, pargs, bypass := rowScopeClause(app, table, session, "view")
+	if filter, fargs := readRowFilter(app, table, pred, pargs, bypass); filter != "" {
+		readSQL += " AND " + filter
+		readArgs = append(readArgs, fargs...)
 	}
 
-	rows, err := QueryRows(app.DB, readSQL, readArgs...)
+	rows, err := appMCPReadRows(app, r, table, readSQL, readArgs...)
+	if err != nil && !errors.Is(err, errAppMCPGrantDenied) {
+		// A failed query is kept server-side with a request id; the answer
+		// stays the 404 this route has always given.
+		w.Header().Set(requestIDHeader, noteServerError(r, table+" read", err))
+	}
 	if err != nil || len(rows) == 0 {
 		httpError(w, "Not found", http.StatusNotFound)
 		return
 	}
 
 	// Relationship includes: ?include=contact,tasks
-	if inc := r.URL.Query().Get("include"); inc != "" {
-		ResolveIncludes(app, table, rows, inc, session)
+	if include != "" {
+		ResolveIncludes(app, table, rows, include, session)
 	}
 
 	// Mask encrypted fields for unauthorized roles (v2.7.58+:
 	// session-aware; see MaskEncryptedFields docstring).
-	MaskEncryptedFields(app.Encrypted, table, rows, session)
+	sanitizeResponseRows(app, table, rows, session)
+	stripMaskingProjection(rows, hiddenMasking)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rows[0])

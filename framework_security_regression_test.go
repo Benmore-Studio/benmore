@@ -21,7 +21,7 @@ import (
 func auditApp(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db")+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
+	db, err := sql.Open(sqliteHistoryTestDriver, filepath.Join(dir, "data.db")+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +46,12 @@ func auditApp(t *testing.T) (*App, *http.ServeMux) {
 	EnsureAuditLogTable(db)
 	EnsureIdempotencyTable(db)
 	EnsureNotificationsTable(db)
+	EnsureWebhooksTable(db)
+	if exists, err := tableExists(db, "_benmore_webhooks"); err != nil {
+		t.Fatal(err)
+	} else if !exists {
+		t.Fatal("fixture initialization did not create _benmore_webhooks")
+	}
 	app := &App{Dir: dir, DB: db, Stop: make(chan struct{}), SessionDuration: time.Hour,
 		Group: &GroupConfig{Table: "members", Key: "org_id", UserField: "email"},
 		Access: &AccessConfig{rules: map[string]map[AccessOp]string{
@@ -53,7 +59,7 @@ func auditApp(t *testing.T) (*App, *http.ServeMux) {
 			"rooms": {"all": "member-of:room_members(room_id, member_id)"},
 		}},
 	}
-	t.Cleanup(func() { close(app.Stop) })
+	t.Cleanup(app.Shutdown)
 	names, err := GetTableNames(db)
 	if err != nil {
 		t.Fatal(err)

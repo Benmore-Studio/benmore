@@ -5,12 +5,14 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +32,18 @@ type queryCacheEntry struct {
 	table     string // which table this query reads from (for per-table invalidation)
 }
 
-func queryCacheKey(sql string, args []any) string {
-	h := sha256.New()
-	h.Write([]byte(sql))
-	for _, a := range args {
-		h.Write([]byte(fmt.Sprintf("%v", a)))
+// queryCacheKey identifies one app's query and arguments. The cache is
+// process-wide, so the key carries the app directory (a `benmore host`
+// process serves many apps, and two apps can run the same SQL text), and
+// the parts are JSON-encoded so ("1","23") and ("12","3") differ. An
+// argument JSON can't encode yields "" and the query is not cached.
+func queryCacheKey(appDir, sql string, args []any) string {
+	enc, err := json.Marshal([]any{appDir, sql, args})
+	if err != nil {
+		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256(enc)
+	return hex.EncodeToString(sum[:])
 }
 
 func queryCacheGet(key string) ([]map[string]any, bool) {
@@ -49,10 +56,39 @@ func queryCacheGet(key string) ([]map[string]any, bool) {
 	return entry.rows, true
 }
 
+// The key carries request-derived arguments, so a visitor can mint entries at
+// will. Bound the cache: expired entries are dropped when it fills, then the
+// entry closest to expiry is evicted, and result sets too large to hold are
+// simply not cached (the query still runs).
+const (
+	queryCacheMaxEntries = 1024
+	queryCacheMaxRows    = 2000
+)
+
 func queryCacheSet(key string, rows []map[string]any, ttl time.Duration, table string) {
+	if len(rows) > queryCacheMaxRows {
+		return
+	}
 	queryCache.mu.Lock()
 	defer queryCache.mu.Unlock()
-	queryCache.entries[key] = &queryCacheEntry{rows: rows, expiresAt: time.Now().Add(ttl), table: table}
+	now := time.Now()
+	if _, exists := queryCache.entries[key]; !exists && len(queryCache.entries) >= queryCacheMaxEntries {
+		var soonestKey string
+		var soonest time.Time
+		for k, e := range queryCache.entries {
+			if now.After(e.expiresAt) {
+				delete(queryCache.entries, k)
+				continue
+			}
+			if soonestKey == "" || e.expiresAt.Before(soonest) {
+				soonestKey, soonest = k, e.expiresAt
+			}
+		}
+		if len(queryCache.entries) >= queryCacheMaxEntries && soonestKey != "" {
+			delete(queryCache.entries, soonestKey)
+		}
+	}
+	queryCache.entries[key] = &queryCacheEntry{rows: rows, expiresAt: now.Add(ttl), table: table}
 }
 
 // InvalidateQueryCacheForTable clears cached queries that read from the given table.
@@ -77,6 +113,12 @@ var (
 	seedTagRe    = regexp.MustCompile(`(?s)<seed>(.*?)</seed>`)
 	pageBlockRe  = regexp.MustCompile(`(?s)<page\s+([^>]*)>(.*?)</page>`)
 	attrRe       = regexp.MustCompile(`(\w+)="([^"]*)"`)
+
+	// queryOpenTagRe matches <query ...>, allowing > inside quoted
+	// attribute values (e.g. sql="... > 0").
+	queryOpenTagRe   = regexp.MustCompile(`<query\s+((?:[^>"]*"[^"]*")*[^>]*)>`)
+	imgTagRe         = regexp.MustCompile(`<img\s([^>]*?)>`)
+	transitionsTagRe = regexp.MustCompile(`<transitions\s+([^>]*?)/?>`)
 )
 
 // ParsePageAttrs extracts auth, scope, title, layout, and require attributes from a page's HTML.
@@ -136,6 +178,12 @@ func ParsePageSEO(rawHTML string) (description, image, robots string) {
 // it stays inside `dir` so that a CMS-style flow rendering DB-controlled
 // HTML through this pipeline can't escape via `../../`.
 func ProcessIncludes(content string, partials map[string]string, dir string) string {
+	return processIncludesWithReader(content, partials, dir, func(name string) ([]byte, error) {
+		return readFileInRoot(dir, name)
+	})
+}
+
+func processIncludesWithReader(content string, partials map[string]string, dir string, readSource func(string) ([]byte, error)) string {
 	return includeTagRe.ReplaceAllStringFunc(content, func(match string) string {
 		m := includeTagRe.FindStringSubmatch(match)
 		if m == nil {
@@ -154,7 +202,7 @@ func ProcessIncludes(content string, partials map[string]string, dir string) str
 		if err != nil || (path != absRoot && !strings.HasPrefix(path, absRoot+string(filepath.Separator))) {
 			return fmt.Sprintf(`<div class="benmore-error">Include error: %s blocked</div>`, html.EscapeString(src))
 		}
-		data, err := os.ReadFile(path)
+		data, err := readSource(src)
 		if err != nil {
 			return fmt.Sprintf(`<div class="benmore-error">Include error: %s not found</div>`, html.EscapeString(src))
 		}
@@ -168,17 +216,16 @@ func ExtractQueries(content string) []QueryTag {
 	var queries []QueryTag
 	// Match <query ...> - must handle > inside quoted attribute values (e.g. sql="... > 0")
 	// Uses a non-greedy match that finds the last > after accounting for quoted strings
-	openTagRe := regexp.MustCompile(`<query\s+((?:[^>"]*"[^"]*")*[^>]*)>`)
 	i := 0
 	for i < len(content) {
 		// Find next <query ...>
-		loc := openTagRe.FindStringIndex(content[i:])
+		loc := queryOpenTagRe.FindStringIndex(content[i:])
 		if loc == nil {
 			break
 		}
 		tagStart := i + loc[0]
 		tagEnd := i + loc[1]
-		attrStr := openTagRe.FindStringSubmatch(content[i:])[1]
+		attrStr := queryOpenTagRe.FindStringSubmatch(content[i:])[1]
 
 		// Check for self-closing: </query> immediately after (possibly with whitespace)
 		rest := content[tagEnd:]
@@ -271,8 +318,16 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 		return "", fmErr
 	}
 	if fm != nil {
-		// Merge frontmatter into Page so auth/scope/layout work even on a
-		// fresh load that hasn't been through the page loader yet.
+		// Pages are shared with other requests and the context graph. Apply
+		// fallback metadata to this render only, including the Page used by
+		// query scoping and layout selection in the request context.
+		originalPage := page
+		renderPage := *page
+		page = &renderPage
+		if ctx.Page == originalPage {
+			ctx.Page = page
+			defer func() { ctx.Page = originalPage }()
+		}
 		ApplyFrontmatterToPage(page, fm)
 		content = body
 		if fm.Engine == "gotmpl" {
@@ -305,7 +360,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 			// Same origin as the backend - cookies, CSRF, /api/* all
 			// just work. Edges live at a different origin; raw pages do
 			// not.
-			return finalizeRender(app, page, ctx, body), nil
+			return string(injectI18nBootstrap([]byte(finalizeRender(app, page, ctx, body)), app)), nil
 		}
 	}
 
@@ -313,7 +368,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 	content = stripPageTag(content)
 
 	// 2. Expand includes
-	content = ProcessIncludes(content, app.Partials, app.Dir)
+	content = processIncludesWithReader(content, app.Partials, app.Dir, app.readAppInclude)
 
 	// 2b. Resolve {{env.X}} variables from env.yaml
 	content = InterpolateEnv(content, app.Dir)
@@ -330,7 +385,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 			lang = detected
 		}
 	}
-	content = TranslateTemplate(content, lang)
+	content = app.i18nConfig().TranslateTemplate(content, lang)
 
 	// 3. Execute <query> tags
 	content, err := executeQueries(content, app, ctx)
@@ -370,9 +425,9 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) string {
 	if ctx.Page != nil && ctx.Page.Layout != "" && ctx.Page.Layout != "none" {
 		layoutPath := fmt.Sprintf("layouts/%s.html", ctx.Page.Layout)
-		if layoutData, err := os.ReadFile(filepath.Join(app.Dir, layoutPath)); err == nil {
+		if layoutData, err := app.readSourceFile(layoutPath); err == nil {
 			layoutHTML := string(layoutData)
-			layoutHTML = ProcessIncludes(layoutHTML, app.Partials, app.Dir)
+			layoutHTML = processIncludesWithReader(layoutHTML, app.Partials, app.Dir, app.readAppInclude)
 			layoutHTML = strings.Replace(layoutHTML, "{{content}}", content, 1)
 			content = RenderMustache(layoutHTML, ctx.Data)
 		}
@@ -381,8 +436,8 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 		// if it exists so marketing/landing/auth pages that skip the layout
 		// still get the app's design-system styling (CSS variables, component
 		// classes, fonts) without boilerplate in every file.
-		if kitData, err := os.ReadFile(filepath.Join(app.Dir, "partials", "kit.html")); err == nil {
-			kitHTML := ProcessIncludes(string(kitData), app.Partials, app.Dir)
+		if kitData, err := app.readSourceFile("partials/kit.html"); err == nil {
+			kitHTML := processIncludesWithReader(string(kitData), app.Partials, app.Dir, app.readAppInclude)
 			content = kitHTML + "\n" + content
 		}
 	}
@@ -413,8 +468,7 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 
 // addImageOptimizations adds loading="lazy" and decoding="async" to img tags.
 func addImageOptimizations(content string) string {
-	imgRe := regexp.MustCompile(`<img\s([^>]*?)>`)
-	return imgRe.ReplaceAllStringFunc(content, func(match string) string {
+	return imgTagRe.ReplaceAllStringFunc(content, func(match string) string {
 		if strings.Contains(match, `loading=`) {
 			return match // already has loading attribute
 		}
@@ -455,35 +509,56 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 
 			if q.From != "" {
 				// Shorthand mode: expand from/pick/where/owned/sort into SQL.
-				// Pre-resolve mustache vars in attribute values so authors can
-				// write where="id = {{param_id}}" the same as raw <query sql>.
-				// Issue #7. Vars resolve to escaped string values inline since
-				// shorthand builds WHERE via concatenation (not ? placeholders).
+				// Authors can write where="id = {{param_id}}" the same as raw
+				// <query sql> (issue #7): the value is bound as a ? argument.
+				// Other attributes are validated against the schema or parsed
+				// as numbers by ExpandShorthand.
+				where, whereArgs, bindErr := bindTemplateSQL(q.Attrs["where"], ctx.Data, ctx.User)
+				if bindErr != nil {
+					content = content[:q.Start] + queryErrorHTML(app, q, bindErr) + content[q.End:]
+					continue
+				}
 				resolvedAttrs := make(map[string]string, len(q.Attrs))
 				for k, v := range q.Attrs {
-					resolvedAttrs[k] = resolveShorthandVars(v, ctx.Data)
+					resolvedAttrs[k] = resolveAttrVars(v, ctx.Data)
 				}
+				resolvedAttrs["where"] = where
 				var userID int64
 				if ctx.User != nil {
 					userID = ctx.User.UserID
 				}
-				sql, args = ExpandShorthand(app, q.From, resolvedAttrs, userID)
+				var expandErr error
+				sql, args, expandErr = ExpandShorthand(app, q.From, resolvedAttrs, userID, whereArgs)
+				if expandErr != nil {
+					content = content[:q.Start] + queryErrorHTML(app, q, expandErr) + content[q.End:]
+					continue
+				}
 			} else if q.SQL != "" {
-				// Raw SQL mode - resolve mustache vars (e.g. {{param_id}}) as parameterized args
-				sql, args = resolveQueryParams(q.SQL, ctx.Data, args)
+				// Raw SQL mode - {{vars}} and :current_user bind as ? args in
+				// statement order (bindTemplateSQL).
+				var bindErr error
+				sql, args, bindErr = bindTemplateSQL(q.SQL, ctx.Data, ctx.User)
+				if bindErr != nil {
+					content = content[:q.Start] + queryErrorHTML(app, q, bindErr) + content[q.End:]
+					continue
+				}
 			} else {
 				continue
 			}
 
-			// Replace :current_user with session user ID
-			if ctx.User != nil && strings.Contains(sql, ":current_user") {
-				sql = strings.ReplaceAll(sql, ":current_user", "?")
-				args = append(args, ctx.User.UserID)
-			}
-
-			// Handle scope="owner" - inject WHERE clause
-			if ctx.Page != nil && ctx.Page.Scope == "owner" && ctx.User != nil {
-				sql = injectOwnerScope(sql, ctx.User.UserID)
+			// Handle scope="owner" - inject WHERE clause. Without a session
+			// the page gets no rows rather than every owner's rows.
+			if ctx.Page != nil && ctx.Page.Scope == "owner" {
+				var uid int64
+				if ctx.User != nil {
+					uid = ctx.User.UserID
+				}
+				scoped, scopeErr := injectOwnerScope(sql, uid, ctx.User != nil)
+				if scopeErr != nil {
+					content = content[:q.Start] + queryErrorHTML(app, q, scopeErr) + content[q.End:]
+					continue
+				}
+				sql = scoped
 			}
 
 			// Query cache: <query cache="5m" ...> caches results for the given duration
@@ -493,7 +568,9 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 			}
 			var cacheKey string
 			if cacheTTL > 0 {
-				cacheKey = queryCacheKey(sql, args)
+				cacheKey = queryCacheKey(app.Dir, sql, args)
+			}
+			if cacheKey != "" {
 				if cachedRows, ok := queryCacheGet(cacheKey); ok {
 					if q.As != "" {
 						ctx.Data[q.As] = cachedRows
@@ -505,23 +582,24 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 					}
 					if q.Inner != "" {
 						var rendered strings.Builder
+						frag := newFragmentRenderer(content[:q.Start])
 						if q.As != "" && len(cachedRows) > 0 {
 							sectionTag := "{{#" + q.As + "}}"
 							hasSectionLoop := strings.Contains(q.Inner, sectionTag)
 							if hasSectionLoop {
 								innerProtected := protectFetchInner(q.Inner)
-								expanded := RenderMustache(innerProtected, ctx.Data)
+								expanded := frag.render(innerProtected, ctx.Data)
 								rendered.WriteString(restoreFetchInner(expanded))
 							} else {
 								for _, row := range cachedRows {
 									rowData := mergeData(ctx.Data, row)
 									innerProtected := protectFetchInner(q.Inner)
-									expanded := RenderMustache(innerProtected, rowData)
+									expanded := frag.render(innerProtected, rowData)
 									rendered.WriteString(restoreFetchInner(expanded))
 								}
 							}
 						} else {
-							rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
+							rendered.WriteString(frag.render(q.Inner, ctx.Data))
 						}
 						content = content[:q.Start] + rendered.String() + content[q.End:]
 					} else {
@@ -559,17 +637,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 			}
 
 			if err != nil {
-				var errHTML string
-				if app.DevMode {
-					// Dev mode: show full error with SQL for debugging
-					errHTML = fmt.Sprintf(`<div class="benmore-error"><strong>SQL Error</strong><pre>%s</pre><p>%s</p></div>`,
-						html.EscapeString(q.SQL), html.EscapeString(err.Error()))
-				} else {
-					// Production: generic error, log details to stderr
-					log.Printf("ERROR [query] %s: %s", q.SQL, err.Error())
-					errHTML = `<div class="benmore-error">An error occurred loading this content.</div>`
-				}
-				content = content[:q.Start] + errHTML + content[q.End:]
+				content = content[:q.Start] + queryErrorHTML(app, q, err) + content[q.End:]
 				continue
 			}
 
@@ -598,6 +666,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 			// Render the inner template with query results
 			if q.Inner != "" {
 				var rendered strings.Builder
+				frag := newFragmentRenderer(content[:q.Start])
 				if q.As != "" && len(rows) > 0 {
 					// Check if inner content contains a {{#as}}...{{/as}} section matching
 					// the query's as name. If so, let mustache handle iteration (render once).
@@ -607,20 +676,20 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 					if hasSectionLoop {
 						// Render once - mustache {{#as}} section handles row iteration
 						innerProtected := protectFetchInner(q.Inner)
-						expanded := RenderMustache(innerProtected, ctx.Data)
+						expanded := frag.render(innerProtected, ctx.Data)
 						rendered.WriteString(restoreFetchInner(expanded))
 					} else {
 						// No section wrapper - render per-row (each row's fields available directly)
 						for _, row := range rows {
 							rowData := mergeData(ctx.Data, row)
 							innerProtected := protectFetchInner(q.Inner)
-							expanded := RenderMustache(innerProtected, rowData)
+							expanded := frag.render(innerProtected, rowData)
 							rendered.WriteString(restoreFetchInner(expanded))
 						}
 					}
 				} else if len(rows) == 0 {
 					// Empty state - render {{^as}}...{{/as}} blocks
-					rendered.WriteString(RenderMustache(q.Inner, ctx.Data))
+					rendered.WriteString(frag.render(q.Inner, ctx.Data))
 				}
 				content = content[:q.Start] + rendered.String() + content[q.End:]
 			} else {
@@ -688,84 +757,6 @@ func expandMustacheWithProtectedFetch(content string, data map[string]any) strin
 	return rendered
 }
 
-// injectOwnerScope appends a user_id filter. userID is always from the server-side
-// session (int64), never from user input, so fmt.Sprintf is safe here.
-func injectOwnerScope(sql string, userID int64) string {
-	upper := strings.ToUpper(sql)
-	// Extract primary table alias to qualify user_id (avoids ambiguity in JOINs)
-	qualifier := extractPrimaryAlias(upper, sql)
-	col := "user_id"
-	if qualifier != "" {
-		col = qualifier + ".user_id"
-	}
-	hasTopLevelWhere := indexTopLevel(upper, "WHERE ") >= 0
-	clause := fmt.Sprintf(" AND %s = %d", col, userID)
-	if !hasTopLevelWhere {
-		clause = fmt.Sprintf(" WHERE %s = %d", col, userID)
-	}
-	// Find insertion point: before top-level GROUP BY, ORDER BY, or LIMIT
-	// (skip keywords inside parentheses like OVER(ORDER BY ...) or subqueries)
-	for _, keyword := range []string{"GROUP BY", "ORDER BY", "LIMIT"} {
-		if idx := indexTopLevel(upper, keyword); idx >= 0 {
-			return sql[:idx] + clause + " " + sql[idx:]
-		}
-	}
-	return sql + clause
-}
-
-// extractPrimaryAlias returns the alias (or table name) of the primary FROM table.
-// Uses indexTopLevel to skip FROM inside subqueries.
-// e.g. "SELECT ..., (SELECT ... FROM x) FROM players p LEFT JOIN teams t" → "p"
-//
-//	"FROM teams ORDER BY" → "teams"
-func extractPrimaryAlias(upper, original string) string {
-	idx := indexTopLevel(upper, "FROM ")
-	if idx < 0 {
-		return ""
-	}
-	rest := original[idx+5:] // after "FROM "
-	rest = strings.TrimSpace(rest)
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return ""
-	}
-	table := fields[0]
-	if len(fields) > 1 {
-		next := strings.ToUpper(fields[1])
-		if next != "WHERE" && next != "ORDER" && next != "GROUP" && next != "LIMIT" &&
-			next != "LEFT" && next != "RIGHT" && next != "INNER" && next != "OUTER" &&
-			next != "JOIN" && next != "CROSS" && next != "ON" && next != "NATURAL" {
-			return fields[1] // alias
-		}
-	}
-	return table
-}
-
-// indexTopLevel finds the first occurrence of keyword at parenthesis depth 0.
-func indexTopLevel(upper, keyword string) int {
-	depth := 0
-	klen := len(keyword)
-	for i := 0; i < len(upper)-klen+1; i++ {
-		switch upper[i] {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if depth == 0 && upper[i:i+klen] == keyword {
-				// Ensure it's a word boundary (not mid-identifier)
-				if i > 0 && upper[i-1] != ' ' && upper[i-1] != ')' && upper[i-1] != '\n' && upper[i-1] != '\t' {
-					continue
-				}
-				return i
-			}
-		}
-	}
-	return -1
-}
-
 // neutralizeReparse defuses mustache delimiters that appear INSIDE a resolved
 // data value, so a later render pass can't re-interpret stored data as
 // template syntax. The pipeline runs two full mustache passes (loops/sections,
@@ -777,7 +768,27 @@ func indexTopLevel(upper, keyword string) int {
 // scanner. Resolved values are DATA, never template - only `<fetch>` inner
 // content is intentionally re-rendered, and that has its own marker-based
 // protection (protectFetchInner).
+//
+// A resolved value must also never carry the NUL byte that delimits the
+// fetch-protection markers (`\x00MO\x00`, `\x00OPEN\x00`): restoreFetchInner
+// and expandMustacheWithProtectedFetch turn those markers back into `{{`/`}}`
+// with a global replace over output that already holds the value, so a stored
+// value containing the marker bytes would otherwise become a live tag on the
+// next pass. NUL never legitimately appears in rendered HTML, so it is
+// replaced with the Unicode replacement character.
+//
+// The same holds for the framework's server-side tags. A <query> block's
+// rendered rows are spliced into the page before the next extraction pass,
+// and <fetch> / <transitions> expand after the mustache pass, so a raw
+// ({{{{x}}}}) value holding `<query sql="...">` ran that SQL on the app's
+// database handle, outside every access rule. The opener's `<` becomes
+// `&lt;` (the tag scanners match `<name` + whitespace); the value renders as
+// text instead of an unknown element.
 func neutralizeReparse(s string) string {
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "�")
+	}
+	s = neutralizeFrameworkTags(s)
 	if !strings.Contains(s, "{{") && !strings.Contains(s, "}}") {
 		return s
 	}
@@ -786,9 +797,90 @@ func neutralizeReparse(s string) string {
 	return s
 }
 
-// RenderMustache performs simple mustache-like template rendering.
+// frameworkTagNames are the tags the renderer executes after values are in
+// the page (queryOpenTagRe, fetchTagRe, transitionsTagRe).
+var frameworkTagNames = []string{"query", "fetch", "transitions"}
+
+// neutralizeFrameworkTags escapes the `<` of every `<query`, `<fetch` or
+// `<transitions` followed by whitespace (RE2 \s, what the tag patterns
+// require), so a rendered value can never open one of those tags.
+func neutralizeFrameworkTags(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '<' {
+			continue
+		}
+		for _, name := range frameworkTagNames {
+			end := i + 1 + len(name)
+			if end < len(s) && s[i+1:end] == name && strings.IndexByte(" \t\n\f\r", s[end]) >= 0 {
+				b.WriteString(s[last:i])
+				b.WriteString("&lt;")
+				last = i + 1
+				break
+			}
+		}
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// RenderMustache performs simple mustache-like template rendering. Values
+// are escaped for the HTML context they land in (template_context.go):
+// body text and ordinary attributes get html.EscapeString, URL attributes
+// also neutralize script-capable schemes, and <script> blocks / on* handlers
+// get JS-string or JSON encoding.
 func RenderMustache(template string, data map[string]any) string {
+	return renderMustacheCtx(template, data, &htmlCtx{})
+}
+
+// fragmentRenderer renders fragments that are spliced into a document right
+// after `before` (a <query> body inside its page), so their values are
+// escaped for the context at the splice point. Successive renders (one per
+// row) continue in the context the previous one left.
+type fragmentRenderer struct{ c *htmlCtx }
+
+func newFragmentRenderer(before string) *fragmentRenderer {
+	c := &htmlCtx{}
+	c.feedString(before)
+	return &fragmentRenderer{c: c}
+}
+
+func (f *fragmentRenderer) render(template string, data map[string]any) string {
+	out := renderMustacheCtx(template, data, f.c.clone())
+	f.c.feedString(out)
+	return out
+}
+
+// renderValue escapes one resolved `{{ }}` / `{{{ }}}` value for c's
+// context. sanitized selects the `{{{ }}}` / raw-pipe output, which keeps
+// its unescaped HTML only where HTML is being written (body text, comments,
+// non-script raw text); in attributes and scripts it is escaped like `{{ }}`.
+func renderValue(c *htmlCtx, raw any, s string, rawHTML, jsonPipe bool) string {
+	if rawHTML && c.writesHTML() {
+		return neutralizeReparse(s)
+	}
+	out := escapeMustacheValue(c, raw, s, jsonPipe)
+	if c.inScript() {
+		// JS/JSON escaping already turns braces inside strings into \u
+		// escapes; neutralizeReparse's HTML entities would corrupt script.
+		return out
+	}
+	return neutralizeReparse(out)
+}
+
+func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string {
 	var result strings.Builder
+	write := func(s string) {
+		result.WriteString(s)
+		c.feedString(s)
+	}
 	i := 0
 	for i < len(template) {
 		// Check for {{{{ truly raw }}}} (no sanitization - explicit dangerous opt-in)
@@ -797,7 +889,7 @@ func RenderMustache(template string, data map[string]any) string {
 			if end >= 0 {
 				key := strings.TrimSpace(template[i+4 : i+4+end])
 				val := lookupValue(data, key)
-				result.WriteString(neutralizeReparse(fmt.Sprintf("%v", val)))
+				write(neutralizeReparse(fmt.Sprintf("%v", val)))
 				i = i + 4 + end + 4
 				continue
 			}
@@ -809,7 +901,14 @@ func RenderMustache(template string, data map[string]any) string {
 			if end >= 0 {
 				key := strings.TrimSpace(template[i+3 : i+3+end])
 				val := lookupValue(data, key)
-				result.WriteString(neutralizeReparse(SanitizeHTML(fmt.Sprintf("%v", val))))
+				s := fmt.Sprintf("%v", val)
+				// Sanitized HTML is only meaningful where HTML is being
+				// written; in attributes and scripts escape it like {{ }}.
+				if c.writesHTML() {
+					write(neutralizeReparse(SanitizeHTML(s)))
+				} else {
+					write(renderValue(c, val, s, false, false))
+				}
 				i = i + 3 + end + 3
 				continue
 			}
@@ -864,7 +963,7 @@ func RenderMustache(template string, data map[string]any) string {
 								}
 							}
 							if match {
-								result.WriteString(RenderMustache(inner, data))
+								write(renderMustacheCtx(inner, data, c.clone()))
 							}
 							i = nextI + closeIdx + len(closeTag)
 							continue
@@ -888,9 +987,9 @@ func RenderMustache(template string, data map[string]any) string {
 								falsePart = body[elseIdx+8:]
 							}
 							if evaluateIfExpr(expr, data) {
-								result.WriteString(RenderMustache(truePart, data))
+								write(renderMustacheCtx(truePart, data, c.clone()))
 							} else {
-								result.WriteString(RenderMustache(falsePart, data))
+								write(renderMustacheCtx(falsePart, data, c.clone()))
 							}
 							i = nextI + closeIdx + len(closeTag)
 							continue
@@ -906,7 +1005,7 @@ func RenderMustache(template string, data map[string]any) string {
 						if closeIdx >= 0 {
 							body := template[nextI : nextI+closeIdx]
 							fieldVal := fmt.Sprintf("%v", lookupValue(data, field))
-							result.WriteString(evaluateSwitch(body, fieldVal, data))
+							write(evaluateSwitch(body, fieldVal, data, c))
 							i = nextI + closeIdx + len(closeTag)
 							continue
 						}
@@ -918,7 +1017,7 @@ func RenderMustache(template string, data map[string]any) string {
 					if closeIdx >= 0 {
 						inner := template[nextI : nextI+closeIdx]
 						val := lookupValue(data, name)
-						result.WriteString(renderSection(inner, val, data))
+						write(renderSection(inner, val, data, c))
 						i = nextI + closeIdx + len(closeTag)
 						continue
 					}
@@ -931,7 +1030,7 @@ func RenderMustache(template string, data map[string]any) string {
 						inner := template[nextI : nextI+closeIdx]
 						val := lookupValue(data, name)
 						if isEmpty(val) {
-							result.WriteString(RenderMustache(inner, data))
+							write(renderMustacheCtx(inner, data, c.clone()))
 						}
 						i = nextI + closeIdx + len(closeTag)
 						continue
@@ -950,16 +1049,15 @@ func RenderMustache(template string, data map[string]any) string {
 					}
 					val := lookupValue(data, key)
 					s := fmt.Sprintf("%v", val)
+					rawHTML, jsonPipe := false, false
 					if pipe != "" {
 						s = ApplyPipe(val, pipe)
-						if isRawHTMLPipe(pipe) {
-							// benmark output is already sanitized; emit raw.
-							result.WriteString(neutralizeReparse(s))
-							i = nextI
-							continue
-						}
+						// benmark output is already sanitized; emitted raw
+						// where HTML is being written.
+						rawHTML = isRawHTMLPipe(pipe)
+						jsonPipe = strings.TrimSpace(strings.SplitN(pipe, ":", 2)[0]) == "json"
 					}
-					result.WriteString(neutralizeReparse(html.EscapeString(s)))
+					write(renderValue(c, val, s, rawHTML, jsonPipe))
 					i = nextI
 					continue
 				}
@@ -967,6 +1065,7 @@ func RenderMustache(template string, data map[string]any) string {
 		}
 
 		result.WriteByte(template[i])
+		c.feed(template[i])
 		i++
 	}
 	return result.String()
@@ -1022,92 +1121,49 @@ func findElseAtDepth0(s string) int {
 	return -1
 }
 
-func renderSection(inner string, val any, parentData map[string]any) string {
+// renderSection renders a {{#name}} section starting in context c (the
+// caller's escaping context at the section; c itself is not modified).
+func renderSection(inner string, val any, parentData map[string]any, c *htmlCtx) string {
 	if val == nil {
 		return ""
+	}
+	render := func(data map[string]any) string {
+		return renderMustacheCtx(inner, data, c.clone())
 	}
 
 	switch v := val.(type) {
 	case []map[string]any:
+		// Each iteration continues in the context the previous one left.
 		var sb strings.Builder
+		cc := c.clone()
 		for _, item := range v {
 			merged := mergeData(parentData, item)
-			sb.WriteString(RenderMustache(inner, merged))
+			out := renderMustacheCtx(inner, merged, cc.clone())
+			cc.feedString(out)
+			sb.WriteString(out)
 		}
 		return sb.String()
 	case map[string]any:
 		merged := mergeData(parentData, v)
-		return RenderMustache(inner, merged)
+		return render(merged)
 	case bool:
 		if v {
-			return RenderMustache(inner, parentData)
+			return render(parentData)
 		}
 		return ""
 	case string:
 		if v != "" {
-			return RenderMustache(inner, parentData)
+			return render(parentData)
 		}
 		return ""
 	case int64:
 		if v != 0 {
-			return RenderMustache(inner, parentData)
+			return render(parentData)
 		}
 		return ""
 	default:
-		return RenderMustache(inner, parentData)
+		return render(parentData)
 	}
-}
-
-// resolveQueryParams replaces {{var}} placeholders in SQL with parameterized ? args.
-// Unquoted vars become ? params (safe from injection). Vars inside SQL string quotes
-// ('{{var}}') are replaced inline since SQLite doesn't bind params inside quotes.
-// Inline values are sanitized to prevent SQL injection.
-// resolveShorthandVars replaces {{var}} references in a shorthand attribute
-// value (where/sort/limit/offset) with the resolved value from template
-// context. Single quotes in the value are escaped to prevent SQL injection
-// via interpolation. Used by the shorthand query path which builds WHERE
-// clauses by concatenation rather than parameterised queries. Issue #7.
-func resolveShorthandVars(s string, data map[string]any) string {
-	if !strings.Contains(s, "{{") {
-		return s
-	}
-	varRe := regexp.MustCompile(`\{\{(\w[\w.]*)\}\}`)
-	return varRe.ReplaceAllStringFunc(s, func(match string) string {
-		key := strings.TrimSpace(match[2 : len(match)-2])
-		val := lookupValue(data, key)
-		valStr := fmt.Sprintf("%v", val)
-		// Escape single quotes - protects against an injection vector if a
-		// developer accidentally references a user-controlled var.
-		return strings.ReplaceAll(valStr, "'", "''")
-	})
-}
-
-func resolveQueryParams(sqlStr string, data map[string]any, args []any) (string, []any) {
-	varRe := regexp.MustCompile(`\{\{(\w[\w.]*)\}\}`)
-	// Find all matches and their positions to determine if inside quotes
-	result := varRe.ReplaceAllStringFunc(sqlStr, func(match string) string {
-		key := strings.TrimSpace(match[2 : len(match)-2])
-		val := lookupValue(data, key)
-		s := fmt.Sprintf("%v", val)
-
-		// Check if this var is inside SQL string quotes by counting quotes before it
-		idx := strings.Index(sqlStr, match)
-		before := sqlStr[:idx]
-		singleQuotes := strings.Count(before, "'") - strings.Count(before, "\\'")
-		insideQuotes := singleQuotes%2 == 1
-
-		if insideQuotes {
-			// Inside SQL quotes - inline the value (escape single quotes to prevent injection)
-			return strings.ReplaceAll(s, "'", "''")
-		}
-		if s == "" {
-			// Empty unquoted param - use NULL to avoid SQL syntax errors
-			return "NULL"
-		}
-		args = append(args, s)
-		return "?"
-	})
-	return result, args
 }
 
 func lookupValue(data map[string]any, key string) any {
@@ -1168,7 +1224,7 @@ func isEmpty(val any) bool {
 // evaluateSwitch processes {{#switch field}} body to find the matching {{#case "value"}} block.
 // Falls back to {{#default}} if no case matches.
 // Syntax: {{#switch status}}{{#case "active"}}...{{#case "pending"}}...{{#default}}...{{/switch}}
-func evaluateSwitch(body, fieldVal string, data map[string]any) string {
+func evaluateSwitch(body, fieldVal string, data map[string]any, c *htmlCtx) string {
 	type block struct {
 		value   string // empty for default
 		content string
@@ -1223,13 +1279,13 @@ func evaluateSwitch(body, fieldVal string, data map[string]any) string {
 	// Find matching case
 	for _, b := range blocks {
 		if !b.isDef && b.value == fieldVal {
-			return RenderMustache(b.content, data)
+			return renderMustacheCtx(b.content, data, c.clone())
 		}
 	}
 	// Fallback to default
 	for _, b := range blocks {
 		if b.isDef {
-			return RenderMustache(b.content, data)
+			return renderMustacheCtx(b.content, data, c.clone())
 		}
 	}
 	return ""
@@ -1361,92 +1417,148 @@ func ParseSingleFile(content string) (schema, seed string, pages map[string]*Pag
 
 // LoadPages discovers and parses all .html files in the app directory.
 func LoadPages(dir string) (map[string]*Page, map[string]string, error) {
+	return loadPagesFromSources(dir, nil)
+}
+
+func loadPagesFromSources(dir string, captured map[string][]byte) (map[string]*Page, map[string]string, error) {
 	pages := make(map[string]*Page)
 	partials := make(map[string]string)
+	pageSources := make(map[string][]byte)
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			// Check partials directory
-			if entry.Name() == "partials" {
-				partialDir := filepath.Join(dir, "partials")
-				partialEntries, err := os.ReadDir(partialDir)
-				if err == nil {
-					for _, pe := range partialEntries {
-						if strings.HasSuffix(pe.Name(), ".html") {
-							data, err := os.ReadFile(filepath.Join(partialDir, pe.Name()))
-							if err == nil {
-								partials["partials/"+pe.Name()] = string(data)
-							}
+	if captured == nil {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				if entry.Name() == "partials" {
+					// Read through an os.Root at the app dir: a partial
+					// symlinked outside the app is skipped, not inlined
+					// into every page that includes it.
+					for name, data := range readGotmplPartials(dir) {
+						if strings.HasSuffix(name, ".html") && !isMetadataSidecar(name) {
+							partials["partials/"+name] = data
 						}
 					}
 				}
+				continue
 			}
-			continue
+			if !strings.HasSuffix(entry.Name(), ".html") || entry.Name() == "head.html" || isMetadataSidecar(entry.Name()) {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+			}
+			pageSources[entry.Name()] = data
 		}
+	} else {
+		keys := make([]string, 0, len(captured))
+		for name := range captured {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		for _, name := range keys {
+			if strings.HasPrefix(name, "partials/") {
+				partial := strings.TrimPrefix(name, "partials/")
+				if strings.Contains(partial, "/") || !strings.HasSuffix(partial, ".html") || isMetadataSidecar(partial) {
+					continue
+				}
+				if data := captured[name]; data != nil {
+					partials[name] = string(data)
+				}
+				continue
+			}
+			if strings.Contains(name, "/") || !strings.HasSuffix(name, ".html") || name == "head.html" || isMetadataSidecar(name) {
+				continue
+			}
+			pageSources[name] = captured[name]
+		}
+	}
 
-		if !strings.HasSuffix(entry.Name(), ".html") {
-			continue
+	pageNames := make([]string, 0, len(pageSources))
+	for name := range pageSources {
+		pageNames = append(pageNames, name)
+	}
+	sort.Strings(pageNames)
+	for _, name := range pageNames {
+		data := pageSources[name]
+		if captured != nil && data == nil {
+			return nil, nil, fmt.Errorf("read %s: %w", name, os.ErrNotExist)
 		}
-		// Skip special files that aren't pages
-		if entry.Name() == "head.html" {
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
-		}
-
 		content := string(data)
 
 		// Determine route from filename
-		name := strings.TrimSuffix(entry.Name(), ".html")
-		route := "/" + name
-		if name == "index" {
+		pageName := strings.TrimSuffix(name, ".html")
+		route := "/" + pageName
+		if pageName == "index" {
 			route = "/"
 		}
 
-		auth, scope, title, layout := ParsePageAttrs(content)
-		description, image, robots := ParsePageSEO(content)
-
-		page := &Page{
-			Route:       route,
-			File:        entry.Name(),
-			RawHTML:     content,
-			Description: description,
-			Image:       image,
-			Robots:      robots,
-			Auth:        auth,
-			Scope:       scope,
-			Title:       title,
-			Layout:      layout,
-			Require:     ExtractPageRequire(content),
-			Type:        ExtractPageType(content),
-			Redirect:    ExtractPageRedirect(content),
-		}
-		// Frontmatter takes effect when the legacy <page> tag is absent -
-		// otherwise the <page> tag wins so a mixed file stays self-consistent.
-		if fm, _, fmErr := ExtractFrontmatter(content); fmErr == nil && fm != nil {
-			ApplyFrontmatterToPage(page, fm)
-		}
+		page := &Page{Route: route, File: name}
+		setPageAttrsFromSource(page, content)
 		pages[route] = page
 	}
 
 	return pages, partials, nil
 }
 
+// setPageAttrsFromSource derives a page's gates and metadata from its source:
+// the <page> tag first, then frontmatter for anything the tag leaves empty
+// (the tag wins so a mixed file stays self-consistent). The page loader and
+// the dev-mode re-read both use it, so neither can drop a frontmatter gate.
+func setPageAttrsFromSource(page *Page, content string) {
+	page.RawHTML = content
+	page.Auth, page.Scope, page.Title, page.Layout = ParsePageAttrs(content)
+	page.Description, page.Image, page.Robots = ParsePageSEO(content)
+	page.Require = ExtractPageRequire(content)
+	page.Type = ExtractPageType(content)
+	page.Redirect = ExtractPageRedirect(content)
+	page.Role = extractPageRole(content)
+	page.Engine = ""
+	if fm, _, fmErr := ExtractFrontmatter(content); fmErr == nil && fm != nil {
+		ApplyFrontmatterToPage(page, fm)
+	}
+	page.Auth = normalizePageAuth(page.Auth, page.File)
+}
+
+// normalizePageAuth maps a page's auth value onto the two the router knows:
+// "required" or open ("" / "none"). Route registration gated only the exact
+// string "required", so auth="true", `auth: yes` or a typo registered the page
+// with no sign-in check. Anything that isn't an explicit opt-out now requires
+// sign-in.
+func normalizePageAuth(auth, file string) string {
+	norm, known := canonicalAuthValue(auth)
+	if !known {
+		log.Printf("WARNING page %s: unknown auth=%q; treating it as auth=\"required\"", file, auth)
+	}
+	return norm
+}
+
+// canonicalAuthValue maps a page or flow `auth` value onto "" (unset),
+// "none" (explicit opt-out) or "required". known is false for a value that
+// is not one of the recognized spellings; it still maps to "required", so an
+// unrecognized value fails closed.
+func canonicalAuthValue(auth string) (norm string, known bool) {
+	switch strings.ToLower(strings.TrimSpace(auth)) {
+	case "":
+		return "", true
+	case "none", "public", "false", "no", "off":
+		return "none", true
+	case "required", "true", "yes", "on":
+		return "required", true
+	default:
+		return "required", false
+	}
+}
+
 // expandTransitionTags replaces <transitions table="X" id="Y"> with rendered
 // workflow transition buttons based on the current state and user's role.
 // Reads from workflows.yaml config - no API call needed at render time.
 func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
-	re := regexp.MustCompile(`<transitions\s+([^>]*?)/?>`)
-	return re.ReplaceAllStringFunc(content, func(match string) string {
-		m := re.FindStringSubmatch(match)
+	return transitionsTagRe.ReplaceAllStringFunc(content, func(match string) string {
+		m := transitionsTagRe.FindStringSubmatch(match)
 		if m == nil {
 			return match
 		}
@@ -1469,8 +1581,24 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 			return fmt.Sprintf(`<!-- transitions: no workflow for table %s -->`, table)
 		}
 
-		// Fetch the current state
-		row, err := QueryRows(app.DB, fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", wf.Field, table), id)
+		// Fetch the current state through the same gates as
+		// GET /api/<table>/{id}/transitions: the table's read mode and the
+		// canonical row scope. Another tenant's (or owner's) record is "not
+		// found" rather than a view of its state.
+		session := ctx.User
+		if session == nil || !SessionCanAccessTable(app, table, OpRead, session) {
+			return `<!-- transitions: record not found -->`
+		}
+		readSQL := "SELECT " + quoteColumn(table, wf.Field) + " FROM " + quoteIdent(table) + " WHERE id = ?"
+		readArgs := []any{id}
+		if hasColumn(app, table, "deleted_at") {
+			readSQL += " AND deleted_at IS NULL"
+		}
+		if pred, pargs, bypass := rowScopeClause(app, table, session, "view"); !bypass && pred != "" {
+			readSQL += " AND " + pred
+			readArgs = append(readArgs, pargs...)
+		}
+		row, err := queryNativeRowsWith(app.DB, app, table, readSQL, readArgs...)
 		if err != nil || len(row) == 0 {
 			return `<!-- transitions: record not found -->`
 		}
@@ -1482,7 +1610,6 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 			return "" // no transitions available from this state
 		}
 
-		session := ctx.User
 		var sb strings.Builder
 		sb.WriteString(`<div class="flex flex-wrap gap-2" data-transitions>`)
 		for to, t := range targets {

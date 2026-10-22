@@ -7,9 +7,15 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	readAuditDefaultLimit = 100
+	readAuditMaxLimit     = 1000
 )
 
 // Read audit logging: tracks WHO read WHAT WHEN for compliance (HIPAA, SOC2, GDPR).
@@ -81,6 +87,9 @@ func InitReadAudit(app *App, syncMode bool) {
 func appReadAudit(app *App) *readAuditBuffer {
 	if app == nil {
 		return nil
+	}
+	if app.auditOwner != nil {
+		return appReadAudit(app.auditOwner)
 	}
 	app.mu.RLock()
 	defer app.mu.RUnlock()
@@ -185,7 +194,7 @@ func splitComma(s string) []string {
 }
 
 // RegisterReadAuditAPI sets up the compliance query endpoint.
-func RegisterReadAuditAPI(mux *http.ServeMux, app *App) {
+func RegisterReadAuditAPI(mux appRouteRegistrar, app *App) {
 	// GET /api/_audit/reads - query read access logs.
 	// Admin: sees all logs. Regular user: sees only their own (GDPR right of access).
 	mux.HandleFunc("GET /api/_audit/reads", func(w http.ResponseWriter, r *http.Request) {
@@ -195,21 +204,27 @@ func RegisterReadAuditAPI(mux *http.ServeMux, app *App) {
 			return
 		}
 
+		limit := readAuditDefaultLimit
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > readAuditMaxLimit {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "limit must be an integer between 1 and 1000"})
+				return
+			}
+			limit = parsed
+		}
+
 		FlushReadAudit(app) // ensure current data for this app only
 
 		table := r.URL.Query().Get("table")
 		userID := r.URL.Query().Get("user_id")
 		rowID := r.URL.Query().Get("row_id")
-		limit := r.URL.Query().Get("limit")
-		if limit == "" {
-			limit = "100"
-		}
 
 		query := "SELECT table_name, row_id, query_type, user_id, user_email, created_at FROM _benmore_read_audit WHERE 1=1"
 		var args []any
 
 		// Non-admin users can only see their own read history
-		if !session.IsAdmin() {
+		if !session.IsAdminConsole() {
 			query += " AND user_id = ?"
 			args = append(args, session.UserID)
 			// Ignore user_id filter param for non-admins (forced to own)
@@ -232,9 +247,9 @@ func RegisterReadAuditAPI(mux *http.ServeMux, app *App) {
 		query += " ORDER BY created_at DESC LIMIT ?"
 		args = append(args, limit)
 
-		rows, err := QueryRows(app.DB, query, args...)
+		rows, err := queryMetadataRows(app.DB, query, args...)
 		if err != nil {
-			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "query failed"})
+			serverErrorJSON(w, r, app, "_read_audit", err, "query failed")
 			return
 		}
 

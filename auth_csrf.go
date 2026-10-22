@@ -77,7 +77,7 @@ func authCSRFSignWithSecret(payload, sid, secret string) string {
 // the originating session. Persistent API tokens (bmr_ prefix) are exempt -
 // those callers go through the isBearerAuth CSRF exemption anyway.
 func authRawSessionID(r *http.Request) string {
-	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+	if c, err := requestSessionCookie(r); err == nil && c.Value != "" {
 		return c.Value
 	}
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -107,7 +107,7 @@ func isBearerAuth(r *http.Request) bool {
 	if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		return false
 	}
-	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+	if c, err := requestSessionCookie(r); err == nil && c.Value != "" {
 		return false
 	}
 	return true
@@ -173,6 +173,46 @@ func validateCSRF(r *http.Request) bool {
 	return ok
 }
 
+// csrfOriginReason is validateCSRF's browser-origin gate on its own, for a
+// mutation that has no ambient credential to protect but must still not be
+// driven by another site through a visitor's browser.
+//
+// CSRF origin gate (round-2 #2). The session cookie is SameSite=Lax so a
+// cross-site POST/fetch won't even carry it; this is the second layer and
+// is what actually stops a forged request - the HMAC token is
+// defense-in-depth. A cross-site request must NOT be able to reach the HMAC
+// check (which would otherwise accept a session-less/unbound token lifted
+// from /api/_csrf or the page meta tag).
+//   - Origin present -> must match our Host.
+//   - Origin absent  -> consult Sec-Fetch-Site (sent by all modern
+//     browsers): reject cross-site / same-site. Earlier this treated a
+//     missing Origin as same-origin, which let a no-Origin cross-site POST
+//     through. A request with neither header (old/native client) still
+//     passes, preserving legitimate non-browser callers.
+//   - Origin `null`  -> an opaque origin. A browser also sends this literal
+//     on a form POST to the page's OWN origin when the page's referrer
+//     policy is no-referrer (Fetch, "append a request Origin header"), so it
+//     can't be refused outright: the framework's confirmation pages set that
+//     policy, and every one of their POSTs failed here in a browser. The
+//     literal says nothing about where the request came from; only
+//     Sec-Fetch-Site does, and only `same-origin` passes. A sandboxed frame,
+//     a data: page or a cross-origin redirect is `cross-site` there, and a
+//     browser that sends no fetch metadata is refused.
+func csrfOriginReason(r *http.Request) (string, bool) {
+	if origin := r.Header.Get("Origin"); origin == "null" {
+		if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			return "origin_null", false
+		}
+	} else if origin != "" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return "origin_mismatch", false
+		}
+	} else if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" || sfs == "same-site" {
+		return "sec_fetch_" + sfs, false
+	}
+	return "", true
+}
+
 // validateCSRFReason is the implementation; surfaces WHY the token was
 // rejected so operators can debug stale-token-after-redeploy issues
 // (the most common false-positive on this code path).
@@ -181,6 +221,24 @@ func validateCSRFReason(r *http.Request) (string, bool) {
 	if token == "" {
 		token = r.Header.Get("X-CSRF-Token")
 	}
+	return csrfTokenReason(r, token)
+}
+
+// validateCSRFToken is validateCSRF for a token the handler read from the
+// request itself, for the one carrier validateCSRF cannot see: a JSON body.
+// navigator.sendBeacon cannot set X-CSRF-Token, so a beacon's token travels
+// as `_csrf` inside its JSON payload. The token gets exactly the checks a
+// header or form token gets (origin gate, session-bound HMAC, expiry).
+func validateCSRFToken(r *http.Request, token string) bool {
+	reason, ok := csrfTokenReason(r, token)
+	if !ok {
+		log.Printf("validateCSRF: REJECT path=%s reason=%s ua=%q", r.URL.Path, reason, r.UserAgent())
+	}
+	return ok
+}
+
+// csrfTokenReason validates one presented token against the request.
+func csrfTokenReason(r *http.Request, token string) (string, bool) {
 	if token == "" {
 		return "missing", false
 	}
@@ -192,24 +250,8 @@ func validateCSRFReason(r *http.Request) (string, bool) {
 
 	nonce, tsStr, providedSig := parts[0], parts[1], parts[2]
 
-	// CSRF origin gate (round-2 #2). The session cookie is SameSite=Lax so a
-	// cross-site POST/fetch won't even carry it; this is the second layer and
-	// is what actually stops a forged request - the HMAC token below is
-	// defense-in-depth. A cross-site request must NOT be able to reach the HMAC
-	// check (which would otherwise accept a session-less/unbound token lifted
-	// from /api/_csrf or the page meta tag).
-	//   - Origin present -> must match our Host.
-	//   - Origin absent  -> consult Sec-Fetch-Site (sent by all modern
-	//     browsers): reject cross-site / same-site. Earlier this treated a
-	//     missing Origin as same-origin, which let a no-Origin cross-site POST
-	//     through. A request with neither header (old/native client) still
-	//     falls through to the token, preserving legitimate non-browser callers.
-	if origin := r.Header.Get("Origin"); origin != "" {
-		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
-			return "origin_mismatch", false
-		}
-	} else if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" || sfs == "same-site" {
-		return "sec_fetch_" + sfs, false
+	if reason, ok := csrfOriginReason(r); !ok {
+		return reason, false
 	}
 
 	// Verify HMAC. H-11: prefer the session-bound MAC (token tied to the
