@@ -280,9 +280,15 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 		report.ContractDigest = config.mcp.ContractDigest
 		report.ExecutionDigest = config.mcp.ExecutionDigest
 		for _, tool := range config.mcp.Tools {
-			handler := map[string]string{"kind": tool.Handler.Kind, "operation": tool.Handler.Operation, "table": tool.Handler.Table, "flow": tool.Handler.Flow}
+			handler := map[string]any{"kind": tool.Handler.Kind, "operation": tool.Handler.Operation, "table": tool.Handler.Table, "flow": tool.Handler.Flow}
 			if tool.Handler.FileColumn != "" {
 				handler["file_column"] = tool.Handler.FileColumn
+			}
+			if tool.Handler.UploadTenant != nil {
+				handler["upload_tenant"] = *tool.Handler.UploadTenant
+			}
+			if len(tool.Handler.MembershipConstraints) > 0 {
+				handler["membership_constraints"] = tool.Handler.MembershipConstraints
 			}
 			report.ReviewedTools = append(report.ReviewedTools, map[string]any{"name": tool.Name, "description": tool.Description, "handler": handler, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema, "permissions": tool.Permissions, "effect": tool.Effect, "approval": tool.Approval, "idempotency": tool.Idempotency, "reconciliation": tool.Reconciliation, "output_projection": tool.Output.Include, "component": tool.Component})
 		}

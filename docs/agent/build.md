@@ -37,6 +37,10 @@ runtime OpenAPI; hosted account, push, skill, and MCP API commands are separate.
 
 - Runtime 2.7.302: native MCP file tools can bind `handler.file_column` to one reviewed current file reference; legacy omission retains broader matching. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
 
+- Runtime 2.7.302: file tools can add bounded equalities on the actor's live group membership and expose a reviewed metadata-only `status` operation for known successful snapshot-backed processing results. Current file and row authority are rechecked; parsed blocks and snapshot payloads are not returned. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
+
+- Runtime 2.7.302: file tools can opt into `handler.upload_tenant: current` to require private-upload provenance to match both the selected workspace and source-row tenant. Legacy omission keeps existing upload-vouch behavior. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
+
 - Runtime 2.7.300: import launch synchronizes its cancellation generation with reload; cancellation still rolls back pending rows. See `api(at:"import")` (`reload_generation`).
 
 - Runtime 2.7.300: YAML writes and checks reject over-budget content before repeated validation. See `api(at:"verification")` (`yaml_resource_limits`).

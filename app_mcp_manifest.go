@@ -116,11 +116,13 @@ type AppMCPTransfer struct {
 	ResultChecksumField     string `yaml:"result_checksum_field,omitempty" json:"ResultChecksumField,omitempty"`
 }
 type AppMCPHandler struct {
-	FileColumn string `yaml:"file_column,omitempty" json:"FileColumn,omitempty"`
-	Kind       string `yaml:"kind"`
-	Operation  string `yaml:"operation"`
-	Table      string `yaml:"table"`
-	Flow       string `yaml:"flow"`
+	FileColumn            string         `yaml:"file_column,omitempty" json:"FileColumn,omitempty"`
+	MembershipConstraints map[string]any `yaml:"membership_constraints,omitempty" json:"MembershipConstraints,omitempty"`
+	UploadTenant          *string        `yaml:"upload_tenant,omitempty" json:"UploadTenant,omitempty"`
+	Kind                  string         `yaml:"kind"`
+	Operation             string         `yaml:"operation"`
+	Table                 string         `yaml:"table"`
+	Flow                  string         `yaml:"flow"`
 	// External read handler: kind: external, connection, operation_id.
 	Connection  string `yaml:"connection,omitempty" json:",omitempty"`
 	OperationID string `yaml:"operation_id,omitempty" json:",omitempty"`
@@ -344,8 +346,20 @@ func validateAppMCPManifestGated(m *AppMCPManifest, externalEnabled bool) error 
 		if tool.Handler.FileColumn != "" && (!fileTool || !safeIdent(tool.Handler.FileColumn) || apiHiddenColumn(nil, tool.Handler.Table, tool.Handler.FileColumn) || strings.HasSuffix(tool.Handler.FileColumn, blindColSuffix)) {
 			return fmt.Errorf("tool %q file_column requires a canonical readable file-handler column", tool.Name)
 		}
-		if fileTool && (tool.Handler.Table == "" || tool.Handler.Flow != "" || tool.Handler.Connection != "" || tool.Handler.OperationID != "" || (tool.Handler.Operation != "ingest" && tool.Handler.Operation != "verify")) {
+		if tool.Handler.UploadTenant != nil && (*tool.Handler.UploadTenant != "current" || !fileTool || tool.Handler.FileColumn == "") {
+			return fmt.Errorf("tool %q upload_tenant must be current on a file handler with file_column", tool.Name)
+		}
+		if err := validateAppMCPFileMembershipConstraints(tool.Handler.MembershipConstraints); err != nil {
+			return fmt.Errorf("tool %q membership_constraints: %w", tool.Name, err)
+		}
+		if len(tool.Handler.MembershipConstraints) > 0 && !fileTool {
+			return fmt.Errorf("tool %q membership_constraints are only supported on file handlers", tool.Name)
+		}
+		if fileTool && (tool.Handler.Table == "" || tool.Handler.Flow != "" || tool.Handler.Connection != "" || tool.Handler.OperationID != "" || (tool.Handler.Operation != "ingest" && tool.Handler.Operation != "verify" && tool.Handler.Operation != "status")) {
 			return fmt.Errorf("tool %q file handler requires one table binding and a supported file operation", tool.Name)
+		}
+		if fileTool && tool.Handler.Operation == "status" && !appMCPFileStatusInputSchemaValid(tool.InputSchema) {
+			return fmt.Errorf("tool %q file status requires string processing_id, record_id, and file_ref inputs", tool.Name)
 		}
 		if externalTool && tool.Effect != "read" {
 			return fmt.Errorf("tool %q: external write tools are not enabled in this runtime; declare effect: read", tool.Name)
@@ -408,7 +422,7 @@ func validateAppMCPManifestGated(m *AppMCPManifest, externalEnabled bool) error 
 			if !commandTool || tool.Handler.Flow == "" || tool.Handler.Table != "" {
 				return fmt.Errorf("tool %q requires exactly one flow command binding", tool.Name)
 			}
-		case "ingest", "verify":
+		case "ingest", "verify", "status":
 			if !fileTool {
 				return fmt.Errorf("tool %q file operation requires kind: file", tool.Name)
 			}
@@ -590,6 +604,12 @@ func validateAppMCPBindings(dir string, m *AppMCPManifest, flows []Flow) error {
 		return err
 	}
 	if err := validateAppMCPFileColumnBindings(m, definitions); err != nil {
+		return err
+	}
+	if err := validateAppMCPFileMembershipConstraintBindings(dir, m, LoadGroupConfig(dir), definitions); err != nil {
+		return err
+	}
+	if err := validateAppMCPFileUploadTenantBindings(m, LoadGroupConfig(dir), definitions); err != nil {
 		return err
 	}
 	if err := validateAppMCPBindingsForTables(m, flows, eligibleCRUDTables(definitions), LoadRolesConfig(dir)); err != nil {

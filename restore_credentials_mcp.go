@@ -23,7 +23,7 @@ const (
 	mcpFileProcessingsTable       = "_benmore_mcp_file_processings"
 )
 
-var mcpFileProcessingRestoreColumns = []string{"id", "file_id", "file_sha256", "origin", "origin_version", "content_type", "parser_version", "limits_json", "complete", "quality_flags", "created_by", "created_at", "source_connection", "source_file_id", "source_revision", "owner_created_at", "tenant", "source_table", "record_id", "file_ref", "snapshot_version", "snapshot_sha256", "snapshot_size"}
+var mcpFileProcessingRestoreColumns = []string{"id", "file_id", "file_sha256", "origin", "origin_version", "content_type", "parser_version", "limits_json", "complete", "quality_flags", "created_by", "created_at", "source_connection", "source_file_id", "source_revision", "owner_created_at", "tenant", "source_table", "record_id", "file_ref", "upload_tenant", "snapshot_version", "snapshot_sha256", "snapshot_size"}
 
 var restoreMCPTables = []string{mcpGrantsTable, mcpCredentialsTable, mcpAuthorizationsTable, mcpConnectionCredentialsTable}
 
