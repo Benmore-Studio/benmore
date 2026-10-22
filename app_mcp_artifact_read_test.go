@@ -248,7 +248,14 @@ func newReadArtifactEnv(t *testing.T, yaml string) *readArtifactEnv {
 // connector error code.
 func (e *readArtifactEnv) create(args map[string]any) (map[string]any, string) {
 	e.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := 30 * time.Second
+	if args["format"] == "pdf" {
+		// The request includes a 10-second version probe, a separate 30-second
+		// render budget and bounded process cleanup. Let the server report its
+		// result before this test client's deadline cancels the request.
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	result, err := e.client.CallTool(ctx, &sdk.CallToolParams{Name: mcpArtifactCreateTool, Arguments: args})
 	if err != nil {
