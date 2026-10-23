@@ -580,7 +580,10 @@ func validateAppMCPFileMembershipConstraintBindings(dir string, manifest *AppMCP
 		if membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
 			return fmt.Errorf("mcp.yaml: tool %q membership_constraints must use the configured canonical groups table and key columns", tool.Name)
 		}
-		encrypted := LoadEncryptedFieldsConfig(dir).Fields[group.Table]
+		var encrypted []EncryptedFieldDef
+		if config := LoadEncryptedFieldsConfig(dir); config != nil {
+			encrypted = config.Fields[group.Table]
+		}
 		for column := range constraints {
 			if !membershipTable.columns[column] || apiHiddenColumn(nil, group.Table, column) {
 				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q is not a canonical readable groups column", tool.Name, column)

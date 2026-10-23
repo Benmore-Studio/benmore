@@ -290,3 +290,34 @@ func TestAppMCPUploadTenantManifestContractAndInspection(t *testing.T) {
 		t.Fatalf("valid canonical tenant bindings rejected: %v", err)
 	}
 }
+
+func TestAppMCPFileMembershipBindingsWithoutEncryptedConfig(t *testing.T) {
+	app, _, _ := appMCPUploadTenantFixture(t)
+	encryptedPath := filepath.Join(app.Dir, "encrypted.yaml")
+	if _, err := os.Stat(encryptedPath); !os.IsNotExist(err) {
+		t.Fatalf("fixture must omit encrypted.yaml, stat err=%v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(app.Dir, "mcp.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := parseAppMCPManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range manifest.Tools {
+		if manifest.Tools[i].Handler.Kind == "file" {
+			manifest.Tools[i].Handler.MembershipConstraints = map[string]any{"kind": "human", "status": "active"}
+		}
+	}
+	writeTestFile(t, app.Dir, "schema.sql", "CREATE TABLE notes (id INTEGER PRIMARY KEY, file_path TEXT, org_id TEXT); CREATE TABLE members (id INTEGER PRIMARY KEY, org_id TEXT, email TEXT, kind TEXT, status TEXT);\n")
+	if err := validateAppMCPBindings(app.Dir, manifest, nil); err != nil {
+		t.Fatalf("valid file membership bindings without encrypted.yaml were rejected: %v", err)
+	}
+
+	writeTestFile(t, app.Dir, "encrypted.yaml", "tables:\n  members:\n    fields: [kind]\n")
+	if err := validateAppMCPBindings(app.Dir, manifest, nil); err == nil || !strings.Contains(err.Error(), "cannot use an encrypted column") {
+		t.Fatalf("encrypted membership column was not refused: %v", err)
+	}
+}

@@ -1,6 +1,6 @@
 {
   "name": "@benmore/bm",
-  "version": "2.7.302",
+  "version": "2.7.303",
   "description": "Zero-dependency browser SDK for external Benmore frontends",
   "type": "module",
   "module": "./index.js",
