@@ -568,7 +568,7 @@ func commandVerifiedTriggerFunction(name string) bool {
 
 func commandAllowedSQLFunction(name string) bool {
 	switch strings.ToLower(name) {
-	case "abs", "avg", "char", "coalesce", "concat", "concat_ws", "count", "date", "datetime", "benmore_today", "glob", "hex", "ifnull", "instr", "length", "like", "lower", "ltrim", "max", "min", "nullif", "printf", "quote", "replace", "round", "rtrim", "sign", "soundex", "sqlite_version", "substr", "substring", "sum", "time", "total", "trim", "typeof", "unicode", "upper", "zeroblob", "json", "json_array", "json_extract", "json_insert", "json_object", "json_patch", "json_remove", "json_replace", "json_type", "json_valid", "json_quote", "julianday", "strftime":
+	case "abs", "avg", "char", "coalesce", "concat", "concat_ws", "count", "date", "datetime", "benmore_today", "glob", "hex", "ifnull", "instr", "length", "like", "lower", "ltrim", "max", "min", "nullif", "printf", "quote", "replace", "round", "rtrim", "sign", "soundex", "sqlite_version", "substr", "substring", "sum", "time", "total", "trim", "typeof", "unicode", "upper", "zeroblob", "json", "json_array", "json_array_length", "json_group_array", "json_extract", "json_insert", "json_object", "json_patch", "json_remove", "json_replace", "json_type", "json_valid", "json_quote", "julianday", "strftime":
 		return true
 	default:
 		return false
@@ -1045,11 +1045,15 @@ func (exec *appMCPCommandExecution) executeSQL(ctx *FlowContext, step *FlowStep)
 		// Both compare the rows the statement returned.
 		if step.ExpectRows != "" {
 			ok, checkErr := evalExpectRows(step.ExpectRows, int64(len(result)))
-			if checkErr != nil || !ok {
-				if !isWrite {
-					return errors.New("command SQL read cardinality check failed")
+			if checkErr != nil {
+				return checkErr
+			}
+			if !ok {
+				message := "command SQL read cardinality check failed"
+				if isWrite {
+					message = "command DML RETURNING cardinality check failed"
 				}
-				return errors.New("command DML RETURNING cardinality check failed")
+				return &appMCPCommandRowCountConflictError{message: message}
 			}
 		}
 		if isWrite && len(result) > 0 {
@@ -1070,8 +1074,11 @@ func (exec *appMCPCommandExecution) executeSQL(ctx *FlowContext, step *FlowStep)
 	}
 	if step.ExpectRows != "" {
 		ok, checkErr := evalExpectRows(step.ExpectRows, affected)
-		if checkErr != nil || !ok {
-			return errors.New("command SQL mutation cardinality check failed")
+		if checkErr != nil {
+			return checkErr
+		}
+		if !ok {
+			return &appMCPCommandRowCountConflictError{message: "command SQL mutation cardinality check failed"}
 		}
 	}
 	if affected > 0 {

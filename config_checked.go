@@ -522,6 +522,9 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 		if err != nil {
 			return nil, err
 		}
+		if err := validateAppMCPFileColumnBindings(c.mcp, definitions); err != nil {
+			return nil, err
+		}
 		if err := validateAppMCPBindingsForTables(c.mcp, c.flows, eligibleCRUDTables(definitions), parseRolesConfig(appData)); err != nil {
 			return nil, err
 		}

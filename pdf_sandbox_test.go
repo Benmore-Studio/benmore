@@ -19,6 +19,21 @@ import (
 	"time"
 )
 
+func TestPDFChromeArgsUseEphemeralCredentialStore(t *testing.T) {
+	args := pdfChromeArgs("127.0.0.1:4321", "http://document.test/report", "/tmp/report.pdf", "/tmp/profile")
+	for _, want := range []string{"--password-store=basic", "--use-mock-keychain", "--user-data-dir=/tmp/profile"} {
+		count := 0
+		for _, arg := range args {
+			if arg == want {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("ephemeral PDF args require exactly one %q, got %d", want, count)
+		}
+	}
+}
+
 // The sandbox proxy serves only the one document and tunnels only HTTPS to
 // allowed hosts that resolve publicly.
 func TestPDFSandboxProxyServesOnlyTheDocument(t *testing.T) {

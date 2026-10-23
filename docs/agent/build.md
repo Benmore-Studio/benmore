@@ -21,6 +21,26 @@ runtime OpenAPI; hosted account, push, skill, and MCP API commands are separate.
 
 ## Recent
 
+- Runtime 2.7.302: data-event transaction panics release their database connection after rollback. See `api(at:"flows")` (`event_transaction_cleanup`).
+- Runtime 2.7.302: platform upload-retention sweeps keep selection and deletion on their captured database. See `api(at:"recovery")` (`worker_generations`).
+
+- Runtime 2.7.302: PDF jobs isolate Chrome HOME/XDG caches, select disposable credential stores and report cleanup failures; host startup and old residue remain separate. See `api(at:"pdf")` (`runtime_cleanup`).
+
+- CLI 0.1.53: confirmed user deletion accepts an explicit environment; invalid or duplicate flags refuse before dispatch. See `api(at:"auth")` (`cli_user_provisioning`).
+
+- Runtime 2.7.302: source history separates successful Git warnings from parsed paths; unreadable-directory cleanup remains separate. See `api(at:"github")` (`git_diagnostics`).
+
+- Runtime 2.7.302: test diagnostics retain published root pages and partials until validated reload. See `api(at:"frontend")` (`root_page_reload`).
+- Runtime 2.7.302: route registration and graph extraction preserve published page definitions and use matching effective gates. See `api(at:"frontend")` (`root_page_reload`).
+
+- Runtime 2.7.302: reviewed command SQL admits `json_array_length` and `json_group_array` without widening table or function authority. See `api(at:"connector")` (`connector_grants`).
+
+- Runtime 2.7.302: native MCP file tools can bind `handler.file_column` to one reviewed current file reference; legacy omission retains broader matching. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
+
+- Runtime 2.7.302: file tools can add bounded equalities on the actor's live group membership and expose a reviewed metadata-only `status` operation for known successful snapshot-backed processing results. Current file and row authority are rechecked; parsed blocks and snapshot payloads are not returned. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
+
+- Runtime 2.7.302: file tools can opt into `handler.upload_tenant: current` to require private-upload provenance to match both the selected workspace and source-row tenant. Legacy omission keeps existing upload-vouch behavior. See `api(at:"connector")` (`connector_grants`) and `benmore docs connector`.
+
 - Runtime 2.7.300: import launch synchronizes its cancellation generation with reload; cancellation still rolls back pending rows. See `api(at:"import")` (`reload_generation`).
 
 - Runtime 2.7.300: YAML writes and checks reject over-budget content before repeated validation. See `api(at:"verification")` (`yaml_resource_limits`).
@@ -165,7 +185,7 @@ runtime OpenAPI; hosted account, push, skill, and MCP API commands are separate.
 | Unreleased: a flow step key its step type does not read is refused at write time and logged at load (`retry`/`on_error`/`if`/`id` under `with:`, `timeout` off api/compute/transcribe, `params` on `sql_dynamic`, `with.sql`, any `with:` key not listed for the type); `else:` on a gated `if:` + `run:` step, `with.timeout` on transcribe and step-root `timeout` on compute are read now; a SQL step with no statement fails with `no SQL statement` | `api(at:"flows")` (`step_keys`) |
 | Unreleased: SQL flows can call `benmore_today('America/New_York')` for the server's current date in an IANA zone; blank, `Local`, and invalid zones fail the SQL statement | `api(at:"flows")` (`timezone_dates`) |
 | Unreleased: a table/column name in config must be a plain identifier (letters, digits, `_`, not starting with a digit): `groups.table`/`key`/`user_field`/`role_field`/`bootstrap.org_table`, encrypted.yaml and inline `encrypted:` tables/columns, retention.yaml `table`/`column`, a workflow's `table`/`field` - a non-identifier is refused at push / `benmore check` instead of breaking at reload (plain names unchanged) | `api(at:"scoping")` (`tenant_bootstrap`) |
-| Unreleased: `expect_rows` is checked on every `run: sql` / `sql_dynamic` step - rows returned for a SELECT or a `RETURNING` write (it was ignored there), rows affected otherwise - and under `with:` (was ignored; the step root is canonical); `WITH ... <write>` without RETURNING stores `rows_affected`; an assertion that cannot be checked is refused at write time and stops the step | `api(at:"flows")` |
+| Unreleased: `expect_rows` is checked on every `run: sql` / `sql_dynamic` step - rows returned for a SELECT or a `RETURNING` write (it was ignored there), rows affected otherwise - and under `with:` (was ignored; the step root is canonical); `WITH ... <write>` without RETURNING stores `rows_affected`; an assertion that cannot be checked is refused at write time and stops the step. A valid mismatch in an approved command records a retryable `conflict`; SQL/assertion/count errors remain operational | `api(at:"flows")`, `api(at:"connector")` |
 | Unreleased: `${{ steps.<id>.outputs.rows_affected }}` resolves (it never did: `!=` on it was always true, `==` always false; same for any output column named `rows…`) | `api(at:"flows")` |
 | Unreleased: a hard-bounce email pause ends by itself (24h, then 72h, then manual; complaints stay manual) and a resume restarts the measurement; accepting an ownership transfer is refused while the app carries paid features the recipient's plan lacks (`plan_gaps`); `GET /platform/ops/over-plan` for operators | `api(at:"email")`, `api(at:"collaborators")` |
 | Unreleased security round seventeen: `before_update` hook SQL placeholders are the request's fields again (2.7.251 regression); the groups membership table needs a tenant admin unless it declares its own rule; `member-of:` parents can be explicit (`<join>=id`); encrypted secret-named columns stay hidden without unmask roles; email `to:` values are one recipient (`| recipients` for a list) and HTML email bodies escape values (`| raw` keeps markup); sign-up limits (`auth.signup_rate_limit`); support sessions can't manage credentials | `api(at:"hooks")`, `api(at:"scoping")`, `api(at:"access")`, `api(at:"encryption")`, `api(at:"email")`, `api(at:"auth")` |

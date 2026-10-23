@@ -389,9 +389,9 @@ func gitRevert(dir, sha string) (GitCommit, error) {
 	return commits[0], nil
 }
 
-// gitRun is the low-level exec helper. Captures combined stdout/stderr
-// (git's user-facing output sometimes goes to stderr) and returns it
-// as a string. err is non-nil if git exited non-zero.
+// gitRun is the low-level exec helper. Returns only stdout: successful git
+// commands may also warn on stderr, which is not part of their paths, hashes,
+// or other machine-readable results. Nonzero errors retain both diagnostics.
 //
 // `-c safe.directory=<dir>` is prepended on every invocation. The
 // production deploy chowns app directories to a per-app DynamicUser
@@ -547,13 +547,14 @@ func gitRunInput(dir, input string, args ...string) (string, error) {
 	cmd.Dir = dir
 	cmd.Env = gitCommandEnv()
 	cmd.Stdin = strings.NewReader(input)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return buf.String(), fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(buf.String()))
+		diagnostic := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
+		return stdout.String(), fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, diagnostic)
 	}
-	return buf.String(), nil
+	return stdout.String(), nil
 }
 
 // cappedBuffer keeps the first limit bytes and, once full, cancels the command

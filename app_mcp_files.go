@@ -13,10 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,6 +76,7 @@ const appMCPFileProcessingDDL = `CREATE TABLE IF NOT EXISTS _benmore_mcp_file_pr
 	source_table TEXT NOT NULL DEFAULT '',
 	record_id TEXT NOT NULL DEFAULT '',
 	file_ref TEXT NOT NULL DEFAULT '',
+	upload_tenant TEXT NOT NULL DEFAULT '',
 	snapshot_version INTEGER NOT NULL DEFAULT 0,
 	snapshot_sha256 TEXT NOT NULL DEFAULT '',
 	snapshot_size INTEGER NOT NULL DEFAULT 0,
@@ -122,7 +126,7 @@ func ensureAppMCPFileProcessingSchema(db appMCPFileProcessingSchemaDB) error {
 	for name, declaration := range map[string]string{
 		"source_connection": "TEXT NOT NULL DEFAULT ''", "source_file_id": "TEXT NOT NULL DEFAULT ''", "source_revision": "TEXT NOT NULL DEFAULT ''",
 		"owner_created_at": "TEXT NOT NULL DEFAULT ''", "tenant": "TEXT NOT NULL DEFAULT ''", "source_table": "TEXT NOT NULL DEFAULT ''",
-		"record_id": "TEXT NOT NULL DEFAULT ''", "file_ref": "TEXT NOT NULL DEFAULT ''",
+		"record_id": "TEXT NOT NULL DEFAULT ''", "file_ref": "TEXT NOT NULL DEFAULT ''", "upload_tenant": "TEXT NOT NULL DEFAULT ''",
 		"snapshot_version": "INTEGER NOT NULL DEFAULT 0", "snapshot_sha256": "TEXT NOT NULL DEFAULT ''", "snapshot_size": "INTEGER NOT NULL DEFAULT 0",
 		"snapshot_data": "BLOB NOT NULL DEFAULT X''",
 	} {
@@ -138,7 +142,16 @@ func ensureAppMCPFileProcessingSchema(db appMCPFileProcessingSchemaDB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS _benmore_mcp_file_processings_owner ON _benmore_mcp_file_processings(created_by,owner_created_at,tenant,source_table,record_id,file_ref,file_sha256,parser_version)`); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS _benmore_mcp_file_processings_snapshot_identity ON _benmore_mcp_file_processings(created_by,owner_created_at,tenant,source_table,record_id,file_ref,file_sha256,parser_version,limits_json) WHERE snapshot_version=1`); err != nil {
+	var hasLegacyIdentityIndex int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM main.sqlite_master WHERE type='index' AND name='_benmore_mcp_file_processings_snapshot_identity'`).Scan(&hasLegacyIdentityIndex); err != nil {
+		return err
+	}
+	if hasLegacyIdentityIndex != 0 {
+		if _, err := db.Exec(`DROP INDEX _benmore_mcp_file_processings_snapshot_identity`); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS _benmore_mcp_file_processings_snapshot_identity_v2 ON _benmore_mcp_file_processings(created_by,owner_created_at,tenant,source_table,record_id,file_ref,upload_tenant,file_sha256,parser_version,limits_json) WHERE snapshot_version=1`); err != nil {
 		return err
 	}
 	return nil
@@ -150,10 +163,15 @@ func appMCPRegisterFileTools(server *sdk.Server, app *App, generation *appMCPRun
 	}
 	for _, declared := range generation.manifest.Tools {
 		tool := declared
-		if tool.Handler.Kind != "file" || (tool.Handler.Operation != "ingest" && tool.Handler.Operation != "verify") || !appMCPToolAllowed(generation.view, &tool, actor) {
+		if tool.Handler.Kind != "file" || (tool.Handler.Operation != "ingest" && tool.Handler.Operation != "verify" && tool.Handler.Operation != "status") || !appMCPToolAllowed(generation.view, &tool, actor) {
 			continue
 		}
-		description := tool.Description + " Supports private CSV, XLSX and XLSM uploads, plus PDF text/OCR when fixed Poppler, Tesseract, English trained data and enforced seccomp network isolation are available. OCR runs on pages with no native text blocks; mixed pages may omit raster-only text. PDFs are capped at 200 pages, 40 MP per rendered page, 60 seconds and 512 MiB per page, 512 MiB total temporary storage, and 10 minutes total. Results return bounded page blocks with page, bounding box, OCR confidence when applicable, and quality flags."
+		description := tool.Description
+		if tool.Handler.Operation == "status" {
+			description += " Returns bounded metadata for a known successful snapshot-backed processing result after current row, file, membership, and owner checks. It does not return parsed blocks or snapshot content; complete describes historical parser completion, not current file integrity."
+		} else {
+			description += " Supports private CSV, XLSX and XLSM uploads, plus PDF text/OCR when fixed Poppler, Tesseract, English trained data and enforced seccomp network isolation are available. OCR runs on pages with no native text blocks; mixed pages may omit raster-only text. PDFs are capped at 200 pages, 40 MP per rendered page, 60 seconds and 512 MiB per page, 512 MiB total temporary storage, and 10 minutes total. Results return bounded page blocks with page, bounding box, OCR confidence when applicable, and quality flags."
+		}
 		server.AddTool(&sdk.Tool{Name: tool.Name, Description: description, InputSchema: tool.InputSchema, OutputSchema: appMCPEnvelopeSchema(&tool), Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}}, func(ctx context.Context, request *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 			input, ok := appMCPDecodeToolArguments(request.Params.Arguments)
 			if !ok {
@@ -177,11 +195,140 @@ func appMCPRegisterFileTools(server *sdk.Server, app *App, generation *appMCPRun
 }
 
 type appMCPFileSnapshotScope struct {
-	OwnerCreatedAt string
-	Tenant         string
-	Table          string
-	RecordID       string
-	FileRef        string
+	OwnerCreatedAt        string
+	Tenant                string
+	Table                 string
+	RecordID              string
+	FileRef               string
+	FileColumn            string
+	UploadTenant          string
+	MembershipConstraints map[string]any
+}
+
+// validateAppMCPFileMembershipConstraints accepts only a small, deterministic
+// set of scalar equality predicates. The keys are resolved against the live
+// configured membership table before use; values are always SQL parameters.
+func validateAppMCPFileMembershipConstraints(constraints map[string]any) error {
+	if len(constraints) > 8 {
+		return errors.New("at most eight membership columns may be constrained")
+	}
+	for column, value := range constraints {
+		if !membershipIdentRe.MatchString(column) || strings.HasSuffix(column, blindColSuffix) {
+			return fmt.Errorf("%q is not a supported canonical membership column", column)
+		}
+		switch v := value.(type) {
+		case string:
+			if len(v) > 128 || strings.ContainsRune(v, 0) {
+				return fmt.Errorf("%q must be a string of at most 128 bytes without NUL", column)
+			}
+		case bool:
+		case int:
+			if v < -1e15 || v > 1e15 {
+				return fmt.Errorf("%q must be a bounded number", column)
+			}
+		case int64:
+			if v < -1e15 || v > 1e15 {
+				return fmt.Errorf("%q must be a bounded number", column)
+			}
+		case uint64:
+			if v > 1e15 {
+				return fmt.Errorf("%q must be a bounded number", column)
+			}
+		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) || math.Abs(v) > 1e15 {
+				return fmt.Errorf("%q must be a finite bounded number", column)
+			}
+		default:
+			return fmt.Errorf("%q must use a string, boolean, or number scalar", column)
+		}
+	}
+	return nil
+}
+
+func appMCPFileStatusInputSchemaValid(schema *AppMCPSchema) bool {
+	if schema == nil || schema.Type != "object" {
+		return false
+	}
+	for _, name := range []string{"processing_id", "record_id", "file_ref"} {
+		property := schema.Properties[name]
+		if property == nil || property.Type != "string" || !slices.Contains(schema.Required, name) {
+			return false
+		}
+	}
+	return true
+}
+
+func appMCPFileMembershipConstraintsValid(q appMCPFileSnapshotQueryer, app *App, constraints map[string]any) bool {
+	if len(constraints) == 0 {
+		return true
+	}
+	if validateAppMCPFileMembershipConstraints(constraints) != nil || q == nil || app == nil || app.DB == nil || app.Group == nil || app.Group.Table == "" || app.Group.Key == "" || app.Group.UserField == "" || !membershipIdentRe.MatchString(app.Group.Table) || !membershipIdentRe.MatchString(app.Group.Key) || !membershipIdentRe.MatchString(app.Group.UserField) {
+		return false
+	}
+	for column := range constraints {
+		if apiHiddenColumn(app, app.Group.Table, column) || (app.Encrypted != nil && func() bool {
+			for _, field := range app.Encrypted.Fields[app.Group.Table] {
+				if field.Column == column {
+					return true
+				}
+			}
+			return false
+		}()) || !appMCPHasDeclaredColumn(q, app.Group.Table, column) {
+			return false
+		}
+	}
+	return true
+}
+
+// appMCPFileMembershipAllowed requires exactly one live row for this actor and
+// tenant before applying the reviewed equality constraints. This prevents a
+// second, qualifying membership row from borrowing authority from the row that
+// established the actor's tenant.
+func appMCPFileMembershipAllowed(q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, app *App, actor *Session, tenant string, constraints map[string]any) bool {
+	if len(constraints) == 0 {
+		return true
+	}
+	if !appMCPFileMembershipConstraintsValid(q, app, constraints) || q == nil || actor == nil || tenant == "" || tenant == "0" {
+		return false
+	}
+	group := app.Group
+	member, ok := groupMemberValue(group, actor)
+	if !ok {
+		return false
+	}
+	keys := make([]string, 0, len(constraints))
+	for key := range constraints {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	from := "main." + quoteIdent(group.Table)
+	identity := quoteColumn(group.Table, group.Key) + "=? AND " + quoteColumn(group.Table, group.UserField) + "=?"
+	live := membershipLiveConds(group, group.Table, "", func(col string) bool { return appMCPHasDeclaredColumn(q, group.Table, col) })
+	match := "1"
+	matchArgs := make([]any, 0, len(keys))
+	for _, key := range keys {
+		sqlType := "text"
+		switch constraints[key].(type) {
+		case bool, int, int64, uint64:
+			sqlType = "integer"
+		case float64:
+			sqlType = "real"
+		}
+		column := quoteColumn(group.Table, key)
+		match += " AND typeof(" + column + ")=? AND " + column + "=?"
+		matchArgs = append(matchArgs, sqlType)
+		matchArgs = append(matchArgs, constraints[key])
+	}
+	query := "SELECT COUNT(*), COALESCE(SUM(CASE WHEN " + match + " THEN 1 ELSE 0 END),0) FROM " + from + " WHERE " + identity + live
+	args := append(append([]any{}, matchArgs...), tenant, member)
+	var liveCount, matchingCount int
+	if q.QueryRowContext(context.Background(), query, args...).Scan(&liveCount, &matchingCount) != nil {
+		return false
+	}
+	return liveCount == 1 && matchingCount == 1
 }
 
 type appMCPFileSnapshot struct {
@@ -207,6 +354,7 @@ type appMCPStoredFileSnapshot struct {
 	Table          string
 	RecordID       string
 	FileRef        string
+	UploadTenant   string
 	Digest         string
 	SourceDigest   string
 	Size           int64
@@ -221,12 +369,26 @@ type appMCPFileSnapshotQueryer interface {
 // appMCPFileRecordAuthorizedFrom repeats the established file-read gates using
 // the publication transaction, so a long parse cannot publish after its row,
 // scope, uploader ownership, or file reference has changed.
-func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor *Session, table, id, logical string) bool {
-	if q == nil || app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || !SessionCanAccessTable(app, table, OpRead, actor) || checkScope(actor, table, "read") != nil {
+func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor *Session, table, id, logical string, fileColumns ...string) bool {
+	return appMCPFileRecordAuthorizedWithUploadTenantFrom(q, app, actor, table, id, logical, "", "", fileColumns...)
+}
+
+func appMCPFileRecordAuthorizedWithUploadTenantFrom(q appMCPFileSnapshotQueryer, app *App, actor *Session, table, id, logical, uploadTenant, tenant string, fileColumns ...string) bool {
+	column := ""
+	if len(fileColumns) > 1 {
+		return false
+	}
+	if len(fileColumns) == 1 {
+		column = fileColumns[0]
+	}
+	if q == nil || app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || id != strings.TrimSpace(id) || strings.ContainsAny(id, "/?#\\\x00") || !SessionCanAccessTable(app, table, OpRead, actor) || checkScope(actor, table, "read") != nil {
+		return false
+	}
+	if column != "" && !appMCPFileColumnReadable(q, app, table, column) {
 		return false
 	}
 	predicate, args, bypass := rowScopeClause(app, table, actor, "view")
-	query := "SELECT * FROM " + quoteIdent(table) + " WHERE id=?"
+	query := "SELECT * FROM main." + quoteIdent(table) + " WHERE id=?"
 	queryArgs := []any{id}
 	if hasColumn(app, table, "deleted_at") {
 		query += " AND deleted_at IS NULL"
@@ -270,7 +432,10 @@ func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor
 	}
 	want := uploadRelPath(logical)
 	referenced := false
-	for _, value := range values {
+	for i, value := range values {
+		if column != "" && columnNames[i] != column {
+			continue
+		}
 		if text, ok := value.(string); ok && text != "" {
 			if uploadRelPath(text) == want {
 				referenced = true
@@ -287,6 +452,9 @@ func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor
 		}
 	}
 	if !referenced {
+		return false
+	}
+	if uploadTenant != "" && !appMCPFileUploadTenantMatches(q, app, table, id, logical, uploadTenant, tenant) {
 		return false
 	}
 	var uploader int64
@@ -312,6 +480,157 @@ func appMCPFileRecordAuthorizedFrom(q appMCPFileSnapshotQueryer, app *App, actor
 		var rowGroup string
 		if q.QueryRowContext(context.Background(), "SELECT "+quoteColumn(table, app.Group.Key)+" FROM "+quoteIdent(table)+" WHERE id=?", id).Scan(&rowGroup) == nil && rowGroup == group {
 			return true
+		}
+	}
+	return false
+}
+
+// appMCPFileUploadTenantMatches is an opt-in strengthening for apps whose
+// authorization policy allows admins to attach files across workspace rows.
+// It deliberately runs before legacy admin/uploader/row-owner vouching.
+func appMCPFileUploadTenantMatches(q appMCPFileSnapshotQueryer, app *App, table, id, logical, policy, tenant string) bool {
+	if policy != "current" || tenant == "" || tenant == "0" || q == nil || app == nil || app.Group == nil {
+		return false
+	}
+	group := app.Group
+	if !safeIdent(group.Table) || !safeIdent(group.Key) || !safeIdent(group.UserField) || !appMCPHasDeclaredColumn(q, group.Table, group.Key) || !appMCPHasDeclaredColumn(q, group.Table, group.UserField) || !appMCPHasDeclaredColumn(q, table, group.Key) {
+		return false
+	}
+	var rowTenant sql.NullString
+	if err := q.QueryRowContext(context.Background(), "SELECT CAST("+quoteColumn(table, group.Key)+" AS TEXT) FROM main."+quoteIdent(table)+" WHERE id=?", id).Scan(&rowTenant); err != nil || !rowTenant.Valid || rowTenant.String == "" || rowTenant.String != tenant {
+		return false
+	}
+	var ownerTenant sql.NullString
+	if err := q.QueryRowContext(context.Background(), `SELECT group_id FROM main._benmore_upload_owners WHERE path=?`, privateUploadKey(app, logical)).Scan(&ownerTenant); err != nil || !ownerTenant.Valid || ownerTenant.String == "" || ownerTenant.String != tenant {
+		return false
+	}
+	return true
+}
+
+func validateAppMCPFileColumnBindings(manifest *AppMCPManifest, definitions []crudTableDefinition) error {
+	if manifest == nil {
+		return nil
+	}
+	for _, tool := range manifest.Tools {
+		if tool.Handler.FileColumn == "" {
+			continue
+		}
+		found := false
+		for _, table := range definitions {
+			if table.name == tool.Handler.Table && table.columns[tool.Handler.FileColumn] {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("mcp.yaml: tool %q has unresolved file_column %q", tool.Name, tool.Handler.FileColumn)
+		}
+	}
+	return nil
+}
+
+func validateAppMCPFileUploadTenantBindings(manifest *AppMCPManifest, group *GroupConfig, definitions []crudTableDefinition) error {
+	if manifest == nil {
+		return nil
+	}
+	for _, tool := range manifest.Tools {
+		if tool.Handler.UploadTenant == nil {
+			continue
+		}
+		if *tool.Handler.UploadTenant != "current" || tool.Handler.Kind != "file" || tool.Handler.FileColumn == "" || group == nil || !safeIdent(group.Table) || !safeIdent(group.Key) || !safeIdent(group.UserField) {
+			return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires current, a file_column, and configured groups.table/key/user_field", tool.Name)
+		}
+		var sourceTable, membershipTable *crudTableDefinition
+		for i := range definitions {
+			if definitions[i].name == tool.Handler.Table {
+				sourceTable = &definitions[i]
+			}
+			if definitions[i].name == group.Table {
+				membershipTable = &definitions[i]
+			}
+		}
+		if sourceTable == nil || !sourceTable.columns[group.Key] || membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
+			return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires the configured tenant key on its source row and canonical groups table", tool.Name)
+		}
+	}
+	return nil
+}
+
+func validateAppMCPFileMembershipConstraintBindings(dir string, manifest *AppMCPManifest, group *GroupConfig, definitions []crudTableDefinition) error {
+	if manifest == nil {
+		return nil
+	}
+	for _, tool := range manifest.Tools {
+		constraints := tool.Handler.MembershipConstraints
+		if len(constraints) == 0 {
+			continue
+		}
+		if err := validateAppMCPFileMembershipConstraints(constraints); err != nil {
+			return fmt.Errorf("mcp.yaml: tool %q membership_constraints: %w", tool.Name, err)
+		}
+		if tool.Handler.Kind != "file" || group == nil || !membershipIdentRe.MatchString(group.Table) || !membershipIdentRe.MatchString(group.Key) || !membershipIdentRe.MatchString(group.UserField) {
+			return fmt.Errorf("mcp.yaml: tool %q membership_constraints require configured groups.table, groups.key, and groups.user_field", tool.Name)
+		}
+		var membershipTable *crudTableDefinition
+		for i := range definitions {
+			if definitions[i].name == group.Table {
+				membershipTable = &definitions[i]
+				break
+			}
+		}
+		if membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
+			return fmt.Errorf("mcp.yaml: tool %q membership_constraints must use the configured canonical groups table and key columns", tool.Name)
+		}
+		encrypted := LoadEncryptedFieldsConfig(dir).Fields[group.Table]
+		for column := range constraints {
+			if !membershipTable.columns[column] || apiHiddenColumn(nil, group.Table, column) {
+				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q is not a canonical readable groups column", tool.Name, column)
+			}
+			if strings.HasSuffix(column, blindColSuffix) {
+				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use a blind index", tool.Name, column)
+			}
+			for _, field := range encrypted {
+				if field.Column == column {
+					return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use an encrypted column", tool.Name, column)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func appMCPFileColumnReadable(q appMCPFileSnapshotQueryer, app *App, table, column string) bool {
+	if q == nil || app == nil || !safeIdent(table) || !safeIdent(column) || apiHiddenColumn(app, table, column) {
+		return false
+	}
+	if app.Encrypted != nil {
+		for _, field := range app.Encrypted.Fields[table] {
+			if field.Column == column {
+				return false
+			}
+		}
+	}
+	rows, err := q.QueryContext(context.Background(), "PRAGMA main.table_info("+quoteIdent(table)+")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	columns := []Column{}
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var def any
+		if rows.Scan(&cid, &name, &kind, &notNull, &def, &primary) != nil {
+			return false
+		}
+		columns = append(columns, Column{Name: name, Type: kind})
+	}
+	if rows.Err() != nil || !listColumnAllowlist(app, table, columns)[column] {
+		return false
+	}
+	for _, field := range columns {
+		if field.Name == column {
+			kind := strings.ToUpper(field.Type)
+			return strings.Contains(kind, "TEXT") || strings.Contains(kind, "CHAR") || strings.Contains(kind, "CLOB")
 		}
 	}
 	return false
@@ -401,7 +720,11 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 	}
 	app := generation.view
 	tool := appMCPFileTool(generation.manifest, name)
+	uploadTenant := appMCPHandlerUploadTenant(tool.Handler)
 	if !appMCPToolAllowed(app, tool, actor) {
+		return nil, appMCPResultFailure("denied")
+	}
+	if !appMCPFileMembershipConstraintsValid(app.DB, app, tool.Handler.MembershipConstraints) || !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
 		return nil, appMCPResultFailure("denied")
 	}
 	if validateAppMCPSchemaValue(tool.InputSchema, input) != nil {
@@ -419,6 +742,30 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 	recordID, _ := input["record_id"].(string)
 	if len(recordID) > 256 {
 		return nil, appMCPResultFailure("invalid_input")
+	}
+	if tool.Handler.Operation == "status" {
+		processingID, _ := input["processing_id"].(string)
+		if !appMCPFileProcessingID(processingID) || recordID == "" || len(fileRef) == 0 {
+			return nil, appMCPResultFailure("invalid_input")
+		}
+		if !appMCPAuthorizeFileRecordForTool(app, actor, tool.Handler.Table, recordID, logical, tool.Handler, grant.Tenant) || !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
+			return nil, appMCPResultFailure("denied")
+		}
+		row, statusErr := appMCPReadFileProcessingStatus(ctx, app, processingID, actor.UserID, grant.UserCreated, grant.Tenant, tool.Handler.Table, recordID, logical, uploadTenant)
+		if statusErr != nil {
+			return nil, appMCPResultFailure("denied")
+		}
+		projected, projectErr := appMCPProjectRow(tool, row)
+		currentGrant, currentActor, authErr := resolveAppMCPAccessForGeneration(ctx, origin, generation, raw, resource, time.Now())
+		if projectErr != nil || len(projected) == 0 || authErr != nil || currentGrant.ID != grant.ID || !appMCPAuthorityUnchanged(actor, currentActor) || !appMCPToolAllowed(app, tool, currentActor) || !appMCPAuthorizeFileRecordForTool(app, currentActor, tool.Handler.Table, recordID, logical, tool.Handler, currentGrant.Tenant) || !appMCPFileMembershipAllowed(app.DB, app, currentActor, currentGrant.Tenant, tool.Handler.MembershipConstraints) {
+			return nil, appMCPResultFailure("denied")
+		}
+		response := &appMCPReadResult{Data: projected, ProcessingID: processingID, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), SourceRevisions: map[string]string{"contract": generation.manifest.ContractDigest, "execution": generation.manifest.ExecutionDigest}, Completeness: appMCPCompleteness{State: "complete", Basis: "authorized_row"}, Freshness: "observed", Warnings: []string{}}
+		encoded, encodeErr := json.Marshal(response)
+		if encodeErr != nil || len(encoded) > appMCPResultLimit {
+			return nil, appMCPResultFailure("incomplete_result")
+		}
+		return response, nil
 	}
 	page, perPage := 1, appMCPFileDefaultPageSize
 	if tool.Handler.Operation == "ingest" {
@@ -457,17 +804,20 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 	var result IngestResult
 	if tool.Handler.Operation == "verify" {
 		processingID, _ = input["processing_id"].(string)
-		if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical) {
+		if !appMCPAuthorizeFileRecordForTool(app, actor, tool.Handler.Table, recordID, logical, tool.Handler, grant.Tenant) || !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
 			return nil, appMCPResultFailure("denied")
 		}
-		stored, readErr := appMCPReadFileSnapshot(ctx, app, processingID, actor.UserID, grant.UserCreated, grant.Tenant, tool.Handler.Table, recordID, logical)
+		stored, readErr := appMCPReadFileSnapshot(ctx, app, processingID, actor.UserID, grant.UserCreated, grant.Tenant, tool.Handler.Table, recordID, logical, uploadTenant)
 		if readErr != nil {
 			return nil, appMCPResultFailure("denied")
 		}
 		result = stored.Snapshot.Result
 		pdfResult = stored.Snapshot.PDF
 	} else {
-		data, contentType, err := appMCPReadAuthorizedPrivateUpload(ctx, app, actor, tool.Handler.Table, recordID, logical, limits.MaxFileBytes)
+		if !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
+			return nil, appMCPResultFailure("denied")
+		}
+		data, contentType, err := appMCPReadAuthorizedPrivateUploadForTool(ctx, app, actor, tool.Handler.Table, recordID, logical, limits.MaxFileBytes, tool.Handler, grant.Tenant)
 		if err != nil {
 			var failure *appMCPResultError
 			if errors.As(err, &failure) && failure.Code == "denied" {
@@ -479,7 +829,10 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 			}
 			return nil, appMCPResultFailure("incomplete_result")
 		}
-		scope := appMCPFileSnapshotScope{OwnerCreatedAt: grant.UserCreated, Tenant: grant.Tenant, Table: tool.Handler.Table, RecordID: recordID, FileRef: logical}
+		scope := appMCPFileSnapshotScope{OwnerCreatedAt: grant.UserCreated, Tenant: grant.Tenant, Table: tool.Handler.Table, RecordID: recordID, FileRef: logical, FileColumn: tool.Handler.FileColumn, UploadTenant: uploadTenant, MembershipConstraints: tool.Handler.MembershipConstraints}
+		if !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
+			return nil, appMCPResultFailure("denied")
+		}
 		if reusedID, reused, ok := appMCPFindReusableFileProcessing(ctx, app, actor.UserID, scope, data, limits); ok {
 			processingID = reusedID
 			result, pdfResult = reused.Snapshot.Result, reused.Snapshot.PDF
@@ -523,7 +876,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 				}
 				return nil, appMCPResultFailure("incomplete_result")
 			}
-			if !appMCPAuthorizeFileRecord(app, actor, tool.Handler.Table, recordID, logical) {
+			if !appMCPAuthorizeFileRecordForTool(app, actor, tool.Handler.Table, recordID, logical, tool.Handler, grant.Tenant) || !appMCPFileMembershipAllowed(app.DB, app, actor, grant.Tenant, tool.Handler.MembershipConstraints) {
 				return nil, appMCPResultFailure("denied")
 			}
 			if processingID, err = appMCPRecordFileProcessing(app, actor.UserID, logical, result.SHA256, "private_upload", result.SHA256, contentType, limits, true, quality, appMCPFileSnapshotInput{Scope: scope, Original: data, Result: result, PDF: pdfResult, Actor: actor}); err != nil {
@@ -574,7 +927,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 		return nil, appMCPResultFailure("incomplete_result")
 	}
 	currentGrant, currentActor, authErr := resolveAppMCPAccessForGeneration(ctx, origin, generation, raw, resource, time.Now())
-	if authErr != nil || currentGrant.ID != grant.ID || !appMCPAuthorityUnchanged(actor, currentActor) || !appMCPToolAllowed(app, tool, currentActor) || !appMCPAuthorizeFileRecord(app, currentActor, tool.Handler.Table, recordID, logical) {
+	if authErr != nil || currentGrant.ID != grant.ID || !appMCPAuthorityUnchanged(actor, currentActor) || !appMCPToolAllowed(app, tool, currentActor) || !appMCPAuthorizeFileRecordForTool(app, currentActor, tool.Handler.Table, recordID, logical, tool.Handler, currentGrant.Tenant) || !appMCPFileMembershipAllowed(app.DB, app, currentActor, currentGrant.Tenant, tool.Handler.MembershipConstraints) {
 		return nil, appMCPResultFailure("denied")
 	}
 	pageCount := (len(result.Blocks) + perPage - 1) / perPage
@@ -622,7 +975,20 @@ func appMCPFileTool(manifest *AppMCPManifest, name string) *AppMCPTool {
 	return nil
 }
 
-func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical string) bool {
+func appMCPHandlerUploadTenant(handler AppMCPHandler) string {
+	if handler.UploadTenant == nil {
+		return ""
+	}
+	return *handler.UploadTenant
+}
+
+func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical string, fileColumns ...string) bool {
+	if len(fileColumns) > 1 {
+		return false
+	}
+	if len(fileColumns) == 1 && fileColumns[0] != "" {
+		return app != nil && app.DB != nil && appMCPFileRecordAuthorizedFrom(app.DB, app, actor, table, id, logical, fileColumns[0])
+	}
 	if app == nil || actor == nil || actor.UserID <= 0 || !safeIdent(table) || !appHasTable(app, table) || id == "" || id != strings.TrimSpace(id) || strings.ContainsAny(id, "/?#\\\x00") {
 		return false
 	}
@@ -637,8 +1003,29 @@ func appMCPAuthorizeFileRecord(app *App, actor *Session, table, id, logical stri
 	return privateUploadVouched(app, actor, table, id, privateUploadKey(app, logical))
 }
 
-func appMCPReadAuthorizedPrivateUpload(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64) ([]byte, string, error) {
-	if !appMCPAuthorizeFileRecord(app, actor, table, id, logical) {
+func appMCPAuthorizeFileRecordForTool(app *App, actor *Session, table, id, logical string, handler AppMCPHandler, tenant string) bool {
+	policy := ""
+	if handler.UploadTenant != nil {
+		policy = *handler.UploadTenant
+	}
+	if handler.FileColumn != "" {
+		return app != nil && app.DB != nil && appMCPFileRecordAuthorizedWithUploadTenantFrom(app.DB, app, actor, table, id, logical, policy, tenant, handler.FileColumn)
+	}
+	if policy != "" {
+		return false
+	}
+	return appMCPAuthorizeFileRecord(app, actor, table, id, logical)
+}
+
+func appMCPReadAuthorizedPrivateUpload(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64, fileColumns ...string) ([]byte, string, error) {
+	if !appMCPAuthorizeFileRecord(app, actor, table, id, logical, fileColumns...) {
+		return nil, "", appMCPResultFailure("denied")
+	}
+	return appMCPReadPrivateUpload(ctx, app, logical, maxBytes)
+}
+
+func appMCPReadAuthorizedPrivateUploadForTool(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64, handler AppMCPHandler, tenant string) ([]byte, string, error) {
+	if !appMCPAuthorizeFileRecordForTool(app, actor, table, id, logical, handler, tenant) {
 		return nil, "", appMCPResultFailure("denied")
 	}
 	return appMCPReadPrivateUpload(ctx, app, logical, maxBytes)
@@ -781,7 +1168,7 @@ func appMCPRecordFileProcessing(app *App, userID int64, fileID, sha, origin, ver
 	// app with groups never has an empty or "0" tenant (the grant authority
 	// refuses one), so neither is stored for it.
 	grouped := app.Group != nil && app.Group.Table != ""
-	if scope.OwnerCreatedAt == "" || (grouped && (scope.Tenant == "" || scope.Tenant == "0")) || len(scope.Tenant) > appMCPInputLimit || !safeIdent(scope.Table) || scope.RecordID == "" || scope.FileRef != fileID || len(snapshotInput.Original) == 0 || int64(len(snapshotInput.Original)) > limits.MaxFileBytes {
+	if (scope.FileColumn != "" && (!safeIdent(scope.FileColumn) || snapshotInput.Actor == nil)) || (scope.UploadTenant != "" && (scope.UploadTenant != "current" || scope.FileColumn == "" || !grouped || snapshotInput.Actor == nil)) || scope.OwnerCreatedAt == "" || (grouped && (scope.Tenant == "" || scope.Tenant == "0")) || len(scope.Tenant) > appMCPInputLimit || !safeIdent(scope.Table) || scope.RecordID == "" || scope.FileRef != fileID || len(snapshotInput.Original) == 0 || int64(len(snapshotInput.Original)) > limits.MaxFileBytes {
 		return "", errors.New("source snapshot scope or size is invalid")
 	}
 	sourceHash := sha256.Sum256(snapshotInput.Original)
@@ -808,18 +1195,18 @@ func appMCPRecordFileProcessing(app *App, userID int64, fileID, sha, origin, ver
 	}
 	defer tx.Rollback()
 	_, err = tx.Exec(`INSERT INTO _benmore_mcp_file_processings
-(id,file_id,file_sha256,origin,origin_version,content_type,parser_version,limits_json,complete,quality_flags,created_by,created_at,owner_created_at,tenant,source_table,record_id,file_ref,snapshot_version,snapshot_sha256,snapshot_size,snapshot_data)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, fileID, sha, origin, version, contentType, parser, string(limitJSON), complete, string(qualityJSON), userID, createdAt,
-		scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, appMCPFileSnapshotVersion, snapshotDigest, len(encoded), encoded)
+(id,file_id,file_sha256,origin,origin_version,content_type,parser_version,limits_json,complete,quality_flags,created_by,created_at,owner_created_at,tenant,source_table,record_id,file_ref,upload_tenant,snapshot_version,snapshot_sha256,snapshot_size,snapshot_data)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, fileID, sha, origin, version, contentType, parser, string(limitJSON), complete, string(qualityJSON), userID, createdAt,
+		scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant, appMCPFileSnapshotVersion, snapshotDigest, len(encoded), encoded)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
 			_ = tx.Rollback()
 			var existingID string
-			lookupErr := app.DB.QueryRow(`SELECT id FROM _benmore_mcp_file_processings WHERE created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND file_sha256=? AND parser_version=? AND limits_json=? AND snapshot_version=?`, userID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, sha, parser, string(limitJSON), appMCPFileSnapshotVersion).Scan(&existingID)
+			lookupErr := app.DB.QueryRow(`SELECT id FROM _benmore_mcp_file_processings WHERE created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND upload_tenant=? AND file_sha256=? AND parser_version=? AND limits_json=? AND snapshot_version=?`, userID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant, sha, parser, string(limitJSON), appMCPFileSnapshotVersion).Scan(&existingID)
 			if lookupErr != nil {
 				return "", lookupErr
 			}
-			stored, readErr := appMCPReadFileSnapshot(context.Background(), app, existingID, userID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef)
+			stored, readErr := appMCPReadFileSnapshot(context.Background(), app, existingID, userID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant)
 			if readErr != nil || !bytes.Equal(stored.Snapshot.Original, snapshotInput.Original) {
 				return "", errors.New("existing source snapshot failed immutable reuse validation")
 			}
@@ -831,8 +1218,11 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, fileID, sha, origin, ver
 	if err := tx.QueryRow(`SELECT created_at FROM _benmore_users WHERE id=?`, userID).Scan(&currentOwnerCreatedAt); err != nil || !sameAccountIncarnation(currentOwnerCreatedAt, scope.OwnerCreatedAt) {
 		return "", errors.New("source snapshot owner account changed during processing")
 	}
-	if snapshotInput.Actor != nil && !appMCPFileRecordAuthorizedFrom(tx, app, snapshotInput.Actor, scope.Table, scope.RecordID, scope.FileRef) {
+	if snapshotInput.Actor != nil && !appMCPFileRecordAuthorizedWithUploadTenantFrom(tx, app, snapshotInput.Actor, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant, scope.Tenant, scope.FileColumn) {
 		return "", errors.New("source record authorization changed during processing")
+	}
+	if snapshotInput.Actor != nil && !appMCPFileMembershipAllowed(tx, app, snapshotInput.Actor, scope.Tenant, scope.MembershipConstraints) {
+		return "", errors.New("source membership authorization changed during processing")
 	}
 	if err := appMCPCheckFileSnapshotBudget(tx, id, 0); err != nil {
 		return "", err
@@ -894,20 +1284,27 @@ func appMCPFindReusableFileProcessing(ctx context.Context, app *App, ownerID int
 	}
 	var id string
 	err = app.DB.QueryRowContext(ctx, `SELECT id FROM _benmore_mcp_file_processings
-WHERE created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=?
+WHERE created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND upload_tenant=?
 AND file_sha256=? AND parser_version=? AND limits_json=? AND complete=1 AND snapshot_version=?
-ORDER BY created_at DESC,id DESC LIMIT 1`, ownerID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, sourceDigest, parser, string(limitJSON), appMCPFileSnapshotVersion).Scan(&id)
+ORDER BY created_at DESC,id DESC LIMIT 1`, ownerID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant, sourceDigest, parser, string(limitJSON), appMCPFileSnapshotVersion).Scan(&id)
 	if err != nil {
 		return "", nil, false
 	}
-	stored, err := appMCPReadFileSnapshot(ctx, app, id, ownerID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef)
+	stored, err := appMCPReadFileSnapshot(ctx, app, id, ownerID, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef, scope.UploadTenant)
 	if err != nil || !bytes.Equal(stored.Snapshot.Original, original) || stored.Snapshot.Result.ParserVersion != parser {
 		return "", nil, false
 	}
 	return id, stored, true
 }
 
-func appMCPReadFileSnapshot(ctx context.Context, app *App, id string, ownerID int64, ownerCreatedAt, tenant, table, recordID, fileRef string) (*appMCPStoredFileSnapshot, error) {
+func appMCPReadFileSnapshot(ctx context.Context, app *App, id string, ownerID int64, ownerCreatedAt, tenant, table, recordID, fileRef string, uploadTenants ...string) (*appMCPStoredFileSnapshot, error) {
+	if len(uploadTenants) > 1 {
+		return nil, errors.New("source snapshot policy is invalid")
+	}
+	wantUploadTenant := ""
+	if len(uploadTenants) == 1 {
+		wantUploadTenant = uploadTenants[0]
+	}
 	if ctx == nil || ctx.Err() != nil || app == nil || app.DB == nil || len(id) != 32 {
 		return nil, errors.New("source snapshot reference is invalid")
 	}
@@ -917,9 +1314,9 @@ func appMCPReadFileSnapshot(ctx context.Context, app *App, id string, ownerID in
 	stored := &appMCPStoredFileSnapshot{}
 	var complete int
 	var blobSize int64
-	err := app.DB.QueryRowContext(ctx, `SELECT id,created_by,owner_created_at,tenant,source_table,record_id,file_ref,snapshot_version,snapshot_sha256,snapshot_size,file_sha256,complete,length(snapshot_data)
-	FROM _benmore_mcp_file_processings WHERE id=?`, id).Scan(&stored.ID, &stored.OwnerID, &stored.OwnerCreatedAt, &stored.Tenant, &stored.Table, &stored.RecordID, &stored.FileRef, &stored.Snapshot.Version, &stored.Digest, &stored.Size, &stored.SourceDigest, &complete, &blobSize)
-	if err != nil || complete != 1 || stored.OwnerID != ownerID || !sameAccountIncarnation(stored.OwnerCreatedAt, ownerCreatedAt) || stored.Tenant != tenant || stored.Table != table || stored.RecordID != recordID || stored.FileRef != fileRef || stored.Snapshot.Version != appMCPFileSnapshotVersion || stored.Size <= 0 || stored.Size > appMCPFileSnapshotMaxBytes || !appMCPFileDigest(stored.Digest) {
+	err := app.DB.QueryRowContext(ctx, `SELECT id,created_by,owner_created_at,tenant,source_table,record_id,file_ref,upload_tenant,snapshot_version,snapshot_sha256,snapshot_size,file_sha256,complete,length(snapshot_data)
+	FROM _benmore_mcp_file_processings WHERE id=?`, id).Scan(&stored.ID, &stored.OwnerID, &stored.OwnerCreatedAt, &stored.Tenant, &stored.Table, &stored.RecordID, &stored.FileRef, &stored.UploadTenant, &stored.Snapshot.Version, &stored.Digest, &stored.Size, &stored.SourceDigest, &complete, &blobSize)
+	if err != nil || complete != 1 || stored.OwnerID != ownerID || !sameAccountIncarnation(stored.OwnerCreatedAt, ownerCreatedAt) || stored.Tenant != tenant || stored.Table != table || stored.RecordID != recordID || stored.FileRef != fileRef || stored.UploadTenant != wantUploadTenant || stored.Snapshot.Version != appMCPFileSnapshotVersion || stored.Size <= 0 || stored.Size > appMCPFileSnapshotMaxBytes || !appMCPFileDigest(stored.Digest) {
 		return nil, errors.New("source snapshot authority or metadata mismatch")
 	}
 	if blobSize != stored.Size {
@@ -929,7 +1326,7 @@ func appMCPReadFileSnapshot(ctx context.Context, app *App, id string, ownerID in
 	// Bind the row's own owner_created_at: the caller's value was already
 	// matched as a time by sameAccountIncarnation, but may be spelled in the
 	// other format (RFC 3339 from the driver vs SQLite's datetime text).
-	if err := app.DB.QueryRowContext(ctx, `SELECT snapshot_data FROM _benmore_mcp_file_processings WHERE id=? AND created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND snapshot_version=? AND snapshot_sha256=? AND snapshot_size=? AND length(snapshot_data)=?`, id, ownerID, stored.OwnerCreatedAt, tenant, table, recordID, fileRef, appMCPFileSnapshotVersion, stored.Digest, stored.Size, stored.Size).Scan(&data); err != nil {
+	if err := app.DB.QueryRowContext(ctx, `SELECT snapshot_data FROM _benmore_mcp_file_processings WHERE id=? AND created_by=? AND owner_created_at=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND upload_tenant=? AND snapshot_version=? AND snapshot_sha256=? AND snapshot_size=? AND length(snapshot_data)=?`, id, ownerID, stored.OwnerCreatedAt, tenant, table, recordID, fileRef, wantUploadTenant, appMCPFileSnapshotVersion, stored.Digest, stored.Size, stored.Size).Scan(&data); err != nil {
 		return nil, errors.New("source snapshot authority or metadata mismatch")
 	}
 	digest := sha256.Sum256(data)
@@ -953,6 +1350,101 @@ func appMCPReadFileSnapshot(ctx context.Context, app *App, id string, ownerID in
 		return nil, errors.New("source PDF snapshot is invalid")
 	}
 	return stored, nil
+}
+
+// appMCPReadFileProcessingStatus returns only bounded metadata from a
+// successful, snapshot-backed processing row. The private snapshot payload is
+// neither selected nor decoded, and historical completion is not a claim that
+// the current file bytes still match.
+func appMCPReadFileProcessingStatus(ctx context.Context, app *App, id string, ownerID int64, ownerCreatedAt, tenant, table, recordID, fileRef string, uploadTenants ...string) (map[string]any, error) {
+	if len(uploadTenants) > 1 {
+		return nil, errors.New("file processing status policy is invalid")
+	}
+	wantUploadTenant := ""
+	if len(uploadTenants) == 1 {
+		wantUploadTenant = uploadTenants[0]
+	}
+	if ctx == nil || ctx.Err() != nil || app == nil || app.DB == nil || !appMCPFileProcessingID(id) {
+		return nil, errors.New("file processing status reference is invalid")
+	}
+	var storedID, storedOwnerCreatedAt, storedTenant, storedTable, storedRecordID, storedFileRef, storedUploadTenant string
+	var digest, contentType, parser, limitsJSON, qualityJSON, createdAt, sourceConnection, sourceFileID, sourceRevision string
+	var complete int
+	err := app.DB.QueryRowContext(ctx, `SELECT id,owner_created_at,tenant,source_table,record_id,file_ref,upload_tenant,file_sha256,content_type,parser_version,limits_json,complete,quality_flags,created_at,source_connection,source_file_id,source_revision
+FROM _benmore_mcp_file_processings
+WHERE id=? AND created_by=? AND tenant=? AND source_table=? AND record_id=? AND file_ref=? AND upload_tenant=? AND complete=1 AND snapshot_version=? AND snapshot_size>0 AND snapshot_size<=? AND snapshot_data IS NOT NULL AND length(snapshot_data)=snapshot_size`,
+		id, ownerID, tenant, table, recordID, fileRef, wantUploadTenant, appMCPFileSnapshotVersion, appMCPFileSnapshotMaxBytes).Scan(&storedID, &storedOwnerCreatedAt, &storedTenant, &storedTable, &storedRecordID, &storedFileRef, &storedUploadTenant, &digest, &contentType, &parser, &limitsJSON, &complete, &qualityJSON, &createdAt, &sourceConnection, &sourceFileID, &sourceRevision)
+	if err != nil || storedID != id || complete != 1 || !sameAccountIncarnation(storedOwnerCreatedAt, ownerCreatedAt) || storedTenant != tenant || storedTable != table || storedRecordID != recordID || storedFileRef != fileRef || storedUploadTenant != wantUploadTenant || !appMCPFileDigest(digest) || len(contentType) > 256 || len(parser) > 128 || len(createdAt) > 64 || len(sourceConnection) > 128 || len(sourceFileID) > 512 || len(sourceRevision) > 512 || len(limitsJSON) > 2048 || len(qualityJSON) > 2048 {
+		return nil, errors.New("file processing status authority or metadata mismatch")
+	}
+	limitsValue, err := appMCPDecodeFileProcessingLimits(parser, limitsJSON)
+	if err != nil {
+		return nil, err
+	}
+	var quality []string
+	if err := json.Unmarshal([]byte(qualityJSON), &quality); err != nil || len(quality) > 32 {
+		return nil, errors.New("file processing quality metadata is invalid")
+	}
+	for _, flag := range quality {
+		if len(flag) > 128 || strings.ContainsRune(flag, 0) {
+			return nil, errors.New("file processing quality metadata is invalid")
+		}
+	}
+	return map[string]any{
+		"processing_id": storedID, "record_id": storedRecordID, "file_ref": storedFileRef,
+		"sha256": digest, "content_type": contentType, "parser_version": parser, "limits": limitsValue,
+		"complete": true, "quality_flags": appMCPFileQualityFlags(quality), "created_at": createdAt,
+		"source_connection": sourceConnection, "source_file_id": sourceFileID, "source_revision": sourceRevision,
+	}, nil
+}
+
+func appMCPDecodeFileProcessingLimits(parser, encoded string) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	var limits IngestLimits
+	if parser == IngestParserVersion {
+		if err := decoder.Decode(&limits); err != nil {
+			return nil, errors.New("file processing limits metadata is invalid")
+		}
+	} else if parser == appMCPPDFParserVersion {
+		var persisted struct {
+			Ingest IngestLimits `json:"ingest"`
+			PDF    struct {
+				MaxPages                int   `json:"max_pages"`
+				MaxDecodedPixelsPerPage int   `json:"max_decoded_pixels_per_page"`
+				PageTimeoutSeconds      int   `json:"page_timeout_seconds"`
+				PageMemoryBytes         int64 `json:"page_memory_bytes"`
+				MaxTempBytes            int64 `json:"max_temp_bytes"`
+				TotalTimeoutSeconds     int   `json:"total_timeout_seconds"`
+				MaxExtractedBytes       int64 `json:"max_extracted_bytes"`
+			} `json:"pdf"`
+		}
+		if err := decoder.Decode(&persisted); err != nil || persisted.PDF.MaxPages != appMCPPDFMaxPages || persisted.PDF.MaxDecodedPixelsPerPage != appMCPPDFMaxPixelsPerPage || persisted.PDF.PageTimeoutSeconds != int(appMCPPDFPageTimeout.Seconds()) || persisted.PDF.PageMemoryBytes != appMCPPDFPageMemoryBytes || persisted.PDF.MaxTempBytes != appMCPPDFMaxTempBytes || persisted.PDF.TotalTimeoutSeconds != int(appMCPPDFTotalTimeout.Seconds()) || persisted.PDF.MaxExtractedBytes != appMCPPDFMaxExtractedBytes {
+			return nil, errors.New("file processing PDF limits metadata is invalid")
+		}
+		limits = persisted.Ingest
+	} else {
+		return nil, errors.New("file processing parser version is unsupported")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("file processing limits metadata has trailing data")
+	}
+	defaults := DefaultIngestLimits()
+	if limits.MaxFileBytes <= 0 || limits.MaxFileBytes > defaults.MaxFileBytes || limits.MaxCells <= 0 || limits.MaxCells > defaults.MaxCells || limits.MaxDecompressedBytes <= 0 || limits.MaxDecompressedBytes > defaults.MaxDecompressedBytes || limits.MaxEntryBytes <= 0 || limits.MaxEntryBytes > defaults.MaxEntryBytes || limits.MaxZipEntries <= 0 || limits.MaxZipEntries > defaults.MaxZipEntries || limits.MaxCompressionRatio <= 0 || limits.MaxCompressionRatio > defaults.MaxCompressionRatio || limits.MaxSharedStrings <= 0 || limits.MaxSharedStrings > defaults.MaxSharedStrings || limits.MaxSheets <= 0 || limits.MaxSheets > defaults.MaxSheets || limits.MaxXMLDepth <= 0 || limits.MaxXMLDepth > defaults.MaxXMLDepth || limits.MaxXMLTokens <= 0 || limits.MaxXMLTokens > defaults.MaxXMLTokens || limits.MaxCSVRows <= 0 || limits.MaxCSVRows > defaults.MaxCSVRows || limits.MaxFieldBytes <= 0 || limits.MaxFieldBytes > defaults.MaxFieldBytes || limits.MaxExtractedBytes <= 0 || limits.MaxExtractedBytes > defaults.MaxExtractedBytes {
+		return nil, errors.New("file processing limits metadata is outside supported bounds")
+	}
+	limitsBytes, err := json.Marshal(limits)
+	if err != nil {
+		return nil, errors.New("file processing limits metadata is invalid")
+	}
+	limitsDecoder := json.NewDecoder(bytes.NewReader(limitsBytes))
+	limitsDecoder.UseNumber()
+	var limitsValue any
+	if err := limitsDecoder.Decode(&limitsValue); err != nil {
+		return nil, errors.New("file processing limits metadata is invalid")
+	}
+	return limitsValue, nil
 }
 
 func appMCPFileDigest(value string) bool {

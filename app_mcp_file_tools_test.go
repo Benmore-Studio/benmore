@@ -57,6 +57,8 @@ connections: []
 		strings.Replace(valid, "permissions: [files:read, documents:read]", "permissions: [files:read]", 1),
 		strings.Replace(valid, "operation: ingest", "operation: table.read", 1),
 		strings.Replace(valid, "operation: ingest", "operation: verify", 1),
+		strings.Replace(valid, "operation: ingest", "operation: status", 1), // status must bind all three identity inputs
+		strings.Replace(valid, "handler: {kind: file, operation: ingest, table: documents}", "handler: {kind: file, operation: ingest, table: documents, membership_constraints: {kind: [human]}}", 1),
 		strings.Replace(valid, "    input_schema:\n      type: object\n      additionalProperties: false\n      required: [file_ref, record_id]\n      properties:\n        file_ref: {type: string}\n        record_id: {type: string}\n", "", 1),
 	} {
 		if _, err := parseAppMCPManifest([]byte(invalid)); err == nil {
@@ -269,6 +271,13 @@ func TestAppMCPFileProcessingRestoreCarryForward(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	strictMarkerID := strings.Repeat("f", 32)
+	if _, err := live.DB.Exec(`INSERT INTO _benmore_mcp_file_processings
+(id,file_id,file_sha256,origin,origin_version,content_type,parser_version,limits_json,complete,quality_flags,created_by,created_at,owner_created_at,tenant,source_table,record_id,file_ref,upload_tenant,snapshot_version,snapshot_sha256,snapshot_size,snapshot_data)
+SELECT ?,file_id,file_sha256,origin,origin_version,content_type,parser_version,limits_json,complete,quality_flags,created_by,created_at,owner_created_at,tenant,source_table,record_id,file_ref,'current',snapshot_version,snapshot_sha256,snapshot_size,snapshot_data
+FROM _benmore_mcp_file_processings WHERE id=?`, strictMarkerID, processingID); err != nil {
+		t.Fatal(err)
+	}
 	rows, err := readCredTable(context.Background(), live.DB, mcpFileProcessingsTable, false, mcpFileProcessingRestoreColumns)
 	if err != nil {
 		t.Fatal(err)
@@ -289,6 +298,10 @@ func TestAppMCPFileProcessingRestoreCarryForward(t *testing.T) {
 	var restoredOwnerCreatedAt string
 	if err := candidate.DB.QueryRow(`SELECT created_by,owner_created_at FROM _benmore_mcp_file_processings WHERE id=?`, processingID).Scan(&owner, &restoredOwnerCreatedAt); err != nil || owner != 2 || restoredOwnerCreatedAt != scope.OwnerCreatedAt {
 		t.Fatalf("restored processing owner = %d, %v", owner, err)
+	}
+	var restoredUploadTenant string
+	if err := candidate.DB.QueryRow(`SELECT upload_tenant FROM _benmore_mcp_file_processings WHERE id=?`, strictMarkerID).Scan(&restoredUploadTenant); err != nil || restoredUploadTenant != "current" {
+		t.Fatalf("restored strict processing policy = %q, err %v", restoredUploadTenant, err)
 	}
 	if _, err := appMCPReadFileSnapshot(context.Background(), candidate, processingID, 2, scope.OwnerCreatedAt, scope.Tenant, scope.Table, scope.RecordID, scope.FileRef); err != nil {
 		t.Fatalf("restored BLOB snapshot unavailable: %v", err)

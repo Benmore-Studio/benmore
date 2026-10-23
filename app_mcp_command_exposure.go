@@ -76,6 +76,55 @@ const (
 // appMCPCommandErrorClass separates authorization outcomes (expected, never
 // logged) from infrastructure failures, which are logged and reported as
 // unavailable_provider so an operator can tell a broken store from a refusal.
+type appMCPCommandRowCountConflictError struct{ message string }
+
+func (e *appMCPCommandRowCountConflictError) Error() string {
+	if e.message != "" {
+		return e.message
+	}
+	return "command SQL row-count assertion failed"
+}
+
+func appMCPCommandRowCountConflictOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	pending := []error{err}
+	found := false
+	for visited := 0; len(pending) > 0; visited++ {
+		if visited == 256 {
+			return false
+		}
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == nil {
+			continue
+		}
+		if _, ok := current.(*appMCPCommandRowCountConflictError); ok {
+			found = true
+			continue
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			if len(children) == 0 {
+				return false
+			}
+			pending = append(pending, children...)
+			continue
+		}
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			child := wrapped.Unwrap()
+			if child == nil {
+				return false
+			}
+			pending = append(pending, child)
+			continue
+		}
+		return false
+	}
+	return found
+}
+
 func appMCPCommandErrorClass(err error) string {
 	var unknown *appMCPCommandOutcomeUnknownError
 	var failure *appMCPResultError
@@ -88,6 +137,8 @@ func appMCPCommandErrorClass(err error) string {
 		return "hook_refused"
 	case errors.As(err, &unknown):
 		return "unknown_execution"
+	case appMCPCommandRowCountConflictOnly(err):
+		return "conflict"
 	case errors.Is(err, errAppMCPOperationExpired):
 		return "expired_intent"
 	case errors.Is(err, errAppMCPOperationNotApproved):

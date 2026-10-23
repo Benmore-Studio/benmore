@@ -173,6 +173,11 @@ func pdfChromeArgs(proxyAddr, docURL, pdfPath, profileDir string) []string {
 		"--disable-sync",
 		"--disable-background-networking",
 		"--disable-component-update",
+		// This disposable profile needs no OS password store. Match the
+		// browser allocator defaults so a private HOME cannot prompt for a
+		// user's macOS Keychain while rendering a server-owned document.
+		"--password-store=basic",
+		"--use-mock-keychain",
 		"--user-data-dir=" + profileDir,
 		// Everything through the sandbox proxy, loopback included.
 		"--proxy-server=http://" + proxyAddr,

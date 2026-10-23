@@ -1688,18 +1688,9 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 			return
 		}
 	}
-	// In dev mode, re-read the file on each request for hot reload
-	if dev {
-		app.mu.Lock()
-		if app.MCP == nil {
-			data, err := os.ReadFile(filepath.Join(app.Dir, page.File))
-			if err == nil {
-				setPageAttrsFromSource(page, string(data))
-			}
-			app.Partials = reloadPartials(app.Dir)
-		}
-		app.mu.Unlock()
-	}
+	// Requests use the published page and partials, including the test mux
+	// that enables dev diagnostics. Source activation belongs to validated
+	// reloads; rereading here would replace shared state after gate checks.
 
 	session := getSession(app, r)
 	if session != nil {
@@ -1983,6 +1974,20 @@ func serveListenAddr(port int, mcpLocal bool) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
+// pageRouteSnapshot applies route defaults to an owned value. Published pages
+// are also read by the context graph and other handlers while routes are built.
+// Neither registration nor graph extraction may normalize them in place.
+func pageRouteSnapshot(source *Page) Page {
+	page := *source
+	// LoadPages already merged the <page> tag with frontmatter. Preserve a
+	// nonempty require; sources built elsewhere may still need the tag fallback.
+	if page.Require == "" {
+		page.Require = ExtractPageRequire(page.RawHTML)
+	}
+	page.Auth = normalizePageAuth(page.Auth, page.File)
+	return page
+}
+
 // registerAppPageRoutes shares actual page registration with candidate preflight.
 // Returned patterns contain only successful registrations; handlers are not invoked.
 func registerAppPageRoutes(mux appRouteRegistrar, app *App, dev bool) []string {
@@ -1991,15 +1996,8 @@ func registerAppPageRoutes(mux appRouteRegistrar, app *App, dev bool) []string {
 	// Converted to Go 1.22 {param} syntax for proper mux registration.
 	registered := make([]string, 0, len(app.Pages))
 	for route, page := range app.Pages {
-		p := page
-		// LoadPages already merged the <page> tag with frontmatter; only
-		// pages built elsewhere (single-file apps, fixtures) need the tag
-		// read here. Overwriting unconditionally dropped a frontmatter
-		// require: and left the page with no gate at all.
-		if p.Require == "" {
-			p.Require = ExtractPageRequire(p.RawHTML)
-		}
-		p.Auth = normalizePageAuth(p.Auth, p.File)
+		snapshot := pageRouteSnapshot(page)
+		p := &snapshot
 
 		// Convert :param to {param} for Go 1.22 mux
 		muxPattern := route

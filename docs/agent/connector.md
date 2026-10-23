@@ -521,7 +521,8 @@ may call only these functions: `abs`, `avg`, `char`, `coalesce`, `concat`,
 `length`, `like`, `lower`, `ltrim`, `max`, `min`, `nullif`, `printf`, `quote`,
 `replace`, `round`, `rtrim`, `sign`, `soundex`, `sqlite_version`, `substr`,
 `substring`, `sum`, `time`, `total`, `trim`, `typeof`, `unicode`, `upper`,
-`zeroblob`, `julianday`, `strftime` and the `json`, `json_array`, `json_extract`,
+`zeroblob`, `julianday`, `strftime` and the `json`, `json_array`,
+`json_array_length`, `json_group_array`, `json_extract`,
 `json_insert`, `json_object`, `json_patch`, `json_remove`, `json_replace`,
 `json_type`, `json_valid`, `json_quote` family, plus `raise`, `current_timestamp`
 and `benmore_encrypt`, which only triggers may call. Any other call (`random`, `randomblob`, `iif`) and bare
@@ -658,6 +659,11 @@ transaction, where a refusal must remain an `expect_rows` assertion that rolls
 the transaction back. Equality in an `if:` of a command (`== 0`, `== 'x'`) is
 evaluated as written; `!=`, `>`, `<`, `>=` and `<=` work the same way.
 
+When an apply step's valid `expect_rows` assertion fails, `_commit` returns
+`conflict`; `_status` records a retryable `conflict` attempt after the business
+transaction rolls back. Invalid assertions, SQL failures and unavailable row
+counts remain `unavailable_provider` operational failures.
+
 ### Server-generated tokens (invitations)
 
 A row that needs an unguessable value, such as an invitation token, cannot get
@@ -726,8 +732,46 @@ receive it.
 ## Files, reports, resources and providers
 
 Private file tools refer to a readable table row and its exact private upload
-reference. They do not accept arbitrary paths or URLs. `kind: file` supports
-`ingest` and `verify`; permissions include both `files:read` and the row's
+reference. Declare `handler: {kind: file, operation: ingest, table: documents,
+file_column: file_url}` (and the same binding for `verify`) to authorize only the
+row's current `file_url`. Other string columns, including notes, cannot vouch for
+that file. The declared column must exist in the reviewed schema; every read,
+cache reuse, verification and publication rechecks its current readable text
+value, row authority and upload ownership. Hidden, encrypted and non-text
+columns refuse at runtime. The binding is reviewed contract content and requires
+resealing; the snapshot remains immutable, but a changed column no longer grants
+access to its old processing result. Without `file_column`, legacy tools retain
+their broader any-string-column reference check; do not use that mode to claim an
+exact document-version binding. This addition is unreleased; source review and
+fixture tests do not prove an installed or hosted runtime supports it.
+
+File handlers may also declare `membership_constraints: {kind: human, status: active}`.
+Each key must name a canonical, visible scalar column in the configured groups
+table; all declared equalities must match the actor's one live membership row
+and are checked alongside existing grants, table/row access, exact file-column
+binding and ownership. Omission preserves existing behavior. A file handler may
+declare a `status` operation with required `processing_id`, `record_id` and
+`file_ref` inputs. It returns bounded metadata for a known successful,
+snapshot-backed processing result only, after rechecking current row, file,
+membership and owner authority. The response contains no parsed blocks or
+snapshot payload. `complete` describes historical parser completion and does
+not attest to the current file bytes. Failure-only and legacy unbound records
+are not eligible. This source feature is unreleased.
+
+Apps that allow admins to attach uploads across workspace rows can opt a file
+handler into `upload_tenant: current`, alongside its exact `file_column`. The
+canonical private-upload owner record must have a nonempty group matching both
+the connector grant's selected workspace and the source row's configured group
+key. The framework checks that provenance before file access and again during
+cache reuse, verification, status reads and snapshot publication. A strict tool
+cannot reuse a snapshot recorded under legacy policy. The configured groups
+table, key and user field, plus that key on the source table, must be declared in
+the reviewed schema. Omitting the field keeps the established admin/uploader/
+row-owner vouch rules. The setting is part of the reviewed manifest contract
+and appears in lowercase in source inspection. This source feature is unreleased.
+
+File tools do not accept arbitrary paths or URLs. `kind: file` supports
+`ingest`, `verify` and metadata-only `status`; permissions include both `files:read` and the row's
 `<table>:read`. Ingested results are paginated and retain source locations;
 verification uses the returned `processing_id` to compare a value against the
 same immutable extraction. CSV/XLSX/XLSM and PDF limits and host prerequisites

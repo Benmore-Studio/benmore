@@ -1406,7 +1406,7 @@ func ParseSingleFile(content string) (schema, seed string, pages map[string]*Pag
 		pages[route] = &Page{
 			Route:   route,
 			RawHTML: m[2],
-			Auth:    attrs["auth"],
+			Auth:    normalizePageAuth(attrs["auth"], ""),
 			Scope:   attrs["scope"],
 			Title:   attrs["title"],
 		}
@@ -1506,8 +1506,8 @@ func loadPagesFromSources(dir string, captured map[string][]byte) (map[string]*P
 
 // setPageAttrsFromSource derives a page's gates and metadata from its source:
 // the <page> tag first, then frontmatter for anything the tag leaves empty
-// (the tag wins so a mixed file stays self-consistent). The page loader and
-// the dev-mode re-read both use it, so neither can drop a frontmatter gate.
+// (the tag wins so a mixed file stays self-consistent). It runs while loading
+// candidate pages, before those values are published to request handlers.
 func setPageAttrsFromSource(page *Page, content string) {
 	page.RawHTML = content
 	page.Auth, page.Scope, page.Title, page.Layout = ParsePageAttrs(content)

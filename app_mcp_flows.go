@@ -82,7 +82,7 @@ func appMCPToolAllowed(app *App, tool *AppMCPTool, actor *Session) bool {
 		return false
 	}
 	if tool.Handler.Kind == "file" {
-		return (tool.Handler.Operation == "ingest" || tool.Handler.Operation == "verify") && SessionCanAccessTable(app, tool.Handler.Table, OpRead, actor) && scopesWithin(actor.Scopes, tool.Handler.Table+":read")
+		return (tool.Handler.Operation == "ingest" || tool.Handler.Operation == "verify" || tool.Handler.Operation == "status") && SessionCanAccessTable(app, tool.Handler.Table, OpRead, actor) && scopesWithin(actor.Scopes, tool.Handler.Table+":read")
 	}
 	switch tool.Handler.Operation {
 	case "table.list", "table.read":
