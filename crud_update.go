@@ -126,6 +126,15 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 			}, refusalNoFields))
 			return
 		}
+		if errors.As(err, &requestErr) && requestErr.noFields && multipartRequest(r) {
+			// No field was read from a multipart body: say the body type is
+			// the reason, not the field names.
+			httpJSON(w, http.StatusBadRequest, withRefusalDocs(map[string]any{
+				"error": requestErr.message,
+				"hint":  multipartUpdateHint,
+			}, refusalMultipartUpdate))
+			return
+		}
 		if errors.As(err, &requestErr) {
 			writeUpdateRequestError(w, r, app, table+" update", requestErr)
 		} else {
@@ -167,6 +176,22 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		body["hint"] = strippedUpdateHint(app, table, id, stripped)
 	}
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// refusalMultipartUpdate names, in refusal_docs.go, the 400 of an update
+// that read no field from a multipart body.
+const refusalMultipartUpdate = "multipart_update"
+
+// multipartUpdateHint is what that 400 says to send instead. An update
+// never stores a file part, and a request with an API token or Bearer
+// session reads no field of a multipart body at all, so `-F name=x` on a
+// PATCH answered a bare "No fields to update" that pointed at the field
+// names.
+const multipartUpdateHint = "this PATCH has a multipart/form-data body, and an update reads no field from one and never stores a file part: send the fields as JSON or as a URL-encoded form. To change a file column, upload the file first (POST /api/_upload) and send the reference it returns as the column's value"
+
+// multipartRequest reports a request whose body is multipart/form-data.
+func multipartRequest(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "multipart/")
 }
 
 // updateStrippedFields names the submitted columns a PATCH drops because no
@@ -231,7 +256,13 @@ func strippedUpdateHint(app *App, table, id string, stripped []string) string {
 		if len(managed) > 1 {
 			verb = "are"
 		}
-		parts = append(parts, fmt.Sprintf("%s %s managed by the framework (owner, tenant, timestamps, computed or credential columns) and never written by PATCH; change it server-side in a flow if the app needs to", strings.Join(managed, ", "), verb))
+		if identIs(table, "_benmore_users") {
+			// Not "change it in a flow": these are the account's role,
+			// password and sign-in factor.
+			parts = append(parts, fmt.Sprintf("%s %s account state the admin panel never writes: role changes through POST /_admin/set-role, a password and a sign-in factor only through the account's own sign-in and account endpoints", strings.Join(managed, ", "), verb))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %s managed by the framework (owner, tenant, timestamps, computed or credential columns) and never written by PATCH; change it server-side in a flow if the app needs to", strings.Join(managed, ", "), verb))
+		}
 	}
 	return strings.Join(parts, "; ")
 }

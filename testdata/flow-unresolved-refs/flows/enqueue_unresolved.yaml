@@ -12,5 +12,7 @@ jobs:
           flow: worker
           with:
             note: "${{ params.b }}"
+            # Names this flow's jobs: other flows of the fixture queue `worker` too.
+            source: "enqueue-unresolved"
       - run: respond
         with: { status: 200, json: { ok: true } }

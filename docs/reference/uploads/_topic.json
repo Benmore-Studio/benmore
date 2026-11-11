@@ -16,6 +16,9 @@
     "deletion_example",
     "private_deletion",
     "endpoint",
+    "sdk_upload",
+    "files_endpoint",
+    "multipart_bodies",
     "js_snippet",
     "gotchas"
   ]

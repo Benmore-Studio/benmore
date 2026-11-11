@@ -258,7 +258,8 @@ func applySchemaChainTx(ctx context.Context, tx *sql.Tx, chain []pendingChainMig
 				}
 				// The same tolerance the user-migration runner applies to
 				// these files: the change is already in place.
-				if isBenignMigrationError(err) || isRenameAlreadyApplied(tx, stmt, err) {
+				if what, ok := migrationStatementAlreadyApplied(tx, stmt, err); ok {
+					noteMigrationSkip(ctx, m.name, stmt, what)
 					continue
 				}
 				return nil, fmt.Sprintf("%s: %s: %v", m.name, truncate(stmt, 60), err), nil

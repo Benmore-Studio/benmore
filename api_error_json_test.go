@@ -223,9 +223,9 @@ func TestAdminOnlyAPIRefusalsAreJSON(t *testing.T) {
 		{"POST", "/api/_schema/notes/fields", `{"name":"extra","type":"TEXT"}`},
 		{"DELETE", "/api/_schema/notes/fields/extra", ""},
 	} {
-		for who, sid := range map[string]string{"a member": member, "an anonymous caller": ""} {
-			wantJSONRefusal(t, c.method+" "+c.path+" as "+who, bearerCall(mux, c.method, c.path, c.body, sid), http.StatusForbidden, "admin required")
-		}
+		wantJSONRefusal(t, c.method+" "+c.path+" as a member", bearerCall(mux, c.method, c.path, c.body, member), http.StatusForbidden, "admin required")
+		// No credential is unauthenticated (401), as on every other route.
+		wantJSONRefusal(t, c.method+" "+c.path+" as an anonymous caller", bearerCall(mux, c.method, c.path, c.body, ""), http.StatusUnauthorized, "authentication required")
 	}
 	if got := gateScalar(t, app, "SELECT COUNT(*) FROM _benmore_funnels"); got != "1" {
 		t.Fatalf("a refused funnel request changed the funnels: %s rows, want 1", got)

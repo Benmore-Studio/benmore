@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,9 +24,9 @@ import (
 // change and recreates them inside the caller's transaction. DDL is
 // transactional in SQLite and a writer holds the database exclusively, so no
 // other connection ever sees the triggers missing and a rollback restores
-// them. A statement that can reach a connection without this wrapper (authored
-// flow SQL) is not stopped by it: the guarantee is against editor SQL and
-// accident, not against code that ships in the app.
+// them. Authored flow, hook and page SQL reaches a connection without this
+// wrapper; its scope (app_sql_guard.go) refuses DDL on the triggers and the
+// tables, and UPDATE/DELETE on the tables whether or not a trigger is there.
 
 var auditAppendOnlyTables = []string{"_benmore_audit_log", "_benmore_read_audit"}
 
@@ -63,6 +64,29 @@ func auditTriggerSQL(table, kind string) string {
 	}
 }
 
+// auditAppendOnlyTriggerRead reports a read the triggers above make while a
+// row is inserted into an audit table: the overwrite guard looks the new row's
+// id up in that table (`EXISTS (SELECT 1 ... WHERE id = NEW.id)`), which
+// SQLite reports as a read of `id` and a columnless read of the table (the
+// `SELECT 1`, no column value). The update and delete guards do not fire on an
+// insert. A connection whose authorizer admits an audit
+// INSERT must admit exactly these reads with it, or the insert is refused on
+// every `compliance: hipaa` app (the approved-command audit scope,
+// authorizeCommandNativeMetadata). The set is checked against the generated
+// trigger text by TestAuditAppendOnlyTriggerReadsMatchTheGeneratedTriggers;
+// a trigger that reads more has to widen it here, in one place.
+func auditAppendOnlyTriggerRead(table, column string) bool {
+	if column != "" && !strings.EqualFold(column, "id") {
+		return false
+	}
+	for _, audit := range auditAppendOnlyTables {
+		if strings.EqualFold(table, audit) {
+			return true
+		}
+	}
+	return false
+}
+
 func auditTriggerNames() []string {
 	names := make([]string, 0, len(auditAppendOnlyTables)*len(auditAppendOnlyKinds))
 	for _, table := range auditAppendOnlyTables {
@@ -80,6 +104,13 @@ func auditTriggerNames() []string {
 // ... RAISE(IGNORE) would silently drop new audit rows) is dropped. It runs at
 // every start and reload of a hipaa app and inside withAuditMutable.
 func installAuditAppendOnly(x auditExecer) error {
+	return installAuditAppendOnlyNoting(x, nil)
+}
+
+// installAuditAppendOnlyNoting calls checked for every audit table that
+// exists, with the triggers that were not there and had to be created and the
+// number of the framework's triggers the table still had.
+func installAuditAppendOnlyNoting(x auditExecer, checked func(table string, missing []string, kept int)) error {
 	for _, table := range auditAppendOnlyTables {
 		var n int
 		if err := x.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n); err != nil {
@@ -88,7 +119,8 @@ func installAuditAppendOnly(x auditExecer) error {
 		if n == 0 {
 			continue
 		}
-		expected := map[string]string{}
+		expected, changed, kept := map[string]string{}, map[string]bool{}, 0
+		var missing []string
 		for _, kind := range auditAppendOnlyKinds {
 			expected[auditTriggerName(table, kind)] = auditTriggerSQL(table, kind)
 		}
@@ -99,10 +131,12 @@ func installAuditAppendOnly(x auditExecer) error {
 		for name, text := range stored {
 			if want, ours := expected[name]; ours && text == want {
 				delete(expected, name)
+				kept++
 				continue
 			}
 			if _, ours := expected[name]; ours {
 				log.Printf("SECURITY: audit trigger %s was changed; restoring it", name)
+				changed[name] = true
 			} else {
 				log.Printf("SECURITY: dropping trigger %s on append-only table %s", name, table)
 			}
@@ -111,12 +145,19 @@ func installAuditAppendOnly(x auditExecer) error {
 			}
 		}
 		for _, kind := range auditAppendOnlyKinds {
-			if _, missing := expected[auditTriggerName(table, kind)]; !missing {
+			name := auditTriggerName(table, kind)
+			if _, absent := expected[name]; !absent {
 				continue
 			}
 			if _, err := x.Exec(auditTriggerSQL(table, kind)); err != nil {
 				return err
 			}
+			if !changed[name] {
+				missing = append(missing, name)
+			}
+		}
+		if checked != nil {
+			checked(table, missing, kept)
 		}
 	}
 	return nil
@@ -176,6 +217,10 @@ func refuseAuditTableStatement(x auditExecer, stmt string) error {
 	return nil
 }
 
+// auditAppendOnlyEnsured records, per app directory and audit table, that this
+// process has installed the triggers.
+var auditAppendOnlyEnsured sync.Map
+
 // ensureAuditAppendOnly installs the triggers for a `compliance: hipaa` app,
 // retrying once (a busy database). A failure is returned: the served build
 // refuses to start or reload without them (buildAppMuxChecked), since a hipaa
@@ -185,10 +230,23 @@ func ensureAuditAppendOnly(app *App) error {
 	if !app.hipaa() {
 		return nil
 	}
-	err := installAuditAppendOnly(app.DB)
+	// A trigger that is missing where it was is logged: while the table still
+	// has another of its triggers, or when this process installed them before
+	// (a reload). A table with none at the first check of a process is a first
+	// install, which is not.
+	checked := func(table string, missing []string, kept int) {
+		key := app.Dir + "\x00" + table
+		if _, before := auditAppendOnlyEnsured.Load(key); kept > 0 || (before && app.Dir != "") {
+			for _, name := range missing {
+				log.Printf("SECURITY: audit trigger %s was missing; restoring it", name)
+			}
+		}
+		auditAppendOnlyEnsured.Store(key, true)
+	}
+	err := installAuditAppendOnlyNoting(app.DB, checked)
 	if err != nil {
 		time.Sleep(200 * time.Millisecond)
-		err = installAuditAppendOnly(app.DB)
+		err = installAuditAppendOnlyNoting(app.DB, checked)
 	}
 	if err != nil {
 		log.Printf("SECURITY: audit append-only triggers could not be installed: %v", err)

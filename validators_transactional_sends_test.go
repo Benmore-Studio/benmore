@@ -60,7 +60,7 @@ func TestTransactionalSendProblems(t *testing.T) {
 			sends := flowTransactionalSendProblems(file)
 			named := false
 			for _, p := range sends {
-				if strings.Contains(p, "can't run in a `transaction: true` flow") {
+				if strings.Contains(p, "sends at once and is not undone by a rollback") {
 					named = true
 				}
 			}
@@ -68,7 +68,7 @@ func TestTransactionalSendProblems(t *testing.T) {
 				t.Fatalf("named=%v, want %v\nsends=%q\n%s", named, c.refused, sends, c.src)
 			}
 			for _, p := range flowStepValueProblems(file) {
-				if strings.Contains(p, "it sends at once") {
+				if strings.Contains(p, "sends at once") {
 					t.Fatalf("the write gate would refuse a send that deployed files carry: %q", p)
 				}
 			}
@@ -103,9 +103,17 @@ jobs:
 	writeTestFile(t, dir, "flows/order.yaml", flow)
 	sendWarnings := func(report CheckReport) (out []string) {
 		for _, f := range report.Findings {
-			if strings.Contains(f.Message, "can't run in a `transaction: true` flow") {
+			if strings.Contains(f.Message, "sends at once and is not undone by a rollback") {
 				if f.Severity != "warning" || f.Source != "flows" || f.File != "flows/order.yaml" {
 					t.Errorf("finding is not a flows warning on the file: %+v", f)
+				}
+				// The step runs: nothing in the warning may read as a refusal,
+				// and its address is the key that states the rule.
+				if strings.Contains(f.Message, "can't run") || strings.Contains(f.Message, "refused") {
+					t.Errorf("the warning reads as a refusal: %s", f.Message)
+				}
+				if got := checkFindingDocs(f); got != "flows.transactional_sends" {
+					t.Errorf("the warning is documented at %q, want flows.transactional_sends", got)
 				}
 				out = append(out, f.Message)
 			}
@@ -117,7 +125,7 @@ jobs:
 		"benmore check":                         RunSourceCheck(dir, ""),
 	} {
 		got := sendWarnings(report)
-		if len(got) != 1 || !strings.HasPrefix(got[0], `flows/order.yaml: job "order" step steps[1] ("mail"): `+"`run: email` can't run") || !strings.Contains(got[0], "`run: enqueue`") {
+		if len(got) != 1 || !strings.HasPrefix(got[0], `flows/order.yaml: job "order" step steps[1] ("mail"): `+"`run: email` in a `transaction: true` flow sends at once") || !strings.Contains(got[0], "`run: enqueue`") {
 			t.Errorf("%s: got %q", name, got)
 		}
 		if report.Errors != 0 {

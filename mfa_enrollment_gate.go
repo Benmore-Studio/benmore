@@ -29,6 +29,22 @@ const mfaEnrollmentRequiredError = "mfa_enrollment_required"
 
 const mfaEnrollmentRequiredMessage = "Your role requires two-factor authentication. Set it up before this credential can be used: POST /api/_auth/mfa/setup with your current password, then POST /api/_auth/mfa/verify with a code from your authenticator (or sign in again to start enrollment)."
 
+// mfaEnrollmentCannotEnrollMessage is for a held credential that may not
+// enroll itself (an API token, a scoped or act-as session): the setup call the
+// other message names refuses it, so it is told to sign in instead.
+const mfaEnrollmentCannotEnrollMessage = "Your role requires two-factor authentication before this credential can be used, and an API token cannot enroll (nor can a scoped or act-as session). Sign in with the account's password to get a full session, then POST /api/_auth/mfa/setup with your current password and POST /api/_auth/mfa/verify with a code from your authenticator. This credential works again once the factor is active."
+
+// mfaEnrollmentRefusal is the 403 body for a credential held until its
+// account enrolls: what is required, where a browser goes, and the steps this
+// credential can actually take.
+func mfaEnrollmentRefusal(app *App, held *Session) map[string]any {
+	message := mfaEnrollmentRequiredMessage
+	if held != nil && (!credentialManagementSession(app, held) || !accountManagementSession(held)) {
+		message = mfaEnrollmentCannotEnrollMessage
+	}
+	return map[string]any{"error": mfaEnrollmentRequiredError, "message": message, "redirect": mfaSetupPagePath(app)}
+}
+
 // mfaEnrollmentConfigured reports whether app.yaml lists any role in
 // auth.require_mfa_for_roles.
 func mfaEnrollmentConfigured(app *App) bool {
@@ -150,14 +166,19 @@ func mfaEnrollmentStepRequest(app *App, r *http.Request) bool {
 // Bearer callers, a redirect to the setup page for page navigation.
 func mfaEnrollmentMiddleware(next http.Handler, app *App) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !mfaEnrollmentConfigured(app) || isStaticPath(r.URL.Path) || mfaEnrollmentStepRequest(app, r) || mfaEnrollmentSession(app, r) == nil {
+		if !mfaEnrollmentConfigured(app) || isStaticPath(r.URL.Path) || mfaEnrollmentStepRequest(app, r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		held := mfaEnrollmentSession(app, r)
+		if held == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		setup := mfaSetupPagePath(app)
 		if strings.HasPrefix(r.URL.Path, "/api/") || wantsJSON(r) || isBearerAuth(r) {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": mfaEnrollmentRequiredError, "message": mfaEnrollmentRequiredMessage, "redirect": setup})
+			httpJSON(w, http.StatusForbidden, mfaEnrollmentRefusal(app, held))
 			return
 		}
 		if isHTMX(r) {

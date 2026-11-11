@@ -897,7 +897,10 @@ export function room(name) {
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'error') {
-        // The server's only error frames refuse a join; on this room's own
+        // An error frame with `tables` answers a table subscribe sent on
+        // this socket (unknown table names): it is not about the room.
+        if (Array.isArray(msg.tables)) return;
+        // Every other error frame refuses a join; on this room's own
         // connection that refusal is final.
         const message = typeof msg.body === 'string' && msg.body ? msg.body : 'room error';
         const code = roomErrorCode(msg.body);
@@ -2251,6 +2254,26 @@ function rememberTableKey(tableName, key) {
   _queryTableKeys.get(tableName).add(k);
 }
 
+// The key a table read is cached under, and the request it sends. One
+// function answers both bm.query.table and bm.query.tableKey, so a subscriber
+// to tableKey(name, opts) reads the entry table(name, opts) writes.
+function defaultReadKey(spec) {
+  return ['query', spec];
+}
+
+function tableRead(tableName, opts) {
+  // Separate client control options (which never affect the server result)
+  // from the server-affecting query spec. Only the spec may influence the
+  // cache key, otherwise two identical reads that differ only in staleTime/
+  // force/live would fragment into distinct cache entries and defeat dedupe.
+  const { staleTime, staleMs, force, live, key, ...serverOpts } = opts || {};
+  const spec = { ...serverOpts, table: tableName };
+  // The default is read()'s ['query', spec] key shape, so that a
+  // bm.query.table('posts') and bm.query.read({ table: 'posts' }) targeting
+  // identical rows collapse onto one shared cache entry.
+  return { spec, key: key || defaultReadKey(spec), control: { staleTime, staleMs, force, live } };
+}
+
 function ensureQueryLiveInvalidation() {
   if (_queryLiveStop || typeof live !== 'function' || typeof EventSource === 'undefined') return;
   const stop = live('*', (ev) => {
@@ -2355,7 +2378,7 @@ export const query = {
     // We deliberately avoid raw string startsWith on the stable-stringified key
     // because that produced false positives (e.g. {a:1} matching {a:1,b:2}, or
     // ['user'] matching ['username']). Array-prefix is predictable for the
-    // common ['table', name, spec] / ['query', spec] key shapes used here.
+    // ['query', spec] key shape used here and for an app's own array keys.
     const matchExact = typeof match !== 'function' ? queryKey(match) : null;
     const matchPrefix = (typeof match !== 'function' && Array.isArray(match)) ? match : null;
     const isArrayPrefix = (prefix, raw) => {
@@ -2379,12 +2402,15 @@ export const query = {
     }
     return keys;
   },
-  tableKey(tableName, spec = {}) {
-    return ['table', tableName, spec];
+  // The key bm.query.table(tableName, opts) caches under, for subscribe/get/
+  // set/invalidate/mutate: opts.key when the caller names one, otherwise the
+  // key derived from the request.
+  tableKey(tableName, opts = {}) {
+    return tableRead(tableName, opts).key;
   },
   async read(spec, opts = {}) {
     if (!spec || !spec.table) throw new Error('bm.query.read({ table, ... }) requires table');
-    const key = opts.key || ['query', spec];
+    const key = opts.key || defaultReadKey(spec);
     if (opts.live !== false) {
       rememberTableKey(spec.table, key);
       ensureQueryLiveInvalidation();
@@ -2395,17 +2421,10 @@ export const query = {
     }, opts);
   },
   table(tableName, opts = {}) {
-    // Separate client control options (which never affect the server result)
-    // from the server-affecting query spec. Only the spec may influence the
-    // cache key, otherwise two identical reads that differ only in staleTime/
-    // force/live would fragment into distinct cache entries and defeat dedupe.
-    const { staleTime, staleMs, force, live, key, ...serverOpts } = opts;
-    const spec = { ...serverOpts, table: tableName };
-    // Route through read() with the same ['query', spec] key shape so that a
-    // bm.query.table('posts') and bm.query.read({ table: 'posts' }) targeting
-    // identical rows collapse onto one shared cache entry. Forward every client
-    // control option (staleTime/staleMs/force/live) so none are silently dropped.
-    return query.read(spec, { key: key, staleTime, staleMs, force, live });
+    // Forward every client control option (staleTime/staleMs/force/live) so
+    // none are silently dropped.
+    const { spec, key, control } = tableRead(tableName, opts);
+    return query.read(spec, { ...control, key });
   },
   invalidateTable(tableName, opts = {}) {
     const keys = _queryTableKeys.get(tableName);

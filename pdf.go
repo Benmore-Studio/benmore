@@ -268,7 +268,10 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 		title = pageDefaultTitle(page.Route)
 	}
 
-	fullHTML := WrapLayoutWithPage(content, title, app, session, page)
+	// The print shell: the page, without what the browser shell adds for a
+	// person looking at it (consent banner, feedback widget, analytics,
+	// live-update and reload clients, service worker).
+	fullHTML := WrapLayoutForPrint(content, title, app, session, page)
 
 	// Render inside the sandbox (pdf_sandbox.go): the document is served
 	// from an isolated http origin and every request Chrome makes goes

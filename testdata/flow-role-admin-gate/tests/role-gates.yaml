@@ -1,0 +1,178 @@
+# Anyone can sign up and found an organisation, which makes them its `admin`
+# (groups.bootstrap.founding_role). That tenant role must not open a flow
+# gated `role: admin`: the flow's payload is trusted to come from the app.
+a_tenant_admin_does_not_pass_a_role_admin_flow:
+  as_user: "founder@roles.test"
+  setup:
+    - sql: "INSERT INTO organizations (name) VALUES ('Other Co')"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Acme" }
+      save: { org_id: "group_id" }
+      expect:
+        status: 200
+        json: { status: created, founding_role: admin }
+    - sql: "SELECT id FROM org_members WHERE org_id = {{org_id}} AND user_id = {{user_id}} AND member_role = 'admin'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM organizations WHERE name = 'Other Co'"
+      save: { other_org: "id" }
+      expect: { rows: 1 }
+    # Another tenant's id in the payload, and the caller's own: both refused.
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: "{{other_org}}", note: "written into another tenant" }
+      expect:
+        status: 403
+        json: { error: Forbidden }
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: "{{org_id}}", note: "written into my own tenant" }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM activity WHERE note LIKE 'written into %'"
+      expect: { rows: 0 }
+    # The same account still passes a table's `role:admin` rule inside its tenant.
+    - api: "PATCH /api/organizations/{{org_id}}"
+      json: { name: "Acme Ltd" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM organizations WHERE id = {{org_id}} AND name = 'Acme Ltd'"
+      expect: { rows: 1 }
+    # A tenant admin is not a finance user either.
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect: { status: 403 }
+    # A flow that lists several tenant roles in its own SQL admits it.
+    - api: "POST /api/period/close"
+      json: {}
+      expect:
+        status: 200
+        json: { closed: true }
+
+the_global_admin_passes_a_role_admin_flow:
+  as_user: "root@roles.test"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO organizations (name) VALUES ('Globex')"
+  steps:
+    - sql: "SELECT id FROM organizations WHERE name = 'Globex'"
+      save: { org: "id" }
+      expect: { rows: 1 }
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: "{{org}}", note: "queued work" }
+      expect:
+        status: 200
+        json: { logged: true }
+    - sql: "SELECT id FROM activity WHERE org_id = {{org}} AND note = 'queued work'"
+      expect: { rows: 1 }
+    # A global admin passes every role gate.
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect: { status: 200 }
+
+a_tenant_finance_user_passes_a_role_finance_flow:
+  as_user: "fin@roles.test"
+  setup:
+    - sql: "INSERT INTO organizations (name) VALUES ('Initech'), ('Initrode')"
+    - sql: "INSERT INTO org_members (org_id, user_id, member_role) SELECT id, {{user_id}}, 'finance' FROM organizations WHERE name = 'Initech'"
+    - sql: "INSERT INTO activity (org_id, note) SELECT id, 'one' FROM organizations WHERE name = 'Initech'"
+    - sql: "INSERT INTO activity (org_id, note) SELECT id, 'two' FROM organizations WHERE name = 'Initech'"
+    - sql: "INSERT INTO activity (org_id, note) SELECT id, 'another tenant' FROM organizations WHERE name = 'Initrode'"
+  steps:
+    - sql: "SELECT id FROM organizations WHERE name = 'Initech'"
+      save: { org: "id" }
+      expect: { rows: 1 }
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect:
+        status: 200
+        json: { entries: 2 }
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: "{{org}}", note: "finance is not admin" }
+      expect: { status: 403 }
+    - api: "POST /api/org/rename"
+      json: { name: "Renamed by finance" }
+      expect:
+        status: 403
+        json: { error: not_org_admin }
+    - api: "POST /api/period/close"
+      json: {}
+      expect:
+        status: 200
+        json: { closed: true }
+    - sql: "SELECT id FROM organizations WHERE id = {{org}} AND name = 'Initech'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM activity WHERE note = 'finance is not admin'"
+      expect: { rows: 0 }
+
+a_plain_member_passes_neither_role_gate:
+  as_user: "member@roles.test"
+  setup:
+    - sql: "INSERT INTO organizations (name) VALUES ('Hooli')"
+    - sql: "INSERT INTO org_members (org_id, user_id, member_role) SELECT id, {{user_id}}, 'member' FROM organizations WHERE name = 'Hooli'"
+  steps:
+    - sql: "SELECT id FROM organizations WHERE name = 'Hooli'"
+      save: { org: "id" }
+      expect: { rows: 1 }
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect: { status: 403 }
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: "{{org}}", note: "written by a member" }
+      expect: { status: 403 }
+    - api: "POST /api/period/close"
+      json: {}
+      expect:
+        status: 403
+        json: { error: not_finance_or_org_admin }
+    - sql: "SELECT id FROM activity WHERE note = 'written by a member'"
+      expect: { rows: 0 }
+
+# What a builder writes when the tenant's own admins should pass: the flow
+# checks the caller's membership row.
+a_tenant_admin_passes_a_flow_that_checks_the_membership_row:
+  as_user: "owner@roles.test"
+  setup:
+    - sql: "INSERT INTO organizations (name) VALUES ('Someone else')"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Umbrella" }
+      save: { org_id: "group_id" }
+      expect: { status: 200 }
+    - api: "POST /api/org/rename"
+      json: { name: "Umbrella Corp" }
+      expect:
+        status: 200
+        json: { renamed: true }
+    - sql: "SELECT id FROM organizations WHERE id = {{org_id}} AND name = 'Umbrella Corp'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM organizations WHERE name = 'Someone else'"
+      expect: { rows: 1 }
+
+a_signed_in_caller_with_no_tenant_is_refused_everywhere:
+  as_user: "loner@roles.test"
+  steps:
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: 1, note: "written with no tenant" }
+      expect: { status: 403 }
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect: { status: 403 }
+    - api: "POST /api/org/rename"
+      json: { name: "No tenant" }
+      expect:
+        status: 403
+        json: { error: not_org_admin }
+    - api: "POST /api/period/close"
+      json: {}
+      expect:
+        status: 403
+        json: { error: not_finance_or_org_admin }
+    - sql: "SELECT id FROM activity WHERE note = 'written with no tenant'"
+      expect: { rows: 0 }
+
+signed_out_callers_are_asked_to_sign_in:
+  anon: true
+  steps:
+    - api: "POST /api/internal/log-activity"
+      json: { org_id: 1, note: "anon" }
+      expect: { status: 401 }
+    - api: "POST /api/reports/spend"
+      json: {}
+      expect: { status: 401 }

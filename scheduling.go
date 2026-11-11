@@ -271,6 +271,9 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "table and row_id required"})
 			return
 		}
+		// The table in the schema's spelling: SQLite resolves a table name in
+		// any letter case, so `Docs` is the app's `docs` and gets its checks.
+		b.Table = approvalTableName(app, b.Table)
 		// An approval on an app record joins that record's approval history,
 		// which every reader of the record sees (GET below), so only a caller
 		// who can read the record may request one. A table name that is not
@@ -284,8 +287,9 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// normalized, or `BOB@example.com` would reach nobody. ASCII letters
 		// only, matching the COLLATE NOCASE lookups (approval_assignee.go).
 		b.ApproverEmail = approvalAddressKey(b.ApproverEmail)
-		// Bound to (and notifying) only an account that has proven the
-		// address; see approval_assignee.go.
+		// The account that has proven the address, if any (approval_assignee.go).
+		// It is bound and notified below only when the record admits it as
+		// approver (approval_audience.go).
 		approverID, err := approvalApproverByEmail(app.DB, b.ApproverEmail)
 		if err != nil {
 			serverErrorJSON(w, r, app, "_approvals", err, "request failed")
@@ -319,10 +323,10 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// identical submit that stored the pending request first makes this
 		// insert nothing; answer the stored one.
 		res, err := app.DB.Exec(
-			`INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_id, approver_email, title)
-			SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM _benmore_approvals WHERE table_name = ? AND row_id = ? AND requested_by = ?
+			`INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_email, title)
+			SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM _benmore_approvals WHERE table_name = ? AND row_id = ? AND requested_by = ?
 				AND approver_email = ? AND title = ? AND status = 'pending')`,
-			b.Table, string(b.RowID), session.UserID, session.Email, nullableInt(approverID), b.ApproverEmail, b.Title,
+			b.Table, string(b.RowID), session.UserID, session.Email, b.ApproverEmail, b.Title,
 			b.Table, string(b.RowID), session.UserID, b.ApproverEmail, b.Title,
 		)
 		if err != nil {
@@ -340,8 +344,18 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			return
 		}
 		id, _ := res.LastInsertId()
+		// An account outside the record's tenant is not bound or notified:
+		// the request is stored and answered like one naming an address
+		// nobody holds, which says nothing about the account.
 		if approverID.Valid {
-			CreateNotification(app.DB, approverID.Int64, "Approval requested", b.Title, "info", "")
+			bound, err := approvalBindApprover(app, id, approverID.Int64, b.Table, string(b.RowID))
+			if err != nil {
+				serverErrorJSON(w, r, app, "_approvals", err, "request failed")
+				return
+			}
+			if bound {
+				CreateNotification(app.DB, approverID.Int64, "Approval requested", b.Title, "info", "")
+			}
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"id": id, "status": "pending"})
 	})
@@ -353,10 +367,14 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		}
 		q := "SELECT id, table_name, row_id, requested_by, requested_email, approver_email, title, status, note, created_at, decided_at FROM _benmore_approvals WHERE 1=1"
 		args := []any{}
-		t, rid := r.URL.Query().Get("table"), r.URL.Query().Get("row_id")
+		written, rid := r.URL.Query().Get("table"), r.URL.Query().Get("row_id")
+		// The table in the schema's spelling, as a request stores it, plus the
+		// name as written: a request stored under another letter case of a
+		// table name is a label (requester and approver only, below).
+		t := approvalTableName(app, written)
 		if t != "" {
-			q += " AND table_name = ?"
-			args = append(args, t)
+			q += " AND table_name IN (?, ?)"
+			args = append(args, t, written)
 		}
 		if rid != "" {
 			q += " AND row_id = ?"
@@ -366,11 +384,17 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// and have no tenant column. Besides an admin, a caller sees the
 		// approvals they requested or are asked to decide, and every approval
 		// on a record they can read (the Approval component's history).
-		// An approval addressed by email belongs to a verified address
-		// (approvalAssignedSQL, the same test /decide applies).
-		assigned, assignedArgs := approvalAssignedSQL(session)
-		if !session.IsAdminBypass() && !(t != "" && rid != "" && canAccessRow(app, t, rid, session)) {
-			q += " AND (requested_by = ? OR " + assigned + ")"
+		// An approval addressed by email belongs to a verified address, and
+		// one on a tenant's record to an account of that tenant
+		// (approvalApproverSQL, the same test /decide applies).
+		assigned, assignedArgs := approvalApproverSQL(app, session)
+		if !session.IsAdminBypass() {
+			if t != "" && rid != "" && canAccessRow(app, t, rid, session) {
+				q += " AND (table_name = ? OR requested_by = ? OR " + assigned + ")"
+				args = append(args, t)
+			} else {
+				q += " AND (requested_by = ? OR " + assigned + ")"
+			}
 			args = append(append(args, session.UserID), assignedArgs...)
 		}
 		// "mine" = pending approvals assigned to me (to act on).
@@ -414,13 +438,14 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			return
 		}
 		// Only the assigned approver (or an admin) may decide. Assigned is the
-		// test the list applies (approvalAssignedSQL): a request addressed by
-		// email belongs to the account that has proven that address.
+		// test the list applies (approvalApproverSQL): a request addressed by
+		// email belongs to the account that has proven that address, and one
+		// on a tenant's record only while that account is in the tenant.
 		var isApprover bool
 		var requestedEmail, title string
 		var requestedBy int64
 		id := r.PathValue("id")
-		assigned, assignedArgs := approvalAssignedSQL(session)
+		assigned, assignedArgs := approvalApproverSQL(app, session)
 		scanErr := app.DB.QueryRow("SELECT COALESCE("+assigned+", 0), requested_by, requested_email, title FROM _benmore_approvals WHERE id = ?", append(assignedArgs, id)...).
 			Scan(&isApprover, &requestedBy, &requestedEmail, &title)
 		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
@@ -496,13 +521,6 @@ var errInvalidWhen = &timeParseError{}
 type timeParseError struct{}
 
 func (e *timeParseError) Error() string { return "invalid time" }
-
-func nullableInt(n sql.NullInt64) any {
-	if n.Valid {
-		return n.Int64
-	}
-	return nil
-}
 
 // StartSchedulerSweeper fires due scheduled tasks every 30s until app.Stop.
 func StartSchedulerSweeper(app *App) {
@@ -815,7 +833,7 @@ func schedulableFlow(app *App, name string, actor *Session) (*Flow, error) {
 		if flow.Trigger.Type != "http" && !actor.GlobalAdmin {
 			return nil, fmt.Errorf("internal flow requires a global administrator")
 		}
-		if flow.Role != "" && !HasAnyRole(actor, []string{flow.Role}) {
+		if flow.Role != "" && !flowRoleAllowed(actor, flow.Role) {
 			return nil, errScheduledFlowRole
 		}
 		if len(flow.Permissions) > 0 && !scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " ")) {

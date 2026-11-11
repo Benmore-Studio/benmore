@@ -892,8 +892,8 @@ func appMCPRevisionForeignKeyEffects(tx *sql.Tx, appTables map[string]string, op
 }
 
 // verifyAppMCPDeclaredTriggerClosure accepts only trigger SQL generated from
-// captured Prisma, full-text, computed, and encryption declarations (plus the
-// separately verified revision triggers). Authored SQLite triggers are refused
+// captured Prisma, full-text, computed, encryption and versioning declarations
+// (plus the separately verified revision triggers). Authored SQLite triggers are refused
 // until their effect contract is represented by an explicit adapter.
 func verifyAppMCPDeclaredTriggerClosure(tx *sql.Tx, generation *appMCPRuntimeGeneration, tables []string, allowRepair bool) error {
 	_ = allowRepair
@@ -1030,6 +1030,25 @@ func verifyAppMCPDeclaredTriggerClosure(tx *sql.Tx, generation *appMCPRuntimeGen
 					if err := add(name, sql, table); err != nil {
 						return err
 					}
+				}
+			}
+		}
+	}
+	// The history triggers of a table in app.yaml `versioned:` are generated
+	// by the framework too. As above, the authority is the full regenerated
+	// text for the table's current columns, never the _benmore_ver_ name.
+	if versioned := generation.view.versionedConfig(); versioned != nil {
+		for _, table := range versioned.Tables {
+			if !inside[strings.ToLower(table)] {
+				continue
+			}
+			triggers, err := appMCPVerifiedHistoryTriggers(tx, generation, table)
+			if err != nil {
+				return err
+			}
+			for _, trigger := range triggers {
+				if err := add(trigger.name, trigger.ddl, table); err != nil {
+					return err
 				}
 			}
 		}

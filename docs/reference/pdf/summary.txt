@@ -1,1 +1,1 @@
-Server-side PDF generation from any page. The framework renders the page's SERVER-SIDE (gotmpl/SSR) HTML and prints it to PDF via a sandboxed headless Chrome on the host.
+Server-side PDF generation from any page. The framework renders the page's SERVER-SIDE (gotmpl/SSR) HTML and prints it to PDF via a sandboxed headless Chrome on the host. The PDF holds the page only: none of the browser tooling the framework adds to a page, and no browser print header or footer (see gotchas).

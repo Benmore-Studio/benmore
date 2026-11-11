@@ -279,10 +279,15 @@ func (d *benmoreDriver) Open(dsn string) (driver.Conn, error) {
 		return conn, nil
 	}
 	c := &benmoreConn{SQLiteConn: sc, limited: d.limited}
-	if file := sc.GetFilename("main"); file != "" {
+	file := sc.GetFilename("main")
+	if file != "" {
 		c.lock = dbWriteLockFor(file)
 		c.tracked = sqliteDSNTxLock(dsn) != "deferred"
 	}
+	// The connection's default authorizer (app_sql_guard.go). The served
+	// driver's ConnectHook has applied the storage ceiling by now.
+	benmoreConnsByDriverConn.Store(sc, c)
+	c.installDefaultAuthorizer(d.limited && effectiveDBStorageLimit(canonicalDBPath(file)) > 0)
 	return c, nil
 }
 
@@ -318,6 +323,11 @@ type benmoreConn struct {
 	// stmtCtx, when set, bounds every statement that came without a deadline of
 	// its own (bindStatementContext). Guarded by gate.
 	stmtCtx context.Context
+	// appSQL is the scope of the app-authored statement being compiled
+	// (app_sql_guard.go); set and cleared under gate. ceiling: the default
+	// authorizer also guards the storage-ceiling pragmas.
+	appSQL  *appSQLScope
+	ceiling atomic.Bool
 }
 
 // bindStatementContext makes statements on this connection that carry no
@@ -388,7 +398,13 @@ func (c *benmoreConn) ExecContext(ctx context.Context, query string, args []driv
 	if err := c.enter(); err != nil {
 		return nil, err
 	}
+	query, scope, err := c.beginAppSQL(query)
+	if err != nil {
+		c.gate.Unlock()
+		return nil, err
+	}
 	res, err := c.SQLiteConn.ExecContext(c.statementContext(ctx), query, args)
+	err = c.endAppSQL(scope, err)
 	c.gate.Unlock()
 	if err != nil {
 		c.noteIfBusy(ctx, err, "could not write")
@@ -400,7 +416,13 @@ func (c *benmoreConn) QueryContext(ctx context.Context, query string, args []dri
 	if err := c.enter(); err != nil {
 		return nil, err
 	}
+	query, scope, err := c.beginAppSQL(query)
+	if err != nil {
+		c.gate.Unlock()
+		return nil, err
+	}
 	rows, err := c.SQLiteConn.QueryContext(c.statementContext(ctx), query, args)
+	err = c.endAppSQL(scope, err)
 	c.gate.Unlock()
 	if err != nil {
 		c.noteIfBusy(ctx, err, "could not run a query")
@@ -428,7 +450,13 @@ func (c *benmoreConn) PrepareContext(ctx context.Context, query string) (driver.
 	if err := c.enter(); err != nil {
 		return nil, err
 	}
+	query, scope, err := c.beginAppSQL(query)
+	if err != nil {
+		c.gate.Unlock()
+		return nil, err
+	}
 	stmt, err := c.SQLiteConn.PrepareContext(ctx, query)
+	err = c.endAppSQL(scope, err)
 	c.gate.Unlock()
 	if err != nil {
 		return nil, err
@@ -483,6 +511,7 @@ func (c *benmoreConn) Close() error {
 		c.finishLocked(t)
 	}
 	c.gate.Unlock()
+	benmoreConnsByDriverConn.Delete(c.SQLiteConn)
 	return c.SQLiteConn.Close()
 }
 

@@ -1,0 +1,21 @@
+# flows/close-period.yaml - several tenant roles: a flow's `role:` gate takes
+# one name, so the flow reads the caller's membership row and lists the roles
+# that pass.
+on:
+  request:
+    method: POST
+    path: /api/period/close
+    auth: required
+jobs:
+  close:
+    steps:
+      - id: me
+        run: sql
+        with:
+          query: "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role IN ('finance', 'admin')"
+          params: { org: "${{ user.group_id || 0 }}" }
+      - if: ${{ !steps.me.outputs.rows }}
+        run: respond
+        with: { status: 403, json: { error: not_finance_or_org_admin } }
+      - run: respond
+        with: { status: 200, json: { closed: true } }

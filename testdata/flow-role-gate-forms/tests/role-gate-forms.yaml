@@ -1,0 +1,172 @@
+# Each test writes rows under its own sku and counts only those: the tests of
+# this file share one database and run in any order.
+
+# `role: "warehouse,manager"` is one role name nobody holds.
+a_comma_list_does_not_admit_the_first_listed_role:
+  as_user: "wendy@gates.test"
+  as_role: "warehouse"
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-1" }
+      expect:
+        status: 403
+        json: { error: Forbidden }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-1'"
+      expect: { rows: 0 }
+
+a_comma_list_does_not_admit_the_second_listed_role:
+  as_user: "mona@gates.test"
+  as_role: "manager"
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-4" }
+      expect:
+        status: 403
+        json: { error: Forbidden }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-4'"
+      expect: { rows: 0 }
+
+a_comma_list_admits_a_global_admin:
+  as_user: "root@gates.test"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-2" }
+      expect:
+        status: 201
+        json: { received: true }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-2' AND kind = 'receive'"
+      expect: { rows: 1 }
+
+a_signed_out_caller_of_a_role_gated_flow_is_asked_to_sign_in:
+  anon: true
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-3" }
+      expect: { status: 401 }
+    - api: "POST /api/pick-stock"
+      json: { sku: "LIST-3" }
+      expect: { status: 401 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-3'"
+      expect: { rows: 0 }
+
+# The `if:` on the account's own role lets each listed role in.
+the_if_form_admits_a_warehouse_user:
+  as_user: "walt@gates.test"
+  as_role: "warehouse"
+  steps:
+    - api: "POST /api/pick-stock"
+      json: { sku: "IF-1" }
+      expect:
+        status: 201
+        json: { picked: true }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'IF-1' AND kind = 'pick' AND moved_by = {{user_id}}"
+      expect: { rows: 1 }
+
+the_if_form_admits_a_manager:
+  as_user: "mia@gates.test"
+  as_role: "manager"
+  steps:
+    - api: "POST /api/pick-stock"
+      json: { sku: "IF-2" }
+      expect: { status: 201 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'IF-2' AND kind = 'pick'"
+      expect: { rows: 1 }
+
+the_if_form_admits_an_admin:
+  as_user: "ada@gates.test"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/pick-stock"
+      json: { sku: "IF-3" }
+      expect: { status: 201 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'IF-3' AND kind = 'pick'"
+      expect: { rows: 1 }
+
+the_if_form_refuses_any_other_account:
+  as_user: "carl@gates.test"
+  steps:
+    - api: "POST /api/pick-stock"
+      json: { sku: "IF-4" }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'IF-4'"
+      expect: { rows: 0 }
+
+# `${{ user.role }}` is the account's own role only: a role held through a
+# grant needs the SQL form.
+a_role_grant_passes_the_sql_form_and_not_the_if_form:
+  as_user: "gina@gates.test"
+  setup:
+    - sql: "INSERT INTO _benmore_user_roles (user_id, role) VALUES ({{user_id}}, 'manager')"
+  steps:
+    - api: "POST /api/count-stock"
+      json: { sku: "GRANT-1" }
+      expect:
+        status: 201
+        json: { counted: true }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'GRANT-1' AND kind = 'count' AND moved_by = {{user_id}}"
+      expect: { rows: 1 }
+    - api: "POST /api/pick-stock"
+      json: { sku: "GRANT-1" }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'GRANT-1' AND kind = 'pick'"
+      expect: { rows: 0 }
+
+the_sql_form_admits_the_account_role:
+  as_user: "wes@gates.test"
+  as_role: "warehouse"
+  steps:
+    - api: "POST /api/count-stock"
+      json: { sku: "SQL-1" }
+      expect: { status: 201 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'SQL-1' AND kind = 'count'"
+      expect: { rows: 1 }
+
+# An expired grant of a listed role, and a grant of another role, admit nobody.
+the_sql_form_refuses_an_expired_grant_and_another_role:
+  as_user: "cora@gates.test"
+  setup:
+    - sql: "INSERT INTO _benmore_user_roles (user_id, role, expires_at) VALUES ({{user_id}}, 'manager', '2001-01-01 00:00:00')"
+    - sql: "INSERT INTO _benmore_user_roles (user_id, role) VALUES ({{user_id}}, 'auditor')"
+  steps:
+    - api: "POST /api/count-stock"
+      json: { sku: "SQL-2" }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'SQL-2'"
+      expect: { rows: 0 }
+
+# Background work for several roles: the synchronous flow refuses or queues.
+a_listed_role_queues_the_worker_and_the_job_runs:
+  as_user: "wanda@gates.test"
+  as_role: "warehouse"
+  steps:
+    - api: "POST /api/request-recount"
+      json: { sku: "QUEUE-1" }
+      expect: { status: 202 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'QUEUE-1' AND kind = 'recount' AND moved_by = {{user_id}}"
+      expect: { rows: 1 }
+    # The worker's own gate stops a direct call.
+    - api: "POST /api/internal/recount-stock"
+      json: { sku: "QUEUE-1", requested_by: 1 }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'QUEUE-1'"
+      expect: { rows: 1 }
+
+another_account_queues_nothing:
+  as_user: "cleo@gates.test"
+  steps:
+    - api: "POST /api/request-recount"
+      json: { sku: "QUEUE-2" }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - flush: "jobs"
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'QUEUE-2'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%QUEUE-2%'"
+      expect: { rows: 0 }

@@ -415,6 +415,8 @@ func TestWriteGateRefusalsCarryTheAddressOfTheirRule(t *testing.T) {
 		{"workflows", "workflows.yaml", "order:\n  table: notes\n  field: title\n  initial: draft\n  states: [draft]\n  transitions:\n    - { from: draft, to: nowhere }\n", "workflows.yaml", "workflows.keys"},
 		{"app.yaml key", "app.yaml", "routes:\n  - /x\n", "[unknown-app-yaml-key]", "recovery.configuration_loading"},
 		{"app.yaml auth key", "app.yaml", "auth:\n  enabled: true\n", "[unknown-auth-key]", "auth.app_yaml_flags"},
+		{"app.yaml hipaa control", "app.yaml", "compliance: hipaa\nauth:\n  idle_timeout: 1h\n", "compliance: hipaa requires auth.idle_timeout", "compliance.controls"},
+		{"app.yaml compliance value", "app.yaml", "compliance: soc2\n", "compliance = soc2 is not recognized", "compliance.controls"},
 		{"app.yaml access mode", "app.yaml", "access:\n  notes:\n    read: anybody\n", "is not a known access mode", "access.modes"},
 		{"app.yaml csp", "app.yaml", "csp:\n  script: x\n", "[unknown-csp-key]", "csp.gotchas"},
 		{"encrypted.yaml", "encrypted.yaml", "tables:\n  ghosts:\n    fields: [secret]\n", "ghosts", "schema.config_references"},

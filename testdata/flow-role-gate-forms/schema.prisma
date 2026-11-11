@@ -1,0 +1,8 @@
+model StockMove {
+  id        Int      @id @default(autoincrement())
+  sku       String
+  kind      String
+  movedBy   Int      @map("moved_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("stock_moves")
+}

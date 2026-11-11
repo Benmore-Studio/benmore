@@ -1,5 +1,10 @@
 # A step that reads a value the request did not send fails before it writes
 # or queues anything.
+#
+# The tests of a run share one database and run in no fixed order, so every
+# assertion names the rows its own test writes (a title, a label, a payload
+# value): a count over a whole table, or over every job of a flow that two
+# tests queue, would see another test's rows.
 sql_params_reference_with_no_value_writes_no_row:
   as_user: "a@test.com"
   steps:
@@ -61,12 +66,57 @@ enqueue_reference_with_no_value_queues_no_job:
       expect:
         status: 500
         contains: "reference in the step had no value"
-    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker'"
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker' AND json_extract(payload, '$.source') = 'enqueue-unresolved'"
       expect: { rows: 0 }
     - api: "POST /api/enqueue-unresolved"
       json: { b: "queued" }
       expect:
         status: 200
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker' AND json_extract(payload, '$.source') = 'enqueue-unresolved' AND json_extract(payload, '$.note') = 'queued'"
+      expect: { rows: 1 }
     - flush: "jobs"
     - sql: "SELECT id FROM notes WHERE title = 'worker' AND body = 'queued'"
+      expect: { rows: 1 }
+
+# In a `transaction: true` flow the answer is part of the transaction: a
+# respond step that reads a value the request did not send answers 500 and
+# nothing the flow wrote, queued or notified is kept. Sent again with the
+# value, the flow commits once.
+transactional_respond_with_no_value_commits_nothing:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/tx-respond"
+      json: { label: "first" }
+      expect:
+        status: 500
+        contains:
+          - "template_unresolved"
+          - "params.ref"
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker' AND json_extract(payload, '$.note') = 'tx-respond-job'"
+      expect: { rows: 0 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'tx-respond' AND body = 'first'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM receipts WHERE label = 'first'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM notes WHERE title = 'worker' AND body = 'tx-respond-job'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM _benmore_notifications WHERE title = 'tx-respond'"
+      expect: { rows: 0 }
+    - api: "POST /api/tx-respond"
+      json: { label: "second", ref: "r-1" }
+      expect:
+        status: 201
+        json:
+          ref: "r-1"
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker' AND json_extract(payload, '$.note') = 'tx-respond-job'"
+      expect: { rows: 1 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'tx-respond' AND body = 'second'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM receipts WHERE label = 'second'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM notes WHERE title = 'worker' AND body = 'tx-respond-job'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM _benmore_notifications WHERE title = 'tx-respond'"
       expect: { rows: 1 }

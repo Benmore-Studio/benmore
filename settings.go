@@ -540,6 +540,10 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		parseSettingsForm(w, r)
+		// A JSON body (bm.api.post sends one, and /login and /signup read
+		// one) carries the same fields; they land in r.Form, so the CSRF and
+		// current-password checks below are the same for every encoding.
+		mergeJSONBodyIntoForm(r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return

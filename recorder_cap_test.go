@@ -53,8 +53,9 @@ func TestRecordingReadsAreNotCacheable(t *testing.T) {
 	for _, path := range []string{"/_internal/recordings", "/_internal/recording/s1", "/_internal/latest-snapshot"} {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		if rec.Code != http.StatusForbidden {
-			t.Fatalf("%s without a session: status %d, want 403", path, rec.Code)
+		// No credential is unauthenticated (401); the answer is still private.
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without a session: status %d, want 401", path, rec.Code)
 		}
 		if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") || !strings.Contains(cc, "private") {
 			t.Fatalf("%s: Cache-Control %q, want private, no-store", path, cc)

@@ -360,12 +360,7 @@ func RegisterRecordingRoutes(mux appRouteRegistrar, app *App) {
 		// Captured sessions are per-admin reads: a shared cache in front of
 		// the app (a CDN rule caching /_internal/*) must never keep one.
 		w.Header().Set("Cache-Control", "private, no-store")
-		s := getSession(app, r)
-		if s == nil || !s.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
-			return false
-		}
-		return true
+		return adminConsoleSession(w, r, app, "") != nil
 	}
 	// Receive recording events. Anonymous, so it is budgeted per client
 	// address and the number of batches decoded at once is capped (the

@@ -68,6 +68,17 @@ await section('generic refresh supersedes an older pending read', async () => {
   ok(oldRows[0].version === 1 && bm.query.get('queue')[0].version === 2, 'superseded read overwrote generic refresh result');
 });
 
+await section('a tableKey subscriber renders the table read and its live refetch', async () => {
+  const spec = { where: { team_id: 7 }, limit: 50 }, rendered = [];
+  const stop = bm.query.subscribe(bm.query.tableKey('cards', spec), state => { if (state.data) rendered.push(state.data[0].version); });
+  await bm.query.table('cards', { ...spec, staleTime: 60000 });
+  ok(rendered.at(-1) === 1, 'subscriber to tableKey did not receive the rows table() read');
+  version = 2; emit({ table: 'cards', action: 'update' }); await sleep(85);
+  ok(count('cards') === 2 && rendered.at(-1) === 2, 'live change did not reach the tableKey subscriber');
+  ok(bm.query.key(bm.query.tableKey('cards', spec)) === bm.query.key(['query', { ...spec, table: 'cards' }]), 'table() no longer shares the default key of read()');
+  stop();
+});
+
 await section('session reset cancels queued generic invalidation', async () => {
   await bm.query.table('tasks', { key: 'shared-key' });
   const oldConnection = connections.at(-1);

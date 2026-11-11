@@ -1,0 +1,13 @@
+# `SELECT *` hands the whole row to the response: the encrypted column in
+# clear and its blind-index column. `benmore check` warns here.
+on:
+  request: { method: GET, path: /api/patient-row, auth: required }
+jobs:
+  patient_row:
+    steps:
+      - id: p
+        run: sql
+        with:
+          query: "SELECT p.* FROM patients p WHERE p.user_id = :user_id"
+      - run: respond
+        with: { json: { patient: "${{ steps.p.outputs.first }}" } }

@@ -1,0 +1,66 @@
+# The SQL steps that write escalation_count / submitted_at stand for the
+# server's own writes (a flow or cron step), which hooks do not gate.
+
+a_revert_that_leaves_the_server_set_columns_alone_succeeds:
+  as_user: "ann@revert.test"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, escalation_count, submitted_at, user_id) VALUES (8101, 'Laptop', 90000, 2, '2026-03-01T09:00:00Z', {{user_id}})"
+  steps:
+    - api: "PATCH /api/requests/8101"       # version 1 holds the row as inserted
+      json: { title: "Laptpo" }
+      expect: { status: 200 }
+    - api: "PATCH /api/requests/8101"
+      json: { amount_cents: 95000 }
+      expect: { status: 200 }
+    # The guard is in force for an ordinary update.
+    - api: "PATCH /api/requests/8101"
+      json: { escalation_count: 0 }
+      expect: { status: 422, contains: "set by the server" }
+    # Version 1 holds the same escalation_count and submitted_at as the row.
+    - api: "POST /api/requests/8101/revert/1"
+      json: {}
+      expect:
+        status: 200
+        json: { status: reverted }
+    - sql: "SELECT id FROM requests WHERE id = 8101 AND title = 'Laptop' AND amount_cents = 90000 AND escalation_count = 2 AND submitted_at IS NOT NULL"
+      expect: { rows: 1 }
+
+a_revert_that_would_change_a_server_set_column_is_refused:
+  as_user: "bob@revert.test"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (8102, 'Desk', 40000, {{user_id}})"
+  steps:
+    - api: "PATCH /api/requests/8102"       # version 1: not escalated, not submitted
+      json: { title: "Standing desk" }
+      expect: { status: 200 }
+    - sql: "UPDATE requests SET escalation_count = 1, submitted_at = '2026-03-02T10:00:00Z' WHERE id = 8102"
+    # Reverting to version 1 would put escalation_count back to 0.
+    - api: "POST /api/requests/8102/revert/1"
+      json: {}
+      expect: { status: 422, contains: "set by the server" }
+    - sql: "SELECT id FROM requests WHERE id = 8102 AND title = 'Standing desk' AND escalation_count = 1 AND submitted_at IS NOT NULL"
+      expect: { rows: 1 }
+
+a_revert_to_a_version_taken_after_the_server_write_succeeds:
+  as_user: "cat@revert.test"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (8103, 'Chair', 20000, {{user_id}})"
+  steps:
+    - sql: "UPDATE requests SET escalation_count = 3, submitted_at = '2026-03-03T11:00:00Z' WHERE id = 8103"   # version 1
+    - api: "PATCH /api/requests/8103"       # version 2: 'Chair', escalated 3 times
+      json: { title: "Chair (mesh)" }
+      expect: { status: 200 }
+    - api: "PATCH /api/requests/8103"       # version 3
+      json: { title: "Chair (leather)", amount_cents: 35000 }
+      expect: { status: 200 }
+    - api: "POST /api/requests/8103/revert/2"
+      json: {}
+      expect: { status: 200 }
+    - sql: "SELECT id FROM requests WHERE id = 8103 AND title = 'Chair' AND amount_cents = 20000 AND escalation_count = 3"
+      expect: { rows: 1 }
+    # Version 1 is the row before the server escalated it.
+    - api: "POST /api/requests/8103/revert/1"
+      json: {}
+      expect: { status: 422, contains: "set by the server" }
+    - sql: "SELECT id FROM requests WHERE id = 8103 AND escalation_count = 3"
+      expect: { rows: 1 }

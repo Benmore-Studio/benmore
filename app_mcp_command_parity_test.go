@@ -396,3 +396,39 @@ func TestAppMCPCommandParityRespectsForeignEditLock(t *testing.T) {
 		})
 	}
 }
+
+// A transition's `when:` on the command path is judged over the same row as on
+// the CRUD transition route: the caller's session keys and old_<column>. It
+// used to get the plain stored row, where user_email is NULL.
+func TestAppMCPCommandParityWorkflowWhenSeesTheActor(t *testing.T) {
+	for _, tc := range []struct {
+		name, when string
+		allowed    bool
+	}{
+		{"the actor", "user_email = 'task-actor@example.com' AND old_status = 'open' AND user_group_id = org_id", true},
+		{"someone else", "user_email != 'task-actor@example.com'", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, sessionID, _ := newCommandProviderTaskFixture(t)
+			workflows := &WorkflowConfig{Workflows: map[string]*Workflow{"tasks": {
+				Name: "task-state", Table: "tasks", Field: "status", Initial: "open", States: []string{"open", "done"},
+				Transitions: map[string]map[string]Transition{"open": {"done": {When: tc.when}}},
+			}}}
+			commandParityGeneration(app, func(generation *appMCPRuntimeGeneration) {
+				generation.workflows = workflows
+				generation.view.Workflows = workflows
+			})
+			_, err := runHookedCommand(t, app, sessionID)
+			if tc.allowed {
+				if err != nil {
+					t.Fatalf("a condition naming the actor refused the command: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "workflow transition condition was not met") {
+				t.Fatalf("a condition the actor does not meet let the command through: %v", err)
+			}
+			assertCommandTaskUnchanged(t, app)
+		})
+	}
+}

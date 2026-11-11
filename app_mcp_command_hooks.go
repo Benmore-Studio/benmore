@@ -754,7 +754,9 @@ func appMCPValidateWorkflowTransition(cap *appMCPCommandCapability, tx appMCPCon
 			return errors.New(workflowRoleRequired(transition.Role))
 		}
 		if transition.When != "" {
-			met, err := evaluateWhen(tx, cap.generation.view, table, transition.When, before)
+			// The same row the CRUD transition route judges the condition
+			// over: the stored row, old_<column> and the actor's session keys.
+			met, err := evaluateWhen(tx, cap.generation.view, table, transition.When, transitionEventRow(before, before, &cap.actor))
 			if err != nil || !met {
 				return errors.New("workflow transition condition was not met")
 			}
@@ -959,6 +961,11 @@ func authorizeCommandHook(policy appMCPCommandAuthorizerPolicy, action int, arg1
 			return sqlite3.SQLITE_DENY
 		}
 		if policy.hookWrites[sqliteIdentifierFold(arg1)] || policy.verifiedFTSWrites[sqliteIdentifierFold(arg1)] || appMCPCommandHookFrameworkTable(arg1) || commandVerifiedTriggerWrite(arg1) {
+			return sqlite3.SQLITE_OK
+		}
+		// A hook's write to a versioned enrolled table fires its verified
+		// history trigger, which only inserts (app_mcp_command_versions.go).
+		if action == sqlite3.SQLITE_INSERT && policy.verifiedHistoryWrites[sqliteIdentifierFold(arg1)] {
 			return sqlite3.SQLITE_OK
 		}
 		// Framework code, never hook SQL, opens this window around its own

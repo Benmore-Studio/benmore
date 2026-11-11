@@ -33,6 +33,7 @@ type appMCPCommandExecution struct {
 	allowedWrites              map[string]bool
 	verifiedFTSWrites          map[string]bool
 	verifiedFTSPriming         map[string]bool
+	verifiedHistoryWrites      map[string]bool
 	foreignKeyScanReads        map[string]bool
 	hookWrites                 map[string]bool
 	jobInsert                  bool
@@ -64,6 +65,11 @@ type appMCPCommandAuthorizerPolicy struct {
 	allowedWrites      map[string]bool
 	verifiedFTSWrites  map[string]bool
 	verifiedFTSPriming map[string]bool
+	// verifiedHistoryWrites holds the history tables (<table>_history, folded)
+	// of captured versioned tables in the revision universe. Set only for an
+	// apply write statement, a hook-write scope and the version attribution
+	// scope (app_mcp_command_versions.go).
+	verifiedHistoryWrites map[string]bool
 	// foreignKeyScanReads holds "child\x00column" keys (identifier-folded):
 	// the child-table key columns SQLite's foreign-key enforcement reads while
 	// a write statement changes a parent this phase may write. Set only for an
@@ -97,6 +103,10 @@ const (
 	// (app_mcp_command_revoke.go). Deliberately after HookWrite and routed
 	// before the hook range check in authorize.
 	appMCPCommandMetadataRevoke
+	// Version attribution scope: names the actor on the versions an apply
+	// recorded (app_mcp_command_versions.go). Routed before the hook range
+	// check in authorize, like Revoke.
+	appMCPCommandMetadataVersionActor
 )
 
 // The read/write maps are built before publication and remain immutable after it.
@@ -114,6 +124,8 @@ func (g *appMCPCommandExecution) authorizerPolicy() appMCPCommandAuthorizerPolic
 		finalizing:          g.finalizing,
 		hookWrites:          g.hookWrites,
 		jobInsert:           g.jobInsert,
+
+		verifiedHistoryWrites: g.verifiedHistoryWrites,
 	}
 	g.policyMu.RUnlock()
 	return policy
@@ -127,13 +139,14 @@ func (g *appMCPCommandExecution) swapInternal(internal bool) bool {
 	return previous
 }
 
-func (g *appMCPCommandExecution) publishAuthorizerPolicy(internal bool, phase string, reads, writes, verifiedFTSWrites, foreignKeyScanReads map[string]bool) {
+func (g *appMCPCommandExecution) publishAuthorizerPolicy(internal bool, phase string, reads, writes, verifiedFTSWrites, verifiedHistoryWrites, foreignKeyScanReads map[string]bool) {
 	g.policyMu.Lock()
 	g.internal = internal
 	g.phase = phase
 	g.allowedReads = reads
 	g.allowedWrites = writes
 	g.verifiedFTSWrites = verifiedFTSWrites
+	g.verifiedHistoryWrites = verifiedHistoryWrites
 	g.foreignKeyScanReads = foreignKeyScanReads
 	g.policyMu.Unlock()
 }
@@ -146,6 +159,7 @@ func (g *appMCPCommandExecution) restoreAuthorizerPolicy(policy appMCPCommandAut
 	g.allowedWrites = policy.allowedWrites
 	g.verifiedFTSWrites = policy.verifiedFTSWrites
 	g.verifiedFTSPriming = policy.verifiedFTSPriming
+	g.verifiedHistoryWrites = policy.verifiedHistoryWrites
 	g.foreignKeyScanReads = policy.foreignKeyScanReads
 	g.metadataOp = policy.metadataOp
 	g.finalizing = policy.finalizing
@@ -161,6 +175,7 @@ func (g *appMCPCommandExecution) publishNativeMetadataPolicy(internal bool, op a
 	g.allowedReads = nil
 	g.allowedWrites = nil
 	g.verifiedFTSWrites = nil
+	g.verifiedHistoryWrites = nil
 	g.foreignKeyScanReads = nil
 	g.hookWrites = nil
 	g.jobInsert = false
@@ -178,10 +193,19 @@ func (g *appMCPCommandExecution) setJobInsert(on bool) {
 
 // publishHookWrites admits exactly the revision-enrolled tables for the active
 // hook-write scope; every other scope publishes none.
-func (g *appMCPCommandExecution) publishHookWrites(writes, verifiedFTSWrites map[string]bool) {
+func (g *appMCPCommandExecution) publishHookWrites(writes, verifiedFTSWrites, verifiedHistoryWrites map[string]bool) {
 	g.policyMu.Lock()
 	g.hookWrites = writes
 	g.verifiedFTSWrites = verifiedFTSWrites
+	g.verifiedHistoryWrites = verifiedHistoryWrites
+	g.policyMu.Unlock()
+}
+
+// publishHistoryWrites admits the verified history tables to the version
+// attribution scope, which publishes nothing else.
+func (g *appMCPCommandExecution) publishHistoryWrites(verifiedHistoryWrites map[string]bool) {
+	g.policyMu.Lock()
+	g.verifiedHistoryWrites = verifiedHistoryWrites
 	g.policyMu.Unlock()
 }
 
@@ -193,6 +217,7 @@ func (g *appMCPCommandExecution) beginFinalizingPolicy() {
 	g.allowedReads = nil
 	g.allowedWrites = nil
 	g.verifiedFTSWrites = nil
+	g.verifiedHistoryWrites = nil
 	g.foreignKeyScanReads = nil
 	g.metadataOp = 0
 	g.finalizing = false
@@ -205,6 +230,7 @@ func (g *appMCPCommandExecution) finishFinalizingPolicy() {
 	g.phase = ""
 	g.allowedReads = nil
 	g.allowedWrites = nil
+	g.verifiedHistoryWrites = nil
 	g.foreignKeyScanReads = nil
 	g.metadataOp = 0
 	g.finalizing = false
@@ -293,6 +319,9 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 	if policy.metadataOp == appMCPCommandMetadataRevoke {
 		return authorizeCommandRevoke(action, arg1, arg2, database)
 	}
+	if policy.metadataOp == appMCPCommandMetadataVersionActor {
+		return authorizeCommandVersionActor(policy, action, arg1, arg2, database)
+	}
 	if policy.metadataOp >= appMCPCommandMetadataSavepoint {
 		return authorizeCommandHook(policy, action, arg1, arg2, database)
 	}
@@ -304,6 +333,12 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 	}
 	if action == sqlite3.SQLITE_FUNCTION {
 		if commandPhaseSQLFunctionAllowed(policy.phase, arg2) {
+			return sqlite3.SQLITE_OK
+		}
+		// The generated history triggers of a versioned table this statement
+		// may write. Command SQL cannot call these by name
+		// (commandTriggerOnlyCall), so only a verified trigger reaches them.
+		if policy.phase == "apply" && !policy.internal && len(policy.verifiedHistoryWrites) != 0 && commandHistoryTriggerFunction(arg2) {
 			return sqlite3.SQLITE_OK
 		}
 		// Remembered so the failed statement is reported as a declaration that
@@ -336,6 +371,12 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 			return sqlite3.SQLITE_DENY
 		}
 		if policy.phase == "apply" && strings.EqualFold(database, "main") && policy.verifiedFTSWrites[sqliteIdentifierFold(arg1)] {
+			return sqlite3.SQLITE_OK
+		}
+		// A verified history trigger reads the row's newest version to number
+		// and date the next one. Authored SQL cannot name a history table: it
+		// is no app table, so it is in no declaration (validateSQLPhase).
+		if policy.phase == "apply" && strings.EqualFold(database, "main") && policy.verifiedHistoryWrites[sqliteIdentifierFold(arg1)] {
 			return sqlite3.SQLITE_OK
 		}
 		if strings.HasPrefix(strings.ToLower(arg1), "_benmore_") || strings.HasPrefix(strings.ToLower(arg1), "sqlite_") {
@@ -371,6 +412,11 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 		if strings.EqualFold(database, "main") && (policy.allowedWrites[sqliteIdentifierFold(arg1)] || policy.verifiedFTSWrites[sqliteIdentifierFold(arg1)] || commandVerifiedTriggerWrite(arg1)) {
 			return sqlite3.SQLITE_OK
 		}
+		// History is append-only here: a verified trigger inserts the replaced
+		// row, and nothing in an apply statement updates or deletes a version.
+		if action == sqlite3.SQLITE_INSERT && strings.EqualFold(database, "main") && policy.verifiedHistoryWrites[sqliteIdentifierFold(arg1)] {
+			return sqlite3.SQLITE_OK
+		}
 	}
 	if action == sqlite3.SQLITE_PRAGMA && strings.EqualFold(arg1, "data_version") && arg2 == "" {
 		return sqlite3.SQLITE_OK
@@ -398,6 +444,14 @@ func authorizeCommandNativeMetadata(op appMCPCommandMetadataOp, action int, arg1
 			return sqlite3.SQLITE_DENY
 		}
 		if op == appMCPCommandMetadataAudit && table == "sqlite_sequence" {
+			return sqlite3.SQLITE_OK
+		}
+		// On a `compliance: hipaa` app the audit insert runs the append-only
+		// triggers, whose overwrite guard looks the new row's id up in the
+		// audit log. Admit exactly what those triggers read, and only of the
+		// one table this scope inserts into: no other audit column, no
+		// read-audit row. UPDATE and DELETE of an audit row stay refused below.
+		if op == appMCPCommandMetadataAudit && table == "_benmore_audit_log" && auditAppendOnlyTriggerRead(arg1, arg2) {
 			return sqlite3.SQLITE_OK
 		}
 		switch table {
@@ -508,7 +562,7 @@ func (cap *appMCPCommandCapability) endFinalization() error {
 
 func (cap *appMCPCommandCapability) withNativeMetadata(op appMCPCommandMetadataOp, use func() error) (err error) {
 	if cap == nil || cap.guard == nil || cap.tx == nil || cap.conn == nil || use == nil ||
-		op < appMCPCommandMetadataRead || op > appMCPCommandMetadataRevoke || cap.guard.phaseActive {
+		op < appMCPCommandMetadataRead || op > appMCPCommandMetadataVersionActor || cap.guard.phaseActive {
 		return errors.New("native command metadata scope is invalid")
 	}
 	policy := cap.guard.authorizerPolicy()
@@ -518,13 +572,16 @@ func (cap *appMCPCommandCapability) withNativeMetadata(op appMCPCommandMetadataO
 	if err := cap.validateLifetime(); err != nil {
 		return err
 	}
-	var hookFTSWrites map[string]bool
+	var hookFTSWrites, historyWrites map[string]bool
 	if op == appMCPCommandMetadataHookWrite {
 		var err error
 		hookFTSWrites, err = appMCPCommandFullTextTriggerWrites(cap.generation, cap.effectTables())
 		if err != nil {
 			return fmt.Errorf("derive verified hook full-text trigger writes: %w", err)
 		}
+	}
+	if op == appMCPCommandMetadataHookWrite || op == appMCPCommandMetadataVersionActor {
+		historyWrites = commandTableSet(appMCPCommandHistoryTables(cap.generation, cap.effectTables()))
 	}
 	guard := cap.guard
 	previousPolicy := guard.authorizerPolicy()
@@ -558,7 +615,10 @@ func (cap *appMCPCommandCapability) withNativeMetadata(op appMCPCommandMetadataO
 		}
 		guard.publishNativeMetadataPolicy(false, op, false)
 		if op == appMCPCommandMetadataHookWrite {
-			guard.publishHookWrites(commandTableSet(cap.effectTables()), hookFTSWrites)
+			guard.publishHookWrites(commandTableSet(cap.effectTables()), hookFTSWrites, historyWrites)
+		}
+		if op == appMCPCommandMetadataVersionActor {
+			guard.publishHistoryWrites(historyWrites)
 		}
 		if scopeErr = cap.ctx.Err(); scopeErr != nil {
 			return scopeErr
@@ -652,8 +712,9 @@ func (cap *appMCPCommandCapability) enterPhase(phase string, reads, writes []str
 		return err
 	}
 	guard := cap.guard
-	var verifiedFTSWrites, foreignKeyScanReads map[string]bool
+	var verifiedFTSWrites, verifiedHistoryWrites, foreignKeyScanReads map[string]bool
 	if phase == "apply" && !readOnly {
+		verifiedHistoryWrites = commandTableSet(appMCPCommandHistoryTables(cap.generation, writes))
 		var err error
 		foreignKeyScanReads, err = cap.foreignKeyChildScanReads(writes)
 		if err != nil {
@@ -683,7 +744,7 @@ func (cap *appMCPCommandCapability) enterPhase(phase string, reads, writes []str
 			return err
 		}
 	}
-	guard.publishAuthorizerPolicy(false, phase, commandTableSet(reads), commandTableSet(writes), verifiedFTSWrites, foreignKeyScanReads)
+	guard.publishAuthorizerPolicy(false, phase, commandTableSet(reads), commandTableSet(writes), verifiedFTSWrites, verifiedHistoryWrites, foreignKeyScanReads)
 	guard.phaseActive = true
 	return nil
 }
@@ -703,7 +764,7 @@ func (cap *appMCPCommandCapability) leavePhase() {
 	if _, err := cap.tx.ExecContext(cleanupCtx, "PRAGMA query_only=ON"); err != nil {
 		guard.markConnectionUncertain(err)
 	}
-	guard.publishAuthorizerPolicy(false, "", nil, nil, nil, nil)
+	guard.publishAuthorizerPolicy(false, "", nil, nil, nil, nil, nil)
 	guard.phaseActive = false
 }
 

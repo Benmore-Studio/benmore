@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -41,6 +42,31 @@ func ownerOrTenantReplaced(session *Session, field, value string, groupKey bool)
 			return false // an admin's explicit tenant is honored
 		}
 		return session == nil || !session.EffectiveHasGroup() || value != session.EffectiveGroupID()
+	}
+	return false
+}
+
+// columnNamed reports whether cols holds a column of exactly this name, the
+// match X-Ignored-Fields uses.
+func columnNamed(cols []Column, name string) bool {
+	return slices.ContainsFunc(cols, func(c Column) bool { return c.Name == name })
+}
+
+// createTakesFileField reports whether a multipart create writes the stored
+// reference of the file part named field into the new row: field is a
+// column, and not one the create fills itself or never takes from a request
+// (the primary key, the owner and tenant keys, the other protected columns,
+// a workflow's state column).
+func createTakesFileField(app *App, table string, cols []Column, protected protectedFields, field string) bool {
+	for _, col := range cols {
+		if col.Name != field {
+			continue
+		}
+		if col.PK || protected.has(field) {
+			return false
+		}
+		// A nil value is refused exactly when field is a state column.
+		return !workflowCreateStateRefused(app, table, field, nil)
 	}
 	return false
 }
@@ -199,19 +225,36 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 			}
 		}
 	}()
+	// Protected fields - never accept from user input. The set covers the
+	// owner, tenant key, in-tenant role field and computed columns, and
+	// matches names case-insensitively (a column declared USER_ID is still
+	// the owner column to the scoping SQL).
+	protected := protectedCreateFields(app, table)
+	isGroupKey := func(name string) bool { return app.Group != nil && identIs(name, app.Group.Key) }
+
+	// unusedFiles are the file parts the create does not store: their field
+	// is no column of the table (X-Ignored-Fields) or a column a create
+	// never takes from the request (X-Stripped-Fields).
+	var unusedFiles []string
 	if r.MultipartForm != nil {
 		for fieldName, fileHeaders := range r.MultipartForm.File {
 			if len(fileHeaders) > 0 {
+				// A file part is stored only when its reference goes into
+				// the row. Every part used to be stored, so a part named
+				// for no column (a typo in the input's name), or for a
+				// column the create fills itself, left its bytes in storage
+				// with nothing pointing at them.
+				if !createTakesFileField(app, table, cols, protected, fieldName) {
+					unusedFiles = append(unusedFiles, fieldName)
+					continue
+				}
 				// Save the uploaded file
 				path, dest, err := handleFileUploadAt(app, r, fieldName, table, 0, nil)
 				if dest != "" {
 					storedUploads = append(storedUploads, dest)
 				}
 				if err != nil {
-					if respondMediaAllowance(w, err) {
-						return
-					}
-					httpError(w, err.Error(), http.StatusBadRequest)
+					writeUploadRefusal(w, err)
 					return
 				}
 				if path != "" {
@@ -250,13 +293,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		return
 	}
 
-	// Protected fields - never accept from user input. The set covers the
-	// owner, tenant key, in-tenant role field and computed columns, and
-	// matches names case-insensitively (a column declared USER_ID is still
-	// the owner column to the scoping SQL).
-	protected := protectedCreateFields(app, table)
-	isGroupKey := func(name string) bool { return app.Group != nil && identIs(name, app.Group.Key) }
-
 	// Surface stripped fields via response header. When a client (or
 	// agent) submits a protected field, the framework silently swaps
 	// the value out for the session-derived one. With no signal back,
@@ -273,14 +309,22 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 			stripped = append(stripped, k)
 		}
 	}
+	// A file part that was not stored is named like a text field the
+	// create did not use: stripped when its field is a column, ignored
+	// (below) when it is none.
+	for _, name := range unusedFiles {
+		if columnNamed(cols, name) && !slices.Contains(stripped, name) {
+			stripped = append(stripped, name)
+		}
+	}
 	if len(stripped) > 0 {
 		w.Header().Set("X-Stripped-Fields", strings.Join(stripped, ","))
 	}
-	formFields := make([]string, 0, len(r.Form))
+	formFields := make([]string, 0, len(r.Form)+len(unusedFiles))
 	for k := range r.Form {
 		formFields = append(formFields, k)
 	}
-	setIgnoredFieldsHeader(w, r, formFields, cols)
+	setIgnoredFieldsHeader(w, r, append(formFields, unusedFiles...), cols)
 
 	// submitted: the columns written from the request itself, for the
 	// before-hooks' {{_submitted}} (not the framework-filled user_id and
@@ -516,6 +560,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 			return
 		}
 		if respondStorageFull(w, app, err) || respondDatabaseBusy(w, err) {
+			return
+		}
+		// A missing parent the visibility check above does not cover (a
+		// parent table with no row scope, an admin's write) answers as a
+		// forbidden one does.
+		if writeFKTargetDenial(w, foreignKeyConstraintDenial(tx, app, table, submittedValues, err)) {
 			return
 		}
 		httpError(w, "Insert failed: "+publicConstraintMessage(app, "insert "+table, err), http.StatusBadRequest)

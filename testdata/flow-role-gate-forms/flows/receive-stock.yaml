@@ -1,0 +1,15 @@
+# flows/receive-stock.yaml - the form that does NOT work: the whole text is
+# read as one role name nobody holds, so only a global admin passes. The write
+# is accepted with a warning that says so.
+on:
+  request:
+    method: POST
+    path: /api/receive-stock
+    role: "warehouse,manager"
+jobs:
+  receive:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO stock_moves (sku, kind, moved_by) VALUES (:sku, 'receive', :user_id)" }
+      - run: respond
+        with: { status: 201, json: { received: true } }

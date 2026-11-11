@@ -138,6 +138,31 @@ func (s *Session) IsAdminConsole() bool {
 	return s != nil && s.IsAdmin() && accountManagementSession(s)
 }
 
+// adminConsoleSession resolves the caller of an admin-only management
+// endpoint and answers the two refusals in order: a request with no valid
+// credential (signed out, an expired or idle-ended session, a revoked token)
+// is unauthenticated, 401 `authentication required`, as on every other route;
+// a signed-in caller who is not an admin console (IsAdminConsole) is
+// forbidden, 403 with forbidden as its error ("admin required" when empty).
+// Returns nil after answering. These endpoints used to answer the 403 to
+// both, which told a signed-out client it lacked a role instead of telling it
+// to sign in.
+func adminConsoleSession(w http.ResponseWriter, r *http.Request, app *App, forbidden string) *Session {
+	session := getSession(app, r)
+	if session == nil {
+		httpError(w, "authentication required", http.StatusUnauthorized)
+		return nil
+	}
+	if !session.IsAdminConsole() {
+		if forbidden == "" {
+			forbidden = "admin required"
+		}
+		httpError(w, forbidden, http.StatusForbidden)
+		return nil
+	}
+	return session
+}
+
 // accountManagementSession reports whether session may manage the account
 // itself: profile edits, sessions, API tokens, MFA, password. A scoped
 // credential (an API token or Bearer session narrowed to, say, notes:read)

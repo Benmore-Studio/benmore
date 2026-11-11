@@ -1,0 +1,5 @@
+# "These columns are set by the server": refuse any update that submits them.
+before_update:
+  requests:
+    - sql: "SELECT 'escalation_count and submitted_at are set by the server' AS error"
+      when: "instr(_submitted, ',escalation_count,') > 0 OR instr(_submitted, ',submitted_at,') > 0"

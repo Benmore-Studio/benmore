@@ -1,0 +1,16 @@
+# flows/spend-report.yaml - a tenant role other than admin gates a flow by name.
+on:
+  request:
+    method: POST
+    path: /api/reports/spend
+    role: finance
+jobs:
+  report:
+    steps:
+      - id: n
+        run: sql
+        with:
+          query: "SELECT COUNT(*) AS entries FROM activity WHERE org_id = :org"
+          params: { org: "${{ user.group_id || 0 }}" }
+      - run: respond
+        with: { status: 200, json: { entries: "${{ steps.n.outputs.entries }}" } }

@@ -11,6 +11,7 @@
     "failure_report",
     "summary",
     "test_keys",
+    "test_variables",
     "test_file_load",
     "commands",
     "profiles",

@@ -1,0 +1,27 @@
+import bm from 'bm';
+
+// One options object for the key and the read: the same arguments give the same key.
+const opts = { where: { team_id: teamId }, order_by: [{ col: 'position', dir: 'asc' }], limit: 200 };
+const key = bm.query.tableKey('cards', opts);
+
+// Called at once (data is undefined before the first read), when a read of
+// the key starts (pending: true) and when it settles.
+const stop = bm.query.subscribe(key, ({ data, error }) => {
+  if (error) return renderError(error);
+  if (data) renderCards(data);   // rows of the first read and of every refetch
+});
+
+// First read. A change to `cards`, from this session or another, refetches
+// the key in the background and the subscriber renders the new rows.
+await bm.query.table('cards', opts);
+
+// After your own write, refetch without waiting for the change event.
+await bm.table('cards').create({ title, team_id: teamId });
+bm.query.invalidate(key, { refetch: true });
+
+// On unmount.
+stop();
+
+// With bm.query.read, name the key yourself and subscribe to it.
+bm.query.subscribe('cards-by-status', ({ data }) => { if (data) renderSummary(data); });
+await bm.query.read({ table: 'cards', group_by: ['status'], aggregates: [{ fn: 'count', as: 'n' }] }, { key: 'cards-by-status' });

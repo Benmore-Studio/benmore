@@ -1,5 +1,5 @@
 [
   "Frontmatter (a YAML block fenced by `---` lines at the top of the file) or a `<page ...>` tag. Keys: title, description, image, robots (SEO); auth, role, require (gates); scope (`owner` adds the viewer's user_id filter to the page's queries); layout; type (login, signup, forgot-password, reset-password, verify-otp, verify-mfa, settings: auth page discovery); redirect (`admin:/admin,*:/home`, by role). Frontmatter adds engine (mustache, gotmpl or raw), queries and sources. When both spell a key, the tag wins.",
-  "`auth` other than none/public/false/no/off requires sign-in; gate details, `role=` and `require=` are in api({at:'frontend'}) ssr_page_gates.",
+  "`auth` other than none/public/false/no/off requires sign-in; gate details, `role=` and `require=` are in api({at:'frontend'}) ssr_page_gates. A scoped API token passes the gates as its account, and its scopes do not narrow the page's queries (same key).",
   "`engine: raw` serves the body as is: no template pass, no query tags; the runtime adds the CSRF meta tag and the `_csrf` field of POST forms."
 ]

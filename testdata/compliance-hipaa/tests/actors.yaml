@@ -1,0 +1,50 @@
+# Two accounts in one test. Every `users:` account (and the `as_user` one) has
+# its session token saved as <local part>_token, so a step acts as it with
+# `set_auth`. Under compliance: hipaa that is the only way: the token exchange
+# asks for an MFA code, and the factor a test account is given is not known to
+# the test.
+second_account_reads_only_its_own_notes:
+  as_user: "ann@actors.test"
+  users:
+    - "ben@actors.test"
+  setup:
+    # The users exist before setup runs: a seed row can belong to one.
+    - sql: "INSERT INTO notes (title, user_id) VALUES ('bens-seed', (SELECT id FROM _benmore_users WHERE email = 'ben@actors.test'))"
+  steps:
+    - api: "POST /api/notes"
+      json: {title: "anns-private-note"}
+      save: {ann_note: id, ann_title: title}
+      expect: {status: 200}
+    - get: "/api/notes"
+      expect:
+        status: 200
+        contains: "{{ann_title}}"
+        not_contains: "bens-seed"
+    - set_auth: "ben_token"
+    - get: "/api/notes"
+      expect:
+        status: 200
+        json_length: 1
+        contains: "bens-seed"
+        not_contains: "{{ann_title}}"
+    - get: "/api/notes/{{ann_note}}"
+      expect: {status: 404}
+    - api: "DELETE /api/notes/{{ann_note}}"
+      expect: {status: 404}
+    - set_auth: "{{ann_token}}"
+    - get: "/api/notes/{{ann_note}}"
+      expect:
+        status: 200
+        json: {id: "{{ann_note}}", title: "{{ann_title}}"}
+
+token_exchange_needs_a_code_no_test_has:
+  as_user: "cat@actors.test"
+  users:
+    - "dan@actors.test"
+  steps:
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: {email: "dan@actors.test", password: "testpass123"}
+      expect:
+        status_in: [401, 403]
+        not_contains: '"token"'

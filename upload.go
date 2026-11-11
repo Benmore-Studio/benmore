@@ -748,6 +748,12 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 	contentType, disposition := uploadContentMeta(ext, mimeType, safeName)
 
 	backend := storageBackendForApp(app)
+	// The platform's media store refuses some keys by their extension.
+	// Refuse those here, before the ownership row is written and the store
+	// is asked, with a message the client can act on.
+	if err := platformMediaTypeRefusal(backend, destPath); err != nil {
+		return "", "", err
+	}
 	// Record ownership before storing private bytes. A failed DB write must
 	// not leave a new file looking like an unowned legacy upload. If storage
 	// fails later, retain this harmless reservation: a remote failure may
@@ -760,13 +766,13 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 		if ms, ok := backend.(metaSaver); ok {
 			url, err = ms.SaveWithMeta(destPath, file, contentType, disposition)
 			if err != nil {
-				return "", destPath, fmt.Errorf("save upload: %w", err)
+				return "", destPath, uploadSaveError(backend, destPath, err)
 			}
 			return url, destPath, nil
 		}
 		url, err = backend.Save(destPath, file)
 		if err != nil {
-			return "", destPath, fmt.Errorf("save upload: %w", err)
+			return "", destPath, uploadSaveError(backend, destPath, err)
 		}
 		return url, destPath, nil
 	}
@@ -782,6 +788,109 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 		return "", destPath, fmt.Errorf("write upload: %w", err)
 	}
 	return "/" + destPath, destPath, nil
+}
+
+// errUploadNeedsExtension refuses a file with no filename extension where
+// the platform's media store holds the app's uploads.
+var errUploadNeedsExtension = errors.New("file type not allowed: the file name has no extension, and on the hosted platform an upload needs one (for example .pdf or .txt); send the file under a name that has an extension")
+
+// platformMediaTypeRefusal applies the platform media store's own file-type
+// rule (brokerObjectMeta) in the app process, for an upload that would go
+// to that store. The store decides an object's served type from the key's
+// extension alone, so it refuses a key with none, and the active types. The
+// app used to send such an upload anyway and hand the store's refusal to the
+// client as "save upload: save upload: presign broker: file type not
+// allowed", after writing the ownership row. Other backends (local disk, the
+// app's own bucket, a process that holds the media key itself) have no such
+// rule and keep accepting a file with no extension.
+func platformMediaTypeRefusal(backend StorageBackend, destPath string) error {
+	cdn, ok := backend.(*CDNStorage)
+	if !ok {
+		return nil
+	}
+	if _, viaBroker := cdn.brokerSocket(); !viaBroker {
+		return nil
+	}
+	if _, _, err := brokerObjectMeta(filepath.ToSlash(destPath)); err != nil {
+		ext := strings.TrimPrefix(filepath.Ext(destPath), ".")
+		if ext == "" {
+			return errUploadNeedsExtension
+		}
+		return fmt.Errorf("file type not allowed: .%s", ext)
+	}
+	return nil
+}
+
+// errUploadStoreFault is what a client is told when the platform's media
+// store did not take an upload for a reason that is not the client's.
+var errUploadStoreFault = errors.New("save upload: the media store did not accept the file; try again, and see the app's log if it keeps failing")
+
+// uploadSaveError is the error of an upload whose bytes the backend did not
+// store. A fault of the platform's media store is logged and answered in
+// general terms: its text names the platform's own components, never
+// something the client can change. The account's media allowance, and the
+// errors of local disk or the app's own bucket, pass through.
+func uploadSaveError(backend StorageBackend, destPath string, err error) error {
+	var allowance *mediaAllowanceError
+	if _, platform := backend.(*CDNStorage); !platform || errors.As(err, &allowance) {
+		return fmt.Errorf("save upload: %w", err)
+	}
+	log.Printf("upload %s: media store: %v", destPath, err)
+	return errUploadStoreFault
+}
+
+// Names of the upload refusals in refusal_docs.go.
+const (
+	refusalUploadFileSize = "upload_file_too_large" // 413, one file over the per-file cap
+	refusalUploadFileType = "upload_file_type"      // 415, a refused type or extension
+)
+
+// uploadRefusalStatus is the status of an upload handleFileUploadAt refused,
+// the same on every path that stores a client's file (POST /api/_upload,
+// POST /api/_files, a multipart create): 413 for a file over the per-file
+// cap, 415 for a refused type or extension, 400 otherwise.
+func uploadRefusalStatus(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "too large"):
+		return http.StatusRequestEntityTooLarge
+	case strings.Contains(msg, "not allowed"):
+		return http.StatusUnsupportedMediaType
+	}
+	return http.StatusBadRequest
+}
+
+// writeUploadRefusal answers an upload handleFileUploadAt refused. The three
+// paths each mapped the error themselves, and only POST /api/_upload
+// answered the documented 415 and 413; the multipart create and POST
+// /api/_files answered 400 for the same file.
+func writeUploadRefusal(w http.ResponseWriter, err error) {
+	// The owner account's media allowance on the hosted platform: 507 with
+	// the usage and the way out, like the database limit.
+	if respondMediaAllowance(w, err) {
+		return
+	}
+	switch status := uploadRefusalStatus(err); status {
+	case http.StatusRequestEntityTooLarge:
+		httpRefusal(w, err.Error(), status, refusalUploadFileSize)
+	case http.StatusUnsupportedMediaType:
+		httpRefusal(w, err.Error(), status, refusalUploadFileType)
+	default:
+		httpError(w, err.Error(), status)
+	}
+}
+
+// writeUploadsOff answers a request to an upload route while the app has
+// features.uploads: false: the route's 404, as JSON like every other
+// /api/* miss, with the code a multipart create's refusal carries, so page
+// code can tell "uploads are switched off" from a wrong path. The body is
+// never read.
+func writeUploadsOff(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	httpJSON(w, http.StatusNotFound, withRefusalDocs(map[string]any{
+		"error":   uploadsDisabledCode,
+		"message": errUploadsDisabled.Error(),
+	}, uploadsDisabledCode))
 }
 
 // discardStoredUpload removes the bytes a refused request left behind, then
@@ -824,21 +933,21 @@ func generateShortID() string {
 //	_csrf      (required for cookie auth) framework's CSRF token.
 //	           Bearer-auth requests are exempt.
 //
-// Returns JSON:
+// Returns JSON (the generated bm.d.ts types bm.upload's answer from this;
+// TestUploadTypeMatchesTheAnswer keeps the two the same):
 //
-//	{ "path": "/uploads/<kind>/<id>.<ext>",
-//	  "url":  "<absolute or signed url>",
-//	  "size": <bytes>,
-//	  "mime": "<detected mime>",
-//	  "filename": "<original filename>" }
+//	{ "path": "<the stored reference: /uploads/<kind>/<id>.<ext>, or a media CDN URL>",
+//	  "url":  "<the same reference>",
+//	  "filename": "<original filename>",
+//	  "size": <bytes> }
 //
 // 200 on success, 401 if anonymous + auth required, 403 on CSRF mismatch,
-// 413 (Payload Too Large) when the file exceeds the per-app cap,
-// 415 (Unsupported Media Type) when the MIME-type sniff rejects it.
+// 413 (Payload Too Large) when the file exceeds the per-file cap,
+// 415 (Unsupported Media Type) for a refused type or extension.
 func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_upload", func(w http.ResponseWriter, r *http.Request) {
 		if !app.FeatureEnabled("uploads") {
-			http.NotFound(w, r)
+			writeUploadsOff(w)
 			return
 		}
 		// Auth: require a session when the app has auth: configured.
@@ -880,20 +989,7 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 		// Returns the stored path/URL.
 		savedURL, err := HandleFileUpload(app, r, "file", kind, 0, nil)
 		if err != nil {
-			// The owner account's media allowance on the hosted platform:
-			// 507 with the usage and the way out, like the database limit.
-			if respondMediaAllowance(w, err) {
-				return
-			}
-			msg := err.Error()
-			status := http.StatusBadRequest
-			switch {
-			case strings.Contains(msg, "too large"):
-				status = http.StatusRequestEntityTooLarge
-			case strings.Contains(msg, "not allowed"):
-				status = http.StatusUnsupportedMediaType
-			}
-			httpJSON(w, status, map[string]any{"error": msg})
+			writeUploadRefusal(w, err)
 			return
 		}
 		if savedURL == "" {

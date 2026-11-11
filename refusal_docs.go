@@ -200,6 +200,7 @@ var gateRuleDocs = map[gateRule]docsRule{
 		{"on.request.secret", "verify.built_in_recipes"},
 		{"verify must be", "verify.built_in_recipes"},
 		{"on.request.auth", "flows.public_flows"},
+		{"on.request.role", "flows.role_gate"},
 		{"on.request.mode", "async-flows.yaml_example"},
 		{"flows.yaml: rate_limit", "flows.gotchas_request_input"},
 		{"on.schedule", "flows.trigger_schedule"},
@@ -218,7 +219,6 @@ var gateRuleDocs = map[gateRule]docsRule{
 		{"revoke_user_sessions", "connector.connector_commands"},
 		{"run: extract_text", "pdf.extract_text_flow"},
 		{"`run: parse`", "parse.with_shape"},
-		{"can't run in a `transaction: true` flow", "flows.transactional_sends"},
 		{"inside a `run: parallel` block", "flows.parallel"},
 		{"with.attachments", "flows.email_attachments"},
 		{"unsubscribe", "flows.email_headers"},
@@ -259,6 +259,8 @@ var gateRuleDocs = map[gateRule]docsRule{
 	gateAppYAML: {At: "recovery.configuration_loading", When: []docsWhen{
 		{"[unknown-app-yaml-key]", "recovery.configuration_loading"},
 		{"-auth-key]", "auth.app_yaml_flags"},
+		{"compliance: hipaa", "compliance.controls"},
+		{"app.yaml: compliance", "compliance.controls"},
 		{"[unknown-csp-key]", "csp.gotchas"},
 		{"app.yaml: access.", "access.modes"},
 		{"app.yaml: ws_rooms", "websocket.room_authorization"},
@@ -363,12 +365,27 @@ var checkSourceDocs = map[string]docsRule{
 	"syntax":     {At: "cron.contract"}, // cron.yaml naming a flow a write removed (cronFlowRefFindingsAfterWrite)
 	"tests":      {At: "verification.test_file_load"},
 	"cross_file": {At: "schema.config_references", When: []docsWhen{{"app.yaml: access.", "access.modes"}}},
-	"config":     {At: "frontend.site_identity"}, // an app.yaml key that is accepted and has no effect
+	// An app.yaml key or value that is accepted and has no effect
+	// (app_yaml_no_effect.go, app_yaml_unread.go).
+	"config": {At: "frontend.site_identity", When: []docsWhen{
+		{"is not a key the framework reads", "recovery.configuration_loading"},
+		{"is not a value the framework knows", "ssr.appearance"},
+		{"takes text", "recovery.configuration_loading"},
+		// A switch or an enumeration written in a value that is not read
+		// the way it is written (app_yaml_switch_values.go).
+		{"`recording.", "frontend.ssr_session_recording"},
+		{"`features.", "recovery.configuration_loading"},
+		{"`oauth.", "oauth.configuration_notes"},
+		{"`auth.identifier", "auth.app_yaml_flags"},
+	}},
 	"flows": {At: "flows.checked_values", When: []docsWhen{
+		{"on.request.role", "flows.role_gate"},
+		{"sends at once and is not undone", "flows.transactional_sends"},
 		{"write-transaction limit", "flows.time_limits"},
 		{"is `mode: async` but has a respond", "async-flows.hint"},
 		{"redirects to a templated", "flows.redirect"},
 		{"shadows the request field", "flows.step_named_request_fields"},
+		{"`run: respond` has no `with:`", "flows.step_types"},
 	}},
 	"edge_status":  {At: "flows.edge_error_status"},
 	"step_outputs": {At: "flows.step_output_refs"},
@@ -381,6 +398,7 @@ var checkSourceDocs = map[string]docsRule{
 		{"auth.require_mfa_for_roles", "mfa.config"},
 		{"in unmask roles", "encryption.owner_alias"},
 		{"join WebSocket rooms", "websocket.room_authorization"},
+		{"app.yaml: ws_rooms", "websocket.room_authorization"},
 		{"unique constraint", "scoping.tenant_unique_constraints"},
 		{"is the groups membership table", "scoping.tenant_unique_constraints"},
 		{"member-of membership table", "access.member_of"},
@@ -392,6 +410,9 @@ var checkSourceDocs = map[string]docsRule{
 	"mcp_connector": {At: "connector.command_encryption_key", When: []docsWhen{
 		{"revision ledger row missing", "connector.revision_trigger_order"},
 		{"removes", "connector.destructive_schema"},
+	}},
+	"compliance": {At: "audit.flow_writes", When: []docsWhen{
+		{"responds with whole rows of step", "encryption.flow_results"},
 	}},
 	"retention":          {At: "retention.keys"},
 	"pwa":                {At: "mobile.pwa"},
@@ -480,10 +501,13 @@ var refusalDocs = map[string]docsRule{
 	refusalRecordLocked:      {At: "locks.conflict"},
 	refusalBodyTooLarge:      {At: "flows.request_body"},
 	refusalUploadTooLarge:    {At: "uploads.size_limits"},
+	refusalUploadFileSize:    {At: "uploads.size_limits"},
+	refusalUploadFileType:    {At: "uploads.gotchas", When: []docsWhen{{"has no extension", "uploads.size_limits"}}},
+	refusalMultipartUpdate:   {At: "uploads.multipart_bodies"},
 	refusalValidatorRule:     {At: "schema.cross_field_validators"},
 	refusalForeignKey:        {At: "scoping.foreign_keys"},
 	refusalTenantRequired:    {At: "scoping.tenant_bootstrap"},
-	refusalNoFields:          {At: "scoping.how", When: []docsWhen{{"changes only through a transition", "workflows.transition_writes"}}},
+	refusalNoFields:          {At: "scoping.how", When: []docsWhen{{"changes only through a transition", "workflows.transition_writes"}, {"the admin panel never writes", "auth.admin_panel_accounts"}}},
 	"field_owned_by_command": {At: "scoping.command_owned_fields"},
 	uploadsDisabledCode:      {At: "uploads.feature_gate"},
 	"storage_limit":          {At: "recovery.storage_limit"},
@@ -506,11 +530,18 @@ var refusalDocs = map[string]docsRule{
 	emailVerificationRequiredCode: {At: "auth.account_state_signin"},
 	"email_unverified":            {At: "scoping.email_keyed_grants"},
 	"api_token_limit":             {At: "auth.credential_limits"},
+	// The admin panel's write routes on a table it only shows.
+	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}}},
+	// The admin panel's edit of another admin's sign-in identifier.
+	adminIdentifierProtectedCode: {At: "auth.admin_panel_accounts"},
 	// Other built-in routes.
 	"report_source_limit_exceeded": {At: "query.report_sources"},
 	"language_not_found":           {At: "i18n.endpoint"},
 	"encryption_key_not_durable":   {At: "encryption.secret_durability"},
+	"invalid_expires_in":           {At: "signed-urls.lifetime"},
 	refusalPromoteUpgrade:          {At: "environments.publishing"},
+	// A command aimed at the production of an app that has none.
+	"no_production_instance": {At: "environments.no_production_instance"},
 	// POST /platform/billing/plan: the first thing the refusal names as over.
 	refusalPlanChangeUse: {At: "environments.publishing", When: []docsWhen{
 		{"published where", "environments.publishing"},

@@ -397,6 +397,18 @@ type SyncReport struct {
 	// (SourceManifest.FailedMigrations). Not drift: the instance removes
 	// them once its schema migrates.
 	FailedMigrations []string `json:"failed_migrations,omitempty"`
+	// KeptLocal are workspace files neither deploy nor pull exchanges
+	// (workspaceKeptLocal): hidden directories outside static/ and
+	// editor/agent auto-run config. Not drift, and not on the server through
+	// deploy; listed so nobody reads their absence from Files either way.
+	KeptLocal []string `json:"kept_local,omitempty"`
+	// ServerKept are the instance's files of the same kind (serverKeptFiles):
+	// held by the server, never pulled. Not drift either.
+	ServerKept []string `json:"server_kept,omitempty"`
+	// UnsentSources are the KeptLocal files an MCP review digest covers that
+	// the server lacks or holds with other content (unsentReviewSources).
+	// Delivering a reviewed mcp.yaml is blocked on them.
+	UnsentSources []string `json:"unsent_sources,omitempty"`
 }
 
 func DiffSourceManifests(base SourceManifest, hasBase bool, local SourceManifest, remote SourceManifest) SyncReport {

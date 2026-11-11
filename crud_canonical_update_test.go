@@ -31,6 +31,9 @@ func canonicalUpdateFixture(t *testing.T) (*App, string, int64) {
 		mustExec(t, app.DB, statement)
 	}
 	refreshTableColumns(t, app, "notes", "activities")
+	// A real tenant-a member: notes now carries the tenant key, and a caller
+	// with no tenant owns only rows that carry none.
+	mustExec(t, app.DB, `INSERT INTO members (id, org_id, email) VALUES (1, 'tenant-a', 'canonical@example.com')`)
 	sid := createCrudScopeSession(t, app, "canonical@example.com", "user", "tenant-a", "")
 	session := GetSessionFromDB(app.DB, sid)
 	if session == nil {

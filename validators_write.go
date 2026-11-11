@@ -455,6 +455,10 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 			// Write gate and `benmore check` only: the loader never
 			// refuses a file over a `when:` (warnWhenConditions logs).
 			add(gateWhen, msg)
+		} else if msg := hooksFrameworkDDLViolation(content); msg != "" {
+			// Write gate and `benmore check` only: the runtime refuses the
+			// statement when the hook runs (app_sql_guard.go).
+			add(gateHooks, msg)
 		}
 
 	case base == "mcp.yaml":
@@ -1103,6 +1107,11 @@ func validateFlowsYAML(content string) string {
 	// Probe into the GHA-shaped struct. The file is well-formed GHA when
 	// `on:` and `jobs:` are TOP-LEVEL keys (not nested under a flow
 	// name). Anything else gets a specific, fixable error.
+	// A role list would fail the typed decode below with the decoder's own
+	// words (validators_flow_role_gate.go).
+	if msg := flowRoleListViolation(probe); msg != "" {
+		return msg
+	}
 	var ghaFile FlowFileGHA
 	if err := yamlUnmarshal([]byte(content), &ghaFile); err != nil {
 		return fmt.Sprintf("flows.yaml: invalid typed declaration: %v", err)
@@ -1436,7 +1445,7 @@ func commandWritePath(appDir, filePath string) (string, error) {
 	rel = filepath.ToSlash(rel)
 	parts := strings.Split(rel, "/")
 	if len(parts) != 2 || parts[0] != "flows" || strings.ToLower(filepath.Ext(rel)) != ".yaml" {
-		return "", fmt.Errorf("command declarations must be written to flows/<safe-name>.yaml")
+		return "", fmt.Errorf("a command declaration must be written to flows/<name>.yaml (directly in flows/, extension .yaml): %s", commandFileNameRule)
 	}
 	return rel, nil
 }

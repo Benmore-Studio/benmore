@@ -1,0 +1,57 @@
+# Each test writes rows under its own label and counts only those: the tests
+# of this file share one database and run in any order.
+
+a_flow_that_ends_on_a_status_answers_it_and_commits_once:
+  as_user: "ann@respond.test"
+  steps:
+    - api: "POST /api/archive-entry"
+      json: { label: "ARCHIVE-1" }
+      expect:
+        status: 204
+        not_contains:
+          - "flow_no_response"
+          - "error"
+    - sql: "SELECT id FROM entries WHERE label = 'ARCHIVE-1' AND kind = 'archived' AND user_id = {{user_id}}"
+      expect: { rows: 1 }
+
+a_refusal_written_as_a_status_stops_the_run:
+  as_user: "ben@respond.test"
+  steps:
+    - api: "POST /api/save-entry"
+      json: { label: "SAVE-1" }
+      expect:
+        status: 403
+        not_contains:
+          - "saved"
+          - "error"
+    - sql: "SELECT id FROM entries WHERE label = 'SAVE-1'"
+      expect: { rows: 0 }
+    - api: "POST /api/save-entry"
+      json: { label: "SAVE-1", confirm: "yes" }
+      expect:
+        status: 201
+        json: { saved: true }
+    - sql: "SELECT id FROM entries WHERE label = 'SAVE-1' AND kind = 'saved'"
+      expect: { rows: 1 }
+
+a_taken_status_inside_a_transaction_commits_what_came_before_it:
+  as_user: "cat@respond.test"
+  steps:
+    - api: "POST /api/claim-entry"
+      json: { label: "CLAIM-1" }
+      expect:
+        status: 201
+        not_contains: "error"
+    - sql: "SELECT id FROM entries WHERE label = 'CLAIM-1' AND kind = 'claimed'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM entries WHERE label = 'CLAIM-1' AND kind = 'attempt'"
+      expect: { rows: 1 }
+    - api: "POST /api/claim-entry"
+      json: { label: "CLAIM-1" }
+      expect:
+        status: 409
+        not_contains: "error"
+    - sql: "SELECT id FROM entries WHERE label = 'CLAIM-1' AND kind = 'claimed'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM entries WHERE label = 'CLAIM-1' AND kind = 'attempt'"
+      expect: { rows: 2 }

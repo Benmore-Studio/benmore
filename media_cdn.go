@@ -287,16 +287,24 @@ func (c *CDNStorage) SaveWithMeta(path string, data io.Reader, contentType, disp
 	// the router only) and are firewalled off IMDS, so they upload through the
 	// presign broker. The router / dev / off-platform (which DO have a static
 	// key or reachable IMDS) sign directly. See presign_broker.go.
-	if c.s3.Key == "" {
-		if sock := presignBrokerSocketPath(); brokerSocketReachable(sock) {
-			return c.saveViaBroker(sock, path, data, contentType, disposition)
-		}
+	if sock, ok := c.brokerSocket(); ok {
+		return c.saveViaBroker(sock, path, data, contentType, disposition)
 	}
 	key := c.cdnKeyFor(path)
 	if _, err := c.s3.SaveWithMeta(key, data, contentType, disposition); err != nil {
 		return "", err
 	}
 	return "https://" + c.CDNDomain + "/" + key, nil
+}
+
+// brokerSocket is the router's broker socket when this process stores
+// through it: it holds no media key of its own and the socket is there.
+func (c *CDNStorage) brokerSocket() (sock string, ok bool) {
+	if c.s3.Key != "" {
+		return "", false
+	}
+	sock = presignBrokerSocketPath()
+	return sock, brokerSocketReachable(sock)
 }
 
 func (c *CDNStorage) Delete(path string) error {

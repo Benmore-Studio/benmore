@@ -1,0 +1,14 @@
+# flows/recount-stock.yaml - queued by request-recount.yaml. A queued job has
+# no caller, so the gate does not apply to it; it stops direct calls.
+on:
+  request:
+    method: POST
+    path: /api/internal/recount-stock
+    role: admin                     # the queue runs it; only a global admin may call it directly
+jobs:
+  recount:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO stock_moves (sku, kind, moved_by) VALUES (:sku, 'recount', :requested_by)" }
+      - run: respond
+        with: { status: 200, json: { recounted: true } }

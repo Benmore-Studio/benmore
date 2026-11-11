@@ -24,8 +24,10 @@ const (
 // Developer configures which tables are read-audited via read_audit: in app.yaml.
 // Writes are batched to avoid a DB insert on every API read.
 
-// EnsureReadAuditTable creates the read audit log table. client_ip was added
-// later (an additive column; rows from before it hold NULL).
+// EnsureReadAuditTable creates the read audit log table. client_ip and the
+// impersonator columns were added later (additive columns; rows from before
+// them hold NULL, and 0 / ” for the impersonator). ADD COLUMN neither fires
+// nor drops the append-only triggers of a compliance: hipaa app.
 func EnsureReadAuditTable(db *sql.DB) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_read_audit (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,9 +40,23 @@ func EnsureReadAuditTable(db *sql.DB) {
 	)`)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_read_audit_table ON _benmore_read_audit(table_name, created_at DESC)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_read_audit_user ON _benmore_read_audit(user_id, created_at DESC)")
-	if cols, err := GetTableColumns(db, "_benmore_read_audit"); err == nil && !hasColumnInList(cols, "client_ip") {
-		if _, err := db.Exec(`ALTER TABLE _benmore_read_audit ADD COLUMN client_ip TEXT`); err != nil {
-			log.Printf("READ AUDIT: add client_ip column: %v", err)
+	cols, err := GetTableColumns(db, "_benmore_read_audit")
+	if err != nil {
+		return
+	}
+	// The admin behind a support-impersonation session, as on
+	// _benmore_audit_log: user_id/user_email stay the impersonated account
+	// (whose records were read); these name who read them.
+	for _, add := range []struct{ name, ddl string }{
+		{"client_ip", "client_ip TEXT"},
+		{"impersonator_user_id", "impersonator_user_id INTEGER DEFAULT 0"},
+		{"impersonator_email", "impersonator_email TEXT DEFAULT ''"},
+	} {
+		if hasColumnInList(cols, add.name) {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE _benmore_read_audit ADD COLUMN ` + add.ddl); err != nil {
+			log.Printf("READ AUDIT: add %s column: %v", add.name, err)
 		}
 	}
 }
@@ -60,9 +76,13 @@ type readAuditEntry struct {
 	UserID    int64  // 0 for an anonymous or system read
 	Email     string // the reader's address, "anonymous" or "system:<query type>"
 	IP        string // client address of the HTTP request, empty without one
+	// The admin behind a support-impersonation session; zero / empty for
+	// every other reader (Session.ImpersonatorUserID).
+	ImpersonatorID    int64
+	ImpersonatorEmail string
 }
 
-const readAuditInsertSQL = "INSERT INTO _benmore_read_audit (table_name, row_id, query_type, user_id, user_email, client_ip) VALUES (?, ?, ?, ?, ?, ?)"
+const readAuditInsertSQL = "INSERT INTO _benmore_read_audit (table_name, row_id, query_type, user_id, user_email, client_ip, impersonator_user_id, impersonator_email) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 
 // InitReadAudit starts the read audit buffer with periodic flush.
 // Pass syncMode=true to write each read immediately rather than buffer it.
@@ -152,6 +172,9 @@ func readAuditEvent(app *App, r *http.Request, table, rowID, queryType string, s
 	switch {
 	case session != nil:
 		entry.UserID, entry.Email = session.UserID, session.Email
+		// A support session reads as the impersonated user; the row also
+		// names the admin who read, like a mutation's audit row.
+		entry.ImpersonatorID, entry.ImpersonatorEmail = session.ImpersonatorUserID, session.ImpersonatorEmail
 	case r != nil:
 		entry.Email = "anonymous"
 	default:
@@ -270,7 +293,7 @@ func (rab *readAuditBuffer) write(pending []readAuditEntry) error {
 	}
 	defer stmt.Close()
 	for _, e := range pending {
-		if _, err := stmt.Exec(e.Table, e.RowID, e.QueryType, e.UserID, e.Email, e.IP); err != nil {
+		if _, err := stmt.Exec(e.Table, e.RowID, e.QueryType, e.UserID, e.Email, e.IP, e.ImpersonatorID, e.ImpersonatorEmail); err != nil {
 			return err
 		}
 	}
@@ -421,11 +444,12 @@ func RegisterReadAuditAPI(mux appRouteRegistrar, app *App) {
 		userID := r.URL.Query().Get("user_id")
 		rowID := r.URL.Query().Get("row_id")
 
-		query := "SELECT table_name, row_id, query_type, user_id, user_email, client_ip, created_at FROM _benmore_read_audit WHERE 1=1"
+		query := "SELECT table_name, row_id, query_type, user_id, user_email, client_ip, COALESCE(impersonator_user_id, 0) AS impersonator_user_id, COALESCE(impersonator_email, '') AS impersonator_email, created_at FROM _benmore_read_audit WHERE 1=1"
 		var args []any
 
 		// Non-admin users can only see their own read history
-		if !session.IsAdminConsole() {
+		ownHistory := !session.IsAdminConsole()
+		if ownHistory {
 			query += " AND user_id = ?"
 			args = append(args, session.UserID)
 			// Ignore user_id filter param for non-admins (forced to own)
@@ -452,6 +476,16 @@ func RegisterReadAuditAPI(mux appRouteRegistrar, app *App) {
 		if err != nil {
 			serverErrorJSON(w, r, app, "_read_audit", err, "query failed")
 			return
+		}
+		if ownHistory {
+			// An account sees which of its events were support reads
+			// (impersonator_user_id), not the admin's address or client
+			// address: its session list hides the support session the same way.
+			for _, row := range rows {
+				if toInt64(row["impersonator_user_id"]) != 0 {
+					row["impersonator_email"], row["client_ip"] = "", nil
+				}
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")

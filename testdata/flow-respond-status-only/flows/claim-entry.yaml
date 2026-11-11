@@ -1,0 +1,25 @@
+# flows/claim-entry.yaml - in a transaction: the attempt is recorded, a taken
+# 409 is an answer (it commits the attempt and nothing after it), and the
+# success answer is a status alone too.
+on:
+  request:
+    method: POST
+    path: /api/claim-entry
+    auth: required
+    transaction: true
+jobs:
+  claim:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO entries (label, kind, user_id) VALUES (:label, 'attempt', :user_id)" }
+      - id: taken
+        run: sql
+        with: { query: "SELECT id FROM entries WHERE label = :label AND kind = 'claimed'" }
+      - if: ${{ steps.taken.outputs.rows }}
+        steps:
+          - run: respond
+            with: { status: 409 }
+      - run: sql
+        with: { query: "INSERT INTO entries (label, kind, user_id) VALUES (:label, 'claimed', :user_id)" }
+      - run: respond
+        with: { status: 201 }

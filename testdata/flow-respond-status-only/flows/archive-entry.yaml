@@ -1,0 +1,14 @@
+# flows/archive-entry.yaml - a transactional flow that ends on a status alone.
+on:
+  request:
+    method: POST
+    path: /api/archive-entry
+    auth: required
+    transaction: true
+jobs:
+  archive:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO entries (label, kind, user_id) VALUES (:label, 'archived', :user_id)" }
+      - run: respond
+        with: { status: 204 }

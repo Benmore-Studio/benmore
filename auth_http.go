@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -99,9 +100,14 @@ func authCSRFRefused(w http.ResponseWriter, r *http.Request, path string) {
 // the auth handlers so bm.api.post('/signup', {...}) (which sends
 // JSON) behaves identically to a native <form method="POST"> submit.
 // No-ops when Content-Type isn't JSON. Body is capped at 1MB.
+//
+// The media type itself must be application/json. A substring match also
+// read `text/plain; x=application/json` as JSON, a type a cross-site page may
+// send without a CORS preflight; the CSRF checks behind every caller refuse
+// such a post anyway, but its body is not a JSON request and is not read as
+// one.
 func mergeJSONBodyIntoForm(r *http.Request) {
-	ct := strings.ToLower(r.Header.Get("Content-Type"))
-	if !strings.Contains(ct, "application/json") {
+	if media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || media != "application/json" {
 		return
 	}
 	if r.Body == nil {

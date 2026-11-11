@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -399,6 +400,215 @@ func isRenameAlreadyApplied(q sqlQuerier, stmt string, err error) bool {
 	return false
 }
 
+// migrationStatementAlreadyApplied reports whether a migration statement that
+// failed with err has nothing left to do on this database, and names the case
+// for the log line. The user-migration runner and the reuse of a pending file
+// for a schema.prisma change (prisma_migrate_adopt.go) share it, so a file
+// meets the same tolerance on every path that runs it.
+func migrationStatementAlreadyApplied(q sqlQuerier, stmt string, err error) (string, bool) {
+	switch {
+	case isBenignMigrationError(err):
+		return "already-applied statement", true
+	case isRenameAlreadyApplied(q, stmt, err):
+		// A fresh DB gets the TARGET column/table straight from the schema
+		// sync, so the rename's source is missing but the end state is
+		// already correct (e.g. `RENAME COLUMN role TO solar_role` in a user
+		// migration on a DB born with solar_role).
+		return "already-applied rename", true
+	case isDropAlreadyApplied(q, stmt, err):
+		return migrationSkippedAsDrop, true
+	}
+	return "", false
+}
+
+// migrationSkippedAsDrop is migrationStatementAlreadyApplied's name for a
+// drop whose target the database does not hold.
+const migrationSkippedAsDrop = "a drop of what this database does not hold"
+
+// migrationSkippedDrop is a drop statement of a migration file that was
+// skipped because the database does not hold what it names. Skipping is right
+// for a database built after the column left the schema, and it is also what
+// happens to a drop whose name is misspelt, which used to fail loudly: so
+// every run that can answer someone (the write's dry run, a promote's and a
+// restore's) hands these back as warnings.
+type migrationSkippedDrop struct {
+	File    string `json:"file"`
+	Kind    string `json:"kind"`    // column, table or index
+	Missing string `json:"missing"` // table.column, table or index name
+}
+
+// warning is the line a builder reads.
+func (d migrationSkippedDrop) warning() string {
+	return fmt.Sprintf("migrations/%s: this drop names `%s`, which this database does not have, so the statement is skipped (the file still counts as applied). If the name is misspelt, the %s it was meant to drop is still there.", d.File, d.Missing, d.Kind)
+}
+
+// migrationSkipLog collects the skipped drops of one run. File is the file
+// whose statements are running.
+type migrationSkipLog struct {
+	File  string
+	drops []migrationSkippedDrop
+}
+
+type migrationSkipLogKey struct{}
+
+// withMigrationSkipLog returns a context whose migration statements record
+// the drops they skip.
+func withMigrationSkipLog(ctx context.Context) (context.Context, *migrationSkipLog) {
+	l := &migrationSkipLog{}
+	return context.WithValue(ctx, migrationSkipLogKey{}, l), l
+}
+
+// noteMigrationSkip records stmt, skipped as what, in ctx's log when it has
+// one and the skip is a drop. A statement a run executes twice is one entry.
+func noteMigrationSkip(ctx context.Context, file, stmt, what string) {
+	l, _ := ctx.Value(migrationSkipLogKey{}).(*migrationSkipLog)
+	drop, ok := parseMigrationPureDrop(stmt)
+	if l == nil || what != migrationSkippedAsDrop || !ok || len(l.drops) >= migrationSkippedDropMax {
+		return
+	}
+	if file == "" {
+		file = l.File
+	}
+	d := migrationSkippedDrop{File: file, Kind: "table", Missing: drop.table}
+	switch {
+	case drop.index != "":
+		d.Kind, d.Missing = "index", drop.index
+	case drop.column != "":
+		d.Kind, d.Missing = "column", drop.table+"."+drop.column
+	}
+	for _, have := range l.drops {
+		if have == d {
+			return
+		}
+	}
+	l.drops = append(l.drops, d)
+}
+
+// migrationSkippedDropMax bounds the skipped drops one run reports.
+const migrationSkippedDropMax = 20
+
+// migrationPureDrop is a statement that is exactly one drop in the main
+// schema and nothing else: of a column (table and column), a table (table) or
+// an index (index).
+type migrationPureDrop struct {
+	table, column, index string
+}
+
+// parseMigrationPureDrop reads stmt as `ALTER TABLE t DROP [COLUMN] c`,
+// `DROP TABLE t` or `DROP INDEX i`, with the shared SQLite lexer (comments,
+// quoting and a `main.` qualifier read as SQLite reads them). Any other
+// statement, a name in another schema, a second statement or a trailing token
+// is not one. `IF EXISTS` forms are left out: they cannot fail for a missing
+// target.
+func parseMigrationPureDrop(stmt string) (migrationPureDrop, bool) {
+	statements := sqlTokenStatements(sqlTokenize(stmt))
+	if len(statements) != 1 {
+		return migrationPureDrop{}, false
+	}
+	toks, i := statements[0], 0
+	kw := func(word string) bool {
+		if i < len(toks) && toks[i].kind == sqlTokWord && strings.EqualFold(toks[i].text, word) {
+			i++
+			return true
+		}
+		return false
+	}
+	// name reads [main .] name; "" for none or a name in another schema.
+	name := func() string {
+		if i+2 < len(toks) && toks[i+1].kind == sqlTokPunct && toks[i+1].text == "." {
+			if toks[i].kind == sqlTokPunct || !strings.EqualFold(toks[i].text, "main") {
+				return ""
+			}
+			i += 2
+		}
+		if i >= len(toks) || toks[i].kind == sqlTokPunct {
+			return ""
+		}
+		i++
+		return toks[i-1].text
+	}
+	var drop migrationPureDrop
+	switch {
+	case kw("DROP"):
+		switch {
+		case kw("TABLE"):
+			drop.table = name()
+		case kw("INDEX"):
+			drop.index = name()
+		}
+	case kw("ALTER"):
+		if !kw("TABLE") {
+			return migrationPureDrop{}, false
+		}
+		drop.table = name()
+		if drop.table == "" || !kw("DROP") {
+			return migrationPureDrop{}, false
+		}
+		// COLUMN is optional, and a column may itself be named column.
+		if i+1 < len(toks) {
+			kw("COLUMN")
+		}
+		if drop.column = name(); drop.column == "" {
+			return migrationPureDrop{}, false
+		}
+	}
+	if i != len(toks) || (drop.table == "" && drop.index == "") {
+		return migrationPureDrop{}, false
+	}
+	return drop, true
+}
+
+// isDropAlreadyApplied reports whether a failed drop names something this
+// database does not hold, so the statement has nothing to do here. A database
+// built from the current schema never had the column a removed field left
+// behind elsewhere, and the file that drops it (`ALTER TABLE t DROP COLUMN
+// c;`, the recipe a push prints) failed there with `no such column`; SQLite
+// has no DROP COLUMN IF EXISTS to write instead. The same holds for a table
+// or index the schema no longer creates. Deliberately narrow: the statement
+// is exactly one drop, SQLite's error is the missing-target one, and the
+// absence is read from the live schema through q, never from the error text
+// alone (dropping a column a trigger still reads also says "no such column").
+// A check that cannot be made counts as "not applied": the file fails.
+func isDropAlreadyApplied(q sqlQuerier, stmt string, err error) bool {
+	if err == nil {
+		return false
+	}
+	drop, ok := parseMigrationPureDrop(stmt)
+	if !ok {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if drop.index != "" {
+		held, qerr := migrationSchemaHolds(q, `SELECT 1 FROM main.sqlite_master WHERE type = 'index' AND name = ? COLLATE NOCASE`, drop.index)
+		return qerr == nil && !held && strings.Contains(msg, "no such index")
+	}
+	tableHeld, qerr := migrationSchemaHolds(q, `SELECT 1 FROM main.sqlite_master WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE`, drop.table)
+	if qerr != nil {
+		return false
+	}
+	if !tableHeld {
+		// The table is gone, and any column of it with it.
+		return strings.Contains(msg, "no such table")
+	}
+	if drop.column == "" {
+		return false
+	}
+	// table_xinfo also lists generated columns, which table_info leaves out.
+	columnHeld, qerr := migrationSchemaHolds(q, `SELECT 1 FROM pragma_table_xinfo(?, 'main') WHERE name = ? COLLATE NOCASE`, drop.table, drop.column)
+	return qerr == nil && !columnHeld && strings.Contains(msg, "no such column")
+}
+
+// migrationSchemaHolds reports whether query returns a row.
+func migrationSchemaHolds(q sqlQuerier, query string, args ...any) (bool, error) {
+	rows, err := q.Query(query, args...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	held := rows.Next()
+	return held, rows.Err()
+}
+
 func RunMigrationFile(db *sql.DB, path, name, recordSQL string) error {
 	return runMigrationFileCtx(context.Background(), db, path, name, recordSQL)
 }
@@ -472,6 +682,9 @@ func (e *migrationStatementError) Unwrap() error { return e.err }
 // agree on which statements run and which failures are tolerated.
 func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) error {
 	upSQL, _ := extractMigrationSection(string(data))
+	// Decided once, before anything in the file runs
+	// (migration_framework_guard.go).
+	hipaa := migrationUnderHIPAA(ctx, tx)
 	for _, stmt := range splitStatements(upSQL) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
@@ -486,7 +699,11 @@ func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) erro
 		if err := dropFrameworkIndexesForStatement(tx, stmt); err != nil { // scoping_indexes.go
 			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
 		}
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, appMigrationSQL(hipaa, stmt)); err != nil {
+			var refused *appSQLRefusedError
+			if errors.As(err, &refused) {
+				return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
+			}
 			// Idempotency: if the desired change is ALREADY present (the column /
 			// table / index was created by an earlier schema sync or a prior
 			// partial run), skip the statement instead of failing the file. A
@@ -495,19 +712,11 @@ func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) erro
 			// boot - emitting `migration warning: ... duplicate column name: X`
 			// in perpetuity. SQLite leaves the transaction usable after these
 			// schema-level errors, so the remaining statements still apply.
-			if isBenignMigrationError(err) {
-				log.Printf("  migration: skipping already-applied statement (%v)", err)
-				continue
-			}
-			// Same idempotency for RENAMEs: a fresh DB gets the TARGET
-			// column/table straight from the schema sync, so the rename's
-			// source is missing but the end state is already correct
-			// (e.g. `RENAME COLUMN role TO solar_role` in a user migration
-			// on a DB born with solar_role). Without this the file rolled back,
-			// never recorded, and warned on every boot. Checked against the
-			// tx so it sees renames from earlier statements in this file.
-			if isRenameAlreadyApplied(tx, stmt, err) {
-				log.Printf("  migration: skipping already-applied rename (%v)", err)
+			// Checked against the tx so it sees what earlier statements in
+			// this file did.
+			if what, ok := migrationStatementAlreadyApplied(tx, stmt, err); ok {
+				log.Printf("  migration: skipping %s: %s (%v)", what, truncate(stmt, 80), err)
+				noteMigrationSkip(ctx, "", stmt, what)
 				continue
 			}
 			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
@@ -533,6 +742,7 @@ func runMigrationsCtx(ctx context.Context, db *sql.DB, dir string, beforeApply f
 	return runMigrationsCtxFromSources(ctx, db, dir, beforeApply, nil)
 }
 func runMigrationsCtxFromSources(ctx context.Context, db *sql.DB, dir string, beforeApply func() error, captured map[string][]byte) error {
+	ctx = withMigrationAppDir(ctx, dir, readFileInRoot)
 	names, err := migrationSourceNames(dir, captured)
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)

@@ -148,6 +148,8 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	mustExec(t, app.DB, `INSERT INTO _benmore_jobs(flow_name,payload,status) VALUES('mine-pending','{"user_id":1,"email":"owner@example.com"}','pending'),('mine-complete','{"user_id":"1","email":"owner@example.com"}','complete'),('theirs','{"user_id":2,"email":"victim@example.com"}','pending')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_audit_log(action,table_name,row_id,user_id,user_email,old_values,new_values) VALUES('update','_benmore_users','1',1,'owner@example.com','{"email":"owner@example.com"}','{"email":"new@example.com"}')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_read_audit(table_name,query_type,user_id,user_email,client_ip) VALUES('docs','read',1,'owner@example.com','203.0.113.9')`)
+	// A read the account made of another user's rows through a support session.
+	mustExec(t, app.DB, `INSERT INTO _benmore_read_audit(table_name,query_type,user_id,user_email,client_ip,impersonator_user_id,impersonator_email) VALUES('docs','read',2,'victim@example.com','203.0.113.9',1,'owner@example.com')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_subscriptions(user_id,status) VALUES(1,'active')`)
 
 	flow := &Flow{
@@ -212,6 +214,7 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_audit_log WHERE action='update' AND user_id=1 AND user_email='' AND old_values IS NULL AND new_values IS NULL", 1)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_audit_log WHERE action='account_purge' AND row_id='1'", 1)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_read_audit WHERE user_id=1 AND user_email='' AND client_ip IS NULL", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_read_audit WHERE user_id=2 AND user_email='victim@example.com' AND impersonator_user_id=1 AND impersonator_email='' AND client_ip IS NULL", 1)
 
 	// The released identifier may create a genuinely new account, but it must
 	// never reconnect that identity to the retained tombstone/history.

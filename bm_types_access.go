@@ -122,7 +122,7 @@ func flowListedFor(f Flow, session *Session) bool {
 		return false
 	}
 	if f.Role != "" {
-		return session != nil && HasAnyRole(session, []string{f.Role})
+		return flowRoleAllowed(session, f.Role)
 	}
 	if f.Auth == "required" {
 		return session != nil

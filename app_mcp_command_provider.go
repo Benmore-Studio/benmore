@@ -412,6 +412,10 @@ func (cap *appMCPCommandCapability) apply(prepared *appMCPCommandPrepared) (map[
 	if err := appMCPCommandEffectsSupported(cap); err != nil {
 		return nil, nil, err
 	}
+	versionMarks, err := cap.versionMarks()
+	if err != nil {
+		return nil, nil, err
+	}
 	var result map[string]any
 	err = cap.withFullSourceVerificationPhase(func() error {
 		var phaseErr error
@@ -423,6 +427,11 @@ func (cap *appMCPCommandCapability) apply(prepared *appMCPCommandPrepared) (map[
 	}
 	if len(result) != 1 || result["ok"] != true {
 		return nil, nil, appMCPResultFailure("incomplete_result")
+	}
+	// The versions the apply recorded name the approving user, in this
+	// transaction (app_mcp_command_versions.go).
+	if err := appMCPCommandAttributeVersions(cap, versionMarks); err != nil {
+		return nil, nil, err
 	}
 	var readback map[string]any
 	err = cap.withFullSourceVerificationPhase(func() error {

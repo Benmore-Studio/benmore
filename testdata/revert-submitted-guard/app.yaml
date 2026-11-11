@@ -1,0 +1,7 @@
+# Purchase requests whose escalation columns are written by the server only
+# (hooks.yaml), on a versioned table: a revert is refused only when it would
+# change one of them.
+site_name: "Revert with server-set columns"
+auth:
+  identifier: email
+versioned: [requests]

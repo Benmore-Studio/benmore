@@ -257,6 +257,21 @@ advance(120000);
 	roomWant(t, vm, `sockets[0].discarded`, `[]`)
 }
 
+// An app may send a table subscribe on the room's socket (room.raw). The
+// server answers unknown table names with {type:'error', tables, body}, which
+// says nothing about the room: the room stays open and reports no bm:error.
+func TestBMRoomIgnoresTableSubscribeErrorFrame(t *testing.T) {
+	vm := bmRoomVM(t)
+	roomRun(t, vm, `
+var r = track(room('channel-7'));
+sockets[0].accept();
+sockets[0].recv({ type: 'error', tables: ['notez'], body: 'subscribe: unknown table notez' });
+advance(1000);
+`)
+	roomWant(t, vm, `{state: r.state, errors: errors(), sockets: sockets.length, closed: sockets[0].closeCodes}`,
+		`{"state":"open","errors":[],"sockets":1,"closed":[]}`)
+}
+
 // A handshake the server refuses with 401 (signed out) or 403 (cross-origin)
 // cannot succeed by retrying. Browsers hide the status from the WebSocket, so
 // the room asks /ws once; a 401/403 ends the room with a bm:error and the

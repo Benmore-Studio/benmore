@@ -17,6 +17,7 @@
     "summary",
     "media",
     "remove_production",
+    "no_production_instance",
     "model",
     "commands",
     "pin_notice",

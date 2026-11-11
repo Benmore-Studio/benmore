@@ -1,0 +1,99 @@
+an_approver_cannot_decide_their_own_request:
+  as_user: "ann@decisions.test"
+  as_role: "approver"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7001, 'Anns laptop', 90000, 'submitted', {{user_id}})"
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7002, 'Someone elses desk', 40000, 'submitted', 99999)"
+  steps:
+    # Her own request: no move is offered, and the route refuses both.
+    - get: "/api/requests/7001/transitions"
+      expect:
+        status: 200
+        json: { current: submitted }
+        contains: '"transitions":[]'
+    - api: "POST /api/requests/7001/transition"
+      json: { to: "approved" }
+      expect: { status: 422, contains: "condition not met" }
+    - api: "POST /api/requests/7001/transition"
+      json: { to: "returned" }
+      expect: { status: 422, contains: "condition not met" }
+    - sql: "SELECT id FROM requests WHERE id = 7001 AND status = 'submitted'"
+      expect: { rows: 1 }
+    # Another requester's: both moves are offered and one is made.
+    - get: "/api/requests/7002/transitions"
+      expect:
+        status: 200
+        contains:
+          - '"to":"approved"'
+          - '"to":"returned"'
+    - api: "POST /api/requests/7002/transition"
+      json: { to: "approved" }
+      expect:
+        status: 200
+        json: { from: submitted, to: approved }
+    - sql: "SELECT id FROM requests WHERE id = 7002 AND status = 'approved'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'requests' AND action = 'transition' AND row_id = '7002' AND user_id = {{user_id}}"
+      expect: { rows: 1 }
+
+only_the_requester_takes_a_returned_request_back_to_draft:
+  as_user: "bob@decisions.test"
+  as_role: "approver"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7003, 'Not bobs', 20000, 'returned', 99999)"
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7004, 'Bobs chair', 20000, 'returned', {{user_id}})"
+  steps:
+    # An approver reads every request, but this move is the requester's.
+    - get: "/api/requests/7003/transitions"
+      expect:
+        status: 200
+        json: { current: returned }
+        contains: '"transitions":[]'
+    - api: "POST /api/requests/7003/transition"
+      json: { to: "draft" }
+      expect: { status: 422, contains: "condition not met" }
+    - sql: "SELECT id FROM requests WHERE id = 7003 AND status = 'returned'"
+      expect: { rows: 1 }
+    - get: "/api/requests/7004/transitions"
+      expect:
+        status: 200
+        contains: '"to":"draft"'
+    - api: "POST /api/requests/7004/transition"
+      json: { to: "draft" }
+      expect:
+        status: 200
+        json: { from: returned, to: draft }
+    - sql: "SELECT id FROM requests WHERE id = 7004 AND status = 'draft'"
+      expect: { rows: 1 }
+
+a_transition_hook_reads_the_state_it_leaves:
+  as_user: "cat@decisions.test"
+  as_role: "approver"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7005, 'Monitor', 30000, 'approved', 99999)"
+    - sql: "INSERT INTO requests (id, title, amount_cents, po_number, status, user_id) VALUES (7006, 'Server rack', 900000, 'PO-2', 'approved', 99999)"
+  steps:
+    # The before_update guard keys on old_status = 'approved'.
+    - api: "POST /api/requests/7005/transition"
+      json: { to: "ordered" }
+      expect: { status: 422, contains: "an ordered request needs a purchase order number" }
+    - sql: "SELECT id FROM requests WHERE id = 7005 AND status = 'approved'"
+      expect: { rows: 1 }
+    # An edit is not that move: the guard leaves it alone.
+    - api: "PATCH /api/requests/7005"
+      json: { po_number: "PO-1" }
+      expect: { status: 200 }
+    - api: "POST /api/requests/7005/transition"
+      json: { to: "ordered" }
+      expect:
+        status: 200
+        json: { from: approved, to: ordered }
+    # A move whose condition is not met is not offered.
+    - get: "/api/requests/7006/transitions"
+      expect:
+        status: 200
+        json: { current: approved }
+        contains: '"transitions":[]'
+    - api: "POST /api/requests/7006/transition"
+      json: { to: "ordered" }
+      expect: { status: 422, contains: "condition not met" }

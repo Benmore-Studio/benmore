@@ -1,6 +1,6 @@
 [
   "Tenant isolation is server-enforced regardless of act-as state - non-admin users have no bypass. Tenants are safe whether platform staff use act-as or not.",
-  "Starting step-in (POST) is admin-only - non-admins get 403 `admin required`. GET (state) and DELETE (step out) answer any signed-in session.",
+  "Starting step-in (POST) is admin-only - non-admins get 403 `admin required`, a request with no valid credential 401 `authentication required`. GET (state) and DELETE (step out) answer any signed-in session.",
   "Step-in belongs to an admin: if the account stops being one (the role column changes and it holds no global admin grant), its sessions stop using a step-in they still carry and answer in the account's own tenant again, while still counting as stepped-in for the direct-sign-in gates until DELETE /api/_auth/act_as clears it.",
   "POST requires the admin's password as re-authentication. A stolen session cookie alone CANNOT start step-in; the attacker would also need the admin's password. Same pattern as /api/_auth/impersonate. Wrong-password attempts are logged.",
   "Every step-in and step-out writes an audit row with action=`act_as_start`/`act_as_end`, `user_email` (the admin's), and `target_group_id` / `prior_group_id` in `new_values`. Query `_benmore_audit_log` for the governance trail.",

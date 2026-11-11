@@ -96,7 +96,10 @@ func RegisterSSERoutes(mux appRouteRegistrar, app *App) {
 		if needsAuth && !reloadAllowedAnonymous && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
-				http.Error(w, "authentication required", http.StatusUnauthorized)
+				// A held account gets its documented 403, never a stream.
+				if !accountHoldRefusal(w, r, app) {
+					http.Error(w, "authentication required", http.StatusUnauthorized)
+				}
 				return
 			}
 			client.userID = session.UserID

@@ -74,9 +74,8 @@ func RegisterCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	// List custom fields for a table
 	mux.HandleFunc("GET /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 
@@ -150,9 +149,8 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 
 	// Add a custom field to a table
 	mux.HandleFunc("POST /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 
@@ -321,9 +319,8 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 
 	// Remove a custom field from a table
 	mux.HandleFunc("DELETE /api/_schema/{table}/fields/{name}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 

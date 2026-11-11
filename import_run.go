@@ -212,13 +212,35 @@ func validateImportColumns(db *sql.DB, table string, app *App, want []string) er
 	for _, name := range want {
 		norm := normalizeImportHeaderName(name)
 		if !allowed[norm] {
-			bad = append(bad, name)
+			bad = append(bad, name+" ("+importColumnRefusal(db, table, app, norm, allowed)+")")
 		}
 	}
 	if len(bad) > 0 {
-		return fmt.Errorf("column(s) %s are not importable (unknown, the primary key, or protected against mass assignment) - remove them from the file or the declared columns list", strings.Join(bad, ", "))
+		return fmt.Errorf("column(s) not importable: %s - remove them from the file or the declared columns list", strings.Join(bad, ", "))
 	}
 	return nil
+}
+
+// importColumnRefusal says why one declared column is not importable. One
+// reason ("unknown, the primary key, or protected against mass assignment")
+// covered a misspelt column, `id`, `user_id` and a workflow's state column,
+// which a builder fixes in four different ways.
+func importColumnRefusal(db *sql.DB, table string, app *App, name string, importable map[string]bool) string {
+	cols, _ := GetTableColumns(db, table)
+	at := slices.IndexFunc(cols, func(c Column) bool { return identIs(c.Name, name) })
+	switch {
+	case at < 0:
+		return "no such column in " + table
+	case cols[at].PK:
+		return "the primary key: the database assigns it"
+	case identIs(name, "user_id"):
+		return "the owner column: the import fills it, see import.owner"
+	case app != nil && slices.ContainsFunc(workflowProtectedFields(app, table), func(f string) bool { return identIs(f, name) }):
+		return "a workflow's state column: every imported row starts in the workflow's initial state, see import.workflow_state"
+	case importable[cols[at].Name]:
+		return "the table spells it " + cols[at].Name
+	}
+	return "set by the framework, never from a file"
 }
 
 // startImport launches a load in a dedicated goroutine.

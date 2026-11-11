@@ -29,7 +29,7 @@ import (
 
 // docsUsageLines is the entry for `benmore docs` in the usage text.
 const docsUsageLines = `  benmore docs [<guide>|<topic>[.<key>]|index] [--full] [--reference] [--search "<words>"]
-                                    Guides (build, harness, connector, changes) and the reference api(at:) answers, read offline:
+                                    Guides (build, harness, connector, changes, deploy) and the reference api(at:) answers, read offline:
                                     <topic> a topic (a large one as an index of its keys), <topic>.<key> one key, index every
                                     topic, --full a whole large topic, --search the keys that best match, --reference the
                                     topic when its name is also a guide
@@ -146,6 +146,12 @@ func docsPlan(req docsRequest) (source docsSource, guide string) {
 	return docsFromNowhere, ""
 }
 
+// docsNearestNames lists the guides and reference topics whose names are
+// closest to one that is neither (a typo such as `enviroments`).
+func docsNearestNames(name string) []string {
+	return apiNearestKeys(strings.ToLower(strings.TrimSpace(name)), append(AgentDocsTopics(), apiRecipeTopics()...))
+}
+
 // docsIsGuide reports whether name is a bundled guide's own name.
 func docsIsGuide(name string) bool {
 	for _, guide := range AgentDocsTopics() {
@@ -217,7 +223,11 @@ func docsRun(args []string, stdout, stderr io.Writer) (code int, guide string) {
 		}
 		return 0, guide
 	case docsFromNowhere:
-		fmt.Fprintf(stderr, "Unknown topic: %q\n\n", req.Name)
+		fmt.Fprintf(stderr, "Unknown topic: %q\n", req.Name)
+		if near := docsNearestNames(req.Name); len(near) > 0 {
+			fmt.Fprintf(stderr, "Did you mean: benmore docs %s\n", strings.Join(near, ", benmore docs "))
+		}
+		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Guides:")
 		fmt.Fprint(stderr, AgentDocsCatalog())
 		fmt.Fprintln(stderr)

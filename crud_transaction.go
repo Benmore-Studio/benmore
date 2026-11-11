@@ -206,7 +206,15 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			}
 			oldRows[i], err = txAuthorizedRow(tx, app, op.Table, valueText(op.ID), session, action)
 			if err != nil {
-				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not found or not authorized"})
+				// The answer PATCH and DELETE give for a row that is missing
+				// or outside the caller's scope.
+				if errors.Is(err, errUpdateTarget) {
+					httpJSON(w, http.StatusNotFound, map[string]any{"error": errUpdateTarget.Error()})
+					return
+				}
+				if !respondDatabaseBusy(w, err) {
+					serverErrorJSON(w, r, app, "_transaction "+op.Action+" "+op.Table, err, "transaction failed")
+				}
 				return
 			}
 		}
@@ -282,8 +290,9 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 				if respondStorageFull(w, app, err) {
 					return
 				}
-				status, msg := http.StatusBadRequest, errUpdateTarget.Error()
+				status, msg := http.StatusNotFound, errUpdateTarget.Error()
 				if !errors.Is(err, errUpdateTarget) {
+					status = http.StatusBadRequest
 					_, msg = mutationErrorResponse(app, "transaction delete "+op.Table, err)
 				}
 				if _, denied := err.(*membershipManageError); denied {
@@ -565,6 +574,10 @@ func txInsertWithPlan(tx *sql.Tx, app *App, table string, data map[string]any, s
 
 	var id any
 	if err := tx.QueryRow(sqlStr+" RETURNING id", values...).Scan(&id); err != nil {
+		// A missing parent the visibility check above does not cover.
+		if fkErr := foreignKeyConstraintDenial(tx, app, table, submittedValues, err); fkErr != nil {
+			return nil, fkErr
+		}
 		return nil, err
 	}
 	if rule := memberOfFor(app, table, OpRead); rule != nil && session != nil && memberOfAutoJoins(app, table, rule) {
@@ -584,6 +597,9 @@ type updateRequestError struct {
 	status  int
 	message string
 	cause   error
+	// code: a stable refusal code. The answer is then {error: code, message,
+	// docs} rather than the sentence alone.
+	code string
 	// noopEcho: everything submitted was an unchanged echo (a command-owned
 	// column's stored value, or the mask the caller reads for an encrypted
 	// column), so a single-row PATCH answers 200 with nothing written.
@@ -609,6 +625,10 @@ func writeUpdateRequestError(w http.ResponseWriter, r *http.Request, app *App, w
 			cause = errors.New(e.message)
 		}
 		serverErrorJSONBody(w, r, app, e.status, where, cause, map[string]any{"error": e.message})
+		return
+	}
+	if e.code != "" {
+		httpJSON(w, e.status, withRefusalDocs(map[string]any{"error": e.code, "message": e.message}, e.code))
 		return
 	}
 	httpJSON(w, e.status, map[string]any{"error": e.message})
@@ -725,6 +745,12 @@ func applyCanonicalUpdateTxContextMode(ctx context.Context, tx *sql.Tx, app *App
 		return ""
 	}); d != nil {
 		return nil, nil, nil, &memberOfUpdateError{denial: d}
+	}
+	// An edit of a _benmore_users row that changes a sign-in identifier is
+	// refused for another admin's account and otherwise ends the account's
+	// credentials first, in this transaction (user_identifier_update.go).
+	if err := userIdentifierUpdate(tx, q, app, actor, table, id, values); err != nil {
+		return nil, nil, nil, err
 	}
 	// An edit of a _benmore_users row (the admin panel writes deactivated_at
 	// and verified) may not end the standing of the app's last usable durable
@@ -950,6 +976,11 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 		// boundary; internal faults may contain constraint-looking text.
 		var sqliteErr sqlite3.Error
 		if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint {
+			// A re-point to a missing parent the visibility check above does
+			// not cover answers as one to a forbidden parent does.
+			if fkErr := foreignKeyConstraintDenial(tx, app, table, parents, err); fkErr != nil {
+				return &updateRequestError{status: http.StatusUnprocessableEntity, message: fkErr.Error(), cause: err}
+			}
 			return &updateRequestError{status: http.StatusBadRequest, message: publicConstraintMessage(app, "update "+table, err), cause: err}
 		}
 		return updateInternalError(err)

@@ -1,0 +1,17 @@
+site_name: "hipaa flow checks fixture"
+compliance: hipaa
+auth:
+  identifier: email
+access:
+  patients:
+    read: self
+    write: self
+    update: self
+    delete: self
+  visit_notes:
+    read: self
+    write: self
+    update: self
+    delete: self
+frontend:
+  stack: html

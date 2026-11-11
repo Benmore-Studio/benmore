@@ -821,12 +821,11 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 			httpError(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		// Use the shared multi-role resolver (session.Roles via
-		// HasAnyRole) instead of a single-field session.Role compare. The
-		// old check ignored grants in _benmore_user_roles, so a user
-		// holding the required role only via the join table was wrongly
-		// denied (and an admin grant via the join table didn't bypass).
-		if flow.Role != "" && !HasAnyRole(session, []string{flow.Role}) {
+		// The role is matched against every role the session holds (the
+		// primary column, grants in _benmore_user_roles, the tenant
+		// membership role), except that `role: admin` admits only a global
+		// admin (flowRoleAllowed, flows_role_gate.go).
+		if flow.Role != "" && !flowRoleAllowed(session, flow.Role) {
 			httpError(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -1067,6 +1066,18 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 	}
 	if responseBuffer != nil && responseBuffer.err != nil && ctx.Error == nil {
 		ctx.Error = responseBuffer.err
+	}
+	// The answer is part of the transaction. A respond step that could not
+	// produce its own (a reference with no value) has put the
+	// template_unresolved envelope in the buffer and stopped the run with no
+	// step error; committing here kept every write, queued job and
+	// notification of a request the caller is told failed, and a retry wrote
+	// them twice. Fail the run so it rolls back, and keep the buffered
+	// envelope as the answer, as for an on_error handler's response.
+	if ctx.Tx != nil && ctx.Error == nil && ctx.respondFailure != nil {
+		ctx.Error = fmt.Errorf("%w (the respond step could not produce its answer, so the transaction was rolled back)", ctx.respondFailure)
+		ctx.FailedStep, ctx.FailedType = ctx.respondFailureStep, "respond"
+		ctx.errorResponse = true
 	}
 
 	// Commit or rollback transaction

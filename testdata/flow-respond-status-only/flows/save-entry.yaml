@@ -1,0 +1,16 @@
+# flows/save-entry.yaml - a refusal written as a status alone stops the run.
+on:
+  request:
+    method: POST
+    path: /api/save-entry
+    auth: required
+jobs:
+  save:
+    steps:
+      - if: ${{ params.confirm || '' }} != 'yes'
+        run: respond
+        with: { status: 403 }
+      - run: sql
+        with: { query: "INSERT INTO entries (label, kind, user_id) VALUES (:label, 'saved', :user_id)" }
+      - run: respond
+        with: { status: 201, json: { saved: true } }

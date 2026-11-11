@@ -353,10 +353,10 @@ Core SDK surface:
 | `bm.aggregate(name)` / `bm.aggregates.all()` | Materialized aggregates; admin only (`GET /api/_aggregates` answers 403 to other users) |
 | `bm.jobs.{status, wait}` | Async-flow polling |
 | `bm.notifications.{list, markRead, markAllRead, onNew}` | In-app inbox |
-| `bm.upload(file, opts)` | Multipart upload → `{path}` |
+| `bm.upload(file, opts)` | Multipart upload → `{path, url, filename, size}`; `opts.kind: 'private'` for a private file |
 | `bm.api.optimistic({apply, request, snapshot, revert})` | Optimistic mutation + reconcile |
 | `bm.createStore(initial, {persist?})` | Selector subscriptions, reset, unsubscribe, optional versioned cache persistence |
-| `bm.query.{fetch, read, table, subscribe, invalidate, mutate}` | Keyed read cache, dedupe, stale time, table live invalidation, optimistic rollback |
+| `bm.query.{fetch, read, table, tableKey, subscribe, invalidate, mutate}` | Keyed read cache, dedupe, stale time, table live invalidation, optimistic rollback; `subscribe(tableKey(t, opts), fn)` renders what `table(t, opts)` reads (`api(at:"sdk.query_live_snippet")`) |
 | `bm.presence(slug)` | Heartbeat + cleanup + server sweep |
 | `bm.cache.namespaced(n, v)` / `.persistent(n, v)` | Self-busting client cache |
 | `bm.markdown(text)` / `bm.markdownBatch(items)` | Server-rendered, sanitized CommonMark + GFM via benmark; batch rendering avoids one request per item |
@@ -591,8 +591,13 @@ hidden directories outside `static/` (other than `.well-known`/`.github`) or
 editor/agent auto-run config (`.vscode`, `.claude`, `.mcp.json`, `.envrc`,
 `*.code-workspace`, ...); they list them as skipped (`api(at:"sync-status")`).
 The server leaves the same paths out of pull archives and manifests, and hosted
-write tools refuse the named auto-run config outside `static/` (deploy and the
-save hook keep it local).
+write tools refuse the named auto-run config outside `static/`. `deploy` and the
+save hook upload the same set pull hands back: a hidden directory outside
+`static/` (an agent's `.scratch/` or `.sdd/`) and the auto-run config stay in
+the workspace, `deploy` prints how many files it left there, and `sync-status`
+lists them as `kept_local`, not as drift. Keep scratch files and credentials in
+such a directory or outside the app directory, and source the app needs in a
+plain one (`.gitignore` does not decide what is uploaded).
 
 Feature packs are the clone mechanism for reusable app pieces:
 

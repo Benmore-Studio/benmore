@@ -1,6 +1,7 @@
 {
   "keys": [
     "session_revocation",
+    "token_exchange",
     "visitor_password",
     "email_change_link",
     "self_service_controls",
@@ -28,7 +29,9 @@
     "security_update",
     "session_storage",
     "credential_limits",
+    "api_tokens",
     "admin_actions_on_others",
+    "admin_panel_accounts",
     "recovery_hardening",
     "step_pages",
     "summary",

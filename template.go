@@ -1687,7 +1687,8 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 		if session == nil || !SessionCanAccessTable(app, table, OpRead, session) {
 			return `<!-- transitions: record not found -->`
 		}
-		readSQL := "SELECT " + quoteColumn(table, wf.Field) + " FROM " + quoteIdent(table) + " WHERE id = ?"
+		// The whole row: a transition's `when:` is judged over it.
+		readSQL := "SELECT * FROM " + quoteIdent(table) + " WHERE id = ?"
 		readArgs := []any{id}
 		if hasColumn(app, table, "deleted_at") {
 			readSQL += " AND deleted_at IS NULL"
@@ -1700,21 +1701,17 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 		if err != nil || len(row) == 0 {
 			return `<!-- transitions: record not found -->`
 		}
-		currentState := fmt.Sprintf("%v", row[0][wf.Field])
 
-		// Get available transitions for the current user
-		targets := wf.Transitions[currentState]
-		if len(targets) == 0 {
+		// The moves this viewer may make now, as GET .../transitions lists
+		// them: role, `when:` and a command-owned state column all count.
+		if len(wf.Transitions[valueText(row[0][wf.Field])]) == 0 {
 			return "" // no transitions available from this state
 		}
 
 		var sb strings.Builder
 		sb.WriteString(`<div class="flex flex-wrap gap-2" data-transitions>`)
-		for to, t := range targets {
-			// Check role
-			if t.Role != "" && (session == nil || !hasWorkflowRole(app, session, wf.Table, t.Role)) {
-				continue
-			}
+		for _, move := range availableWorkflowMoves(app, wf, session, row[0]) {
+			to := move.To
 			label := strings.Title(strings.ReplaceAll(to, "_", " "))
 			// Use HTMX to POST the transition
 			sb.WriteString(fmt.Sprintf(`<button hx-post="/api/%s/%s/transition" hx-vals='{"to":"%s"}' hx-swap="outerHTML" hx-target="closest [data-transitions]" hx-confirm="Transition to %s?" class="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md border border-border bg-secondary text-secondary-foreground hover:bg-accent transition-colors">%s</button>`,

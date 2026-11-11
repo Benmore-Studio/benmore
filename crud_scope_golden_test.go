@@ -128,7 +128,8 @@ func TestCrudScopeBehavior_CrossTenantIsolation(t *testing.T) {
 			map[string]any{"table": "records", "action": "update", "id": 2, "data": map[string]any{"title": "tx-leak"}},
 		},
 	})
-	if tx.Code != http.StatusBadRequest {
+	// The row is outside the caller's tenant: 404, as PATCH answers.
+	if tx.Code != http.StatusNotFound {
 		t.Fatalf("transaction status = %d body=%s", tx.Code, tx.Body.String())
 	}
 	assertRecordTitle(t, app.DB, 2, "b")

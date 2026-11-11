@@ -1,0 +1,16 @@
+# In a transition's `when:` user_id is the caller and old_user_id the row's own
+# user_id (the requester).
+requests:
+  table: requests
+  field: status
+  initial: draft
+  transitions:
+    draft:
+      submitted: {}
+    submitted:
+      approved: { role: approver, when: "old_user_id != user_id" }   # not your own request
+      returned: { role: approver, when: "old_user_id != user_id" }
+    returned:
+      draft:    { when: "old_user_id = user_id" }                    # only the requester
+    approved:
+      ordered:  { role: approver, when: "amount_cents <= 100000" }

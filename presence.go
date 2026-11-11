@@ -18,7 +18,8 @@ package main
 //
 //   POST /api/_presence/heartbeat
 //       body: { slug, action: 'join' | 'heartbeat' | 'leave' }
-//       returns: { ok, members: number, expires_in_s: number }
+//       returns: { ok, members: number, expires_in_s: number, heartbeat_s: number }
+//       (no `members` for a leave by a caller the slug's ws_rooms room refuses)
 //
 //   GET  /api/_presence?slug=...
 //       returns: { slug, members: [{ user_id, joined_at, last_seen }], count }
@@ -36,8 +37,9 @@ import (
 	"time"
 )
 
-// Heartbeat staleness window. Clients send a heartbeat every 20s; the
-// server treats anything older than 90s as departed. The sweep loop
+// Heartbeat staleness window. The endpoint advises a heartbeat every 20s
+// (bm.presence sends one every 18s); the server treats anything older than
+// 90s as departed. The sweep loop
 // runs every 60s.
 // presenceTable is the framework table behind bm.presence; its realtime
 // events drive bm.presence(slug).onChange.
@@ -103,7 +105,8 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 		// A slug is a room name: declared ws_rooms rules decide who may be
 		// present in it, as they do for bm.room and bm.broadcast. Leaving
 		// stays open so a member removed mid-session can still clear its row.
-		if action != "leave" && !roomMembershipAllowed(app, session, session.UserID, slug) {
+		member := roomMembershipAllowed(app, session, session.UserID, slug)
+		if action != "leave" && !member {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
 			return
 		}
@@ -143,13 +146,18 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "action must be join | heartbeat | leave"})
 			return
 		}
-		count := presenceMemberCount(app.DB, key)
-		httpJSON(w, http.StatusOK, map[string]any{
+		out := map[string]any{
 			"ok":           true,
-			"members":      count,
 			"expires_in_s": int(presenceExpiryWindow.Seconds()),
 			"heartbeat_s":  presenceHeartbeatS,
-		})
+		}
+		// The count is part of the room's member list, which a caller the
+		// room refuses may not read: its always-allowed leave is answered
+		// without it.
+		if member {
+			out["members"] = presenceMemberCount(app.DB, key)
+		}
+		httpJSON(w, http.StatusOK, out)
 	})
 
 	mux.HandleFunc("GET /api/_presence", func(w http.ResponseWriter, r *http.Request) {

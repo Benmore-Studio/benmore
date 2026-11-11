@@ -62,6 +62,11 @@ type appMCPPDFBlock struct {
 	Value      string       `json:"value"`
 	Confidence *float64     `json:"confidence,omitempty"`
 	Quality    []string     `json:"quality,omitempty"`
+	// Where the parser put the word on its page: the ordinal of its line and
+	// of its block or paragraph (0 when the output names none).
+	// `run: extract_text` joins words into page text with them. Unexported:
+	// the connector result and stored snapshots carry words and boxes only.
+	textLine, textBlock int
 }
 
 type appMCPPDFResult struct {
@@ -229,6 +234,8 @@ func appMCPPDFParseBBox(data []byte) ([][]appMCPPDFBlock, error) {
 	var current appMCPPDFBlock
 	var text strings.Builder
 	count := 0
+	// `pdftotext -bbox-layout` nests words as flow > block > line > word.
+	lineSeq, blockSeq := 0, 0
 	for {
 		token, err := decoder.Token()
 		if err == io.EOF {
@@ -246,6 +253,11 @@ func appMCPPDFParseBBox(data []byte) ([][]appMCPPDFBlock, error) {
 					return nil, ErrIngestLimit
 				}
 				pages = append(pages, nil)
+				lineSeq, blockSeq = 0, 0
+			case "block":
+				blockSeq++
+			case "line":
+				lineSeq++
 			case "word":
 				if page == 0 || word {
 					return nil, ErrIngestCorrupt
@@ -284,7 +296,7 @@ func appMCPPDFParseBBox(data []byte) ([][]appMCPPDFBlock, error) {
 				if !appMCPPDFValidBox(coords[0], coords[1], coords[2], coords[3]) {
 					return nil, ErrIngestCorrupt
 				}
-				current = appMCPPDFBlock{Page: page, Ref: fmt.Sprintf("p%dw%d", page, len(pages[page-1])+1), BBox: appMCPPDFBox{XMin: coords[0], YMin: coords[1], XMax: coords[2], YMax: coords[3]}, BBoxUnit: "points"}
+				current = appMCPPDFBlock{Page: page, Ref: fmt.Sprintf("p%dw%d", page, len(pages[page-1])+1), BBox: appMCPPDFBox{XMin: coords[0], YMin: coords[1], XMax: coords[2], YMax: coords[3]}, BBoxUnit: "points", textLine: lineSeq, textBlock: blockSeq}
 				text.Reset()
 				word = true
 			}
@@ -339,6 +351,10 @@ func appMCPPDFParseTSV(data []byte, page int) ([]appMCPPDFBlock, error) {
 		return nil, ErrIngestCorrupt
 	}
 	blocks := make([]appMCPPDFBlock, 0)
+	// A word row names its block, paragraph and line (columns 3 to 5); the
+	// numbers restart inside each parent, so a change of any of them counts.
+	lineSeq, blockSeq := 0, 0
+	lineKey, blockKey := "", ""
 	for _, line := range lines[1:] {
 		if len(line) == 0 {
 			continue
@@ -372,7 +388,13 @@ func appMCPPDFParseTSV(data []byte, page int) ([]appMCPPDFBlock, error) {
 			return nil, ErrIngestCorrupt
 		}
 		c := confidence
-		blocks = append(blocks, appMCPPDFBlock{Page: page, Ref: fmt.Sprintf("p%dw%d", page, len(blocks)+1), BBox: appMCPPDFBox{XMin: float64(coords[0]), YMin: float64(coords[1]), XMax: float64(coords[0] + coords[2]), YMax: float64(coords[1] + coords[3])}, BBoxUnit: "pixels", Value: value, Confidence: &c, Quality: []string{"ocr"}})
+		if key := fields[2] + "\t" + fields[3]; blockSeq == 0 || key != blockKey {
+			blockSeq, blockKey = blockSeq+1, key
+		}
+		if key := blockKey + "\t" + fields[4]; lineSeq == 0 || key != lineKey {
+			lineSeq, lineKey = lineSeq+1, key
+		}
+		blocks = append(blocks, appMCPPDFBlock{Page: page, Ref: fmt.Sprintf("p%dw%d", page, len(blocks)+1), BBox: appMCPPDFBox{XMin: float64(coords[0]), YMin: float64(coords[1]), XMax: float64(coords[0] + coords[2]), YMax: float64(coords[1] + coords[3])}, BBoxUnit: "pixels", Value: value, Confidence: &c, Quality: []string{"ocr"}, textLine: lineSeq, textBlock: blockSeq})
 		if len(blocks) > appMCPPDFMaxBlocks {
 			return nil, ErrIngestLimit
 		}

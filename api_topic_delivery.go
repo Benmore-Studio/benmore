@@ -108,9 +108,10 @@ func apiDescribeTopic(topic string) map[string]any {
 		return out
 	}
 	return map[string]any{
-		"error":  "unknown topic: " + topic,
-		"hint":   "Pick one of the topics below, or use at='METHOD /path' for a specific route.",
-		"topics": apiRecipeTopics(),
+		"error":   "unknown topic: " + topic,
+		"hint":    "Pick one of the topics below, or use at='METHOD /path' for a specific route.",
+		"nearest": apiNearestKeys(topic, apiRecipeTopics()),
+		"topics":  apiRecipeTopics(),
 	}
 }
 
@@ -349,7 +350,9 @@ func apiMatchKey(names []string, want string) (string, bool) {
 
 // apiNearestKeys ranks the names closest to want: a shared prefix, then one
 // containing the other, then a typo's distance, then a shared word. At most
-// five.
+// five. When none of those holds, the name or names fewest edits away, if
+// under half of want would change (`env_varz_list` for `env_vars`); never
+// nil, so an answer's `nearest` is a list and not null.
 func apiNearestKeys(want string, names []string) []string {
 	want = apiKeyForm(want)
 	if want == "" {
@@ -370,13 +373,23 @@ func apiNearestKeys(want string, names []string) []string {
 			ranked[name] = 3
 		}
 	}
+	if len(ranked) == 0 {
+		best := len(want)/2 + 1
+		for _, name := range names {
+			if d := levenshtein(apiKeyForm(name), want); d < best {
+				best, ranked = d, map[string]int{name: 0}
+			} else if d == best && len(ranked) > 0 {
+				ranked[name] = 0
+			}
+		}
+	}
 	near := slices.SortedFunc(maps.Keys(ranked), func(a, b string) int {
 		if ranked[a] != ranked[b] {
 			return ranked[a] - ranked[b]
 		}
 		return strings.Compare(a, b)
 	})
-	return near[:min(len(near), 5)]
+	return append([]string{}, near[:min(len(near), 5)]...)
 }
 
 // apiUnknownKey is the answer for an address that names no key: the nearest

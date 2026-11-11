@@ -29,6 +29,18 @@ owner_reads_their_claim_and_its_receipt:
       expect: { status: 200 }
     - get: "{{signed}}"
       expect: { status: 200, contains: "Taxi 23.50" }
+    # A lifetime the owner names is the lifetime signed (seconds or a
+    # duration); one that cannot be read is refused, never replaced by the
+    # one-hour default.
+    - get: "/api/_signed_url?path={{receipt}}&record_table=claims&record_id={{claim_id}}&expires_in=30s"
+      save: { short: "path" }
+      expect: { status: 200, json: { expires_in: 30 } }
+    - get: "{{short}}"
+      expect: { status: 200, contains: "Taxi 23.50" }
+    - get: "/api/_signed_url?path={{receipt}}&record_table=claims&record_id={{claim_id}}&expires_in=soon"
+      expect: { status: 400, contains: "invalid_expires_in", not_contains: "sig=" }
+    - get: "/api/_signed_url?path={{receipt}}&record_table=claims&record_id={{claim_id}}&expires_in=0"
+      expect: { status: 400, contains: "invalid_expires_in", not_contains: "sig=" }
 
     # Another signed-in user: no row, no file.
     - set_auth: "none"

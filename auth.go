@@ -271,14 +271,13 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 
 	// Impersonation: admin logs in as another user for support
 	mux.HandleFunc("POST /api/_auth/impersonate", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
 		// The result is a full-access session as someone else, so a scoped
 		// credential can't start it (same rule as role grants). The
 		// credential's own scopes decide (IsAdminConsole), not the
 		// role-derived session scopes: a roles: block that declares admin
 		// with narrow scopes narrows those for the app's own admin.
-		if !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
+		session := adminConsoleSession(w, r, app, "admin with a full-access session required")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -544,7 +543,11 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 
 		mux.HandleFunc("POST /api/_auth/act_as", func(w http.ResponseWriter, r *http.Request) {
 			session := getSession(app, r)
-			if session == nil || !session.IsAdmin() {
+			if session == nil {
+				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+				return
+			}
+			if !session.IsAdmin() {
 				httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
 				return
 			}

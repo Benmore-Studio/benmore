@@ -518,7 +518,7 @@ func unreadTestResult(file, name string, tc AppTestCase) (result AppTestResult, 
 	if problem == "" {
 		return AppTestResult{}, false
 	}
-	return AppTestResult{File: file, Test: name, Pass: false, Message: appTestNotRun + problem + appTestNotRunWhy}, true
+	return AppTestResult{File: file, Test: name, Pass: false, Message: withDocsLine(appTestNotRun+problem+appTestNotRunWhy, testKeysDocs)}, true
 }
 
 // unreadTestResults are the failed results for the tests of files the runner

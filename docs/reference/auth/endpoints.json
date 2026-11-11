@@ -6,8 +6,11 @@
   "POST /verify-otp  (auth.otp emailed or texted code)",
   "POST /forgot-password",
   "POST /reset-password",
+  "POST /api/_auth/api-tokens  (mint an API token: JSON {name, scopes, expires_in?}; see api_tokens)",
+  "GET /api/_auth/api-tokens",
+  "DELETE /api/_auth/api-tokens/{id}",
   "GET /api/_auth/profile",
   "PATCH /api/_auth/profile",
-  "POST /api/_auth/token  (Bearer for non-browser clients)",
-  "GET /api/_csrf"
+  "POST /api/_auth/token  (Bearer for non-browser clients: JSON {email, password} answers 200 {token, user_id, email}; see token_exchange)",
+  "GET /api/_csrf  → { token }: send it as the X-CSRF-Token header (or the _csrf form field) on a cookie session's POST/PATCH/DELETE; Bearer requests need none"
 ]

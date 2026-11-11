@@ -9,10 +9,12 @@ package main
 // from the single-row path again.
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -46,14 +48,32 @@ func identIs(name, want string) bool {
 	return want != "" && sqliteIdentifierFold(name) == sqliteIdentifierFold(want)
 }
 
+// userSignInStateColumns are the _benmore_users columns only the sign-in and
+// account endpoints write, beside password_hash, role and
+// password_change_required (protected on every table): the TOTP factor (a
+// pending enrollment is a value of totp_secret too), its backup codes, the
+// spent-code watermark, the setup nonce, and the mark that an address was
+// trusted before verification was required. The admin panel runs generic
+// create and update on this table; through it one admin replaced or cleared
+// another admin's factor, and a new row was seeded with one. This is the one
+// list: a column the framework adds to _benmore_users joins it or the
+// writable list in TestUserTableColumnsAreClassifiedForGenericWrites.
+// deactivated_at and verified stay writable (the panel manages them, under
+// the last-admin guard); the identifiers are guarded by userIdentifierUpdate.
+var userSignInStateColumns = []string{
+	"totp_secret", "backup_codes", "mfa_last_totp", "mfa_last_totp_at", mfaSetupNonceColumn,
+	"email_grandfathered",
+}
+
 // protectedCreateFields is the mass-assignment set for a create on table:
 // framework identity columns, the tenant key, the in-tenant role field on the
-// membership table, and the columns triggers derive: computed columns and
-// blind-index siblings (`<col>_blind`, the HMAC of an encrypted column).
+// membership table, the account's sign-in state on _benmore_users, and the
+// columns triggers derive: computed columns and blind-index siblings
+// (`<col>_blind`, the HMAC of an encrypted column).
 func protectedCreateFields(app *App, table string) protectedFields {
 	p := newProtectedFields("user_id", "created_at", "updated_at", "password_hash", "role", "password_change_required")
 	if identIs(table, "_benmore_users") {
-		p.add(mfaSetupNonceColumn)
+		p.add(userSignInStateColumns...)
 	}
 	if app == nil {
 		return p
@@ -221,6 +241,66 @@ func fkParentScope(app *App, parent string, session *Session) (string, []any, bo
 		return "0", nil, true
 	}
 	return pred, args, true
+}
+
+// foreignKeyConstraintDenial names the submitted foreign key behind a FOREIGN
+// KEY constraint failure. foreignKeyTargetDenial checks only parents the
+// caller's read scope restricts: a parent table with no row scope (no owner
+// or tenant column, an anon/everyone read mode) and every parent of an
+// admin's write are left to the schema's constraint, whose error names no
+// column. This turns that failure into the same *fkTargetError a forbidden
+// parent gets, so a missing parent answers one way whatever the parent's read
+// mode is.
+//
+// Only a write the database already refused reaches it, and only declared
+// foreign keys (the ones SQLite enforces) are looked at, in column order, with
+// the value the write bound. A submitted parent that exists was either
+// readable to the caller (the check before the write) or sits in a table the
+// caller may read in full, so "this one is missing" tells nothing new.
+// Returns nil when err is another failure or no submitted column names a
+// missing parent (a composite key, a deferred constraint, a trigger's write):
+// the caller keeps its generic answer.
+func foreignKeyConstraintDenial(q mutationQuerier, app *App, table string, submitted map[string]any, err error) error {
+	if err == nil || app == nil || len(submitted) == 0 || !strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+		return nil
+	}
+	var declared map[string]ForeignKey
+	for t, fks := range app.joinMapSnapshot() {
+		if sqliteIdentifierFold(t) == sqliteIdentifierFold(table) {
+			declared = fks
+			break
+		}
+	}
+	cols := make([]string, 0, len(submitted))
+	for col := range submitted {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	for _, col := range cols {
+		v := submitted[col]
+		if v == nil {
+			continue
+		}
+		for refCol, fk := range declared {
+			if !identIs(col, refCol) {
+				continue
+			}
+			parentCol := fk.Column
+			if parentCol == "" {
+				parentCol = "id"
+			}
+			if !safeIdent(fk.Table) || !safeIdent(parentCol) {
+				break
+			}
+			var one int
+			lookup := fmt.Sprintf("SELECT 1 FROM main.%s WHERE %s = ? LIMIT 1", quoteIdent(fk.Table), quoteIdent(parentCol))
+			if errors.Is(q.QueryRow(lookup, v).Scan(&one), sql.ErrNoRows) {
+				return &fkTargetError{column: col}
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // writeFKTargetDenial renders a foreign-key refusal.

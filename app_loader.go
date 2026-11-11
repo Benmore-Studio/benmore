@@ -421,6 +421,13 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 		return nil, fmt.Errorf("relationships: %w", err)
 	}
 
+	// ws_rooms rules whose membership table or column the migrated database
+	// does not have: their rooms refuse every join, so say which. A check-only
+	// load reports them as findings instead (wsRoomRuleWarnings).
+	if !opts.checkOnly {
+		logWSRoomRuleReferences(db, app.WSRooms)
+	}
+
 	// Load pages
 	trace.phase("pages")
 	pages, partials := config.pages, config.partials

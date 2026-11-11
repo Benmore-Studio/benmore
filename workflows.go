@@ -255,16 +255,19 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		httpJSON(w, http.StatusConflict, map[string]any{"error": "state changed", "from": currentState})
 		return
 	}
-	if transition.When != "" && !whenHolds(tx, app, wf.Table, transition.When, row) {
+	// The condition is judged over the row before the change, with the
+	// caller's session keys and old_<column> (transitionEventRow).
+	if transition.When != "" && !whenHolds(tx, app, wf.Table, transition.When, transitionEventRow(row, row, session)) {
 		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "condition not met", "when": transition.When})
 		return
 	}
 	// Preserve workflow hook semantics: predicates and placeholders see the
-	// stored row merged with the requested state, plus session context.
-	beforeRow := copyRow(row)
-	beforeRow[wf.Field] = body.To
+	// stored row merged with the requested state, plus the previous values
+	// and session context.
+	target := copyRow(row)
+	target[wf.Field] = body.To
+	beforeRow := transitionEventRow(target, row, session)
 	markSubmittedFields(beforeRow, []string{wf.Field})
-	injectSessionContext(beforeRow, session)
 	if err := fireBeforeHooksWith(tx, app, "update", wf.Table, beforeRow); err != nil {
 		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
@@ -370,29 +373,94 @@ func handleAvailableTransitions(w http.ResponseWriter, r *http.Request, app *App
 		return
 	}
 
-	currentState := valueText(rows[0][wf.Field])
-	targets := wf.Transitions[currentState]
-
-	var transitions []map[string]string
-	for to, t := range targets {
-		// Only show transitions the user has the role for
-		if t.Role == "" || hasWorkflowRole(app, session, wf.Table, t.Role) {
-			entry := map[string]string{"to": to}
-			if t.Role != "" {
-				entry["role"] = canonicalWorkflowRole(t.Role)
-			}
-			transitions = append(transitions, entry)
+	transitions := []map[string]string{}
+	for _, move := range availableWorkflowMoves(app, wf, session, rows[0]) {
+		entry := map[string]string{"to": move.To}
+		if move.Role != "" {
+			entry["role"] = move.Role
 		}
-	}
-
-	if transitions == nil {
-		transitions = []map[string]string{}
+		transitions = append(transitions, entry)
 	}
 
 	httpJSON(w, http.StatusOK, map[string]any{
-		"current":     currentState,
+		"current":     valueText(rows[0][wf.Field]),
 		"transitions": transitions,
 	})
+}
+
+// workflowMove is one transition a caller may make from a row's current state.
+type workflowMove struct {
+	To   string
+	Role string // the transition's role list, "" when it has none
+}
+
+// availableWorkflowMoves lists, sorted by target, the transitions session may
+// make from the state row is in: the ones whose `role:` it holds and whose
+// `when:` holds for it, judged over the row handleTransition judges it over
+// (transitionEventRow). A condition that cannot be evaluated is not met, as on
+// the transition route. A command-owned state column moves only through its
+// command (the route answers 403 field_owned_by_command), so nothing is listed
+// for it. GET /api/<table>/{id}/transitions and the SSR <transitions> tag both
+// answer from here; row is the full row as the caller may read it.
+func availableWorkflowMoves(app *App, wf *Workflow, session *Session, row map[string]any) []workflowMove {
+	if session == nil || ownedFieldViolation(app, wf.Table, wf.Field) != nil {
+		return nil
+	}
+	targets := wf.Transitions[valueText(row[wf.Field])]
+	var eventRow map[string]any
+	var moves []workflowMove
+	for _, to := range slices.Sorted(maps.Keys(targets)) {
+		t := targets[to]
+		if t.Role != "" && !hasWorkflowRole(app, session, wf.Table, t.Role) {
+			continue
+		}
+		if t.When != "" {
+			if eventRow == nil {
+				eventRow = transitionEventRow(row, row, session)
+			}
+			if !whenHolds(app.DB, app, wf.Table, t.When, eventRow) {
+				continue
+			}
+		}
+		move := workflowMove{To: to}
+		if t.Role != "" {
+			move.Role = canonicalWorkflowRole(t.Role)
+		}
+		moves = append(moves, move)
+	}
+	return moves
+}
+
+// rowWithOldValues returns row with old_<column> added for every column of
+// before, the row as it was stored before the change.
+func rowWithOldValues(row, before map[string]any) map[string]any {
+	out := make(map[string]any, len(row)+len(before)+len(sessionContextKeys)+1)
+	maps.Copy(out, row)
+	for k, v := range before {
+		out["old_"+k] = v
+	}
+	return out
+}
+
+// transitionEventRow is the row a transition is judged over and its hooks
+// read, the shape an update's event row has: row's columns, old_<column> for
+// every column of before (the row as stored before the state moves) and the
+// caller's session keys. The session keys replace same-named columns, as in
+// every hooks.yaml hook, so on a table with a user_id column `user_id` is who
+// makes the transition and `old_user_id` the row's own. One builder for the
+// transition's `when:` (row and before are both the stored row: the state
+// column still holds the current state), the before_update hooks (row holds
+// the target state), on_transition and on_update hooks (row is the row read
+// back), the available-moves list and the approved-command path, so a guard
+// such as `old_user_id != user_id` means the same everywhere. It used to be
+// the plain stored row for `when:` (user_id the row's own, every old_<column>
+// NULL), which made that guard always true: a requester approved their own
+// request. actor nil is a timeout, which has no caller: the row keeps its own
+// user_id and the other caller keys are unset.
+func transitionEventRow(row, before map[string]any, actor *Session) map[string]any {
+	out := rowWithOldValues(row, before)
+	injectSessionContext(out, actor)
+	return out
 }
 
 // hasWorkflowRole reports whether session may make a transition whose `role:`
@@ -785,12 +853,8 @@ func transitionEffectsTx(tx mutationTx, app *App, wf *Workflow, id string, oldRo
 		}
 		return nil, nil, fmt.Errorf("could not read transitioned row: %w", err)
 	}
-	updatedRow := updatedRows[0]
-	for k, v := range oldRow {
-		updatedRow["old_"+k] = v
-	}
-	stored := copyRow(updatedRow) // what a subscription delivers (webhookDataRow)
-	injectSessionContext(updatedRow, actor)
+	stored := rowWithOldValues(updatedRows[0], oldRow) // what a subscription delivers (webhookDataRow)
+	updatedRow := transitionEventRow(updatedRows[0], oldRow, actor)
 
 	// A timeout has no caller to run hook SQL as: its hooks are queued as jobs
 	// in this transaction instead, so a hook needing a session value, or whose

@@ -1,0 +1,21 @@
+# flows/count-stock.yaml - several roles, role grants included: a SQL step
+# reads the account's own role and its unexpired global grants.
+on:
+  request:
+    method: POST
+    path: /api/count-stock
+    auth: required
+jobs:
+  count:
+    steps:
+      - id: me
+        run: sql
+        with:
+          query: "SELECT id FROM _benmore_users WHERE id = :user_id AND (role IN ('warehouse', 'manager', 'admin') OR EXISTS (SELECT 1 FROM _benmore_user_roles g WHERE g.user_id = _benmore_users.id AND g.role IN ('warehouse', 'manager', 'admin') AND g.group_id IS NULL AND (g.expires_at IS NULL OR datetime(g.expires_at) > datetime('now'))))"
+      - if: ${{ !steps.me.outputs.rows }}
+        run: respond
+        with: { status: 403, json: { error: forbidden } }
+      - run: sql
+        with: { query: "INSERT INTO stock_moves (sku, kind, moved_by) VALUES (:sku, 'count', :user_id)" }
+      - run: respond
+        with: { status: 201, json: { counted: true } }

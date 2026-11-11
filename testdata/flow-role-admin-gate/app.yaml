@@ -1,0 +1,32 @@
+# A tenant app whose founder holds the tenant role `admin` (a membership role,
+# not the app's global admin). The flows show how a flow's `role:` gate reads
+# it: `role: admin` is the global admin only, any other role name matches the
+# caller's tenant role, and a flow that tenant admins (or several tenant
+# roles) should pass checks the membership row itself.
+site_name: "Flow role gates"
+auth:
+  identifier: email
+groups:
+  table: org_members
+  key: org_id
+  user_field: user_id
+  role_field: member_role
+  bootstrap:
+    org_table: organizations
+    founding_role: admin
+access:
+  organizations:
+    read: member-of:org_members(org_id, user_id)
+    write: off
+    update: role:admin
+    delete: off
+  org_members:
+    read: group
+    write: off
+    update: off
+    delete: off
+  activity:
+    read: group
+    write: off
+    update: off
+    delete: off

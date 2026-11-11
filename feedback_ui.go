@@ -425,9 +425,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 
 	// GET /api/_feedback - list feedback (admin only)
 	mux.HandleFunc("GET /api/_feedback", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		rows, _ := queryMetadataRows(app.DB, `SELECT id, visitor_name, visitor_email, page_url, origin_host, body, element_selector, status, created_at
@@ -437,9 +436,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 
 	// GET /api/_feedback/{id} - single feedback with comments
 	mux.HandleFunc("GET /api/_feedback/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		id := r.PathValue("id")
@@ -456,9 +454,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 
 	// PATCH /api/_feedback/{id} - update status (admin)
 	mux.HandleFunc("PATCH /api/_feedback/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -479,9 +476,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 
 	// POST /api/_feedback/{id}/comment - add comment (admin)
 	mux.HandleFunc("POST /api/_feedback/{id}/comment", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -512,9 +508,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 	// error, so a seed could drop an audit trigger or a framework table and
 	// a failed seed still answered success.
 	mux.HandleFunc("POST /api/_testing/reset", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {

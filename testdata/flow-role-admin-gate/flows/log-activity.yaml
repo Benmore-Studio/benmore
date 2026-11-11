@@ -1,0 +1,17 @@
+# flows/log-activity.yaml - a worker flow: its payload names the tenant, so
+# only a trusted producer (the queue, or the app's global admin) may run it.
+on:
+  request:
+    method: POST
+    path: /api/internal/log-activity
+    role: admin                     # the app's global admin; a tenant role named admin does not pass
+    inputs:
+      org_id: { type: number, required: true }
+      note:   { type: text, required: true }
+jobs:
+  log:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO activity (org_id, note) VALUES (:org_id, :note)" }
+      - run: respond
+        with: { status: 200, json: { logged: true } }

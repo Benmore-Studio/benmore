@@ -614,7 +614,7 @@ func appMCPArtifactAuthorizedFrom(ctx context.Context, queryer appMCPArtifactQue
 	if err := queryer.QueryRowContext(ctx, "SELECT COALESCE(created_at,''),COALESCE(role,'user') FROM _benmore_users WHERE id=?", artifact.OwnerUserID).Scan(&ownerCreatedAt, &role); err != nil || !sameAccountIncarnation(ownerCreatedAt, artifact.OwnerCreatedAt) {
 		return false
 	}
-	if !(hasRole(role, artifact.RequiredRole) || HasAnyRole(session, []string{artifact.RequiredRole})) {
+	if !(hasRole(role, artifact.RequiredRole) || flowRoleAllowed(session, artifact.RequiredRole)) {
 		return false
 	}
 	if strings.HasPrefix(artifact.OperationID, mcpReadArtifactOperationPrefix) && !appMCPReadArtifactStillAllowed(app, session, artifact, time.Now()) {

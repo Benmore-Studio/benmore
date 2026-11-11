@@ -1,0 +1,5 @@
+tables:
+  patients:
+    fields: [ssn]
+    blind_index: [ssn]
+    unmask_roles: [admin]

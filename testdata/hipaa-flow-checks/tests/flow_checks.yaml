@@ -1,0 +1,140 @@
+# What `compliance: hipaa` leaves to the app's own flows and pages. Every SQL
+# assertion counts only the rows of its own test user.
+
+# The generated API records the write; a flow's own INSERT does not.
+flow_write_leaves_no_audit_row:
+  as_user: "unaudited@test.com"
+  steps:
+    - api: "POST /api/visit_notes"
+      json: { body: "through the api" }
+      expect: { status: 200 }
+    - api: "POST /api/note-unaudited"
+      json: { body: "through a flow" }
+      expect: { status: 200 }
+    - sql: "SELECT 1 FROM visit_notes n JOIN _benmore_users u ON u.id = n.user_id WHERE u.email = 'unaudited@test.com'"
+      expect: { rows: 2 }
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE table_name = 'visit_notes' AND user_email = 'unaudited@test.com'"
+      expect: { rows: 1 }
+
+# The documented pattern (api(at:"audit.flow_writes_example")): the flow
+# inserts its own audit row in the transaction of its write. A second signing
+# changes no row, so the flow fails and writes no second audit row.
+flow_writes_its_own_audit_row:
+  as_user: "audited@test.com"
+  steps:
+    - api: "POST /api/visit_notes"
+      json: { body: "to be signed" }
+      save: { note_id: "id" }
+      expect: { status: 200 }
+    - api: "POST /api/notes/{{note_id}}/sign"
+      expect: { status: 200, contains: '"signed_at":"20' }
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'update' AND table_name = 'visit_notes' AND row_id = '{{note_id}}' AND user_email = 'audited@test.com' AND json_extract(new_values, '$.signed_at') LIKE '20%'"
+      expect: { rows: 1 }
+    - api: "POST /api/notes/{{note_id}}/sign"
+      expect: { status: 500 }
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'update' AND table_name = 'visit_notes' AND row_id = '{{note_id}}' AND user_email = 'audited@test.com'"
+      expect: { rows: 1 }
+
+# The API masks the encrypted column and never returns the blind index; a
+# flow that responds with a `SELECT *` row returns both, a flow that names its
+# columns returns neither.
+flow_select_star_returns_clear_value_and_blind_index:
+  as_user: "row@test.com"
+  steps:
+    - api: "POST /api/patients"
+      json: { name: "Pat Row", ssn: "111-22-3333" }
+      expect: { status: 200 }
+    - get: "/api/patients"
+      expect:
+        status: 200
+        contains: '"ssn":"****"'
+        not_contains:
+          - "ssn_blind"
+          - "111-22-3333"
+    - get: "/api/patient-row"
+      expect:
+        status: 200
+        contains:
+          - '"ssn":"111-22-3333"'
+          - '"ssn_blind":"'
+    - get: "/api/patient-card"
+      expect:
+        status: 200
+        contains: "Pat Row"
+        not_contains:
+          - "ssn"
+          - "111-22-3333"
+    - get: "/chart"
+      expect:
+        status: 200
+        contains:
+          - "chart-name=Pat Row"
+          - "chart-ssn=****"
+          - "chart-blind=[]"
+        not_contains: "111-22-3333"
+
+# A token's scopes narrow the generated API. A page's queries and a flow that
+# declares no permissions: run as the token's account.
+scoped_token_reads_a_page_and_a_flow:
+  as_user: "scoped@test.com"
+  steps:
+    - api: "POST /api/patients"
+      json: { name: "Pat Scoped", ssn: "444-55-6666" }
+      expect: { status: 200 }
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "notes only", scopes: "visit_notes:read" }
+      save: { tok: "token" }
+      expect: { status: 200, contains: '"scopes":"visit_notes:read"' }
+    - set_auth: "{{tok}}"
+    - get: "/api/patients"
+      expect: { status: 403, contains: "scope denied" }
+    - get: "/chart"
+      expect: { status: 200, contains: "chart-name=Pat Scoped" }
+    - get: "/api/patient-card"
+      expect: { status: 200, contains: "Pat Scoped" }
+
+# POST /api/_auth/api-tokens: `scopes` is required and is one string of
+# space-separated <table>:<action> entries.
+api_token_request_shape:
+  as_user: "minter@test.com"
+  steps:
+    - api: "POST /api/_auth/api-tokens"
+      json: { scopes: "*" }
+      expect: { status: 400, contains: "name required" }
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "ci" }
+      expect: { status: 400, contains: "scopes required (use '*' for full access)" }
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "ci", scopes: "patients:read,visit_notes:read" }
+      expect: { status: 400, contains: "invalid scope action" }
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "ci", scopes: ["patients:read"] }
+      expect: { status: 400, contains: "invalid request" }
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "ci", scopes: "patients:read visit_notes:read", expires_in: "30d" }
+      expect:
+        status: 200
+        contains:
+          - '"token":"bmr_'
+          - '"scopes":"patients:read visit_notes:read"'
+          - '"expires_at":"'
+    - api: "POST /api/_auth/api-tokens"
+      json: { name: "full", scopes: "*" }
+      expect: { status: 200, contains: '"token":"bmr_' }
+    # Minting a token writes no audit row.
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE user_email = 'minter@test.com'"
+      expect: { rows: 0 }
+
+# hooks.yaml: the hook's write and the audit row its second entry inserts.
+hook_writes_its_own_audit_row:
+  as_user: "hook@test.com"
+  steps:
+    - api: "POST /api/patients"
+      json: { name: "Pat Hook" }
+      expect: { status: 200 }
+    # A hook's SQL runs as a job after the write commits.
+    - flush: "jobs"
+    - sql: "SELECT 1 FROM visit_notes n JOIN _benmore_users u ON u.id = n.user_id WHERE u.email = 'hook@test.com' AND n.body = 'intake'"
+      expect: { rows: 1 }
+    - sql: "SELECT 1 FROM _benmore_audit_log a JOIN visit_notes n ON a.row_id = CAST(n.id AS TEXT) WHERE a.table_name = 'visit_notes' AND a.action = 'insert' AND a.user_email = 'hook@test.com' AND n.body = 'intake' AND json_extract(a.new_values, '$.source') = 'hook:patients.on_insert'"
+      expect: { rows: 1 }

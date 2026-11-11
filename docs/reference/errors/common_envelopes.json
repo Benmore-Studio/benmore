@@ -116,7 +116,7 @@
       "request_id": "3f9c2a1b7d4e5f60",
       "docs": "errors.common_envelopes"
     },
-    "when": "a respond step referenced a value no step produced; `unresolved_refs` lists them as `<step id>.<output>`. A body that is one whole `${{ ref }}` answers `unresolved_key: \"<step id>.<output>\"` instead of the list. A development instance adds `available_keys`"
+    "when": "a respond step referenced a value no step produced; `unresolved_refs` lists them as `<step id>.<output>`. A body that is one whole `${{ ref }}` answers `unresolved_key: \"<step id>.<output>\"` instead of the list. A development instance adds `available_keys`. In a `transaction: true` flow nothing the flow wrote is kept (api({at:'flows'}) transactional_responses)"
   },
   {
     "status": 500,

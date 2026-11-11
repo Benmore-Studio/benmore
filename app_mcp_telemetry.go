@@ -504,9 +504,8 @@ func registerAppMCPTelemetryRoute(mux appRouteRegistrar, app *App) {
 		return
 	}
 	mux.HandleFunc("GET /api/_mcp/telemetry", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		columns := strings.Join(append([]string{"tool_name", "contract_digest", "execution_digest", "schema_revision"}, appMCPTelemetryColumns()...), ",")

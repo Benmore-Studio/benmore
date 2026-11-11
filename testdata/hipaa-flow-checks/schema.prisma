@@ -1,0 +1,21 @@
+model Patient {
+  id        Int      @id @default(autoincrement())
+  name      String
+  ssn       String?
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("patients")
+}
+
+model VisitNote {
+  id        Int      @id @default(autoincrement())
+  body      String
+  signedAt  String?  @map("signed_at")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("visit_notes")
+}

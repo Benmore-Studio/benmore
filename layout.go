@@ -62,6 +62,27 @@ func pageSEOPath(page *Page) string {
 // wrapLayoutAt is WrapLayoutWithPage with the path the canonical link and
 // og:url name (pageCanonicalPath).
 func wrapLayoutAt(content, title string, app *App, session *Session, page *Page, canonicalPath string) string {
+	return wrapLayoutFor(content, title, app, session, page, canonicalPath, false)
+}
+
+// WrapLayoutForPrint is the page shell for a document nobody browses: the
+// one GET /pdf/<page> hands to the renderer. It keeps what makes the page
+// look the way it does (the app's head.html, theme, fonts and styles, the
+// helper scripts page markup may call) and leaves out what the shell adds for
+// a person at a browser: the cookie-consent banner and analytics beacon, the
+// feedback widget, the session recorder, the live-update and dev reload
+// clients, and the web-app manifest with its service-worker registration.
+// Printed, the banner and the feedback flag sat on top of the sheet. The
+// free plan's "Built with" attribution stays: it is part of the plan, not
+// browser tooling.
+func WrapLayoutForPrint(content, title string, app *App, session *Session, page *Page) string {
+	return wrapLayoutFor(content, title, app, session, page, pageSEOPath(page), true)
+}
+
+// wrapLayoutFor builds the shell for a browser or, with forPrint, for a
+// printed document (WrapLayoutForPrint). Anything added to the shell for
+// someone using the page in a browser belongs behind !forPrint.
+func wrapLayoutFor(content, title string, app *App, session *Session, page *Page, canonicalPath string, forPrint bool) string {
 	if title == "" {
 		title = "Benmore App"
 	}
@@ -130,7 +151,7 @@ func wrapLayoutAt(content, title string, app *App, session *Session, page *Page,
 	sb.WriteString(`<link rel="alternate" type="application/atom+xml" title="Feed" href="/feed.xml">`)
 
 	// PWA meta tags + service worker registration
-	if app != nil {
+	if app != nil && !forPrint {
 		sb.WriteString(PWAMetaTags(app))
 		if IsPWAEnabled(app) {
 			sb.WriteString(pwaRegisterScriptTag)
@@ -212,29 +233,32 @@ func wrapLayoutAt(content, title string, app *App, session *Session, page *Page,
 	}
 	sb.WriteString(content)
 
+	// DefaultJS holds the helpers page markup may call (switchTab,
+	// toggleAccordion, ...); "none" mode skips it. Live updates and the dev
+	// reload are for a browser: a printed document is a snapshot.
+	shellJS := ""
 	if cssMode != "none" {
-		sb.WriteString(`<script>`)
-		sb.WriteString(DefaultJS)
-		sb.WriteString(SSEClientScript)
+		shellJS = DefaultJS
+	}
+	if !forPrint {
+		shellJS += SSEClientScript
 		if devReloadClientEnabled(app) {
-			sb.WriteString(DevReloadClientScript)
+			shellJS += DevReloadClientScript
 		}
-		sb.WriteString(`</script>`)
-	} else {
-		// In "none" mode, still inject SSE for live updates but skip DefaultJS (switchTab, toggleAccordion, etc.)
+	}
+	if shellJS != "" {
 		sb.WriteString(`<script>`)
-		sb.WriteString(SSEClientScript)
-		if devReloadClientEnabled(app) {
-			sb.WriteString(DevReloadClientScript)
-		}
+		sb.WriteString(shellJS)
 		sb.WriteString(`</script>`)
 	}
 	if app != nil {
-		sb.WriteString(RecorderScript(app, app.DevMode))
-		// Testing mode shows the feedback flag (below); there is no banner.
-		// features.feedback keeps the flag on a published prod app.
-		if app.FeedbackWidgetEnabled() {
-			sb.WriteString(FeedbackWidgetHTML(app.FeatureEnabled("testing")))
+		if !forPrint {
+			sb.WriteString(RecorderScript(app, app.DevMode))
+			// Testing mode shows the feedback flag (below); there is no banner.
+			// features.feedback keeps the flag on a published prod app.
+			if app.FeedbackWidgetEnabled() {
+				sb.WriteString(FeedbackWidgetHTML(app.FeatureEnabled("testing")))
+			}
 		}
 		// "Built with Benmore" attribution badge. Renders only for the hosted
 		// platform's free tier; a no-op for self-hosted apps (see
@@ -243,9 +267,16 @@ func wrapLayoutAt(content, title string, app *App, session *Session, page *Page,
 	}
 	// Analytics beacon - auto-injected when features.analytics is enabled (default: true)
 	if app.FeatureEnabled("analytics") {
-		sb.WriteString(AnalyticsBeaconJS())
-		if !pageOptsOutOfCookieBanner([]byte(content)) {
-			sb.WriteString(AnalyticsCookieNotice(app))
+		bannerShown := !pageOptsOutOfCookieBanner([]byte(content))
+		if !forPrint {
+			sb.WriteString(AnalyticsBeaconJS())
+			if bannerShown {
+				sb.WriteString(AnalyticsCookieNotice(app))
+			}
+		} else if bannerShown {
+			// No visitor, so no beacon and no banner; page script that asks
+			// for the choice still gets an answer.
+			sb.WriteString(analyticsConsentPrintStub)
 		}
 	}
 	// Form control styling handled by @tailwindcss/forms plugin (embedded in tailwind.min.js)

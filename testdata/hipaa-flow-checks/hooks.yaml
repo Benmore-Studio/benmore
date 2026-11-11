@@ -1,0 +1,6 @@
+# A hook's own SQL write is not in the audit log either. The second entry of
+# the same event and table records it.
+on_insert:
+  patients:
+    - sql: "INSERT INTO visit_notes (body, user_id) VALUES ('intake', {{user_id}})"
+    - sql: "INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, new_values) VALUES ('insert', 'visit_notes', (SELECT MAX(id) FROM visit_notes WHERE user_id = {{user_id}} AND body = 'intake'), {{user_id}}, {{user_email}}, json_object('source', 'hook:patients.on_insert'))"

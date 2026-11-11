@@ -285,7 +285,7 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 			sqlRows, err = ctx.mcpReadConn.QueryContext(ctx.Request.Context(), query, args...)
 		} else {
 			key = cryptoKeyForQuerier(db)
-			sqlRows, err = db.QueryContext(ctx.execContext(), query, args...)
+			sqlRows, err = db.QueryContext(ctx.execContext(), appSQL(ctx.App, query), args...)
 		}
 		if err != nil {
 			return fmt.Errorf("sql: %w", err)
@@ -340,7 +340,7 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 		if _, ok := sqlRunnableText(query); !ok {
 			return fmt.Errorf("sql: %w", errNoSQLStatement)
 		}
-		res, err := db.ExecContext(ctx.execContext(), query, args...)
+		res, err := db.ExecContext(ctx.execContext(), appSQL(ctx.App, query), args...)
 		if err != nil {
 			return fmt.Errorf("sql: %w", err)
 		}
@@ -810,7 +810,7 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 			sqlRows, err = ctx.mcpReadConn.QueryContext(ctx.Request.Context(), query)
 		} else {
 			key = cryptoKeyForQuerier(db)
-			sqlRows, err = db.QueryContext(ctx.execContext(), query)
+			sqlRows, err = db.QueryContext(ctx.execContext(), appSQL(ctx.App, query))
 		}
 		if err != nil {
 			return fmt.Errorf("sql_dynamic: %w", err)
@@ -846,7 +846,7 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 		if _, ok := sqlRunnableText(query); !ok {
 			return fmt.Errorf("sql_dynamic: %w", errNoSQLStatement)
 		}
-		res, err := db.ExecContext(ctx.execContext(), query)
+		res, err := db.ExecContext(ctx.execContext(), appSQL(ctx.App, query))
 		if err != nil {
 			return fmt.Errorf("sql_dynamic: %w", err)
 		}

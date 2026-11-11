@@ -11,6 +11,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -138,6 +139,20 @@ func sendMFASetupStep(w http.ResponseWriter, r *http.Request, app *App) {
 // useless after a single sign-in attempt.
 const mfaSetupTokenTTL = 15 * time.Minute
 
+// errMFACredentialMayNotEnroll refuses a caller who is signed in with a
+// credential that may not manage the account's factor: an API token, a scoped
+// session, an act-as or support session. The credential is valid, so the
+// answer is 403; a request with no credential stays 401.
+var errMFACredentialMayNotEnroll = errors.New("MFA enrollment requires a full-access login session outside act-as mode: sign in with the account's password (an API token or a scoped session cannot enroll)")
+
+// mfaCallerRefusalStatus maps a mfaCallerIdentity error onto its status.
+func mfaCallerRefusalStatus(err error) int {
+	if errors.Is(err, errMFACredentialMayNotEnroll) {
+		return http.StatusForbidden
+	}
+	return http.StatusUnauthorized
+}
+
 // mfaCallerIdentity resolves the caller of an MFA endpoint. Prefers a
 // real session; falls back to an MFA-setup token from the
 // X-MFA-Setup-Token header or _benmore_mfa_setup cookie. Returns
@@ -148,7 +163,7 @@ const mfaSetupTokenTTL = 15 * time.Minute
 func mfaCallerIdentity(app *App, r *http.Request) (userID int64, email string, fromSetupToken bool, err error) {
 	if s := getSession(app, r); s != nil {
 		if !credentialManagementSession(app, s) || !accountManagementSession(s) {
-			return 0, "", false, fmt.Errorf("MFA enrollment requires a full-access login session outside act-as mode")
+			return 0, "", false, errMFACredentialMayNotEnroll
 		}
 		return s.UserID, s.Email, false, nil
 	}
@@ -158,7 +173,7 @@ func mfaCallerIdentity(app *App, r *http.Request) (userID int64, email string, f
 	}
 	if s := mfaEnrollmentSession(app, r); s != nil {
 		if !credentialManagementSession(app, s) || !accountManagementSession(s) {
-			return 0, "", false, fmt.Errorf("MFA enrollment requires a full-access login session outside act-as mode")
+			return 0, "", false, errMFACredentialMayNotEnroll
 		}
 		return s.UserID, s.Email, false, nil
 	}
@@ -214,7 +229,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		}
 		userID, email, fromSetup, err := mfaCallerIdentity(app, r)
 		if err != nil {
-			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": err.Error()})
+			httpJSON(w, mfaCallerRefusalStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		// CSRF only protects cookie-session callers. Bearer-auth and the
@@ -346,7 +361,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		}
 		userID, email, fromSetup, err := mfaCallerIdentity(app, r)
 		if err != nil {
-			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": err.Error()})
+			httpJSON(w, mfaCallerRefusalStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		if !isBearerAuth(r) && !fromSetup && !validateCSRF(r) {

@@ -85,6 +85,31 @@ func commandActorIdentityKind(raw string) string {
 	return ""
 }
 
+// commandFileNameRule is what the file name of a command flow must be. The
+// name before .yaml is the command's name (the one mcp.yaml binds and audit
+// rows carry), so it follows commandIdent.
+const commandFileNameRule = "<name> starts with a lowercase letter and holds only lowercase letters, digits and underscores, 1 to 64 characters (no hyphen, capital letter or dot)"
+
+// commandFileNameError refuses a command file whose name breaks the rule,
+// says the rule, and offers the nearest allowed name when there is one
+// (receive-stock -> receive_stock).
+func commandFileNameError(stem string) error {
+	if stem == "flows" {
+		return fmt.Errorf("command file name %q is reserved: name the file after the command, flows/<name>.yaml", stem)
+	}
+	msg := fmt.Sprintf("command file name %q is not allowed: in flows/<name>.yaml, %s", stem, commandFileNameRule)
+	fixed := strings.Map(func(r rune) rune {
+		if r == '-' || r == '.' || r == ' ' {
+			return '_'
+		}
+		return r
+	}, strings.ToLower(stem))
+	if fixed != stem && fixed != "flows" && commandIdent.MatchString(fixed) {
+		msg += fmt.Sprintf("; rename it to flows/%s.yaml", fixed)
+	}
+	return errors.New(msg)
+}
+
 func parseFlowCommandFile(filePath string, data []byte, tables map[string]bool) (Flow, error) {
 	return parseFlowCommandFileColumns(filePath, data, tables, nil)
 }
@@ -97,7 +122,7 @@ func parseFlowCommandFileColumns(filePath string, data []byte, tables map[string
 		return Flow{}, err
 	}
 	if !strings.HasPrefix(filePath, "flows/") || strings.Count(filePath, "/") != 1 || path.Clean(filePath) != filePath || path.Ext(filePath) != ".yaml" {
-		return Flow{}, fmt.Errorf("command filename must be flows/<safe-name>.yaml")
+		return Flow{}, fmt.Errorf("a command file must be flows/<name>.yaml (directly in flows/, extension .yaml): %s", commandFileNameRule)
 	}
 	var doc yaml.Node
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -128,7 +153,7 @@ func parseFlowCommandFileColumns(filePath string, data []byte, tables map[string
 	}
 	stem := strings.TrimSuffix(path.Base(filePath), path.Ext(filePath))
 	if !commandIdent.MatchString(stem) || stem == "flows" {
-		return Flow{}, fmt.Errorf("command filename must be flows/<safe-name>.yaml")
+		return Flow{}, commandFileNameError(stem)
 	}
 	cmd, err := compileFlowCommand(root["command"], root["jobs"], root["on"], tables, columns)
 	if err != nil {
