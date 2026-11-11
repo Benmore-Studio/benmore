@@ -1,0 +1,4 @@
+[
+  "You have a platform-staff role with role=admin (sees all tenants) AND occasionally needs to operate AS one tenant - support ticket resolution, cross-tenant audit, building a portfolio-mode dashboard with a tenant drill-down.",
+  "Tenants themselves do NOT need this - their isolation is already enforced by the framework's group scoping. act-as is governance + defense-in-depth for the admin pathway."
+]

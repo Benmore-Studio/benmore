@@ -163,3 +163,50 @@ func TestRequestLogCapsVisitorPathLength(t *testing.T) {
 		t.Fatalf("truncated path is not a rune-safe prefix (len %d)", len(stored))
 	}
 }
+
+// A handler that aborts its answer (http.ErrAbortHandler: a proxy step whose
+// stream failed after it started) still gets its log line, with the status
+// already sent (0 when none was) and its error marked aborted; the abort
+// still reaches net/http.
+func TestRequestLogRecordsAbortedResponse(t *testing.T) {
+	db := requestLogTestDB(t)
+	app := &App{Dir: t.TempDir(), DB: db, Stop: make(chan struct{})}
+	h := requestLogMiddleware(app, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/mid-body":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("partial"))
+			setRequestLogError(r, "proxy upstream cut off")
+		case "/api/before-header":
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	for _, path := range []string{"/api/mid-body", "/api/before-header"} {
+		func() {
+			defer func() {
+				if rec := recover(); rec != http.ErrAbortHandler {
+					t.Errorf("%s: the abort did not reach net/http (recovered %v)", path, rec)
+				}
+			}()
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+		}()
+	}
+	close(app.Stop)
+	app.workerWG.Wait()
+	for path, want := range map[string]struct {
+		status int
+		err    string
+	}{
+		"/api/mid-body":      {http.StatusOK, "response aborted: proxy upstream cut off"},
+		"/api/before-header": {0, "response aborted"},
+	} {
+		var status int
+		var errDetail string
+		if err := db.QueryRow(`SELECT status, error FROM _benmore_request_log WHERE path = ?`, path).Scan(&status, &errDetail); err != nil {
+			t.Fatalf("%s: not logged: %v", path, err)
+		}
+		if status != want.status || errDetail != want.err {
+			t.Errorf("%s: logged status=%d error=%q, want %d %q", path, status, errDetail, want.status, want.err)
+		}
+	}
+}

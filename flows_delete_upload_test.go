@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type countingRoundTripper struct{ calls int }
@@ -35,6 +36,9 @@ func TestDeleteUploadParserValidatorRuntimeInterpolation(t *testing.T) {
 jobs:
   delete:
     steps:
+      - id: lookup
+        run: sql
+        query: "SELECT '/uploads/private/report.pdf' AS path"
       - id: remove
         run: delete_upload
         with:
@@ -47,10 +51,10 @@ jobs:
 		t.Fatal(err)
 	}
 	flows := LoadFlowsGHA(app.Dir)
-	if len(flows) != 1 || len(flows[0].Steps) != 1 {
+	if len(flows) != 1 || len(flows[0].Steps) != 2 {
 		t.Fatalf("parsed flows = %#v", flows)
 	}
-	step := flows[0].Steps[0]
+	step := flows[0].Steps[1]
 	if step.Type != "delete_upload" || step.DeleteUpload != "{{lookup.path}}" {
 		t.Fatalf("parsed step = %#v", step)
 	}
@@ -222,11 +226,12 @@ func TestPresignBrokerDeleteClampsPrefixAndPropagatesFailure(t *testing.T) {
 			}))
 			defer server.Close()
 			s3 := &S3Storage{Endpoint: server.URL, Bucket: "bucket"}
-			resp, err := executePresignBrokerRequest(presignReq{
-				Operation: "delete",
-				Prefix:    "other-app",
-				Path:      "uploads/private/a.pdf",
-			}, "current-app", false, s3)
+			req := presignReq{Operation: "delete", Prefix: "other-app", Path: "uploads/private/a.pdf"}
+			scope, err := presignCallerScope(req, "current-app", false, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := executePresignBrokerRequest(req, scope, s3)
 			if status == http.StatusNoContent {
 				if err != nil {
 					t.Fatalf("broker delete: %v", err)
@@ -299,5 +304,85 @@ func TestDeleteUploadFailureStopsFlowAndRollsBackSQL(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("step after failed delete ran: %v", err)
+	}
+}
+
+// A reference names an object in exactly one spelling. A doubled slash after
+// the app's prefix used to resolve to the same object as the stored URL, so a
+// value that no upload ever produced could still delete or read it.
+func TestPrivateUploadReferenceRefusesNonCanonicalSpellings(t *testing.T) {
+	app := &App{Dir: filepath.Join(t.TempDir(), "current-app")}
+	cdn := &CDNStorage{Prefix: "current-app", CDNDomain: "cdn.example"}
+	s3 := &S3Storage{Endpoint: "https://objects.example", Bucket: "bucket"}
+	local := &LocalStorage{Dir: app.Dir}
+	prefix := appMediaPrefix(app)
+	cdnBase := "https://cdn.example/private/" + prefix
+
+	for _, tt := range []struct {
+		name    string
+		backend StorageBackend
+		raw     string
+	}{
+		{"cdn doubled slash after prefix", cdn, cdnBase + "//uploads/private/a.pdf"},
+		{"cdn tripled slash after prefix", cdn, cdnBase + "///uploads/private/a.pdf"},
+		{"cdn doubled slash before prefix", cdn, "https://cdn.example//private/" + prefix + "/uploads/private/a.pdf"},
+		{"cdn doubled slash in the tier", cdn, "https://cdn.example/private//" + prefix + "/uploads/private/a.pdf"},
+		{"cdn doubled slash in uploads", cdn, cdnBase + "/uploads//private/a.pdf"},
+		{"cdn doubled slash in the key", cdn, cdnBase + "/uploads/private//a.pdf"},
+		{"cdn trailing slash", cdn, cdnBase + "/uploads/private/a.pdf/"},
+		{"cdn uppercase scheme", cdn, "HTTPS://cdn.example/private/" + prefix + "/uploads/private/a.pdf"},
+		{"cdn explicit port", cdn, "https://cdn.example:443/private/" + prefix + "/uploads/private/a.pdf"},
+		{"s3 doubled slash after bucket", s3, "https://objects.example/bucket//uploads/private/a.pdf"},
+		{"s3 doubled slash in the key", s3, "https://objects.example/bucket/uploads/private//a.pdf"},
+		{"s3 uppercase scheme", s3, "HTTPS://objects.example/bucket/uploads/private/a.pdf"},
+		{"logical doubled leading slash", local, "//uploads/private/a.pdf"},
+		{"logical doubled slash in uploads", local, "uploads//private/a.pdf"},
+		{"logical doubled slash in the key", local, "uploads/private//a.pdf"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := privateUploadPath(app, tt.backend, tt.raw); err == nil {
+				t.Fatalf("privateUploadPath(%q) accepted it as %q", tt.raw, got)
+			}
+		})
+	}
+
+	// What uploads actually produce stays accepted, including the served path
+	// /api/_upload returns for local files.
+	for _, tt := range []struct {
+		name    string
+		backend StorageBackend
+		raw     string
+	}{
+		{"cdn stored url", cdn, cdnBase + "/uploads/private/sub/a.pdf"},
+		{"s3 stored url", s3, "https://objects.example/bucket/uploads/private/sub/a.pdf"},
+		{"local served path", local, "/uploads/private/sub/a.pdf"},
+		{"logical path", local, "uploads/private/sub/a.pdf"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := privateUploadPath(app, tt.backend, tt.raw); err != nil || got != "uploads/private/sub/a.pdf" {
+				t.Fatalf("privateUploadPath(%q) = %q, %v", tt.raw, got, err)
+			}
+		})
+	}
+}
+
+// delete_upload refuses the doubled-slash spelling before any storage I/O: the
+// canonical URL reaches the CDN backend (here it stops at the missing broker),
+// the doubled one stops at the reference check.
+func TestDeletePrivateUploadRefusesDoubledSlashBeforeStorage(t *testing.T) {
+	app, cleanup := newTestApp(t)
+	defer cleanup()
+	t.Setenv("BENMORE_PRESIGN_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	cfg := testMediaConfig(t)
+	withPlatformMedia(t, cfg)
+	base := "https://" + cfg.CDNDomain + "/private/" + appMediaPrefix(app)
+
+	err := deletePrivateUpload(app, base+"/uploads/private/a.pdf")
+	if err == nil || !strings.Contains(err.Error(), "broker") {
+		t.Fatalf("canonical reference = %v, want it to reach the storage backend", err)
+	}
+	err = deletePrivateUpload(app, base+"//uploads/private/a.pdf")
+	if err == nil || strings.Contains(err.Error(), "broker") {
+		t.Fatalf("doubled-slash reference = %v, want a refusal before the storage backend", err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -646,6 +647,37 @@ func sqlStatementWrite(toks []sqlToken) (sqlWrite, bool) {
 		}
 	}
 	return sqlWrite{Table: table, Action: action}, true
+}
+
+// sqlSingleSelectProblem says why a text is not one read-only statement
+// (a SELECT, a WITH ... SELECT or a VALUES), or "" when it is. It reads the
+// statement's own verb off the token stream, so a comment, a quoted name or a
+// CTE cannot hide it, and a word that only looks like a write (a 'delete'
+// literal, the replace() function, a column named update_count) is not one.
+// SQLite has no SELECT that writes, apart from load_extension, which is
+// refused wherever it appears. Used for app-authored SQL that must only read
+// (app.yaml aggregates, computed.yaml sql:); the connection that runs an
+// aggregate is read-only as well (queryRowReadOnly).
+func sqlSingleSelectProblem(query string) string {
+	if strings.Contains(strings.ToLower(query), "load_extension") {
+		return "load_extension is not allowed"
+	}
+	statements := sqlTokenStatements(sqlTokenize(query))
+	switch len(statements) {
+	case 0:
+		return "it holds no SQL statement"
+	case 1:
+	default:
+		return "it holds " + strconv.Itoa(len(statements)) + " statements; write one SELECT"
+	}
+	switch verb := sqlMainVerb(statements[0]); verb {
+	case "SELECT", "VALUES":
+		return ""
+	case "":
+		return "it does not start with SELECT"
+	default:
+		return "its statement is " + verb + ", not a SELECT"
+	}
 }
 
 // --- text the driver can run ---

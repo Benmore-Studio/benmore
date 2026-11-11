@@ -1,0 +1,5 @@
+[
+  "Supports macOS/Linux on amd64/arm64 and verifies the selected GitHub release archive against checksums.txt before installing.",
+  "Set BENMORE_VERSION=cli-vX.Y.Z to pin a release and BENMORE_INSTALL_DIR=/path/to/bin to choose the destination.",
+  "Without BENMORE_INSTALL_DIR, the installer uses writable /usr/local/bin or falls back to ~/.local/bin and reports when PATH needs updating."
+]

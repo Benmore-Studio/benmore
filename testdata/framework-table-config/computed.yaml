@@ -1,0 +1,8 @@
+fields:
+  - table: notes
+    column: title_len
+    expr: "length(title)"
+  # Not installed: it would make every account that signs in an admin.
+  - table: _benmore_users
+    column: role
+    expr: "'admin'"

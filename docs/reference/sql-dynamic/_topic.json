@@ -1,0 +1,15 @@
+{
+  "keys": [
+    "summary",
+    "when_to_use",
+    "never_use_for",
+    "yaml_example",
+    "validation",
+    "params",
+    "unresolved",
+    "expect_rows",
+    "audit_logging",
+    "alternatives",
+    "hint"
+  ]
+}

@@ -1,0 +1,5 @@
+[
+  "POST /api/_analytics — pageview beacon; body keys p (path), r (referrer), sw/sh (screen size), us/um/uc (UTM attribution)",
+  "POST /api/_analytics — duration update with p, fin:1 and d (milliseconds); does not create another pageview or visitor",
+  "GET /api/_analytics/summary?days=7 — admin-only aggregate statistics"
+]

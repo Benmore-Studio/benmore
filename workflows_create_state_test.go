@@ -67,7 +67,7 @@ func TestWorkflowStateOnCreateIsInitialOnly(t *testing.T) {
 	if got["approved"] != 0 {
 		t.Fatalf("a create placed rows directly in a guarded state: %v", got)
 	}
-	if got["pending"] != 3 {
-		t.Fatalf("the declared initial state must still be accepted on create (single, batch, tx): %v", got)
+	if got["pending"] != 7 {
+		t.Fatalf("every create (single, batch, ingest, tx) must start in the declared initial state, sent or not: %v", got)
 	}
 }

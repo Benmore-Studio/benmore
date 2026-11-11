@@ -5,6 +5,10 @@ export interface User {
   last_name?: string | null;
   role: string;
   verified: number;
+  /** Every role the user holds: global roles plus the current tenant's roles. */
+  roles?: string[];
+  /** A groups: app's current tenant id (an admin's act-as tenant while stepped in); null without one. */
+  group_id?: string | null;
   [field: string]: unknown;
 }
 
@@ -16,12 +20,30 @@ export interface ListOpts {
   /** Column to order by (snake_case, as stored). */
   sort?: string;
   order?: 'asc' | 'desc';
+  /** REST shorthand for sort + order: 'starts_at:asc'. Ignored when sort is set. */
+  orderBy?: string;
+  /** Related rows to embed (?include=): 'author' or ['author', 'comments']. */
+  include?: string | string[];
+  /** Columns to return (?fields=). */
+  fields?: string | string[];
+  /** Page number for page/per_page pagination (list() still returns the rows only). */
+  page?: number;
+  per_page?: number;
+  /** Equality filters (col: value) and operator filters (col__gte: value). Other top-level keys are not sent. */
   where?: Record<string, string | number | boolean>;
 }
 
 export interface ApiResult<T = unknown> {
   ok: boolean;
   status: number;
+  /**
+   * Parsed JSON; the text of a 2xx text/* answer; a Blob for a 2xx answer of
+   * any other type (an image, PDF or ZIP); {error, body} for a failed answer
+   * that is not JSON (body is the text as received; error is that text when it
+   * is one short line of plain text, else "Request failed (HTTP <status>)", so
+   * an HTML error page never becomes a thrown Error's message); null for an
+   * empty body.
+   */
   data: T | null;
 }
 
@@ -52,6 +74,11 @@ export interface AuthCalls {
   me(): Promise<User | null>;
   signOut(): Promise<void>;
   refreshMe(): Promise<User | null>;
+  /**
+   * When the sign-in still needs a step ({otp_required | mfa_required |
+   * mfa_setup_required, redirect}), the browser goes to that page (/verify-otp,
+   * /verify-mfa, /mfa-setup, keeping ?next=) and the promise does not settle.
+   */
   signIn(identifier: string, password: string): Promise<User | null>;
   signUp(fields: { email: string; password: string; [extraField: string]: unknown }): Promise<User | null>;
   /** Passkeys (WebAuthn): Face ID, Touch ID, Windows Hello, a phone. */
@@ -101,11 +128,17 @@ export interface VersionHistory {
   id: string;
   versions: VersionMetadata[];
 }
+export interface RevertKeptColumn {
+  column: string;
+  reason: 'command_owned' | 'workflow_state' | 'protected' | 'hidden' | 'not_in_version';
+}
 export interface RevertReceipt {
   status: 'reverted';
   id: string;
   reverted_to_version: string;
   owned_fields_kept: string[] | null;
+  /** Columns that kept their current value instead of the version's, and why. */
+  kept: RevertKeptColumn[];
 }
 
 export interface TableClient<Row = Record<string, unknown>> {
@@ -121,21 +154,69 @@ export interface TableClient<Row = Record<string, unknown>> {
   revertTo(id: number | string, version: number): Promise<RevertReceipt>;
 }
 
+/** bm.room() connection state, delivered as the 'bm:status' event (from is null). */
+export interface RoomStatus {
+  state: 'open' | 'reconnecting' | 'closed';
+  /** 'open' after a reconnect: messages sent while it was down are not replayed. */
+  reconnected?: boolean;
+  /** 'reconnecting': retry number, delay in ms, and the socket's close code. */
+  attempt?: number;
+  retryIn?: number;
+  code?: number;
+  /** 'reconnecting' after a failed handshake: the GET /ws answer (429, 502, ...). */
+  http?: number;
+  /** 'closed': why the room ended for good. */
+  reason?: 'left' | 'refused' | 'unauthorized' | 'forbidden';
+  /** 'closed': queued messages that were never sent. */
+  unsent?: number;
+}
+
+/** A refused join or handshake, delivered as the 'bm:error' event (from is null). The room then closes. */
+export interface RoomError {
+  code: 'not_member' | 'too_many_rooms' | 'join_refused' | 'unauthorized' | 'forbidden';
+  message: string;
+  room: string;
+}
+
 export interface RoomClient {
   readonly name: string;
+  /** Reconnects with backoff after a drop; 'closed' is final (leave, refused join, 401/403). */
+  readonly state: 'connecting' | 'open' | 'reconnecting' | 'closed';
+  on(kind: 'bm:status', fn: (status: RoomStatus, from: null) => void): this;
+  on(kind: 'bm:error', fn: (error: RoomError, from: null) => void): this;
   on(kind: string, fn: (payload: unknown, from: number | string) => void): this;
-  onAny(fn: (payload: unknown, from: number | string, kind: string) => void): this;
+  onAny(fn: (payload: unknown, from: number | string | null, kind: string) => void): this;
   off(kind: string, fn: Function): this;
-  send(payload: unknown): void;
+  /** true: sent; false: queued (16 max) until the room is open again.
+   *  Throws (code 'room_closed' or 'room_queue_full') instead of dropping. */
+  send(payload: unknown): boolean;
   leave(): void;
+  /** The current WebSocket; a reconnect replaces it. */
   readonly raw: WebSocket;
+}
+
+/** POST /api/<table>/<id>/transition answer. */
+export interface WorkflowTransitionResult {
+  status: 'transitioned';
+  from: string;
+  to: string;
+  /** The row id as it appeared in the URL (a string). */
+  id: string;
+}
+
+/** GET /api/<table>/<id>/transitions answer: the row's state and the moves this caller may make. */
+export interface WorkflowAvailable {
+  current: string;
+  /** role is set when the transition is role-gated (the caller holds it). */
+  transitions: Array<{ to: string; role?: string }>;
 }
 
 export interface WorkflowClient {
   readonly table: string;
   readonly id: number | string;
-  transitionTo(state: string): Promise<{ state: string }>;
-  available(): Promise<string[]>;
+  transitionTo(state: string): Promise<WorkflowTransitionResult>;
+  available(): Promise<WorkflowAvailable>;
+  /** The state stored in the workflow's own field (workflows.yaml field:). */
   current(): Promise<string>;
 }
 
@@ -292,6 +373,13 @@ export namespace live {
 }
 
 export function room(name: string): RoomClient;
+/**
+ * Call a flow by name. params fill the route's :path segments; a GET or HEAD
+ * flow sends the other params as its query string (it has no body). Resolves
+ * the parsed JSON answer, the text of a text/* answer (a CSV), or a Blob for
+ * any other type (the image or PDF of run: proxy / serve_file); an async flow
+ * resolves a Job.
+ */
 export const flows: Record<string, (params?: Record<string, unknown>, body?: unknown) => Promise<unknown | Job>>;
 export function workflow(table: string, id: number | string): WorkflowClient;
 export function aggregate<Result = unknown>(name: string): Promise<Result | null>;
@@ -317,6 +405,7 @@ export const permissions: {
   revoke(table: string, id: number | string, email: string): Promise<void>;
   list(table: string, id: number | string): Promise<unknown>;
 };
+/** Time-limited URL for a file. Default lifetime 300s; audio/video default to 4h so playback does not outlive the link (max 6h). */
 export function signedUrl(path: string, opts?: number | { ttl?: number; ttlSeconds?: number; record?: { table: string; id: number | string } }): Promise<string>;
 export function t(key: string, vars?: Record<string, string | number>): string;
 export const broadcast: {
@@ -326,9 +415,12 @@ export const broadcast: {
 };
 export const webrtc: { iceServers(): Promise<IceServer[]> };
 export const mfa: {
-  enroll(): Promise<{ qr_data_url: string; secret: string; backup_codes: string[] }>;
-  verify(code: string): Promise<{ ok: boolean }>;
-  disable(password: string): Promise<{ ok: boolean }>;
+  /** From a signed-in session pass the current password; on the /mfa-setup page after a sign-in that requires enrollment, pass nothing. */
+  enroll(password?: string): Promise<{ secret: string; otpauth_uri: string; backup_codes: string[] }>;
+  /** After a sign-in that required enrollment this also signs the person in (token, user_id, email). */
+  verify(code: string): Promise<{ status: "mfa_enabled"; token?: string; user_id?: number; email?: string }>;
+  /** Turns the factor off. Takes a current 6-digit code from the authenticator (not the password, not a backup code). */
+  disable(code: string): Promise<{ status: "mfa_disabled" }>;
 };
 export function html(strings: TemplateStringsArray, ...values: unknown[]): SafeHtml;
 export function raw(value: string): SafeHtml;
@@ -357,7 +449,14 @@ declare const cache: {
   persistent(name: string, version: string | number): CacheClient | null;
 };
 
+export function captureError(err: unknown, options?: { tags?: Record<string, string> }): void;
+export function captureMessage(message: string, level?: 'warning' | 'error' | 'fatal'): void;
+export function setTag(key: string, value: string): void;
+
 declare const bm: {
+  captureError: typeof captureError;
+  captureMessage: typeof captureMessage;
+  setTag: typeof setTag;
   api: typeof api;
   auth: typeof auth;
   users: typeof users;

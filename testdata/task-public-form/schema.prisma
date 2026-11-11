@@ -1,0 +1,9 @@
+model Message {
+  id         Int      @id @default(autoincrement())
+  name       String
+  email      String
+  body       String
+  notifiedAt String   @default("") @map("notified_at")   // when the owner was emailed
+  createdAt  DateTime @default(now()) @map("created_at")
+  @@map("messages")
+}

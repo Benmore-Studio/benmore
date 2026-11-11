@@ -1,0 +1,10 @@
+// What transitions can the current user trigger from here?
+const { current, transitions } = await fetch(`/api/orders/${id}/transitions`).then(r => r.json());
+// { current: 'pending', transitions: [{ to: 'processing', role: 'admin' }, { to: 'cancelled' }] }
+
+// Move to the next state
+await fetch(`/api/orders/${id}/transition`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  body: JSON.stringify({ to: 'processing' }),
+});

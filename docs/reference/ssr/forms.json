@@ -1,0 +1,5 @@
+[
+  "A POST form needs no token field: the runtime adds `_csrf` to every form with method=\"post\" or an hx-post/put/patch/delete attribute (HTMX requests also send the X-CSRF-Token header). Don't write one: `{{csrf}}` renders empty in mustache and `{{.csrf}}` in gotmpl.",
+  "A search or filter form is a GET form: `<form method=\"get\" action=\"/events\"><input name=\"city\"><button>Filter</button></form>`. Its fields become the next page's `{{param_city}}` / `.param_city` / `:param_city`. A form the browser submits with GET (method=\"get\", hx-get, or no method) never gets the CSRF token, so it never lands in the URL. The write gate accepts method=\"get\" and hx-get forms; a form with inputs and no method at all is refused (next entry).",
+  "The write gate refuses a form with inputs and no method, HTMX attribute or directive (dead-form), a password form without method=\"post\", nested forms and `_method` overrides."
+]

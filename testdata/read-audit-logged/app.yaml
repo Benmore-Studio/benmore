@@ -1,0 +1,16 @@
+site_name: "read audit outside hipaa"
+auth:
+  identifier: email
+  read_audit: patients,notices
+  read_audit_sync: true
+access:
+  patients:
+    read: self
+    write: self
+    update: self
+    delete: self
+  notices:
+    read: anon
+    write: role:admin
+frontend:
+  stack: html

@@ -10,10 +10,11 @@ import (
 	"time"
 )
 
-// The bmp-auth mint endpoint (POST /api/_auth/api-tokens) authenticates a
+// The API-token mint endpoint (POST /api/_auth/api-tokens) authenticates a
 // browser via the session cookie. Like every sibling cookie-session mutation
-// it MUST require a CSRF token, otherwise a logged-in victim navigated to
-// /bmp-auth (or a cross-site POST) mints a full-scope bmr_ token. (Task 4/22.)
+// it MUST require a CSRF token, otherwise a logged-in victim navigated to a
+// page that mints on load (or a cross-site POST) mints a full-scope bmr_
+// token. (Task 4/22.)
 func TestCreateAPITokenRequiresCSRF(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
@@ -56,8 +57,8 @@ func TestCreateAPITokenRequiresCSRF(t *testing.T) {
 	}
 
 	// Cookie auth WITH a valid session-bound CSRF token → succeeds. Proves the
-	// gate accepts the exact header bmp-auth.html sends (no legitimate client
-	// breaks).
+	// gate accepts the X-CSRF-Token header a signed-in page sends (no
+	// legitimate client breaks).
 	w := mint(true)
 	if w.Code != http.StatusOK {
 		t.Fatalf("cookie mint with valid CSRF must be 200, got %d: %s", w.Code, w.Body.String())

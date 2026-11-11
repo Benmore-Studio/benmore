@@ -1,0 +1,5 @@
+site_name: "ddl-text-baseline"
+auth:
+  identifier: email
+
+versioned: [tasks]

@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-enqueue
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - run: enqueue
+        with: { flow: plain_email }
+      - run: respond
+        with: { json: { ok: true } }

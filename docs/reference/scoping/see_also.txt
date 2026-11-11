@@ -1,0 +1,1 @@
+api({ at: 'access' }) - the declarative model that unifies scoping + visibility per operation. api({ at: 'act-as' }) - composes with the self-scoped tenant-root pattern above.

@@ -14,7 +14,7 @@ import (
 )
 
 // Behavioural half of referrer_policy_post_form_guard_test.go (incident
-// 2026-10-14, benmore-go#464: the connector review pages sent
+// 2026-10-14: the connector review pages sent
 // Referrer-Policy: no-referrer, a real browser posted the approve form with
 // `Origin: null`, and no person could approve a connector change on any app,
 // while every Go test passed because net/http never derives an Origin from a

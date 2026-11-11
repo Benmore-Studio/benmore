@@ -138,7 +138,7 @@ func TestSFUFailureDoesNotRelayUpstreamDetail(t *testing.T) {
 	_, mux, sid, rec := sfuScopeFixture(t)
 	rec.failPull = `{"errorCode":"internal","errorDescription":"upstream-secret-detail"}`
 	w := sfuPost(mux, sid, "/api/_broadcast/publish", `{"slug":"live","sdp":"v=0\r\na=mid:0\r\n"}`)
-	if w.Code != http.StatusBadGateway || strings.Contains(w.Body.String(), "upstream-secret-detail") || strings.Contains(w.Body.String(), "detail") {
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "upstream-secret-detail") || strings.Contains(w.Body.String(), "detail") {
 		t.Fatalf("publish failure relayed upstream detail: %d %s", w.Code, w.Body.String())
 	}
 }

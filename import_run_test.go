@@ -1044,3 +1044,81 @@ func TestRunImportAtTargetScale(t *testing.T) {
 	t.Logf("peak heap during load: %.1f MB (fixture on disk: %.1f MB)",
 		float64(peakHeap.Load())/1e6, float64(bytesTotal)/1e6)
 }
+
+// A key a later NDJSON object leaves out takes the column's DEFAULT, as a
+// column no object carries does; a key written as null stays NULL.
+func TestRunImportNDJSONMissingKeyTakesDefault(t *testing.T) {
+	app, cleanup := newImportTestApp(t)
+	defer cleanup()
+	mustExec(t, app.DB, `CREATE TABLE stock (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		sku TEXT,
+		qty INTEGER DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'active'
+	)`)
+	content := "{\"sku\":\"A\",\"qty\":5,\"status\":\"held\"}\n{\"sku\":\"B\"}\n{\"sku\":\"C\",\"qty\":null,\"status\":\"held\"}\n{}\n"
+	sum := stageString(t, app, "run0010a", content)
+	sess := &importSession{ID: "run0010a", TableName: "stock", Format: "ndjson", BytesTotal: int64(len(content)), SHA256: sum}
+	insertSession(t, app, sess)
+	if err := runImport(app, sess); err != nil {
+		t.Fatalf("runImport: %v", err)
+	}
+	rows, err := app.DB.Query("SELECT COALESCE(sku, '-'), COALESCE(CAST(qty AS TEXT), 'NULL'), status FROM stock ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var sku, qty, status string
+		rows.Scan(&sku, &qty, &status)
+		got = append(got, sku+"/"+qty+"/"+status)
+	}
+	want := []string{"A/5/held", "B/0/active", "C/NULL/held", "-/0/active"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("rows = %v, want %v", got, want)
+	}
+}
+
+// Columns the published Prisma schema declares are type-checked like CRUD
+// writes: text in an Int column fails the load (atomically), and a Boolean
+// takes true/false.
+func TestRunImportChecksPrismaTypes(t *testing.T) {
+	app, cleanup := newImportTestApp(t)
+	defer cleanup()
+	mustExec(t, app.DB, `CREATE TABLE gadgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, qty INTEGER, live BOOLEAN)`)
+	app.mu.Lock()
+	app.Tables = append(app.Tables, Table{Name: "gadgets", Columns: []Column{
+		{Name: "id", Type: "INTEGER", prismaScalar: true},
+		{Name: "name", Type: "TEXT", prismaScalar: true},
+		{Name: "qty", Type: "INTEGER", prismaScalar: true},
+		{Name: "live", Type: "BOOLEAN", prismaScalar: true},
+	}})
+	app.mu.Unlock()
+
+	bad := "name,qty,live\nA,1,true\nB,abc,false\n"
+	sum := stageString(t, app, "run0011a", bad)
+	sess := &importSession{ID: "run0011a", TableName: "gadgets", Format: "csv", BytesTotal: int64(len(bad)), SHA256: sum}
+	insertSession(t, app, sess)
+	err := runImport(app, sess)
+	if err == nil || !strings.Contains(err.Error(), "row 2") || !strings.Contains(err.Error(), "qty must be an integer") {
+		t.Fatalf("runImport = %v, want row 2: qty must be an integer", err)
+	}
+	var n int
+	app.DB.QueryRow("SELECT COUNT(*) FROM gadgets").Scan(&n)
+	if n != 0 {
+		t.Fatalf("a refused load left %d rows", n)
+	}
+
+	good := "name,qty,live\nA,1,true\nB,2,false\n"
+	sum = stageString(t, app, "run0011b", good)
+	sess = &importSession{ID: "run0011b", TableName: "gadgets", Format: "csv", BytesTotal: int64(len(good)), SHA256: sum}
+	insertSession(t, app, sess)
+	if err := runImport(app, sess); err != nil {
+		t.Fatalf("runImport: %v", err)
+	}
+	var stored string
+	if err := app.DB.QueryRow("SELECT typeof(live) || ':' || CAST(live AS TEXT) FROM gadgets WHERE name = 'A'").Scan(&stored); err != nil || stored != "integer:1" {
+		t.Fatalf("Boolean true stored as %q (%v), want integer:1", stored, err)
+	}
+}

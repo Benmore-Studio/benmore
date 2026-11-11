@@ -24,6 +24,7 @@ package main
 // Ring buffer: auto-prune to last 50,000 events per app.
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -349,7 +350,7 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_analytics/summary", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, "admin required", 403)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 		// Only the parsed integer reaches the SQL text.
@@ -433,7 +434,7 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, "admin required", 403)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 		if !requireCSRF(w, r) {
@@ -444,7 +445,7 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 			Steps []string `json:"steps"` // ["/", "/pricing", "/signup"]
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || len(req.Steps) < 2 {
-			http.Error(w, "name and at least 2 steps required", 400)
+			httpError(w, "name and at least 2 steps required", http.StatusBadRequest)
 			return
 		}
 		stepsJSON, _ := json.Marshal(req.Steps)
@@ -462,7 +463,7 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_analytics/funnels", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, "admin required", 403)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 		// Only the parsed integer reaches the SQL text.
@@ -503,7 +504,7 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("DELETE /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, "admin required", 403)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 		if !requireCSRF(w, r) {
@@ -522,6 +523,12 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 // For each step, counts how many unique visitors who started at step 1
 // also visited the subsequent steps (in any order, within the same session).
 func evaluateFunnel(db *sql.DB, steps []string, since string) []map[string]any {
+	return evaluateFunnelContext(context.Background(), db, steps, since)
+}
+
+// evaluateFunnelContext is evaluateFunnel bounded by ctx: its queries stop
+// when ctx ends (the data channel's per-operation budget).
+func evaluateFunnelContext(ctx context.Context, db *sql.DB, steps []string, since string) []map[string]any {
 	if len(steps) == 0 {
 		return nil
 	}
@@ -530,7 +537,7 @@ func evaluateFunnel(db *sql.DB, steps []string, since string) []map[string]any {
 
 	// Get all sessions that hit step 1
 	step1Sessions := map[string]bool{}
-	rows, err := db.Query(
+	rows, err := db.QueryContext(ctx,
 		"SELECT DISTINCT session_id FROM _benmore_analytics WHERE path = ? AND created_at >= "+since,
 		steps[0],
 	)
@@ -556,8 +563,11 @@ func evaluateFunnel(db *sql.DB, steps []string, since string) []map[string]any {
 	for i := 1; i < len(steps); i++ {
 		count := 0
 		for sid := range step1Sessions {
+			if ctx.Err() != nil {
+				break
+			}
 			var exists int
-			db.QueryRow(
+			db.QueryRowContext(ctx,
 				"SELECT 1 FROM _benmore_analytics WHERE session_id = ? AND path = ? LIMIT 1",
 				sid, steps[i],
 			).Scan(&exists)

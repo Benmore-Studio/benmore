@@ -23,6 +23,15 @@ func recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				// http.ErrAbortHandler is how httputil.ReverseProxy (and our own
+				// handlers) abort a response on purpose, usually because the
+				// client went away mid-stream (an SSE tab closing). It is not a
+				// fault: pass it on so net/http aborts the connection quietly.
+				// Swallowing it logged a stack trace per closed stream and let
+				// the server finish a truncated body as if it were complete.
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				stack := debug.Stack()
 				log.Printf("PANIC %s %s - %v\n%s", r.Method, r.URL.Path, rec, stack)
 				// Best-effort 500. If headers are already written, this is a
@@ -35,8 +44,9 @@ func recoverMiddleware(next http.Handler) http.Handler {
 					reference = `<p style="color:#666">Request id: ` + html.EscapeString(id) + `</p>`
 				}
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprint(w, `<!doctype html><html><head><title>Error</title></head><body style="font-family:system-ui,sans-serif;padding:40px;text-align:center"><h1>Something went wrong</h1><p style="color:#666">A server error occurred. The team has been notified.</p>`+reference+`</body></html>`)
+				fmt.Fprint(w, `<!doctype html><html><head><title>Error</title></head><body style="font-family:system-ui,sans-serif;padding:40px;text-align:center"><h1>Something went wrong</h1><p style="color:#666">A server error occurred.</p>`+reference+`</body></html>`)
 			}
 		}()
 		next.ServeHTTP(w, r)

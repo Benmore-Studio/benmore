@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"strings"
 
@@ -17,7 +16,7 @@ const passwordChangePagePath = "/auth/change-password"
 const passwordChangeAPIPath = "/api/_auth/change-password"
 
 // This identity deliberately is not a Session: it can only replace a temporary
-// password. Normal session, API-token and edge resolution deny pending users.
+// password. Normal session and API-token resolution deny pending users.
 type passwordChangeIdentity struct {
 	UserID                 int64
 	Email, Hash, SessionID string
@@ -25,6 +24,11 @@ type passwordChangeIdentity struct {
 
 func pendingPasswordChange(app *App, r *http.Request) *passwordChangeIdentity {
 	if app == nil || app.DB == nil {
+		return nil
+	}
+	// A dashboard whose sign-in the router owns holds no password that
+	// counts: the router's gate sends a pending account to its change page.
+	if dashboardUsesRouterIdentity(app) {
 		return nil
 	}
 	token := authRawSessionID(r)
@@ -47,8 +51,8 @@ func pendingPasswordChange(app *App, r *http.Request) *passwordChangeIdentity {
 }
 
 // passwordChangeMiddleware routes an account that must replace a temporary
-// password to the change page. It is a navigation gate: every session, API
-// token and edge lookup already refuses a pending account, so nothing behind
+// password to the change page. It is a navigation gate: every session and API
+// token lookup already refuses a pending account, so nothing behind
 // it grants that account access. That makes two shortcuts safe:
 //   - static assets (public, CDN-cached bundles and files) skip the check;
 //   - a request whose credential resolves to a normal session is not
@@ -71,7 +75,8 @@ func passwordChangeMiddleware(next http.Handler, app *App) http.Handler {
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		if strings.HasPrefix(r.URL.Path, "/api/") || wantsJSON(r) || isBearerAuth(r) {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "password_change_required", "redirect": passwordChangePagePath})
+			body := map[string]any{"error": "password_change_required", "redirect": passwordChangePagePath}
+			httpJSON(w, http.StatusForbidden, withRefusalDocs(body, "password_change_required"))
 			return
 		}
 		if isHTMX(r) {
@@ -212,7 +217,6 @@ func handleRequiredPasswordChange(w http.ResponseWriter, r *http.Request, app *A
 	}
 	recordLoginAttempt(app.DB, key, true)
 	invalidateRequestSession(r)
-	revokeEdgeGrantsAfterCredentialChange(app, p.UserID)
 	platformPasswordChanged(app, p.Email, string(hash), false)
 	clearSessionCookies(w, app.DevMode)
 	if wantsJSON(r) {
@@ -307,7 +311,6 @@ func changeSignedInPasswordWith(app *App, session *Session, proofHash, newHash s
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
-	revokeEdgeGrantsAfterCredentialChange(app, session.UserID)
 	return email, nil
 }
 
@@ -329,9 +332,10 @@ func revokePasswordCredentialsExcept(tx *sql.Tx, userID int64, keepSessionID str
 }
 
 // revokeUserAccessExcept ends every way the account can act in this app: its
-// sessions (but keepSessionID), API tokens, OAuth codes and MCP connector
-// grants. An approved command that removes a member uses it as is
-// (app_mcp_command_revoke.go); a password change adds the recovery cleanup.
+// sessions (but keepSessionID), the support sessions it started as an admin,
+// API tokens, OAuth codes and MCP connector grants. An approved command that
+// removes a member uses it as is (app_mcp_command_revoke.go); a password
+// change adds the recovery cleanup.
 func revokeUserAccessExcept(tx *sql.Tx, userID int64, keepSessionID string) error {
 	for _, table := range []string{"_benmore_sessions", "_benmore_signin_challenges", "_benmore_api_tokens", "_benmore_oauth_codes"} {
 		var exists int
@@ -349,8 +353,33 @@ func revokeUserAccessExcept(tx *sql.Tx, userID int64, keepSessionID string) erro
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
+		if table == "_benmore_sessions" {
+			if err := endSupportSessionsStartedBy(tx, userID, keepSessionID); err != nil {
+				return err
+			}
+		}
 	}
 	return revokeAppMCPUserGrants(tx, userID)
+}
+
+// endSupportSessionsStartedBy deletes the support (impersonation) sessions
+// adminID started. Such a row is stored under the CUSTOMER's user id, so
+// deleting the admin's sessions by user id never reached it: after the admin
+// changed a compromised password, a support session opened with the old one
+// kept acting as the customer for the rest of its hour. One started from
+// keepSessionID stays with that session; one that names no starting session
+// (an API-token start, a row from before the column) always goes.
+func endSupportSessionsStartedBy(tx *sql.Tx, adminID int64, keepSessionID string) error {
+	query, args := "DELETE FROM _benmore_sessions WHERE is_impersonation = 1 AND impersonator_user_id = ?", []any{adminID}
+	if keepSessionID != "" {
+		query += " AND COALESCE(started_by_session_id, '') <> ?"
+		args = append(args, keepSessionID)
+	}
+	// A session table from before these columns holds no support session.
+	if _, err := tx.Exec(query, args...); err != nil && !strings.Contains(err.Error(), "no such column") {
+		return err
+	}
+	return nil
 }
 
 // cancelPendingRecovery ends the account changes that were authorized by the
@@ -402,14 +431,3 @@ const passwordChangeHTML = `<!doctype html>
 <label>Confirm new password<input type="password" name="confirm_password" autocomplete="new-password" minlength="8" maxlength="72" required></label>
 <button type="submit">Save password and sign in</button></form>
 <form method="post" action="{{.Logout}}"><input type="hidden" name="_csrf" value="{{.CSRF}}"><p><button type="submit">Sign out</button></p></form></main></body></html>`
-
-// revokeEdgeGrantsAfterCredentialChange ends the account's edge (paste) grants
-// once a password change, reset or claim - or the erasure of the account -
-// has committed. Grants live in the platform database, outside the app
-// transaction, so this runs after COMMIT; a failure is logged rather than
-// undoing the credential change.
-func revokeEdgeGrantsAfterCredentialChange(app *App, userID int64) {
-	if err := revokeEdgeGrantsForUser(app, userID); err != nil {
-		log.Printf("edge grants: revoke for user %d after credential change: %v", userID, err)
-	}
-}

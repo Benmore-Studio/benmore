@@ -51,10 +51,10 @@ const whenExtraKeyCap = 200
 const whenRecursiveSelect = 33
 
 // whenSessionKeys are the caller keys injectSessionContext adds, plus the
-// before-hook submitted-field list. They are always defined (NULL when
-// absent), so a condition that names one never fails for a sessionless
-// event.
-var whenSessionKeys = []string{"user_id", "user_email", "user_role", "user_roles", "user_group_id", submittedFieldsKey}
+// before-hook submitted-field list. Session identity keys are defined as
+// NULL when absent; act-as is empty and admin-bypass is false for a
+// sessionless event, so these names never cause an unknown-column failure.
+var whenSessionKeys = append(append([]string(nil), sessionContextKeys...), submittedFieldsKey)
 
 // whenKeyRe is a row key that can be a CTE column without quoting games.
 var whenKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
@@ -533,6 +533,17 @@ func sqliteAffinity(declType string) string {
 // queryWhenOnConn runs the condition on a connection held for this call,
 // with query_only and a read-only authorizer, restoring both after.
 func queryWhenOnConn(ctx context.Context, db *sql.DB, query string, args []any, met *int64) error {
+	return queryRowReadOnly(ctx, db, query, args, met)
+}
+
+// queryRowReadOnly runs one statement of app-authored SQL that may only read
+// (a hook or workflow `when:`, an app.yaml aggregate) and scans its first
+// row into dest. The statement runs on a connection held for this call with
+// query_only on and the SELECT-only authorizer (authorizeWhenQuery); both are
+// put back before the connection returns to the pool, or it is discarded.
+// SQLite refuses a write on that connection whatever the statement's text
+// says, so callers' own text checks are for a clear message, not for safety.
+func queryRowReadOnly(ctx context.Context, db *sql.DB, query string, args []any, dest ...any) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -546,7 +557,7 @@ func queryWhenOnConn(ctx context.Context, db *sql.DB, query string, args []any, 
 		return err
 	}
 	defer conn.Raw(func(raw any) error {
-		sqlite, ok := raw.(*sqlite3.SQLiteConn)
+		sqlite, ok := sqliteConnOf(raw)
 		if !ok {
 			return driver.ErrBadConn
 		}
@@ -563,16 +574,16 @@ func queryWhenOnConn(ctx context.Context, db *sql.DB, query string, args []any, 
 		return nil
 	})
 	if err := conn.Raw(func(raw any) error {
-		sqlite, ok := raw.(*sqlite3.SQLiteConn)
+		sqlite, ok := sqliteConnOf(raw)
 		if !ok {
-			return fmt.Errorf("when: needs a SQLite connection")
+			return fmt.Errorf("a read-only statement needs a SQLite connection")
 		}
 		sqlite.RegisterAuthorizer(authorizeWhenQuery)
 		return nil
 	}); err != nil {
 		return err
 	}
-	return conn.QueryRowContext(ctx, query, args...).Scan(met)
+	return conn.QueryRowContext(ctx, query, args...).Scan(dest...)
 }
 
 // queryWhenInTx runs the condition inside the hook's transaction, so it

@@ -16,9 +16,10 @@ package main
 // JSON-string-escaped, and one in a value position is written as one JSON
 // value: its text when that is already exactly one JSON value (a number,
 // true/false, JSON text such as a json_group_array() column), null for no
-// value, a JSON array/object for a list or map, otherwise a JSON string. A
-// `:param` is substituted only inside a string literal (escaped); outside one,
-// `:` is the key separator. Any other template (plain text, a single
+// value, a JSON array/object for a list or map, otherwise a JSON string; a
+// string the caller sent is never written as an object or array
+// (flows_request_text.go). A `:param` is substituted only inside a string
+// literal (escaped); outside one, `:` is the key separator. Any other template (plain text, a single
 // placeholder, a fragment that splices raw JSON) renders verbatim exactly as
 // before. Values are written once and never scanned again (single-pass, see
 // interpolateCtx).
@@ -26,7 +27,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"strings"
 )
@@ -169,6 +169,18 @@ func writeJSONUnresolved(b *strings.Builder, p jsonTemplatePart) {
 // interpolateCtxJSON is interpolateCtx for a template whose output is a
 // JSON body or message.
 func interpolateCtxJSON(template string, ctx *FlowContext) string {
+	if rendered, isJSON := interpolateCtxJSONDocument(template, ctx); isJSON {
+		return rendered
+	}
+	return interpolateCtx(template, ctx)
+}
+
+// interpolateCtxJSONDocument renders template value by value when the author
+// wrote it as a JSON document, and reports false (rendering nothing) when not.
+// A string the caller sent that is JSON text of an object or array is written
+// as a JSON string in a value position, never as the structure it spells
+// (flows_request_text.go); other values are written as writeJSONValue says.
+func interpolateCtxJSONDocument(template string, ctx *FlowContext) (string, bool) {
 	parts, isJSON := jsonTemplateParts(template, func(t string, i int) int {
 		n, _, ok := colonParamAt(t, i, ctx.Params)
 		if !ok {
@@ -177,7 +189,7 @@ func interpolateCtxJSON(template string, ctx *FlowContext) string {
 		return n
 	})
 	if !isJSON {
-		return interpolateCtx(template, ctx)
+		return "", false
 	}
 	flatData := flatDataForCtx(ctx)
 	var b strings.Builder
@@ -196,14 +208,20 @@ func interpolateCtxJSON(template string, ctx *FlowContext) string {
 			}
 			raw := ""
 			if val != nil {
-				raw = fmt.Sprintf("%v", val)
+				raw = valueText(val)
+			}
+			if _, text := val.(string); text && !p.inString && jsonContainerText(raw) && ctx.exprReadsRequestText(expr, flatData) {
+				b.WriteByte('"')
+				writeJSONStringContent(&b, raw)
+				b.WriteByte('"')
+				continue
 			}
 			writeJSONPlaceholder(&b, p, val, raw)
 		default:
 			b.WriteString(p.text)
 		}
 	}
-	return b.String()
+	return b.String(), true
 }
 
 // interpolateRowJSONWithEnv is interpolateRowWithEnv for a template whose
@@ -220,7 +238,7 @@ func interpolateRowJSONWithEnv(template string, row map[string]any, env map[stri
 			continue
 		}
 		if val, ok := row[p.ref]; ok {
-			writeJSONPlaceholder(&b, p, val, fmt.Sprintf("%v", val))
+			writeJSONPlaceholder(&b, p, val, valueText(val))
 			continue
 		}
 		if key, ok := strings.CutPrefix(p.ref, "env."); ok {

@@ -30,19 +30,38 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 	}
 	flowName := interpolateCtx(step.Enqueue.Flow, ctx)
 	payload := map[string]any{}
-	var tainted, secret []string
+	var tainted, secret, sqlText, computed []string
+	flat := flatDataForCtx(ctx)
 	for k, v := range step.Enqueue.With {
+		// The identity names are the runtime's in the job flow too
+		// (flowJobIdentityKey): a `with:` value is not who the job runs for.
+		if flowJobIdentityKey(k) {
+			log.Printf("WARNING: flows: enqueue step=%q flow=%q: payload key %q is a reserved identity name and was not queued; pass the value under another name (for example target_user_id)", step.Name, flowName, k)
+			continue
+		}
 		payload[k] = interpolateCtx(v, ctx)
 		if ctx.taintedRef(v) != "" {
 			tainted = append(tainted, k)
+			// Request input that is data a step computed (a lookup keyed
+			// by request input) keeps decoding in the job flow's JSON
+			// bodies; request text does not (flows_request_text.go).
+			if !ctx.readsRequestText(v, flat) {
+				computed = append(computed, k)
+			}
 		}
 		if ctx.readsSecret(v) {
 			secret = append(secret, k)
+		}
+		if ctx.sqlTextRef(v) != "" {
+			sqlText = append(sqlText, k)
 		}
 	}
 	// Explicit enqueue jobs are sessionless. Only the async HTTP entry point
 	// may attach an actor snapshot; a with: value can contain request input.
 	delete(payload, flowJobActorPayloadField)
+	// Nor may a with: value pose as the request body an async HTTP flow
+	// queues for its parse step.
+	delete(payload, flowRequestBodyPayloadField)
 	// A payload value computed from request input is still request input in
 	// the job flow. Carry the taint across the queue the same way an async
 	// HTTP flow does (executeFlowJob → takeFlowRequestKeys), written after
@@ -61,6 +80,20 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 	} else {
 		delete(payload, flowSecretKeysPayloadField)
 	}
+	if len(computed) > 0 {
+		sort.Strings(computed)
+		payload[flowComputedKeysPayloadField] = computed
+	} else {
+		delete(payload, flowComputedKeysPayloadField)
+	}
+	// A value built from the caller's email stays out of sql_dynamic text in
+	// the job flow too (flows_user_taint.go).
+	if len(sqlText) > 0 {
+		sort.Strings(sqlText)
+		payload[flowSQLTextKeysPayloadField] = sqlText
+	} else {
+		delete(payload, flowSQLTextKeysPayloadField)
+	}
 	var runAt *time.Time
 	if step.Enqueue.RunAt != "" {
 		v := interpolateCtx(step.Enqueue.RunAt, ctx)
@@ -74,6 +107,14 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 	if step.Enqueue.UniqueKey != "" {
 		uniqueKey = interpolateCtx(step.Enqueue.UniqueKey, ctx)
 	}
+	// A reference with no value is not queued as the text `{{name}}` for the
+	// job to work on later: nothing is queued (flows_steps.go).
+	if err := ctx.unresolvedRefsBeforeEffect(step); err != nil {
+		return err
+	}
+	// The job runs as many times as the target flow allows (one unless it
+	// declares on.request.max_attempts), like the target's own async jobs.
+	attempts := flowJobMaxAttemptsByName(ctx.App, flowName)
 	var (
 		id       int64
 		jobToken string
@@ -84,10 +125,10 @@ func execStepEnqueue(ctx *FlowContext, step *FlowStep) error {
 		// flow may enqueue concurrently, and *sql.Tx is not safe for
 		// concurrent use. See FlowContext.TxMu.
 		ctx.transactionMutex().Lock()
-		id, jobToken, err = EnqueueJobTxUnique(ctx.Tx, uniqueKey, flowName, payload, runAt)
+		id, jobToken, err = enqueueFlowJob(ctx.Tx, uniqueKey, flowName, payload, runAt, attempts)
 		ctx.transactionMutex().Unlock()
 	} else {
-		id, jobToken, err = EnqueueJobUnique(ctx.App.DB, uniqueKey, flowName, payload, runAt)
+		id, jobToken, err = enqueueFlowJob(ctx.App.DB, uniqueKey, flowName, payload, runAt, attempts)
 	}
 	if err != nil {
 		return fmt.Errorf("enqueue %s: %w", flowName, err)
@@ -125,6 +166,11 @@ func execStepWS(ctx *FlowContext, step *FlowStep) error {
 	if payload == "" {
 		payload = "{}"
 	}
+	// Room members must not receive a reference with no value as the text
+	// `{{name}}`, in the payload or as part of the room name.
+	if err := ctx.unresolvedRefsBeforeEffect(step); err != nil {
+		return err
+	}
 	groupID := ""
 	if ctx.Session != nil {
 		groupID = ctx.Session.EffectiveGroupID()
@@ -135,6 +181,14 @@ func execStepWS(ctx *FlowContext, step *FlowStep) error {
 func execStepEmail(ctx *FlowContext, step *FlowStep) error {
 	opts, appDir, err := buildEmailOpts(ctx, step)
 	if err != nil {
+		return err
+	}
+	// A message that has left cannot be taken back, so a reference with no
+	// value in any field stops the step before the send: the recipient used
+	// to get the text `{{name}}` and the step failed afterwards. An
+	// `unsubscribe_url` that does not resolve only drops its header and is
+	// not counted here (flowEmailUnsubscribeURL).
+	if err := ctx.unresolvedRefsBeforeEffect(step); err != nil {
 		return err
 	}
 	return SendEmailOpts(appDir, opts)
@@ -172,14 +226,21 @@ func buildEmailOpts(ctx *FlowContext, step *FlowStep) (EmailOpts, string, error)
 		appDir = ctx.App.Dir
 	}
 
+	// An attachment the step declares and cannot produce fails the step
+	// here, before anything is sent. It used to be left out and the message
+	// went out without the file.
+	if step.Email.AttachmentsError != "" {
+		return EmailOpts{}, "", fmt.Errorf("email step: %s; nothing was sent", strings.ReplaceAll(step.Email.AttachmentsError, "`", ""))
+	}
 	var atts []EmailAttachment
-	for _, a := range step.Email.Attachments {
+	for i, a := range step.Email.Attachments {
 		content := strings.TrimSpace(interpolateCtx(a.Content, ctx))
+		filename := interpolateCtx(a.Filename, ctx)
 		if content == "" {
-			continue
+			return EmailOpts{}, "", fmt.Errorf("email step: attachment %d (%q) has no content: its `content` rendered empty, so there is no file to attach; nothing was sent", i, filename)
 		}
 		atts = append(atts, EmailAttachment{
-			Filename:    interpolateCtx(a.Filename, ctx),
+			Filename:    filename,
 			ContentType: a.ContentType,
 			Content:     content,
 		})
@@ -311,6 +372,8 @@ func resolveEmailBody(ctx *FlowContext, email *FlowEmail) (html, text string, er
 			}
 			// A reviewed app reads the bytes its digest captured, so a template
 			// the runtime-source digest does not bind (docs/x.html) is not found.
+			// Any other app reads through an os.Root at the app dir, so a
+			// candidate that is a symlink leading outside it is not found either.
 			raw, readErr := ctx.App.readSourceFile(c)
 			if readErr != nil {
 				continue

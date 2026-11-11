@@ -79,6 +79,7 @@ type FeatureInstallPlan struct {
 	DryRun          bool                `json:"dry_run"`
 	Replace         bool                `json:"replace,omitempty"`
 	DeleteMissing   bool                `json:"delete_missing,omitempty"`
+	AllowTableDrop  bool                `json:"allow_table_drop,omitempty"`
 	RoutePrefix     string              `json:"route_prefix,omitempty"`
 	ModelPrefix     string              `json:"model_prefix,omitempty"`
 	RouteMap        map[string]string   `json:"route_map,omitempty"`
@@ -94,6 +95,10 @@ type FeatureInstallPlan struct {
 	RequiredOptions []FeaturePackOption `json:"required_options,omitempty"`
 	Collisions      []string            `json:"collisions,omitempty"`
 	Blocked         bool                `json:"blocked"`
+	// TableDrops is the data the target app would drop when it reloads with
+	// the pack's schema.prisma or migrations/ files, each "<file>: <what>
+	// (<n> rows)". The plan is blocked on it unless AllowTableDrop.
+	TableDrops []string `json:"table_drops,omitempty"`
 }
 
 type FeatureInstallOptions struct {
@@ -104,12 +109,29 @@ type FeatureInstallOptions struct {
 	ModelPrefix   string `json:"model_prefix,omitempty"`
 	RouteMap      map[string]string
 	ModelMap      map[string]string
+	// AllowTableDrop is the caller's consent to an install that makes the
+	// app drop a table or column holding data (allow_table_drop, the write
+	// gate's name for it).
+	AllowTableDrop bool `json:"allow_table_drop,omitempty"`
+	// DataDrops says what the target app would drop when it reloads with
+	// content at rel (schema.prisma or a migrations/*.sql file): the write
+	// gate's check against the instance's database. nil: not checked (a
+	// plan made without an instance).
+	DataDrops func(rel, content string) []string `json:"-"`
 }
 
 type FeaturePackRename struct {
 	From string `json:"from"`
 	To   string `json:"to"`
 }
+
+// featureInstallMigrationCheckLimit is how many migration files one install
+// has the instance judge for data loss. Each is one dry run of the app's
+// reload, as the app's user, holding its write lock for up to
+// migrationDryRunTimeout; a whole-app pack can carry hundreds of files. A
+// pack with more new or changed files than this is not judged file by file:
+// the plan says so and asks for the consent instead.
+const featureInstallMigrationCheckLimit = 12
 
 var featurePackApplyAfterWriteHook func(dir, rel string) error
 

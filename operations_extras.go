@@ -22,12 +22,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -61,6 +58,7 @@ func RegisterDSARRoute(mux appRouteRegistrar, app *App) {
 			"tables":      map[string]any{},
 		}
 		tables := out["tables"].(map[string]any)
+		var readAudited []string
 		for _, t := range app.Tables {
 			hasUserID := false
 			for _, c := range t.Columns {
@@ -86,6 +84,18 @@ func RegisterDSARRoute(mux appRouteRegistrar, app *App) {
 			}
 			sanitizeResponseRows(app, t.Name, records, session)
 			tables[t.Name] = records
+			if IsReadAudited(app, t.Name) {
+				readAudited = append(readAudited, t.Name)
+			}
+		}
+		// The export reads every row the caller owns, so a read-audited
+		// table gets a read event like a list read: one per table, no row id.
+		// Logged once every table is read, since a failed export sends none.
+		for _, table := range readAudited {
+			if err := LogReadAccess(app, r, table, "", "my_data", session); err != nil {
+				readAuditRefused(w, r, app, table, err)
+				return
+			}
 		}
 		// Profile from _benmore_users.
 		if rows, err := app.DB.Query("SELECT * FROM _benmore_users WHERE id = ?", session.UserID); err == nil {
@@ -272,6 +282,7 @@ func RegisterErrorCaptureRoute(mux appRouteRegistrar, app *App) {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	app.DB.Exec(`CREATE INDEX IF NOT EXISTS idx_client_err_created ON _benmore_client_errors(created_at)`)
+	app.DB.Exec(`ALTER TABLE _benmore_client_errors ADD COLUMN stack_raw TEXT DEFAULT ''`)
 
 	registerErrorCaptureRoute(mux, app)
 }
@@ -280,54 +291,79 @@ func registerErrorCaptureRoute(mux appRouteRegistrar, app *App) {
 	var inserts atomic.Int64
 	// The endpoint is anonymous by design (window.onerror runs before login),
 	// so what it forwards to Sentry/Slack is rate limited per app.
-	stop := app.Stop
-	forwardLimiter := sync.OnceValue(func() *RateLimiter { return NewRateLimiterStoppable(30, time.Minute, stop) })
 
 	mux.HandleFunc("POST /api/_errors", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Kind, Message, Stack, Source, URL string
-			Line, Col, Status                 int
+		if r.ContentLength > 64<<10 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
 		}
-		dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
-		dec.Decode(&body)
+		// Anyone can post here; each report parses and maps a stack and
+		// writes two rows, so one client gets a small budget per app.
+		if !clientErrorBeaconLimiter.Allow(appLimiterKey(app, "errors", clientRateBucket(clientIP(r)))) {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		// A same-site page (a sibling tenant) can make a signed-in visitor's
+		// browser post here with the session cookie; the report would then be
+		// filed and exported under that visitor. bm.js posts from the page's
+		// own origin, so the origin gate (security.md 5) refuses only forgeries.
+		if _, err := requestSessionCookie(r); err == nil {
+			if _, ok := csrfOriginReason(r); !ok {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+		var body clientErrorBody
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err := dec.Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		if body.Message == "" {
 			w.WriteHeader(204)
 			return
 		}
+		boundClientErrorBody(&body)
+		body.host = r.Host
+		exportBody := body
 		body.Kind = truncateRunes(body.Kind, 40)
 		body.Message = truncateRunes(body.Message, clientErrorMessageMax)
-		body.Stack = truncateRunes(body.Stack, clientErrorStackMax)
 		body.Source = truncateRunes(clientErrorLocation(body.Source), 500)
 		body.URL = truncateRunes(clientErrorLocation(body.URL), 500)
 		userID := int64(0)
 		if s := getSession(app, r); s != nil {
 			userID = s.UserID
+			body.UserEmail = s.Email
 		}
 		ip := clientIP(r)
 		ua := r.UserAgent()
 		if len(ua) > 240 {
 			ua = ua[:240]
 		}
-		app.DB.Exec(`INSERT INTO _benmore_client_errors (kind, message, stack, source, line, col, status, url, ua, user_id, ip)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			body.Kind, body.Message, body.Stack, body.Source, body.Line, body.Col, body.Status, body.URL, ua, userID, ip)
+		exportBody.UserID, exportBody.UserEmail, exportBody.UA = userID, body.UserEmail, errorUserAgent(r.UserAgent())
+		// The stack is stored as sent; the reporter worker maps it through the
+		// bundle's sourcemap and rewrites the row's stack (symbolication reads
+		// the bundle cache and parses maps, which an anonymous request must not
+		// pay for).
+		res, err := app.DB.Exec(`INSERT INTO _benmore_client_errors (kind, message, stack, stack_raw, source, line, col, status, url, ua, user_id, ip)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			body.Kind, body.Message, body.Stack, body.Stack, body.Source, body.Line, body.Col, body.Status, body.URL, ua, userID, ip)
+		if err == nil {
+			exportBody.rowID, _ = res.LastInsertId()
+		}
 		// Keep the newest rows only: anyone can POST here, so an unpruned
 		// table is an unbounded write.
 		if inserts.Add(1)%200 == 0 {
 			app.DB.Exec(`DELETE FROM _benmore_client_errors WHERE id NOT IN (SELECT id FROM _benmore_client_errors ORDER BY id DESC LIMIT ?)`, clientErrorRowCap)
 		}
-		// Best-effort external forwarding.
-		if forwardLimiter().Allow("forward") {
-			go forwardErrorExternals(app, body, ip)
-		}
+		// Keep the bounded input until the worker scrubs it. A full queue drops
+		// the report without expensive export work on this request.
+		reportError(app, errorEvent{clientBody: &exportBody})
 		w.WriteHeader(204)
 	})
 }
 
-// forwardErrorExternals fans the error out to Sentry and/or Slack
-// when the relevant env vars are configured. Both are HTTP POSTs;
-// failures swallowed (don't let an external outage block more
-// important work).
 // clientErrorLocation reduces a reported page or script URL to origin and
 // path. The browser sends location.href, and on a password-reset, email
 // verification or magic-link page the query string or fragment is a live
@@ -345,65 +381,10 @@ func clientErrorLocation(raw string) string {
 	return u.String()
 }
 
-func forwardErrorExternals(app *App, body struct {
-	Kind, Message, Stack, Source, URL string
-	Line, Col, Status                 int
-}, ip string) {
-	if dsn := GetEnv(app.Dir, "SENTRY_DSN"); dsn != "" {
-		sendToSentry(dsn, body)
-	}
-	if hook := GetEnv(app.Dir, "ERROR_SLACK_WEBHOOK"); hook != "" {
-		sendErrorToSlack(hook, app, body, ip)
-	}
-}
-
-// sendToSentry uses Sentry's standard envelope endpoint. The DSN is
-// parsed inline so we don't need the official SDK. Throws away the
-// response - Sentry's reliability is on them.
-func sendToSentry(dsn string, body struct {
-	Kind, Message, Stack, Source, URL string
-	Line, Col, Status                 int
-}) {
-	// DSN shape: https://<public>@<host>/<project>
-	u := strings.TrimPrefix(strings.TrimPrefix(dsn, "https://"), "http://")
-	at := strings.Index(u, "@")
-	slash := strings.LastIndex(u, "/")
-	if at < 0 || slash < 0 || slash < at {
-		return
-	}
-	publicKey := u[:at]
-	host := u[at+1 : slash]
-	project := u[slash+1:]
-	endpoint := "https://" + host + "/api/" + project + "/store/"
-	if isPrivateURL(endpoint) {
-		return
-	}
-	payload := map[string]any{
-		"event_id":  fmt.Sprintf("%032x", time.Now().UnixNano()),
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"platform":  "javascript",
-		"level":     "error",
-		"message":   body.Message,
-		"exception": map[string]any{
-			"values": []any{map[string]any{
-				"type":  body.Kind,
-				"value": body.Message,
-			}},
-		},
-		"request": map[string]any{"url": body.URL},
-	}
-	data, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", endpoint, strings.NewReader(string(data)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Sentry-Auth", fmt.Sprintf("Sentry sentry_version=7, sentry_key=%s, sentry_client=benmore/1", publicKey))
-	client := safeHTTPClientStrict(5 * time.Second)
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("sentry: %s", err)
-		return
-	}
-	resp.Body.Close()
-}
+// clientErrorBeaconLimiter admits error beacons per app and client address
+// (an IPv6 client by its /64). bm.js sends at most 25 reports in ten minutes
+// per page, so a real visitor stays well inside it.
+var clientErrorBeaconLimiter = NewRateLimiter(30, time.Minute)
 
 // Caps on what the anonymous error beacon stores.
 const (
@@ -432,23 +413,4 @@ func slackErrorText(subdomain, kind, message, source string, line, col int, ip s
 	return fmt.Sprintf("*[%s] %s error*\n```%s```\nat %s:%d:%d\nIP %s",
 		slackFieldSafe(subdomain, 80), slackFieldSafe(kind, 40), slackFieldSafe(message, 500),
 		slackFieldSafe(source, 200), line, col, slackFieldSafe(ip, 64))
-}
-
-func sendErrorToSlack(webhook string, app *App, body struct {
-	Kind, Message, Stack, Source, URL string
-	Line, Col, Status                 int
-}, ip string) {
-	if isPrivateURL(webhook) {
-		return
-	}
-	subdomain := ""
-	if app != nil {
-		subdomain = app.AppID
-	}
-	text := slackErrorText(subdomain, body.Kind, body.Message, body.Source, body.Line, body.Col, ip)
-	payload, _ := json.Marshal(map[string]any{"text": text})
-	resp, err := safeHTTPClientStrict(5*time.Second).Post(webhook, "application/json", strings.NewReader(string(payload)))
-	if err == nil {
-		resp.Body.Close()
-	}
 }

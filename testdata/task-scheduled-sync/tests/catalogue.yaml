@@ -1,0 +1,38 @@
+# The sync itself calls the supplier, so it is exercised with a stand-in for
+# the supplier's API (the Go test of this fixture); these tests hold the rest.
+signed_in_users_read_products_and_cannot_change_them:
+  as_user: "shopper@catalogue.test"
+  setup:
+    - sql: "INSERT INTO products (id, external_id, name, price_cents, synced_at) VALUES (8001, 'p-8001', 'Synced kettle', 2500, '2026-01-01T00:00:00Z')"
+  steps:
+    - get: "/api/products"
+      expect: { status: 200, contains: "Synced kettle" }
+    - api: "PATCH /api/products/8001"
+      json: { price_cents: 1 }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - api: "POST /api/products"
+      json: { external_id: "mine", name: "Injected" }
+      expect: { status: 403 }
+    - get: "/api/sync_runs"
+      expect: { status: 404 }
+    - sql: "SELECT id FROM products WHERE id = 8001 AND price_cents = 2500"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM products WHERE name = 'Injected'"
+      expect: { rows: 0 }
+
+an_admin_reads_the_run_log:
+  as_user: "ops@catalogue.test"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO sync_runs (fired_at, pages, items, stored) VALUES ('2026-01-01T00:00:00Z', 2, 3, 3)"
+  steps:
+    - get: "/api/sync_runs"
+      expect: { status: 200, contains: "2026-01-01T00:00:00Z" }
+
+signed_out_callers_get_nothing:
+  anon: true
+  steps:
+    - get: "/api/products"
+      expect: { status: 401 }

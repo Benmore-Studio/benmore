@@ -1,0 +1,26 @@
+# flows/email-hours-report.yaml - mail the caller their logged hours as a CSV file
+on:
+  request:
+    method: POST
+    path: /api/reports/hours/email
+    auth: required
+    rate_limit: "5/hour per user"
+jobs:
+  send:
+    steps:
+      - id: csv
+        run: sql
+        with:
+          query: "SELECT 'task,hours' || char(10) || COALESCE(group_concat(task_id || ',' || hours, char(10)), '') AS text FROM time_entries WHERE user_id = :user_id"
+      - run: email
+        with:
+          to: "${{ user.email }}"
+          cc: "${{ env.REPORTS_CC | default:'' }}"      # an optional copy; cc is in the headers, bcc is not
+          subject: "Your logged hours"
+          text: "The report is attached."
+          attachments:
+            - filename: hours.csv
+              content_type: text/csv                    # left out: taken from the file extension
+              content: "${{ steps.csv.outputs.text | base64 }}"   # base64 of the file's bytes
+      - run: respond
+        with: { status: 200, json: { sent: true } }

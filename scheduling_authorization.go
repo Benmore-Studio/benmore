@@ -131,7 +131,7 @@ func loadScheduledActorWith(app *App, db mutationQuerier, userID int64, group *s
 		}
 		var groups []string
 		for _, row := range rows {
-			v := fmt.Sprint(row["group_id"])
+			v := valueText(row["group_id"])
 			if v != "" && v != "0" {
 				groups = append(groups, v)
 			}
@@ -244,7 +244,7 @@ func scheduledFlowRequest(flow *Flow, body string) (*http.Request, error) {
 		value := data[name]
 		switch value.(type) {
 		case string, json.Number:
-			if fmt.Sprint(value) == "" {
+			if valueText(value) == "" {
 				return nil, fmt.Errorf("scheduled flow requires a path parameter in its body")
 			}
 		default:
@@ -253,7 +253,7 @@ func scheduledFlowRequest(flow *Flow, body string) (*http.Request, error) {
 		// executeFlowHTTP reads PathValue after positional parsing. A fixed path
 		// segment keeps values containing '/' from shifting subsequent parameters.
 		parts[i] = "_scheduled"
-		r.SetPathValue(name, fmt.Sprint(value))
+		r.SetPathValue(name, valueText(value))
 	}
 	if flow.Trigger.Path != "" {
 		r.URL.Path = strings.Join(parts, "/")

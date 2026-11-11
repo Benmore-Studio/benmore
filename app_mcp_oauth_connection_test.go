@@ -6,8 +6,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPOAuthParserRejectsDirtyClientRegistrationAndRestoresPool(t *testing.T) {
@@ -170,7 +168,7 @@ func TestAppMCPOAuthCanceledDirectSessionReadRejectsAndRestoresPool(t *testing.T
 	}
 	started, unblock := make(chan struct{}, 1), make(chan struct{})
 	err = conn.Raw(func(raw any) error {
-		native := raw.(*sqlite3.SQLiteConn)
+		native := mustSQLiteConn(raw)
 		return native.RegisterFunc("oauth_session_read_started", func() int64 {
 			_, _ = native.Exec("INSERT INTO session_read_effects VALUES(1)", nil)
 			select {

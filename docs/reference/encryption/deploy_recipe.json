@@ -1,0 +1,6 @@
+[
+  "1. Write encrypted.yaml - the YAML shape above.",
+  "2. `benmore push encrypted.yaml` (it lands on the dev instance when the app has one; `benmore promote` ships it to prod).",
+  "3. The push reloads the app, which installs the triggers; a push that turns on the app's first encrypted field restarts it instead so a key is pinned first (see hosted_restart). Verify with `benmore logs <app> -f`: `encryption: active (N fields across M tables)` and `encryption: K triggers installed`.",
+  "4. New writes are encrypted automatically. Existing plaintext rows are NOT migrated by trigger installation - see Backfill below."
+]

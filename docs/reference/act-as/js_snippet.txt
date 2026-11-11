@@ -1,0 +1,26 @@
+// Step in - prompt the admin for their password first (same
+// pattern as the impersonate flow). The framework will reject the
+// request if the password is missing or wrong.
+const password = await promptForPassword(); // your UI's password modal
+
+await fetch('/api/_auth/act_as', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json',
+             'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+  body: JSON.stringify({ group_id: '7', password }),
+});
+
+// Now every CRUD call from this session is scoped to tenant 7.
+// Build the tenant-scoped UI as if the admin were a member of that tenant.
+
+// Inspect current state (e.g. show a "Acting as: Ramsey" pill in the header)
+const { acting_as_group, effective_group, role } =
+  await fetch('/api/_auth/act_as', { credentials: 'same-origin' }).then(r => r.json());
+
+// Step out - admin bypass restored
+await fetch('/api/_auth/act_as', {
+  method: 'DELETE',
+  headers: { 'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+});

@@ -1,0 +1,1 @@
+Bulk create/update/delete. Single HTTP call, single transaction, single audit-log fan-out.

@@ -1,0 +1,1 @@
+limit/offset work for noncursor list requests and return a row array. Defaults are 50 rows, maximum 500 and maximum offset 100000. Explicit page or per_page takes precedence over both aliases. The SDK preserves cursor:0 and unwraps array, rows and data envelopes into its promised row array.

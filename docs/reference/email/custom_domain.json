@@ -1,0 +1,9 @@
+[
+  "1. Add the domain: dashboard → app → Email → Add domain, or `benmore email-domain <app> add clientdomain.org`, or MCP `email_domains {action:'add'}`. Returns 3 DKIM CNAME records.",
+  "2. Create the records at the domain's DNS provider: <token>._domainkey.clientdomain.org CNAME <token>.dkim.amazonses.com (×3).",
+  "3. Verification completes automatically (minutes; up to an hour for DNS propagation). Check with `benmore email-domain <app> verify clientdomain.org`.",
+  "4. Set EMAIL_FROM: `benmore env <app> set EMAIL_FROM=hello@clientdomain.org`. All framework + flow email now sends from it.",
+  "Adding also returns an ownership TXT record (`_benmore-challenge.<domain>` = a per-app `benmore-verify-…` value). A claim that is neither DKIM-verified nor TXT-proven does not block anyone: another app that publishes ITS OWN challenge value takes the domain over (the refused add error tells it the record). A verified claim is never taken over. A domain whose sending identity already exists on the platform with no claim by this app (an operator domain, or a removal whose identity cleanup failed) needs that same TXT before the add is accepted (409 otherwise), because the identity's verification proves nothing about the new claimant. The same TXT is required to add a domain that sits under one another app has verified or proven (`billing.corp.example` when another app sends from `corp.example`); the holder's own subdomains are not asked for it.",
+  "A domain belongs to exactly ONE app; verification is re-checked daily - removing the DNS records flips it back to pending and sends from it are refused (fail closed, loud error in the flow/hook audit log).",
+  "Managing platform email is the app owner's: the dashboard Email tab, `benmore email`/`email-domain` and every `email_domains` action, `status` included, refuse collaborators."
+]

@@ -36,7 +36,6 @@ package main
 // headers). Values are written once and never scanned again.
 
 import (
-	"fmt"
 	"strings"
 )
 
@@ -131,7 +130,7 @@ func interpolateRowHTML(template string, row map[string]any, appDir string) stri
 				name = strings.TrimSpace(inner)
 			}
 			if val, found := row[name]; found {
-				write(htmlPlaceholderValue(c, val, fmt.Sprintf("%v", val), braces, false))
+				write(htmlPlaceholderValue(c, val, valueText(val), braces, false))
 				i += n
 				continue
 			}
@@ -155,8 +154,11 @@ func interpolateRowHTML(template string, row map[string]any, appDir string) stri
 
 // interpolateCtxHTML is interpolateCtx for a flow email's inline `html:`.
 func interpolateCtxHTML(template string, ctx *FlowContext) string {
-	if _, sole := soleFlowExpr(template); sole && !strings.HasPrefix(strings.TrimSpace(template), "{{{") {
-		// The value is the whole document.
+	if expr, sole := soleFlowExpr(template); sole && !strings.HasPrefix(strings.TrimSpace(template), "{{{") &&
+		!ctx.exprReadsRequestText(expr, flatDataForCtx(ctx)) {
+		// The value is the whole document the app built. Text the caller
+		// sent is not a document: it is escaped below like any other value,
+		// so a public form cannot send arbitrary markup from the app's domain.
 		return interpolateCtx(template, ctx)
 	}
 	flatData := flatDataForCtx(ctx)
@@ -185,7 +187,7 @@ func interpolateCtxHTML(template string, ctx *FlowContext) string {
 			}
 			if val, resolved := resolveBindExpr(resolve, flatData); resolved {
 				if val != nil {
-					text := fmt.Sprintf("%v", val)
+					text := valueText(val)
 					switch {
 					case breaks:
 						text = escapeMustacheValue(c, val, text, false)

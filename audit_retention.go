@@ -52,6 +52,10 @@ func StartAuditRetentionWorker(app *App) {
 	if ttl == 0 {
 		return
 	}
+	if app.hipaa() && ttl < hipaaMinAuditRetention {
+		log.Printf("audit-retention: compliance: hipaa keeps audit rows for at least %s; ignoring BENMORE_AUDIT_RETENTION=%s", formatDuration(hipaaMinAuditRetention), formatDuration(ttl))
+		return
+	}
 	shipperGated := strings.TrimSpace(os.Getenv("BENMORE_AUDIT_WEBHOOK_URL")) != ""
 	log.Printf("  audit retention: deleting audit rows older than %s (shipped rows only: %v)", formatDuration(ttl), shipperGated)
 	app.startWorker("audit.retention", func(stop <-chan struct{}) {
@@ -93,7 +97,7 @@ func sweepAuditLog(db *sql.DB, ttl time.Duration, shipperGated bool, now time.Ti
 			return total, nil
 		default:
 		}
-		res, err := db.Exec(`DELETE FROM _benmore_audit_log WHERE id IN (
+		res, err := execAuditMutable(db, `DELETE FROM _benmore_audit_log WHERE id IN (
 			SELECT id FROM _benmore_audit_log
 			WHERE created_at < ? AND (? < 0 OR id <= ?)
 			ORDER BY id LIMIT ?)`, cutoff, maxID, maxID, auditRetentionBatch)

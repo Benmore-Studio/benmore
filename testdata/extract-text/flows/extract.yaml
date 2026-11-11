@@ -1,0 +1,25 @@
+on:
+  request: { method: POST, path: /api/documents/:id/extract, auth: required, mode: async }
+jobs:
+  extract:
+    steps:
+      - id: doc
+        run: sql
+        query: SELECT id, file_url FROM documents WHERE id = :id AND user_id = :user_id
+        expect_rows: 1
+      - id: text
+        run: extract_text
+        with:
+          source_path: "${{ steps.doc.outputs.first.file_url }}"
+          ocr: false
+          record: { table: documents, id: "${{ steps.doc.outputs.first.id }}" }
+        on_error:
+          - run: sql
+            query: UPDATE documents SET extract_error = :e WHERE id = :id
+            params: { e: "${{ error }}", id: "${{ params.id }}" }
+      - run: sql
+        query: UPDATE documents SET extracted_text = :t, extract_complete = :c WHERE id = :id
+        params:
+          t: "${{ steps.text.outputs.pages | json }}"
+          c: "${{ steps.text.outputs.complete }}"
+          id: "${{ steps.doc.outputs.first.id }}"

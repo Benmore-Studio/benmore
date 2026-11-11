@@ -14,7 +14,7 @@ func TestFrameAncestorsNoneReplacesDefaultsAndFailsClosed(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			app := &App{Design: &DesignConfig{Auth: map[string]string{}, SEO: map[string]string{}, CSP: map[string]string{"frame_ancestors": value}}}
 			w := httptest.NewRecorder()
-			applySecurityHeaders(w, false, app)
+			applySecurityHeaders(w, nil, false, app)
 			csp := w.Header().Get("Content-Security-Policy")
 			if !strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "frame-ancestors 'self'") {
 				t.Fatalf("frame policy did not replace defaults: %q", csp)
@@ -27,7 +27,7 @@ func TestFrameAncestorsNoneReplacesDefaultsAndFailsClosed(t *testing.T) {
 
 	app := &App{Design: &DesignConfig{Auth: map[string]string{}, SEO: map[string]string{}, CSP: map[string]string{"frame_ancestors": "https://embed.example"}}}
 	w := httptest.NewRecorder()
-	applySecurityHeaders(w, false, app)
+	applySecurityHeaders(w, nil, false, app)
 	if got := w.Header().Get("X-Frame-Options"); got != "" {
 		t.Fatalf("origin allowlist kept X-Frame-Options %q", got)
 	}
@@ -44,10 +44,13 @@ func TestAnalyticsOptOutAddsNoTransformOnlyToHTMLAndPreservesCachePolicy(t *test
 		contentType   string
 		cacheControl  string
 		wantTransform bool
+		status        int
 	}{
 		{name: "html opt-out", analyticsOff: true, contentType: "text/html; charset=utf-8", cacheControl: "no-store, must-revalidate", wantTransform: true},
 		{name: "json opt-out", analyticsOff: true, contentType: "application/json", cacheControl: "no-store"},
 		{name: "html default-on", analyticsOff: false, contentType: "text/html", cacheControl: "no-store"},
+		{name: "method refusal default-on", contentType: "text/plain", cacheControl: "public, max-age=3600", status: http.StatusMethodNotAllowed},
+		{name: "HTML error opt-out", analyticsOff: true, contentType: "text/html", cacheControl: "public, max-age=3600", status: http.StatusInternalServerError, wantTransform: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			features := &FeaturesConfig{}
@@ -58,7 +61,11 @@ func TestAnalyticsOptOutAddsNoTransformOnlyToHTMLAndPreservesCachePolicy(t *test
 			h := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", tc.contentType)
 				w.Header().Set("Cache-Control", tc.cacheControl)
-				w.WriteHeader(http.StatusOK)
+				status := tc.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				w.WriteHeader(status)
 				_, _ = w.Write([]byte("<html>response</html>"))
 			}), false, app)
 			w := httptest.NewRecorder()

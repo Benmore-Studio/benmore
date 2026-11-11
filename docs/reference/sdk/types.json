@@ -1,0 +1,5 @@
+[
+  "Schema/config pushes refresh local src/bm.d.ts once, after the final batch write and after the reloaded runtime is seen healthy. The CLI waits up to 25 seconds for reload; if the baseline, target, batch or reload cannot be verified, it preserves the existing declarations and prints a warning. When the app rejected the reload (check_app reports its last reload failed), push and deploy print that error and exit non-zero instead; see api(at:\"recovery\") rejected_reload. A failed type download also preserves the file. Source writes remain persisted; verify runtime behavior, then run benmore types explicitly. This observation does not attest exact source bytes or exclude concurrent writers.",
+  "Explicit refresh: benmore types [app] --out PATH [--env dev|prod]. Inside a workspace, omit app and the .benmore/app marker selects the deployment.",
+  "src/bm.d.ts is generated augmentation retained locally for offline editor use; never hand-edit it."
+]

@@ -1,0 +1,1 @@
+Per-language YAML files in i18n/<lang>.yaml. Fetch all strings for a language and look up client-side.

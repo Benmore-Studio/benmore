@@ -1,0 +1,10 @@
+{
+  "keys": [
+    "cluster_tenant_identity",
+    "reconnect",
+    "summary",
+    "endpoint",
+    "js_snippet",
+    "gotchas"
+  ]
+}

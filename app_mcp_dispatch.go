@@ -232,7 +232,7 @@ func appMCPReadColumns(ctx context.Context, app *App, table string) ([]Column, e
 		return nil, err
 	}
 	defer closeConn()
-	if err := conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPMetadata); return nil }); err != nil {
+	if err := conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPMetadata); return nil }); err != nil {
 		return nil, err
 	}
 	return tableColumnsQuery(func(query string, args ...any) (*sql.Rows, error) { return conn.QueryContext(ctx, query, args...) }, table)

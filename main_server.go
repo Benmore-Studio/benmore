@@ -46,29 +46,24 @@ func serverDispatch(cmd string) bool {
 	return dispatchPlatformServer(cmd)
 }
 
+// runServerTest is `benmore test`. It runs on a disposable copy of the app's
+// source (runServerTestsOnCopy), so the workspace is never written. A run that
+// cannot reach the tests still prints a result with a SUMMARY entry, which
+// --json consumers read as "nothing ran".
 func runServerTest() {
 	dir, mode, asJSON, err := parseServerTestArgs()
 	if err != nil {
+		if hasFlag("json") {
+			printTestResults(testSetupFailure(nil, "arguments", err), true)
+		}
 		fmt.Fprintf(os.Stderr, "Usage: benmore test [dir] [--app|--framework] [--json]\n%s\n", err)
 		os.Exit(1)
 	}
-	app, err := loadAppForServerTests(dir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "test: load app: %s\n", err)
-		os.Exit(1)
-	}
-	defer app.Shutdown()
-
-	var results []AppTestResult
-	switch mode {
-	case "app":
-		results = RunAppTests(app)
-	case "framework":
-		results = RunAllTests(app, GenerateFrameworkTests(app), false)
-	default:
-		results = RunAllTests(app, GenerateFrameworkTests(app), true)
-	}
+	results, setupErr := runServerTestsOnCopy(dir, mode)
 	printTestResults(results, asJSON)
+	if setupErr != nil {
+		fmt.Fprintf(os.Stderr, "test: %s\n", setupErr)
+	}
 	if !testResultsPassed(results) {
 		os.Exit(1)
 	}
@@ -114,18 +109,20 @@ func loadAppForServerTests(dir string) (*App, error) {
 			_ = os.Unsetenv("BENMORE_TEST_BOOT")
 		}
 	}()
-	return loadApp(dir)
+	// Nothing a test run reports reaches the developer's Sentry or Slack.
+	return loadAppWithOptions(dir, appLoadOptions{noErrorDelivery: true})
 }
 
 func resetServerTestDatabase(dir string) error {
-	// `benmore test` ALWAYS resets the DB for a clean run, and this command
-	// ships in every edition (including the platform binary). Running it inside
-	// a deployed app dir would wipe live data. A per-app `.benmore/` git dir is
-	// the signature of a hosted/managed app (per-app git auto-commit) that a
-	// freshly-scaffolded local app does not have, so refuse there unless the
-	// operator explicitly opts in with BENMORE_TEST_RESET=1.
+	// A test load ALWAYS deletes data.db for a clean run. `benmore test` and
+	// `benmore verify` load a disposable copy of the source (copyTestSource),
+	// which has no .benmore/, so this never meets a real app. It stays a
+	// backstop: a directory with .benmore/ holds an app's state - a hosted app
+	// instance, a workspace an app was served or deployed from - and its
+	// data.db is not deleted unless the operator opts in with
+	// BENMORE_TEST_RESET=1.
 	if _, err := os.Stat(filepath.Join(dir, ".benmore")); err == nil && os.Getenv("BENMORE_TEST_RESET") != "1" {
-		return fmt.Errorf("refusing to reset data.db in %s: looks like a deployed app (.benmore/ present); set BENMORE_TEST_RESET=1 to override", filepath.Base(dir))
+		return fmt.Errorf("refusing to reset data.db in %s: .benmore/ holds this app's state (a deployed app or a linked workspace); benmore test runs on a copy of the source instead. Set BENMORE_TEST_RESET=1 to override", filepath.Base(dir))
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		path := filepath.Join(dir, "data.db"+suffix)
@@ -159,15 +156,29 @@ func runServerNew() {
 	fmt.Print(scaffoldNextSteps(absDir))
 }
 
+// scaffoldNextSteps is what `benmore new` prints after it writes the app: the
+// commands this edition runs next, and nothing it does not have. The
+// framework edition has no development mode, so it names no local address
+// (it used to print `open http://localhost:8080` beside a scaffolded
+// AGENTS.md that says there is no localhost development mode).
 func scaffoldNextSteps(absDir string) string {
 	if editionName == "framework" {
-		return fmt.Sprintf("Created %s\n\nNext:\n  benmore serve %q --port 8080\n  open http://localhost:8080\n", absDir, absDir)
+		return fmt.Sprintf("Created %s\n\nNext:\n  benmore test %q\n  benmore serve %q --port 8080\n\n`benmore test` runs the generated tests and tests/*.yaml on a copy of the source.\n`benmore serve` is the self-hosted runtime, not a development mode: run it as a\nservice and open the app at the address your deployment gives that port.\nAGENTS.md in the new directory describes the runtime; `benmore docs build` is the guide.\n", absDir, absDir, absDir)
 	}
 	return fmt.Sprintf("Created %s\n\nNext:\n  cd %q\n  benmore deploy\n  benmore open .\n\nOptional app connector: after deploying, pull the complete source before authoring and reviewing mcp.yaml. See `benmore docs connector`.\n", absDir, absDir)
 }
 
 // startServedApp is the start of a served process: the boot check, the start-up
 // load and the one-shot resume of approved connector writes, in that order.
+// bootCheckApplies reports whether startup runs the full source check. A
+// hosted app's files already passed the platform's write gate, and the check
+// (a second app load plus a parse of every static/ and src/ script) ran before
+// the app served anything, inside the unit's memory and CPU limits: a dev app
+// with 16 MB of bundled JavaScript never finished starting under 2.7.306.
+func bootCheckApplies() bool {
+	return !hostedTenantProcess()
+}
+
 // Tests restart through it so they cannot skip a step the real process takes.
 func startServedApp(dir string) (*App, error) {
 	// Run the unified validators before boot (v2.7.164). The platform's
@@ -176,7 +187,9 @@ func startServedApp(dir string) (*App, error) {
 	// broken `INSERT…SELECT…ON CONFLICT` flow loaded silently and only
 	// surfaced at push time. Findings print as warnings - serve still
 	// boots so a stale finding can't brick local dev.
-	serveBootCheck(dir)
+	if bootCheckApplies() {
+		serveBootCheck(dir)
+	}
 	app, err := loadAppWithOptions(dir, appLoadOptions{startup: true})
 	if err != nil {
 		return nil, err
@@ -187,6 +200,11 @@ func startServedApp(dir string) (*App, error) {
 
 // runServerServe boots a single app on a single port.
 func runServerServe() {
+	// Before the load: boot (migrations, the source check) is when a
+	// hosted app's heap first meets its unit's memory cap. The platform owns
+	// a hosted tenant's memory policy; a self-hosted GOMEMLIMIT wins.
+	startGoMemoryLimitFromCgroup(hostedTenantProcess())
+	logMallocArenaCap()
 	dir := getAppDir(2)
 	port, _ := strconv.Atoi(getFlag("port", "8080"))
 

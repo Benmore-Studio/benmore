@@ -24,6 +24,7 @@ package main
 // not have - so a hashed row matches only its preimage.
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -99,8 +100,9 @@ type sessionExecer interface {
 }
 
 // rekeySession moves session oldID to newID everywhere the framework records
-// a session id: the row itself, the impersonation sessions it started, and
-// the audit rows that name it (act-as start/end). Run inside the caller's
+// a session id: the row itself, the impersonation sessions it started (the
+// session to hand back and the session they live with), and the audit rows
+// that name it (act-as start/end). Run inside the caller's
 // transaction so the row and its references move together. It reports
 // whether the session row itself moved.
 func rekeySession(tx sessionExecer, oldID, newID string) (bool, error) {
@@ -115,10 +117,19 @@ func rekeySession(tx sessionExecer, oldID, newID string) (bool, error) {
 	if _, err := tx.Exec("UPDATE _benmore_sessions SET impersonator_session_id = ? WHERE impersonator_session_id = ?", newID, oldID); err != nil {
 		return false, err
 	}
+	// A support session lives only while the session it was started from
+	// does (supportSessionStarterLive): it must follow that session's key.
+	// A table from before the column names no starting session.
+	if _, err := tx.Exec("UPDATE _benmore_sessions SET started_by_session_id = ? WHERE started_by_session_id = ?", newID, oldID); err != nil && !strings.Contains(err.Error(), "no such column") {
+		return false, err
+	}
 	if ok, err := sessionTableExists(tx, "_benmore_audit_log"); err != nil {
 		return false, err
 	} else if ok {
-		if _, err := tx.Exec("UPDATE _benmore_audit_log SET row_id = ? WHERE table_name = '_benmore_sessions' AND row_id = ?", newID, oldID); err != nil {
+		if err := withAuditMutable(tx, func() error {
+			_, err := tx.Exec("UPDATE _benmore_audit_log SET row_id = ? WHERE table_name = '_benmore_sessions' AND row_id = ?", newID, oldID)
+			return err
+		}); err != nil {
 			return false, err
 		}
 	}
@@ -138,7 +149,7 @@ func sessionTableExists(tx sessionExecer, name string) (bool, error) {
 // recorded on impersonation rows, and session ids in the audit log. Values
 // already hashed are left alone, so it is safe to run on every startup.
 func migrateLegacySessionIDs(db *sql.DB) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "session id migration"), nil)
 	if err != nil {
 		return err
 	}
@@ -187,10 +198,15 @@ func migrateLegacySessionIDs(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
-		for _, id := range audit {
-			if _, err := tx.Exec("UPDATE _benmore_audit_log SET row_id = ? WHERE table_name = '_benmore_sessions' AND row_id = ?", sessionStorageKey(id), id); err != nil {
-				return err
+		if err := withAuditMutable(tx, func() error {
+			for _, id := range audit {
+				if _, err := tx.Exec("UPDATE _benmore_audit_log SET row_id = ? WHERE table_name = '_benmore_sessions' AND row_id = ?", sessionStorageKey(id), id); err != nil {
+					return err
+				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		refs = append(refs, audit...)
 	}

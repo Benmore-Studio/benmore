@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -19,12 +20,15 @@ func InstallVersioningTriggers(db *sql.DB, config *VersionedConfig, encryption .
 		encrypted = encryption[0]
 	}
 	key := cryptoKeyForQuerier(db)
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "versioning triggers"), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	if err := installVersioningTriggersTx(tx, config, encrypted, key); err != nil {
+		return err
+	}
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -46,7 +50,7 @@ func installVersioningTriggersTx(tx *sql.Tx, config *VersionedConfig, encrypted 
 			if err := configIdentError("app.yaml: versioned table", table); err != nil {
 				return err
 			}
-			if err := reconcileVersionedTable(tx, table, encrypted); err != nil {
+			if err := reconcileVersionedTable(tx, table, encrypted, config.Derived[table]); err != nil {
 				return fmt.Errorf("versioning %s: %w", table, err)
 			}
 		}
@@ -91,25 +95,36 @@ func installVersioningTriggersTx(tx *sql.Tx, config *VersionedConfig, encrypted 
 // Reconcile existing source tables before migrations, then use the complete
 // checked installer afterward. A migration may legitimately create a new source.
 func installVersioningBeforeMigrations(db *sql.DB, config *VersionedConfig, encrypted *EncryptedFieldConfig) error {
-	var existing *VersionedConfig
-	if config != nil {
-		existing = &VersionedConfig{}
-		for _, table := range config.Tables {
-			if err := configIdentError("app.yaml: versioned table", table); err != nil {
-				return err
-			}
-			var name string
-			err := db.QueryRow(`SELECT name FROM main.sqlite_schema WHERE name=? COLLATE NOCASE AND type IN ('table','view')`, table).Scan(&name)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			existing.Tables = append(existing.Tables, table)
-		}
+	existing, err := versionedTablesThatExist(db, config)
+	if err != nil {
+		return err
 	}
 	return InstallVersioningTriggers(db, existing, encrypted)
+}
+
+// versionedTablesThatExist is config limited to the source tables the
+// database has: what a start reconciles before its migration files run (they
+// may create the rest). nil for a nil config.
+func versionedTablesThatExist(q mutationQuerier, config *VersionedConfig) (*VersionedConfig, error) {
+	if config == nil {
+		return nil, nil
+	}
+	existing := &VersionedConfig{Derived: config.Derived}
+	for _, table := range config.Tables {
+		if err := configIdentError("app.yaml: versioned table", table); err != nil {
+			return nil, err
+		}
+		var name string
+		err := q.QueryRow(`SELECT name FROM main.sqlite_schema WHERE name=? COLLATE NOCASE AND type IN ('table','view')`, table).Scan(&name)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		existing.Tables = append(existing.Tables, table)
+	}
+	return existing, nil
 }
 
 // Refresh only one table, preserving every other active versioning policy.
@@ -120,12 +135,12 @@ func installVersioningForTable(db *sql.DB, table string, encryption ...*Encrypte
 		encrypted = encryption[0]
 	}
 	key := cryptoKeyForQuerier(db)
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "versioning install "+table), nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	if err := installVersioningForTableTx(tx, table, encrypted, key); err != nil {
+	if err := installVersioningForTableTx(tx, table, encrypted, nil, key); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -134,7 +149,8 @@ func installVersioningForTable(db *sql.DB, table string, encryption ...*Encrypte
 	return 2, nil
 }
 
-func installVersioningForTableTx(tx *sql.Tx, table string, encrypted *EncryptedFieldConfig, key []byte) error {
+// computed supplies the table's derived columns (withComputedVersionMaintenance).
+func installVersioningForTableTx(tx *sql.Tx, table string, encrypted *EncryptedFieldConfig, computed *ComputedFieldConfig, key []byte) error {
 	if err := configIdentError("versioned table", table); err != nil {
 		return err
 	}
@@ -148,7 +164,7 @@ func installVersioningForTableTx(tx *sql.Tx, table string, encrypted *EncryptedF
 			return err
 		}
 	}
-	if err := reconcileVersionedTable(tx, table, encrypted); err != nil {
+	if err := reconcileVersionedTable(tx, table, encrypted, computedExprColumns(computed, table)); err != nil {
 		return err
 	}
 	if encrypted != nil {
@@ -234,7 +250,45 @@ func versionHistoryExists(q mutationQuerier, history string) (bool, error) {
 
 func versionSQLLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
-func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedFieldConfig) error {
+// versionUpdateWhen builds the history UPDATE trigger's WHEN clause. A version
+// is the state a user write replaced, so an UPDATE that changes no content is
+// skipped when it is storage maintenance:
+//
+//   - every content column is unchanged (unchanged), and
+//   - at least one maintenance column changed (normalized: encryption
+//     normalization, blind-index siblings, computed recalculation), or the
+//     row's updated_at moved to an instant the recorded history already
+//     covers (stamp, compared with latestEnd, the newest version's end).
+//
+// The second rule is the Prisma @updatedAt touch: a raw UPDATE that leaves
+// updated_at alone is versioned, then the trigger rewrites updated_at, and
+// that second write used to record a version holding the new content with
+// the old timestamp. A covered timestamp proves nothing is lost: point-in-time
+// reads serve the current row from the newest boundary on. A timestamp-only
+// write past that boundary (an explicit touch) still records a version, so
+// the earlier interval keeps its state. Without maintenance columns or an
+// updated_at column the trigger has no WHEN, as before.
+func versionUpdateWhen(unchanged, normalized []string, stamp, latestEnd string) string {
+	content := "1"
+	if len(unchanged) != 0 {
+		content = "(" + strings.Join(unchanged, " AND ") + ")"
+	}
+	if stamp == "" {
+		if len(normalized) == 0 {
+			return ""
+		}
+		return " WHEN NOT (" + content + " AND (" + strings.Join(normalized, " OR ") + "))"
+	}
+	newStamp := "NEW." + quoteIdent(stamp)
+	covered := "benmore_history_covers(" + latestEnd + ", " + newStamp + ")"
+	still := "(OLD." + quoteIdent(stamp) + " IS " + newStamp + " OR " + covered + ")"
+	maintenance := append(append([]string(nil), normalized...), covered)
+	return " WHEN NOT (" + content + " AND " + still + " AND (" + strings.Join(maintenance, " OR ") + "))"
+}
+
+// derived names the table's same-row computed columns; their recalculation
+// is storage maintenance (see the WHEN clause below).
+func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedFieldConfig, derived []string) error {
 	cols, err := mainTableColumnsWith(tx, table)
 	if err != nil {
 		return err
@@ -294,12 +348,27 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 			}
 		}
 	}
+	derivedCols := map[string]bool{}
+	for _, name := range derived {
+		derivedCols[sqliteIdentifierFold(name)] = true
+	}
+	// The Prisma @updatedAt trigger rewrites updated_at after any UPDATE that
+	// left it alone, including the framework's own maintenance writes. It is
+	// judged separately below rather than as content.
+	stamp := ""
 	var oldRefs, unchanged, normalized []string
 	for _, col := range cols {
 		old, next := "OLD."+quoteIdent(col.Name), "NEW."+quoteIdent(col.Name)
 		equal := old + " IS " + next
 		if aadColumn, ok := encCols[sqliteIdentifierFold(col.Name)]; ok {
 			oldRefs = append(oldRefs, "benmore_history_encrypt("+old+", "+versionSQLLiteral(aadTable)+", "+versionSQLLiteral(aadColumn)+")")
+			if derivedCols[sqliteIdentifierFold(col.Name)] {
+				// A computed column that is also encrypted is sealed by its
+				// own trigger (computedSeal): its recalculation is storage
+				// maintenance, as for a plain computed column below.
+				normalized = append(normalized, "("+old+" IS NOT "+next+")")
+				continue
+			}
 			// The encryption AFTER trigger performs a second UPDATE. That storage
 			// normalization is not another user version (including on INSERT).
 			norm := "benmore_history_normalized(" + old + ", " + next + ", " + versionSQLLiteral(aadTable) + ", " + versionSQLLiteral(aadColumn) + ")"
@@ -307,10 +376,15 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 			normalized = append(normalized, norm)
 		} else {
 			oldRefs = append(oldRefs, old)
-			if blindCols[sqliteIdentifierFold(col.Name)] {
-				// A derived blind-index write is storage maintenance too.
+			switch {
+			case blindCols[sqliteIdentifierFold(col.Name)], derivedCols[sqliteIdentifierFold(col.Name)]:
+				// A derived blind-index write is storage maintenance too, and so
+				// is a computed field's recalculation: the expression's inputs
+				// are content, and the user's own write already recorded them.
 				normalized = append(normalized, "("+old+" IS NOT "+next+")")
-			} else {
+			case sqliteIdentifierFold(col.Name) == "updated_at":
+				stamp = col.Name
+			default:
 				unchanged = append(unchanged, "("+equal+")")
 			}
 		}
@@ -335,8 +409,8 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 		}
 		validTo := "benmore_history_end(boundary.start, " + candidate + ")"
 		when := ""
-		if op == "update" && len(normalized) != 0 {
-			when = " WHEN NOT ((" + strings.Join(unchanged, " AND ") + ") AND (" + strings.Join(normalized, " OR ") + "))"
+		if op == "update" {
+			when = versionUpdateWhen(unchanged, normalized, stamp, previous("_valid_to"))
 		}
 		// MATERIALIZED prevents SQLite from evaluating the start clock twice
 		// when a table has no source/retained timestamps, including clock rollback.
@@ -497,6 +571,72 @@ func suspendEncryptionTriggers(tx *sql.Tx) ([]string, error) {
 		}
 	}
 	return ddls, nil
+}
+
+// suspendRowMaintenanceTriggers keeps storage maintenance from reading as an
+// edit of the row. The Prisma @updatedAt trigger stamps every UPDATE that
+// leaves updated_at alone, and the computed-field triggers (_benmore_cf_)
+// recalculate on every UPDATE; an aggregate rewrites its parent row, which
+// stamps the parent too. Re-sealing a value under a new key or writing a
+// blind-index sibling changes neither the plaintext nor anything a computed
+// field can meaningfully derive from it, yet key rotation used to move
+// updated_at on every encrypted row: ?as_of= before the rotation found no
+// state for unedited rows and _expected_updated_at read before it got 409.
+//
+// Only the exact generated @updatedAt definitions are suspended; an app's own
+// trigger keeps firing. The caller drops and restores inside one write
+// transaction (SQLite's write lock is held throughout, so no other writer runs
+// without them) and reseats connector revision triggers before committing.
+// The returned DDL restores @updatedAt triggers before computed ones, the
+// order a load creates them in.
+func suspendRowMaintenanceTriggers(tx *sql.Tx) ([]string, error) {
+	rows, err := tx.Query(`SELECT name,tbl_name,sql FROM main.sqlite_schema WHERE type='trigger' AND (substr(name,1,12)='_benmore_cf_' OR substr(name,1,4)='trg_') ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	var names, stamps, computed []string
+	for rows.Next() {
+		var name, table string
+		var ddl sql.NullString
+		if err := rows.Scan(&name, &table, &ddl); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if strings.TrimSpace(ddl.String) == "" {
+			continue // nothing to restore it from: leave it in place
+		}
+		if strings.HasPrefix(name, "_benmore_cf_") {
+			names, computed = append(names, name), append(computed, ddl.String)
+			continue
+		}
+		column, onTable := strings.CutPrefix(name, "trg_"+table+"_")
+		column, stamp := strings.CutSuffix(column, "_updated")
+		if !onTable || !stamp || column == "" {
+			continue
+		}
+		stored := normalizePrismaUpdatedAtSQL(ddl.String)
+		if stored == normalizePrismaUpdatedAtSQL(prismaUpdatedAtTriggerSQL(table, column)) || stored == normalizePrismaUpdatedAtSQL(legacyPrismaUpdatedAtTriggerSQL(table, column)) {
+			names, stamps = append(names, name), append(stamps, ddl.String)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		if _, err := tx.Exec("DROP TRIGGER " + quoteIdent(name)); err != nil {
+			return nil, err
+		}
+	}
+	return append(stamps, computed...), nil
+}
+
+func restoreRowMaintenanceTriggers(tx *sql.Tx, ddls []string) error {
+	for _, ddl := range ddls {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func restoreEncryptionTriggers(tx *sql.Tx, ddls []string) error {

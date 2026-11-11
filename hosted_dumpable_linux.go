@@ -36,7 +36,16 @@ func init() {
 // filesystem, where a dumpable process would lend that view to the app's
 // other instance for as long as the check runs.
 func markProcessNonDumpable() {
-	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetDumpable, 0, 0); errno != 0 {
-		log.Printf("SECURITY: could not mark the hosted tenant process non-dumpable: %v", errno)
+	if err := setProcessNonDumpable(); err != nil {
+		log.Printf("SECURITY: could not mark the hosted tenant process non-dumpable: %v", err)
 	}
+}
+
+// setProcessNonDumpable is markProcessNonDumpable for a caller that must
+// not go on dumpable (the tenant file helper exits instead).
+func setProcessNonDumpable() error {
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetDumpable, 0, 0); errno != 0 {
+		return errno
+	}
+	return nil
 }

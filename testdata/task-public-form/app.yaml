@@ -1,0 +1,7 @@
+# Public contact form: anyone may send a message, the owner reads them signed
+# in as an admin and gets an email for each one.
+site_name: "Contact"
+auth:
+  identifier: email
+access:
+  messages: { all: admin }      # visitors write only through the flow

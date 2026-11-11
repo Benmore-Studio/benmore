@@ -1,0 +1,7 @@
+site_name: "static-paths-reviewed fixture"
+# A reviewed mcp.yaml: static/ is served from the source captured at load.
+# The twin fixture static-paths holds the same files without a manifest.
+# After changing any file outside tests/, bind the manifest again:
+#   benmore mcp review testdata/static-paths-reviewed --reviewed
+frontend:
+  stack: html

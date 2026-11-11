@@ -1,0 +1,8 @@
+[
+  "GET    /api/_auth/roles                                 - list configured roles + effective scopes",
+  "GET    /api/_auth/users/{id}/roles                      - list a user's assignments (admin OR self)",
+  "POST   /api/_auth/users/{id}/roles                      - body {role, expires_at?, group_id?}",
+  "PATCH  /api/_auth/users/{id}/roles/{role}[?group_id=X]  - body {expires_at?}",
+  "DELETE /api/_auth/users/{id}/roles/{role}[?group_id=X|all]",
+  "GET    /api/_auth/profile                               - returns roles[] + permissions[] alongside the legacy single role field"
+]

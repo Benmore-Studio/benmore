@@ -1,0 +1,8 @@
+[
+  "`run: transcribe` with `with: { file, model?, language? }`.",
+  "`file` (required) - the audio/video to transcribe. LOCAL-FILE-FIRST: an app-relative path (e.g. `uploads/brief.webm`) is the primary input and takes NO HTTP hop. Local paths are contained to the app's `uploads/` subtree (serve_file parity) - a path that escapes it (`../…`, absolute paths, app files outside uploads/) is rejected before any binary runs. An http(s) URL is allowed as a secondary form and is fetched through the framework's existing SSRF-guarded fetch path (private/internal IPs blocked; 1GB size cap).",
+  "`model` (optional) - overrides `WHISPER_MODEL` for this step (e.g. `base.en`). Resolves to `<WHISPER_MODEL_DIR>/ggml-<model>.bin`; the model file must already be on the host (see provisioning).",
+  "`language` (optional) - forces the spoken language; omit to let Whisper auto-detect (the default `small.en` model is English-only).",
+  "Outputs: `steps.<id>.outputs.text` (the trimmed transcript) and `steps.<id>.outputs.audio_path` (the RESOLVED INPUT reference - the app-relative `uploads/…` path, or the source URL for URL inputs). The decoded temp WAV is deleted before the step returns and is never exposed.",
+  "`timeout:` (optional; at the step root or under `with:`, as on `run: api`, and the step root wins) caps the call; the effective deadline is the SMALLER of the step timeout and `TRANSCRIBE_TIMEOUT`."
+]

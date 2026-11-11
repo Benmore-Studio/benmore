@@ -1,0 +1,3 @@
+site_name: "workflow-sql-default"
+auth:
+  identifier: email

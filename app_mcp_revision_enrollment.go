@@ -82,6 +82,27 @@ func repairAppMCPRevisionEnrollment(ctx context.Context, app *App, generation *a
 	return changeAppMCPRevisionEnrollment(ctx, app, generation, true)
 }
 
+// appMCPRevisionUniverseChanged reports that an active enrollment covers a
+// different table set than the loaded reviewed commands need: the condition
+// write verification refuses as "revision enrollment universe changed". It
+// reads only, and says false whenever it cannot tell (the enable path then
+// reports verification's own error).
+func appMCPRevisionUniverseChanged(ctx context.Context, app *App, generation *appMCPRuntimeGeneration, enrollment *appMCPRevisionEnrollment) bool {
+	if ctx == nil || app == nil || app.DB == nil || generation == nil || generation.manifest == nil || enrollment == nil || enrollment.State != "active" {
+		return false
+	}
+	tx, err := app.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback()
+	tables, err := appMCPRevisionUniverse(tx, generation, false)
+	if err != nil {
+		return false
+	}
+	return !sameStrings(enrollment.TableNames, tables) || len(enrollment.Tables) != len(tables)
+}
+
 // enableAppMCPRevisionEnrolledWrites is the only enrollment-aware write-enable
 // path. It verifies the full active enrollment and main DB under the same gate
 // and owner lease before rotating the owner's write epoch.
@@ -947,11 +968,13 @@ func verifyAppMCPDeclaredTriggerClosure(tx *sql.Tx, generation *appMCPRuntimeGen
 				if field == nil {
 					return errors.New("nil computed field in captured trigger declaration")
 				}
+				// A computed column that is also encrypted is written
+				// sealed by its trigger (computedSeal), as the load
+				// installs it.
+				seal := computedSealFor(generation.view.Encrypted, field.Table, field.Column)
 				if field.Expr != "" && inside[strings.ToLower(field.Table)] {
 					for _, event := range []string{"insert", "update"} {
-						name := fmt.Sprintf("_benmore_cf_%s_%s_%s", field.Table, field.Column, event)
-						verb := strings.ToUpper(event)
-						sql := fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER %s ON %s FOR EACH ROW BEGIN UPDATE %s SET %s = (%s) WHERE rowid = NEW.rowid; END", name, verb, field.Table, field.Table, field.Column, field.Expr)
+						name, sql := computedExprTriggerSQLFor(field, event, seal)
 						if err := add(name, sql, field.Table); err != nil {
 							return err
 						}
@@ -963,24 +986,15 @@ func verifyAppMCPDeclaredTriggerClosure(tx *sql.Tx, generation *appMCPRuntimeGen
 							continue
 						}
 						for _, event := range trigger.On {
-							ref := "NEW"
-							switch event {
-							case "insert", "update":
-							case "delete":
-								ref = "OLD"
-							default:
+							name, sql, ok := computedAggregateTriggerSQL(field, trigger, event, seal)
+							if !ok {
 								return fmt.Errorf("unsupported computed trigger event %q", event)
 							}
-							name := fmt.Sprintf("_benmore_cf_%s_%s_%s_%s", field.Table, field.Column, trigger.Table, event)
-							recalc := strings.Replace(field.SQL, "?", fmt.Sprintf("%s.%s", ref, trigger.FK), 1)
-							sql := fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER %s ON %s FOR EACH ROW WHEN %s.%s IS NOT NULL BEGIN UPDATE %s SET %s = (%s) WHERE id = %s.%s; END", name, strings.ToUpper(event), trigger.Table, ref, trigger.FK, field.Table, field.Column, recalc, ref, trigger.FK)
 							if err := add(name, sql, trigger.Table); err != nil {
 								return err
 							}
 							if event == "update" {
-								name = fmt.Sprintf("_benmore_cf_%s_%s_%s_update_old", field.Table, field.Column, trigger.Table)
-								recalc = strings.Replace(field.SQL, "?", fmt.Sprintf("OLD.%s", trigger.FK), 1)
-								sql = fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE ON %s FOR EACH ROW WHEN OLD.%s IS NOT NULL AND OLD.%s IS NOT NEW.%s BEGIN UPDATE %s SET %s = (%s) WHERE id = OLD.%s; END", name, trigger.Table, trigger.FK, trigger.FK, trigger.FK, field.Table, field.Column, recalc, trigger.FK)
+								name, sql = computedAggregateOldTriggerSQL(field, trigger, seal)
 								if err := add(name, sql, trigger.Table); err != nil {
 									return err
 								}
@@ -1006,10 +1020,12 @@ func verifyAppMCPDeclaredTriggerClosure(tx *sql.Tx, generation *appMCPRuntimeGen
 				for _, event := range []string{"insert", "update"} {
 					name := fmt.Sprintf("_benmore_enc_%s_%s_%s", table, col, event)
 					var sql string
+					// Names as InstallEncryptionTriggers writes them (ddlIdent).
+					sqlTable, sqlCol := ddlIdent(table), ddlIdent(col)
 					if event == "insert" {
-						sql = fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END", name, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit)
+						sql = fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END", name, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, sqlCol, sqlCol, tableLit, colLit)
 					} else {
-						sql = fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END", name, col, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit)
+						sql = fmt.Sprintf("CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END", name, sqlCol, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, sqlCol, sqlCol, tableLit, colLit)
 					}
 					if err := add(name, sql, table); err != nil {
 						return err

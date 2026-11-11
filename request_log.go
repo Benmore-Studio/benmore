@@ -33,6 +33,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,10 @@ const (
 	// requestLogCap rows in the app's own, storage-capped database.
 	requestLogPathMax = 2048
 )
+
+// requestLogAborted marks the error of a request whose handler aborted the
+// response (http.ErrAbortHandler): the caller got a cut-off answer or none.
+const requestLogAborted = "response aborted"
 
 // requestLogTruncate cuts s to at most n bytes without splitting a UTF-8
 // rune.
@@ -248,7 +253,7 @@ func requestLogMiddleware(app *App, next http.Handler) http.Handler {
 
 		start := time.Now()
 		rw := &statusCapture{ResponseWriter: w, status: 200}
-		slot := &requestLogSlot{}
+		slot := &requestLogSlot{app: app}
 		logged := r.WithContext(context.WithValue(r.Context(), requestLogErrorKey{}, slot))
 		logLine := func(status int) {
 			dur := time.Since(start).Milliseconds()
@@ -268,15 +273,36 @@ func requestLogMiddleware(app *App, next http.Handler) http.Handler {
 				method: r.Method, path: path, status: status, durationMS: dur,
 				ip: ip, userID: userID, ua: ua, errorDetail: errorDetail, requestID: requestID,
 			})
+			reportRequestFailure(app, logged, slot, status)
 		}
 		// A handler panic unwinds past this middleware to recoverMiddleware,
 		// which answers 500 and logs the stack. The request still gets its
 		// log line, with the panic as its error and a request id on the
-		// answer; http.ErrAbortHandler is a deliberate abort, not a fault.
+		// answer. http.ErrAbortHandler is a deliberate abort (a proxy step
+		// whose stream failed after it started, a reverse proxy whose
+		// backend did), not a fault: its line keeps the status already sent
+		// (0 when none was) and the handler's own error, marked aborted.
 		defer func() {
 			if rec := recover(); rec != nil {
-				if rec != http.ErrAbortHandler {
+				if rec == http.ErrAbortHandler {
+					status := 0
+					if rw.wrote {
+						status = rw.status
+					}
+					switch detail, _ := slot.read(); {
+					case detail == "":
+						setRequestLogError(logged, requestLogAborted)
+					case !strings.HasPrefix(detail, requestLogAborted):
+						setRequestLogError(logged, requestLogAborted+": "+detail)
+					}
+					logLine(status)
+				} else {
 					id := recordRequestError(logged, fmt.Sprintf("panic: %v", rec))
+					pcs := make([]uintptr, 64)
+					n := runtime.Callers(2, pcs)
+					slot.mu.Lock()
+					slot.panicked, slot.panicValue, slot.pcs = true, fmt.Sprint(rec), pcs[:n]
+					slot.mu.Unlock()
 					if !rw.wrote {
 						rw.Header().Set(requestIDHeader, id)
 					}
@@ -303,9 +329,16 @@ type requestLogErrorKey struct{}
 // (server_error.go). Locked because a handler may record from a goroutine
 // other than the one that serves the request.
 type requestLogSlot struct {
-	mu        sync.Mutex
-	err       string
-	requestID string
+	app         *App
+	exportError string
+	mu          sync.Mutex
+	err         string
+	requestID   string
+	pcs         []uintptr
+	panicked    bool
+	panicValue  string
+	where       string
+	reported    bool
 }
 
 func (s *requestLogSlot) read() (string, string) {

@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +21,8 @@ import (
 // handleStreamingIngest accepts NDJSON (newline-delimited JSON) for bulk data ingestion.
 // Single transaction, no after-hooks (performance). Each row goes through the
 // shared create pipeline (txInsertWithPlan): validators, before-hooks on the
-// transaction, protected/computed columns and foreign-key visibility. A
+// transaction, protected/computed columns and foreign-key visibility, and
+// gets its own "insert" audit entry in the transaction, like batch create. A
 // refused row is skipped and counted; the rest of the stream continues.
 // A read failure commits the valid prefix but returns a non-2xx partial result.
 // Ingested always counts committed rows; errors includes a terminal read error.
@@ -34,7 +36,7 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	}
 
 	// CSRF check (Bearer bypass)
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
@@ -46,25 +48,33 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 		return
 	}
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
 	// Rate limit: 5 ingestions per minute per user
 	rateLimitKey := appLimiterKey(app, "ingest", fmt.Sprintf("user:%d", session.UserID))
-	if !ingestLimiter.Allow(rateLimitKey) {
-		http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
+	if ok, retry, _ := ingestLimiter.Check(rateLimitKey); !ok {
+		setRetryAfter(w, retry)
+		httpRefusal(w, rateLimitedMessage, http.StatusTooManyRequests, refusalIngestLimit)
 		return
 	}
 
-	// Body size limit: 100MB
+	// The body arrives only as fast as rows are inserted, so the documented
+	// 100k rows outlast the server's 15 s read and 30 s write deadlines.
+	// Extended only now, for an authenticated, rate-limited writer.
+	extendBulkBodyDeadlines(w)
+
+	// Body size limit: 100MB. The global request-body cap does not apply
+	// here: serverBodyLimitMiddleware leaves this route to this cap.
 	const maxBodySize = 100 * 1024 * 1024
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
 	ownedCheck := ownedFieldChecker(app, table)
 
 	// Begin transaction
-	tx, err := app.DB.Begin()
+	ctx := withWriteTxLabel(context.Background(), "ingest:"+table)
+	tx, err := app.DB.BeginTx(ctx, nil)
 	if err != nil {
 		serverError(w, r, app, table+" ingest", err, "Server error")
 		return
@@ -77,6 +87,12 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 		serverError(w, r, app, table+" ingest", err, "Server error")
 		return
 	}
+	// Each committed row is read back for its audit entry. The read is
+	// queryNativeRowsWith's, with the database's key resolved once instead
+	// of once per row (it stats the database path).
+	readBackKey := cryptoKeyForQuerier(tx)
+	readBackDecrypt := nativeRowDecryptor(app, table)
+	readBackSQL := "SELECT * FROM " + quoteIdent(table) + " WHERE id = ?"
 
 	const maxRows = 100000
 	const maxLineSize = 1024 * 1024 // 1MB max line length
@@ -138,6 +154,21 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 			return
 		}
 
+		// A row naming another member refuses the whole stream too: the strip
+		// below would create it for the caller, and a skipped-row count would
+		// not say why (membershipNamedIdentityDenial).
+		if err := membershipCreateIdentityDenial(app, table, session, item); err != nil {
+			httpJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error":       err.Error(),
+				"ingested":    0, // The deferred rollback discards every row.
+				"errors":      errCount + 1,
+				"line":        lineNum,
+				"duration_ms": time.Since(start).Milliseconds(),
+				"status":      "failed",
+			})
+			return
+		}
+
 		// Protected fields are stripped silently (same as handleCreate);
 		// a truly unknown column rejects the row.
 		data := make(map[string]any, len(item))
@@ -168,7 +199,8 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 			serverError(w, r, app, table+" ingest", err, "Server error")
 			return
 		}
-		if _, err := txInsertWithPlan(tx, app, table, data, session, plan); err != nil {
+		id, err := txInsertWithPlan(tx, app, table, data, session, plan)
+		if err != nil {
 			// SQLite may end the whole transaction on SQLITE_FULL; any later
 			// statement would then commit on its own. Stop and roll back.
 			if isStorageFullError(err) {
@@ -187,6 +219,33 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 			tx.Exec("RELEASE benmore_ingest_row")
 			errCount++
 			continue
+		}
+		// One audit entry per committed row, as batch create writes: the row
+		// as stored, under the same "insert" action as a single create. A
+		// failure here is the server's, not the row's, so it ends the request
+		// and the deferred rollback discards every row.
+		stored, err := queryRowsWithKeyContextDecrypt(ctx, tx, readBackKey, readBackDecrypt, readBackSQL, id)
+		if err != nil || len(stored) != 1 {
+			if err == nil {
+				err = fmt.Errorf("inserted row %v read back %d rows", id, len(stored))
+			}
+			serverErrorJSONBody(w, r, app, http.StatusInternalServerError, table+" ingest", err, map[string]any{
+				"error":    "could not read inserted row",
+				"ingested": 0,
+				"errors":   errCount,
+			})
+			return
+		}
+		if err := LogAuditTx(tx, app, "insert", table, valueText(id), session, nil, stored[0]); err != nil {
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			serverErrorJSONBody(w, r, app, http.StatusInternalServerError, table+" ingest", err, map[string]any{
+				"error":    "audit write failed",
+				"ingested": 0,
+				"errors":   errCount,
+			})
+			return
 		}
 		if _, err := tx.Exec("RELEASE benmore_ingest_row"); err != nil {
 			serverError(w, r, app, table+" ingest", err, "Server error")
@@ -230,22 +289,6 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 		return
 	}
 
-	// Single audit log entry for the batch, committed with the rows.
-	if err := LogAuditTx(tx, app, "ingest", table, fmt.Sprintf("batch:%d", ingested), session, nil, map[string]any{
-		"ingested": ingested,
-		"errors":   errCount,
-	}); err != nil {
-		if respondStorageFull(w, app, err) {
-			return
-		}
-		serverErrorJSONBody(w, r, app, http.StatusInternalServerError, table+" ingest", err, map[string]any{
-			"error":    "audit write failed",
-			"ingested": 0,
-			"errors":   errCount,
-		})
-		return
-	}
-
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		if respondStorageFull(w, app, err) {
@@ -275,9 +318,16 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 	}
 	status := http.StatusOK
 	if readErr != nil {
+		// Say what committed in the message itself: a caller that reads only
+		// the error (or takes any non-2xx to mean nothing happened) must not
+		// replay rows that are already in the table.
 		status = readStatus
 		result["status"] = "partial"
-		result["error"] = "read error: " + readErr.Error()
+		rows := "rows"
+		if ingested == 1 {
+			rows = "row"
+		}
+		result["error"] = fmt.Sprintf("read error: %s; the request body ended before it was complete, and the %d %s accepted before line %d were committed", readErr, ingested, rows, lineNum+1)
 		result["line"] = lineNum + 1
 	}
 	httpJSON(w, status, result)

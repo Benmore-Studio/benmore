@@ -30,27 +30,42 @@ const (
 )
 
 // writeAppSourceFile writes a source-tree file from the app process and makes
-// it group read/writable despite the unit's umask.
+// it group read/writable despite the unit's umask. A link at path is refused,
+// never written through (a migration linked to data.db must not truncate the
+// database or widen it to the source mode).
 func writeAppSourceFile(path string, data []byte) error {
-	if err := os.WriteFile(path, data, appSourceFileMode); err != nil {
+	f, err := openNoFollow(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, appSourceFileMode)
+	if err != nil {
 		return err
 	}
-	_ = os.Chmod(path, appSourceFileMode)
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	_ = chmodNoFollow(path, appSourceFileMode)
 	return nil
 }
 
-// repairAppSourceModes widens migrations/ and its *.sql files plus the
-// derived schema.sql when this process owns them and they are narrower than
-// the shared modes. Best-effort and silent: a file owned by the other user is
-// left alone (chmod would fail), and nothing else in the tree is touched.
+// repairAppSourceModes widens migrations/ and its *.sql files, the derived
+// schema.sql and the history .gitignore when this process owns them and they
+// are narrower than the shared modes (an older router wrote .gitignore 0600,
+// and under the tenant-data lock the tree's owner is this process's user). Best-effort and silent: a file owned by the other user is
+// left alone (chmod would fail), and nothing else in the tree is touched. Only
+// a regular file or a directory is widened, never through a link (lstat, then
+// a chmod through a descriptor opened without following one): a schema.sql
+// or migration linked to data.db would otherwise open the database to the
+// group at every start.
 func repairAppSourceModes(dir string) {
 	widen := func(path string, want os.FileMode) {
-		info, err := os.Stat(path)
-		if err != nil {
+		info, err := os.Lstat(path)
+		if err != nil || (!info.Mode().IsRegular() && !info.IsDir()) {
 			return
 		}
 		if info.Mode().Perm()&want != want {
-			_ = os.Chmod(path, info.Mode().Perm()|want)
+			_ = chmodNoFollow(path, info.Mode().Perm()|want)
 		}
 	}
 	migDir := filepath.Join(dir, "migrations")
@@ -63,4 +78,5 @@ func repairAppSourceModes(dir string) {
 		}
 	}
 	widen(filepath.Join(dir, "schema.sql"), appSourceFileMode)
+	widen(filepath.Join(dir, ".gitignore"), appSourceFileMode)
 }

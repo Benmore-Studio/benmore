@@ -1,0 +1,1 @@
+Last-resort recovery surface for app-level issues - corrupt DB, accidental file delete, partial migrations. Three CLI commands: `delete-file`, `integrity-check`, `restore`. Auto-recovery handles the common case (a boot-time backup restore on an unreadable data.db); this is the manual surface for when that's not enough.

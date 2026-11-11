@@ -1,0 +1,1 @@
+One request names at most 1000 rows: POST items, PATCH/DELETE ids, and /api/_transaction operations. More answers 413 {error, limit:1000} before anything runs. Split larger work, or use api(at:"ingest") / api(at:"import") for bulk loads. Batch DELETE ids are decoded as exact numbers, like PATCH ids, so an id past 2^53 names exactly that row.

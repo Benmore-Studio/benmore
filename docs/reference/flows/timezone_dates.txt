@@ -1,0 +1,1 @@
+`benmore_today(timezone)` returns the server's current calendar date in the supplied IANA time zone (for example `America/New_York`). It is time-dependent and raises a SQL error for blank, `Local`, or invalid zones; it never accepts a caller-supplied clock value.

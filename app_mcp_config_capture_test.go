@@ -83,7 +83,9 @@ func TestAppMCPCapturedFeatureConfigUsesCanonicalConsumers(t *testing.T) {
 	if app.versionedConfig() != nil || len(app.aggregateConfig()) != 0 || len(app.retentionConfig()) != 0 {
 		t.Fatal("empty capture admitted late files")
 	}
-	if LoadVersionedConfig(app.Dir) == nil || len(LoadAggregateConfig(app.Dir)) != 1 || len(LoadRetentionConfig(app.Dir)) != 2 {
+	// retention.yaml's one policy: app.yaml's inline `retention:` (orgdocs,
+	// still on disk) is not read.
+	if LoadVersionedConfig(app.Dir) == nil || len(LoadAggregateConfig(app.Dir)) != 1 || len(LoadRetentionConfig(app.Dir)) != 1 {
 		t.Fatal("ordinary feature loaders changed")
 	}
 }
@@ -210,7 +212,7 @@ func TestAppMCPFeatureSnapshotsDuringPublication(t *testing.T) {
 			if roomMembershipAllowed(app, nil, 0, "room-1") {
 				t.Error("anonymous room admission")
 			}
-			if ValidateCrossField(app.validatorConfig(), "notes", map[string]any{"title": "blocked"}) == nil {
+			if ValidateCrossField(app.validatorConfig(), "notes", map[string]any{"title": "blocked"}, nil) == nil {
 				t.Error("validator admission")
 			}
 			if !app.adminConfig().IsTableHidden("notes") || app.computedConfig().Fields["notes"]["title"].Expr != "title" {

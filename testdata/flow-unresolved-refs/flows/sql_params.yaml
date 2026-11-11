@@ -1,0 +1,19 @@
+# `b` is optional in the request and has no fallback here: a request without
+# it must not store the reference text.
+on:
+  request:
+    method: POST
+    path: /api/sql-params
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: ins
+        run: sql
+        with:
+          query: "INSERT INTO notes (title, body) VALUES (:a, :b)"
+          params:
+            a: "${{ params.a }}"
+            b: "${{ params.b }}"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

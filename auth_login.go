@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -22,47 +23,69 @@ import (
 
 func handleSwitchGroup(w http.ResponseWriter, r *http.Request, app *App) {
 	mergeJSONBodyIntoForm(r)
+	// A JSON client (bm.api, fetch with a JSON body or Accept:
+	// application/json) gets JSON; a 303 made fetch follow it and hand the
+	// caller the home page's HTML. A browser form post keeps the redirect.
+	jsonClient := wantsJSON(r)
+	fail := func(msg string, code int) {
+		if jsonClient {
+			httpJSON(w, code, map[string]any{"error": msg})
+			return
+		}
+		http.Error(w, msg, code)
+	}
 	session := getSession(app, r)
 	if session == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		fail("Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if !validateCSRF(r) {
-		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+	// A cookie-less Bearer request carries its credential explicitly, as on
+	// every other authenticated mutation; demanding a CSRF token here kept a
+	// native client's sign-in session from ever switching tenants.
+	if !isBearerAuth(r) && !validateCSRF(r) {
+		fail("Invalid CSRF token", http.StatusForbidden)
 		return
 	}
 	newGroupID := r.FormValue("group_id")
 	if newGroupID == "" {
-		http.Error(w, "group_id required", http.StatusBadRequest)
+		fail("group_id required", http.StatusBadRequest)
 		return
 	}
 	// Platform admins can switch to any org; others must belong to the org
 	if !session.IsAdmin() {
 		// Email-keyed memberships count only for a verified address.
 		if _, ok := groupMemberValue(app.Group, session); !ok {
-			http.Error(w, "Verify your email to join this organization", http.StatusForbidden)
+			fail("Verify your email to join this organization", http.StatusForbidden)
 			return
 		}
 		// Only a live membership row (not soft-deleted, active per
 		// groups.active_field) lets the user into the organization.
 		if !groupMembershipLive(app.DB, app.Group, session, newGroupID) {
-			http.Error(w, "Not a member of this organization", http.StatusForbidden)
+			fail("Not a member of this organization", http.StatusForbidden)
 			return
 		}
 	}
 	// Update session org_id. The tenant lives on the session row: an API
-	// token or edge identity has none, and reporting a switch that did not
+	// token has none, and reporting a switch that did not
 	// happen sent the caller's next writes to the tenant it left.
 	res, err := app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", newGroupID, session.ID)
 	if err != nil {
-		serverError(w, r, app, "switch organization", err, "Could not switch organization")
+		if jsonClient {
+			serverErrorJSON(w, r, app, "switch organization", err, "Could not switch organization")
+		} else {
+			serverError(w, r, app, "switch organization", err, "Could not switch organization")
+		}
 		return
 	}
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
-		http.Error(w, "Switching organization needs a sign-in session: an API token or edge identity can't hold one", http.StatusBadRequest)
+		fail("Switching organization needs a sign-in session: an API token can't hold one", http.StatusBadRequest)
 		return
 	}
 	invalidateRequestSession(r)
+	if jsonClient {
+		httpJSON(w, http.StatusOK, map[string]any{"status": "switched", "group_id": newGroupID})
+		return
+	}
 	referer := r.Header.Get("Referer")
 	if referer == "" {
 		referer = "/"
@@ -145,14 +168,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	var id int64
 	var hash string
 	var email string
+	var deactivatedAt string
 	// Look up user by configured identifier, also fetch email for session
 	// creation. Email matches case-insensitively so legacy rows stored with
 	// uppercase (pre-normalization) keep working.
-	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, '') FROM _benmore_users WHERE %s = ?", identifier)
+	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(deactivated_at, '') FROM _benmore_users WHERE %s = ?", identifier)
 	if identifier == "email" {
 		query += " COLLATE NOCASE"
 	}
-	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email)
+	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email, &deactivatedAt)
 	if err != nil {
 		burnPasswordCheck(password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, loginValue, false)
@@ -162,16 +186,22 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Capture the generation before checking the password. Challenge issuance
-	// rechecks it while holding the writer, including same-hash resets.
-	_, proofHash, proofBinding, err := mfaSetupAccountState(app, app.DB, id, email)
-	if err != nil || !hmac.Equal([]byte(hash), []byte(proofHash)) {
-		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
-		return
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+	// rechecks it while holding the writer, including same-hash resets. Its
+	// error is acted on only after the password check below.
+	_, proofHash, proofBinding, stateErr := mfaSetupAccountState(app, app.DB, id, email)
+	// A deactivated account answers exactly as a wrong password does, even
+	// when the password is right: the same bcrypt work, message and failed
+	// attempt. It used to stop before the password check with "Credentials
+	// changed", which told anyone without the password that the address
+	// belongs to a deactivated account.
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil || deactivatedAt != "" {
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
+		return
+	}
+	if stateErr != nil || !hmac.Equal([]byte(hash), []byte(proofHash)) {
+		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
 		return
 	}
 
@@ -181,6 +211,14 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	// A grandfathered, unverified account proves its email before any factor.
 	if _, stop := grandfatheredSignInNeedsProof(app, r, id); stop {
 		authRedirect(w, r, app.Paths.Login, grandfatheredVerifyMessage)
+		return
+	}
+	// So does any unverified account under auth.require_verified (unless
+	// the emailed OTP step below proves the address): its session would be
+	// refused on every request, so none is issued, nor an MFA step or
+	// enrollment grant that would end in one.
+	if msg, stop := requireVerifiedSignInStop(app, r, id); stop {
+		refuseUnverifiedSignIn(w, r, app, msg, nil)
 		return
 	}
 
@@ -196,7 +234,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 				return
 			}
 			setFlowCookie(w, flowCookieMFA, token, !app.DevMode, 300)
-			http.Redirect(w, r, app.Paths.VerifyMFA, http.StatusSeeOther)
+			sendMFAChallenge(w, r, app)
 			return
 		}
 		completeInlineMFALogin(w, r, app, id, email, loginValue, hash, proofBinding, mfaCode)
@@ -306,9 +344,7 @@ func prepareLoginOTPTx(app *App, tx *sql.Tx, id int64, email, loginValue, bindin
 		return "", "", err
 	}
 	code = generateOTP()
-	if _, err = tx.Exec("CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)"); err != nil {
-		return "", "", err
-	}
+	// The table and its email index are created at startup (ensureOTPTable).
 	if _, err = tx.Exec("DELETE FROM _benmore_otp WHERE email=?", loginValue); err != nil {
 		return "", "", err
 	}
@@ -373,6 +409,36 @@ func sendOTPChallenge(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+// sendMFAChallenge routes the caller to the authenticator-code step once the
+// password passed and the one-use MFA step cookie is set. As with the emailed
+// code, a JSON client gets {mfa_required, redirect} and a form post a 303.
+// JSON callers used to get the 303 too: fetch followed it to GET /verify-mfa,
+// which most apps did not serve, so bm.auth.signIn failed with that 404
+// page's HTML as its message.
+func sendMFAChallenge(w http.ResponseWriter, r *http.Request, app *App) {
+	target := authStepTarget(app.Paths.VerifyMFA, r)
+	if wantsJSON(r) {
+		httpJSON(w, http.StatusOK, map[string]any{"ok": true, "mfa_required": true, "redirect": target})
+		return
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+// authStepTarget is a sign-in step page carrying the request's post-sign-in
+// destination (?next=, same-origin paths only), so the page can send it back
+// with the step's form and the person lands where they were going.
+func authStepTarget(path string, r *http.Request) string {
+	next := r.FormValue("next")
+	if !isSafeNext(next) {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "next=" + url.QueryEscape(next)
 }
 
 func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
@@ -493,15 +559,15 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 	clearFlowCookie(w, flowCookieOTP)
 	platformEmailProved(app, email, true)
 	if authIdentifier(app) != "phone" {
-		activateEmailInvites(app, id, email)
+		// The sign-in is committed; a failed invite write is logged and
+		// tried again at the next OTP sign-in.
+		if err := activateEmailInvites(app, id, email); err != nil {
+			log.Printf("auth: OTP sign-in of account %d did not attach its pending invites: %v", id, err)
+		}
 	}
 	if setupToken != "" {
 		setFlowCookie(w, flowCookieMFASetup, setupToken, !app.DevMode, int(mfaSetupTokenTTL.Seconds()))
-		redirect := "/mfa-setup"
-		if app.Design != nil && strings.TrimSpace(app.Design.Auth["mfa_setup_redirect"]) != "" {
-			redirect = app.Design.Auth["mfa_setup_redirect"]
-		}
-		http.Redirect(w, r, redirect, http.StatusSeeOther)
+		sendMFASetupStep(w, r, app)
 		return
 	}
 	AttachSessionContext(app.DB, sessionID, r)
@@ -722,6 +788,14 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 
 	id, _ := result.LastInsertId()
 
+	// The enrollment decision every other sign-in makes (/login, the token
+	// exchange, the OTP step, social and passkey sign-in), taken for the
+	// account as it was created: the on_insert hooks fired next are queued
+	// jobs, and one that assigns a role may run at any moment from here on.
+	// An account such a hook later moves into a listed role is held by the
+	// credential gate, as before (mfa_enrollment_gate.go).
+	mustEnrollMFA := userRequiresMFAEnrollment(app, id)
+
 	// Fire user hooks (on_insert: _benmore_users)
 	FireUserHooks(app, "insert", id)
 
@@ -736,26 +810,24 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	// Email verification (opt-in via auth.verify_email in app.yaml).
 	//
 	// SECURITY NOTE (LOWER): sending the verification email is DECORATIVE
-	// on its own. This handler proceeds to mint a full session below even
-	// when verify_email is set - the unverified user is logged in
-	// immediately. Actual ENFORCEMENT is gated by a SEPARATE config key,
-	// auth.require_verified: when that is "true", getSession() refuses to
-	// resolve any session whose user row is not verified (see getSession,
-	// "require_verified" branch), so the session minted here is inert until
-	// the user clicks the link. So:
+	// on its own. With verify_email alone this handler mints a full session
+	// below - the unverified user is logged in immediately (back-compat:
+	// many apps rely on immediate login + a soft "please verify" banner).
+	// Actual ENFORCEMENT is a SEPARATE config key, auth.require_verified:
+	// getSession() refuses every session whose user row is not verified, so
+	// with it set this handler issues no session at all (one it couldn't
+	// use) and answers email_verification_required; the account signs in
+	// once the link is opened. So:
 	//   - verify_email=true alone  → email sent, but login works unverified
-	//   - require_verified=true    → unverified sessions are rejected at
-	//                                every request until verified
-	// Apps that need a hard gate MUST set require_verified. We intentionally
-	// keep issuing the session here (back-compat: many apps rely on
-	// immediate login + a soft "please verify" banner) and rely on the
-	// request-time check rather than withholding the session at signup.
+	//   - require_verified=true    → no session until the email is verified
+	// Apps that need a hard gate MUST set require_verified.
 	needsVerification := app.Design != nil && app.Design.Auth["verify_email"] == "true"
 	// No trustworthy origin → no link (securityLinkBaseURL logged why).
 	linkBase, linkOK := "", false
 	if needsVerification {
 		linkBase, linkOK = securityLinkBaseURL(app, r)
 	}
+	linkSent := false
 	if needsVerification && linkOK {
 		token := generateToken(32)
 		expires := time.Now().Add(1 * time.Hour)
@@ -773,8 +845,10 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 <p>Thanks for signing up for %s! Click below to verify your email address.</p>
 <p><a href="%s">Verify Email</a></p>`, html.EscapeString(siteName), verifyURL)
 
-		if err := SendEmail(app.Dir, email, "Verify your email - "+siteName, body); err != nil {
+		if err := sendVerificationEmail(app, email, "Verify your email - "+siteName, body); err != nil {
 			log.Printf("auth: signup verification email failed (user=%d): %s", id, logSendError(err, email))
+		} else {
+			linkSent = true
 		}
 	}
 
@@ -804,6 +878,30 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		}
 		setFlowCookie(w, flowCookieOTP, token, !app.DevMode, 600)
 		sendOTPChallenge(w, r, app)
+		return
+	}
+
+	// auth.require_verified: the new account is unverified, so a session
+	// issued now would be refused on every request (the client saw "not
+	// signed in" with no reason). Issue none and say why; the account
+	// exists, and signs in once its email is verified.
+	if requireVerifiedEmail(app) {
+		msg := unverifiedSignupNoLinkMessage
+		if linkSent {
+			msg = unverifiedSignupLinkMessage
+		}
+		refuseUnverifiedSignIn(w, r, app, msg, map[string]any{"account_created": true})
+		return
+	}
+
+	// A new account whose role is listed in auth.require_mfa_for_roles has no
+	// factor: a session issued here would be held on every request and could
+	// enroll only by typing the password again. Start the enrollment step
+	// instead, as /login does: the setup cookie, and verify issues the
+	// session. The password was set by this request. (With auth.otp the OTP
+	// step above makes this decision once the code is proven.)
+	if mustEnrollMFA {
+		redirectToMFAEnrollment(w, r, app, id, email, string(hash))
 		return
 	}
 
@@ -856,6 +954,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request, app *App) {
 // POST /api/_auth/token with JSON body: {"email": "...", "password": "..."}
 // Returns: {"token": "...", "user_id": N, "email": "..."}
 func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
+	w.Header().Set("Cache-Control", "no-store")
 	if refuseDisabledAuthFeature(w, r, app, "api_tokens") {
 		return
 	}
@@ -864,11 +963,11 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// too - otherwise oauth_only would close the interactive login/signup
 	// but leave this API path open as a silent password bypass.
 	if oauthOnly(app) {
-		http.Error(w, `{"error":"password auth is disabled - this app uses social sign-in only"}`, http.StatusForbidden)
+		httpError(w, "password auth is disabled - this app uses social sign-in only", http.StatusForbidden)
 		return
 	}
 	if !tokenAuthIPLimiter.Allow(appLimiterKey(app, "token", clientRateBucket(clientIP(r)))) {
-		http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
+		httpError(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	var body struct {
@@ -878,15 +977,15 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		MFACode  string `json:"mfa_code"` // required if user has MFA enabled
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		httpError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	if body.Email == "" || body.Password == "" {
-		http.Error(w, `{"error":"email and password required"}`, http.StatusBadRequest)
+		httpError(w, "email and password required", http.StatusBadRequest)
 		return
 	}
 	if len(body.Password) > maxPasswordLength {
-		http.Error(w, `{"error":"password too long"}`, http.StatusBadRequest)
+		httpError(w, "password too long", http.StatusBadRequest)
 		return
 	}
 	if authIdentifier(app) == "email" {
@@ -911,7 +1010,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// Check brute force lockout
 	defer lockAttempt(body.Email)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, body.Email) {
-		http.Error(w, `{"error":"too many attempts, try again later"}`, http.StatusTooManyRequests)
+		httpError(w, "too many attempts, try again later", http.StatusTooManyRequests)
 		return
 	}
 	// The same per-IP failure cap as /login: this is a password sign-in
@@ -919,80 +1018,115 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// network lock the interactive form applies.
 	loginIP := clientIP(r)
 	if authIsIPLocked(app.DB, loginIP) {
-		http.Error(w, `{"error":"too many failed attempts from this network, try again later"}`, http.StatusTooManyRequests)
+		httpError(w, "too many failed attempts from this network, try again later", http.StatusTooManyRequests)
 		return
 	}
 
 	identifier := authIdentifier(app)
 	var userID int64
 	var pending int
-	var hash, email string
-	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(password_change_required,0) FROM _benmore_users WHERE %s = ?", identifier)
+	var hash, email, deactivatedAt string
+	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(password_change_required,0), COALESCE(deactivated_at, '') FROM _benmore_users WHERE %s = ?", identifier)
 	if identifier == "email" {
 		query += " COLLATE NOCASE"
 	}
-	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending)
+	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending, &deactivatedAt)
 	if err != nil {
 		burnPasswordCheck(body.Password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, body.Email, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
-		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		httpError(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil {
+	// Capture the credential generation before the ~250ms bcrypt check, as
+	// /login does. The session is minted only while that generation is still
+	// current (tokenExchangeSessionTx), so a reset, password change or
+	// unverified-account claim that lands during the check (and revokes every
+	// credential it can see) cannot be followed by a fresh 30-day Bearer
+	// session issued on the old password. Its error is acted on only after the
+	// password check, so it is no oracle for the account's state.
+	_, proofHash, proofBinding, stateErr := mfaSetupAccountState(app, app.DB, userID, email)
+
+	// A deactivated account is refused exactly like a wrong password, as
+	// /login does. It used to get a token (and a session row, a last_login_at
+	// bump and user hooks) that every later request refused.
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil || deactivatedAt != "" {
 		recordLoginAttempt(app.DB, body.Email, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
-		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		httpError(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if stateErr != nil || !hmac.Equal([]byte(hash), []byte(proofHash)) {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "credentials changed; sign in again"})
 		return
 	}
 
 	recordLoginAttempt(app.DB, body.Email, true)
 	if _, stop := grandfatheredSignInNeedsProof(app, r, userID); stop {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "email_verification_required", "message": grandfatheredVerifyMessage})
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": emailVerificationRequiredCode, "message": grandfatheredVerifyMessage}, emailVerificationRequiredCode))
+		return
+	}
+	// auth.require_verified refuses an unverified account's token on every
+	// request, so none is issued.
+	if msg, stop := requireVerifiedSignInStop(app, r, userID); stop {
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": emailVerificationRequiredCode, "message": msg}, emailVerificationRequiredCode))
 		return
 	}
 	// Pending accounts must finish the interactive login path, including any
 	// configured email OTP. A password-only token must not bypass that proof.
 	if pending != 0 {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "password_change_required", "redirect": app.Paths.Login})
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": "password_change_required", "redirect": app.Paths.Login}, "password_change_required"))
 		return
 	}
 	// The same holds for every account when auth.otp is set: only the
 	// interactive login proves the emailed code, so this exchange can't
 	// issue a session on the password alone.
 	if app.Design != nil && app.Design.Auth["otp"] == "true" {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "otp_required", "redirect": app.Paths.Login})
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": "otp_required", "redirect": app.Paths.Login}, "otp_required"))
 		return
 	}
 
+	groupID := ResolveGroupID(app.DB, app.Group, email)
+	var token string
 	// MFA check: if user has TOTP enabled, require mfa_code
 	if CheckMFA(app.DB, userID) {
 		if body.MFACode == "" {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "mfa_required", "message": "MFA code required"})
+			httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": "mfa_required", "message": "MFA code required"}, "mfa_required"))
 			return
 		}
 		mfaKey := mfaLockKey(userID)
+		defer lockAttempt(mfaKey)()
 		if isAccountLocked(app.DB, mfaKey) {
 			httpJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many MFA attempts"})
 			return
 		}
-		if !ValidateMFACode(app.DB, userID, body.MFACode) {
+		// The code is spent in the same writer transaction that re-checks the
+		// password generation and inserts the session, as the inline /login
+		// MFA path does: a storage failure cannot eat a backup code, and a
+		// reset cannot be followed by a session from the earlier proof.
+		var badCode bool
+		token, badCode, err = tokenExchangeSessionTx(app, userID, email, groupID, body.Scopes, proofBinding, body.MFACode)
+		if badCode {
 			recordLoginAttempt(app.DB, mfaKey, false)
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid MFA code"})
 			return
 		}
-		recordLoginAttempt(app.DB, mfaKey, true)
+		if err == nil {
+			recordLoginAttempt(app.DB, mfaKey, true)
+		}
 	} else {
 		// MFA not enrolled. If the user's role appears in
 		// `auth.require_mfa_for_roles`, withhold the session and return
 		// a short-lived setup token - the SPA then drives enrollment
 		// via /api/_auth/mfa/setup + /verify, and verify mints the
 		// real session on successful enrollment.
-		var role string
-		app.DB.QueryRow("SELECT COALESCE(role, '') FROM _benmore_users WHERE id = ?", userID).Scan(&role)
 		if userRequiresMFAEnrollment(app, userID) {
-			setupToken := mintMFASetupToken(app, userID, email, hash)
+			var role string
+			app.DB.QueryRow("SELECT COALESCE(role, '') FROM _benmore_users WHERE id = ?", userID).Scan(&role)
+			// Bound to the generation captured before bcrypt, not only the hash,
+			// so an identical-hash reset during the check voids it too.
+			setupToken := mintMFASetupToken(app, userID, email, hash, proofBinding)
 			if setupToken == "" {
 				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "credentials changed; sign in again"})
 				return
@@ -1007,13 +1141,17 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 			})
 			return
 		}
+		token, _, err = tokenExchangeSessionTx(app, userID, email, groupID, body.Scopes, proofBinding, "")
 	}
-
-	app.DB.Exec("UPDATE _benmore_users SET last_login_at = datetime('now') WHERE id = ?", userID)
+	if errors.Is(err, errSignInCredentialsChanged) {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "credentials changed; sign in again"})
+		return
+	}
+	if err != nil || token == "" {
+		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "session could not be created"})
+		return
+	}
 	FireUserHooks(app, "update", userID)
-
-	groupID := ResolveGroupID(app.DB, app.Group, email)
-	token := CreateSession(app.DB, userID, email, groupID, app.SessionDuration, body.Scopes)
 	// Each exchange leaves a session behind for the whole session lifetime;
 	// the account keeps its newest ones (auth_credential_caps.go).
 	trimTokenExchangeSessions(app.DB, userID)

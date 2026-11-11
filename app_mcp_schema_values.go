@@ -9,6 +9,8 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -26,6 +28,34 @@ func validateAppMCPSchemaValue(schema *AppMCPSchema, value any) error {
 		return fmt.Errorf("invalid schema: %w", err)
 	}
 	return validateAppMCPSchemaValueAt(schema, value, 0)
+}
+
+// appMCPSchemaValueError says where a value broke its schema: Path is a JSON
+// path built from the schema's own property names and array indexes
+// ("arguments.items[2].status"; empty for the value itself) and Rule is the
+// broken rule. It never holds the value, which can be anything the caller
+// typed, and names an undeclared key only when it is a plain identifier.
+type appMCPSchemaValueError struct{ Path, Rule string }
+
+func (e *appMCPSchemaValueError) Error() string {
+	if e.Path == "" {
+		return e.Rule
+	}
+	return e.Path + ": " + e.Rule
+}
+
+var appMCPPlainPropertyName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
+
+// appMCPSchemaValuePath appends one object key to a JSON path; a key that is
+// not a plain identifier is written as a quoted index.
+func appMCPSchemaValuePath(parent, name string) string {
+	if !appMCPPlainPropertyName.MatchString(name) {
+		return parent + "[" + strconv.Quote(name) + "]"
+	}
+	if parent == "" {
+		return name
+	}
+	return parent + "." + name
 }
 
 func appMCPProjectSchemaValue(schema *AppMCPSchema, value any) any {
@@ -58,8 +88,13 @@ func appMCPProjectSchemaValue(schema *AppMCPSchema, value any) any {
 }
 
 func validateAppMCPSchemaValueAt(schema *AppMCPSchema, value any, depth int) error {
+	return validateAppMCPSchemaValuePath(schema, value, depth, "")
+}
+
+func validateAppMCPSchemaValuePath(schema *AppMCPSchema, value any, depth int, path string) error {
+	fail := func(rule string) error { return &appMCPSchemaValueError{Path: path, Rule: rule} }
 	if schema == nil || depth > appMCPSchemaValueMaxDepth {
-		return fmt.Errorf("schema value exceeds depth limit")
+		return fail("schema value exceeds depth limit")
 	}
 	value = appMCPJSONNull(value)
 	if len(schema.Enum) > 0 {
@@ -67,13 +102,13 @@ func validateAppMCPSchemaValueAt(schema *AppMCPSchema, value any, depth int) err
 		for _, candidate := range schema.Enum {
 			raw, err := json.Marshal(candidate)
 			if err != nil {
-				return fmt.Errorf("invalid schema enum")
+				return fail("invalid schema enum")
 			}
 			decoder := json.NewDecoder(bytes.NewReader(raw))
 			decoder.UseNumber()
 			var normalized any
 			if err := decoder.Decode(&normalized); err != nil {
-				return fmt.Errorf("invalid schema enum")
+				return fail("invalid schema enum")
 			}
 			if appMCPJSONValueEqual(value, normalized, 0) {
 				matched = true
@@ -81,7 +116,7 @@ func validateAppMCPSchemaValueAt(schema *AppMCPSchema, value any, depth int) err
 			}
 		}
 		if !matched {
-			return fmt.Errorf("value is not in enum")
+			return fail("value is not in enum")
 		}
 	}
 
@@ -93,81 +128,90 @@ func validateAppMCPSchemaValueAt(schema *AppMCPSchema, value any, depth int) err
 	switch schema.Type {
 	case "null":
 		if value != nil {
-			return fmt.Errorf("expected null")
+			return fail("expected null")
 		}
 	case "boolean":
 		if _, ok := value.(bool); !ok {
-			return fmt.Errorf("expected boolean")
+			return fail("expected boolean")
 		}
 	case "string":
 		v, ok := value.(string)
 		if !ok || !utf8.ValidString(v) {
-			return fmt.Errorf("expected valid UTF-8 string")
+			return fail("expected valid UTF-8 string")
 		}
 		n := utf8.RuneCountInString(v)
 		if schema.MinLength != nil && n < *schema.MinLength || schema.MaxLength != nil && n > *schema.MaxLength {
-			return fmt.Errorf("string length is outside schema bounds")
+			return fail("string length is outside schema bounds")
 		}
 	case "number", "integer":
 		n, ok := appMCPExactNumber(value)
 		if !ok {
-			return fmt.Errorf("expected finite number")
+			return fail("expected finite number")
 		}
 		if schema.Type == "integer" && !n.IsInt() {
-			return fmt.Errorf("expected integer")
+			return fail("expected integer")
 		}
 		if schema.Minimum != nil {
 			bound, _ := appMCPExactNumber(*schema.Minimum)
 			if n.Cmp(bound) < 0 {
-				return fmt.Errorf("number is outside schema bounds")
+				return fail("number is outside schema bounds")
 			}
 		}
 		if schema.Maximum != nil {
 			bound, _ := appMCPExactNumber(*schema.Maximum)
 			if n.Cmp(bound) > 0 {
-				return fmt.Errorf("number is outside schema bounds")
+				return fail("number is outside schema bounds")
 			}
 		}
 	case "object":
 		v, ok := value.(map[string]any)
 		if !ok {
-			return fmt.Errorf("expected object")
+			return fail("expected object")
 		}
 		for _, name := range schema.Required {
 			if _, ok := v[name]; !ok {
-				return fmt.Errorf("required property is missing")
+				return &appMCPSchemaValueError{Path: appMCPSchemaValuePath(path, name), Rule: "required property is missing"}
 			}
 		}
-		for name, item := range v {
+		// Sorted, so the property an error names does not depend on map order.
+		names := make([]string, 0, len(v))
+		for name := range v {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
 			if !utf8.ValidString(name) {
-				return fmt.Errorf("invalid object property encoding")
+				return fail("invalid object property encoding")
 			}
 			property, ok := schema.Properties[name]
 			if !ok {
 				if schema.AdditionalProperties != nil && !*schema.AdditionalProperties {
-					return fmt.Errorf("additional property is not allowed")
+					if appMCPPlainPropertyName.MatchString(name) {
+						return fail(fmt.Sprintf("property %q is not allowed (additionalProperties is false)", name))
+					}
+					return fail("a property the schema does not declare is not allowed")
 				}
 				continue
 			}
-			if err := validateAppMCPSchemaValueAt(property, item, depth+1); err != nil {
+			if err := validateAppMCPSchemaValuePath(property, v[name], depth+1, appMCPSchemaValuePath(path, name)); err != nil {
 				return err
 			}
 		}
 	case "array":
 		v, ok := value.([]any)
 		if !ok {
-			return fmt.Errorf("expected array")
+			return fail("expected array")
 		}
 		if schema.MinItems != nil && len(v) < *schema.MinItems || schema.MaxItems != nil && len(v) > *schema.MaxItems {
-			return fmt.Errorf("array length is outside schema bounds")
+			return fail("array length is outside schema bounds")
 		}
-		for _, item := range v {
-			if err := validateAppMCPSchemaValueAt(schema.Items, item, depth+1); err != nil {
+		for i, item := range v {
+			if err := validateAppMCPSchemaValuePath(schema.Items, item, depth+1, path+"["+strconv.Itoa(i)+"]"); err != nil {
 				return err
 			}
 		}
 	default:
-		return fmt.Errorf("unsupported schema type")
+		return fail("unsupported schema type")
 	}
 	return nil
 }

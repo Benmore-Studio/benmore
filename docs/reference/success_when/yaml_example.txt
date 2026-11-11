@@ -1,0 +1,11 @@
+- id: fetch
+  run: api
+  with:
+    url: https://api.rss2json.com/v1/api.json?rss_url=...
+    success_when: "${{ steps.fetch.outputs.json.status }} == 'ok'"
+
+# When success_when evaluates false:
+# - Step errors with "api: success_when failed (<expr>)"
+# - flow envelope: {failed_step: "fetch", failed_type: "api", hint: ...}
+# - Downstream steps don't run; the response shape never reaches your
+#   upsert step where it would land as bad data.

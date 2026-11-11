@@ -3,12 +3,14 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"slices"
@@ -76,7 +78,7 @@ func EnsureJobsTable(db *sql.DB) {
 		job_type TEXT NOT NULL DEFAULT 'flow',
 		flow_name TEXT NOT NULL DEFAULT '',
 		payload TEXT,
-		status TEXT DEFAULT 'pending',
+		status TEXT DEFAULT 'pending', -- jobStatuses: pending | running | completed | failed
 		attempts INTEGER DEFAULT 0,
 		max_attempts INTEGER DEFAULT 3,
 		error TEXT,
@@ -108,6 +110,7 @@ func EnsureJobsTable(db *sql.DB) {
 	// release the key. Best-effort ALTER covers fresh + upgraded tables.
 	db.Exec("ALTER TABLE _benmore_jobs ADD COLUMN unique_key TEXT")
 	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')")
+	ensureCronJobUniqueIndex(db)
 	// Retry gate that preserves ordering (review finding #11). The strictly
 	// ordered reconcile chains (sync_project / release_window) guarantee order
 	// purely via strictly-increasing PAST run_at on the single serial worker.
@@ -143,6 +146,40 @@ func EnsureJobsTable(db *sql.DB) {
 		log.Printf("jobs: running-project index unavailable: %v", err)
 	}
 }
+
+// ensureCronJobUniqueIndex makes a cron key (cron:<id>:<minute>) unique in
+// every status. The active-only index above let a sibling scheduler insert a
+// second run of a minute whose first run completed between its lookup and
+// its insert. Duplicates left by that race are removed once, before the
+// index first exists (keeping the oldest row, and never a running one: a
+// sibling may be executing it); while a running duplicate remains the index
+// is not created and the next start tries again.
+func ensureCronJobUniqueIndex(db *sql.DB) {
+	const where = "job_type = 'cron' AND unique_key IS NOT NULL"
+	var exists int
+	if db.QueryRow("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_cron_unique'").Scan(&exists) == nil {
+		return
+	}
+	if res, err := db.Exec("DELETE FROM _benmore_jobs WHERE " + where + " AND status <> 'running' AND id NOT IN (SELECT MIN(id) FROM _benmore_jobs WHERE " + where + " GROUP BY unique_key)"); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("jobs: removed %d duplicate cron run(s) of an already-fired minute", n)
+		}
+	}
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_cron_unique ON _benmore_jobs(unique_key) WHERE " + where); err != nil {
+		log.Printf("jobs: cron same-minute unique index not created (%v); a cluster sibling can fire a minute twice", err)
+	}
+}
+
+// Job statuses (_benmore_jobs.status). The table predates CHECK constraints
+// and is not rebuilt for one; writers keep to this set.
+const (
+	jobStatusPending   = "pending"
+	jobStatusRunning   = "running"
+	jobStatusCompleted = "completed"
+	jobStatusFailed    = "failed"
+)
+
+var jobStatuses = []string{jobStatusPending, jobStatusRunning, jobStatusCompleted, jobStatusFailed}
 
 // jobProjectExpr is the ordering-group expression for a payload column
 // reference. It is shared by the expression index and the claim query.
@@ -271,6 +308,9 @@ type jobEnqueueExecer interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
+// EnqueueJob and its variants queue a flow job that runs once (max_attempts
+// 1); enqueueFlowJob queues one with the attempts its flow declares.
+//
 // EnqueueJob returns (id, statusToken, error). statusToken is the unguessable
 // capability the caller embeds in the status_url so the submitter (authed OR
 // anonymous) can poll GET /api/_jobs/{id}/status?token=... without exposing
@@ -289,6 +329,12 @@ func EnqueueJobTx(tx *sql.Tx, flowName string, payload map[string]any, runAt *ti
 
 func EnqueueJobTxUnique(tx *sql.Tx, uniqueKey, flowName string, payload map[string]any, runAt *time.Time) (int64, string, error) {
 	return enqueueTypedJob(tx, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{})
+}
+
+// enqueueFlowJob queues a run of flowName that may take maxAttempts runs
+// (flowJobMaxAttempts: 1 unless the flow declares on.request.max_attempts).
+func enqueueFlowJob(exec jobEnqueueExecer, uniqueKey, flowName string, payload map[string]any, runAt *time.Time, maxAttempts int) (int64, string, error) {
+	return enqueueTypedJob(exec, "flow", uniqueKey, flowName, payload, runAt, jobEnqueueOpts{maxAttempts: maxAttempts})
 }
 
 // EnqueueCronJob enqueues a durable cron run.
@@ -316,7 +362,8 @@ func EnqueueCronJob(db *sql.DB, cronID, uniqueKey string, payload map[string]any
 // jobEnqueueOpts carries optional, type-specific enqueue behavior so the
 // generic enqueue path stays a single code path.
 type jobEnqueueOpts struct {
-	// maxAttempts overrides the column DEFAULT (3) when > 0.
+	// maxAttempts overrides the column DEFAULT (3) when > 0. A flow job
+	// without one gets 1: it runs once (flows_job_attempts.go).
 	maxAttempts int
 	// dedupAnyStatus, when set, treats a matching unique_key in ANY status
 	// (including completed/failed) as a duplicate to collapse against.
@@ -329,6 +376,9 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 		if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
 			return id, token, nil
 		}
+	}
+	if jobType == "flow" && opts.maxAttempts <= 0 {
+		opts.maxAttempts = 1
 	}
 	// Surface marshal failures rather than silently enqueuing an
 	// empty/partial body: a payload that fails to marshal (e.g. a
@@ -357,21 +407,19 @@ func enqueueTypedJob(exec jobEnqueueExecer, jobType, uniqueKey, flowName string,
 	}
 	if err != nil {
 		if uniqueKey != "" && isUniqueJobConstraintErr(err) {
-			if id, token, ok := findJobByUniqueKey(exec, uniqueKey, opts.dedupAnyStatus); ok {
-				return id, token, nil
-			}
-			// On the Tx path (*sql.Tx), go-sqlite3 takes a read snapshot at
-			// the transaction's first read, so a row committed by a competing
-			// transaction AFTER that snapshot is invisible to the recovery
-			// SELECT above. We still know the key is held by an active job
-			// (the UNIQUE index just rejected our INSERT), so treat this as a
-			// successful idempotent no-op rather than surfacing the raw
-			// constraint error and failing the whole flow transaction. The id
-			// is unknown from inside the stale snapshot, so return 0 / no token;
-			// the caller's enqueue is a dedup no-op against the winner. (Tx
-			// callers needing the winner's id/token should re-read after commit.)
-			if _, isTx := exec.(*sql.Tx); isTx {
-				return 0, "", nil
+			// The index refused the key, so the row holding it is visible
+			// here: an insert only reaches the index on a current snapshot
+			// (a stale one fails with SQLITE_BUSY_SNAPSHOT instead). The
+			// lookup above missed it because a competitor inserted it since,
+			// or because it has no status token (a row from before tokens);
+			// such a row gets one so the caller has the job's id and a usable
+			// status_url, never id 0.
+			var id int64
+			var held string
+			if exec.QueryRow(`UPDATE main._benmore_jobs SET status_token = COALESCE(NULLIF(status_token, ''), ?)
+				WHERE id = (SELECT id FROM main._benmore_jobs WHERE unique_key = ? AND (? OR status IN ('pending', 'running')) ORDER BY id DESC LIMIT 1)
+				RETURNING id, status_token`, token, uniqueKey, opts.dedupAnyStatus).Scan(&id, &held) == nil {
+				return id, held, nil
 			}
 		}
 		return 0, "", err
@@ -493,10 +541,16 @@ func hookJobPayload(hook Hook, table string, row map[string]any) map[string]any 
 	if table != "" {
 		h["table"] = table
 	}
+	if hook.reportEvent != "" {
+		h["event"] = hook.reportEvent
+	}
 	if hook.Email != nil {
 		h["email_to"] = hook.Email.To
 		h["email_subject"] = hook.Email.Subject
 		h["email_template"] = hook.Email.Template
+		// An inline body travels with the job: without it every queued hook
+		// email with `body:` went out empty (or was refused by the provider).
+		h["email_body"] = hook.Email.Body
 	}
 	if hook.Notify != nil {
 		h["notify"] = marshalNotifyHook(hook.Notify)
@@ -566,6 +620,17 @@ const serveJobDrainTimeout = 8 * time.Second
 // instead of being claimed, crashing the worker and requeued forever.
 const jobsRecoverRequeueGuard = " AND attempts < max_attempts"
 
+// jobLeaseLapsedSQL matches a running row whose lease has passed (first
+// argument: now) or that never had one and started before the second
+// argument. A claim always writes a lease; a running row without one comes
+// from a binary older than leases, and it held its project group and unique
+// key forever because every sweep required a lease.
+const jobLeaseLapsedSQL = "(lease_expires_at < ? OR (lease_expires_at IS NULL AND COALESCE(started_at, created_at) < ?))"
+
+// jobsLegacyLeaseBound is how long a lease-less running row is given before
+// recovery treats it as orphaned: far beyond any job a heartbeat keeps alive.
+const jobsLegacyLeaseBound = time.Hour
+
 // jobsRecoverOrphanedJobs handles 'running' jobs whose lease has expired - the
 // signature of a worker that crashed mid-execution.
 //
@@ -578,17 +643,21 @@ const jobsRecoverRequeueGuard = " AND attempts < max_attempts"
 // risk a silent duplicate delivery.
 func jobsRecoverOrphanedJobs(app *App) {
 	now := time.Now().UTC().Format(sqliteDateTimeLayout)
+	legacyCutoff := time.Now().Add(-jobsLegacyLeaseBound).UTC().Format(sqliteDateTimeLayout)
 	// Requeue only the safe-to-rerun types.
 	for jobType := range jobsRerunSafeTypes() {
 		app.DB.Exec(
-			"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = ? AND lease_expires_at IS NOT NULL AND lease_expires_at < ?"+jobsRecoverRequeueGuard+" AND json_valid(payload) = 1 AND json_type(payload, '$._mcp_effect') IS NULL",
-			jobType, now,
+			"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = ? AND "+jobLeaseLapsedSQL+jobsRecoverRequeueGuard+" AND json_valid(payload) = 1 AND json_type(payload, '$._mcp_effect') IS NULL",
+			jobType, now, legacyCutoff,
 		)
 	}
+	// A flow job runs once on failure unless its flow opts in (max_attempts
+	// 1), but a crash of an idempotent flow's job keeps the crash budget it
+	// always had (idempotentFlowCrashClaims claims).
 	for _, flowName := range idempotentFlowJobNames(app) {
 		app.DB.Exec(
-			"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = 'flow' AND flow_name = ? AND lease_expires_at IS NOT NULL AND lease_expires_at < ?"+jobsRecoverRequeueGuard,
-			flowName, now,
+			"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = 'flow' AND flow_name = ? AND "+jobLeaseLapsedSQL+" AND attempts < MAX(max_attempts, ?)",
+			flowName, now, legacyCutoff, idempotentFlowCrashClaims,
 		)
 	}
 	// Cron jobs run arbitrary flow steps, so they're only re-run when the cron
@@ -597,18 +666,34 @@ func jobsRecoverOrphanedJobs(app *App) {
 	// to the fail-closed sweep below so a partial side effect isn't duplicated;
 	// it will fire again on its next schedule anyway.
 	app.DB.Exec(
-		"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = 'cron' AND max_attempts > 1 AND attempts < max_attempts AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
-		now,
+		"UPDATE _benmore_jobs SET status = 'pending', lease_expires_at = NULL WHERE status = 'running' AND job_type = 'cron' AND max_attempts > 1 AND attempts < max_attempts AND "+jobLeaseLapsedSQL,
+		now, legacyCutoff,
 	)
 	// Everything else: fail closed rather than re-run a non-idempotent body.
-	res, err := app.DB.Exec(
-		"UPDATE _benmore_jobs SET status = 'failed', error = 'worker died mid-execution; not re-run to avoid duplicate side effects (C-1)', completed_at = datetime('now') WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
-		now,
+	rows, err := app.DB.Query(
+		"UPDATE _benmore_jobs SET status = 'failed', error = 'worker died mid-execution; not re-run to avoid duplicate side effects (C-1)', completed_at = datetime('now'), lease_expires_at = NULL WHERE status = 'running' AND "+jobLeaseLapsedSQL+" RETURNING job_type",
+		now, legacyCutoff,
 	)
-	if err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			log.Printf("jobs: failed %d orphaned job(s) with expired lease (worker crash; not re-run to avoid duplicate side effects)", n)
+	if err != nil {
+		return
+	}
+	types := map[string]int{}
+	for rows.Next() {
+		var jobType string
+		if err := rows.Scan(&jobType); err != nil {
+			rows.Close()
+			return
 		}
+		types[jobType]++
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil || closeErr != nil {
+		return
+	}
+	for jobType, n := range types {
+		log.Printf("jobs: failed %d orphaned %s job(s) with expired lease (worker crash; not re-run to avoid duplicate side effects)", n, jobType)
+		reportError(app, errorEvent{Source: "server", Kind: "job", Level: "error", Type: "job_worker_died", Message: "worker died mid-execution; not re-run to avoid duplicate side effects", Handled: true, Tags: map[string]string{"job_type": jobType}, Extra: map[string]any{"orphaned_jobs": n}})
 	}
 }
 
@@ -631,6 +716,8 @@ func idempotentFlowJobNames(app *App) []string {
 // processNextJob claims and runs at most one job. Returns true if a job was
 // claimed (so the caller can drain a backlog without idling).
 func processNextJob(app *App) (worked bool) {
+	app.jobsInProcess.Add(1)
+	defer app.jobsInProcess.Add(-1)
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("JOB WORKER PANIC: %v", r)
@@ -702,7 +789,7 @@ func processNextJob(app *App) (worked bool) {
 	// valid because enqueueTypedJob produces it for a nil payload map.
 	var data map[string]any
 	var jobErr error
-	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+	if err := unmarshalJSONExact([]byte(payload), &data); err != nil {
 		jobErr = jobNotRetryable{errors.New("invalid job payload: expected a JSON object or null")}
 		data = nil
 	}
@@ -717,11 +804,13 @@ func processNextJob(app *App) (worked bool) {
 		jobErr = appMCPEffectGate(app, data)
 	}
 
+	cronRan := false // runCronJob reports its own failures
 	switch {
 	case jobErr != nil:
 	case jobType == "hook":
 		jobErr = executeHookJob(app, data)
 	case jobType == "cron":
+		cronRan = true
 		jobErr = executeCronJob(app, flowName, data)
 	case jobType == "webhook_subscription":
 		jobErr = executeWebhookSubscriptionJob(data, app)
@@ -737,17 +826,52 @@ func processNextJob(app *App) (worked bool) {
 
 	// Every terminal/transition below clears lease_expires_at so a finished or
 	// requeued job is never mistaken for an orphan by jobsRecoverOrphanedJobs.
-	if jobErr != nil {
+	// Each is a compare-and-set on this claim (status running, this attempt)
+	// written through finishJobRow, which retries a write the database
+	// refused: the body has run, so a lost write must not leave the row
+	// running until recovery fails a success or re-delivers it.
+	const claimed = " WHERE id = ? AND status = 'running' AND attempts = ?"
+	var note jobCompletedWithNote
+	var deferred jobDeferred
+	switch {
+	case errors.As(jobErr, &deferred) && finishJobRow(app, id, attempts+1,
+		// Nothing was attempted (the endpoint's circuit is open): give the
+		// attempt back and wait for the cooldown. A delivery deferred for a
+		// day spends its attempts like any other failure instead.
+		"UPDATE _benmore_jobs SET status = 'pending', attempts = attempts - 1, error = ?, not_before = ?, lease_expires_at = NULL"+claimed+" AND created_at > datetime('now', '-1 day')",
+		// not_before has whole seconds and the circuit opens strictly after
+		// until: round up with a margin, or the job is re-claimed while the
+		// circuit is still shut and spins the worker.
+		jobErrorText(app, errorText(deferred.error)), deferred.until.Truncate(time.Second).Add(2*time.Second).UTC().Format(sqliteDateTimeLayout), id, attempts+1):
+		log.Printf("JOB DEFERRED [%s/%s] #%d until %s: %s", jobType, flowName, id, deferred.until.Format("15:04:05"), jobErrorText(app, errorText(deferred.error)))
+	case errors.As(jobErr, &note):
+		// The action that did not take effect already logged why.
+		errText := jobErrorText(app, errorText(note.error))
+		if finishJobRow(app, id, attempts+1, "UPDATE _benmore_jobs SET status = 'completed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL"+claimed, errText, id, attempts+1) {
+			appMCPRecordEffectTelemetry(app, data, appMCPJobEffectOutcome(nil), 1)
+		}
+	case jobErr != nil:
+		// The error is stored, answered on status_url (to an anonymous async
+		// caller too) and logged only in its redacted form (jobErrorText).
+		errText := jobErrorText(app, errorText(jobErr))
 		var final jobNotRetryable
-		if attempts+1 >= maxAttempts || errors.As(jobErr, &final) {
-			res, updateErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ? AND status = 'running' AND attempts = ?",
-				jobErr.Error(), id, attempts+1)
-			if updateErr == nil {
-				if changed, _ := res.RowsAffected(); changed == 1 {
-					appMCPRecordEffectTelemetry(app, data, appMCPJobEffectOutcome(jobErr), 1)
+		// A flow job re-runs the whole flow, so it is retried only when its
+		// flow opts in and the failure is one a later run can change.
+		budget := maxAttempts
+		if jobType == "flow" {
+			budget = flowJobAttemptBudget(app, flowName, maxAttempts, jobErr)
+		}
+		if attempts+1 >= budget || errors.As(jobErr, &final) {
+			if finishJobRow(app, id, attempts+1, "UPDATE _benmore_jobs SET status = 'failed', error = ?, completed_at = datetime('now'), lease_expires_at = NULL"+claimed, errText, id, attempts+1) {
+				appMCPRecordEffectTelemetry(app, data, appMCPJobEffectOutcome(jobErr), 1)
+				// A cron run reports its own failure with the job and step
+				// (runCronJob); a second job_failed report made every failed
+				// run two Sentry issues and two Slack posts.
+				if !cronRan {
+					reportError(app, errorEvent{Source: "server", Kind: "job", Level: "error", Type: "job_failed", Message: errText, Handled: true, Tags: map[string]string{"job_type": jobType, "flow": flowName, "attempts": fmt.Sprint(attempts + 1)}})
 				}
 			}
-			log.Printf("JOB FAILED [%s/%s] #%d: %s (no more retries)", jobType, flowName, id, jobErr)
+			log.Printf("JOB FAILED [%s/%s] #%d: %s (no more retries)", jobType, flowName, id, errText)
 		} else {
 			// LOWER: cap the backoff shift so a high attempt count can't overflow
 			// the shift (1<<attempts wraps negative around attempt 58 -> a
@@ -764,20 +888,82 @@ func processNextJob(app *App) (worked bool) {
 			// gate the re-claim with not_before instead - the head-of-line
 			// check in the claim query keeps the retry in its original slot.
 			notBefore := time.Now().Add(backoff)
-			app.DB.Exec("UPDATE _benmore_jobs SET status = 'pending', error = ?, not_before = ?, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND attempts = ?",
-				jobErr.Error(), notBefore.UTC().Format(sqliteDateTimeLayout), id, attempts+1)
-			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, not_before %s)", jobType, flowName, id, jobErr, attempts+1, notBefore.Format("15:04:05"))
+			finishJobRow(app, id, attempts+1, "UPDATE _benmore_jobs SET status = 'pending', error = ?, not_before = ?, lease_expires_at = NULL"+claimed,
+				errText, notBefore.UTC().Format(sqliteDateTimeLayout), id, attempts+1)
+			log.Printf("JOB RETRY [%s/%s] #%d: %s (attempt %d, not_before %s)", jobType, flowName, id, errText, attempts+1, notBefore.Format("15:04:05"))
 		}
-	} else {
-		res, updateErr := app.DB.Exec("UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL WHERE id = ? AND status = 'running' AND attempts = ?", id, attempts+1)
-		if updateErr == nil {
-			if changed, _ := res.RowsAffected(); changed == 1 {
-				appMCPRecordEffectTelemetry(app, data, appMCPJobEffectOutcome(nil), 1)
-			}
+	default:
+		if finishJobRow(app, id, attempts+1, "UPDATE _benmore_jobs SET status = 'completed', completed_at = datetime('now'), lease_expires_at = NULL"+claimed, id, attempts+1) {
+			appMCPRecordEffectTelemetry(app, data, appMCPJobEffectOutcome(nil), 1)
 		}
 	}
 	return true
 }
+
+// finishJobRow runs a claimed job's closing compare-and-set (query, guarded
+// on status running and attempt) and reports whether it changed the row. A
+// write refused because the database is busy is retried with backoff for up
+// to one lease window while the caller's lease heartbeat keeps running: the
+// body already ran, and a row left running would later be failed by
+// recovery although it succeeded, or re-delivered. It stops once the row has
+// moved on (recovery or an admin got there first) or the app stops. Any
+// other error (storage ceiling, a trigger, a closed pool) would not change
+// on retry and would hold the single worker, so it is logged loudly at once
+// and the row left to lease recovery.
+func finishJobRow(app *App, id int64, attempt int, query string, args ...any) bool {
+	stop := app.workerStopGeneration()
+	deadline := time.Now().Add(jobsLeaseTTL())
+	wait := 100 * time.Millisecond
+	for try := 1; ; try++ {
+		res, err := app.DB.Exec(query, args...)
+		if err == nil {
+			n, _ := res.RowsAffected()
+			return n == 1
+		}
+		if !isDatabaseBusyError(err) {
+			log.Printf("JOB STATUS WRITE LOST #%d: %v; the row stays running until lease recovery settles it", id, err)
+			return false
+		}
+		var status string
+		var got int
+		if app.DB.QueryRow("SELECT status, attempts FROM _benmore_jobs WHERE id = ?", id).Scan(&status, &got) == nil && (status != jobStatusRunning || got != attempt) {
+			log.Printf("JOB STATUS WRITE #%d refused (%v); the row has since moved to %s (attempt %d), left as is", id, err, status, got)
+			return false
+		}
+		if time.Now().Add(wait).After(deadline) {
+			log.Printf("JOB STATUS WRITE LOST #%d after %d tries: %v; the row stays running until lease recovery settles it", id, try, err)
+			return false
+		}
+		log.Printf("JOB STATUS WRITE #%d refused (try %d): %v; retrying", id, try, err)
+		select {
+		case <-stop:
+			log.Printf("JOB STATUS WRITE LOST #%d: the app stopped while the database was busy; the row stays running until lease recovery settles it", id)
+			return false
+		case <-time.After(wait):
+		}
+		if wait < 2*time.Second {
+			wait *= 2
+		}
+	}
+}
+
+// jobDeferred is a job error meaning nothing was attempted: the job waits
+// until `until` without spending an attempt (a webhook delivery whose
+// endpoint's circuit breaker is open).
+type jobDeferred struct {
+	error
+	until time.Time
+}
+
+func (e jobDeferred) Unwrap() error { return e.error }
+
+// jobCompletedWithNote finishes a job as completed while keeping, in its
+// error column, why part of it did not take effect (a hook action that was
+// skipped or failed). /api/_jobs and describe_jobs show it next to status
+// completed; nothing is retried.
+type jobCompletedWithNote struct{ error }
+
+func (e jobCompletedWithNote) Unwrap() error { return e.error }
 
 // flowJobActorLive re-checks, when the job runs, the account an async flow
 // was queued for. The request's gates (auth, role, permissions, tenant) ran
@@ -870,7 +1056,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 		}
 		if app.Roles != nil {
 			actor.accessTables = app.Roles.accessTables
-			if roleScopes := app.Roles.ResolveScopesForRoles(kept); roleScopes != "" {
+			if roleScopes := app.Roles.sessionRoleScopes(actor, kept); roleScopes != "" {
 				actor.Scopes = intersectScopes(actor.Scopes, roleScopes)
 			} else {
 				actor.Scopes = "_none_:read"
@@ -905,7 +1091,9 @@ func startJobLeaseHeartbeat(app *App, id int64) func() {
 				return
 			case <-ticker.C:
 				next := time.Now().Add(jobsLeaseTTL()).UTC().Format(sqliteDateTimeLayout)
-				app.DB.Exec("UPDATE _benmore_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'", next, id)
+				if _, err := app.DB.Exec("UPDATE _benmore_jobs SET lease_expires_at = ? WHERE id = ? AND status = 'running'", next, id); err != nil {
+					log.Printf("JOB LEASE #%d not extended: %v (recovery may take a live job for an orphan)", id, err)
+				}
 			}
 		}
 	})
@@ -943,6 +1131,14 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 	// the sql_dynamic guard sees what the synchronous path would have.
 	requestKeys := takeFlowRequestKeys(data)
 	secretKeys := takeFlowSecretKeys(data)
+	sqlTextKeys := takeFlowSQLTextKeys(data)
+	// Only the async HTTP entry point queues a request body; other payloads
+	// (enqueue steps, event rows) lose a same-named key without it applying.
+	queuedBody := takeFlowQueuedBody(data)
+	if targetFlow.Trigger.Type != "http" || !targetFlow.Async {
+		queuedBody = nil
+	}
+	computedKeys := takeFlowComputedKeys(data)
 	actor, err := takeFlowJobActor(data)
 	if err != nil {
 		return jobNotRetryable{err}
@@ -955,13 +1151,35 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 		}
 	}
 	ctx := &FlowContext{
-		App:         app,
-		Data:        data,
-		Params:      make(map[string]string),
-		RequestKeys: requestKeys,
-		SecretKeys:  secretKeys,
-		Session:     session,
-		Writes:      newFlowWriteLog(),
+		App:           app,
+		Data:          data,
+		Params:        make(map[string]string),
+		RequestKeys:   requestKeys,
+		SecretKeys:    secretKeys,
+		SQLTextKeys:   sqlTextKeys,
+		Session:       session,
+		Writes:        newFlowWriteLog(),
+		queuedBody:    queuedBody,
+		computedKeys:  computedKeys,
+		backgroundRun: true,
+	}
+	// An async HTTP flow's request fields named like a step id, set key or
+	// loop variable were put in the shadow store before queuing;
+	// `params.<name>` reads only that store, here as inline. A payload key
+	// at the top level under such a name that the store lacks (an enqueue
+	// step's `with:`) was never a shadowed request field, so it keeps
+	// reading as before.
+	if targetFlow.Trigger.Type == "http" {
+		names := flowRequestOnlyParamNames(targetFlow.Steps)
+		shadowed, _ := data[flowStepNamedParamsKey].(map[string]any)
+		for name := range names {
+			if _, queued := data[name]; queued {
+				if _, inStore := shadowed[name]; !inStore {
+					delete(names, name)
+				}
+			}
+		}
+		ctx.requestOnlyParams = names
 	}
 	// Mirror scalar Data values into Params so `:name` placeholders +
 	// any code path that reads from ctx.Params (interpolateCtxSafe's
@@ -973,7 +1191,7 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 		case string:
 			ctx.Params[k] = val
 		case bool, float64, int, int64:
-			ctx.Params[k] = fmt.Sprintf("%v", val)
+			ctx.Params[k] = valueText(val)
 		default:
 			if b, err := json.Marshal(v); err == nil {
 				ctx.Params[k] = string(b)
@@ -988,7 +1206,7 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 	// processNextJob's top-level recover().
 	var guard *txCommitGuard
 	if targetFlow.Transaction {
-		tx, err := app.DB.Begin()
+		tx, err := app.DB.BeginTx(withWriteTxLabel(context.Background(), "job:"+flowName), nil)
 		if err != nil {
 			return fmt.Errorf("begin transaction: %w", err)
 		}
@@ -1006,7 +1224,7 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 				log.Printf("job flow %s: tx rollback error: %s", flowName, rbErr)
 			}
 			announceFlowWrites(ctx, false)
-			return ctx.Error
+			return flowRunFailure(ctx, ctx.Error)
 		}
 		commitErr := ctx.Tx.Commit()
 		// Whether Commit succeeded or failed, the tx is done from
@@ -1020,7 +1238,42 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 		return nil
 	}
 	announceFlowWrites(ctx, false)
-	return ctx.Error
+	// The step error leaves the run redacted against its own env and
+	// secret-derived values, as the synchronous path logs it.
+	return flowRunFailure(ctx, ctx.Error)
+}
+
+// restoreJobRowIntegers turns a queued row's whole numbers back into the
+// integers they were. The payload crosses the queue as JSON, which decodes
+// every number as a float64, and a float binds in hook SQL as REAL: an
+// on_insert hook stored the new row's id 4 as "4.0" in a TEXT column and
+// rendered 'Invoice #{{id}}' as "Invoice #4.0", where the same SQL run in the
+// write transaction gave "4". A column with REAL affinity keeps its float
+// (`old_<col>` follows its column), as a row read from the database has it.
+func restoreJobRowIntegers(app *App, table string, row map[string]any) {
+	var columns []Column
+	for _, t := range app.Tables {
+		if strings.EqualFold(t.Name, table) {
+			columns = t.Columns
+			break
+		}
+	}
+	realColumn := func(key string) bool {
+		key = strings.TrimPrefix(key, "old_")
+		for _, c := range columns {
+			if strings.EqualFold(c.Name, key) {
+				return sqliteAffinity(c.Type) == "REAL"
+			}
+		}
+		return false
+	}
+	for key, value := range row {
+		f, ok := value.(float64)
+		if !ok || f != math.Trunc(f) || math.Abs(f) > maxExactFloatInteger || realColumn(key) {
+			continue
+		}
+		row[key] = int64(f)
+	}
 }
 
 func executeHookJob(app *App, data map[string]any) error {
@@ -1036,6 +1289,7 @@ func executeHookJob(app *App, data map[string]any) error {
 	if rowData == nil {
 		rowData = make(map[string]any)
 	}
+	restoreJobRowIntegers(app, table, rowData)
 
 	hook := hookFromJobPayload(hookData)
 	_, commandEffect := data[appMCPEffectKey]
@@ -1043,29 +1297,79 @@ func executeHookJob(app *App, data map[string]any) error {
 	// Refuse ambiguous tenant routing before running any hook effect.
 	if hook.WS != nil && app.Group != nil && app.Group.Key != "" {
 		group := rowData[app.Group.Key]
-		if group == nil || fmt.Sprint(group) == "" || fmt.Sprint(group) == "0" {
+		if group == nil || valueText(group) == "" || valueText(group) == "0" {
 			return fmt.Errorf("ws hook requires the row's tenant key %q", app.Group.Key)
 		}
 	}
-	if err := executeHookResult(app, hook, table, rowData); err != nil && commandEffect {
+	hookErr := executeHookResult(app, hook, table, rowData)
+	if hookErr != nil && commandEffect {
 		// A connector-command effect is never reported delivered without evidence,
 		// and a partial run is never retried (that could send twice).
-		return webhookDeliveryError(err, true)
+		return webhookDeliveryError(hookErr, true)
 	}
 	// Use the same schema-aware SQL target recognition as transactional
 	// hooks. The prefix-only extractor missed auto-membership SQL because
 	// it starts with a marker comment and quotes its destination table.
-	// Publication remains unscoped: the dispatcher enforces each reader's
-	// live credential, read scope and named/tableless event visibility.
+	// The job has no session, so each refresh takes its audience from the
+	// triggering row, as a data-event flow's writes do: its tenant key and
+	// user_id (the writer's id, or the stored owner of a sessionless
+	// write), never a request value. A tenant table hears it only in that
+	// tenant (no tenant: admins only); it used to reach every tenant as the
+	// generic refresh. The dispatcher still checks each reader's live
+	// credential and read scope.
 	if hook.SQL != "" {
+		type hookRefresh struct {
+			table, groupID string
+			userID         int64
+			public         bool
+		}
 		app.mu.RLock()
 		targets := canonicalHookRefreshTargets(app, hook.SQL, "")
+		tenant := ""
+		if app.Group != nil && app.Group.Key != "" {
+			tenant = hookRowText(rowData, app.Group.Key)
+		}
+		owner := hookRowText(rowData, "user_id")
+		refreshes := make([]hookRefresh, 0, len(targets))
+		for _, target := range targets {
+			groupID, userID, public := triggeredWriteScope(app, target, tenant, owner)
+			refreshes = append(refreshes, hookRefresh{table: target, groupID: groupID, userID: userID, public: public})
+		}
 		app.mu.RUnlock()
-		for _, table := range targets {
-			BroadcastUnscoped(app, table, "refresh")
+		for _, r := range refreshes {
+			if r.public {
+				BroadcastUnscoped(app, r.table, "refresh")
+				continue
+			}
+			BroadcastScopedDirect(app, r.table, "refresh", r.groupID, r.userID)
 		}
 	}
+	if hookErr != nil {
+		// An ordinary hook stays best effort and is never retried (a retry
+		// could send twice), but the job keeps why an action did not take
+		// effect: a notify: to a user id no account has completed with no
+		// trace beyond one log line.
+		return jobCompletedWithNote{hookErr}
+	}
 	return nil
+}
+
+// hookRowText returns a hook row's column value as text, matching the column
+// name as SQLite does (case-insensitively), or "" when the row has none.
+func hookRowText(row map[string]any, column string) string {
+	value, ok := row[column]
+	if !ok {
+		for k, v := range row {
+			if sqliteIdentifierFold(k) == sqliteIdentifierFold(column) {
+				value, ok = v, true
+				break
+			}
+		}
+	}
+	if !ok || value == nil {
+		return ""
+	}
+	return valueText(value)
 }
 
 // hookFromJobPayload reconstructs a Hook from the serialized `_hook` map a hook
@@ -1075,16 +1379,18 @@ func executeHookJob(app *App, data map[string]any) error {
 // nothing).
 func hookFromJobPayload(hookData map[string]any) Hook {
 	hook := Hook{
-		SQL:     hookPayloadStr(hookData["sql"]),
-		Webhook: hookPayloadStr(hookData["webhook"]),
-		Body:    hookPayloadStr(hookData["body"]),
+		SQL:         hookPayloadStr(hookData["sql"]),
+		reportEvent: hookPayloadStr(hookData["event"]),
+		Webhook:     hookPayloadStr(hookData["webhook"]),
+		Body:        hookPayloadStr(hookData["body"]),
 	}
 
 	if to, ok := hookData["email_to"]; ok && to != nil {
 		hook.Email = &EmailHook{
-			To:       fmt.Sprintf("%v", to),
-			Subject:  fmt.Sprintf("%v", hookData["email_subject"]),
-			Template: fmt.Sprintf("%v", hookData["email_template"]),
+			To:       valueText(to),
+			Subject:  valueText(hookData["email_subject"]),
+			Template: valueText(hookData["email_template"]),
+			Body:     hookPayloadStr(hookData["email_body"]),
 		}
 	}
 
@@ -1122,7 +1428,7 @@ func hookPayloadStr(v any) string {
 	if v == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", v)
+	return valueText(v)
 }
 
 // FlushJobs processes all pending jobs synchronously. Used in tests to
@@ -1149,38 +1455,83 @@ func hookPayloadStr(v any) string {
 // TestRetryDoesNotReorderStrictChain pins). The worker's production claim path
 // is untouched.
 func FlushJobs(app *App) {
+	jobsRecoverOrphanedJobs(app) // the sweep a worker runs when it starts
+	// A row fast-forwarded once that is back in backoff with the same attempt
+	// count was deferred (an open circuit gives the attempt back), not
+	// retried: fast-forwarding it again would spin until the circuit closes,
+	// so it is left for the worker and the flush finishes.
+	forwarded := map[int64]int{}
+	workerDeadline := time.Now().Add(flushWorkerWait)
 	for {
-		var count int64
-		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'pending' AND run_at <= datetime('now')").Scan(&count)
-		if count == 0 {
-			return
-		}
 		if processNextJob(app) {
 			continue
 		}
-		// processNextJob claimed nothing while jobs are due (count > 0): every due
-		// job is gated by an earlier-ordered same-group predecessor in retry
-		// backoff. Fast-forward the single earliest-run_at gated job so `flush`
-		// can proceed. Targeting the earliest gated row (ORDER BY run_at ASC LIMIT
-		// 1) - not every gated row - is what keeps strict-chain ordering intact
+		// processNextJob claimed nothing: every due job is gated by an
+		// earlier-ordered same-group predecessor in retry backoff, or none is
+		// due. Fast-forward the single earliest-run_at gated job so `flush`
+		// can proceed. Targeting the earliest gated row (ORDER BY run_at ASC)
+		// - not every gated row - is what keeps strict-chain ordering intact
 		// across the drain.
-		res, err := app.DB.Exec(`
-			UPDATE _benmore_jobs SET not_before = NULL
-			WHERE id = (
-				SELECT id FROM _benmore_jobs
-				WHERE status = 'pending' AND run_at <= datetime('now')
-				  AND not_before IS NOT NULL AND not_before > datetime('now')
-				ORDER BY run_at ASC LIMIT 1
-			)`)
+		rows, err := app.DB.Query(`
+			SELECT id, attempts FROM _benmore_jobs
+			WHERE status = 'pending' AND run_at <= datetime('now')
+			  AND not_before IS NOT NULL AND not_before > datetime('now')
+			ORDER BY run_at ASC`)
 		if err != nil {
 			return
 		}
-		// Nothing was gated to fast-forward yet processNextJob still claimed
-		// nothing (e.g. a transient claim error): stop rather than spin.
-		if n, _ := res.RowsAffected(); n == 0 {
+		var pick int64
+		for rows.Next() {
+			var id int64
+			var attempts int
+			if rows.Scan(&id, &attempts) != nil {
+				continue
+			}
+			if prev, seen := forwarded[id]; seen && prev == attempts {
+				continue
+			}
+			pick, forwarded[id] = id, attempts
+			break
+		}
+		rows.Close()
+		// Nothing left to fast-forward: the queue is drained (or only
+		// deferred deliveries remain).
+		if pick == 0 {
+			// Unless the app's own worker claimed a job before this flush
+			// could and is still running it: wait for that, then drain
+			// again, since the job may have queued more.
+			if flushWaitForWorker(app, workerDeadline) {
+				continue
+			}
+			return
+		}
+		if _, err := app.DB.Exec("UPDATE _benmore_jobs SET not_before = NULL WHERE id = ?", pick); err != nil {
 			return
 		}
 	}
+}
+
+// flushWorkerWait bounds how long one flush waits, in all, for jobs the
+// worker is running. A flush that reaches it returns, and the test that asked
+// for it reports what it then sees.
+var flushWorkerWait = 30 * time.Second
+
+// flushWaitForWorker waits while another goroutine (the app's job worker) is
+// inside processNextJob. It reports true when it had to wait and the worker
+// then came out, so the caller drains again (the job may have queued more);
+// false when nothing was running or the deadline passed. An idle worker is
+// inside processNextJob for a moment each time it polls: that is a short wait
+// and one more pass over an empty queue.
+func flushWaitForWorker(app *App, deadline time.Time) bool {
+	waited := false
+	for app.jobsInProcess.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		waited = true
+		time.Sleep(2 * time.Millisecond)
+	}
+	return waited
 }
 
 // CleanOldJobs prunes old jobs hourly (pruneOldJobs). Exits on app.Stop
@@ -1332,6 +1683,9 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 			serverErrorJSON(w, r, app, "_jobs", err, "query failed")
 			return
 		}
+		for _, row := range rows {
+			redactJobErrorColumn(app, row)
+		}
 
 		stats := JobStats(app.DB)
 		httpJSON(w, http.StatusOK, map[string]any{"jobs": rows, "stats": stats})
@@ -1349,13 +1703,14 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 		id := r.PathValue("id")
 		var (
 			jobID                                    int64
+			attempts, maxAttempts                    int
 			flowName, status, errMsg, storedToken    string
 			startedAt, completedAt, runAt, createdAt sql.NullString
 		)
 		err := app.DB.QueryRow(
-			"SELECT id, flow_name, status, COALESCE(error,''), COALESCE(status_token,''), started_at, completed_at, run_at, created_at FROM _benmore_jobs WHERE id = ?",
+			"SELECT id, flow_name, status, COALESCE(error,''), COALESCE(status_token,''), started_at, completed_at, run_at, created_at, COALESCE(attempts,0), COALESCE(max_attempts,1) FROM _benmore_jobs WHERE id = ?",
 			id,
-		).Scan(&jobID, &flowName, &status, &errMsg, &storedToken, &startedAt, &completedAt, &runAt, &createdAt)
+		).Scan(&jobID, &flowName, &status, &errMsg, &storedToken, &startedAt, &completedAt, &runAt, &createdAt, &attempts, &maxAttempts)
 		if err != nil {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
 			return
@@ -1370,13 +1725,17 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 				return
 			}
 		}
+		// attempts/max_attempts tell a poller that a pending job with an
+		// error is waiting for a retry (flows_job_attempts.go).
 		resp := map[string]any{
-			"job_id":    jobID,
-			"flow_name": flowName,
-			"status":    status,
+			"job_id":       jobID,
+			"flow_name":    flowName,
+			"status":       status,
+			"attempts":     attempts,
+			"max_attempts": maxAttempts,
 		}
 		if errMsg != "" {
-			resp["error"] = errMsg
+			resp["error"] = jobErrorText(app, errMsg)
 		}
 		if startedAt.Valid {
 			resp["started_at"] = startedAt.String
@@ -1408,6 +1767,7 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 			return
 		}
 		rows[0]["payload"] = redactJobPayloadForRead(app, rows[0]["payload"])
+		redactJobErrorColumn(app, rows[0])
 
 		httpJSON(w, http.StatusOK, rows[0])
 	})
@@ -1441,6 +1801,11 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 			"UPDATE _benmore_jobs SET status = 'pending', run_at = datetime('now'), not_before = NULL, error = NULL WHERE id = ? AND status = 'failed' AND NOT "+jobRetryIsEffectSQL,
 			id,
 		)
+		if isUniqueJobConstraintErr(err) {
+			// Another queued or running job holds this job's unique key.
+			httpJSON(w, http.StatusConflict, map[string]any{"error": "another active job holds this job's unique key; it was not retried"})
+			return
+		}
 		if err != nil {
 			serverErrorJSON(w, r, app, "_jobs retry", err, "retry failed")
 			return
@@ -1488,7 +1853,7 @@ func JobStats(db *sql.DB) map[string]int64 {
 	// the SQL. The values are a fixed allowlist today, but a parameterized query
 	// keeps this off the string-building path so a future caller can't turn it
 	// into an injection vector.
-	for _, status := range []string{"pending", "running", "completed", "failed"} {
+	for _, status := range jobStatuses {
 		var count int64
 		db.QueryRow("SELECT COUNT(*) FROM _benmore_jobs WHERE status = ?", status).Scan(&count)
 		stats[status] = count

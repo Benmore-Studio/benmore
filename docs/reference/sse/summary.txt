@@ -1,0 +1,1 @@
+Real-time invalidation via Server-Sent Events. Every auto-CRUD mutation, and every flow `run: sql` / `run: sql_dynamic` write once it is durable, fires a `change` event with data `{table, action}` (action: insert | update | delete - never the row). The browser auto-reconnects on disconnect.

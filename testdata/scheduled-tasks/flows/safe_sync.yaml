@@ -1,0 +1,11 @@
+on:
+  request:
+    method: POST
+    path: /api/safe_sync
+    mode: async
+idempotent: true
+jobs:
+  run:
+    steps:
+      - run: sql
+        query: "SELECT 1"

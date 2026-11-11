@@ -1,0 +1,47 @@
+# What the keys in app.yaml do, and two that do nothing.
+# Run: benmore test <dir> --app
+
+# features.sse: false and features.ws: false: the endpoints are not served.
+realtime_endpoints_are_off:
+  as_user: "member@switches.test"
+  steps:
+    - get: "/sse/events"
+      expect:
+        status: 404
+    - get: "/ws"
+      expect:
+        status: 404
+
+# css: none: the page gets no Tailwind and no Alpine; HTMX and the CSRF meta
+# tag stay. site_name names the app; the description is seo.description.
+page_shell_follows_css_and_site_name:
+  anon: true
+  steps:
+    - get: "/about"
+      expect:
+        status: 200
+        contains:
+          - "<h1>About</h1>"
+          - '<meta name="csrf-token"'
+          - "/_internal/htmx.js"
+          - '<meta property="og:site_name" content="Switches fixture">'
+          - '<meta name="description" content="The description pages carry">'
+        not_contains:
+          - "/_internal/tailwind.js"
+          - "/_internal/alpine.js"
+          - "ignored top-level description"
+    - get: "/manifest.json"
+      expect:
+        status: 200
+        json:
+          name: "Switches fixture"
+          description: "The description pages carry"
+
+# auth.public_api does not make a table public.
+public_api_opens_nothing:
+  anon: true
+  steps:
+    - get: "/api/notes"
+      expect:
+        status: 401
+        contains: "authentication required"

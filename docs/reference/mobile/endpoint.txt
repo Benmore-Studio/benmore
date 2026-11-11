@@ -1,0 +1,1 @@
+(CLI only - no MCP equivalent. Mobile scaffolding is a developer-machine concern.)

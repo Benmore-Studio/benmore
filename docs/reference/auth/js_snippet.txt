@@ -1,0 +1,47 @@
+// 1. Read the CSRF token (auto-injected into every served HTML).
+const csrf = document.querySelector('meta[name="csrf-token"]').content;
+
+// 2+3. Sign up / sign in. POST JSON so the server answers with a status:
+// a form-encoded POST always answers 303 (back to the page with ?error=
+// on failure), fetch follows it, and res.ok is true for a wrong password.
+// (Or use bm.auth.signUp / bm.auth.signIn from 'bm', which do exactly this.)
+async function authPost(path, fields) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    credentials: 'same-origin',
+    body: JSON.stringify(fields),
+  });
+  const data = await res.json().catch(() => ({}));
+  // 400/401/403/429 {ok:false, error} (403 email_verification_required adds a message to show)
+  if (!res.ok) throw new Error(data.message || data.error || 'Request failed');
+  // A second step (emailed code, authenticator code, MFA enrollment): no session yet.
+  if (data.otp_required || data.mfa_required || data.mfa_setup_required) {
+    location.href = data.redirect;
+    return new Promise(() => {});
+  }
+  return data.user; // 200 {ok:true, user} + session cookie
+}
+
+async function signUp({ email, password, first_name }) {
+  await authPost('/signup', { email, password, first_name });
+  location.href = '/';
+}
+
+async function signIn({ email, password }) {
+  await authPost('/login', { email, password });
+  location.href = '/';
+}
+
+// 4. Who's logged in? Returns 401 when anonymous.
+async function whoami() {
+  const res = await fetch('/api/_auth/profile', { credentials: 'same-origin' });
+  return res.ok ? res.json() : null;
+}
+
+// 5. Sign out.
+async function signOut() {
+  await fetch('/logout', { method: 'POST', headers: { 'X-CSRF-Token': csrf },
+                          credentials: 'same-origin' });
+  location.href = '/login.html';
+}

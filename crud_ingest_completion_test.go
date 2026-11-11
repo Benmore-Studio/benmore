@@ -62,7 +62,8 @@ func TestStreamingIngestReportsReadFailure(t *testing.T) {
 					t.Fatalf("committed rows = %d, want %d: %v", count, wantIngested, err)
 				}
 				var audits int
-				if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log WHERE action='ingest'").Scan(&audits); err != nil || audits != wantIngested {
+				// One insert audit entry per committed row, none for the rest.
+				if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log WHERE action='insert' AND table_name='ingest_rows'").Scan(&audits); err != nil || audits != wantIngested {
 					t.Fatalf("ingest audits = %d, want %d: %v", audits, wantIngested, err)
 				}
 			})
@@ -107,7 +108,7 @@ func TestStreamingIngestRowLimitReportsRollback(t *testing.T) {
 	if n := gateScalar(t, app, "SELECT COUNT(*) FROM ingest_rows"); n != "0" {
 		t.Fatalf("over-limit request must roll back, persisted %s rows", n)
 	}
-	if n := gateScalar(t, app, "SELECT COUNT(*) FROM _benmore_audit_log WHERE action='ingest'"); n != "0" {
+	if n := gateScalar(t, app, "SELECT COUNT(*) FROM _benmore_audit_log"); n != "0" {
 		t.Fatalf("over-limit request must not commit an audit, persisted %s", n)
 	}
 }

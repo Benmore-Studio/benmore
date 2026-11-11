@@ -1,0 +1,1 @@
+Verify inbound webhook signatures or path-bound bearer credentials on an `on.request` block before request-body parsing. Mirror of the outbound `sign:` topic - same shape, opposite direction.

@@ -50,7 +50,7 @@ func TestCRUDTenantMaskingPreservesProjectedReads(t *testing.T) {
 					switch row["name"] {
 					case "own-tenant-value":
 						own++
-					case maskValue("other-tenant-value"):
+					case encryptedFieldMask:
 						masked++
 					default:
 						t.Errorf("unexpected projected value: %#v", row)

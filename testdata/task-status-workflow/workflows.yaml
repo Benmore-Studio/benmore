@@ -1,0 +1,12 @@
+# workflows.yaml - the only way a request's status changes
+requests:
+  table: requests
+  field: status
+  initial: submitted
+  transitions:
+    submitted:
+      approved:  { role: manager }
+      rejected:  { role: manager }
+      withdrawn: {}                 # no role: whoever may update the row, here its requester
+    approved:
+      ordered:   { role: manager, when: "amount_cents <= 500000" }

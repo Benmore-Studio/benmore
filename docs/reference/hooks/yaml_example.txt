@@ -1,0 +1,22 @@
+# hooks.yaml
+# Top-level keys: on_insert, on_update, on_delete, before_insert, before_update, before_delete,
+# each a map of table name to a list of entries. The write gate and benmore check
+# refuse any other top-level key and an entry key the hook parser does not read.
+on_insert:
+  contacts:
+    - email:
+        to: "{{email}}"
+        subject: "Welcome"
+        template: "welcome"
+    - notify: "{{user_id}}"
+      notify_title: "Contact created"
+
+on_update:
+  orders:
+    - sql: "UPDATE stats SET total = total + {{amount}}"
+      when: "status = 'paid' AND old_status != 'paid'"
+
+before_insert:
+  orders:
+    - sql: "SELECT 'amount over limit' AS error"   # a row with a non-empty error column refuses the write (422)
+      when: "amount > 10000"

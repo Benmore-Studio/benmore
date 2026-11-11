@@ -1,0 +1,8 @@
+{
+  "script_src": "JS sources (e.g. Google Maps API: https://maps.googleapis.com https://maps.gstatic.com)",
+  "style_src": "stylesheet sources (Mapbox GL CSS, custom CDN themes)",
+  "img_src": "image sources, including map tiles (OSM: https://*.tile.openstreetmap.org)",
+  "font_src": "@font-face sources",
+  "connect_src": "XHR / fetch / WebSocket destinations (Mapbox tile API: https://api.mapbox.com; a WebSocket feed: wss://ws-feed.exchange.coinbase.com)",
+  "frame_src": "iframe sources (Google Maps embed: https://www.google.com, Stripe checkout: https://js.stripe.com)"
+}

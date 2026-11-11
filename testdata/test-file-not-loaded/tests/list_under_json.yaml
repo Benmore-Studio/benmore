@@ -1,0 +1,11 @@
+# Not loaded: `json:` takes a mapping and this step gives it a list (a list
+# body goes under `json_array:`), so the file does not decode into test cases.
+create_two_notes:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/notes/batch"
+      json:
+        - {title: "first"}
+        - {title: "second"}
+      expect:
+        status: 200

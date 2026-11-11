@@ -1,0 +1,22 @@
+{
+  "keys": [
+    "cli",
+    "hipaa",
+    "file_identity",
+    "feature_gate",
+    "ownership_persistence",
+    "refused_create_files",
+    "transform_security",
+    "summary",
+    "storage_backends",
+    "storage_allowance",
+    "size_limits",
+    "private_ownership",
+    "public_vs_private",
+    "deletion_example",
+    "private_deletion",
+    "endpoint",
+    "js_snippet",
+    "gotchas"
+  ]
+}

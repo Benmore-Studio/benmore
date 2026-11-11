@@ -42,6 +42,10 @@ func TestQueryEncryptedOperationsRefuseCiphertextResults(t *testing.T) {
 				{"where": map[string]any{"private_note": "acme-private-note"}},
 				{"where": map[string]any{"private_note": map[string]any{"in": []string{"acme-private-note"}}}},
 				{"where": map[string]any{"private_amount": map[string]any{"gt": 0}}},
+				{"where": map[string]any{"private_note": map[string]any{"like": "acme"}}},
+				{"where": map[string]any{"private_note": map[string]any{"starts_with": "acme"}}},
+				{"where": map[string]any{"private_note": map[string]any{"ends_with": "note"}}},
+				{"where": map[string]any{"private_note": map[string]any{"contains": "private"}}},
 			} {
 				spec["table"] = "companies"
 				w := crudScopeRequest(t, mux, http.MethodPost, "/api/_query", sid, spec)

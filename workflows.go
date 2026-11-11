@@ -3,10 +3,16 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,19 +27,57 @@ func RegisterWorkflows(mux appRouteRegistrar, app *App) {
 	}
 }
 
+// workflowSameTableError refuses a second workflow on a table. The transition
+// routes are the table's (POST /api/<table>/{id}/transition takes only `to`,
+// GET .../transitions answers one `current`), and the SDK types, the
+// <transitions> tag and the generated tests are keyed by table, so a table
+// has one state machine. Two used to parse clean and then panic ServeMux in
+// registerWorkflows (the same pattern twice): the app died at the next reload
+// and at every start. Tables compare as SQLite compares them, so `Orders` and
+// `orders` are one table.
+func workflowSameTableError(raw map[string]WorkflowYAML) error {
+	first := map[string]string{} // folded table → the first workflow naming it
+	for _, name := range sortedWhenKeys(raw) {
+		table := strings.TrimSpace(raw[name].Table)
+		if table == "" {
+			continue
+		}
+		key := sqliteIdentifierFold(table)
+		other, taken := first[key]
+		if !taken {
+			first[key] = name
+			continue
+		}
+		kept := strings.TrimSpace(raw[other].Table)
+		return fmt.Errorf("workflows.yaml: workflows %q and %q both name table %q, and the framework supports one workflow per table: "+
+			"POST /api/%s/{id}/transition and GET /api/%s/{id}/transitions are the table's routes and move one state column. "+
+			"Keep one workflow on %q and move the other state machine to its own table (for example a row that points at this one), "+
+			"which gets its own transition routes. See api({at:'workflows'}) → one_per_table.",
+			other, name, kept, kept, kept, kept)
+	}
+	return nil
+}
+
 func registerWorkflows(mux appRouteRegistrar, app *App) {
 	for _, wf := range app.Workflows.Workflows {
 		w := wf // capture
 
-		// POST /api/{table}/{id}/transition - execute a state transition
-		mux.HandleFunc(fmt.Sprintf("POST /api/%s/{id}/transition", w.Table), func(wr http.ResponseWriter, r *http.Request) {
-			handleTransition(wr, r, app, w)
-		})
+		// The schema's spelling, plus the one workflows.yaml used when it
+		// differed (ServeMux is case-sensitive; a deployed client keeps working).
+		for _, table := range slices.Compact([]string{w.Table, w.ConfiguredTable}) {
+			if table == "" {
+				continue
+			}
+			// POST /api/{table}/{id}/transition - execute a state transition
+			mux.HandleFunc(fmt.Sprintf("POST /api/%s/{id}/transition", table), func(wr http.ResponseWriter, r *http.Request) {
+				handleTransition(wr, r, app, w)
+			})
 
-		// GET /api/{table}/{id}/transitions - list valid transitions for current user
-		mux.HandleFunc(fmt.Sprintf("GET /api/%s/{id}/transitions", w.Table), func(wr http.ResponseWriter, r *http.Request) {
-			handleAvailableTransitions(wr, r, app, w)
-		})
+			// GET /api/{table}/{id}/transitions - list valid transitions for current user
+			mux.HandleFunc(fmt.Sprintf("GET /api/%s/{id}/transitions", table), func(wr http.ResponseWriter, r *http.Request) {
+				handleAvailableTransitions(wr, r, app, w)
+			})
+		}
 
 		log.Printf("  workflow: %s.%s (%d states, %s → ...)", w.Table, w.Field, len(w.States), w.Initial)
 	}
@@ -50,7 +94,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 
 	// 2. Scope enforcement
 	if err := checkScope(session, wf.Table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 	// A transition is an update of the state column, so it obeys the
@@ -128,7 +172,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 	// 6. Get current state (stateVal is the stored value, kept for the
 	// conditional UPDATE below; hooks later receive and may annotate row)
 	stateVal := row[wf.Field]
-	currentState := fmt.Sprintf("%v", stateVal)
+	currentState := valueText(stateVal)
 
 	// 7. Validate transition exists
 	targets, exists := wf.Transitions[currentState]
@@ -157,11 +201,11 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 	}
 
 	// 8. Check role
-	if transition.Role != "" && !hasWorkflowRole(app, session, transition.Role) {
-		httpJSON(w, http.StatusForbidden, map[string]any{
+	if transition.Role != "" && !hasWorkflowRole(app, session, wf.Table, transition.Role) {
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
 			"error":   "forbidden",
-			"message": fmt.Sprintf("role '%s' required for this transition", transition.Role),
-		})
+			"message": workflowRoleRequired(transition.Role),
+		}, refusalWorkflowRole))
 		return
 	}
 
@@ -207,7 +251,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		return
 	}
 	row = freshRows[0]
-	if fmt.Sprint(row[wf.Field]) != currentState {
+	if valueText(row[wf.Field]) != currentState {
 		httpJSON(w, http.StatusConflict, map[string]any{"error": "state changed", "from": currentState})
 		return
 	}
@@ -238,7 +282,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		updateArgs[1] = next
 	}
 
-	result, err := tx.Exec(updateSQL, updateArgs...)
+	result, err := execVersioned(tx, wf.Table, id, session, updateSQL, updateArgs...)
 	if err != nil {
 		serverErrorJSON(w, r, app, wf.Table+" transition", err, "transition failed")
 		return
@@ -257,37 +301,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		return
 	}
 
-	// Read through the transaction. A missing/failed read cannot report a
-	// successful transition with fabricated hook data.
-	updatedRows, err := queryNativeRowsWith(tx, app, wf.Table, "SELECT * FROM "+quoteIdent(wf.Table)+" WHERE id = ?", id)
-	if err != nil || len(updatedRows) != 1 {
-		if err == nil {
-			err = fmt.Errorf("transitioned row read back %d rows", len(updatedRows))
-		}
-		serverErrorJSON(w, r, app, wf.Table+" transition", err, "could not read transitioned row")
-		return
-	}
-	updatedRow := updatedRows[0]
-
-	// Inject old_* fields for hook context
-	for k, v := range row {
-		updatedRow["old_"+k] = v
-	}
-	injectSessionContext(updatedRow, session)
-
-	refreshTables, err := fireHookListTx(tx, app, "transition", wf.Table, updatedRow, wf.OnTransition[body.To])
-	if err == nil {
-		var afterRefresh []string
-		afterRefresh, err = fireAfterHooksTx(tx, app, "update", wf.Table, updatedRow)
-		refreshTables = append(refreshTables, afterRefresh...)
-	}
-	if err == nil {
-		err = enqueueWebhookSubscriptionsTx(tx, app, "update", wf.Table, updatedRow, session)
-	}
-	if err == nil {
-		err = LogAuditTx(tx, app, "transition", wf.Table, id, session,
-			map[string]any{wf.Field: currentState}, map[string]any{wf.Field: body.To})
-	}
+	updatedRow, refreshTables, err := transitionEffectsTx(tx, app, wf, id, row, currentState, body.To, session)
 	if err != nil {
 		serverErrorJSON(w, r, app, wf.Table+" transition", err, "transition side effect failed")
 		return
@@ -300,7 +314,7 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 	// External event handlers and live notifications only observe a commit.
 	FireFlowsForEvent(app, "on_update", wf.Table, updatedRow)
 	Broadcast(app, wf.Table, "update", session)
-	broadcastHookRefreshes(app, refreshTables, []transactionResult{{Table: wf.Table, Action: "update"}})
+	broadcastHookRefreshes(app, session, refreshTables, []transactionResult{{Table: wf.Table, Action: "update"}})
 
 	// 17. Response
 	httpJSON(w, http.StatusOK, map[string]any{
@@ -321,7 +335,7 @@ func handleAvailableTransitions(w http.ResponseWriter, r *http.Request, app *App
 	// It reads the row's state, so a scoped credential needs read scope
 	// on the table, as a GET /api/<table>/{id} would.
 	if err := checkScope(session, wf.Table, "read"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -356,16 +370,16 @@ func handleAvailableTransitions(w http.ResponseWriter, r *http.Request, app *App
 		return
 	}
 
-	currentState := fmt.Sprintf("%v", rows[0][wf.Field])
+	currentState := valueText(rows[0][wf.Field])
 	targets := wf.Transitions[currentState]
 
 	var transitions []map[string]string
 	for to, t := range targets {
 		// Only show transitions the user has the role for
-		if t.Role == "" || hasWorkflowRole(app, session, t.Role) {
+		if t.Role == "" || hasWorkflowRole(app, session, wf.Table, t.Role) {
 			entry := map[string]string{"to": to}
 			if t.Role != "" {
-				entry["role"] = t.Role
+				entry["role"] = canonicalWorkflowRole(t.Role)
 			}
 			transitions = append(transitions, entry)
 		}
@@ -381,33 +395,56 @@ func handleAvailableTransitions(w http.ResponseWriter, r *http.Request, app *App
 	})
 }
 
-// hasWorkflowRole checks if the user can perform a transition requiring the given role.
-func hasWorkflowRole(app *App, session *Session, requiredRole string) bool {
+// hasWorkflowRole reports whether session may make a transition whose `role:`
+// is requiredRole: one role or an any-of list ("owner,manager"), matched like
+// an access `role:` mode. A listed role passes for a platform admin, through
+// the _benmore_users.role hierarchy (hasRole), as the caller's membership role
+// in the effective tenant (resolveAppRole), or through a role grant counted as
+// the access mode counts it (workflowRoleFromGrant). A `role:` that names no
+// role admits only a platform admin.
+func hasWorkflowRole(app *App, session *Session, table, requiredRole string) bool {
 	if requiredRole == "" {
 		return true
 	}
 	if session.IsAdmin() {
 		return true
 	}
-	// Check app-level role from group membership table
-	appRole := resolveAppRole(app, session)
-	if appRole == requiredRole {
-		return true
+	roles := workflowRoleNames(requiredRole)
+	if len(roles) == 0 {
+		return false
 	}
-	// Fall back to platform role hierarchy
-	return hasRole(session.Role, requiredRole)
+	// App-level role from the group membership table, then the platform
+	// role hierarchy, for each listed role.
+	appRole := resolveAppRole(app, session)
+	for _, role := range roles {
+		if appRole == role || hasRole(session.Role, role) {
+			return true
+		}
+	}
+	return workflowRoleFromGrant(app, table, session, roles, app.DB.QueryRow)
 }
 
-// fireTransitionHooks fires on_transition hooks for the target state.
-func fireTransitionHooks(app *App, wf *Workflow, targetState string, row map[string]any) {
-	hooks := wf.OnTransition[targetState]
-	for _, hook := range hooks {
-		if hook.When != "" && !whenHolds(app.DB, app, wf.Table, hook.When, row) {
-			continue
-		}
-		r := copyRow(row)
-		EnqueueHookJob(app, hook, wf.Table, r)
+// workflowRoleFromGrant reports whether session holds one of roles through its
+// role grants (_benmore_user_roles), counted the way a `role:` access mode on
+// table counts them (tableModeAllowed): a grant scoped to the caller's tenant
+// only on a table the tenant key bounds, otherwise only a global one. queryRow
+// reads the global grant on the caller's connection (a command's transaction).
+func workflowRoleFromGrant(app *App, table string, session *Session, roles []string, queryRow func(query string, args ...any) *sql.Row) bool {
+	if app == nil || session == nil || len(roles) == 0 || !HasAnyRole(session, roles) {
+		return false
 	}
+	if app.Group == nil || app.Group.Key == "" || hasColumn(app, table, app.Group.Key) || groupSharedTable(app, table) {
+		return true
+	}
+	tier, args, ok := globalRoleTier(session, roles)
+	if !ok {
+		return false
+	}
+	if tier == "1=1" {
+		return true
+	}
+	var held bool
+	return queryRow("SELECT "+tier, args...).Scan(&held) == nil && held
 }
 
 // copyRow creates a shallow copy of a row map for safe concurrent access.
@@ -425,7 +462,7 @@ func GetWorkflowForTable(app *App, table string) *Workflow {
 		return nil
 	}
 	for _, wf := range app.Workflows.Workflows {
-		if wf.Table == table {
+		if identIs(wf.Table, table) {
 			return wf
 		}
 	}
@@ -467,64 +504,246 @@ func startWorkflowTimeoutChecker(app *App, wf *Workflow) <-chan struct{} {
 }
 
 func checkWorkflowTimeouts(app *App, wf *Workflow) {
+	checkWorkflowTimeoutsAt(app, wf, time.Now())
+}
+
+// checkWorkflowTimeoutsAt is one sweep of wf. now is the clock the per-row
+// failure waits run on; whether a row is past its deadline is the database's
+// own `datetime('now')`.
+func checkWorkflowTimeoutsAt(app *App, wf *Workflow, now time.Time) {
 	for state, timeout := range wf.Timeouts {
 		if timeout.After <= 0 {
 			continue
 		}
+		sweepWorkflowTimeoutState(app, wf, state, timeout, now)
+	}
+	workflowTimeoutBackoff.prune(now)
+	workflowTimeoutResume.prune(now)
+}
 
-		seconds := int(timeout.After.Seconds())
-		query := fmt.Sprintf(
-			"SELECT id FROM %s WHERE %s = ? AND updated_at < datetime('now', '-%d seconds')",
-			quoteIdent(wf.Table), quoteColumn(wf.Table, wf.Field), seconds,
-		)
-		if hasColumn(app, wf.Table, "deleted_at") {
-			query += " AND deleted_at IS NULL"
+// sweepWorkflowTimeoutState times out the due rows of one state, oldest first.
+// It reads them a page at a time, keyset on (updated_at, id), passes over the
+// rows still waiting out a failed attempt, and stops when workflowTimeoutBatch
+// rows were tried, workflowTimeoutScanLimit rows were read, or the rows ran
+// out. A sweep stopped by either bound leaves its position, and the next one
+// continues from there, so no number of failing rows keeps a later row from
+// being reached. The select this replaces was `ORDER BY updated_at LIMIT 500`
+// with the wait checked inside the loop: once a state held 500 rows whose
+// timeout kept failing, every sweep read those 500, skipped them all, and no
+// newer row of the state timed out again.
+func sweepWorkflowTimeoutState(app *App, wf *Workflow, state string, timeout WorkflowTimeout, now time.Time) {
+	seconds := int(timeout.After.Seconds())
+	// `+updated_at` is the stored value as it is (the driver converts a
+	// DATETIME column, not an expression), so the next page compares against
+	// exactly what this page was ordered by.
+	query := fmt.Sprintf(
+		"SELECT id, +updated_at AS sweep_position FROM %s WHERE %s = ? AND updated_at < datetime('now', '-%d seconds')",
+		quoteIdent(wf.Table), quoteColumn(wf.Table, wf.Field), seconds,
+	)
+	if hasColumn(app, wf.Table, "deleted_at") {
+		query += " AND deleted_at IS NULL"
+	}
+
+	posKey := workflowTimeoutStateKey{dir: app.Dir, workflow: wf.Name, state: state}
+	pos, resumed := workflowTimeoutResume.get(posKey)
+	tried, read := 0, 0
+	failed, firstFailedID, firstErr := 0, "", error(nil)
+	defer func() {
+		// One line per sweep and state, not one per failing row: rows that
+		// keep failing are retried on their own waits indefinitely, and a
+		// line each was up to workflowTimeoutBatch lines a minute for good.
+		if failed > 0 {
+			log.Printf("WORKFLOW TIMEOUT ERROR [%s] state=%s: %d row(s) could not time out (first id=%s: %s); each is retried on its own doubling wait", wf.Name, state, failed, firstFailedID, firstErr)
 		}
-
-		rows, err := queryNativeRowsWith(app.DB, app, wf.Table, query, state)
+	}()
+	for tried < workflowTimeoutBatch && read < workflowTimeoutScanLimit {
+		page, args := query, []any{state}
+		if resumed {
+			page += " AND (updated_at, id) > (?, ?)"
+			args = append(args, pos.updatedAt, pos.id)
+		}
+		// The first page is one batch, which is all a sweep needs unless rows
+		// waiting out a failure fill it; then the rest of the scan budget is
+		// read in one more query. Without an index on (state, updated_at, id)
+		// each page is a full scan of the table, so twenty pages a sweep cost
+		// twenty scans a minute per state.
+		limit := workflowTimeoutBatch
+		if read > 0 {
+			limit = workflowTimeoutScanLimit - read
+		}
+		page += fmt.Sprintf(" ORDER BY updated_at, id LIMIT %d", limit)
+		rows, err := queryNativeRowsWith(app.DB, app, wf.Table, page, args...)
 		if err != nil {
 			log.Printf("WORKFLOW TIMEOUT ERROR [%s]: %s", wf.Name, err)
-			continue
+			// Whatever failed, the next sweep starts from the oldest row
+			// instead of repeating a page that may be what failed.
+			workflowTimeoutResume.clear(posKey)
+			return
 		}
 
-		for _, row := range rows {
-			id := fmt.Sprintf("%v", row["id"])
-
-			// Fetch full row for hooks. A failed read leaves the timeout to
-			// the next sweep rather than applying it without its hooks.
-			fullRows, err := queryNativeRowsWith(app.DB, app, wf.Table, "SELECT * FROM "+quoteIdent(wf.Table)+" WHERE id = ?", id)
-			if err != nil {
-				log.Printf("WORKFLOW TIMEOUT ERROR [%s] id=%s: read row: %s", wf.Name, id, err)
+		seen := 0
+		for seen < len(rows) && tried < workflowTimeoutBatch {
+			row := rows[seen]
+			seen++
+			read++
+			pos, resumed = workflowTimeoutPosition{updatedAt: row["sweep_position"], id: row["id"], at: now}, true
+			id := valueText(row["id"])
+			key := workflowTimeoutKey{dir: app.Dir, workflow: wf.Name, id: id}
+			if workflowTimeoutBackoff.skip(key, now) {
 				continue
 			}
-
-			applied, err := applyWorkflowTimeout(app, wf, id, state, timeout.To)
-			if err != nil {
-				log.Printf("WORKFLOW TIMEOUT ERROR [%s] id=%s: %s", wf.Name, id, err)
+			// Each timed-out row is its own write transaction (with its hook
+			// jobs, audit row and webhook jobs), so the tries are what is
+			// capped: a backlog drains over several sweeps instead of holding
+			// the checker for one unbounded pass.
+			tried++
+			if _, err := applyWorkflowTimeoutDue(app, wf, id, state, timeout.To, seconds); err != nil {
+				workflowTimeoutBackoff.fail(key, now)
+				if failed == 0 {
+					firstFailedID, firstErr = id, err
+				}
+				failed++
 				continue
 			}
-			if !applied {
-				continue
-			}
+			workflowTimeoutBackoff.clear(key)
+		}
+		if seen == len(rows) && len(rows) < limit {
+			// The rows ran out: the next sweep starts from the oldest again.
+			workflowTimeoutResume.clear(posKey)
+			return
+		}
+	}
+	if resumed {
+		workflowTimeoutResume.set(posKey, pos)
+	}
+}
 
-			// Fire on_transition hooks
-			if len(fullRows) > 0 {
-				hookRow := fullRows[0]
-				hookRow["old_"+wf.Field] = state
-				hookRow[wf.Field] = timeout.To
-				fireTransitionHooks(app, wf, timeout.To, hookRow)
-			}
+// workflowTimeoutBatch caps the rows one sweep tries to time out per state.
+const workflowTimeoutBatch = 500
 
-			// Audit log - system session for automated timeout transitions
-			systemSession := &Session{ID: "system:timeout", Email: "system@localhost", Role: "system"}
-			LogAudit(app, "transition", wf.Table, id, systemSession,
-				map[string]any{wf.Field: state},
-				map[string]any{wf.Field: timeout.To, "_trigger": "timeout"},
-			)
+// workflowTimeoutScanLimit caps the rows one sweep reads per state while it
+// looks for workflowTimeoutBatch rows to try: 20 pages. Rows waiting out a
+// failed attempt are read and passed over, so this is what a large backlog of
+// them costs each sweep; the rest is read by the sweeps that follow.
+const workflowTimeoutScanLimit = 20 * workflowTimeoutBatch
 
-			log.Printf("WORKFLOW TIMEOUT [%s] %s id=%s: %s → %s", wf.Name, wf.Table, id, state, timeout.To)
+// workflowTimeoutResume holds, per app, workflow and state, where a sweep that
+// stopped at a bound left off: the (updated_at, id) of the last row it read.
+// In memory only, like the failure waits: after a restart the first sweep
+// starts from the oldest row.
+type workflowTimeoutStateKey struct{ dir, workflow, state string }
 
-			broadcastWorkflowTimeout(app, wf.Table, fullRows)
+type workflowTimeoutPosition struct {
+	updatedAt, id any
+	at            time.Time
+}
+
+type workflowTimeoutResumeMap struct {
+	mu sync.Mutex
+	m  map[workflowTimeoutStateKey]workflowTimeoutPosition
+}
+
+var workflowTimeoutResume = &workflowTimeoutResumeMap{m: map[workflowTimeoutStateKey]workflowTimeoutPosition{}}
+
+func (r *workflowTimeoutResumeMap) get(k workflowTimeoutStateKey) (workflowTimeoutPosition, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pos, ok := r.m[k]
+	return pos, ok
+}
+
+func (r *workflowTimeoutResumeMap) set(k workflowTimeoutStateKey, pos workflowTimeoutPosition) {
+	r.mu.Lock()
+	r.m[k] = pos
+	r.mu.Unlock()
+}
+
+func (r *workflowTimeoutResumeMap) clear(k workflowTimeoutStateKey) {
+	r.mu.Lock()
+	delete(r.m, k)
+	r.mu.Unlock()
+}
+
+// prune drops positions no sweep has moved for a while (the workflow, its
+// timeout or the app is gone), so the map stays bounded.
+func (r *workflowTimeoutResumeMap) prune(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, pos := range r.m {
+		if now.Sub(pos.at) > 2*workflowTimeoutMaxBackoff {
+			delete(r.m, k)
+		}
+	}
+}
+
+// A timeout whose transaction fails (a hook that cannot run on that row, say)
+// would otherwise be retried every sweep forever, one failing write
+// transaction and error line per row per minute. Each failure doubles the
+// wait before the row is tried again, up to an hour.
+type workflowTimeoutKey struct{ dir, workflow, id string }
+
+type workflowTimeoutRetry struct {
+	failures int
+	next     time.Time
+}
+
+type workflowTimeoutBackoffMap struct {
+	mu sync.Mutex
+	m  map[workflowTimeoutKey]workflowTimeoutRetry
+}
+
+var workflowTimeoutBackoff = &workflowTimeoutBackoffMap{m: map[workflowTimeoutKey]workflowTimeoutRetry{}}
+
+const workflowTimeoutMaxBackoff = time.Hour
+
+// workflowTimeoutBackoffMax bounds the failure waits remembered per process.
+const workflowTimeoutBackoffMax = 50_000
+
+func (b *workflowTimeoutBackoffMap) skip(k workflowTimeoutKey, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r, ok := b.m[k]
+	return ok && now.Before(r.next)
+}
+
+func (b *workflowTimeoutBackoffMap) fail(k workflowTimeoutKey, now time.Time) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r, known := b.m[k]
+	if !known && len(b.m) >= workflowTimeoutBackoffMax {
+		// Full: drop one entry (map order is arbitrary). That row is tried
+		// again sooner than its wait, which the per-sweep batch bounds; an
+		// entry for every row that ever failed was unbounded memory on a
+		// large table whose timeout keeps failing.
+		for victim := range b.m {
+			delete(b.m, victim)
+			break
+		}
+	}
+	r.failures++
+	wait := workflowTimeoutMaxBackoff
+	if r.failures < 7 { // 1m, 2m, 4m ... 32m, then the cap
+		wait = time.Minute << (r.failures - 1)
+	}
+	r.next = now.Add(wait)
+	b.m[k] = r
+	return wait
+}
+
+func (b *workflowTimeoutBackoffMap) clear(k workflowTimeoutKey) {
+	b.mu.Lock()
+	delete(b.m, k)
+	b.mu.Unlock()
+}
+
+// prune drops entries for rows that have not been seen failing for a while
+// (deleted, moved by a user, or fixed), so the map stays bounded.
+func (b *workflowTimeoutBackoffMap) prune(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, r := range b.m {
+		if now.Sub(r.next) > 2*workflowTimeoutMaxBackoff {
+			delete(b.m, k)
 		}
 	}
 }
@@ -547,13 +766,73 @@ func broadcastWorkflowTimeout(app *App, table string, rows []map[string]any) {
 	BroadcastScopedDirect(app, table, "update", groupID, userID)
 }
 
-// applyWorkflowTimeout moves one timed-out row to its timeout state. The
-// UPDATE is conditioned on the row still being in the timed-out state: a user
-// transition (or another process's checker, in cluster mode) may have moved it
-// since the SELECT. Only the caller whose UPDATE applied (applied=true) may
-// fire the transition's hooks and audit it.
+// transitionEffectsTx is the in-transaction tail shared by a user transition
+// and a timeout, so both emit what an update emits: it reads the row back in
+// its new state, runs the on_transition hooks and the table's after-update
+// hooks, queues webhook subscriptions and writes the audit row, all in tx
+// (delivery is the job worker's, after commit). oldRow is the row as it was
+// before the state moved. actor is the caller; nil is a timeout, which has no
+// caller (hook context keys stay the row's own, the audit row names the system
+// and carries `_trigger: timeout`). It returns the new row (with old_<column>
+// deltas and, for a caller, session context) and the tables hooks wrote to.
+func transitionEffectsTx(tx mutationTx, app *App, wf *Workflow, id string, oldRow map[string]any, from, to string, actor *Session) (map[string]any, []string, error) {
+	// A missing/failed read cannot report a successful transition with
+	// fabricated hook data.
+	updatedRows, err := queryNativeRowsWith(tx, app, wf.Table, "SELECT * FROM "+quoteIdent(wf.Table)+" WHERE id = ?", id)
+	if err != nil || len(updatedRows) != 1 {
+		if err == nil {
+			err = fmt.Errorf("transitioned row read back %d rows", len(updatedRows))
+		}
+		return nil, nil, fmt.Errorf("could not read transitioned row: %w", err)
+	}
+	updatedRow := updatedRows[0]
+	for k, v := range oldRow {
+		updatedRow["old_"+k] = v
+	}
+	stored := copyRow(updatedRow) // what a subscription delivers (webhookDataRow)
+	injectSessionContext(updatedRow, actor)
+
+	// A timeout has no caller to run hook SQL as: its hooks are queued as jobs
+	// in this transaction instead, so a hook needing a session value, or whose
+	// `when:` fails, cannot roll the state change back.
+	deferred := actor == nil
+	refreshTables, err := fireHookListTxMode(tx, app, "transition", wf.Table, updatedRow, wf.OnTransition[to], deferred)
+	if err == nil {
+		var afterRefresh []string
+		afterRefresh, err = fireHookListTxMode(tx, app, "update", wf.Table, updatedRow, afterHooksFor(app, "update", wf.Table), deferred)
+		refreshTables = append(refreshTables, afterRefresh...)
+	}
+	if err == nil {
+		err = enqueueWebhookSubscriptionsTx(tx, app, "update", wf.Table, stored, actor)
+	}
+	if err == nil {
+		auditActor, auditNew := actor, map[string]any{wf.Field: to}
+		if actor == nil {
+			auditActor = &Session{ID: "system:timeout", Email: "system@localhost", Role: "system"}
+			auditNew["_trigger"] = "timeout"
+		}
+		err = LogAuditTx(tx, app, "transition", wf.Table, id, auditActor, map[string]any{wf.Field: from}, auditNew)
+	}
+	return updatedRow, refreshTables, err
+}
+
+// applyWorkflowTimeout moves one timed-out row to its timeout state in one
+// transaction. The UPDATE is conditioned on the row still being in the
+// timed-out state: a user transition (or another process's checker, in
+// cluster mode) may have moved it since the SELECT. Only the caller whose
+// UPDATE applied (applied=true) has the transition's effects: they commit with
+// the state (transitionEffectsTx), so a crash cannot leave a moved row with
+// no audit row or hook job, and a timeout fires the table's on_update hooks,
+// webhook subscriptions and flows as any update does.
 func applyWorkflowTimeout(app *App, wf *Workflow, id, fromState, toState string) (bool, error) {
-	tx, err := app.DB.Begin()
+	return applyWorkflowTimeoutDue(app, wf, id, fromState, toState, 0)
+}
+
+// applyWorkflowTimeoutDue is applyWorkflowTimeout that also re-checks the
+// deadline (dueSeconds > 0) inside the transaction: a row edited after the
+// sweep selected it has a fresh updated_at and is no longer timed out.
+func applyWorkflowTimeoutDue(app *App, wf *Workflow, id, fromState, toState string, dueSeconds int) (bool, error) {
+	tx, err := app.DB.BeginTx(withWriteTxLabel(context.Background(), "workflow timeout:"+wf.Name), nil)
 	if err != nil {
 		return false, err
 	}
@@ -562,11 +841,14 @@ func applyWorkflowTimeout(app *App, wf *Workflow, id, fromState, toState string)
 	if hasColumn(app, wf.Table, "deleted_at") {
 		where += " AND deleted_at IS NULL"
 	}
-	var matches int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM "+quoteIdent(wf.Table)+where, id, fromState).Scan(&matches); err != nil {
+	if dueSeconds > 0 {
+		where += fmt.Sprintf(" AND updated_at < datetime('now', '-%d seconds')", dueSeconds)
+	}
+	oldRows, err := queryNativeRowsWith(tx, app, wf.Table, "SELECT * FROM "+quoteIdent(wf.Table)+where, id, fromState)
+	if err != nil {
 		return false, err
 	}
-	if matches != 1 {
+	if len(oldRows) != 1 {
 		return false, nil
 	}
 	updateSQL := "UPDATE " + quoteIdent(wf.Table) + " SET " + quoteIdent(wf.Field) + " = ?"
@@ -589,15 +871,31 @@ func applyWorkflowTimeout(app *App, wf *Workflow, id, fromState, toState string)
 	if err != nil {
 		return false, err
 	}
+	if n != 1 {
+		return false, nil
+	}
+	updatedRow, refreshTables, err := transitionEffectsTx(tx, app, wf, id, oldRows[0], fromState, toState, nil)
+	if err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	return n == 1, nil
+
+	// External handlers and live notifications only observe a commit.
+	FireFlowsForEvent(app, "on_update", wf.Table, updatedRow)
+	broadcastWorkflowTimeout(app, wf.Table, []map[string]any{updatedRow})
+	broadcastHookRefreshes(app, nil, refreshTables, []transactionResult{{Table: wf.Table, Action: "update"}})
+	log.Printf("WORKFLOW TIMEOUT [%s] %s id=%s: %s → %s", wf.Name, wf.Table, id, fromState, toState)
+	return true, nil
 }
 
 // ===== Helpers =====
 
 func httpJSON(w http.ResponseWriter, status int, data any) {
+	if status >= http.StatusBadRequest {
+		addCacheControlDirective(w.Header(), "no-store") // keeps a stricter "private, no-store"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
@@ -619,17 +917,153 @@ func httpJSON(w http.ResponseWriter, status int, data any) {
 // when no `initial` is declared) is dropped so the column default applies.
 // Updates are blocked outright (workflowProtectedFields); without this a
 // caller could create a row directly in a role-guarded state. Every create
-// path (single, batch, ingest, transaction) uses it.
+// path (single, batch, ingest, transaction) uses it. A nil value is a JSON
+// null the caller sent and is dropped too.
 func workflowCreateStateRefused(app *App, table, col string, value any) bool {
-	if app == nil || app.Workflows == nil || value == nil {
+	if app == nil || app.Workflows == nil {
 		return false
 	}
 	for _, wf := range app.Workflows.Workflows {
-		if wf.Table == table && wf.Field == col {
-			return wf.Initial == "" || fmt.Sprintf("%v", value) != wf.Initial
+		if identIs(wf.Table, table) && identIs(wf.Field, col) {
+			// An explicit null is not a state either: a nullable column would
+			// store NULL, a row no transition leaves.
+			return value == nil || wf.Initial == "" || valueText(value) != wf.Initial
 		}
 	}
 	return false
+}
+
+// workflowCreateInitial returns the state a new row of table starts in when
+// col is a workflow's state column and the workflow declares `initial`. A
+// create writes it whatever the caller sent or left out, so the row never
+// depends on the column default (a nullable column stored NULL, a NOT NULL one
+// an empty string: a state no transition leaves).
+func workflowCreateInitial(app *App, table, col string) (string, bool) {
+	if app == nil || app.Workflows == nil {
+		return "", false
+	}
+	for _, wf := range app.Workflows.Workflows {
+		if wf != nil && wf.Initial != "" && identIs(wf.Table, table) && identIs(wf.Field, col) {
+			return wf.Initial, true
+		}
+	}
+	return "", false
+}
+
+// withWorkflowInitial returns data with every workflow state column of table
+// set to its initial state (data itself is not modified).
+func withWorkflowInitial(app *App, table string, data map[string]any) map[string]any {
+	if app == nil || app.Workflows == nil {
+		return data
+	}
+	var out map[string]any
+	for _, wf := range app.Workflows.Workflows {
+		if wf == nil || wf.Initial == "" || !identIs(wf.Table, table) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(data)+1)
+			maps.Copy(out, data)
+		}
+		for k := range out {
+			if identIs(k, wf.Field) {
+				delete(out, k)
+			}
+		}
+		out[wf.Field] = wf.Initial
+	}
+	if out == nil {
+		return data
+	}
+	return out
+}
+
+// workflowInitialColumns returns the workflow state columns of table, sorted,
+// that an INSERT the framework builds itself has to write, each with the
+// `initial` state a new row starts in. It is withWorkflowInitial for the
+// inserts that take no row from a request: bulk import Mode A, the founding
+// membership of /api/_groups/create and the member-of auto-join. Without it
+// those rows took the column default: NULL (a state no transition leaves), a
+// NOT NULL failure, or a default that is not `initial`.
+//
+// As in handleCreate and txInsertWithPlan, a column the create set protects
+// (owner, tenant key, in-tenant role field, computed) is left alone. So is one
+// the INSERT already names (written) or the table does not have (hasCol): a
+// workflow naming a missing column must not break the insert.
+func workflowInitialColumns(app *App, table string, hasCol func(string) bool, written []string) ([]string, []any) {
+	state := withWorkflowInitial(app, table, nil)
+	if len(state) == 0 {
+		return nil, nil
+	}
+	protected := protectedCreateFields(app, table)
+	var cols []string
+	var values []any
+	for _, col := range slices.Sorted(maps.Keys(state)) {
+		named := slices.ContainsFunc(written, func(w string) bool { return identIs(w, col) })
+		if named || protected.has(col) || !hasCol(col) {
+			continue
+		}
+		cols = append(cols, col)
+		values = append(values, state[col])
+	}
+	return cols, values
+}
+
+// canonicalizeWorkflowColumns rewrites each workflow's table and state column
+// to the schema's spelling. SQLite folds identifier case, so a workflows.yaml
+// `field: Status` over column `status` ran its SQL but missed every exact
+// comparison (create refusal, route and row lookups), letting a caller create
+// a row directly in a role-guarded state. A name the schema does not have is
+// left as written; the write gate and `benmore check` refuse it.
+func canonicalizeWorkflowColumns(cfg *WorkflowConfig, tables []Table) {
+	if cfg == nil {
+		return
+	}
+	for _, wf := range cfg.Workflows {
+		if wf == nil {
+			continue
+		}
+		for _, t := range tables {
+			if !identIs(t.Name, wf.Table) {
+				continue
+			}
+			if wf.Table != t.Name {
+				wf.ConfiguredTable = wf.Table
+			}
+			wf.Table = t.Name
+			for _, c := range t.Columns {
+				if identIs(c.Name, wf.Field) {
+					wf.Field = c.Name
+				}
+			}
+		}
+	}
+}
+
+// canonicalizeWorkflowTableNames is canonicalizeWorkflowColumns for callers
+// that know only the served table names (connector route validation and
+// review): the transition route is registered under the workflow's table, so
+// it must be spelled as the runtime will spell it.
+func canonicalizeWorkflowTableNames(cfg *WorkflowConfig, names []string) {
+	if cfg == nil {
+		return
+	}
+	for _, wf := range cfg.Workflows {
+		if wf == nil {
+			continue
+		}
+		for _, n := range names {
+			if identIs(n, wf.Table) {
+				if wf.Table != n {
+					// As canonicalizeWorkflowColumns: the runtime keeps the
+					// configured spelling's routes registered too.
+					wf.ConfiguredTable = wf.Table
+				}
+				wf.Table = n
+				break
+			}
+		}
+	}
 }
 
 func workflowProtectedFields(app *App, table string) []string {
@@ -638,7 +1072,7 @@ func workflowProtectedFields(app *App, table string) []string {
 	}
 	var fields []string
 	for _, wf := range app.Workflows.Workflows {
-		if wf.Table == table {
+		if identIs(wf.Table, table) {
 			fields = append(fields, wf.Field)
 		}
 	}

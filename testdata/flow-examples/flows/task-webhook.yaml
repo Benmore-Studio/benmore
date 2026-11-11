@@ -1,0 +1,22 @@
+# flows/task-webhook.yaml - POST one task to an outside URL as JSON
+on:
+  request:
+    method: POST
+    path: /api/tasks/:id/announce
+    auth: required
+jobs:
+  announce:
+    steps:
+      - id: task
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT id, title, status FROM tasks WHERE id = :id AND user_id = :user_id" }
+      - run: webhook
+        with:
+          url: "${{ env.TASK_WEBHOOK_URL }}"            # your endpoint, kept in env
+          payload:                                      # the JSON body
+            event: task.announced
+            task: { id: "${{ steps.task.outputs.id }}", title: "${{ steps.task.outputs.title }}" }
+            done: "${{ steps.task.outputs.status == 'done' }}"
+      - run: respond
+        with: { status: 200, json: { announced: true } }

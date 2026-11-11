@@ -1,0 +1,129 @@
+[
+  {
+    "status": 401,
+    "body": {
+      "error": "authentication required"
+    },
+    "when": "no session: auto-CRUD (which adds `docs` and, for an owner-scoped read or a stale credential, a `hint`) and most built-in routes. A flow's `auth: required` gate answers `{\"error\":\"Unauthorized\"}`, so branch on the status, not the text"
+  },
+  {
+    "status": 403,
+    "body": {
+      "error": "Invalid CSRF token",
+      "docs": "csrf.how_to_send"
+    },
+    "when": "a cookie-session write without a valid X-CSRF-Token header or _csrf field, on auto-CRUD and flow routes. Other built-in routes spell it `invalid CSRF token`, `invalid csrf token` or `invalid csrf`, and a JSON sign-in or sign-up answers `missing or expired CSRF token: ...`, so test `error` for csrf without regard to case, then fetch a fresh token (GET /api/_csrf) and retry"
+  },
+  {
+    "status": 404,
+    "body": {
+      "error": "not_found",
+      "message": "no API route matches this path, or the app's access rules do not let you use it",
+      "docs": "errors.common_envelopes"
+    },
+    "when": "no route, or a table the caller may not read (the two answers are identical, so a hidden table's existence does not leak; the message names both causes). The side routes answer the same: /api/_transaction and /api/_query for an unknown table, and record locks, share/permissions/revoke and revert for a table the caller may not read"
+  },
+  {
+    "status": 403,
+    "body": {
+      "error": "forbidden",
+      "message": "the app's access rules do not let you create rows in services (its `write` rule under access: in app.yaml)",
+      "docs": "access.operations"
+    },
+    "when": "a create, update or delete the access rules refuse on a table the caller may read (GET already shows it exists); a tenant-less caller on a tenant-keyed table also gets a `hint`"
+  },
+  {
+    "status": 409,
+    "body": {
+      "error": "conflict",
+      "message": "Record was modified by another user",
+      "docs": "concurrency.timestamp_contract"
+    },
+    "when": "optimistic concurrency mismatch: the row's updated_at is no longer the `_expected_updated_at` a PATCH or /api/_transaction update sent; re-read the row and retry (api({at:'concurrency'}))"
+  },
+  {
+    "status": 422,
+    "body": {
+      "error": "title is required"
+    },
+    "when": "a refused value; `error` is the sentence, there is no `validation failed` code and no per-field map. A create that omits a required column (NOT NULL without a default) answers `<column> is required`, a validators.yaml rule its own `error:` text (`Validation failed: <rule>` when it has none) and an aborting before-hook its message"
+  },
+  {
+    "status": 409,
+    "body": {
+      "error": "record is locked by another user",
+      "docs": "locks.conflict"
+    },
+    "when": "a record lock held by another user (api({at:'locks'})); the status is 409, not 423"
+  },
+  {
+    "status": 429,
+    "body": {
+      "error": "rate limit exceeded - retry after 1h0m0s",
+      "docs": "flows.gotchas_request_input"
+    },
+    "when": "a rate limit refused the request: a flow's `rate_limit` (this body, naming its window), the app-wide per-user/IP limiter, the ingest limit. Branch on the status, not the text, and wait for the Retry-After header when the answer has one"
+  },
+  {
+    "status": 507,
+    "body": {
+      "error": "storage cap reached",
+      "code": "storage_limit",
+      "docs": "recovery.storage_limit",
+      "limit_bytes": 104857600,
+      "detail": "..."
+    },
+    "when": "a write needed more space than the app's storage limit allows (see api({at:'recovery'}) storage_limit); reads and deletes still work. The check before a create answers only `error` and `detail`; branch on the status and `error`"
+  },
+  {
+    "status": 507,
+    "body": {
+      "error": "storage cap reached",
+      "code": "media_storage_limit",
+      "docs": "uploads.storage_allowance",
+      "used_bytes": 1073741784,
+      "limit_bytes": 1073741824,
+      "detail": "..."
+    },
+    "when": "an upload would take the app owner's account past its media storage allowance on the hosted platform (see api({at:'uploads'}) storage_allowance); nothing is stored, and files already stored keep serving and can be deleted. Same status and `error` as the database limit: `code` tells them apart"
+  },
+  {
+    "status": 413,
+    "body": {
+      "error": "request body too large: the limit is 1.0 MB (1048576 bytes)",
+      "limit_bytes": 1048576,
+      "docs": "flows.request_body"
+    },
+    "when": "a request body over its cap: a flow's JSON body or `parse: body` step (1 MiB), or any flow or auto-CRUD body over the app's MAX_REQUEST_BODY_BYTES (default 10 MiB). Nothing runs"
+  },
+  {
+    "status": 500,
+    "body": {
+      "error": "flow_no_response",
+      "request_id": "3f9c2a1b7d4e5f60",
+      "docs": "flows.step_failures"
+    },
+    "when": "flow registered but produced no respond step, or a step failed (then also message, failed_step, failed_type and reason; see api({at:'flows'}) step_failures)"
+  },
+  {
+    "status": 500,
+    "body": {
+      "error": "template_unresolved",
+      "unresolved_refs": [
+        "fetch.total"
+      ],
+      "hint": "...",
+      "request_id": "3f9c2a1b7d4e5f60",
+      "docs": "errors.common_envelopes"
+    },
+    "when": "a respond step referenced a value no step produced; `unresolved_refs` lists them as `<step id>.<output>`. A body that is one whole `${{ ref }}` answers `unresolved_key: \"<step id>.<output>\"` instead of the list. A development instance adds `available_keys`"
+  },
+  {
+    "status": 500,
+    "body": {
+      "error": "commit failed",
+      "request_id": "3f9c2a1b7d4e5f60"
+    },
+    "when": "a built-in JSON route failed on the server (see server_errors); text routes answer `list failed (request id: 3f9c2a1b7d4e5f60)`"
+  }
+]

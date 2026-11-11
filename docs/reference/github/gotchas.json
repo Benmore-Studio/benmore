@@ -1,0 +1,10 @@
+[
+  "Connecting the ACCOUNT needs a browser (OAuth) - the token never passes through MCP or the CLI, and it is AES-encrypted at rest on the platform.",
+  "Org repos: the org must allow the Benmore OAuth app (GitHub → org settings → Third-party access). GitHub's error is surfaced verbatim on link.",
+  "Linking an EXISTING repo that already has unrelated commits will fail the first push as diverged - sync is one-way; use push --force to overwrite it with the platform history.",
+  "The mirror never forces on its own. When a failed feature_install, promote or refresh is rolled back after its commits were already mirrored, the next push is refused as diverged and the status shows it; the app owner decides whether to overwrite the remote with push --force (github_push force:true is owner-only).",
+  "An unpromoted app has no Live instance yet - only the dev branch pushes until the first promote.",
+  "Any editor can link an app that has no link, and change or unlink a link they made themselves; a link made by another member (typically the owner's mirror) can be replaced or removed only by the app owner, so an editor can't redirect the owner's commits to another repository.",
+  "Pushes use the token of the account that linked the app. If that account is removed from the app or drops below editor, the next push disables the sync with a visible reason instead of continuing; link again from an account that has access.",
+  "An ownership transfer switches the mirror off when it is accepted, unless the new owner is the one who linked it: the mirror pushes with the personal GitHub connection of whoever linked it, usually the previous owner, who stays on as an editor. github_status and the Version Control tab show it as paused with the reason; the accept result carries github_mirror_disabled and a notice. The repository on GitHub and the linker's GitHub connection are not touched. The new owner connects their own GitHub account and links a repository again (github_link); only the app owner can link or unlink a mirror a transfer switched off, so the member who made the link (still an editor) cannot switch it back on."
+]

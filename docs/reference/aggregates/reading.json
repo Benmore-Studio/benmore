@@ -1,0 +1,6 @@
+[
+  "GET /api/_aggregates answers `{aggregates: [{name, value, updated_at, stale}]}`, sorted by name, to an admin on an unscoped session or token. A signed-out caller gets 401 `{\"error\":\"authentication required\"}` and any other caller 403 `{\"error\":\"admin required\"}`. A numeric value is a JSON number, text a string, no value null. The route exists only while app.yaml declares at least one aggregate (404 otherwise).",
+  "`bm.aggregate('revenue')` (the value, or null) and `bm.aggregates.all()` (`{name: value}`) call that route, so they work on admin screens only. The `Stat` component's `aggregate:` option makes the same call.",
+  "Server-rendered pages get every value as `{{aggregate.<name>}}` (gotmpl: `{{ .aggregate.<name> }}`), for every viewer, signed in or not. One with no value prints nothing. See api({at:'ssr'}) page_values.",
+  "To show one to signed-in users of a TSX screen, return it from a flow. The cache is the table `_benmore_aggregates` (`name`, `value` stored as text, `updated_at`), which flow SQL can read: `SELECT value FROM _benmore_aggregates WHERE name = 'revenue'`."
+]

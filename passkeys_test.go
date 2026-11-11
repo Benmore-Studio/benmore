@@ -199,6 +199,9 @@ func TestPasskeyRegisterAndSignIn(t *testing.T) {
 	delete(anon.cookies, sessionCookie("x", app.DevMode, app.SessionDuration).Name)
 	if code, out := signIn(); code != http.StatusOK || out["otp_required"] != true {
 		t.Fatalf("auth.otp passkey sign-in did not continue to email proof: %d %v", code, out)
+	} else if to, _ := out["redirect"].(string); to != app.Paths.VerifyOTP {
+		// bm.auth.passkey.signIn() sends the browser to this page (signInStepURL).
+		t.Fatalf("auth.otp passkey sign-in redirect = %q, want the verify page %q", to, app.Paths.VerifyOTP)
 	}
 	if _, present := anon.cookies[sessionCookie("x", app.DevMode, app.SessionDuration).Name]; present {
 		t.Fatal("auth.otp passkey sign-in issued a session before email proof")

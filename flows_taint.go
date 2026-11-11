@@ -22,8 +22,14 @@ import (
 
 // flowExprRefPaths returns the data paths a `{{ ... }}` expression reads:
 // the base (text before the first pipe) of every `||` operand, with `[N]`
-// indexes normalized to `.N`. Quoted fallback literals are not references.
+// indexes normalized to `.N`, or every ref of an expression. Quoted literals
+// are not references.
 func flowExprRefPaths(expr string) []string {
+	// An expression in the `if:` grammar reads every ref in it, including
+	// the ones behind `&&`, `!` or a comparison (flows_value_expr.go).
+	if flowValueExprUsesOperators(expr) {
+		return flowValueExprRefPaths(expr)
+	}
 	var out []string
 	for _, operand := range strings.Split(expr, "||") {
 		base := strings.TrimSpace(strings.SplitN(operand, "|", 2)[0])
@@ -200,6 +206,9 @@ func (ctx *FlowContext) taintStepOutputs(step *FlowStep) {
 	case "set", "parse", "enqueue", "if", "for_each", "parallel":
 		return
 	}
+	// Its output is data the step computed, even when it read request
+	// input: JSON bodies may decode it (flows_request_text.go).
+	ctx.markComputed(step.Name)
 	templates := flowStepTemplateStrings(step)
 	for _, tmpl := range templates {
 		if ctx.readsSecret(tmpl) {
@@ -211,9 +220,54 @@ func (ctx *FlowContext) taintStepOutputs(step *FlowStep) {
 		return
 	}
 	for _, tmpl := range templates {
+		if ctx.sqlTextRef(tmpl) != "" {
+			ctx.markSQLText(step.Name)
+			break
+		}
+	}
+	for _, tmpl := range templates {
 		if ctx.taintedRef(tmpl) != "" {
 			ctx.markTainted(step.Name)
 			ctx.noteRequestStepSource(step.Name, templates)
+			return
+		}
+	}
+}
+
+// markErrorValueTaint carries a failed step's request taint to
+// `${{ error }}`, the failure text its on_error handler reads. The text can
+// quote any value the step read (an api URL, a compute argument), so it is
+// request input when the step - or, for an if/for_each/parallel block, one
+// of its nested steps - read request input; otherwise a handler could pass
+// request text through `error` and a `run: set` into sql_dynamic. Secret
+// values are handled by redaction instead (flowFailureText): marking `error`
+// secret-derived would make the redactor treat the error's own text as a
+// secret and blank step_error for every flow with a logging handler.
+func (ctx *FlowContext) markErrorValueTaint(step *FlowStep) {
+	if ctx == nil || step == nil {
+		return
+	}
+	var templates []string
+	var walk func(s *FlowStep)
+	walk = func(s *FlowStep) {
+		templates = append(templates, flowStepTemplateStrings(s)...)
+		for i := range s.Steps {
+			walk(&s.Steps[i])
+		}
+		for i := range s.ElseSteps {
+			walk(&s.ElseSteps[i])
+		}
+	}
+	walk(step)
+	for _, tmpl := range templates {
+		if ctx.sqlTextRef(tmpl) != "" {
+			ctx.markSQLText("error")
+			break
+		}
+	}
+	for _, tmpl := range templates {
+		if ctx.taintedRef(tmpl) != "" {
+			ctx.markTainted("error")
 			return
 		}
 	}

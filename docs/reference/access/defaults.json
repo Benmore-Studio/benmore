@@ -1,0 +1,6 @@
+{
+  "table_with_user_id": "self",
+  "table_with_group_key": "group. A table with BOTH user_id and the group key and no declared rule is tenant-wide (every member of the tenant); declare `self` to make it owner-only.",
+  "unscoped_table": "admin",
+  "schema_unknown_table": "A table that exists in the database but not in schema.prisma/schema.sql (a model you removed, a table a migration created) still gets /api/<table> routes, and its columns are unknown to the framework. Implicitly it is admin-only. `self`, `group`, `member-of:` and `owner_or_role:` (declared for it or reached through `default:`) scope rows by those columns, so on such a table they refuse everyone but admins with a 404. Declare the model in the schema, or give the table an explicit everyone/role:/admin rule."
+}

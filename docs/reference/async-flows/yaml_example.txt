@@ -1,0 +1,18 @@
+on:
+  request:
+    method: POST
+    path: /api/sync/run
+    mode: async       # ← the only change vs a sync flow
+    # max_attempts: 3 # optional: re-run the WHOLE flow after a transient failure (see retries)
+idempotent: true      # optional: requeue after a worker crash; only if every side effect is safe to replay
+
+jobs:
+  run:
+    steps:
+      - id: fan_out
+        run: parallel
+        steps:
+          - { id: fw, run: api, with: { url: "{{ env.FREIGHTWISE_URL }}/shipments", sign: { recipe: bearer_token, token: "{{ env.FREIGHTWISE_API_TOKEN }}" } } }
+          - { id: pc, run: api, with: { url: "{{ env.PORTACARRIERS_API_URL }}/shipments", sign: { recipe: oauth_client_credentials, token_url: "{{ env.PORTACARRIERS_OAUTH_URL }}/token" } } }
+          - { id: vs, run: api, with: { url: "{{ env.SHIPPING_URL }}/shipments", sign: { recipe: hmac_sha256_body, secret: "{{ env.SHIPPING_SECRET }}" } } }
+      # …upsert steps follow. respond:/redirect: silently no-op in async - the HTTP response was already sent.

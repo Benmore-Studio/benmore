@@ -1,0 +1,1 @@
+Every sql_dynamic execution logs `flows: sql_dynamic step=<name> template=<template> resolved_len=<n>` before it runs: the step's authored template and the length of the resolved SQL, never the resolved text (it carries row values). Log the generated SQL yourself in a `run: sql` insert if your review trail needs it.

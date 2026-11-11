@@ -1,0 +1,13 @@
+site_name: "workflow-membership-initial"
+auth:
+  identifier: email
+groups:
+  table: team_members
+  key: team_id
+  user_field: user_id
+  role_field: member_role
+  bootstrap:
+    org_table: teams
+    founding_role: owner
+access:
+  rooms: member-of:room_members(room_id, member_id)

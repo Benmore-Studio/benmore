@@ -41,6 +41,7 @@ package main
 //   requires_role
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -57,7 +58,7 @@ func RebuildContextGraph(app *App) {
 	}
 	EnsureContextGraphTables(app.DB)
 
-	tx, err := app.DB.Begin()
+	tx, err := app.DB.BeginTx(withLongWriteTx(context.Background(), "context graph rebuild"), nil)
 	if err != nil {
 		log.Printf("  context graph: begin tx failed: %s", err)
 		return

@@ -1,0 +1,1 @@
+`?page=` with an offset beyond 100,000 rows returns 400 pointing at `?cursor=`; OFFSET cost grows with the skipped rows. Use cursor pagination for deep scrolling or exports.

@@ -1,0 +1,1 @@
+Scheduled backups are uploaded from the snapshot file without loading it into memory; a failed read or upload is reported as an error, never as success.

@@ -1,0 +1,4 @@
+[
+  "Prefer data-testid on every interactive element; qa_inventory ranks selectors testid > id > data-action > name > aria-label > href > structural path and reports `unique` per element - never store a non-unique selector.",
+  "The scaffold's Button/Input helpers take `testid`; scaffold pages carry data-testid on every form, input and button (a few secondary links such as \"Back to log in\" have none)."
+]

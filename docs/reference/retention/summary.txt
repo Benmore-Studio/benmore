@@ -1,0 +1,1 @@
+Data retention: retention.yaml lists tables whose rows are deleted once they are older than a time-to-live. A background sweep hard-deletes expired rows about once an hour and records each deletion in the audit log. It is for data that must not be kept (logs, expired exports, the trash of a soft-delete table), not an archive.

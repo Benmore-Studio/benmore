@@ -53,12 +53,12 @@ func TestOwnerOrRoleCreateWithoutOwnerColumnNeedsRole(t *testing.T) {
 	crudScopeMustExec(t, app.DB, fmt.Sprintf("INSERT INTO _benmore_user_roles (user_id, role) VALUES (%d, 'clinic_staff')", globalID))
 
 	for _, table := range []string{"brokers", "companies", "projects"} {
-		assertStatus(t, mux, http.MethodPost, "/api/"+table, plain, map[string]any{"name": "planted"}, http.StatusNotFound)
-		assertStatus(t, mux, http.MethodPost, "/api/"+table+"/batch", plain, []map[string]any{{"name": "planted"}}, http.StatusNotFound)
+		assertStatus(t, mux, http.MethodPost, "/api/"+table, plain, map[string]any{"name": "planted"}, http.StatusForbidden)
+		assertStatus(t, mux, http.MethodPost, "/api/"+table+"/batch", plain, []map[string]any{{"name": "planted"}}, http.StatusForbidden)
 	}
 	// A tenant role creates only where the row is bounded by its tenant.
-	assertStatus(t, mux, http.MethodPost, "/api/brokers", member, map[string]any{"name": "planted"}, http.StatusNotFound)
-	assertStatus(t, mux, http.MethodPost, "/api/companies", member, map[string]any{"name": "planted"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodPost, "/api/brokers", member, map[string]any{"name": "planted"}, http.StatusForbidden)
+	assertStatus(t, mux, http.MethodPost, "/api/companies", member, map[string]any{"name": "planted"}, http.StatusForbidden)
 	assertStatus(t, mux, http.MethodPost, "/api/projects", member, map[string]any{"name": "member-p"}, http.StatusOK)
 	var n int
 	if err := app.DB.QueryRow("SELECT (SELECT COUNT(*) FROM brokers WHERE name = 'planted') + (SELECT COUNT(*) FROM companies WHERE name = 'planted') + (SELECT COUNT(*) FROM projects WHERE name = 'planted')").Scan(&n); err != nil || n != 0 {
@@ -75,8 +75,8 @@ func TestOwnerOrRoleCreateWithoutOwnerColumnNeedsRole(t *testing.T) {
 	// the fixture's group configuration outside the normal reload lifecycle.
 	realtimeFlush()
 	app.Group = nil
-	assertStatus(t, mux, http.MethodPost, "/api/brokers", plain, map[string]any{"name": "planted"}, http.StatusNotFound)
-	assertStatus(t, mux, http.MethodPost, "/api/brokers", member, map[string]any{"name": "planted"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodPost, "/api/brokers", plain, map[string]any{"name": "planted"}, http.StatusForbidden)
+	assertStatus(t, mux, http.MethodPost, "/api/brokers", member, map[string]any{"name": "planted"}, http.StatusForbidden)
 	if s := getSession(app, authzReq("GET", "/", global, "")); !tableModeAllowed(app, "brokers", OpWrite, "owner_or_role:clinic_staff", s, 0) {
 		t.Fatal("a role-holder must still create without groups:")
 	}

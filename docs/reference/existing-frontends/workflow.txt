@@ -1,0 +1,1 @@
+There is no Benmore localhost mode in the hosted workflow. After copying the build output, run benmore deploy from the Benmore app directory; subsequent artifact changes ship with benmore push or another deploy.

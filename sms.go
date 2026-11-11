@@ -40,6 +40,13 @@ func execStepSMS(ctx *FlowContext, step *FlowStep) error {
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("`run: sms` has an empty `body:` after interpolation (template %q) - check the ${{ }} ref resolves", step.SMS.Body)
 	}
+	// A reference with no value is not empty: it stays in the text as
+	// `{{name}}`, and the message used to go out that way before the step
+	// failed. A text that was sent cannot be taken back (and is billed), so
+	// the step stops here and nothing is sent (flows_steps.go).
+	if err := ctx.unresolvedRefsBeforeEffect(step); err != nil {
+		return err
+	}
 
 	appDir := ""
 	if ctx.App != nil {

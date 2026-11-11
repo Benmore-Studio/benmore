@@ -1,0 +1,1 @@
+benmark is one sanitized renderer shared across the client (bm.markdown), mustache pages ({{ body | markdown }}) and docs. `| markdown` is a mustache pipe: an `engine: gotmpl` page has no markdown function, and `{{ .body | markdown }}` there is refused when the file is written (function "markdown" not defined); see api({at:'ssr'}).

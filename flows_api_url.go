@@ -112,6 +112,11 @@ func flowURLHostValue(v string) bool {
 // env value or an author literal: every `||` operand is an `env.` ref (with
 // any pipes) or a quoted literal.
 func flowExprIsEnvOnly(expr string) bool {
+	// An expression can pick a request value behind `&&` or a comparison;
+	// it is never written as is (flows_value_expr.go).
+	if flowValueExprUsesOperators(expr) {
+		return false
+	}
 	sawEnv := false
 	for _, operand := range strings.Split(expr, "||") {
 		base := strings.TrimSpace(strings.SplitN(operand, "|", 2)[0])
@@ -131,7 +136,7 @@ func flowExprIsEnvOnly(expr string) bool {
 // already encoded, which is how flows put a value in a URL before values
 // were encoded by position. Encoding it again would corrupt it.
 func flowExprEndsInURLEncode(expr string) bool {
-	if strings.Contains(expr, "||") {
+	if strings.Contains(expr, "||") || flowValueExprUsesOperators(expr) {
 		return false
 	}
 	parts := strings.Split(expr, "|")
@@ -155,6 +160,69 @@ func interpolateURLCtx(template string, ctx *FlowContext, secrets bool) (string,
 // except for a leading value its producing step fixed (a literal, an env
 // value).
 func interpolateOutboundURL(template string, ctx *FlowContext, secrets bool, derived string) (string, error) {
+	return renderOutboundURL(template, ctx, secrets, derived, nil)
+}
+
+// proxyURLRules are the extra rules renderOutboundURL applies to a
+// `run: proxy` URL.
+type proxyURLRules struct {
+	// pathSlashes is the step's `path_slashes: true`: a path value that is
+	// not request text may hold `/` and span segments (proxyPathSegments).
+	pathSlashes bool
+}
+
+// interpolateAuthoredHostURL is interpolateURLCtx for a `run: proxy` step,
+// which streams the answer back to the caller: the scheme and host may come
+// only from the author's literal text or an env value, whatever the call
+// sends. Any other reference (request input, a step output, a `:param`)
+// that would land before the path is refused, tainted or not; values in the
+// path, query and fragment are encoded as for an api call.
+//
+// Every value the author did not write (request input, a stored row, a step
+// output, a set value; anything but literal text and env) placed in the
+// path may not hold `/` or `\`, plain or percent-encoded, or be a dot
+// segment (proxyPathValueUnsafe): escaping keeps it one segment for an
+// upstream that reads the path as sent, but one that decodes %2F and then
+// normalizes would let `..%2Fadmin` reach another endpoint with the
+// author's credentials. A value a user wrote earlier through auto-CRUD and
+// a step read back is as much the user's as request input, so the rule is
+// not limited to request-tainted values. With pathSlashes, a value that is
+// not request text (a stored file key, also one read by a request id) may
+// span segments, each escaped, never with an empty or dot segment, a
+// backslash or an encoded slash. Query values are unaffected.
+func interpolateAuthoredHostURL(template string, ctx *FlowContext, pathSlashes bool) (string, error) {
+	return renderOutboundURL(template, ctx, true, "", &proxyURLRules{pathSlashes: pathSlashes})
+}
+
+// proxyPathSegments splits a `path_slashes` value into its segments, or
+// returns false when one of them may not be sent: a dot segment, one holding
+// `\` or an encoded `/` or `\` (proxyPathValueUnsafe), or an empty one (a
+// leading, trailing or doubled `/`) when the value has more than one.
+func proxyPathSegments(text string) ([]string, bool) {
+	parts := strings.Split(text, "/")
+	for _, part := range parts {
+		if len(parts) > 1 && part == "" || proxyPathValueUnsafe(part) {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+// urlRefReadsRequest reports whether a URL reference (`{{expr}}` or a
+// `:name` parameter) reads request text rather than computed data
+// (flows_request_text.go): a SQL row looked up by a request id is data.
+func (ctx *FlowContext) urlRefReadsRequest(ref string) bool {
+	if expr, ok := strings.CutPrefix(ref, "{{"); ok {
+		return ctx.exprReadsRequestKey(strings.TrimSpace(strings.TrimSuffix(expr, "}}")))
+	}
+	name := strings.TrimPrefix(ref, ":")
+	ctx.DataMu.Lock()
+	defer ctx.DataMu.Unlock()
+	return ctx.RequestKeys[name] && !ctx.computedKeys[name]
+}
+
+func renderOutboundURL(template string, ctx *FlowContext, secrets bool, derived string, proxy *proxyURLRules) (string, error) {
+	authoredHost := proxy != nil
 	flatData := flatDataForCtx(ctx)
 	start := len(template) - len(strings.TrimLeft(template, " \t\r\n"))
 	var s flowURLScanner
@@ -164,13 +232,20 @@ func interpolateOutboundURL(template string, ctx *FlowContext, secrets bool, der
 			return nil
 		}
 		leading := at == start
-		tainted := ref != "" && ctx.taintedRef(ref) != ""
+		taintKey := ""
+		if ref != "" {
+			taintKey = ctx.taintedRef(ref)
+		}
+		tainted := taintKey != ""
 		if s.region == flowURLAuthority {
+			if authoredHost {
+				return fmt.Errorf("proxy url: %s may not choose the scheme or host; write the host literally (or as an env value) and pass values in the path or query", ref)
+			}
 			if tainted && secrets {
-				return fmt.Errorf("api url: request input %s may not choose the scheme or host of a request that carries credentials; keep the host literal (or in env) and pass the value in the path or query", ref)
+				return fmt.Errorf("api url: request input %s%s may not choose the scheme or host of a request that carries credentials; keep the host literal (or in env) and pass the value in the path or query", ref, flowUserProfileInputNote(taintKey))
 			}
 			if tainted && derived != "" && !(leading && ctx.flowValueAuthoredByStep(ref, text)) {
-				return fmt.Errorf("api url: request input %s may not choose the scheme or host of a request that sends %s, a value derived from the app's env; keep the host literal (or in env) and pass the value in the path or query", ref, derived)
+				return fmt.Errorf("api url: request input %s%s may not choose the scheme or host of a request that sends %s, a value derived from the app's env; keep the host literal (or in env) and pass the value in the path or query", ref, flowUserProfileInputNote(taintKey), derived)
 			}
 			if leading {
 				s.write(text)
@@ -181,6 +256,32 @@ func interpolateOutboundURL(template string, ctx *FlowContext, secrets bool, der
 			}
 			s.write(text)
 			return nil
+		}
+		if authoredHost && s.region == flowURLPath {
+			requestText := ctx.urlRefReadsRequest(ref)
+			if proxy.pathSlashes && !requestText {
+				parts, ok := proxyPathSegments(text)
+				if !ok {
+					return fmt.Errorf("proxy url: %s has an empty or dot path segment, a `\\`, or an encoded `/` or `\\`; a proxy step never sends one, even with `path_slashes: true`", ref)
+				}
+				for i, part := range parts {
+					if i > 0 {
+						s.write("/")
+					}
+					if encoded {
+						s.write(part)
+					} else {
+						s.write(neturl.PathEscape(part))
+					}
+				}
+				return nil
+			}
+			if proxyPathValueUnsafe(text) {
+				if requestText {
+					return fmt.Errorf("proxy url: request input %s holds a `/` or `\\` (or an encoded one) or is a dot segment, and a proxy step places request input in one path segment only; pass it as a query value instead", ref)
+				}
+				return fmt.Errorf("proxy url: %s holds a `/` or `\\` (or an encoded one) or is a dot segment, and a proxy step places each value it did not get from the author in one path segment only; pass it as a query value, or set `path_slashes: true` on the step to let a stored key such as `users/42/a.png` span segments", ref)
+			}
 		}
 		if s.region == flowURLPath && text != "" && strings.Trim(text, ".") == "" {
 			return fmt.Errorf("api url: value of %s is a dot segment and cannot be placed in the path", ref)
@@ -210,7 +311,7 @@ func interpolateOutboundURL(template string, ctx *FlowContext, secrets bool, der
 				if val, ok := resolveBindExpr(expr, flatData); ok {
 					text := ""
 					if val != nil {
-						text = fmt.Sprintf("%v", val)
+						text = valueText(val)
 					}
 					if err := place(i, "{{"+expr+"}}", text, flowExprIsEnvOnly(expr), flowExprEndsInURLEncode(expr)); err != nil {
 						return "", err
@@ -246,7 +347,7 @@ func apiCallCarriesSecrets(api *FlowAPICall) bool {
 		}
 	}
 	refsEnv := func(s string) bool { return strings.Contains(s, "env.") }
-	if refsEnv(api.URL) || refsEnv(api.Body) {
+	if refsEnv(api.URL) || refsEnv(api.Body) || refsEnv(api.JSONRef) {
 		return true
 	}
 	for _, v := range api.Query {
@@ -268,7 +369,7 @@ func (ctx *FlowContext) apiCallSecretRef(api *FlowAPICall) string {
 	if ctx == nil || api == nil {
 		return ""
 	}
-	templates := []string{api.URL, api.Body, api.Auth}
+	templates := []string{api.URL, api.Body, api.JSONRef, api.Auth}
 	for _, v := range api.Query {
 		templates = append(templates, v)
 	}

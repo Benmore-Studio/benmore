@@ -1,0 +1,5 @@
+# app.yaml
+aggregates:
+  revenue:
+    sql: "SELECT COALESCE(SUM(line_total), 0) FROM orders"
+    refresh: "5m"

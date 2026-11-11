@@ -1,0 +1,1 @@
+The share and permissions routes below are registered on every table, so a flow cannot take them; write and `benmore check` refuse such a flow and name a free path (api(at:'flows') → route_collisions). Use the built-in routes, or give a custom sharing flow its own path.

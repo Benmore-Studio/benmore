@@ -1,0 +1,8 @@
+benmore sync-status [dir] [--app NAME] [--env dev|prod] [--json]
+benmore sync-status --all [--env dev|prod]
+benmore hooks [status|check]
+benmore pull <app> [dir] [--env dev|prod] [--force]
+benmore push <path> [--app NAME] [--env dev|prod] [--force]
+benmore delete-file <path> [--app NAME] [--env dev|prod] [--force]
+benmore deploy [dir] [--name NAME] [--env dev|prod] [--force]
+benmore sync [--force]

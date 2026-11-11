@@ -47,6 +47,23 @@ func EnsureCustomFieldsTable(db *sql.DB) {
 	)`)
 }
 
+// customFieldAppTable reports whether table is one of the app's own model
+// tables: the set auto-CRUD serves (GetTableNames), which leaves out
+// framework tables, version history, full-text indexes with their shadow
+// tables, and SQLite's own tables. Names compare like SQLite identifiers.
+func customFieldAppTable(app *App, table string) (bool, error) {
+	names, err := GetTableNames(app.DB)
+	if err != nil {
+		return false, err
+	}
+	for _, name := range names {
+		if strings.EqualFold(name, table) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RegisterCustomFieldRoutes adds the dynamic schema API endpoints.
 // All endpoints are admin-only.
 func RegisterCustomFieldRoutes(mux appRouteRegistrar, app *App) {
@@ -59,26 +76,26 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 
 		table := r.PathValue("table")
 		if !validColumnNameRe.MatchString(table) {
-			http.Error(w, `{"error":"invalid table name"}`, http.StatusBadRequest)
+			httpError(w, "invalid table name", http.StatusBadRequest)
 			return
 		}
 
 		// Block access to framework tables
 		if strings.HasPrefix(table, "_benmore_") {
-			http.Error(w, `{"error":"cannot modify framework tables"}`, http.StatusForbidden)
+			httpError(w, "cannot modify framework tables", http.StatusForbidden)
 			return
 		}
 
 		// Verify table exists
 		exists, err := tableExists(app.DB, table)
 		if err != nil || !exists {
-			http.Error(w, `{"error":"table not found"}`, http.StatusNotFound)
+			httpError(w, "table not found", http.StatusNotFound)
 			return
 		}
 
@@ -135,32 +152,47 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_schema/{table}/fields", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 
 		// CSRF check (skip for Bearer auth)
 		if !isBearerAuth(r) && !validateCSRF(r) {
-			http.Error(w, `{"error":"invalid CSRF token"}`, http.StatusForbidden)
+			httpError(w, "invalid CSRF token", http.StatusForbidden)
 			return
 		}
 
 		table := r.PathValue("table")
 		if !validColumnNameRe.MatchString(table) {
-			http.Error(w, `{"error":"invalid table name"}`, http.StatusBadRequest)
+			httpError(w, "invalid table name", http.StatusBadRequest)
 			return
 		}
 
 		// Block framework tables
 		if strings.HasPrefix(table, "_benmore_") {
-			http.Error(w, `{"error":"cannot modify framework tables"}`, http.StatusForbidden)
+			httpError(w, "cannot modify framework tables", http.StatusForbidden)
 			return
 		}
 
 		// Verify table exists
 		exists, err := tableExists(app.DB, table)
 		if err != nil || !exists {
-			http.Error(w, `{"error":"table not found"}`, http.StatusNotFound)
+			httpError(w, "table not found", http.StatusNotFound)
+			return
+		}
+		// Only the app's own model tables (the ones auto-CRUD serves) take a
+		// custom field. A <table>_history table took the column behind the
+		// versioning triggers; a full-text index, its shadow tables and
+		// sqlite_sequence failed inside ALTER TABLE as a 500 or were altered.
+		appTable, err := customFieldAppTable(app, table)
+		if err != nil {
+			serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to read table list")
+			return
+		}
+		if !appTable {
+			httpJSON(w, http.StatusBadRequest, map[string]any{
+				"error": fmt.Sprintf("%s is not an app table: custom fields can be added only to the app's own model tables, not to version history (<table>_history), full-text index or SQLite tables", table),
+			})
 			return
 		}
 
@@ -171,7 +203,7 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 			Description string `json:"description"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			httpError(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
 
@@ -180,19 +212,19 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 
 		// Validate column name
 		if !validColumnNameRe.MatchString(body.Name) {
-			http.Error(w, `{"error":"invalid column name (must match [a-zA-Z_][a-zA-Z0-9_]*)"}`, http.StatusBadRequest)
+			httpError(w, "invalid column name (must match [a-zA-Z_][a-zA-Z0-9_]*)", http.StatusBadRequest)
 			return
 		}
 
 		// Block reserved column names
 		if reservedColumnNames[strings.ToLower(body.Name)] {
-			http.Error(w, fmt.Sprintf(`{"error":"column name '%s' is reserved"}`, body.Name), http.StatusBadRequest)
+			httpError(w, fmt.Sprintf("column name '%s' is reserved", body.Name), http.StatusBadRequest)
 			return
 		}
 
 		// Validate column type
 		if !allowedColumnTypes[body.Type] {
-			http.Error(w, `{"error":"invalid column type (allowed: TEXT, INTEGER, REAL, DATETIME)"}`, http.StatusBadRequest)
+			httpError(w, "invalid column type (allowed: TEXT, INTEGER, REAL, DATETIME)", http.StatusBadRequest)
 			return
 		}
 
@@ -200,7 +232,7 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 		var count int
 		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_custom_fields WHERE table_name = ?", table).Scan(&count)
 		if count >= maxCustomFieldsPerTable {
-			http.Error(w, fmt.Sprintf(`{"error":"maximum %d custom fields per table reached"}`, maxCustomFieldsPerTable), http.StatusBadRequest)
+			httpError(w, fmt.Sprintf("maximum %d custom fields per table reached", maxCustomFieldsPerTable), http.StatusBadRequest)
 			return
 		}
 
@@ -212,7 +244,7 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 		}
 		for _, col := range liveCols {
 			if strings.EqualFold(col.Name, body.Name) {
-				http.Error(w, fmt.Sprintf(`{"error":"column '%s' already exists"}`, body.Name), http.StatusConflict)
+				httpError(w, fmt.Sprintf("column '%s' already exists", body.Name), http.StatusConflict)
 				return
 			}
 		}
@@ -249,7 +281,7 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 			}
 		}
 		if activeHistory > 0 {
-			if err := installVersioningForTableTx(tx, table, app.Encrypted, key); err != nil {
+			if err := installVersioningForTableTx(tx, table, app.Encrypted, app.computedConfig(), key); err != nil {
 				tx.Rollback()
 				serverErrorJSON(w, r, app, "custom fields "+table, err, "failed to update history")
 				return
@@ -291,13 +323,13 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("DELETE /api/_schema/{table}/fields/{name}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 
 		// CSRF check (skip for Bearer auth)
 		if !isBearerAuth(r) && !validateCSRF(r) {
-			http.Error(w, `{"error":"invalid CSRF token"}`, http.StatusForbidden)
+			httpError(w, "invalid CSRF token", http.StatusForbidden)
 			return
 		}
 
@@ -305,13 +337,13 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 		name := r.PathValue("name")
 
 		if !validColumnNameRe.MatchString(table) || !validColumnNameRe.MatchString(name) {
-			http.Error(w, `{"error":"invalid table or column name"}`, http.StatusBadRequest)
+			httpError(w, "invalid table or column name", http.StatusBadRequest)
 			return
 		}
 
 		// Block framework tables
 		if strings.HasPrefix(table, "_benmore_") {
-			http.Error(w, `{"error":"cannot modify framework tables"}`, http.StatusForbidden)
+			httpError(w, "cannot modify framework tables", http.StatusForbidden)
 			return
 		}
 
@@ -319,7 +351,7 @@ func registerCustomFieldRoutes(mux appRouteRegistrar, app *App) {
 		var trackCount int
 		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_custom_fields WHERE table_name = ? AND column_name = ?", table, name).Scan(&trackCount)
 		if trackCount == 0 {
-			http.Error(w, `{"error":"field is not a custom field or does not exist"}`, http.StatusNotFound)
+			httpError(w, "field is not a custom field or does not exist", http.StatusNotFound)
 			return
 		}
 

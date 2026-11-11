@@ -1,0 +1,6 @@
+# Deployed on purpose: the write gate refuses these four files, the app still
+# loads, and the tests prove the refused entries do nothing at run time.
+app.yaml
+encrypted.yaml
+workflows.yaml
+computed.yaml

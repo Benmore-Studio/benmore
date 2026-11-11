@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -21,7 +22,7 @@ func ensureMFASetupNonce(db *sql.DB) error {
 	var err error
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		tx, err = db.Begin()
+		tx, err = db.BeginTx(withLongWriteTx(context.Background(), "MFA setup nonce migration"), nil)
 		if err == nil {
 			// Not every caller uses the app DSN's _txlock=immediate. Acquire
 			// the writer before schema reads so a deferred transaction cannot

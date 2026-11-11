@@ -1,0 +1,1 @@
+Set `on.schedule.transaction: true` to run a scheduled flow's SQL steps in the cron transaction: successful flows commit together, and step failures roll back earlier SQL writes. External effects remain outside SQLite rollback.

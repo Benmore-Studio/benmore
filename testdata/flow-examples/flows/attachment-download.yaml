@@ -1,0 +1,20 @@
+# flows/attachment-download.yaml - the owner downloads a private file
+on:
+  request:
+    method: GET
+    path: /api/attachments/:id/download
+    auth: required
+jobs:
+  download:
+    steps:
+      - id: file
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT id, name, file_url FROM attachments WHERE id = :id AND user_id = :user_id" }
+      - run: serve_file
+        with:
+          path: "${{ steps.file.outputs.file_url }}"    # the reference the upload returned
+          record: { table: attachments, id: "${{ steps.file.outputs.id }}" }
+          disposition: attachment                       # inline (default) shows it in the browser
+          filename: "${{ steps.file.outputs.name }}"
+          expires_in: 10m                               # signed-link lifetime on the media CDN

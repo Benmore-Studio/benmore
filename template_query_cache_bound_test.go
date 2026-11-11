@@ -37,7 +37,7 @@ func TestQueryCacheIsBoundedUnderDistinctKeys(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 	for i := 0; i < 50000; i++ {
-		queryCacheSet(queryCacheKey("/apps/a", "SELECT * FROM t WHERE q = ?", []any{fmt.Sprint(i)}), row, time.Minute, "t")
+		queryCacheSet(queryCacheKey("/apps/a", "SELECT * FROM t WHERE q = ?", []any{fmt.Sprint(i)}, ""), row, time.Minute, "t")
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&after)
@@ -46,7 +46,7 @@ func TestQueryCacheIsBoundedUnderDistinctKeys(t *testing.T) {
 		t.Fatalf("query cache grew to %d entries; cap is %d", n, queryCacheMaxEntries)
 	}
 	// The newest entry is still served.
-	last := queryCacheKey("/apps/a", "SELECT * FROM t WHERE q = ?", []any{fmt.Sprint(49999)})
+	last := queryCacheKey("/apps/a", "SELECT * FROM t WHERE q = ?", []any{fmt.Sprint(49999)}, "")
 	if _, ok := queryCacheGet(last); !ok {
 		t.Error("most recent entry was evicted")
 	}

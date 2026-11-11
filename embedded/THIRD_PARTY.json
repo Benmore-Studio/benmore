@@ -1,0 +1,240 @@
+{
+  "about": "Provenance of every third-party file under embedded/ (served from the binary at /_internal/*) and of the third-party files sdui.js loads from a CDN. TestEmbeddedThirdPartyManifest fails when a listed file's sha256 differs, a listed file is missing, or a file under embedded/ is neither listed here nor named in first_party. Each npm source was re-fetched on 2026-10-23, its sha512 matched the registry dist.integrity, and the embedded file is byte-identical to source_file in that tarball unless notes say otherwise.",
+  "update_procedure": [
+    "1. Choose the version from the registry metadata (https://registry.npmjs.org/<package>): the newest release in the current major unless the next major is a drop-in for the loader code. Check https://github.com/advisories?query=ecosystem%3Anpm+<package> for the target version.",
+    "2. Download the tarball (dist.tarball) into a new, empty directory and verify its sha512 against dist.integrity before extracting. Never run npm install, package scripts or any code from the tarball.",
+    "3. Copy source_file from the tarball verbatim to embedded/<path> (for a non-npm source, fetch the exact source URL). Do not rebuild or patch the file.",
+    "4. Update version, source, source_file, registry_integrity, sha256 and size_bytes here. For mcp-apps also regenerate embedded/mcp-apps/VENDOR.json (its own refresh note). For a cdn_loaded file also update the URL and integrity in embedded/sdui.js and the URL constants in csp_cdn_sources.go.",
+    "5. Check the consumers named in the entry's notes still use only APIs the new version keeps, then run: go test -tags sqlite_fts5 -run 'TestEmbeddedThirdParty|TestMCPAppsBundle|TestSDUILeaflet' ."
+  ],
+  "first_party": [
+    "bm.js",
+    "sdui.js",
+    "markdown.js",
+    "design.html",
+    "THIRD_PARTY.json",
+    "mcp-apps/VENDOR.json"
+  ],
+  "first_party_note": "Framework-authored files, plus the *_test.mjs Node tests (matched by suffix). design.html is not embedded in the binary.",
+  "files": [
+    {
+      "path": "alpine.min.js",
+      "library": "alpinejs",
+      "version": "3.15.8",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/alpinejs/-/alpinejs-3.15.8.tgz",
+      "source_file": "package/dist/cdn.min.js",
+      "registry_integrity": "sha512-zxIfCRTBGvF1CCLIOMQOxAyBuqibxSEwS6Jm1a3HGA9rgrJVcjEWlwLcQTVGAWGS8YhAsTRLVrtQ5a5QT9bSSQ==",
+      "sha256": "899842782a7fd16fcc2d7a7c877ff9ec159394044c87b158b2ef132786606932",
+      "size_bytes": 46632,
+      "served_at": "/_internal/alpine.js"
+    },
+    {
+      "path": "chart.min.js",
+      "library": "chart.js",
+      "version": "4.4.7",
+      "license": "MIT",
+      "source": "https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js",
+      "source_file": "package/dist/chart.umd.js in https://registry.npmjs.org/chart.js/-/chart.js-4.4.7.tgz",
+      "registry_integrity": "sha512-pwkcKfdzTMAU/+jNosKhNL2bHtJc/sSmYgVbuGTEDhzkrhmyihmP7vUc/5ZK9WopidMDHNe3Wm7jOd/WhuHWuw==",
+      "sha256": "206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e",
+      "size_bytes": 205889,
+      "served_at": "/_internal/chart.js",
+      "notes": "Byte-identical to the jsDelivr URL, which is the tarball's dist/chart.umd.js preceded by a 274-byte jsDelivr comment header; the remaining bytes equal the tarball file. A refresh may copy dist/chart.umd.js from the tarball directly."
+    },
+    {
+      "path": "htmx.min.js",
+      "library": "htmx.org",
+      "version": "2.0.4",
+      "license": "0BSD",
+      "source": "https://registry.npmjs.org/htmx.org/-/htmx.org-2.0.4.tgz",
+      "source_file": "package/dist/htmx.min.js",
+      "registry_integrity": "sha512-HLxMCdfXDOJirs3vBZl/ZLoY+c7PfM4Ahr2Ad4YXh6d22T5ltbTXFFkpx9Tgb2vvmWFMbIc3LqN2ToNkZJvyYQ==",
+      "sha256": "e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447",
+      "size_bytes": 50917,
+      "served_at": "/_internal/htmx.js"
+    },
+    {
+      "path": "libavoid.js",
+      "library": "libavoid-js",
+      "version": "0.5.0-beta.5",
+      "license": "LGPL-2.1-or-later",
+      "source": "https://registry.npmjs.org/libavoid-js/-/libavoid-js-0.5.0-beta.5.tgz",
+      "source_file": "package/dist/index.js",
+      "registry_integrity": "sha512-jHkn6A10815TgFhZ1paUD/NDnQkg4C66qJc2Juj1NpmO/+QXnJ4UjIdKQarkXLmI/QgXhEO3RWDxMi3i+uHPwA==",
+      "sha256": "b37ef71a879c786edd03895891a55df2288427ce21f3a00e79e92e9ade205c16",
+      "size_bytes": 44017,
+      "served_at": "/_internal/libavoid.js"
+    },
+    {
+      "path": "libavoid.wasm",
+      "library": "libavoid-js",
+      "version": "0.5.0-beta.5",
+      "license": "LGPL-2.1-or-later",
+      "source": "https://registry.npmjs.org/libavoid-js/-/libavoid-js-0.5.0-beta.5.tgz",
+      "source_file": "package/dist/libavoid.wasm",
+      "registry_integrity": "sha512-jHkn6A10815TgFhZ1paUD/NDnQkg4C66qJc2Juj1NpmO/+QXnJ4UjIdKQarkXLmI/QgXhEO3RWDxMi3i+uHPwA==",
+      "sha256": "65deb7172894049eb554cf6e02c520274ac117a1992d3d16a3f346c09ceb41e5",
+      "size_bytes": 492029,
+      "served_at": "/_internal/libavoid.wasm"
+    },
+    {
+      "path": "lucide.min.js",
+      "library": "lucide",
+      "version": "1.7.0",
+      "license": "ISC",
+      "source": "https://registry.npmjs.org/lucide/-/lucide-1.7.0.tgz",
+      "source_file": "package/dist/umd/lucide.min.js",
+      "registry_integrity": "sha512-aYNogbuIxea3a8offpKjdMGf2FsUk9GECFh0B4iJgXlJOX41+7/ncvLVluKki8477SoybEdyGGf+qGYLBDiEsA==",
+      "sha256": "f5dd239b1b1c629ce638fa86f0ea95b02aa076c4091b01f921365411255fa1e2",
+      "size_bytes": 397410,
+      "served_at": "/_internal/lucide.js"
+    },
+    {
+      "path": "mermaid.min.js",
+      "library": "mermaid",
+      "version": "11.17.2",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/mermaid/-/mermaid-11.17.2.tgz",
+      "source_file": "package/dist/mermaid.min.js",
+      "registry_integrity": "sha512-V6K3C8EBdEsPFZXSKMJe6ppQOENxuHARr9GvHX4hh47lAbhMRD9qf4oEK7LoaRQxULMa80/qt5gHO73aCleBBg==",
+      "sha256": "581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8",
+      "size_bytes": 3572661,
+      "served_at": "/_internal/mermaid.js",
+      "notes": "The single-file IIFE build that sets globalThis.mermaid. Consumers call only mermaid.initialize and mermaid.run (benmark hydrate.js, sdui Markdown). 11.17.2 fixes the nine advisories that affected 11.13.0 (fixed in 11.15.0 or 11.16.1). Mermaid 12 is not a drop-in: it re-lays out and recolours existing diagrams (ELK default, new theme), targets Safari 17.4+ and grows the IIFE build by about 500 kB gzipped."
+    },
+    {
+      "path": "rrweb.min.js",
+      "library": "rrweb",
+      "version": "2.0.1",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/rrweb/-/rrweb-2.0.1.tgz",
+      "source_file": "package/dist/rrweb.umd.min.cjs (identical to package/umd/rrweb.min.js)",
+      "registry_integrity": "sha512-MQYzOtI7aZft9ffDMT6rmRSAj6hO4W6T7iA4eB9Mtcuiv3M7DbnnxDMrcPW0sQXepgYN46YhfSKe75d/mlUHrQ==",
+      "sha256": "720d24646556282765ff51be2a768e571fabb2143badcbc9a7024bfe9d9b8eed",
+      "size_bytes": 265817,
+      "served_at": "injected into the headless browser during browser_check (not an /_internal route)"
+    },
+    {
+      "path": "rrweb-player.js",
+      "library": "@amplitude/rrweb-player",
+      "version": "2.1.1",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/@amplitude/rrweb-player/-/rrweb-player-2.1.1.tgz",
+      "source_file": "package/dist/rrweb-player.umd.min.cjs",
+      "registry_integrity": "sha512-oxR3NfbhRoaUiizZ+ECmwcA5nONY/DNrjeLrOvuWj/Uc1cJAipPMn7bPq9zKOZmo184VwdxtaNMR/hUQru009g==",
+      "sha256": "6a2fb6e8cd2c51f097f6378ad8aee74623040a964b2434f80a542e8a59c416f5",
+      "size_bytes": 283111,
+      "served_at": "/_internal/rrweb-player.js",
+      "notes": "The Amplitude fork: the upstream rrweb-player 2.0.x npm build ships without its replayer core (see the PLAYER PROVENANCE comment in libs_embed.go and its smoke test)."
+    },
+    {
+      "path": "rrweb-player.css",
+      "library": "@amplitude/rrweb-player",
+      "version": "2.1.1",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/@amplitude/rrweb-player/-/rrweb-player-2.1.1.tgz",
+      "source_file": "package/dist/style.css",
+      "registry_integrity": "sha512-oxR3NfbhRoaUiizZ+ECmwcA5nONY/DNrjeLrOvuWj/Uc1cJAipPMn7bPq9zKOZmo184VwdxtaNMR/hUQru009g==",
+      "sha256": "5461e9db9340c043aea37733f7b73df59e1aa7ec25f81c349221e480b902e370",
+      "size_bytes": 6298,
+      "served_at": "/_internal/rrweb-player.css"
+    },
+    {
+      "path": "tailwind.min.js",
+      "library": "tailwindcss Play CDN build with @tailwindcss/forms 0.5.10 and @tailwindcss/typography 0.5.16",
+      "version": "3.4.17",
+      "license": "MIT",
+      "source": "https://cdn.tailwindcss.com/3.4.17?plugins=forms@0.5.10,typography@0.5.16",
+      "source_file": "the response body of source (the plugins parameter order matters: typography first gives different bytes)",
+      "sha256": "0656b912a5893ab56c590ef7e1edd2c9ae57bbff18b30a300cdd66f3f1486708",
+      "size_bytes": 510091,
+      "served_at": "/_internal/tailwind.js",
+      "notes": "Not published as a file on npm; the Play CDN builds it per request. Unpatched: it still logs Tailwind's 'should not be used in production' warning."
+    },
+    {
+      "path": "vis-network.min.js",
+      "library": "vis-network",
+      "version": "9.1.6",
+      "license": "Apache-2.0 OR MIT",
+      "source": "https://registry.npmjs.org/vis-network/-/vis-network-9.1.6.tgz",
+      "source_file": "package/standalone/umd/vis-network.min.js",
+      "registry_integrity": "sha512-Eiwx1JleAsUqfy4pzcsFngCVlCEdjAtRPB/OwCV7PHBm+o2jtE4IZPcPITAEGUlxvL4Fdw7/lZsfD32dL+IL6g==",
+      "sha256": "576bb887733eb01bb52ee75b90ef46d818454de5fddb5b616fb8a298d307ca12",
+      "size_bytes": 702611,
+      "served_at": "/_internal/vis-network.js"
+    },
+    {
+      "path": "mcp-apps/app-with-deps.js",
+      "library": "@modelcontextprotocol/ext-apps",
+      "version": "2.0.3",
+      "license": "MIT, Apache-2.0",
+      "source": "https://registry.npmjs.org/@modelcontextprotocol/ext-apps/-/ext-apps-2.0.3.tgz",
+      "source_file": "package/dist/src/app-with-deps.js",
+      "registry_integrity": "sha512-Tn+4+cyhO4f4cQSDxNyLiIfEE+qlTTuIbWBJB8JTinEXOhDYgCT4wDTQplxD9MBYZH5pCYGC59GaxiwIT4bu8w==",
+      "sha256": "fb56376b7583ecafb4820bdebc150abee18feb6258ff84b83c2c944ebd9c3602",
+      "size_bytes": 418465,
+      "notes": "Bundled dependency versions, licences and the dynamic-code allowlist are in mcp-apps/VENDOR.json (TestMCPAppsBundleVendorIntegrity)."
+    },
+    {
+      "path": "mcp-apps/LICENSE.content-type",
+      "library": "content-type (bundled in ext-apps)",
+      "version": "1.0.5",
+      "license": "MIT",
+      "source": "see mcp-apps/VENDOR.json",
+      "sha256": "257aed98914108e91a337912727b6a802eef218248507f74b76faffaff517a38",
+      "size_bytes": 1089
+    },
+    {
+      "path": "mcp-apps/LICENSE.modelcontextprotocol",
+      "library": "@modelcontextprotocol/ext-apps, client, core",
+      "version": "2.0.3 / 2.0.0",
+      "license": "MIT, Apache-2.0",
+      "source": "see mcp-apps/VENDOR.json",
+      "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+      "size_bytes": 12227
+    },
+    {
+      "path": "mcp-apps/LICENSE.standard-schema-spec",
+      "library": "@standard-schema/spec (bundled in ext-apps)",
+      "version": "1.1.0",
+      "license": "MIT",
+      "source": "see mcp-apps/VENDOR.json",
+      "sha256": "653b779005a3a4d64a7288c940f7b9a0e8f0b1e0375f6aa6af9473caf131e564",
+      "size_bytes": 1071
+    },
+    {
+      "path": "mcp-apps/LICENSE.zod",
+      "library": "zod (bundled in ext-apps)",
+      "version": "4.3.5",
+      "license": "MIT",
+      "source": "see mcp-apps/VENDOR.json",
+      "sha256": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8",
+      "size_bytes": 1072
+    }
+  ],
+  "cdn_loaded": [
+    {
+      "url": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+      "library": "leaflet",
+      "version": "1.9.4",
+      "license": "BSD-2-Clause",
+      "integrity": "sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH",
+      "sha256": "db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a",
+      "source_file": "package/dist/leaflet.js in https://registry.npmjs.org/leaflet/-/leaflet-1.9.4.tgz",
+      "registry_integrity": "sha512-nxS1ynzJOmOlHp+iL3FyWqK89GtNL8U8rvlMOsQdTTssxZwCXh8N2NB3GDQOL+YR3XnWyZAxwQixURb+FA74PA==",
+      "loaded_by": "embedded/sdui.js Map (loadLeaflet), with integrity and crossorigin=anonymous"
+    },
+    {
+      "url": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
+      "library": "leaflet",
+      "version": "1.9.4",
+      "license": "BSD-2-Clause",
+      "integrity": "sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H",
+      "sha256": "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
+      "source_file": "package/dist/leaflet.css in https://registry.npmjs.org/leaflet/-/leaflet-1.9.4.tgz",
+      "registry_integrity": "sha512-nxS1ynzJOmOlHp+iL3FyWqK89GtNL8U8rvlMOsQdTTssxZwCXh8N2NB3GDQOL+YR3XnWyZAxwQixURb+FA74PA==",
+      "loaded_by": "embedded/sdui.js Map (loadLeaflet), with integrity and crossorigin=anonymous"
+    }
+  ]
+}

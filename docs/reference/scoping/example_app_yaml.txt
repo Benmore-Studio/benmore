@@ -1,0 +1,5 @@
+scopes:
+  posts:
+    public_read_when: "status = 'published'"
+  contacts:
+    # default: owner-scoped, no public reads

@@ -1,0 +1,1 @@
+An encrypted column cannot also be in @@fulltext - the FTS5 index desyncs when the column is rewritten to ciphertext and every INSERT fails, and the index would store plaintext. Write-time validation and `benmore check` refuse it; see api({at:'search'}) → encrypted.

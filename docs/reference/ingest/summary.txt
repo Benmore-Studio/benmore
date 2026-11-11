@@ -1,0 +1,1 @@
+Streaming NDJSON ingest for bulk data loads. Rate-limited (5 req/min/user). Use for log ingestion, bulk seeds and CSV data converted to NDJSON first (api(at:"import") reads CSV directly).

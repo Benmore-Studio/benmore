@@ -142,7 +142,7 @@ func TestTenantRoleOnTenantRootReachesOnlyOwnTenantRow(t *testing.T) {
 	assertStatus(t, mux, http.MethodDelete, "/api/companies/2", admin, nil, http.StatusNotFound)
 	assertStatus(t, mux, http.MethodPatch, "/api/companies/1", admin, map[string]any{"name": "acme-renamed"}, http.StatusOK)
 	// Creating an org row is not an act on the caller's own tenant.
-	assertStatus(t, mux, http.MethodPost, "/api/companies", admin, map[string]any{"name": "new-co"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodPost, "/api/companies", admin, map[string]any{"name": "new-co"}, http.StatusForbidden)
 
 	var name string
 	if err := app.DB.QueryRow("SELECT name FROM companies WHERE id = 2").Scan(&name); err != nil || name != "globex" {

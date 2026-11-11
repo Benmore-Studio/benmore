@@ -11,8 +11,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 var attemptTestActor = Session{UserID: 1, Email: "task-actor@example.com"}
@@ -262,7 +260,7 @@ func TestAppMCPAttemptCommitUnknownIsNeverReplayed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqlConn := raw.(*sqlite3.SQLiteConn)
+		sqlConn := mustSQLiteConn(raw)
 		sqlConn.RegisterUpdateHook(func(_ int, db, table string, _ int64) {
 			if db == "main" && table == "tasks" {
 				businessWrite.Store(true)

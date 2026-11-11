@@ -1,0 +1,1 @@
+Pre-v2.7.37 a step that returned 200-with-error-envelope ingested cleanly into the next upsert - the bug surfaced N steps later as 'why is my customers table half-broken.' success_when:` short-circuits the bad shape at the source.

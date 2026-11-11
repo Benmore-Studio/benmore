@@ -1,0 +1,18 @@
+# app.yaml - ONE csp: block per file; merge the origins you need into it.
+csp:
+  # Google Maps (JS API + iframe embed)
+  script_src: "https://maps.googleapis.com https://maps.gstatic.com"
+  img_src:    "https://maps.gstatic.com https://maps.googleapis.com"
+  frame_src:  "https://www.google.com"
+
+# Other common origins (add to the directives above - a second csp: key is a
+# duplicate-key error):
+#   Leaflet + OpenStreetMap tiles  img_src:     "https://*.tile.openstreetmap.org https://tile.openstreetmap.org"
+#                                  (sdui's Map gets the Leaflet files automatically; the tiles still need this)
+#   Mapbox GL JS                   script_src/style_src/img_src: "https://api.mapbox.com"
+#                                  connect_src: "https://api.mapbox.com https://events.mapbox.com"
+#   Stripe Checkout (iframe)       script_src:  "https://js.stripe.com"
+#                                  frame_src:   "https://js.stripe.com https://hooks.stripe.com"
+#   A stylesheet and its fonts     style_src:   "https://cdn.example.com"   (the <link rel="stylesheet">)
+#   on another origin              font_src:    "https://cdn.example.com"   (the font files its @font-face loads)
+#   Embeddable share pages         frame_ancestors: "*"   (third-party sites / LLM-host widgets may iframe the app)

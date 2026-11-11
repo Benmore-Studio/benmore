@@ -1,0 +1,70 @@
+# Every request to /api/contact is in this one test: the limit is per client
+# address and the tests of a file share one.
+a_visitor_sends_messages_until_the_limit:
+  anon: true
+  steps:
+    - api: "POST /api/contact"
+      json: { name: "Vera", email: "vera@example.com", message: "Do you ship to Oslo?" }
+      expect:
+        status: 201
+        json: { received: true }
+    - sql: "SELECT id FROM messages WHERE name = 'Vera' AND email = 'vera@example.com' AND body = 'Do you ship to Oslo?'"
+      expect: { rows: 1 }
+    # The email is a queued job, written with the row.
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'notify-owner'"
+      expect: { rows: 1 }
+    # A refused input stores nothing, and still counts against the limit.
+    - api: "POST /api/contact"
+      json: { name: "Vera", email: "not-an-address", message: "x" }
+      expect:
+        status: 422
+        json: { error: 'flow input "email" must be a valid email address' }
+    - api: "POST /api/contact"
+      json: { name: "Anton", email: "a@example.com", message: "3" }
+      expect: { status: 201 }
+    - api: "POST /api/contact"
+      json: { name: "Bea", email: "b@example.com", message: "4" }
+      expect: { status: 201 }
+    - api: "POST /api/contact"
+      json: { name: "Carl", email: "c@example.com", message: "5" }
+      expect: { status: 201 }
+    # The sixth request of the hour is refused before any step.
+    - api: "POST /api/contact"
+      json: { name: "Dora", email: "d@example.com", message: "6" }
+      expect:
+        status: 429
+        contains: "rate limit exceeded"
+    - sql: "SELECT id FROM messages WHERE name IN ('Vera', 'Anton', 'Bea', 'Carl')"
+      expect: { rows: 4 }
+    - sql: "SELECT id FROM messages WHERE name = 'Dora' OR email = 'not-an-address'"
+      expect: { rows: 0 }
+
+the_owner_reads_the_messages:
+  as_user: "owner@contact.test"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO messages (name, email, body) VALUES ('Stored earlier', 'early@example.com', 'Hello')"
+  steps:
+    - get: "/api/messages"
+      expect: { status: 200, contains: "Stored earlier" }
+
+nobody_else_reads_them_or_runs_the_notifier:
+  as_user: "visitor@contact.test"
+  setup:
+    - sql: "INSERT INTO messages (id, name, email, body) VALUES (7001, 'Private', 'p@example.com', 'Not for visitors')"
+  steps:
+    - get: "/api/messages"
+      expect: { status: 404, not_contains: "Not for visitors" }
+    - get: "/api/messages/7001"
+      expect: { status: 404 }
+    - api: "POST /api/contact/notify"
+      json: { message_id: 7001 }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM messages WHERE id = 7001 AND notified_at = ''"
+      expect: { rows: 1 }
+
+signed_out_callers_cannot_list_messages:
+  anon: true
+  steps:
+    - get: "/api/messages"
+      expect: { status: 401 }

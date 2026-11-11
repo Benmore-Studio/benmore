@@ -19,6 +19,9 @@ func TestFlowAuthValuesOtherThanRequiredStillGate(t *testing.T) {
 	}
 	for _, auth := range []string{"true", "yes", "Required", "' required '", "logged_in"} {
 		rr := runProbeGHAFlow(t, app, flow(auth), `{}`)
+		if rr.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("auth: %s error cache policy = %q", auth, rr.Header().Get("Cache-Control"))
+		}
 		if rr.Code != http.StatusUnauthorized || strings.Contains(rr.Body.String(), "s3cret") {
 			t.Errorf("auth: %s answered an anonymous caller: %d %s", auth, rr.Code, rr.Body.String())
 		}

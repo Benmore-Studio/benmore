@@ -1,0 +1,6 @@
+[
+  "A computed value is a column of its row: whoever may read the row reads it, and lists filter and sort by it like any column (`?line_total__gte=100`).",
+  "A `sql:` field is calculated by the database, not as a caller: it counts every child row its SQL matches, whoever owns that row. A child row may only name a parent its writer can read (422 otherwise: api({at:'scoping'}) foreign_keys), so one user cannot move another user's count.",
+  "Encrypted columns: api({at:'encryption'}) computed_columns (a computed column that is itself encrypted) and computed_aggregates (an expression may not read an encrypted column). Versioned tables: api({at:'versioning'}) maintenance_writes.",
+  "A `sql:` field is one value per parent row, current after every write. A number for the whole app that may lag (a dashboard total) is an app.yaml aggregate, and its SQL may read computed columns: api({at:'aggregates'})."
+]

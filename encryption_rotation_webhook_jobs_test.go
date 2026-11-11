@@ -562,7 +562,7 @@ func TestAppWebhookJobRotationSQLAuthorizerDenialIsAWriteError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	if err := conn.Raw(func(raw any) error {
-		sqlite, ok := raw.(*sqlite3.SQLiteConn)
+		sqlite, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("not a SQLite connection")
 		}
@@ -578,7 +578,7 @@ func TestAppWebhookJobRotationSQLAuthorizerDenialIsAWriteError(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if err := conn.Raw(func(raw any) error {
-			sqlite, ok := raw.(*sqlite3.SQLiteConn)
+			sqlite, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("not a SQLite connection")
 			}
@@ -601,7 +601,7 @@ func TestAppWebhookJobRotationSQLAuthorizerDenialIsAWriteError(t *testing.T) {
 		t.Fatalf("authorizer failure was not distinguished from zero-row CAS: %v", err)
 	}
 	_ = tx.Rollback()
-	if err := conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil); return nil }); err != nil {
+	if err := conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(nil); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	var after string

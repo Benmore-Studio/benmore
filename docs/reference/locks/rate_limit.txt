@@ -1,0 +1,1 @@
+Acquire and renew (POST) share one budget of 30 requests per minute per user across all tables; the next answers 429 {error:'rate limit exceeded'} with no Retry-After. Renewing every 20 s costs 3 a minute per lock, so one user can hold about 10 locks at once.

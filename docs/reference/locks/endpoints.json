@@ -1,0 +1,5 @@
+[
+  "POST /api/<table>/<id>/lock     → acquire or renew: 200 {status:'locked', locked_by, expires_at}; 409 {error:'record is locked by another user', locked_by, expires_at} when another user holds it",
+  "GET /api/<table>/<id>/lock      → 200 {locked:false} or {locked:true, locked_by, locked_at, expires_at} (needs a signed-in caller, 401 otherwise, and read access to the row, 404 otherwise; locked_by is included only for a caller who may edit the row)",
+  "DELETE /api/<table>/<id>/lock   → release: 200 {status:'unlocked'}"
+]

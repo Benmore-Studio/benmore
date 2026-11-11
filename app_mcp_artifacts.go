@@ -57,7 +57,7 @@ type appMCPArtifact struct {
 }
 
 func ensureAppMCPArtifactTables(db *sql.DB) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "connector artifact tables"), nil)
 	if err != nil {
 		return err
 	}
@@ -184,7 +184,19 @@ const (
 	mcpArtifactOrphanGrace = 10 * time.Minute
 )
 
-var mcpArtifactFileName = regexp.MustCompile(`^artifact_[0-9a-f]{64}\.(xlsx|html|pdf)$`)
+// HTML bytes are stored as .html.bin (mcpArtifactStorageExt); .html remains
+// valid for artifacts stored before that.
+var mcpArtifactFileName = regexp.MustCompile(`^artifact_[0-9a-f]{64}\.(xlsx|html|pdf|html\.bin)$`)
+
+// mcpArtifactStorageExt is the stored name's extension for each kind. The
+// platform media broker types an object by its extension and refuses .html,
+// so an HTML artifact could not be stored on hosted apps (artifact.create
+// answered incomplete_result, export denied). .html.bin is stored as
+// application/octet-stream with an attachment disposition: the media domain
+// never serves it as a page, and the bytes are read only by the authorized
+// GET /api/_mcp/artifacts/{id}, which sets the HTML type from the manifest's
+// kind and always downloads it.
+var mcpArtifactStorageExt = map[string]string{"xlsx": ".xlsx", "html": ".html.bin", "pdf": ".pdf"}
 
 // appMCPArtifactRefsOwnedBy lists the stored bytes of uid's artifact
 // manifests, read inside the purge transaction before the rows go.
@@ -342,8 +354,7 @@ func storeAppMCPArtifact(ctx context.Context, app *App, ownerUserID int64, owner
 	if err != nil {
 		return out, err
 	}
-	ext := map[string]string{"xlsx": ".xlsx", "html": ".html", "pdf": ".pdf"}[kind]
-	ref := mcpArtifactStoragePrefix + id + ext
+	ref := mcpArtifactStoragePrefix + id + mcpArtifactStorageExt[kind]
 	backend := storageBackendForApp(app)
 	if backend == nil {
 		return out, errors.New("artifact storage unavailable")
@@ -516,7 +527,7 @@ func registerAppMCPArtifactRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_mcp/artifacts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "private, no-store")
 		cookie, cookieErr := requestSessionCookie(r)
-		if cookieErr != nil || cookie == nil || cookie.Value == "" || len(r.Header.Values("Authorization")) > 0 || edgeBridgeUserID(r) > 0 {
+		if cookieErr != nil || cookie == nil || cookie.Value == "" || len(r.Header.Values("Authorization")) > 0 {
 			http.Error(w, "interactive session required", http.StatusUnauthorized)
 			return
 		}
@@ -640,35 +651,68 @@ func renderAppMCPArtifactHTML(title string, headers []string, rows [][]string) (
 	return out.Bytes(), nil
 }
 
+// errAppMCPArtifactPDFProvider marks a failure of the PDF renderer itself: no
+// browser, its version probe, the sandbox, or Chrome failing or running past
+// its deadline. Tools report it as unavailable_provider, never by error text.
+var errAppMCPArtifactPDFProvider = errors.New("PDF provider unavailable")
+
+// artifactPDFBrowser locates the browser that prints artifact PDFs.
+var artifactPDFBrowser = findChrome
+
+func appMCPArtifactPDFProviderError(err error) error {
+	if err == nil || errors.Is(err, errAppMCPArtifactPDFProvider) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errAppMCPArtifactPDFProvider, err)
+}
+
+// appMCPArtifactFailureCode is the tool error code for a failed artifact build
+// that passed authorization.
+func appMCPArtifactFailureCode(err error) string {
+	if errors.Is(err, errAppMCPArtifactPDFProvider) {
+		return "unavailable_provider"
+	}
+	return "incomplete_result"
+}
+
 func renderAppMCPArtifactPDF(ctx context.Context, app *App, html []byte) ([]byte, error) {
-	chrome := findChrome()
+	chrome := artifactPDFBrowser()
 	if chrome == "" {
-		return nil, errors.New("PDF provider unavailable")
+		return nil, errAppMCPArtifactPDFProvider
 	}
 	dir, err := os.MkdirTemp("", "benmore-artifact-pdf-")
 	if err != nil {
-		return nil, err
+		return nil, appMCPArtifactPDFProviderError(err)
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "artifact.pdf")
 	sandbox, err := newPDFSandbox(html, "default-src 'none'; style-src 'unsafe-inline'; img-src data:", nil)
 	if err != nil {
-		return nil, err
+		return nil, appMCPArtifactPDFProviderError(err)
 	}
 	defer sandbox.Close()
 	chromeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(chromeCtx, chrome, pdfChromeArgs(sandbox.ProxyAddr(), sandbox.DocURL(), path, filepath.Join(dir, "profile"))...)
 	if _, err := runPDFChrome(chromeCtx, cmd, path); err != nil {
-		return nil, err
+		return nil, appMCPArtifactPDFProviderError(err)
 	}
-	return os.ReadFile(path)
+	data, err := os.ReadFile(path)
+	return data, appMCPArtifactPDFProviderError(err)
+}
+
+// appMCPArtifactDownloadURL is where the person downloads an artifact: GET
+// /api/_mcp/artifacts/{id} on the connector's origin, which serves it only to
+// the owner's direct interactive session after rechecking owner, tenant, role
+// and scopes. artifact.create and artifact.export both return it.
+func appMCPArtifactDownloadURL(resource, artifactID string) string {
+	return appMCPOAuthOrigin(resource) + "/api/_mcp/artifacts/" + artifactID
 }
 
 // appMCPRegisterArtifactTools exposes one reviewed producer: it formats the
 // immutable receipt of a command the caller already prepared, approved, and
 // committed. It never accepts caller-supplied report rows or queries live data.
-func appMCPRegisterArtifactTools(server *sdk.Server, app *App, generation *appMCPRuntimeGeneration, grant *appMCPGrant, actor *Session) {
+func appMCPRegisterArtifactTools(server *sdk.Server, app *App, generation *appMCPRuntimeGeneration, grant *appMCPGrant, actor *Session, resource string) {
 	if server == nil || app == nil || generation == nil || generation.manifest == nil || grant == nil || actor == nil {
 		return
 	}
@@ -694,12 +738,13 @@ func appMCPRegisterArtifactTools(server *sdk.Server, app *App, generation *appMC
 		"format":       map[string]any{"type": "string", "enum": []any{"xlsx", "html", "pdf"}},
 	})
 	server.AddTool(&sdk.Tool{Name: mcpArtifactExportTool,
-		Description: "Create an immutable XLSX, standalone HTML, or PDF artifact from a committed receipt for one of your reviewed commands. The operation must have completed successfully; this formats its frozen result and does not rerun the command.",
+		Description: "Create an immutable XLSX, standalone HTML, or PDF artifact from a committed receipt for one of your reviewed commands. The operation must have completed successfully; this formats its frozen result and does not rerun the command. The user downloads the file from download_url in their own signed-in browser.",
 		InputSchema: input, OutputSchema: appMCPClosedObject(map[string]any{
-			"artifact_id": map[string]any{"type": "string", "maxLength": 128},
-			"kind":        map[string]any{"type": "string", "enum": []any{"xlsx", "html", "pdf"}},
-			"sha256":      map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
-			"size":        map[string]any{"type": "integer", "minimum": 1, "maximum": mcpArtifactMaxBytes},
+			"artifact_id":  map[string]any{"type": "string", "maxLength": 128},
+			"kind":         map[string]any{"type": "string", "enum": []any{"xlsx", "html", "pdf"}},
+			"sha256":       map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
+			"size":         map[string]any{"type": "integer", "minimum": 1, "maximum": mcpArtifactMaxBytes},
+			"download_url": map[string]any{"type": "string", "maxLength": 2048},
 		}), Annotations: &sdk.ToolAnnotations{DestructiveHint: &no, OpenWorldHint: &no}},
 		func(ctx context.Context, call *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 			args, ok := appMCPDecodeToolArguments(call.Params.Arguments)
@@ -716,89 +761,128 @@ func appMCPRegisterArtifactTools(server *sdk.Server, app *App, generation *appMC
 				return appMCPSDKFailure(appMCPResultFailure("operation_limit")), nil
 			}
 			artifact, err := exportAppMCPCommittedArtifact(ctx, app, generation, grant, actor, operationID, kind)
+			var built *appMCPArtifactBuildError
+			if errors.As(err, &built) {
+				// The receipt was proven the caller's; formatting, rendering or
+				// storing it failed. Report it as artifact.create does, not as a
+				// refusal, and log it (layout and storage text only).
+				log.Printf("MCP artifact.export %s (%s): %v", operationID, kind, built.err)
+				return appMCPSDKFailure(appMCPResultFailure(appMCPArtifactFailureCode(built.err))), nil
+			}
 			if err != nil {
 				return appMCPSDKFailure(appMCPResultFailure("denied")), nil
 			}
-			return appMCPCommandResult(map[string]any{"artifact_id": artifact.ID, "kind": artifact.Kind, "sha256": artifact.SHA256, "size": artifact.Size}), nil
+			return appMCPCommandResult(map[string]any{"artifact_id": artifact.ID, "kind": artifact.Kind, "sha256": artifact.SHA256, "size": artifact.Size,
+				"download_url": appMCPArtifactDownloadURL(resource, artifact.ID)}), nil
 		})
 }
 
+// appMCPArtifactBuildError is an export failure after the receipt was proven
+// the caller's: everything before it is a refusal (denied).
+type appMCPArtifactBuildError struct{ err error }
+
+func (e *appMCPArtifactBuildError) Error() string { return e.err.Error() }
+func (e *appMCPArtifactBuildError) Unwrap() error { return e.err }
+
 func exportAppMCPCommittedArtifact(ctx context.Context, app *App, generation *appMCPRuntimeGeneration, grant *appMCPGrant, actor *Session, operationID, kind string) (appMCPArtifact, error) {
-	var out appMCPArtifact
+	artifact, built, err := exportAppMCPCommittedArtifactStages(ctx, app, generation, grant, actor, operationID, kind)
+	if err != nil && built {
+		return artifact, &appMCPArtifactBuildError{err}
+	}
+	return artifact, err
+}
+
+// exportAppMCPCommittedArtifactStages reports built=true once authorization
+// is complete, so the caller can tell a refusal from a failed build.
+func exportAppMCPCommittedArtifactStages(ctx context.Context, app *App, generation *appMCPRuntimeGeneration, grant *appMCPGrant, actor *Session, operationID, kind string) (out appMCPArtifact, built bool, err error) {
 	if ctx == nil || app == nil || generation == nil || grant == nil || actor == nil ||
 		!appMCPOperationHex(operationID, 32) || (kind != "xlsx" && kind != "html" && kind != "pdf") {
-		return out, errors.New("invalid artifact export request")
+		return out, false, errors.New("invalid artifact export request")
 	}
 	tx, err := app.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return out, err
+		return out, false, err
 	}
 	defer tx.Rollback()
 	appID, key, err := appMCPReadyOperationStorage(ctx, tx, app)
 	if err != nil {
-		return out, err
+		return out, false, err
 	}
 	stored, err := appMCPReadOperationWithKey(ctx, tx, appID, key, operationID)
 	if err != nil || stored == nil || stored.Receipt == nil || stored.Prepared.Origin.Kind != "connector" ||
 		stored.Prepared.Origin.ActorID != actor.UserID || stored.Prepared.Origin.Tenant != actor.GroupID {
-		return out, errors.New("operation receipt is not available to this caller")
+		return out, false, errors.New("operation receipt is not available to this caller")
 	}
 	var ownerCreatedAt string
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(created_at,'') FROM main._benmore_users WHERE id=?", actor.UserID).Scan(&ownerCreatedAt); err != nil || !sameAccountIncarnation(ownerCreatedAt, stored.Prepared.Origin.ActorCreated) {
-		return out, errors.New("operation receipt belongs to a different account incarnation")
+		return out, false, errors.New("operation receipt belongs to a different account incarnation")
 	}
 	tool, _, err := appMCPFindCommandDeclaration(generation, stored.Prepared.Command)
 	if err != nil || !scopesWithin(grant.Scopes, strings.Join(stored.Prepared.Origin.Permissions, " ")) ||
 		!scopesWithin(actor.Scopes, strings.Join(stored.Prepared.Origin.Permissions, " ")) ||
 		!scopesWithin(grant.Scopes, strings.Join(tool.Permissions, " ")) || !scopesWithin(actor.Scopes, strings.Join(tool.Permissions, " ")) {
-		return out, errors.New("operation command is no longer authorized")
+		return out, false, errors.New("operation command is no longer authorized")
 	}
 	approval, err := appMCPReadCommandApprovalWithKey(ctx, tx, appID, key, stored)
 	if err != nil || approval == nil || approval.State != "consumed" {
-		return out, errors.New("operation receipt is not committed")
+		return out, false, errors.New("operation receipt is not committed")
 	}
 	receipt, err := decodeAppMCPCommandReceipt(stored, approval)
 	if err != nil {
-		return out, err
+		return out, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return out, err
+		return out, false, err
 	}
+	// A committed receipt is immutable, so the same caller exporting it in the
+	// same format again gets the artifact already made. Without this every
+	// call stored another copy: export has no read-artifact budget and command
+	// artifacts are never evicted.
+	if existing, ok := findAppMCPExportedArtifact(ctx, app, actor.UserID, stored.Prepared.Origin.ActorCreated, actor.GroupID, operationID, kind); ok {
+		return existing, true, nil
+	}
+	// Authorized: every failure from here is a failed build, not a refusal.
 	var result map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(receipt.Result))
 	decoder.UseNumber()
 	if err := decoder.Decode(&result); err != nil || result == nil {
-		return out, errors.New("command result is not an object")
+		return out, true, errors.New("command result is not an object")
 	}
 	fields := make([]string, 0, len(result))
 	for field := range result {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	rows := make([][]string, 0, len(fields))
+	// The spreadsheet keeps each value's raw form and cell type; the HTML and
+	// PDF show the display text artifact.create would.
+	sheetRows := make([][]string, 0, len(fields))
+	cellFormats := make([][]string, 0, len(fields))
+	shown := make([][]string, 0, len(fields))
 	for _, field := range fields {
-		value, err := json.Marshal(result[field])
+		cell, format, err := appMCPReceiptCell(result[field])
 		if err != nil {
-			return out, err
+			return out, true, err
 		}
-		rows = append(rows, []string{field, string(value)})
+		sheetRows = append(sheetRows, []string{field, cell.Raw})
+		cellFormats = append(cellFormats, []string{xlsxText, format})
+		shown = append(shown, []string{field, cell.Display})
 	}
 	title := stored.Prepared.Command + " result"
 	var data []byte
 	switch kind {
 	case "xlsx":
-		data, err = WriteXLSXSheets([]XLSXSheet{{Name: "Result", Headers: []string{"field", "value"}, Rows: rows}})
+		data, err = WriteXLSXSheets([]XLSXSheet{{Name: "Result", Headers: []string{"field", "value"}, Rows: sheetRows, CellFormats: cellFormats}})
 	case "html":
-		data, err = renderAppMCPArtifactHTML(title, []string{"field", "value"}, rows)
+		data, err = renderAppMCPArtifactHTML(title, []string{"field", "value"}, shown)
 	case "pdf":
 		var html []byte
-		html, err = renderAppMCPArtifactHTML(title, []string{"field", "value"}, rows)
+		html, err = renderAppMCPArtifactHTML(title, []string{"field", "value"}, shown)
 		if err == nil {
 			data, err = renderAppMCPArtifactPDF(ctx, app, html)
 		}
 	}
 	if err != nil {
-		return out, err
+		return out, true, err
 	}
 	sum := sha256.Sum256(stored.Receipt)
 	revisions := map[string]string{"contract": stored.Prepared.ContractDigest, "execution": stored.Prepared.ExecutionDigest}
@@ -808,27 +892,79 @@ func exportAppMCPCommittedArtifact(ctx context.Context, app *App, generation *ap
 	} else if kind == "pdf" {
 		engine, err = appMCPArtifactChromeVersion(ctx)
 		if err != nil {
-			return out, err
+			return out, true, err
 		}
 	}
-	return createAppMCPArtifact(ctx, app, actor.UserID, stored.Prepared.Origin.ActorCreated, actor.GroupID, actor.Role, stored.Prepared.Origin.Permissions, operationID, kind, data,
+	out, err = createAppMCPArtifact(ctx, app, actor.UserID, stored.Prepared.Origin.ActorCreated, actor.GroupID, actor.Role, stored.Prepared.Origin.Permissions, operationID, kind, data,
 		hex.EncodeToString(sum[:]), revisions, engine)
+	return out, true, err
+}
+
+// findAppMCPExportedArtifact returns the caller's artifact of operationID in
+// kind made under the current template version, if one is recorded. Any read
+// failure (no table yet included) means none: the export builds a new one.
+func findAppMCPExportedArtifact(ctx context.Context, app *App, owner int64, ownerCreatedAt, tenant, operationID, kind string) (appMCPArtifact, bool) {
+	var a appMCPArtifact
+	err := app.DB.QueryRowContext(ctx, `SELECT id,kind,content_sha256,size FROM _benmore_mcp_artifacts
+WHERE owner_user_id=? AND owner_created_at=? AND tenant=? AND operation_id=? AND kind=? AND template_version=? AND schema_version=?
+ORDER BY rowid DESC LIMIT 1`, owner, ownerCreatedAt, tenant, operationID, kind, mcpArtifactTemplateVersion, mcpArtifactManifestVersion).Scan(&a.ID, &a.Kind, &a.SHA256, &a.Size)
+	if err != nil {
+		return appMCPArtifact{}, false
+	}
+	return a, true
+}
+
+// appMCPReceiptCell types one value of a committed result the way
+// artifact.create types a column: a string is its own text (never a quoted
+// JSON literal), a whole number an integer cell, any other number a number
+// cell, a boolean Yes or No and null an empty cell. A nested object or array
+// has no cell type, so it stays compact JSON text, as before. A number too
+// large for the exact formatter is kept as its literal text.
+func appMCPReceiptCell(value any) (appMCPArtifactCell, string, error) {
+	switch v := value.(type) {
+	case nil:
+		return appMCPArtifactCell{}, xlsxText, nil
+	case string:
+		return appMCPArtifactCell{Raw: v, Display: v}, xlsxText, nil
+	case bool:
+		cell, err := appMCPArtifactFormatCell(v, xlsxText)
+		return cell, xlsxText, err
+	case json.Number:
+		format := xlsxNumber
+		if number, ok := appMCPExactNumber(v); ok && number.IsInt() {
+			format = xlsxInteger
+		}
+		if cell, err := appMCPArtifactFormatCell(v, format); err == nil {
+			return cell, format, nil
+		}
+		return appMCPArtifactCell{Raw: v.String(), Display: v.String()}, xlsxText, nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return appMCPArtifactCell{}, "", err
+	}
+	return appMCPArtifactCell{Raw: string(encoded), Display: string(encoded)}, xlsxText, nil
 }
 
 func appMCPArtifactChromeVersion(ctx context.Context) (string, error) {
-	chrome := findChrome()
+	chrome := artifactPDFBrowser()
 	if chrome == "" {
-		return "", errors.New("PDF provider unavailable")
+		return "", errAppMCPArtifactPDFProvider
 	}
-	return appMCPProbeArtifactChromeVersion(ctx, chrome)
+	version, err := appMCPProbeArtifactChromeVersion(ctx, chrome)
+	return version, appMCPArtifactPDFProviderError(err)
 }
 
 func appMCPProbeArtifactChromeVersion(ctx context.Context, chrome string) (string, error) {
+	// On macOS the bundle says it without starting Chrome.
+	if version, ok := chromeBundleVersion(chrome); ok {
+		return version, nil
+	}
 	// A cold system browser can need more than three seconds even for --version.
 	// Keep the probe bounded while honoring an earlier caller deadline.
 	versionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(versionCtx, chrome, "--version").Output()
+	output, err := exec.CommandContext(versionCtx, chrome, append([]string{"--version"}, chromeKeychainFreeArgs...)...).Output()
 	if err != nil || len(output) == 0 || len(output) > 256 {
 		return "", errors.New("PDF renderer version unavailable")
 	}

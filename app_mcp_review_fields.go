@@ -314,7 +314,7 @@ func appMCPReviewChanges(tool *AppMCPTool, schema *AppMCPSchema, preview map[str
 			before, hasBefore := object["before"]
 			after, hasAfter := object["after"]
 			if hasBefore && hasAfter {
-				row.Before, row.After = appMCPReviewValueText(before), appMCPReviewValueText(after)
+				row.Before, row.After, row.HasBefore = appMCPReviewValueText(before), appMCPReviewValueText(after), true
 				row.Changed = row.Before != row.After
 				rows = append(rows, row)
 				continue
@@ -327,7 +327,7 @@ func appMCPReviewChanges(tool *AppMCPTool, schema *AppMCPSchema, preview map[str
 		rows = append(rows, row)
 	}
 	for _, pair := range tool.ReviewChanges {
-		row := appMCPReviewChange{Before: appMCPReviewValueText(preview[pair.Before]), After: appMCPReviewValueText(preview[pair.After])}
+		row := appMCPReviewChange{Before: appMCPReviewValueText(preview[pair.Before]), After: appMCPReviewValueText(preview[pair.After]), HasBefore: true}
 		if pair.Label != "" {
 			row.Label = appMCPReviewText(pair.Label)
 		} else if name, ok := preview[pair.Field].(string); ok && name != "" {

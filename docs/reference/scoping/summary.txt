@@ -1,0 +1,1 @@
+Three layers. Owner (user_id auto-set, list/update/delete filtered). Org (configurable foreign-key column from app.yaml groups:). Admin (bypasses all, unless stepped in via act_as). Plus optional public_read_when SQL fragment for shared rows. Which key answers which who-may-see-this-row question: api({at:'access.which_topic'}).

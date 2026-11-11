@@ -1,0 +1,61 @@
+model Note {
+  id        Int      @id @default(autoincrement())
+  title     String
+  body      String   @default("")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([userId, updatedAt])
+}
+
+model Organization {
+ id Int @id @default(autoincrement())
+ name String
+ userId Int @map("user_id")
+}
+model Member {
+ id Int @id @default(autoincrement())
+ orgId Int @map("org_id")
+ userId Int @map("user_id")
+ memberRole String @default("member") @map("member_role")
+ active Int @default(1)
+ @@unique([orgId,userId])
+}
+model CaseRecord {
+ id Int @id @default(autoincrement())
+ orgId Int @map("org_id")
+ userId Int @map("user_id")
+ title String
+ summary String @default("")
+ narrative String @default("")
+ clientReference String @default("") @map("client_reference")
+ budgetCents Int @default(0) @map("budget_cents")
+ status String @default("open")
+ shareToken String @default("") @map("share_token")
+ deletedAt DateTime? @map("deleted_at")
+ createdAt DateTime @default(now()) @map("created_at")
+ updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+ documents CaseDocument[]
+ @@fulltext([title,summary,shareToken])
+}
+model CaseDocument {
+ id Int @id @default(autoincrement())
+ orgId Int @map("org_id")
+ userId Int @map("user_id")
+ caseId Int @map("case_id")
+ title String
+ body String @default("")
+ fileUrl String @default("") @map("file_url")
+ accessToken String @default("") @map("access_token")
+ deletedAt DateTime? @map("deleted_at")
+ updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+ case CaseRecord @relation(fields:[caseId],references:[id])
+}
+model ReferenceBulletin {
+ id Int @id @default(autoincrement())
+ userId Int @map("user_id")
+ title String
+ body String
+ updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+}

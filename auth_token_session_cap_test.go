@@ -64,7 +64,7 @@ func TestTokenExchangeSessionsPerAccountAreCapped(t *testing.T) {
 	exchangeSessions := func(uid int64) int {
 		t.Helper()
 		var n int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM _benmore_sessions WHERE user_id = ? AND COALESCE(login_at, 0) = 0
+		if err := db.QueryRow(`SELECT COUNT(*) FROM _benmore_sessions WHERE user_id = ? AND COALESCE(login_at, 0) <= 0
 			AND COALESCE(is_impersonation, 0) = 0 AND COALESCE(scopes, '') <> 'embed'`, uid).Scan(&n); err != nil {
 			t.Fatal(err)
 		}

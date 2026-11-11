@@ -1,0 +1,47 @@
+on:
+  request:
+    method: GET
+    path: /api/contract/:ref_code
+    auth: required
+    contract:
+      headers:
+        type: object
+        properties:
+          Idempotency-Key: {type: string}
+        required: [Idempotency-Key]
+        additionalProperties: false
+      query:
+        type: object
+        properties:
+          limit: {type: integer}
+        additionalProperties: false
+      responses:
+        '200':
+          type: object
+          properties:
+            rows:
+              type: array
+              items:
+                type: object
+                properties:
+                  label:
+                    anyOf:
+                      - {type: string}
+                      - {type: 'null'}
+                required: [label]
+                additionalProperties: false
+          required: [rows]
+          additionalProperties: false
+        '403':
+          type: object
+          properties:
+            error: {type: string, enum: [forbidden]}
+          required: [error]
+          additionalProperties: false
+jobs:
+  respond:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          json: {rows: []}

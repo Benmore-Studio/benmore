@@ -1,0 +1,34 @@
+model Team {
+  id     Int    @id @default(autoincrement())
+  name   String
+  userId Int?   @map("user_id")
+
+  @@map("teams")
+}
+
+model TeamMember {
+  id         Int     @id @default(autoincrement())
+  teamId     Int     @map("team_id")
+  userId     Int     @map("user_id")
+  memberRole String? @map("member_role")
+  standing   String
+
+  @@map("team_members")
+}
+
+model Room {
+  id    Int    @id @default(autoincrement())
+  title String @default("")
+
+  @@map("rooms")
+}
+
+model RoomMember {
+  id       Int     @id @default(autoincrement())
+  roomId   Int     @map("room_id")
+  memberId Int     @map("member_id")
+  standing String?
+
+  @@unique([roomId, memberId])
+  @@map("room_members")
+}

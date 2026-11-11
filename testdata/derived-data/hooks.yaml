@@ -1,0 +1,4 @@
+# An API delete of an event runs this hook; the retention sweep does not.
+on_delete:
+  events:
+    - sql: "INSERT INTO deleted_events (title) VALUES ('{{title}}')"

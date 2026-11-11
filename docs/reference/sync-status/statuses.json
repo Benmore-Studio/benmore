@@ -1,0 +1,11 @@
+[
+  "synced",
+  "local_changed",
+  "remote_changed",
+  "conflict",
+  "local_only",
+  "remote_only",
+  "deleted_local",
+  "deleted_remote",
+  "instance_migration"
+]

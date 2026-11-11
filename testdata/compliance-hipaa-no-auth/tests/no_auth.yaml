@@ -1,0 +1,10 @@
+# compliance: hipaa alone must not switch authentication on (the key is not an auth: block).
+no_auth_routes_stay_off:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+    - post: "/signup"
+      expect:
+        status_in: [404, 405]

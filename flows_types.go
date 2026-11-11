@@ -5,6 +5,7 @@ package main
 // Flow declarations, step configuration, and execution context.
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"sync"
@@ -18,8 +19,9 @@ type Flow struct {
 	sourceHash string // exact bytes parsed by the checked loader
 	Trigger    FlowTrigger
 	// Verify is the legacy string-shaped verifier: a named provider
-	// ("stripe", "github", "slack", "shopify") or a custom header name
-	// for HMAC-SHA256 fallback. Kept for back-compat. New flows should
+	// ("stripe", "github", "slack", "shopify") or a custom header name that
+	// carries a body HMAC-SHA256 (only that header is read). Kept for
+	// back-compat. New flows should
 	// prefer VerifyConfig (the recipe form) for richer control -
 	// timestamp/replay protection, explicit signature prefixes, etc.
 	Verify       string
@@ -42,10 +44,18 @@ type Flow struct {
 	// async path - by definition the response was already sent.
 	Async      bool
 	Idempotent bool `yaml:"idempotent"`
+	// MaxAttempts is how many runs a queued job of this flow (a `mode: async`
+	// request, a `run: enqueue` step naming it) may take: declared as
+	// `on.request.max_attempts`, 1 when absent. A failed run is repeated only
+	// for a failure a later run can change (flows_job_attempts.go).
+	MaxAttempts int
 	// RateLimit, when set (via `rate_limit:` on on.request), caps how often the
 	// flow can be invoked per requester before it 429s - see flows_ratelimit.go.
 	RateLimit *FlowRateLimit
-	Steps     []FlowStep
+	// Timeout is the declared `on.request.timeout` of a synchronous HTTP
+	// flow; 0 means the default (flows_time_limit.go).
+	Timeout time.Duration
+	Steps   []FlowStep
 	// Command is a private, source-owned named declaration. It is inert in the
 	// ordinary HTTP/job executors; only the approved MCP operation can consume it.
 	Command *FlowCommand
@@ -63,7 +73,8 @@ type FlowTrigger struct {
 	// Inputs is the optional declared input signature (http triggers).
 	// Surfaced in /_internal/flows.json so bm.flows typing + the FlowForm
 	// component can derive a form. Declared values are validated before execution.
-	Inputs map[string]FlowInput
+	Contract map[string]any
+	Inputs   map[string]FlowInput
 }
 
 // FlowStep represents a single step in a flow pipeline.
@@ -118,6 +129,7 @@ type FlowStep struct {
 	WebhookJSON any
 	WS          *FlowWS        // legacy `ws:` room message step
 	Broadcast   *FlowBroadcast // `run: broadcast` room message step
+	Notify      *FlowNotify    // `run: notify` in-app notification step
 	Enqueue     *FlowEnqueue   // enqueue a job for background processing
 	Redirect    string
 	Respond     *FlowRespond
@@ -142,12 +154,20 @@ type FlowStep struct {
 	// a private file (uploads/private/...) can be served to an anon
 	// caller the flow has already gated, without minting a signed URL.
 	ServeFile *FlowServeFile
+	// Proxy streams an outside service's answer to the caller as the
+	// terminal response (`run: proxy`, flows_proxy.go).
+	Proxy *FlowProxy
 	// DeleteUpload is an interpolated stored private-upload reference for the
 	// server-only run: delete_upload step.
 	DeleteUpload string
+	// UploadRecord is the `with.record` of a serve_file or delete_upload
+	// step: the row that owns the private file (flows_upload_owner.go).
+	UploadRecord *FlowUploadRecord
 	// InspectPrivateUpload reads a bounded app-owned PDF or PNG in the
 	// isolated parser and returns a server-derived hash and dimensions.
 	InspectPrivateUpload *FlowInspectPrivateUpload
+	// ExtractText reads a private PDF's text in the isolated parser.
+	ExtractText *FlowExtractText
 	// RenderPDFSignatures stamps signature PNGs onto a new immutable PDF.
 	RenderPDFSignatures *FlowRenderPDFSignatures
 	// RevokeUserID is the authored `user_id` of a command-only
@@ -169,6 +189,11 @@ type FlowStep struct {
 	// Without it a templated target must stay same-origin; see
 	// flowRedirectTarget.
 	RedirectAllowHosts []string
+	// ForEachSource is a for_each step's source as the author wrote it
+	// (`${{ steps.rows.outputs }}`), named by the error a source that is
+	// not a list raises (forEachItems). Empty for legacy flows, whose
+	// ForEach is named instead.
+	ForEachSource string
 }
 
 // FlowServeFile is the payload for a `run: serve_file` step.
@@ -178,15 +203,78 @@ type FlowStep struct {
 //     path: ${{ steps.item.outputs.file_url }}  # /uploads/private/x.pdf
 //     disposition: inline                        # inline (default) | attachment | ${{ expr }}
 //     filename: "Q4 report.pdf"                  # optional download name
+//     expires_in: 2h                             # optional signed-link lifetime (CDN private files)
 type FlowServeFile struct {
 	Path        string
 	Disposition string // "inline" (default) or "attachment"; may be a ${{ }} expression
 	Filename    string // optional Content-Disposition filename
+	// ExpiresIn is the lifetime of the signed CDN link for a private file
+	// (`with.expires_in`, a literal up to 6h). Zero means the default:
+	// mediaPlaybackSignTTL for audio/video, serveFileSignTTL otherwise.
+	ExpiresIn time.Duration
+}
+
+// FlowUploadRecord names the row that owns the private upload a
+// `run: serve_file` or `run: delete_upload` step reads or deletes:
+//
+//   - run: serve_file
+//     with:
+//     path: ${{ steps.doc.outputs.file_url }}
+//     record: { table: documents, id: "${{ steps.doc.outputs.id }}" }
+//
+// The row must reference the file and belong to its uploader (user_id) or
+// the uploader's tenant: the rule /api/_signed_url applies
+// (privateUploadVouched).
+type FlowUploadRecord struct {
+	Table string // a literal table name
+	ID    string // the row id; may be a ${{ }} template
+}
+
+// FlowProxy is the payload for a `run: proxy` step (flows_proxy.go):
+//
+//   - run: proxy
+//     with:
+//     url: https://api.example.com/v1/audio/${{ params.id }}
+//     method: POST                 # GET (default) or POST
+//     headers: { xi-api-key: "${{ env.KEY }}" }
+//     json: { text: "${{ params.text }}" }   # or body: (text)
+//     content_types: [audio/mpeg]  # required, from proxyContentTypes
+//     max_bytes: 20MB              # default 10 MiB, at most 100 MiB
+//     timeout: 30s
+//     disposition: inline          # inline (default) | attachment
+//     filename: speech.mp3         # the extension follows the served type
+//     cache_control: private, max-age=300  # literal; default private, no-store
+type FlowProxy struct {
+	// Request is the outbound call: URL, Method, Auth, Headers and one body
+	// (Body, JSON, JSONArray or JSONRef). Its other fields stay empty.
+	Request *FlowAPICall
+	// ContentTypes are the media types the step accepts from the upstream,
+	// as written; each must be a key of proxyContentTypes.
+	ContentTypes []string
+	// MaxBytes caps the streamed body; 0 is proxyDefaultMaxBytes. Negative
+	// when the written value did not parse (the step then refuses to run).
+	MaxBytes    int64
+	Disposition string // "inline" (default) or "attachment", literal
+	Filename    string // optional download name, a template, sanitized at run time
+	// CacheControl is the literal `cache_control:` the answer carries
+	// (proxyCacheControl); "" sends `private, no-store`. The loader clears a
+	// shared value on a flow signed-in callers reach (dropSharedCacheControl).
+	CacheControl string
+	// PathSlashes is the literal `path_slashes: true`: a path value that is
+	// not request text (a stored file key) may span segments
+	// (interpolateAuthoredHostURL). Without it every value the author did
+	// not write is one plain segment.
+	PathSlashes bool
 }
 
 type FlowInspectPrivateUpload struct {
 	SourcePath string
 	Kind       string
+}
+
+type FlowExtractText struct {
+	SourcePath string
+	OCR        *bool // nil: on
 }
 
 type FlowRenderPDFSignatures struct {
@@ -281,6 +369,19 @@ type FlowBroadcast struct {
 	HasPayload bool // `payload:` key present (an explicit null counts)
 }
 
+// FlowNotify is a `run: notify` step: one in-app notification for one user,
+// stored and announced like a hooks.yaml `notify:` (execStepNotify,
+// flows_notify.go). Every field is GHA-ref normalized text resolved by
+// interpolateCtx when the step runs; UserID must then be a positive whole
+// number naming an existing user.
+type FlowNotify struct {
+	UserID string
+	Title  string
+	Body   string
+	Type   string // info | success | warning | error (default info)
+	Link   string
+}
+
 // FlowAPICall represents an outbound HTTP request step.
 type FlowAPICall struct {
 	Method  string
@@ -299,13 +400,17 @@ type FlowAPICall struct {
 	// upstream API - e.g. Modern Treasury's required `routing_details`/
 	// `account_details` arrays. String leaves are ctx-interpolated and
 	// the whole structure is json.Marshal'd at send time (execStepAPI).
-	// Mirrors FlowRespond.JSON. See benmore-go #94.
+	// Mirrors FlowRespond.JSON.
 	JSON map[string]any
 	// JSONArray is a JSON list body: `with.json` written as a list, or
 	// `with.body` written as one. Resolved and sent like JSON.
 	JSONArray []any
-	Form      map[string]string
-	Body      string
+	// JSONRef is `with.json` written as one `${{ }}` reference: the value
+	// it names (a step's object or list, a request field) is the JSON body.
+	// It used to be dropped, so the request went out with no body.
+	JSONRef string
+	Form    map[string]string
+	Body    string
 	// Sign, if set, runs a recipe-based signer over the built request
 	// before it ships. The recipe (named built-in or inline) declares
 	// optional token exchange + ordered compute bindings + headers/query
@@ -353,7 +458,12 @@ type FlowAPIPaginate struct {
 	CursorField string // JSON path to read next cursor from each response (e.g. "$.next_cursor")
 	// Page-strategy fields.
 	PageParam string // query param name (default "page")
-	PageStart int    // first page number (default 1)
+	// PageStart is the first page number. It counts only when PageStartSet:
+	// the loader sets both for a `page_start` of 0 or more (withToPaginate),
+	// so an upstream that numbers its pages from 0 can be read from its
+	// first one. Unset, the first page is 1.
+	PageStart    int
+	PageStartSet bool
 	// Either strategy.
 	ItemsField string // JSON path to the items array in each response (e.g. "$.shipments")
 	MaxPages   int    // safety cap (default 50, hard max 500)
@@ -389,6 +499,11 @@ type FlowEmail struct {
 	Text                string            // inline plain-text body / multipart alt
 	Data                map[string]string // extra template vars, overlaid on the flow context (alias: vars)
 	Attachments         []FlowAttachment  // files attached to the send (base64 content)
+	// AttachmentsError is why the step's `attachments:` names no file to
+	// attach (not a list, an entry that is not a map or has no content;
+	// emailAttachmentUnresolvable). The step fails with it before anything is
+	// sent: the message used to go out without the file.
+	AttachmentsError string
 	// From overrides EMAIL_FROM for this one send ("send as"). The
 	// from-domain is NOT the flow's to choose freely: on the hosted
 	// platform the email broker refuses any domain not verified for this
@@ -443,13 +558,35 @@ type FlowRespondHeader struct {
 
 // FlowContext holds execution state for a flow run.
 type FlowContext struct {
-	App       *App
-	Request   *http.Request
-	Writer    http.ResponseWriter
-	apiClient *http.Client // per-execution internal test client for api and webhook steps; nil uses the strict SSRF client
+	// readAuditErr: under compliance: hipaa, the post-transaction read-audit
+	// write failed (flushFlowTxReadAudit); the HTTP owner must not release rows.
+	readAuditErr error
+	App          *App
+	Request      *http.Request
+	Writer       http.ResponseWriter
+	apiClient    *http.Client // per-execution internal test client for api and webhook steps; nil uses the strict SSRF client
 	// privateResponse remembers identity injected into a public flow even if
 	// a later step revokes the session. It grants no step authorization.
 	privateResponse bool
+	// verifiedRequest marks a run of a `verify:` flow. No verifier signs
+	// the URL query, so nothing is bound from it: `run: parse` of a form
+	// body reads PostForm, never Request.Form (which merges the query in).
+	verifiedRequest bool
+	// liveResponse marks a run whose Writer answers a live HTTP caller: a
+	// synchronous request flow, set by the HTTP entry point only. Scheduled,
+	// connector, job, cron and event runs, parallel branches and on_error
+	// handlers never have it, so `run: proxy` refuses to run there.
+	liveResponse bool
+	// backgroundRun marks a job, cron, scheduled or data-event run: the only
+	// runs `run: extract_text` accepts. Derived contexts (parallel branches,
+	// on_error handlers) copy it; every other entry point (the HTTP request,
+	// the admin tool runner) leaves it false, so the step refuses there.
+	backgroundRun bool
+	// responseAborted means a `run: proxy` step flushed the status and the
+	// first part of the body to the caller and then failed. Nothing may write after it (no retry, no
+	// on_error handler), and the HTTP entry point aborts the connection so
+	// the caller cannot take the truncated body for a complete one.
+	responseAborted bool
 	// Session is the immutable authenticated actor captured by the HTTP entry
 	// point. Destructive server-only steps must authorize from this value, never
 	// from ctx.Data/Params, which are mutable and may be request-controlled.
@@ -470,11 +607,25 @@ type FlowContext struct {
 	// its host (flows_api_url.go). Like RequestKeys it only grows, and it is
 	// shared with on_error contexts and carried to enqueued jobs.
 	SecretKeys map[string]bool
+	// SQLTextKeys records which Data keys hold a value built from the
+	// caller's email address (flows_user_taint.go). The address is the
+	// server's identity everywhere else, but signup accepts quotes and SQL
+	// comment characters in it, so `run: sql_dynamic` never splices it into
+	// SQL text. user_email and user.email are always in the set (sqlTextRef);
+	// like SecretKeys it only grows, is shared with on_error contexts and is
+	// carried to enqueued jobs.
+	SQLTextKeys map[string]bool
 	// requestStepSources holds, for each request-tainted step output, the
 	// author-written strings of the step that produced it, so a URL that
 	// step fixed (a literal, an env value) can still name the host of a
 	// call that sends secret-derived values (flowValueAuthoredByStep).
 	requestStepSources map[string][]string
+	// computedKeys marks request-tainted keys whose value is data a step
+	// computed (a SQL row, an api answer, a compute result, a data-event
+	// row) rather than text the caller sent. The other tainted keys are
+	// request text, which JSON bodies never decode into an object or array
+	// (flows_request_text.go). Shared with on_error contexts.
+	computedKeys map[string]bool
 	// NullParams records which keys in Params should bind as SQL NULL
 	// (not the empty string). ctx.Params is map[string]string for
 	// historical HTTP-path-param reasons - empty string and NULL are
@@ -493,6 +644,10 @@ type FlowContext struct {
 	mcpReadConn   *sql.Conn // private connector reads pin a protected connection
 	mcpReadKey    []byte
 	Tx            *sql.Tx // active transaction (nil if not transactional)
+	// txWriteSteps names the steps whose stored output came from a write run
+	// in Tx. The rollback before an on_error handler removes those outputs
+	// (forgetRolledBackWriteOutputs). Guarded by DataMu.
+	txWriteSteps map[string]bool
 	// TxMu serializes access to Tx. database/sql's *sql.Tx is NOT safe for
 	// concurrent use, but a flow that is both `transaction: true` and
 	// contains a `parallel:` block fans SQL steps out across goroutines
@@ -542,6 +697,23 @@ type FlowContext struct {
 	// or unnamed parse output that are still readable by their bare name
 	// (flows.go, shadowStepNamedRequestKeys). Shared with on_error contexts.
 	lazyShadow *flowLazyShadow
+	// queuedBody is the request body an async flow's job carried
+	// (flowRequestBodyPayloadField). A `run: parse` body step reads it when
+	// there is no live request, as in the job worker.
+	queuedBody *flowParsedBody
+	// requestOnlyParams names the flow's step ids, set keys and loop
+	// variables once shadowStepNamedRequestKeys (or the job worker) has run.
+	// `${{ params.<name> }}` then reads only the request field, which the
+	// shadow store holds; without one it is missing rather than what a step
+	// wrote (flowLookup, flowDataValue, flowRequestOnlyParamNames).
+	requestOnlyParams map[string]bool
+	// execCtx carries a synchronous HTTP run's deadline (on.request.timeout,
+	// flows_time_limit.go): its transaction, SQL statements, outbound calls
+	// and compute run under it, and steps stop once it passes. Nil for async,
+	// scheduled, event and connector runs. timeLimit is its length. Shared
+	// with on_error and parallel contexts.
+	execCtx   context.Context
+	timeLimit time.Duration
 }
 
 // noteMissingRef appends an unresolved expression to ctx.MissingRefs so
@@ -562,6 +734,17 @@ func (ctx *FlowContext) noteMissingRef(expr string) {
 		}
 	}
 	ctx.MissingRefs = append(ctx.MissingRefs, expr)
+}
+
+// hasMissingRefs reports whether the current step has left an unresolved
+// reference so far, without clearing it (the dispatcher still reports it).
+func (ctx *FlowContext) hasMissingRefs() bool {
+	if ctx == nil {
+		return false
+	}
+	ctx.DataMu.Lock()
+	defer ctx.DataMu.Unlock()
+	return len(ctx.MissingRefs) > 0
 }
 
 // takeMissingRefs returns + clears ctx.MissingRefs. The step dispatcher

@@ -1,0 +1,1 @@
+Install the native hosted CLI. Homebrew is the primary macOS path; the checksum-verifying curl installer is primary on Linux and CI. @benmore/cli is only a dependency-free deprecation notice.

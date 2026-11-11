@@ -187,7 +187,8 @@ func TestAppMCPExposureCommitNeedsTheApprovingSessionAlive(t *testing.T) {
 	if _, code := h.call(h.client, appMCPCommitTool, map[string]any{"operation_id": id}); code != "denied" || h.taskDone() {
 		t.Fatalf("commit with a revoked approver session: %q", code)
 	}
-	if state := h.status(id); state["state"] != "approved" {
+	// _status says what _commit just said (it used to read `approved` here).
+	if state := h.status(id); state["state"] != "denied" || state["reason"] != appMCPBlockApprovalLapsed {
 		t.Fatalf("status: %#v", state)
 	}
 	// An expired session is as dead as a deleted one.

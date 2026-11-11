@@ -13,7 +13,6 @@ package main
 // POSIX sh scripts.
 
 import (
-	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -257,151 +256,12 @@ jobs:
 	}
 }
 
-// TestTranscribeBriefFlowYAML executes the REAL _platform flow
-// (apps/_platform/flows/transcribe_brief.yaml - the file the portal
-// ships, not a fixture copy) through the real loader against a seeded
-// sqlite fixture with fake binaries: the closest repeatable
-// approximation of the portal happy path the Go harness can express.
-// (The full HTTP shape - member submit → 202 → job worker - needs a
-// running server + session auth + the jobs worker; the degraded half of
-// that is pinned by apps/_platform/tests/portal_onboarding.yaml.)
-// This pins the guard SELECT shape, the `save` UPDATE with
-// expect_rows "=1", the announce INSERT..SELECT channel targeting, the
-// non-member no-op, and the retry-safety no-op (status != 'pending').
-func TestTranscribeBriefFlowYAML(t *testing.T) {
-	platformDir := filepath.Join("apps", "_platform")
-	if _, err := os.Stat(platformDir); os.IsNotExist(err) {
-		t.Skip("private platform fixture is not shipped in the framework export")
-	} else if err != nil {
-		t.Fatal(err)
-	}
-
-	app, cleanup := newTestApp(t)
-	defer cleanup()
-
-	binDir := t.TempDir()
-	writeFakeBin(t, binDir, "ffmpeg", fakeFfmpegScript)
-	writeFakeBin(t, binDir, "whisper-cli", fakeWhisperScript)
-	setFakePATH(t, binDir)
-	seedModel(t, "small.en")
-
-	// The actual shipped flow file, loaded from the repo tree.
-	raw, err := os.ReadFile(filepath.Join(platformDir, "flows", "transcribe_brief.yaml"))
-	if err != nil {
-		t.Fatalf("read the shipped flow: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(app.Dir, "flows"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(app.Dir, "flows", "transcribe_brief.yaml"), raw, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	flows := LoadFlowsGHA(app.Dir)
-	if len(flows) != 1 {
-		t.Fatalf("expected 1 flow from transcribe_brief.yaml, got %d", len(flows))
-	}
-
-	// Minimal portal fixture: one project, one member (user 42), a
-	// #general standard channel, and a pending submission with audio.
-	for _, q := range []string{
-		`CREATE TABLE svc_projects (id INTEGER PRIMARY KEY, slack_channel_id TEXT)`,
-		`CREATE TABLE svc_members (project_id INTEGER, user_id INTEGER)`,
-		`CREATE TABLE svc_channels (id INTEGER PRIMARY KEY, project_id INTEGER, kind TEXT, name TEXT)`,
-		`CREATE TABLE svc_onboarding (id INTEGER PRIMARY KEY, project_id INTEGER, audio_url TEXT, transcript TEXT, status TEXT, updated_at TEXT)`,
-		`CREATE TABLE svc_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER, channel_id INTEGER, sender_kind TEXT, body TEXT, origin TEXT, created_at TEXT, updated_at TEXT)`,
-		`INSERT INTO svc_projects (id, slack_channel_id) VALUES (1, NULL)`,
-		`INSERT INTO svc_members (project_id, user_id) VALUES (1, 42)`,
-		`INSERT INTO svc_channels (id, project_id, kind, name) VALUES (10, 1, 'standard', 'general')`,
-		`INSERT INTO svc_onboarding (id, project_id, audio_url, status) VALUES (7, 1, '/uploads/onboarding/7.webm', 'pending')`,
-	} {
-		mustExec(t, app.DB, q)
-	}
-	EnsureUploadOwnersTable(app.DB) // created at app load; the flow checks the audio's uploader
-	audioFull := filepath.Join(app.Dir, "uploads", "onboarding", "7.webm")
-	if err := os.MkdirAll(filepath.Dir(audioFull), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(audioFull, []byte("fake-audio-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	runFlow := func(submissionID, userID int) *FlowContext {
-		ctx := &FlowContext{
-			App:    app,
-			Data:   map[string]any{"submission_id": fmt.Sprint(submissionID), "user": map[string]any{"id": userID}},
-			Params: map[string]string{},
-		}
-		executeSteps(ctx, flows[0].Steps)
-		return ctx
-	}
-
-	// Happy path: member 42, pending submission 7 → transcript saved,
-	// status flipped, one system announce in #general.
-	if ctx := runFlow(7, 42); ctx.Error != nil {
-		t.Fatalf("happy path errored: %v (step %q)", ctx.Error, ctx.FailedStep)
-	}
-	var transcript, status string
-	if err := app.DB.QueryRow(`SELECT transcript, status FROM svc_onboarding WHERE id = 7`).Scan(&transcript, &status); err != nil {
-		t.Fatal(err)
-	}
-	if transcript != "hello from whisper" {
-		t.Errorf("transcript = %q, want the fake transcript", transcript)
-	}
-	if status != "transcribed" {
-		t.Errorf("status = %q, want transcribed", status)
-	}
-	var msgs int
-	var channelID int
-	if err := app.DB.QueryRow(`SELECT COUNT(*), COALESCE(MAX(channel_id),0) FROM svc_messages WHERE project_id = 1 AND sender_kind = 'system'`).Scan(&msgs, &channelID); err != nil {
-		t.Fatal(err)
-	}
-	if msgs != 1 {
-		t.Fatalf("announce messages = %d, want exactly 1", msgs)
-	}
-	if channelID != 10 {
-		t.Errorf("announce landed in channel %d, want the #general channel 10", channelID)
-	}
-
-	// Retry safety (the async worker retries a failed job): re-running
-	// for the SAME submission finds no 'pending' row → guard SELECT is
-	// empty → clean no-op, no double-announce.
-	if ctx := runFlow(7, 42); ctx.Error != nil {
-		t.Fatalf("retry re-run errored: %v", ctx.Error)
-	}
-	if err := app.DB.QueryRow(`SELECT COUNT(*) FROM svc_messages`).Scan(&msgs); err != nil {
-		t.Fatal(err)
-	}
-	if msgs != 1 {
-		t.Errorf("re-run double-announced: %d messages, want still 1", msgs)
-	}
-
-	// Non-member no-op: user 99 is not on project 1, so a fresh pending
-	// submission stays untouched and nothing is announced - the same
-	// uniform "completed" a missing id gets (no existence oracle).
-	mustExec(t, app.DB, `INSERT INTO svc_onboarding (id, project_id, audio_url, status) VALUES (8, 1, '/uploads/onboarding/7.webm', 'pending')`)
-	if ctx := runFlow(8, 99); ctx.Error != nil {
-		t.Fatalf("non-member run errored: %v", ctx.Error)
-	}
-	if err := app.DB.QueryRow(`SELECT status FROM svc_onboarding WHERE id = 8`).Scan(&status); err != nil {
-		t.Fatal(err)
-	}
-	if status != "pending" {
-		t.Errorf("non-member run touched the row: status = %q, want pending", status)
-	}
-	if err := app.DB.QueryRow(`SELECT COUNT(*) FROM svc_messages`).Scan(&msgs); err != nil {
-		t.Fatal(err)
-	}
-	if msgs != 1 {
-		t.Errorf("non-member run announced: %d messages, want still 1", msgs)
-	}
-}
-
 func TestTranscribeStepMissingBinaryErrors(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 
-	// PATH carries ffmpeg but NO whisper-cli - the portal's degrade
-	// scenario. The flow must fail loud through the normal step_error
+	// PATH carries ffmpeg but NO whisper-cli - a host without the
+	// transcriber. The flow must fail loud through the normal step_error
 	// path with the actionable remedy in the message.
 	binDir := t.TempDir()
 	writeFakeBin(t, binDir, "ffmpeg", fakeFfmpegScript)

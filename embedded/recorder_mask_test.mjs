@@ -156,5 +156,27 @@ function runRecorder({ page, href, maskScript = src }) {
   if (code.textContent !== 'SECRET-TOKEN-ONE' || pw.getAttribute('value') !== 'PW-MUTATION-NINE') failures.push('secret page: the recorder modified the live DOM');
 }
 
+// ─── a server-rendered sign-in step: one-time codes outside any mask ──
+{
+  const byHint = h('input', { name: 'code', autocomplete: 'one-time-code', inputmode: 'numeric', value: '' });
+  const byName = h('input', { name: 'otp', value: '' });
+  const byId = h('input', { id: 'totp-input', value: '' });
+  const newPw = h('input', { type: 'text', name: 'confirm', autocomplete: 'new-password', value: '' });
+  const zip = h('input', { name: 'zip', value: '' });
+  const page = h('html', {}, h('head', {}), h('body', {}, byHint, byName, byId, newPw, zip));
+  const r = runRecorder({ page, href: 'https://app.test/login' });
+  byHint.value = 'TYPED-OTP-ELEVEN'; r.input(byHint);
+  byName.value = 'TYPED-OTP-TWELVE'; r.input(byName);
+  byId.value = 'TYPED-TOTP-THIRTEEN'; r.input(byId);
+  newPw.value = 'TYPED-NEWPW-FOURTEEN'; r.input(newPw);
+  zip.value = 'ORDINARY-ZIP'; r.input(zip);
+  r.unload();
+  const all = r.sent.join('\n');
+  for (const secret of ['TYPED-OTP-ELEVEN', 'TYPED-OTP-TWELVE', 'TYPED-TOTP-THIRTEEN', 'TYPED-NEWPW-FOURTEEN']) {
+    if (all.includes(secret)) failures.push(`sign-in step: ${secret} reached the recording`);
+  }
+  if (!all.includes('ORDINARY-ZIP')) failures.push('sign-in step: an ordinary input was masked');
+}
+
 if (failures.length) { console.error(failures.join('\n')); process.exit(1); }
 console.log('all recorder masking assertions passed');

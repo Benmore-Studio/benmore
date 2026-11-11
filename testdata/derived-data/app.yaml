@@ -1,0 +1,9 @@
+site_name: "derived-data fixture"
+auth:
+  identifier: email
+
+# The app.yaml example of api(at:"aggregates"), verbatim.
+aggregates:
+  revenue:
+    sql: "SELECT COALESCE(SUM(line_total), 0) FROM orders"
+    refresh: "5m"

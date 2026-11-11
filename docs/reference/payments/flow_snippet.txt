@@ -1,0 +1,28 @@
+# flows.yaml - create a Stripe Checkout session.
+# The client names a product; the SERVER picks the Stripe price from its own
+# table. Never pass a client-supplied price_id to Stripe: any price on the
+# account (a $1 test price, another product) would be accepted.
+on:
+  request: { method: POST, path: /api/checkout, auth: required }
+jobs:
+  checkout:
+    steps:
+      - id: price                             # no matching row → the api step sends nothing; the flow answers 500 flow_no_response
+        run: sql
+        with:
+          query: "SELECT stripe_price_id FROM prices WHERE slug = :slug AND active = 1"
+          params: { slug: "${{ params.product }}" }
+      - id: session
+        run: api
+        with:
+          url: https://api.stripe.com/v1/checkout/sessions
+          method: POST
+          headers: { Authorization: "Bearer ${{ env.STRIPE_SECRET_KEY }}" }
+          form:
+            mode: payment
+            "line_items[0][price]": "${{ steps.price.outputs.first.stripe_price_id }}"
+            "line_items[0][quantity]": "1"
+            success_url: "https://${{ env.BENMORE_APP_NAME }}.benmore.ai/thanks"
+            cancel_url: "https://${{ env.BENMORE_APP_NAME }}.benmore.ai/cancel"
+      - run: respond
+        with: { json: { url: "${{ steps.session.outputs.json.url }}" } }

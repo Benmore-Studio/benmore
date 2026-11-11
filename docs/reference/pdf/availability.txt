@@ -1,0 +1,1 @@
+app.yaml `features.exports: false` returns 404 for GET /pdf/<page> and GET /api/_my-data before session lookup, database reads or rendering. Defaults to true. This controls framework HTTP exports only; it does not disable operator CLI exports or browser/OS printing.

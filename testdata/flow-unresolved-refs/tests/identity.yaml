@@ -1,0 +1,38 @@
+# The identity names in a queued flow are the runtime's, never the payload's.
+enqueue_payload_user_id_is_not_who_the_job_runs_for:
+  as_user: "caller@test.com"
+  steps:
+    - api: "POST /api/enqueue-identity"
+      json: { victim: "99999" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'job_writes_identity' AND json_extract(payload, '$.user_id') IS NOT NULL"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'job_writes_identity' AND json_extract(payload, '$.label') = 'enq'"
+      expect: { rows: 1 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'enq'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'job_writes_identity' AND status = 'failed'"
+      expect: { rows: 1 }
+
+enqueue_passes_a_user_under_its_own_name:
+  as_user: "caller@test.com"
+  steps:
+    - api: "POST /api/enqueue-target"
+      json: {}
+      expect: { status: 200 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'target' AND user_id = {{user_id}}"
+      expect: { rows: 1 }
+
+async_job_runs_as_the_caller_who_queued_it:
+  as_user: "caller@test.com"
+  steps:
+    - api: "POST /api/async-identity"
+      json: { user_id: 99999, user_email: "victim@test.com", user_role: "admin", user_group_id: "other", _group_id: "other" }
+      expect: { status: 202 }
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'async' AND user_id = {{user_id}} AND body = 'caller@test.com'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM notes WHERE title = 'async' AND (user_id = 99999 OR body = 'victim@test.com')"
+      expect: { rows: 0 }

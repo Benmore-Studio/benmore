@@ -1,0 +1,73 @@
+# api(at:"schema") custom_fields / custom_field_values: an admin adds a column
+# at run time; from then on it is an ordinary column of the table.
+# Run: benmore test <dir> --app
+
+admin_adds_a_field_and_rows_carry_it:
+  as_user: "admin@fields.test"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/_schema/orders/fields"
+      json: {name: "priority", type: "INTEGER", description: "1 = urgent"}
+      expect:
+        status: 201
+        json: {column: "priority", status: "created", type: "INTEGER"}
+    - get: "/api/_schema/orders/fields"
+      expect:
+        status: 200
+        contains: '"name":"priority","type":"INTEGER","custom":true,"description":"1 = urgent"'
+    # Written, read, filtered and sorted like any column.
+    - api: "POST /api/orders"
+      json: {title: "urgent one", priority: 1}
+      save: {oid: "id"}
+      expect:
+        status: 200
+        contains: '"priority":1'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {priority: 3}
+      expect:
+        status: 200
+    - get: "/api/orders?priority=3&sort=priority&order=desc"
+      expect:
+        status: 200
+        contains:
+          - '"title":"urgent one"'
+          - '"priority":3'
+    - api: "POST /api/_schema/orders/fields"
+      json: {name: "priority", type: "INTEGER"}
+      expect:
+        status: 409
+    - api: "POST /api/_schema/orders/fields"
+      json: {name: "flag", type: "BOOLEAN"}
+      expect:
+        status: 400
+        contains: "TEXT, INTEGER, REAL, DATETIME"
+    # Removing the field drops the column and its values.
+    - api: "DELETE /api/_schema/orders/fields/priority"
+      json: {}
+      expect:
+        status: 200
+        json: {column: "priority", status: "removed"}
+    - get: "/api/orders/{{oid}}"
+      expect:
+        status: 200
+        not_contains: "priority"
+    # A column of the schema is not a custom field.
+    - api: "DELETE /api/_schema/orders/fields/title"
+      json: {}
+      expect:
+        status: 404
+    - sql: "SELECT action FROM _benmore_audit_log WHERE action IN ('add_field', 'remove_field') AND table_name = 'orders'"
+      expect:
+        rows: 2
+
+only_admins_change_the_schema:
+  as_user: "member@fields.test"
+  steps:
+    - api: "POST /api/_schema/orders/fields"
+      json: {name: "stage", type: "TEXT"}
+      expect:
+        status: 403
+        contains: "admin required"
+    - get: "/api/_schema/orders/fields"
+      expect:
+        status: 403

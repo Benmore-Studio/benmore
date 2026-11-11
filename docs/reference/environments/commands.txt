@@ -1,0 +1,13 @@
+benmore promote <app>              # ship dev CODE → prod (publish); from a terminal it previews and asks first, --yes (or -y) skips the question
+benmore seed-dev <app>             # add a dev instance to an existing prod app (code only, empty dev data)
+benmore refresh-dev <app>                 # pull ALL prod code → dev - REFUSED if it would discard un-promoted dev work (use after a direct-to-prod change)
+benmore refresh-dev <app> --dry-run       # preview which dev files an all-files refresh would overwrite/delete (applies nothing)
+benmore refresh-dev <app> --force         # (or -f) proceed anyway; dev's code is git-snapshotted first, so it's recoverable
+benmore refresh-dev <app> --data-only     # pull prod DATA only, keep dev's files (e.g. test mid-flight schema changes vs real data)
+benmore refresh-dev <app> --files a,b     # pull only specific code files from prod
+benmore refresh-dev <app> --with-data     # files + prod's LIVE data (real/PII; dev data backed up first; copied sessions/tokens revoked, users sign in to dev again)
+benmore use dev|prod               # PIN the environment - every env-specific command targets it (dev-ops context switch)
+benmore use                        # show the current pin; benmore use none = unpin
+benmore push <file> --env prod     # hotfix: push code DIRECTLY to prod (bypasses promote; diverges prod from dev)
+benmore logs|sql|tail|restart <app> --env prod   # target prod explicitly (one-off override of the pin)
+# default (no pin, no --env): the app's own env - dev for apps that have a dev instance

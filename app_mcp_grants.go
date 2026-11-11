@@ -45,7 +45,7 @@ type appMCPTokenPair struct {
 }
 
 func ensureAppMCPGrantTables(db *sql.DB) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "connector grant tables"), nil)
 	if err != nil {
 		return err
 	}
@@ -106,6 +106,20 @@ func appMCPAutoApproveEntry(name, contractDigest, executionDigest string) string
 // appMCPAutoApproveDisplayName is the tool name of a stored entry.
 func appMCPAutoApproveDisplayName(entry string) string {
 	name, _, _ := strings.Cut(entry, "@")
+	return name
+}
+
+// appMCPAutoApproveConsentLabel is how the consent page names an offered
+// tool: its reviewed title, the same words the approval page heads with,
+// rather than the internal tool name. A tool without a title keeps its name.
+func appMCPAutoApproveConsentLabel(generation *appMCPRuntimeGeneration, name string) string {
+	if generation != nil && generation.manifest != nil {
+		for _, tool := range generation.manifest.Tools {
+			if tool.Name == name && strings.TrimSpace(tool.Title) != "" {
+				return tool.Title
+			}
+		}
+	}
 	return name
 }
 
@@ -292,7 +306,7 @@ func appMCPGrantActorForGenerationScopes(ctx context.Context, app *App, generati
 		return nil, errAppMCPGrantDenied
 	}
 	defer func() { rollbackAppMCPReadConn(conn); closeConn() }()
-	if err = conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPActor); return nil }); err != nil {
+	if err = conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPActor); return nil }); err != nil {
 		return nil, errAppMCPGrantDenied
 	}
 	// Literal deferred BEGIN, independent of the ordinary mutation DSN's txlock.
@@ -515,7 +529,7 @@ func readAppMCPCredentialGrant(ctx context.Context, app *App, hash, kind, resour
 		return nil, err
 	}
 	defer closeConn()
-	if err := conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPAccess); return nil }); err != nil {
+	if err := conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPAccess); return nil }); err != nil {
 		return nil, err
 	}
 	// One statement binds the live credential to its grant under one snapshot.
@@ -574,7 +588,22 @@ func refreshAppMCPGrantFor(ctx context.Context, app *App, raw, client, resource,
 			scopeErr = errAppMCPGrantDenied
 		}
 	}
-	actor, authorityErr := appMCPGrantActorFor(ctx, app, before, now)
+	// Two views of the same authority. The live view (write scopes only while
+	// owner approved writes are on) decides what this refresh issues now; the
+	// declared view (every reviewed tool permission) bounds what the grant
+	// keeps. Narrowing the stored grant by the live view made every refresh in
+	// a writes-off window (any reload turns writes off until the owner
+	// re-enables them) strip the client's write scopes for good.
+	generation := snapshotAppMCPGeneration(app)
+	var declared string
+	if generation != nil {
+		declared = appMCPDeclaredScopes(generation.manifest)
+	}
+	actor, authorityErr := appMCPGrantActorForGeneration(ctx, app, generation, before, now)
+	var keep *Session
+	if authorityErr == nil {
+		keep, authorityErr = appMCPGrantActorForGenerationScopes(ctx, app, generation, before, now, declared)
+	}
 	var tx *sql.Tx
 	var result sql.Result
 	// The consuming write is first: a deferred SQLite transaction must not
@@ -630,7 +659,7 @@ func refreshAppMCPGrantFor(ctx context.Context, app *App, raw, client, resource,
 	if scopeErr != nil {
 		return nil, scopeErr
 	}
-	grant.Scopes = intersectScopes(grant.Scopes, actor.Scopes)
+	grant.Scopes = intersectScopes(grant.Scopes, keep.Scopes)
 	if requested != "" {
 		grant.Scopes = intersectScopes(grant.Scopes, requested)
 	}
@@ -640,10 +669,17 @@ func refreshAppMCPGrantFor(ctx context.Context, app *App, raw, client, resource,
 	if _, err := tx.Exec("UPDATE main._benmore_mcp_grants SET scopes=? WHERE id=?", grant.Scopes, id); err != nil {
 		return nil, err
 	}
+	issued := intersectScopes(grant.Scopes, actor.Scopes)
+	if issued == "_none_:read" || issued == "" {
+		return nil, errAppMCPGrantDenied
+	}
 	pair, err := insertAppMCPCredentials(tx, grant, now)
 	if err != nil {
 		return nil, err
 	}
+	// Access tokens carry no scopes of their own (each use re-resolves the
+	// grant against live scopes); report the set usable now.
+	pair.Scopes = issued
 	if err := validateAppMCPEpoch(app.Dir, grant.Epoch); err != nil {
 		return nil, errAppMCPGrantDenied
 	}

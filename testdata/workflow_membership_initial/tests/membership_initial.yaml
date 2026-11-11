@@ -1,0 +1,45 @@
+# The membership rows the framework inserts itself start in the workflow's
+# `initial` state, like a row created through the API.
+
+# team_members.standing is NOT NULL with no column default: without `initial`
+# the founding membership insert fails and the org row is rolled back.
+founding_membership_starts_in_initial:
+  as_user: "founder@test.com"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: {name: "Acme"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM team_members WHERE standing = 'active' AND member_role = 'owner'"
+      expect:
+        rows: 1
+
+# room_members.standing is nullable with no column default: without `initial`
+# the auto-joined row holds NULL, a state no transition leaves.
+auto_join_starts_in_initial:
+  as_user: "roomer@test.com"
+  steps:
+    - api: "POST /api/rooms"
+      json: {title: "single-room"}
+      expect: {status: 200}
+    - api: "POST /api/rooms/batch"
+      json_array:
+        - {title: "batch-room"}
+      expect: {status: 200}
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {action: "insert", table: "rooms", data: {title: "tx-room"}}
+      expect: {status: 200}
+    - sql: "SELECT id FROM room_members WHERE standing = 'active'"
+      expect:
+        rows: 3
+    - sql: "SELECT id FROM room_members WHERE standing IS NULL"
+      expect:
+        rows: 0
+    - get: "/api/rooms"
+      expect:
+        status: 200
+        contains:
+          - "single-room"
+          - "batch-room"
+          - "tx-room"

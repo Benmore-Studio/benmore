@@ -40,7 +40,7 @@ func TestStepKeyWriteGateRefusesKeysTheRuntimeIgnores(t *testing.T) {
 		// A time limit on a step that cannot be cut off, at either position.
 		"with.timeout on sql": {
 			"      - run: sql\n        with: { query: \"UPDATE items SET qty = 1\", timeout: 5s }\n",
-			"`with.timeout` is not read on a `run: sql` step, so the step would run with no time limit of its own. Only `run: api`, `run: compute` and `run: transcribe` steps can be cut off",
+			"`with.timeout` is not read on a `run: sql` step, so the step would run with no time limit of its own. Only `run: api`, `run: proxy`, `run: compute` and `run: transcribe` steps can be cut off",
 		},
 		"with.timeout on sql_dynamic": {
 			"      - run: sql_dynamic\n        with: { query: \"${{ steps.plan.outputs.sql }}\", timeout: 5 }\n",
@@ -233,7 +233,7 @@ func TestStepKeyWriteGateRefusesKeysTheRuntimeIgnores(t *testing.T) {
 		"on_error on blocks":                 sqlStep + "      - if: ${{ steps.s.outputs.rows_affected }}\n        steps:\n          - run: sql\n            with: { query: \"SELECT 1\" }\n        on_error:\n          - run: respond\n            with: { status: 500, body: { error: block } }\n      - run: parallel\n        steps:\n          - run: sql\n            with: { query: \"SELECT 1\" }\n        on_error:\n          - run: respond\n            with: { status: 500, body: { error: fan } }\n",
 		"the same query in both places":      "      - run: sql\n        query: \"UPDATE items SET qty = 1\"\n        with: { query: \"UPDATE items SET qty = 1\" }\n",
 		"query shorthand with a with block":  "      - query: \"UPDATE items SET qty = :q\"\n        with: { params: { q: \"1\" } }\n",
-		"sql_dynamic with a rendered query":  "      - run: sql_dynamic\n        with: { query: \"${{ steps.plan.outputs.sql }}\" }\n",
+		"sql_dynamic with a rendered query":  "      - id: plan\n        run: compute\n        with: { module: m, function: f, args: {} }\n      - run: sql_dynamic\n        with: { query: \"${{ steps.plan.outputs.sql }}\" }\n",
 		// On `run: set` every `with:` key is a variable, whatever its name.
 		"set variables named like step keys": "      - id: vars\n        run: set\n        with: { retry: \"3\", timeout: \"5s\", if: \"x\", id: \"7\", sql: \"SELECT 1\", params: \"p\", payload: \"y\" }\n",
 		// A comment before the statement is still a statement.

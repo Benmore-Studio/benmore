@@ -1,0 +1,1 @@
+Body-signature recipes read the exact raw request body before form/JSON parsing, with a 1 MiB cap. Oversized input is rejected rather than verified or parsed from truncated bytes. Automatic JSON binding and later `run: parse` steps see the same bytes.

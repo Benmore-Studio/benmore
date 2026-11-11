@@ -1,0 +1,27 @@
+# flows.yaml - transcribe an uploaded voice note, then save + respond
+on:
+  request:
+    method: POST
+    path: /api/notes/:id/transcribe
+    auth: required
+    mode: async              # whisper on long audio can exceed a synchronous flow's time limit (30 s by default)
+
+jobs:
+  transcribe_note:
+    steps:
+      - id: n                                            # no row → the file ref below halts the flow
+        run: sql
+        with:
+          query: "SELECT audio_url FROM notes WHERE id = :id"
+      - id: t
+        run: transcribe
+        with:
+          file: "${{ steps.n.outputs.rows[0].audio_url }}"   # app-relative uploads/… path
+          # model: base.en                                   # optional override
+          # language: en                                     # optional; omit to auto-detect
+      - run: sql
+        with:
+          query: "UPDATE notes SET transcript = :t WHERE id = :id"
+          params:
+            t: "${{ steps.t.outputs.text }}"
+        expect_rows: "=1"

@@ -75,7 +75,7 @@ func TestRowScopeClause_MemberOf(t *testing.T) {
 	if bypass {
 		t.Fatal("member-of user must not bypass")
 	}
-	if !strings.Contains(pred, `EXISTS (SELECT 1 FROM main."room_members" WHERE main."room_members"."room_id" = main."messages"."room_id" AND main."room_members"."member_id" = ?)`) {
+	if !strings.Contains(pred, `EXISTS (SELECT 1 FROM main."room_members" AS _benmore_membership WHERE _benmore_membership."room_id" = main."messages"."room_id" AND _benmore_membership."member_id" = ?)`) {
 		t.Errorf("child table should join on its room_id column: %q", pred)
 	}
 	if len(args) == 0 || args[0] != int64(2) {
@@ -89,7 +89,7 @@ func TestRowScopeClause_MemberOf(t *testing.T) {
 
 	// Parent table: no room_id column → joins on id.
 	pred, _, _ = rowScopeClause(app, "rooms", user, "view")
-	if !strings.Contains(pred, `main."room_members"."room_id" = main."rooms"."id"`) {
+	if !strings.Contains(pred, `_benmore_membership."room_id" = main."rooms"."id"`) {
 		t.Errorf("parent table should join on id: %q", pred)
 	}
 
@@ -132,7 +132,7 @@ func TestMatchWSRoomPattern(t *testing.T) {
 		{"room-:id", "room-42", "42", true},
 		{"room-:id", "room-", "", false},
 		{"room-:id", "lobby", "", false},
-		{"teamup-room-:id", "teamup-room-a1b2", "a1b2", true},
+		{"squad-room-:id", "squad-room-a1b2", "a1b2", true},
 		{"chat/:slug/feed", "chat/general/feed", "general", true},
 		{"chat/:slug/feed", "chat/general", "", false},
 		{"lobby", "lobby", "", true},

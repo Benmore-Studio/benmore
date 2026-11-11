@@ -1,0 +1,1 @@
+Two patterns. DEV-FIRST (default): build on dev, `promote` to prod. PROD-PRIMARY: push to prod (`push --env prod`, or edit prod directly), then `refresh-dev` to realign the dev mirror - `--with-data` to debug against live data. Note: a direct-to-prod change diverges prod from dev, and a later `promote` would overwrite it - `refresh-dev` first to reconcile.

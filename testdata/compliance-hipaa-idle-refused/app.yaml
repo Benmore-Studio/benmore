@@ -1,0 +1,8 @@
+# `benmore test` on this app must FAIL at load: hipaa caps auth.idle_timeout at 15m.
+site_name: "Compliance idle refused fixture"
+compliance: hipaa
+auth:
+  identifier: email
+  idle_timeout: 1h
+frontend:
+  stack: html

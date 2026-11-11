@@ -1,0 +1,5 @@
+model ProbeWrite {
+  id    Int    @id @default(autoincrement())
+  value String
+  @@map("probe_writes")
+}

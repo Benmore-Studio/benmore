@@ -1,0 +1,1 @@
+`push`, `delete-file`, `deploy`, `pull`, and `sync` use the manifest guard. If the remote changed since `.benmore/remote.json` and the local operation would overwrite or discard code, the command blocks unless `--force` is supplied. `--force` is explicit: it bypasses the guard and refreshes `.benmore/remote.json` after success.

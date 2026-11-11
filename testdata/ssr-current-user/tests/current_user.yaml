@@ -1,0 +1,103 @@
+# `current_user` is a signed-in test and nothing else. It was the framework's
+# session object, so a page that printed it wrote the stored session key hash,
+# the user id, the address and the roles into its HTML. No form of it prints
+# anything, in either engine, and its sections follow the viewer's sign-in
+# state. The viewer's address reaches a page only through a documented value.
+
+mustache_signed_in_prints_nothing:
+  as_user: "viewer@fixture.test"
+  steps:
+    - get: "/viewer"
+      expect:
+        status: 200
+        contains:
+          - '<p id="plain">[]</p>'
+          - '<p id="triple">[]</p>'
+          - '<p id="quad">[]</p>'
+          - '<p id="json">[true]</p>'
+          - '<p id="dot">[||]</p>'
+          - '<p id="attr" title="">attr</p>'
+          - 'href="/x?u="'
+          - 'var viewer = true; var viewerText = "";'
+          - '<p id="section">[SIGNED-IN]</p>'
+          - '<p id="inverted">[]</p>'
+          - '<p id="if">[IF-IN]</p>'
+          - '<p id="user">[USER-IN]</p>'
+        not_contains:
+          - "sha256:"
+          - "viewer@fixture.test"
+          - "{map[]"
+          - "CredentialScopes"
+          - "ImpersonatorEmail"
+          - "&lt;nil&gt;"
+
+mustache_anonymous_is_signed_out:
+  anon: true
+  steps:
+    - get: "/viewer"
+      expect:
+        status: 200
+        contains:
+          - '<p id="plain">[]</p>'
+          - '<p id="triple">[]</p>'
+          - '<p id="quad">[]</p>'
+          - '<p id="json">[]</p>'
+          - '<p id="attr" title="">attr</p>'
+          - 'var viewer = ""; var viewerText = "";'
+          - '<p id="section">[]</p>'
+          - '<p id="inverted">[SIGNED-OUT]</p>'
+          - '<p id="if">[IF-OUT]</p>'
+          - '<p id="user">[USER-OUT]</p>'
+        not_contains:
+          - "&lt;nil&gt;"
+          - "<nil>"
+          - "SIGNED-IN"
+
+gotmpl_signed_in_prints_nothing:
+  as_user: "gviewer@fixture.test"
+  steps:
+    - get: "/gviewer"
+      expect:
+        status: 200
+        contains:
+          - '<p id="plain">[]</p>'
+          - '<p id="v">[]</p>'
+          - '<p id="plusv">[]</p>'
+          - '<p id="s">[]</p>'
+          - '<p id="tostring">[]</p>'
+          - '<p id="attr" title="">attr</p>'
+          - '<p id="if">[IF-IN]</p>'
+          - '<p id="with">[WITH-IN]</p>'
+        not_contains:
+          - "sha256:"
+          - "gviewer@fixture.test"
+          - "{map[]"
+          - "CredentialScopes"
+          - "main.Session"
+
+gotmpl_anonymous_is_signed_out:
+  anon: true
+  steps:
+    - get: "/gviewer"
+      expect:
+        status: 200
+        contains:
+          - '<p id="plain">[]</p>'
+          - '<p id="v">[]</p>'
+          - '<p id="plusv">[]</p>'
+          - '<p id="s">[]</p>'
+          - '<p id="tostring">[]</p>'
+          - '<p id="if">[IF-OUT]</p>'
+          - '<p id="with">[WITH-OUT]</p>'
+        not_contains:
+          - "&lt;nil&gt;"
+          - "main.Session"
+          - "IF-IN"
+
+documented_values_still_print_the_viewer:
+  as_user: "named@fixture.test"
+  steps:
+    - get: "/documented"
+      expect:
+        status: 200
+        contains: '<p id="documented">[named@fixture.test|user|named@fixture.test]</p>'

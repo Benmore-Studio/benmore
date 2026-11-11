@@ -1,0 +1,1 @@
+Chunked, resumable, all-or-nothing bulk load into one table (Mode A, CSV/NDJSON) or an owner-only multi-statement SQL restore across many tables (Mode B). Built for files well past what /api/<table>/ingest or /batch can take in a single request - a 270 MB CSV, a multi-GB pg_dump - without ever leaving the target partially loaded.

@@ -1,0 +1,1 @@
+Transition before-hook SQL, the conditional state update, SQL after-hooks, audit and durable webhook jobs commit together. A denied hook, stale state or SQL hook failure rolls all of them back. Event flows and real-time notifications run after commit; external HTTP/email side effects are not database transactions.

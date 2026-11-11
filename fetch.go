@@ -4,15 +4,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -235,44 +239,142 @@ func renderFetchError(app *App, msg string) string {
 // Fails CLOSED on any ambiguity (parse error, DNS lookup failure, unknown scheme):
 // the caller must be able to assume that "false" means we proved the URL is public.
 func isPrivateURL(rawURL string) bool {
+	return outboundURLCheck(rawURL) != nil
+}
+
+// isPrivateURLContext is isPrivateURL bounded by ctx (the DNS lookup stops
+// when ctx ends), for delivery paths that hold a deadline.
+func isPrivateURLContext(ctx context.Context, rawURL string) bool {
+	return outboundURLCheckContext(ctx, rawURL) != nil
+}
+
+// The two reasons outboundURLCheck refuses a URL. Both mean "not proved
+// public"; they differ only in what a message may tell the author.
+var (
+	errOutboundPrivate    = errors.New("the URL is not http(s), or names a private, loopback or reserved address")
+	errOutboundUnresolved = errors.New("the host could not be resolved")
+)
+
+// outboundLookupIP resolves a host for outboundURLCheck; tests replace it to
+// answer without DNS.
+var outboundLookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// outboundURLCheck is isPrivateURL with the reason: nil only when the URL is
+// http(s) and every address its host resolves to is public;
+// errOutboundUnresolved when the host has no address to judge (the lookup
+// failed or found none); errOutboundPrivate for everything else. A host that
+// is an address literal in any spelling a resolver reads (literalOutboundIP:
+// `127.1`, `0x7f000001`, an IPv6 address with a zone) is judged without DNS,
+// so a private one is reported as private.
+func outboundURLCheck(rawURL string) error {
+	return outboundURLCheckContext(context.Background(), rawURL)
+}
+
+// outboundURLCheckContext is outboundURLCheck with the DNS lookup bounded
+// by ctx.
+func outboundURLCheckContext(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return true // block on parse error
+		return errOutboundPrivate // block on parse error
 	}
 
 	// Only HTTP(S) is safe to fan out to. Block file://, gopher://, ftp://,
 	// dict://, ldap://, etc. - they have curl/Go-quirk SSRF histories.
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return true
+		return errOutboundPrivate
 	}
 
 	host := u.Hostname()
 
 	// Block obvious internal hostnames
 	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" || host == "::1" {
-		return true
+		return errOutboundPrivate
 	}
 	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return true
+		return errOutboundPrivate
+	}
+	if ip := literalOutboundIP(host); ip != nil && blockedOutboundIP(ip) {
+		return errOutboundPrivate
 	}
 
 	// Resolve and check IP ranges.
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return true // fail CLOSED - can't prove the URL is public
-	}
-	if len(ips) == 0 {
-		return true
+	ips, err := outboundLookupIP(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return errOutboundUnresolved // fail CLOSED - can't prove the URL is public
 	}
 
 	for _, ip := range ips {
 		if blockedOutboundIP(ip) {
-			return true
+			return errOutboundPrivate
 		}
 	}
 
-	return false
+	return nil
+}
+
+// literalOutboundIP returns the address a host names when it is an address
+// literal: an IPv4 or IPv6 address (an IPv6 zone such as `fe80::1%eth0` is
+// dropped), or a numeric IPv4 form inet_aton(3) reads (parseInetAtonIPv4).
+// nil for a host name. Write-time checks use it to judge a literal host
+// without DNS as the resolver and the dial-time check would.
+func literalOutboundIP(host string) net.IP {
+	host = strings.TrimSuffix(host, ".")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return net.IP(addr.WithZone("").AsSlice())
+	}
+	return parseInetAtonIPv4(host)
+}
+
+// parseInetAtonIPv4 reads host the way inet_aton(3) (and glibc's resolver,
+// curl and browsers' URL parsers) reads a numeric IPv4 host: one to four
+// dot-separated parts, each decimal, octal (a leading 0) or hex (0x), the
+// last part filling the remaining bytes. `127.1`, `0x7f000001`,
+// `2130706433` and `0177.0.0.1` are all 127.0.0.1. A trailing dot is
+// allowed. nil when host is not such a literal.
+func parseInetAtonIPv4(host string) net.IP {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return nil
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) > 4 {
+		return nil
+	}
+	values := make([]uint64, len(parts))
+	for i, part := range parts {
+		base, digits := 10, part
+		switch {
+		case len(part) >= 2 && (part[:2] == "0x" || part[:2] == "0X"):
+			base, digits = 16, part[2:]
+		case len(part) >= 2 && part[0] == '0':
+			base, digits = 8, part[1:]
+		}
+		if digits == "" || strings.ContainsAny(digits, "+-_") {
+			return nil
+		}
+		v, err := strconv.ParseUint(digits, base, 32)
+		if err != nil {
+			return nil
+		}
+		values[i] = v
+	}
+	last := len(values) - 1
+	for _, v := range values[:last] {
+		if v > 0xff {
+			return nil
+		}
+	}
+	if values[last] >= 1<<(8*(4-last)) {
+		return nil
+	}
+	n := values[last]
+	for i, v := range values[:last] {
+		n |= v << (8 * (3 - i))
+	}
+	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 }
 
 // blockedOutboundIP is the one address policy for server-side outbound HTTP,
@@ -296,7 +398,7 @@ func safeHTTPClient(timeout time.Duration) *http.Client {
 			if len(via) >= 10 {
 				return http.ErrUseLastResponse
 			}
-			if isPrivateURL(req.URL.String()) {
+			if isPrivateURLContext(req.Context(), req.URL.String()) {
 				return fmt.Errorf("redirect to private URL blocked: %s", req.URL.Host)
 			}
 			return nil

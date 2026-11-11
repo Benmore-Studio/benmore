@@ -62,14 +62,27 @@ func appMCPCaptureCommandDependencies(cap *appMCPCommandCapability, intent map[s
 		if !ok {
 			return nil, fmt.Errorf("dependency %q query failed: %w", dependency.Name, errNoSQLStatement)
 		}
+		cap.forgetRefusedFunction()
 		rows, err := cap.tx.QueryContext(cap.ctx, dependencyQuery, commandNamedArgs(params)...)
 		if err != nil {
+			// A function outside the command allowlist fails every prepare, and
+			// so does a function or a column the database does not have: both
+			// are reported as invalid_declaration, not as an outage.
+			err = commandUnresolvedNameFailure(cap.refusedFunctionFailure(err, "dependency query"), "dependency query")
 			return nil, fmt.Errorf("dependency %q query failed: %w", dependency.Name, err)
 		}
 		columns, columnErr := rows.Columns()
-		if columnErr != nil || len(columns) != 1 || !strings.EqualFold(columns[0], "id") {
+		if columnErr != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("dependency %q must return exactly one id column", dependency.Name)
+			return nil, fmt.Errorf("dependency %q columns: %w", dependency.Name, columnErr)
+		}
+		if !appMCPDependencyColumnsValid(columns) {
+			// The reviewed declaration itself is wrong for this database (review
+			// refuses the shape whenever the schema files can prepare the query):
+			// no retry can pass, so the caller gets a named, final error.
+			_ = rows.Close()
+			return nil, &appMCPCommandFinalError{Code: appMCPInvalidDeclarationCode,
+				Message: appMCPDependencyShapeMessage(dependency.Name) + "." + appMCPDeclarationRetryAdvice}
 		}
 		keys := make([]appMCPRevisionKey, 0, dependency.MaxRows)
 		seenKeys := map[string]bool{}

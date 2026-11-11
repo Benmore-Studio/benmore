@@ -1080,7 +1080,7 @@ func TestEvaluateFlowCondition_PipeOnLHS_AccountPresent(t *testing.T) {
 	ctx := &FlowContext{
 		App: app,
 		Data: map[string]any{
-			"existing": []map[string]any{{"account_id": "acct_1Tb8UHDBmVbIf39W"}},
+			"existing": []map[string]any{{"account_id": "acct_test_0000000000000000"}},
 		},
 		Params: map[string]string{},
 	}
@@ -1448,7 +1448,7 @@ func TestApplyAPIFilters_NoIDColumn_NoCrash(t *testing.T) {
 	if strings.Contains(sql, "ORDER BY id") {
 		t.Errorf("must not emit ORDER BY id when table has no id column: %s", sql)
 	}
-	if !strings.Contains(sql, "key = ?") {
+	if !strings.Contains(sql, `WHERE "system_state"."key" = ?`) {
 		t.Errorf("where[key]= or key= filter should land in WHERE: %s", sql)
 	}
 	if len(args) != 1 || args[0] != "seed_customers_at" {
@@ -1463,10 +1463,10 @@ func TestApplyAPIFilters_WhereBracketSyntax(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/api/things?where[status]=active&where[price__gte]=100", nil)
 	allowed := map[string]bool{"id": true, "status": true, "price": true}
 	sql, args := applyAPIFilters("SELECT * FROM things", req, "things", allowed)
-	if !strings.Contains(sql, "status = ?") {
+	if !strings.Contains(sql, `"things"."status" = ?`) {
 		t.Errorf("where[status] should produce status = ?: %s", sql)
 	}
-	if !strings.Contains(sql, "price >= ?") {
+	if !strings.Contains(sql, `"things"."price" >= ?`) {
 		t.Errorf("where[price__gte] should produce price >= ?: %s", sql)
 	}
 	if len(args) != 2 {
@@ -1479,7 +1479,7 @@ func TestApplyAPIFilters_OrderByShorthand(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/api/things?orderBy=name:desc", nil)
 	allowed := map[string]bool{"id": true, "name": true}
 	sql, _ := applyAPIFilters("SELECT * FROM things", req, "things", allowed)
-	if !strings.Contains(sql, "ORDER BY name DESC") {
+	if !strings.Contains(sql, `ORDER BY "things"."name" DESC`) {
 		t.Errorf("orderBy=name:desc should produce ORDER BY name DESC: %s", sql)
 	}
 }

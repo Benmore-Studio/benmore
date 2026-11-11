@@ -1,0 +1,5 @@
+[
+  "api({at:'aggregates'}) - one cached value for the whole app",
+  "api({at:'schema'}) - config_references, reserved_word_names",
+  "api({at:'encryption'}) - computed_columns, computed_aggregates"
+]

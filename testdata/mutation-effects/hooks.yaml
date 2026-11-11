@@ -1,0 +1,24 @@
+# Every refusal path must leave nothing behind; every accepted write must
+# leave exactly its audit row and its effect jobs.
+before_insert:
+  docs:
+    - sql: "SELECT CASE WHEN '{{title}}' = 'refuse' THEN RAISE(ABORT, 'refused by hook') END"
+before_update:
+  docs:
+    - sql: "SELECT CASE WHEN '{{title}}' = 'refuse' THEN RAISE(ABORT, 'refused by hook') END"
+before_delete:
+  docs:
+    - sql: "SELECT CASE WHEN '{{title}}' = 'keep' THEN RAISE(ABORT, 'refused by hook') END"
+on_insert:
+  docs:
+    - sql: "INSERT INTO effects (kind, ref) VALUES ('insert', '{{title}}')"
+on_update:
+  docs:
+    - sql: "INSERT INTO effects (kind, ref) VALUES ('update', '{{title}}')"
+on_delete:
+  docs:
+    - sql: "INSERT INTO effects (kind, ref) VALUES ('delete', '{{title}}')"
+  folders:
+    - sql: "INSERT INTO effects (kind, ref) VALUES ('delete', '{{name}}')"
+  pages:
+    - sql: "INSERT INTO effects (kind, ref) VALUES ('delete', '{{name}}')"

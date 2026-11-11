@@ -1,0 +1,18 @@
+{
+  "keys": [
+    "drift_protection",
+    "precise_intervals",
+    "configuration",
+    "schema_changes",
+    "point_in_time",
+    "revert_security",
+    "revert_hidden",
+    "revert_kept",
+    "changed_by",
+    "summary",
+    "maintenance_writes",
+    "retention",
+    "snapshot_scope",
+    "endpoints"
+  ]
+}

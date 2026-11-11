@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -76,24 +77,22 @@ func RegisterSSERoutes(mux appRouteRegistrar, app *App) {
 			http.Error(w, "cross-origin sse blocked", http.StatusForbidden)
 			return
 		}
-		// Auth: require authentication if app has auth. Dev mode skips
-		// the gate so HMR reload events reach pre-auth pages (the SPA
-		// auth screen, for instance). Data events still respect scope
-		// because deliverRealtimeChange filters anonymous clients out - only
-		// framework-level reload events deliver to them.
+		// Auth: require authentication if app has auth. A development
+		// instance skips the gate so HMR reload events reach pre-auth pages
+		// (the SPA auth screen, for instance). Data events still respect
+		// scope because deliverRealtimeChange filters anonymous clients out -
+		// only framework-level reload events deliver to them.
 		var client sseClient
 		// Anonymous streams end when the app stops admitting them (the
 		// same gate as below, re-read at each credential check).
 		client.principal = realtimePrincipal{app: app, request: r, anonAdmitted: func() bool {
-			return !NeedsAuth(app) || devReloadClientEnabled(app) || broadcastAllowAnon(app)
+			return !NeedsAuth(app) || anonymousReloadStreamAllowed(app) || broadcastAllowAnon(app)
 		}}
-		// Allow anonymous SSE wherever the dev reload client is injected so
-		// the injected EventSource is never rejected with 401. This must
-		// track devReloadClientEnabled (DevMode || testing) exactly - the
-		// injection gate and the auth gate cannot be allowed to drift, or
-		// testing-mode pages would connect but get rejected and the reload
-		// would never fire.
-		reloadAllowedAnonymous := devReloadClientEnabled(app)
+		// Anonymous SSE is admitted where the dev reload client is injected
+		// on a development instance, so its EventSource is not refused on a
+		// pre-auth page there. A prod instance in testing mode still injects
+		// the client (signed-in tabs reload) but refuses anonymous streams.
+		reloadAllowedAnonymous := anonymousReloadStreamAllowed(app)
 		if needsAuth && !reloadAllowedAnonymous && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
@@ -232,10 +231,15 @@ func RegisterSSERoutes(mux appRouteRegistrar, app *App) {
 		// legitimate clients but caps the resource an abuser can pin.
 		maxLifetime := time.NewTimer(realtimeSSEMaxConnLifetime)
 		defer maxLifetime.Stop()
+		shutdown := serverShutdownSignal()
 
 		for {
 			select {
 			case <-maxLifetime.C:
+				return
+			case <-shutdown:
+				// The process is restarting: end now so graceful shutdown
+				// does not wait out its deadline with the listener closed.
 				return
 			case msg, ok := <-client.ch:
 				if !ok {
@@ -267,7 +271,7 @@ func RegisterSSERoutes(mux appRouteRegistrar, app *App) {
 		}
 	})
 
-	log.Printf("  sse: /sse/events (live component updates, server-side scoped)")
+	routeInfof(mux, "  sse: /sse/events (live component updates, server-side scoped)")
 }
 
 // BroadcastChange notifies SSE clients that a table changed (unscoped).
@@ -291,6 +295,7 @@ func BroadcastReload(app *App, reason string) {
 	// not from a tree version memoized a moment before the change.
 	if app != nil {
 		invalidateStaticTreeVersion(app.Dir)
+		invalidateCDNSources(app.Dir)
 	}
 	data, _ := json.Marshal(map[string]string{"reason": reason})
 	payload := `reload|` + string(data)
@@ -399,4 +404,18 @@ const DevReloadClientScript = `
 
 func devReloadClientEnabled(app *App) bool {
 	return app != nil && (app.DevMode || app.FeatureEnabled("testing"))
+}
+
+// anonymousReloadStreamAllowed reports whether /sse/events admits a client
+// with no session in an app that has auth, so the injected dev reload client
+// works on pre-auth pages. Only a development instance does: DevMode, or
+// testing mode on a hosted dev instance (`<sub>-dev`). features.testing stays
+// on after promote, and the anonymous stream (it only ever carries `reload`)
+// was admitted on prod too, taking the per-address anonymous connection slots
+// while api(at:"sse") promised 401.
+func anonymousReloadStreamAllowed(app *App) bool {
+	if !devReloadClientEnabled(app) {
+		return false
+	}
+	return app.DevMode || IsDevSubdomain(filepath.Base(app.Dir))
 }

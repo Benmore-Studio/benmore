@@ -1,0 +1,1 @@
+A signed-in user without a tenant does not gain access to group-keyed tables. Where no user_id fallback exists, only explicit row ACL grants can authorize reads; onboarding sees an empty result until tenant membership is established.

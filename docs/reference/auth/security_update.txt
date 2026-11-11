@@ -1,0 +1,1 @@
+Expired sessions, temporary roles and ACL grants are evaluated as timestamps, including RFC3339 values. Personal data export requires a normal login session and obeys current read policy and scopes.

@@ -1,0 +1,1 @@
+Two flavors. Outbound: register a URL to receive HMAC-signed POSTs on CRUD events. Inbound: define a flow with `verify:` header + `secret:` to accept signed webhooks.

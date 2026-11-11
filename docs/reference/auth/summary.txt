@@ -1,0 +1,1 @@
+Login, signup, sessions, sign-out - the canonical browser auth flow using cookies + CSRF. For native/CLI clients use the Bearer-token flow at POST /api/_auth/token.

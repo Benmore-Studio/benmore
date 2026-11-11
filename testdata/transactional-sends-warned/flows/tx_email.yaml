@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-email
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - run: email
+        with: { to: a@example.com, subject: hi, text: hello }
+      - run: respond
+        with: { json: { ok: true } }

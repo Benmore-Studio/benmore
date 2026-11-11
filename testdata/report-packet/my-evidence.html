@@ -1,0 +1,16 @@
+---
+engine: gotmpl
+auth: required
+scope: owner
+title: My evidence packet
+sources:
+  documents:
+    table: case_documents
+    select: [id, title, body]
+    tenant_scope: current
+    where: {deleted_at: null}
+    order_by: [{col: id, dir: asc}]
+    limit: 1000
+    overflow: error
+---
+<style>body{font:16px system-ui,sans-serif;color:#182234;margin:48px}header{border-bottom:2px solid #243b60;margin-bottom:30px}article{break-inside:avoid;padding:18px 0;border-bottom:1px solid #ddd}p{white-space:pre-wrap}.eyebrow{font-size:11px;letter-spacing:2px;color:#53637a}</style><header><p class="eyebrow">CASEWORK / PRIVATE EVIDENCE</p><h1>My evidence packet</h1><p>{{.user.email}}</p><p data-testid="document-count">Documents: {{len .sources.documents}}</p></header>{{range .sources.documents}}<article><h2>{{.title}}</h2><p>{{.body}}</p></article>{{else}}<p>No active evidence belongs to this account.</p>{{end}}

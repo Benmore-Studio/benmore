@@ -11,13 +11,33 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // ===== 404 / 500 Error Pages =====
+
+// writeUnmatchedAPINotFound is the answer for an /api/ path with no route.
+// A table the caller may not reach answers exactly the same (EnforceCRUDAccess):
+// it answered Go's text/plain "404 page not found" instead, so a signed-in
+// user could tell a real admin-only table from a name that matches nothing
+// and list the app's tables. Because both answer these bytes, the message
+// names both causes; it said only "no API route matches this path", which
+// sent developers whose access rule refused the call hunting for a typo.
+func writeUnmatchedAPINotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprint(w, unmatchedAPINotFoundBody)
+}
+
+// unmatchedAPINotFoundBody is the one body of writeUnmatchedAPINotFound. Its
+// `docs` is where the rule is documented (refusal_docs.go).
+var unmatchedAPINotFoundBody = `{"error":"not_found","message":"no API route matches this path, or the app's access rules do not let you use it","docs":"` + refusalDocsAt("not_found", "") + `"}`
 
 func notFoundHandler(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -28,10 +48,7 @@ func notFoundHandler(app *App) http.HandlerFunc {
 		// shadows the flow once it IS deployed. Emit a real JSON 404 with
 		// `no-store` so the CDN won't cache it. (v2.7.139)
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `{"error":"not_found","message":"no API route matches this path"}`)
+			writeUnmatchedAPINotFound(w)
 			return
 		}
 
@@ -80,6 +97,10 @@ func notFoundHandler(app *App) http.HandlerFunc {
 
 // ===== CORS =====
 
+// corsExposedHeaders are the response headers an allowed cross-origin page may
+// read beyond the CORS-safelisted ones.
+const corsExposedHeaders = "X-Limit-Capped, " + ignoredParamsHeader + ", " + ignoredFieldsHeader + ", X-Stripped-Fields"
+
 func corsMiddleware(next http.Handler, app *App) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check for CORS_ORIGIN in env
@@ -114,7 +135,11 @@ func corsMiddleware(next http.Handler, app *App) http.Handler {
 		if allowed {
 			w.Header().Set("Access-Control-Allow-Origin", requestOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, HX-Request")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, HX-Request, X-Benmore-Background")
+			// The CRUD answers say in these headers that a list was capped or
+			// that a field or parameter was not applied; without this a
+			// cross-origin page could not read them.
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 			// Per CORS spec, Access-Control-Allow-Credentials must NOT be set when origin is wildcard.
 			// Only set credentials header when a specific origin is configured.
 			if origin != "*" {
@@ -142,6 +167,33 @@ func healthHandler(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
+
+		// ?deep=1 is the readiness check for external monitors
+		// (health_probe.go): a bounded database probe and the cgroup's
+		// memory pressure, answered 503 with a reason before anything below
+		// can wait on a stalled database. Plain /health is unchanged.
+		ctx := r.Context()
+		deep := healthDeepRequested(r)
+		var readiness healthReadiness
+		if deep {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, healthDeepBudget)
+			defer cancel()
+			readiness = app.healthReadiness.read(ctx, app.DB)
+			if reason := readiness.notReadyReason(); reason != "" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				json.NewEncoder(w).Encode(map[string]any{
+					"status":            "unhealthy",
+					"ready":             false,
+					"reason":            reason,
+					"version":           version,
+					"instance_id":       runtimeInstanceID,
+					"reload_generation": app.reloadGeneration.Load(),
+				})
+				return
+			}
+		}
+
 		status := "healthy"
 		httpStatus := http.StatusOK
 		checks := make(map[string]any)
@@ -149,7 +201,7 @@ func healthHandler(app *App) http.HandlerFunc {
 		// 1. Database: actual query, not just ping - measures real latency
 		dbStart := time.Now()
 		var dbOK int
-		err := app.DB.QueryRowContext(r.Context(), "SELECT 1").Scan(&dbOK)
+		err := app.DB.QueryRowContext(ctx, "SELECT 1").Scan(&dbOK)
 		dbLatency := time.Since(dbStart)
 		if err != nil {
 			status = "unhealthy"
@@ -176,9 +228,9 @@ func healthHandler(app *App) http.HandlerFunc {
 
 		// 3. Job queue: check for stuck/failed jobs
 		var pendingJobs, failedJobs, runningJobs int64
-		app.DB.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'pending'").Scan(&pendingJobs)
-		app.DB.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'failed'").Scan(&failedJobs)
-		app.DB.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'running'").Scan(&runningJobs)
+		app.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'pending'").Scan(&pendingJobs)
+		app.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'failed'").Scan(&failedJobs)
+		app.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_jobs WHERE status = 'running'").Scan(&runningJobs)
 		jobStatus := "ok"
 		if failedJobs > 10 {
 			jobStatus = "degraded"
@@ -199,15 +251,42 @@ func healthHandler(app *App) http.HandlerFunc {
 			checks["circuits"] = cbStats
 		}
 
-		// 5. Sessions: active count
+		// 5. Point-in-time recovery: whether the WAL shipper is covering
+		// this app (a hosted app without a WAL session, or failing uploads,
+		// reports degraded; the app keeps serving either way).
+		if pitr, ok := walCoverageHealth(app); ok {
+			checks["pitr"] = pitr
+		}
+
+		// 6. Sessions: active count
 		var activeSessions int64
-		app.DB.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&activeSessions)
+		app.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&activeSessions)
 		checks["sessions"] = map[string]any{"active": activeSessions}
+
+		// 7. Database file: data.db is still the file this process opened
+		// (db_file_watch.go; `benmore serve` only). Replaced or deleted
+		// degrades the status; the app keeps serving. A hosted app also
+		// names the state in a header for the router to relay
+		// (router_db_file_alert.go), which strips it from what it forwards.
+		if dbFile, ok := dbFileHealth(app); ok {
+			checks["db_file"] = dbFile
+			if dbFile.State != dbFileOK {
+				if status == "healthy" {
+					status = "degraded"
+				}
+				if hostedTenantProcess() {
+					w.Header().Set(dbFileAlertHeader, dbFile.State)
+				}
+			}
+		}
 
 		// Anonymous: basic status only. Admin: full details.
 		// Prevents infrastructure reconnaissance from unauthenticated users.
+		// The detail is an admin-management report no scope names, so it
+		// needs the admin's unscoped credential (IsAdminConsole): a scoped
+		// token an admin minted for an integration gets the basic status.
 		session := getSession(app, r)
-		isAdmin := session != nil && session.IsAdmin()
+		isAdmin := session != nil && session.IsAdminConsole()
 
 		resp := map[string]any{
 			"status":            status,
@@ -215,7 +294,32 @@ func healthHandler(app *App) http.HandlerFunc {
 			"instance_id":       runtimeInstanceID,
 			"reload_generation": app.reloadGeneration.Load(),
 		}
+		if deep {
+			resp["ready"] = httpStatus == http.StatusOK
+			if httpStatus != http.StatusOK {
+				resp["reason"] = "database_error"
+			}
+		}
 		if isAdmin {
+			// 8. Readiness (health_probe.go): shown, never changing a plain
+			// answer's status, which restarts and releases wait on.
+			if !deep {
+				readiness = app.healthReadiness.read(ctx, app.DB)
+			}
+			checks["db_probe"] = readiness.DB
+			if readiness.Memory != nil {
+				checks["memory"] = readiness.Memory
+			}
+			// 9. Retention: how many declared policies run, and which do
+			// not (a retention.yaml keyed by table name runs none).
+			if retention, ok := retentionHealth(app); ok {
+				checks["retention"] = retention
+			}
+			if counts, err := errorHealthCounts(r.Context(), app); err == nil {
+				checks["errors"] = counts
+			} else {
+				checks["errors"] = map[string]string{"status": "unavailable"}
+			}
 			resp["uptime"] = time.Since(startTime).String()
 			resp["checks"] = checks
 		}
@@ -229,7 +333,36 @@ var startTime = time.Now()
 
 // ===== Graceful Shutdown =====
 
+// serverShutdown is closed when graceful shutdown begins. Server.Shutdown
+// closes the listener at once and then waits for in-flight requests, and an
+// SSE stream never finishes on its own: with one browser tab open a restart
+// waited the whole 10 s deadline while new connections were refused, and
+// the router answered an error page for that window plus the boot (seen as
+// ~10-30 s of 502s on a production app after `benmore restart`). Streams end
+// when it closes; EventSource reconnects to the new process.
+var serverShutdown = struct {
+	sync.Mutex
+	ch chan struct{}
+}{ch: make(chan struct{})}
+
+func serverShutdownSignal() <-chan struct{} {
+	serverShutdown.Lock()
+	defer serverShutdown.Unlock()
+	return serverShutdown.ch
+}
+
+func beginServerShutdown() {
+	serverShutdown.Lock()
+	defer serverShutdown.Unlock()
+	select {
+	case <-serverShutdown.ch:
+	default:
+		close(serverShutdown.ch)
+	}
+}
+
 func startServerWithGracefulShutdown(server *http.Server, dev bool) error {
+	server.RegisterOnShutdown(beginServerShutdown)
 	// Channel to listen for interrupt signals
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -388,6 +521,13 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 	// header rather than letting the request return an empty result
 	// and look broken.
 	encCols := map[string]bool{}
+	// Boolean columns: true/false and 1/0 bind as the stored 1/0
+	// (crud_boolean_filter.go). handleList has already refused a value
+	// that is no boolean on a Prisma Boolean.
+	boolCols := listBooleanFilterColumns(r, app, table)
+	// DateTime columns: a value that parses as an instant is compared as one
+	// (crud_datetime_filter.go), whatever spelling each row was stored in.
+	instantCols := listInstantFilterColumns(r, app, table)
 	if app != nil {
 		blindCols = BlindIndexColumnsForTable(app.Encrypted, table)
 		// Add the sibling columns to the allowlist too so a request
@@ -464,6 +604,22 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 		if encCols[col] && op != "=" && op != "IN" {
 			continue
 		}
+		// Canonical 1/0 text before the blind-index rewrite below, which
+		// hashes the same text the write path stored; bound as an integer
+		// further down when the column is compared directly.
+		boolBind := false
+		if boolCols[col] != 0 && booleanFilterOperand(op) {
+			values[0], _ = canonicalBooleanFilterText(values[0], op == "IN")
+			boolBind = !blindCols[col]
+		}
+		bindValue := func(v string) any {
+			if boolBind {
+				if n, ok := parseBooleanFilterValue(v); ok {
+					return n
+				}
+			}
+			return v
+		}
 		// Blind-index rewrite (v2.7.55+). When the caller filters by
 		// equality on an encrypted column flagged `blind_index: true`,
 		// substitute the sibling `<col>_blind` and hash the value so
@@ -515,17 +671,25 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 			}
 		}
 		var cond string
-		if op == "IN" {
+		var instantArgs []any
+		if instantCols[col] {
+			cond, instantArgs, _ = instantListFilter(quoteColumn(table, col), op, values[0])
+		}
+		if cond != "" {
+			args = append(args, instantArgs...)
+		} else if op == "IN" {
 			parts := strings.Split(values[0], ",")
 			placeholders := make([]string, len(parts))
 			for i, p := range parts {
 				placeholders[i] = "?"
-				args = append(args, p)
+				args = append(args, bindValue(p))
 			}
-			cond = fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ","))
+			cond = fmt.Sprintf("%s IN (%s)", quoteColumn(table, col), strings.Join(placeholders, ","))
 		} else {
-			cond = fmt.Sprintf("%s %s ?", col, op)
-			args = append(args, values[0])
+			// Quoted and qualified (quoteColumn): a column named like an SQL
+			// keyword (`order`, `group`, a custom field) is still the column.
+			cond = fmt.Sprintf("%s %s ?", quoteColumn(table, col), op)
+			args = append(args, bindValue(values[0]))
 		}
 		if encryptedScope != "" {
 			cond = "(" + cond + " AND " + encryptedScope + ")"
@@ -535,7 +699,7 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 	}
 
 	if len(conditions) > 0 {
-		if strings.Contains(strings.ToUpper(query), "WHERE") {
+		if sqlHasWhereKeyword(query) {
 			query += " AND " + strings.Join(conditions, " AND ")
 		} else {
 			query += " WHERE " + strings.Join(conditions, " AND ")
@@ -543,6 +707,19 @@ func applyAPIWhereWithApp(baseSQL string, r *http.Request, table string, app *Ap
 	}
 
 	return query, args
+}
+
+// sqlHasWhereKeyword reports whether query holds the keyword WHERE. Only a
+// bare word counts: a quoted name ("where", or a table "elsewhere") and a
+// longer word (whereabouts) are names, and taking one for the keyword
+// appended ` AND ...` to a query that had no WHERE.
+func sqlHasWhereKeyword(query string) bool {
+	for _, token := range sqlTokenize(query) {
+		if token.kind == sqlTokWord && strings.EqualFold(token.text, "WHERE") {
+			return true
+		}
+	}
+	return false
 }
 
 // applyAPIFilters wraps applyAPIWhere with ORDER BY + LIMIT/OFFSET
@@ -567,37 +744,24 @@ func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *
 		allowed = validCols[0]
 	}
 
-	// Sorting: ?sort=name&order=desc OR ?orderBy=col:desc
-	// (validated against schema). Default order is by primary key
-	// DESC - pre-v2.5.12 we always emitted `ORDER BY id DESC`, which
-	// 500'd for tables whose PK isn't `id` (system_state has key TEXT
-	// PRIMARY KEY, the agent saw the 500 with no clue why). Now we
-	// look up the table's actual PK column from the allowlist and
-	// fall back gracefully if there is none.
-	sortField := r.URL.Query().Get("sort")
-	sortOrder := r.URL.Query().Get("order")
-	if orderBy := r.URL.Query().Get("orderBy"); sortField == "" && orderBy != "" {
-		// orderBy=col:desc shorthand
-		parts := strings.SplitN(orderBy, ":", 2)
-		sortField = parts[0]
-		if len(parts) == 2 {
-			sortOrder = parts[1]
+	// Default order is by primary key DESC - pre-v2.5.12 we always
+	// emitted `ORDER BY id DESC`, which 500'd for tables whose PK isn't
+	// `id` (system_state has key TEXT PRIMARY KEY, the agent saw the 500
+	// with no clue why). Now we look up the table's actual PK column from
+	// the allowlist and fall back gracefully if there is none.
+	if ls := resolveAPIListSort(r, table, app, session, allowed); ls.column != "" {
+		dir := "ASC"
+		if ls.desc {
+			dir = "DESC"
 		}
-	}
-	// Sorting by a blind-index sibling orders rows by the HMAC, grouping
-	// equal plaintexts - only for callers who may see the column unmasked.
-	if base := strings.TrimSuffix(sortField, blindColSuffix); base != sortField && app != nil &&
-		BlindIndexColumnsForTable(app.Encrypted, table)[base] && blindFilterAccessFor(app, table, base, session) != blindFilterAllRows {
-		sortField = ""
-	}
-	if sortField != "" && isValidColumnName(sortField) && allowed[sortField] {
-		if sortOrder == "" {
-			sortOrder = "asc"
-		}
-		if strings.ToLower(sortOrder) == "desc" {
-			query += fmt.Sprintf(" ORDER BY %s DESC", sortField)
+		col := quoteColumn(table, ls.column)
+		if listSortsByInstant(r, app, table, ls.column) {
+			// A DateTime column a client can write sorts by instant, not by
+			// stored spelling; created_at and updated_at keep the plain,
+			// indexable sort.
+			query += " ORDER BY " + instantOrderBy(col, dir)
 		} else {
-			query += fmt.Sprintf(" ORDER BY %s ASC", sortField)
+			query += fmt.Sprintf(" ORDER BY %s %s", col, dir)
 		}
 	} else if allowed["id"] {
 		query += " ORDER BY id DESC"
@@ -614,6 +778,85 @@ func applyAPIFiltersWithApp(baseSQL string, r *http.Request, table string, app *
 	query += fmt.Sprintf(" LIMIT %d OFFSET %d", perPage, offset)
 
 	return query, args
+}
+
+// apiListSort is the ORDER BY a list request asked for and the sort
+// parameters it could not apply.
+type apiListSort struct {
+	column  string   // "" = the default order
+	desc    bool     // direction for column
+	ignored []string // query keys not applied: sort, orderBy, order, order_by
+}
+
+// resolveAPIListSort reads ?sort=col&order=asc|desc, or ?orderBy=col[:dir]
+// when sort is absent (a direction there overrides order), against the
+// list's column allowlist. It is the only reader of these parameters, so
+// the ORDER BY and the X-Ignored-Params report cannot disagree. A sort
+// column that is not on the allowlist, a direction other than asc/desc (any
+// case; applied as asc, as always), an orderBy beside a sort, an order with
+// no sort column to apply to and order_by (never read) are reported, not
+// refused: which sorts apply is unchanged. Hidden and encrypted sort
+// columns are refused with 400/403 before this runs.
+func resolveAPIListSort(r *http.Request, table string, app *App, session *Session, allowed map[string]bool) apiListSort {
+	q := r.URL.Query()
+	var out apiListSort
+	ignore := func(key string) {
+		if !slices.Contains(out.ignored, key) {
+			out.ignored = append(out.ignored, key)
+		}
+	}
+	sortField, fieldKey := q.Get("sort"), "sort"
+	sortOrder, orderKey := q.Get("order"), "order"
+	if orderBy := q.Get("orderBy"); sortField == "" && orderBy != "" {
+		// orderBy=col:desc shorthand
+		parts := strings.SplitN(orderBy, ":", 2)
+		sortField, fieldKey = parts[0], "orderBy"
+		if len(parts) == 2 {
+			if sortOrder != "" {
+				ignore("order")
+			}
+			sortOrder, orderKey = parts[1], "orderBy"
+		}
+	} else if orderBy != "" {
+		ignore("orderBy")
+	}
+	if q.Get("order_by") != "" {
+		ignore("order_by")
+	}
+	// Sorting by a blind-index sibling orders rows by the HMAC, grouping
+	// equal plaintexts - only for callers who may see the column unmasked.
+	if base := strings.TrimSuffix(sortField, blindColSuffix); base != sortField && app != nil &&
+		BlindIndexColumnsForTable(app.Encrypted, table)[base] && blindFilterAccessFor(app, table, base, session) != blindFilterAllRows {
+		sortField = ""
+	}
+	if sortField != "" && isValidColumnName(sortField) && allowed[sortField] {
+		out.column = sortField
+	} else if q.Get(fieldKey) != "" {
+		ignore(fieldKey)
+	}
+	switch strings.ToLower(sortOrder) {
+	case "", "asc":
+	case "desc":
+		out.desc = true
+	default:
+		ignore(orderKey)
+	}
+	if out.column == "" && sortOrder != "" && orderKey == "order" {
+		ignore("order")
+	}
+	return out
+}
+
+// listSortParamsPresent names the sort parameters a request carries, for a
+// read that applies no sort (a cursor page is always ordered by id).
+func listSortParamsPresent(r *http.Request) []string {
+	var out []string
+	for _, key := range []string{"order", "orderBy", "order_by", "sort"} {
+		if r.URL.Query().Get(key) != "" {
+			out = append(out, key)
+		}
+	}
+	return out
 }
 
 // maxAPIOffsetRows caps ?page= offset pagination. SQLite has no way to skip
@@ -636,6 +879,25 @@ func apiOffsetTooDeepError(r *http.Request) string {
 	return fmt.Sprintf("offset pagination skips more than %d rows and is capped there. Use keyset pagination instead: ?cursor=<last id>&limit=N (start with ?cursor=0) returns next_cursor for the following page.", maxAPIOffsetRows)
 }
 
+// listPageMax is the most rows one auto-CRUD list page returns, whatever
+// limit or per_page asks for.
+const listPageMax = 500
+
+// listLimitCappedHeader is set to listPageMax on a list response whose
+// request asked for more rows than one page holds. The cap used to be
+// silent: an export asking for limit=5000 got 500 rows of a 28k-row table and
+// could not tell that page from the whole table.
+const listLimitCappedHeader = "X-Limit-Capped"
+
+// offsetListLimitCapped reports whether an offset (non-cursor) list request
+// asked for more than listPageMax rows, by the same keys apiOffsetWindow reads.
+func offsetListLimitCapped(r *http.Request) bool {
+	if r.URL.Query().Get("page") != "" || r.URL.Query().Get("per_page") != "" {
+		return queryParamInt(r, "per_page", 50) > listPageMax
+	}
+	return queryParamInt(r, "limit", 50) > listPageMax
+}
+
 // apiOffsetWindow supports the SDK's limit/offset pair without changing the
 // established page/per_page contract. Explicit legacy controls win together;
 // aliases otherwise keep the same default, size cap and maximum skipped rows.
@@ -645,8 +907,8 @@ func apiOffsetWindow(r *http.Request) (limit, offset int) {
 		return perPage, (page - 1) * perPage
 	}
 	limit = queryParamInt(r, "limit", 50)
-	if limit > 500 {
-		limit = 500
+	if limit > listPageMax {
+		limit = listPageMax
 	}
 	raw := r.URL.Query().Get("offset")
 	n, err := strconv.ParseInt(raw, 10, 64)
@@ -669,8 +931,8 @@ func apiOffsetWindow(r *http.Request) (limit, offset int) {
 func apiOffsetPagination(r *http.Request) (page, perPage int) {
 	page = queryParamInt(r, "page", 1)
 	perPage = queryParamInt(r, "per_page", 50)
-	if perPage > 500 {
-		perPage = 500
+	if perPage > listPageMax {
+		perPage = listPageMax
 	}
 	maxInt := int(^uint(0) >> 1)
 	maxOffsetPage := maxInt / perPage

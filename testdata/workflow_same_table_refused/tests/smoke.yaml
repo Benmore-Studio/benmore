@@ -1,0 +1,8 @@
+# Never reached: the loader refuses the app (tests/expected-failures.txt lists
+# `setup`). If the refusal is ever lifted, this must then pass.
+health_answers:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200

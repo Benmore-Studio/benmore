@@ -141,8 +141,8 @@ func TestEncryptedUnmaskMissingTenantAndHistoricalRow(t *testing.T) {
 	}
 	// Includes must apply the related table's identity, not the parent row.
 	for _, rows := range [][]map[string]any{
-		batchFetchByIDs(app, "companies", map[string]bool{"1": true, "2": true}, actor),
-		batchFetchByFK(app, "projects", "company_id", map[string]bool{"1": true, "2": true}, actor),
+		batchFetchByIDs(app, "companies", map[string]bool{"1": true, "2": true}, actor, &includeAudit{}),
+		batchFetchByFK(app, "projects", "company_id", map[string]bool{"1": true, "2": true}, actor, &includeAudit{}),
 	} {
 		if len(rows) == 0 {
 			t.Fatalf("include fixture returned no authorized rows: %+v", rows)

@@ -123,6 +123,12 @@ var docAliases = map[string]string{
 	"cli":        "build",
 	"tools":      "build",
 	"mcp":        "build",
+	// Cited by the compliance: hipaa refusals. `benmore docs compliance` reads
+	// the reference topic in every edition; help(topic:"compliance") lands on
+	// the build guide's summary.
+	"compliance": "build",
+	"mfa":        "build",
+	"audit":      "build",
 }
 
 // docAliasSections names the build-guide section an aliased topic lives in,
@@ -144,7 +150,15 @@ var docAliasSections = map[string]string{
 	"sdk":        "The frontend - `static/app.tsx` and the `bm` SDK",
 	"bm":         "The frontend - `static/app.tsx` and the `bm` SDK",
 	"frontend":   "The frontend - `static/app.tsx` and the `bm` SDK",
+	"compliance": complianceDocsSection,
+	"mfa":        complianceDocsSection,
+	"audit":      complianceDocsSection,
 }
+
+// complianceDocsSection is the build guide's summary of `compliance: hipaa`:
+// idle logoff, MFA enrollment and the append-only audit tables are described
+// there, so the three topics land on it.
+const complianceDocsSection = "`compliance: hipaa` - stricter defaults for apps holding PHI"
 
 // AgentDocsPointer is the one-line note printed before an aliased topic.
 func AgentDocsPointer(topic string) string {
@@ -152,8 +166,61 @@ func AgentDocsPointer(topic string) string {
 	if docAliases[topic] != "build" || topic == "" || topic == "build" {
 		return ""
 	}
+	note := fmt.Sprintf("`%s` is part of the build guide below.", topic)
 	if section, ok := docAliasSections[topic]; ok {
-		return fmt.Sprintf("(`%s` is covered in the build guide below, section \"%s\". On a deployed app, `benmore api <app> %s` has the live reference.)\n\n", topic, section, topic)
+		note = fmt.Sprintf("`%s` is covered in the build guide below, section \"%s\".", topic, section)
 	}
-	return fmt.Sprintf("(`%s` is part of the build guide below. On a deployed app, `benmore api <app> %s` has the live reference.)\n\n", topic, topic)
+	// The hosted command is named only with a topic it answers: it used to
+	// carry the alias itself, and most aliases are not topics.
+	if apiTopic := docAliasAPITopic(topic); apiTopic != "" {
+		note += fmt.Sprintf(" On a deployed app, `benmore api <app> %s` has the live reference.", apiTopic)
+	}
+	return "(" + note + ")\n\n"
+}
+
+// docAliasAPITopics names the `api(at:<topic>)` topic that covers an alias
+// whose own name is not a topic; "" means none does (general orientation), so
+// AgentDocsPointer prints no `benmore api` command for it. An alias that is
+// not listed is a topic under its own name (auth, hooks, flows, schema, ...).
+//
+// An alias that is itself a reference topic never reaches the build guide on
+// the CLI: `benmore docs auth` reads the topic (docs_reference.go). The names
+// here are the rest, and TestDocsAliasPointersNameRegisteredTopics asks the
+// reference about every alias: a new docAliases entry whose name is not a
+// topic fails that test until it is mapped here.
+var docAliasAPITopics = map[string]string{
+	"start":      "",
+	"intro":      "",
+	"overview":   "",
+	"quickstart": "",
+	"gotchas":    "",
+	"faq":        "",
+	"page":       "ssr",
+	"pages":      "ssr",
+	"directive":  "ssr",
+	"directives": "ssr",
+	"queries":    "query",
+	"hook":       "hooks",
+	"flow":       "flows",
+	"workflow":   "workflows",
+	"ws":         "websocket",
+	"bm":         "sdk",
+	"prisma":     "schema",
+	"migrations": "schema",
+	"migrate":    "schema",
+	"sec":        "access",
+	"security":   "access",
+	"commands":   "cli-contracts",
+	"cli":        "cli-contracts",
+	"tools":      "harness",
+	"mcp":        "connector",
+}
+
+// docAliasAPITopic is the topic `benmore api <app> <topic>` answers for an
+// aliased docs topic, or "" when no topic covers it.
+func docAliasAPITopic(alias string) string {
+	if topic, ok := docAliasAPITopics[alias]; ok {
+		return topic
+	}
+	return alias
 }

@@ -64,7 +64,7 @@ func TestTenantRootOwnerColumnUsesRoleScope(t *testing.T) {
 					if err := app.DB.QueryRow("SELECT name FROM companies WHERE id=1").Scan(&name); err != nil || name != "managed" {
 						t.Fatalf("authorized update did not persist: name=%q err=%v", name, err)
 					}
-					assertStatus(t, mux, http.MethodPost, "/api/companies", manager, map[string]any{"name": "new-root"}, http.StatusNotFound)
+					assertStatus(t, mux, http.MethodPost, "/api/companies", manager, map[string]any{"name": "new-root"}, http.StatusForbidden)
 					return
 				}
 				for _, method := range []string{http.MethodGet, http.MethodPatch, http.MethodDelete} {
@@ -108,7 +108,7 @@ func TestTenantRootOwnerColumnPreservesSelfAndViewer(t *testing.T) {
 	viewer, uid := tenantMember(t, app, "viewer@example.com", "user", 1, "viewer")
 	setTenantRootOwner(t, app, 2, uid)
 	assertListIDs(t, mux, viewer, "/api/companies", []float64{1})
-	assertStatus(t, mux, http.MethodPatch, "/api/companies/1", viewer, map[string]any{"name": "viewer-write"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodPatch, "/api/companies/1", viewer, map[string]any{"name": "viewer-write"}, http.StatusForbidden)
 	app.Access = accessFromYAML(t, "access:\n  companies: self\n")
 	assertListIDs(t, mux, viewer, "/api/companies", []float64{2})
 	assertStatus(t, mux, http.MethodGet, "/api/companies/1", viewer, nil, http.StatusNotFound)

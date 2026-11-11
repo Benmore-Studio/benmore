@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func newAppMCPReadConnectionTestDB(t *testing.T) *sql.DB {
@@ -57,7 +55,7 @@ func TestCloseReadOnlyQueryConnDiscardsUnexpectedTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqlite := raw.(*sqlite3.SQLiteConn)
+		sqlite := mustSQLiteConn(raw)
 		restoreConnAuthorizer(sqlite)
 		_, err := sqlite.Exec(`BEGIN`, nil)
 		return err
@@ -72,7 +70,7 @@ func TestCloseReadOnlyQueryConnDiscardsUnexpectedTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := fresh.Raw(func(raw any) error {
-		if !raw.(*sqlite3.SQLiteConn).AutoCommit() {
+		if !mustSQLiteConn(raw).AutoCommit() {
 			return errors.New("transactional connection was returned to the pool")
 		}
 		return nil
@@ -94,7 +92,7 @@ func TestReadOnlyQueryCancellationAfterExecutionRestoresConnection(t *testing.T)
 	}
 	started := make(chan struct{}, 1)
 	if err := conn.Raw(func(raw any) error {
-		return raw.(*sqlite3.SQLiteConn).RegisterFunc("audit_started", func() int64 {
+		return mustSQLiteConn(raw).RegisterFunc("audit_started", func() int64 {
 			select {
 			case started <- struct{}{}:
 			default:
@@ -144,7 +142,7 @@ func TestReadOnlyQueryCancellationAfterExecutionRestoresConnection(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := fresh.Raw(func(raw any) error {
-		if !raw.(*sqlite3.SQLiteConn).AutoCommit() {
+		if !mustSQLiteConn(raw).AutoCommit() {
 			return errors.New("canceled read left a transaction open")
 		}
 		return nil

@@ -1,0 +1,13 @@
+benmore feature list
+	benmore feature export <app-or-dir|curated-slug> <pack-name> --paths static/foo.tsx --models ModelA,ModelB --flows send --env dev --out pack.tar.gz
+	benmore feature install <pack.tar.gz|curated-slug> --app <target> --env dev --dry-run
+	benmore feature clone <pack.tar.gz|curated-slug|source-app|source-dir> --app <target> --env dev --dry-run
+	benmore clone notify-hub --app <target> --env dev --dry-run
+	benmore clone notify-hub --app <target> --env dev --route-prefix ops --model-prefix Ops --dry-run
+	benmore clone notify-hub --app <target> --env dev --route-map /notify-hub=/alerts --model-map Notification=AlertNotification --dry-run
+	benmore clone source-app target-app --dry-run
+	benmore clone source-app target-app --paths static/foo.tsx --models ModelA --flows send --dry-run
+	benmore clone source-app target-app --paths static/foo.tsx --models ModelA --route-prefix cloned --model-prefix Cloned --dry-run
+	benmore clone source-app target-app --replace --delete-missing --dry-run
+	benmore clone source-app target-app --replace --delete-missing --apply
+	benmore clone source-app target-app --source-env prod --target-env dev --name "Billing" --dry-run

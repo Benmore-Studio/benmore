@@ -1,0 +1,16 @@
+# flows.yaml - fetch data with SQL, compute with JS, persist the result.
+- id: forecast
+  query: SELECT * FROM forecasts WHERE id = :id
+
+- id: irr
+  run: compute
+  with:
+    module: par-engine            # static/par-engine.ts (extension optional)
+    function: irrForInputs         # a named export from that module
+    args: ${{ steps.forecast.outputs.first }}
+    timeout: 10s                   # optional, default 5s
+
+- run: sql
+  query: UPDATE forecasts SET irr_pct = :irr WHERE id = :id
+  params:
+    irr: ${{ steps.irr.outputs }}

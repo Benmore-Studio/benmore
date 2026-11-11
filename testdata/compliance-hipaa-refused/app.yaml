@@ -1,0 +1,7 @@
+# `benmore test` on this app must FAIL at load: compliance accepts only `hipaa`.
+site_name: "Compliance refused fixture"
+compliance: HIPAA
+auth:
+  identifier: email
+frontend:
+  stack: html

@@ -1,0 +1,24 @@
+# flows/contact.yaml - the public form's endpoint: validate, store, queue the email
+on:
+  request:
+    method: POST
+    path: /api/contact
+    auth: none
+    rate_limit: "5/hour per ip"     # 429 with Retry-After before any step runs
+    transaction: true               # the row and the queued email commit together
+    inputs:
+      name:    { type: text, required: true }
+      email:   { type: email, required: true }
+      message: { type: textarea, required: true }
+jobs:
+  contact:
+    steps:
+      - id: saved
+        run: sql
+        with: { query: "INSERT INTO messages (name, email, body) VALUES (:name, :email, :message) RETURNING id" }
+      - run: enqueue
+        with:
+          flow: notify-owner
+          with: { message_id: "${{ steps.saved.outputs.id }}" }
+      - run: respond
+        with: { status: 201, json: { received: true } }

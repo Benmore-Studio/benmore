@@ -5,22 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Third-party code in this workflow is pinned to full commit SHAs (the
+      # comment names the release), so a moved tag cannot change what runs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
       # Provision `tsc` so the generated bm.d.ts compile fixture actually runs
       # in CI instead of skipping. CI=true (set by GitHub Actions) makes the
       # fixture fail hard if tsc is somehow missing, so drift can't land green.
       - name: Install TypeScript
-        run: npm i -g typescript
+        run: npm install -g --ignore-scripts typescript@5.9.3
       - name: Verify release provenance controls
         run: python3 -B scripts/test-release-provenance.py
       - name: Vet

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -488,7 +487,7 @@ func RegisterWebSocketRoutes(mux appRouteRegistrar, app *App) {
 		<-done
 	})
 
-	log.Printf("  ws: /ws (bidirectional, zero deps, RFC 6455)")
+	routeInfof(mux, "  ws: /ws (bidirectional, zero deps, RFC 6455)")
 }
 
 func wsReadLoop(client *wsClient, app *App) {
@@ -637,11 +636,18 @@ func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
 // a caller: rooms matching no rule are open; a matching rule requires a live
 // membership row (admins bypass, anonymous callers never pass). Shared by
 // WebSocket joins and bm.broadcast slugs, which are room names too.
+//
+// A rule whose pattern is unusable (parseWSRoomPattern) matches no room, but
+// it still says its author meant to restrict some: those rooms
+// (wsRoomClosedLead) are closed to everyone but a bypassing admin instead of
+// falling through to "open". A room a usable pattern matches is decided by
+// that pattern first.
 func roomMembershipAllowed(app *App, session *Session, userID int64, room string) bool {
 	if app == nil || room == "" {
 		return true
 	}
-	for _, wr := range app.wsRoomRules() {
+	rules := app.wsRoomRules()
+	for _, wr := range rules {
 		val, ok := matchWSRoomPattern(wr.Pattern, room)
 		if !ok {
 			continue
@@ -663,6 +669,19 @@ func roomMembershipAllowed(app *App, session *Session, userID int64, room string
 		}
 		// Only live membership rows admit (groups_membership.go).
 		live := membershipLiveConds(app.Group, wr.Rule.Table, "", appColumnChecker(app, wr.Rule.Table))
+		// The member-of tenant rule (memberOfPredicate): when the membership
+		// table carries the groups: tenant key, only a row in the caller's
+		// effective tenant admits, and a caller with no tenant gains nothing
+		// from membership rows. Otherwise a member could write a row naming a
+		// user of another tenant, or one with no tenant, into their room.
+		var tenantArgs []any
+		if memberOfTenantKeyed(app, wr.Rule.Table) {
+			if session == nil || !session.EffectiveHasGroup() {
+				return false
+			}
+			live += fmt.Sprintf(" AND %s = ?", quoteColumn(wr.Rule.Table, app.Group.Key))
+			tenantArgs = []any{session.EffectiveGroupID()}
+		}
 		table, userCol := quoteIdent(wr.Rule.Table), quoteColumn(wr.Rule.Table, wr.Rule.UserCol)
 		q := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? AND %s = ?%s LIMIT 1",
 			table, quoteColumn(wr.Rule.Table, wr.Rule.JoinCol), userCol, live)
@@ -671,9 +690,14 @@ func roomMembershipAllowed(app *App, session *Session, userID int64, room string
 			// Literal pattern (no placeholder): membership in ANY row
 			// of the membership table grants the room.
 			q = fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ?%s LIMIT 1", table, userCol, live)
-			return app.DB.QueryRow(q, userVal).Scan(&x) == nil
+			return app.DB.QueryRow(q, append([]any{userVal}, tenantArgs...)...).Scan(&x) == nil
 		}
-		return app.DB.QueryRow(q, val, userVal).Scan(&x) == nil
+		return app.DB.QueryRow(q, append([]any{val, userVal}, tenantArgs...)...).Scan(&x) == nil
+	}
+	for _, wr := range rules {
+		if lead, closed := wsRoomClosedLead(wr.Pattern); closed && strings.HasPrefix(room, lead) {
+			return userID != 0 && session != nil && session.IsAdminBypass()
+		}
 	}
 	return true
 }

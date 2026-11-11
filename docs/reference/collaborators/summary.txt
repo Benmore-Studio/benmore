@@ -1,0 +1,1 @@
+Hosted platform: an app owner invites other Benmore users as editor or viewer. An invite grants NOTHING until the invitee explicitly accepts it. Pending invites never appear in app lists or app-name resolution.

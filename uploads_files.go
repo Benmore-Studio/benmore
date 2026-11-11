@@ -55,7 +55,7 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 			return
 		}
 		defer release()
-		if !validateCSRF(r) && !isBearerAuth(r) {
+		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpError(w, "CSRF validation failed", http.StatusForbidden)
 			return
 		}
@@ -80,6 +80,9 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 
 		path, err := HandleFileUpload(app, r, "file", "_files", 0, nil)
 		if err != nil {
+			if respondMediaAllowance(w, err) {
+				return
+			}
 			httpError(w, err.Error(), http.StatusBadRequest)
 			return
 		}

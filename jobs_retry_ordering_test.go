@@ -3,6 +3,7 @@
 package main
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -29,18 +30,20 @@ func execLogOrder(t *testing.T, app *App) []string {
 
 func setupOrderingApp(t *testing.T) *App {
 	t.Helper()
+	stubFlowUpstream(t, http.StatusServiceUnavailable)
 	app := newJobsTestApp(t)
 	if _, err := app.DB.Exec("CREATE TABLE exec_log (id INTEGER PRIMARY KEY AUTOINCREMENT, who TEXT NOT NULL)"); err != nil {
 		t.Fatalf("create exec_log: %v", err)
 	}
 	app.Flows = []Flow{
 		{
-			// Stage A logs its attempt, then fails (missing table) - a transient
-			// blip that the queue retries.
-			Name: "stage_a",
+			// Stage A logs its attempt, then fails transiently (its upstream
+			// answers 503). It opts into retries, so the queue retries it.
+			Name:        "stage_a",
+			MaxAttempts: 3,
 			Steps: []FlowStep{
 				{Type: "sql", SQL: "INSERT INTO exec_log (who) VALUES ('A')"},
-				{Type: "sql", SQL: "INSERT INTO nonexistent_table (x) VALUES (1)"},
+				{Type: "api", API: &FlowAPICall{Method: "POST", URL: "http://93.184.216.34/stage"}},
 			},
 		},
 		{

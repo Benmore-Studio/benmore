@@ -14,6 +14,7 @@ func newBootstrapTestApp(t *testing.T, userField string) (*App, int64, func()) {
 	t.Helper()
 	app, cleanup := newTestApp(t)
 	EnsureSessionsTable(app.DB)
+	EnsureAuditLogTable(app.DB) // bootstrap audits inside its transaction
 	if err := EnsureUsersTable(app.DB); err != nil {
 		t.Fatalf("EnsureUsersTable: %v", err)
 	}

@@ -1,0 +1,19 @@
+import bm from 'bm';
+
+// Mark a channel as read.
+await bm.api.optimistic({
+  apply:    () => state.markRead(channelId),
+  snapshot: () => state.snapshotChannel(channelId),
+  revert:   (snap) => state.restore(channelId, snap),
+  request:  () => bm.api.patch('/api/memberships/' + id,
+                              { last_read_at: new Date().toISOString() }),
+});
+
+// Like button - the test app pattern.
+await bm.api.optimistic({
+  apply:    () => { post.like_count += 1; rerender(); },
+  snapshot: () => post.like_count,     // runs before apply: the pre-click count
+  revert:   (prev) => { post.like_count = prev; rerender(); },
+  request:  () => bm.api.patch('/api/posts/' + post.id,
+                              { like_count: post.like_count }),
+});

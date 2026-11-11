@@ -1,0 +1,1 @@
+bm.signedUrl signs private files on the platform media CDN as well as local ones, so no serve_file flow is needed for that. If you get `Missing Key-Pair-Id` from CloudFront, you rendered the RAW private URL instead of a bm.signedUrl() result. `serve_file` (flow) remains the server-side equivalent for redirect-style downloads.

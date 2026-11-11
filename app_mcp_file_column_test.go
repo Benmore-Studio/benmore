@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func appMCPFileColumnManifest(t *testing.T, source []byte) []byte {
@@ -109,6 +109,9 @@ func TestAppMCPFileMembershipConstraintsAndMetadataStatus(t *testing.T) {
 	}
 	writeTestFile(t, app.Dir, "mcp.yaml", string(manifestData))
 	writeTestFile(t, app.Dir, "schema.sql", "CREATE TABLE notes (id INTEGER PRIMARY KEY, file_path TEXT); CREATE TABLE members (id INTEGER PRIMARY KEY, org_id TEXT, email TEXT, kind TEXT, status TEXT);\n")
+	// The reviewed source has to configure the groups the constraints read:
+	// a strict load refuses membership_constraints without them.
+	writeTestFile(t, app.Dir, "app.yaml", "groups: {table: members, key: org_id, user_field: email}\n")
 	reviewAppMCPFixture(t, app.Dir)
 	config, err := loadRuntimeConfig(app.Dir)
 	if err != nil {

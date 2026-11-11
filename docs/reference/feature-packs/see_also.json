@@ -1,0 +1,5 @@
+[
+  "api({at:'sync-status'})",
+  "api({at:'environments'})",
+  "api({at:'flows'})"
+]

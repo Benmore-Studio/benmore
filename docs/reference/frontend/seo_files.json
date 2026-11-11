@@ -1,0 +1,5 @@
+[
+  "/feed.xml is valid Atom (RFC 4287): the feed and every entry carry `<updated>` (an entry's is its page file's last change, the feed's the newest of those) and the feed carries `<author><name>` from `seo.author`, else the site name. Entries are listed newest first.",
+  "/.well-known/security.txt follows RFC 9116. With `seo.security_contact` set it has `Contact:` (an address becomes `mailto:`; a `mailto:`, `tel:` or `https:` value is kept), `Expires:` (the start of the current UTC day plus 364 days, the same for every request that day) and `Canonical:`, served as `text/plain; charset=utf-8`. An app's own `static/.well-known/security.txt` is served verbatim instead. With neither, the route answers 404.",
+  "Server-rendered pages (mustache, gotmpl, layouts) link `seo.favicon` when set, else `/static/favicon.svg` when the app has that file (the scaffold ships it). `/favicon.ico` answers static/favicon.ico, static/favicon.png, favicon.ico or favicon.png, and static/favicon.svg as `image/svg+xml` last."
+]

@@ -1,0 +1,72 @@
+# api(at:"auth") redirects: where a form sign-up and a form sign-in land.
+# Run: benmore test <dir> --app
+
+signup_form_lands_on_signup_redirect:
+  anon: true
+  steps:
+    - get: "/api/_csrf"
+      save: {csrf: "token"}
+      expect:
+        status: 200
+    # `next` is not read by sign-up.
+    - api: "POST /signup"
+      data:
+        _csrf: "{{csrf}}"
+        email: "form-signup@switches.test"
+        password: "Correct-Horse-9-Battery"
+        next: "/somewhere-else"
+      expect:
+        status: 303
+        redirect: "/welcome"
+    - sql: "SELECT u.id FROM _benmore_users u JOIN _benmore_sessions s ON s.user_id = u.id WHERE u.email = 'form-signup@switches.test'"
+      expect:
+        rows: 1
+
+signup_json_gets_the_user_not_a_redirect:
+  anon: true
+  steps:
+    - get: "/api/_csrf"
+      save: {csrf: "token"}
+      expect:
+        status: 200
+    - api: "POST /signup"
+      json:
+        _csrf: "{{csrf}}"
+        email: "json-signup@switches.test"
+        password: "Correct-Horse-9-Battery"
+      expect:
+        status: 200
+        json: {ok: true}
+        contains: '"email":"json-signup@switches.test"'
+
+login_form_lands_on_redirect_or_next:
+  anon: true
+  steps:
+    - get: "/api/_csrf"
+      save: {csrf: "token"}
+      expect:
+        status: 200
+    - api: "POST /signup"
+      json:
+        _csrf: "{{csrf}}"
+        email: "login@switches.test"
+        password: "Correct-Horse-9-Battery"
+      expect:
+        status: 200
+    - api: "POST /login"
+      data:
+        _csrf: "{{csrf}}"
+        email: "login@switches.test"
+        password: "Correct-Horse-9-Battery"
+      expect:
+        status: 303
+        redirect: "/home"
+    - api: "POST /login"
+      data:
+        _csrf: "{{csrf}}"
+        email: "login@switches.test"
+        password: "Correct-Horse-9-Battery"
+        next: "/notes/7"
+      expect:
+        status: 303
+        redirect: "/notes/7"

@@ -1,0 +1,14 @@
+{
+  "keys": [
+    "connection_controls",
+    "provider_hardening",
+    "connector_grants",
+    "app_provider",
+    "summary",
+    "config_yaml",
+    "email_verification",
+    "configuration_notes",
+    "flow",
+    "js_snippet"
+  ]
+}

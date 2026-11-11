@@ -1,0 +1,1 @@
+bm.permissions.revoke(table, id, email) calls the email-based DELETE route. It trims surrounding whitespace and compares email case-insensitively, deleting only user grants on that row. It uses the same scope, CSRF and owner/admin gates as the permission-ID route and returns 404 when no matching grant exists. Permission-ID revocation remains supported.

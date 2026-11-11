@@ -1,0 +1,1 @@
+The `<table>_fts` virtual table and its `_data`/`_idx`/`_docsize`/`_config` shadow tables are search internals: they get no CRUD, lock, share or docs routes and are not import targets. Search only through the source table, which keeps its row scope.

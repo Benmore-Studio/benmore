@@ -1,0 +1,5 @@
+[
+  "User signs in normally (has a full session).",
+  "POST /api/_auth/mfa/setup with the session cookie and { password: <current password> } - render QR from otpauth_uri, show backup codes ONCE.",
+  "Submit a TOTP code to POST /api/_auth/mfa/verify - MFA is now active on the account."
+]

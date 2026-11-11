@@ -1,0 +1,4 @@
+[
+  "@benmore/bm is ESM, dependency-free, and needs no Node build step.",
+  "The package holds the same SDK file the framework serves at /_internal/bm.js; there is no second SDK runtime."
+]

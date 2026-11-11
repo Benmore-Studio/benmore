@@ -12,8 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 type appMCPCommandOriginKind uint8
@@ -153,7 +151,7 @@ func appMCPWithCommandOutcome(ctx context.Context, request appMCPCommandRequest,
 		return outcome, err
 	}
 	if err := conn.Raw(func(raw any) error {
-		if _, ok := raw.(*sqlite3.SQLiteConn); !ok {
+		if _, ok := sqliteConnOf(raw); !ok {
 			return errors.New("command connection is not a SQLite connection")
 		}
 		return nil
@@ -413,6 +411,17 @@ func appMCPCommandSessionAuthority(ctx context.Context, generation *appMCPRuntim
 	}
 	if stored == nil || stored.ID != sessionID || stored.UserID <= 0 || stored.ImpersonatorUserID != 0 || stored.ActingAsGroup != "" {
 		return Session{}, "", "", errAppMCPGrantDenied
+	}
+	// auth.idle_timeout: an approval made from a session that has since gone
+	// idle no longer holds (read only; the approving request touches nothing).
+	if timeout := idleTimeoutFor(generation.view); timeout > 0 {
+		last, err := sessionIdleLast(tx, "main._benmore_sessions", stored.ID)
+		if err != nil {
+			return Session{}, "", "", err
+		}
+		if time.Now().Unix()-last > int64(timeout.Seconds()) {
+			return Session{}, "", "", errAppMCPGrantDenied
+		}
 	}
 	tenant := stored.GroupID
 	if generation.view.Group != nil && generation.view.Group.Table != "" && (tenant == "" || tenant == "0") {

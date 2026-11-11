@@ -1,0 +1,8 @@
+[
+  "Telemetry is account-level, enabled by default, and disclosed once on stderr before the first upload.",
+  "The local store holds a fingerprint of the token mapped to an account ID, never the raw token; switching accounts cannot upload another account's pending runs, while same-account token rotation preserves disclosure and throttle state.",
+  "benmore usage --local sends nothing to Benmore (the CLI's daily update check to GitHub can still run in an interactive terminal; BENMORE_NO_UPDATE_CHECK=1 turns it off). Usage collected before authentication, or by an older CLI's store, is shown as unassigned local-only history and is never uploaded. Usage collected for a token not yet resolved to an account stays local until an online sync resolves it and associates it with that account.",
+  "Local source failures are reported only as Claude/Codex scan failures; filesystem paths are never reflected in CLI or hook errors. A rejected sync does surface the platform's own structured error field (it names the reason, e.g. an app the account cannot reach) so the failure is diagnosable; unstructured response bodies - proxy, panic, or CDN output - are still never shown.",
+  "Disable persistently with benmore telemetry off or for one process with BENMORE_TELEMETRY=0.",
+  "Cache-read and cache-write counters are provider-reported measurements. Benmore does not control provider-side prompt caching and does not estimate monetary cost."
+]

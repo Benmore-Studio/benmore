@@ -1,0 +1,162 @@
+# Each test runs one documented example flow (see app.yaml) and checks the
+# result the reference states.
+
+inputs_are_validated_before_any_step:
+  as_user: "ann@flows.test"
+  setup:
+    - sql: "DELETE FROM time_entries"
+    - sql: "DELETE FROM tasks"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (1, 'Write the report', {{user_id}})"
+  steps:
+    - api: "POST /api/tasks/1/time"
+      json: {}
+      expect:
+        status: 422
+        json:
+          error: 'flow input "hours" is required'
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 30 }
+      expect:
+        status: 422
+        json:
+          error: 'flow input "hours" must be a number within the declared range'
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 2, kind: lunch }
+      expect:
+        status: 422
+        json:
+          error: 'flow input "kind" must be one of the declared values'
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 2, worked_on: "10/11/2026" }
+      expect:
+        status: 422
+        json:
+          error: 'flow input "worked_on" must be a YYYY-MM-DD date'
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 2, billable: "yes" }
+      expect:
+        status: 422
+        json:
+          error: 'flow input "billable" must be a boolean'
+    - sql: "SELECT id FROM time_entries"
+      expect: { rows: 0 }
+
+inputs_defaults_are_bound_and_typed:
+  as_user: "ann@flows.test"
+  setup:
+    - sql: "DELETE FROM time_entries"
+    - sql: "DELETE FROM tasks"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (1, 'Write the report', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (2, 'Someone else''s', 99999)"
+  steps:
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 1.5 }
+      expect:
+        status: 201
+        json:
+          kind: dev
+          hours: 1.5
+    - sql: "SELECT id FROM time_entries WHERE task_id = 1 AND hours = 1.5 AND kind = 'dev' AND billable = 1 AND worked_on = '' AND note = '' AND typeof(hours) = 'real' AND typeof(billable) = 'integer'"
+      expect: { rows: 1 }
+    - api: "POST /api/tasks/1/time"
+      json: { hours: 2, kind: review, billable: false, worked_on: "2026-11-09", note: "Second pass" }
+      expect:
+        status: 201
+        json:
+          kind: review
+    - sql: "SELECT id FROM time_entries WHERE task_id = 1 AND hours = 2 AND kind = 'review' AND billable = 0 AND worked_on = '2026-11-09' AND note = 'Second pass'"
+      expect: { rows: 1 }
+    - api: "POST /api/tasks/2/time"
+      json: { hours: 1 }
+      expect:
+        status: 404
+        json:
+          error: task_not_found
+    - sql: "SELECT id FROM time_entries WHERE task_id = 2"
+      expect: { rows: 0 }
+
+loop_is_all_or_nothing_in_a_transaction:
+  as_user: "ann@flows.test"
+  setup:
+    - sql: "DELETE FROM tasks"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (1, 'One', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (2, 'Two', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (3, 'Not mine', 99999)"
+  steps:
+    - api: "POST /api/tasks/complete"
+      json: { ids: [1, 3, 2] }
+      expect:
+        status: 409
+        json:
+          error: not_an_open_task
+          id: 3
+    - sql: "SELECT id FROM tasks WHERE status = 'done'"
+      expect: { rows: 0 }
+    - api: "POST /api/tasks/complete"
+      json: { ids: [1, 2] }
+      expect:
+        status: 200
+        json:
+          completed: 2
+    - sql: "SELECT id FROM tasks WHERE status = 'done' AND user_id = {{user_id}}"
+      expect: { rows: 2 }
+    - sql: "SELECT id FROM tasks WHERE id = 3 AND status = 'open'"
+      expect: { rows: 1 }
+    - api: "POST /api/tasks/complete"
+      json: { ids: [] }
+      expect:
+        status: 200
+        json:
+          completed: 0
+
+parallel_reads_answer_together:
+  as_user: "ann@flows.test"
+  setup:
+    - sql: "DELETE FROM time_entries"
+    - sql: "DELETE FROM tasks"
+    - sql: "INSERT INTO tasks (id, title, status, user_id) VALUES (1, 'One', 'open', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, status, user_id) VALUES (2, 'Two', 'done', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, status, user_id) VALUES (3, 'Three', 'done', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, status, user_id) VALUES (4, 'Not mine', 'open', 99999)"
+    - sql: "INSERT INTO time_entries (task_id, hours, user_id) VALUES (1, 1.5, {{user_id}})"
+    - sql: "INSERT INTO time_entries (task_id, hours, user_id) VALUES (2, 2, {{user_id}})"
+  steps:
+    - get: "/api/dashboard"
+      expect:
+        status: 200
+        json:
+          open: 1
+          done: 2
+          hours: 3.5
+
+redirect_stays_in_the_app_unless_the_host_is_listed:
+  as_user: "ann@flows.test"
+  setup:
+    - sql: "DELETE FROM tasks"
+    - sql: "INSERT INTO tasks (id, title, user_id) VALUES (1, 'Here', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, tracker_url, user_id) VALUES (2, 'Tracked', 'https://tracker.example.com/issues/7', {{user_id}})"
+    - sql: "INSERT INTO tasks (id, title, tracker_url, user_id) VALUES (3, 'Elsewhere', 'https://evil.example.net/x', {{user_id}})"
+  steps:
+    - get: "/api/tasks/1/open"
+      expect:
+        status: 303
+        redirect: "/tasks/1"
+    - get: "/api/tasks/2/open"
+      expect:
+        status: 303
+        redirect: "https://tracker.example.com/issues/7"
+    - get: "/api/tasks/3/open"
+      expect:
+        status: 500
+        contains: "flow_no_response"
+
+anonymous_callers_are_refused:
+  anon: true
+  steps:
+    - get: "/api/dashboard"
+      expect:
+        status: 401
+    - api: "POST /api/tasks/complete"
+      json: { ids: [1] }
+      expect:
+        status: 401

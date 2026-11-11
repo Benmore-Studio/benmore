@@ -4,8 +4,6 @@ package main
 
 import (
 	"fmt"
-	"html"
-	"log"
 	"strings"
 )
 
@@ -206,13 +204,20 @@ func injectOwnerScope(sqlText string, userID int64, hasUser bool) (string, error
 	return s[:ins] + "\nWHERE " + pred + " " + s[ins:], nil
 }
 
-// queryErrorHTML renders a failed <query> in place: full detail in dev mode,
-// a generic message (details to the log) in production.
-func queryErrorHTML(app *App, q QueryTag, err error) string {
-	if app.DevMode {
-		return fmt.Sprintf(`<div class="benmore-error"><strong>SQL Error</strong><pre>%s</pre><p>%s</p></div>`,
-			html.EscapeString(q.SQL), html.EscapeString(err.Error()))
+// queryTagError fails the render of a page whose <query> tag could not run
+// (template binding, shorthand expansion, scope="owner" or the statement
+// itself). It used to be replaced in place by a notice, so the rest of the
+// page, including its {{^name}} empty states, rendered 200 as if the query
+// had returned nothing. The page path answers 500 with the request id; the
+// detail, including the authored SQL, goes to the request log, and dev mode
+// shows it.
+func queryTagError(q QueryTag, err error) error {
+	name := q.As
+	if name == "" {
+		name = q.From
 	}
-	log.Printf("ERROR [query] %s: %s", q.SQL, err.Error())
-	return `<div class="benmore-error">An error occurred loading this content.</div>`
+	if q.SQL != "" {
+		return fmt.Errorf("query %q (%s): %w", name, q.SQL, err)
+	}
+	return fmt.Errorf("query %q: %w", name, err)
 }

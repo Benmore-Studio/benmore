@@ -1,0 +1,24 @@
+{
+  "keys": [
+    "state_removal",
+    "generated_tests",
+    "transaction_boundary",
+    "reload",
+    "summary",
+    "ssr_tag",
+    "one_per_table",
+    "timeout_effects",
+    "encrypted_state",
+    "create_null_state",
+    "state_column_names",
+    "transition_writes",
+    "timeout_sweep",
+    "state_default_check",
+    "role_lists",
+    "transition_roles",
+    "yaml_example",
+    "hook_context",
+    "keys",
+    "js_snippet"
+  ]
+}

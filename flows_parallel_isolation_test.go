@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 // A real SQL call holds the first branch's with.params overlay open while an
@@ -33,7 +31,7 @@ func parallelBarrierContext(t *testing.T) *FlowContext {
 		}
 		conns = append(conns, conn)
 		if err := conn.Raw(func(raw any) error {
-			native := raw.(*sqlite3.SQLiteConn)
+			native := mustSQLiteConn(raw)
 			if err := native.RegisterFunc("parallel_first", func() (int, error) {
 				close(started)
 				select {

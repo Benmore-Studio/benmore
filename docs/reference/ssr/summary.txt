@@ -1,0 +1,1 @@
+Server-rendered pages: root-level *.html files rendered on each request as mustache (the default) or Go html/template (`engine: gotmpl`), with page settings in YAML frontmatter or a <page> tag, SQL through <query> tags or frontmatter `queries:`, layouts, partials, forms and template pipes. The names pages, templates, gotmpl, mustache and pipes answer with this topic.

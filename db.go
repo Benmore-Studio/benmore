@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -35,25 +36,93 @@ func openDBWithEnv(dir string, appEnv map[string]string) (*sql.DB, error) {
 
 // openDBWithPolicyLease is used by loadApp while it already owns the per-app
 // policy/file lease. Corruption recovery reuses that held lease.
-func openDBWithPolicyLease(dir string, appEnv map[string]string, lease *appMCPAuthorityLease) (*sql.DB, error) {
-	return openDBWithPolicyLock(dir, appEnv, lease, true)
+func openDBWithPolicyLease(dir string, appEnv map[string]string, lease *appMCPAuthorityLease) (*sql.DB, dbOpenCheck, error) {
+	return openDBChecked(dir, appEnv, lease, true)
+}
+
+// dbOpenCheck is what an open established about the database file's structure.
+type dbOpenCheck struct {
+	// verifiedAt is when the file last passed a full structural check: the
+	// quick_check this open ran, or the one a clean-shutdown marker carried
+	// forward. Zero when nothing vouches for it (a backup swapped in by
+	// recovery, a degraded reopen, a remote database).
+	verifiedAt time.Time
+	// local is true for the app's own data.db (not a remote DATABASE_URL),
+	// the file the open-time checks apply to.
+	local bool
+	// openedDev/openedIno identify the data.db this pool opened (after any
+	// recovery swap); a clean-shutdown marker may only vouch for that file.
+	openedDev, openedIno uint64
+	openedKnown          bool
+}
+
+// transientIOBackoff spaces the retries of an open or quick_check that failed
+// with a disk I/O error, before it is treated as corruption: a moment of
+// storage trouble must not swap in a backup. A variable so tests can shorten it.
+var transientIOBackoff = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
+
+func isDiskIOErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "disk I/O error")
+}
+
+// retryDiskIO runs op again, with backoff, while it fails with a disk I/O
+// error, and returns its last error.
+func retryDiskIO(what, dir string, op func() error) error {
+	err := op()
+	for _, wait := range transientIOBackoff {
+		if !isDiskIOErr(err) {
+			return err
+		}
+		log.Printf("DB I/O ERROR (%s) in %s: %v - retrying in %s before treating it as corruption", what, dir, err, wait)
+		time.Sleep(wait)
+		err = op()
+	}
+	return err
 }
 
 func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAuthorityLease, policyHeld bool) (*sql.DB, error) {
+	db, _, err := openDBChecked(dir, appEnv, lease, policyHeld)
+	return db, err
+}
+
+func openDBChecked(dir string, appEnv map[string]string, lease *appMCPAuthorityLease, policyHeld bool) (*sql.DB, dbOpenCheck, error) {
+	var check dbOpenCheck
+	// The hosted router under the tenant-data lock never opens this, whichever
+	// branch a later change might send it down (router_tenant_data_lock.go).
+	if err := refuseRouterTenantData(filepath.Join(dir, "data.db")); err != nil {
+		return nil, check, err
+	}
 	if foreignAppDirs.Load() {
-		return openForeignAppDB(dir, appEnv)
+		return nil, check, errForeignAppLoad
 	}
 	dbURL := resolveDatabaseURLWithEnv(dir, appEnv)
 	cfg := buildDBOpenConfigWithEnv(dir, dbURL, appEnv)
 	if cfg.Backend == DatabaseBackendPostgres {
-		return nil, unsupportedPostgresRuntimeError(detectedPostgresScheme(dbURL))
+		return nil, check, unsupportedPostgresRuntimeError(detectedPostgresScheme(dbURL))
 	}
 
+	// Read (and spend) the clean-shutdown marker before SQLite opens the file:
+	// opening can replay a WAL into it, which is exactly the state the marker
+	// must be compared against untouched.
+	var markerVerifiedAt time.Time
+	markerReason := ""
+	if cfg.LocalSQLite {
+		// A refused auto-recovery of this unchanged file stands: fail before
+		// reading it again (db_recovery_refusal.go).
+		if err := standingRecoveryRefusal(dir); err != nil {
+			return nil, check, fmt.Errorf("database: %w", err)
+		}
+		markerVerifiedAt, markerReason = consumeCleanShutdownMarker(dir, filepath.Join(dir, "data.db"), time.Now())
+	}
+
+	check.local = cfg.LocalSQLite
 	db, err := sql.Open(cfg.DriverName, cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, check, fmt.Errorf("open database: %w", err)
 	}
-	if err := db.Ping(); err != nil {
+	if err := retryDiskIO("open", dir, db.Ping); err != nil {
+		// A file that fails to open is not the file the marker vouched for.
+		markerVerifiedAt, markerReason = time.Time{}, "the database failed to open"
 		// If the file is irrecoverably corrupt (the classic "file is
 		// not a database" / "database disk image is malformed" pair),
 		// try to auto-restore from the most recent pre-migrate backup.
@@ -62,7 +131,7 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 		// the user had to delete + recreate the entire app to escape.
 		// Now we look for backups/pre-migrate-*.db, sorted newest-
 		// first, and try each one until something opens successfully.
-		// The corrupt original is moved to data.db.corrupt-<timestamp>
+		// The corrupt original is moved to .benmore/backups/data.db.corrupt-<timestamp>
 		// so a human can post-mortem it; the backup becomes the new
 		// data.db. Logged loudly so the operator knows recovery
 		// happened.
@@ -75,22 +144,27 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 				recovered, rErr = autoRestoreFromBackup(dir, err)
 			}
 			if rErr == nil && recovered {
-				log.Printf("DB AUTO-RECOVERY: %s - restored from most recent pre-migrate backup, original moved to data.db.corrupt-*", dir)
+				log.Printf("DB AUTO-RECOVERY: %s - restored from most recent pre-migrate backup, original moved to .benmore/backups/data.db.corrupt-*", dir)
 				_ = db.Close()
 				// Re-open with the same DSN; the file underneath is now the backup.
 				db, err = sql.Open(cfg.DriverName, cfg.DSN)
 				if err != nil {
-					return nil, fmt.Errorf("re-open after recovery: %w", err)
+					return nil, check, fmt.Errorf("re-open after recovery: %w", err)
 				}
 				if err := db.Ping(); err != nil {
-					return nil, fmt.Errorf("ping after recovery (backup is also bad?): %w", err)
+					return nil, check, fmt.Errorf("ping after recovery (backup is also bad?): %w", err)
 				}
 				// Fall through to the connection-pool setup below.
 			} else {
-				return nil, fmt.Errorf("ping database (corrupt + no usable backup): %w", err)
+				_ = db.Close()
+				if errors.Is(rErr, errAutoRestoreRefused) {
+					recordRecoveryRefusal(dir, rErr)
+					return nil, check, fmt.Errorf("ping database: %w: %w", err, rErr)
+				}
+				return nil, check, fmt.Errorf("ping database (corrupt + no usable backup): %w", err)
 			}
 		} else {
-			return nil, fmt.Errorf("ping database: %w", err)
+			return nil, check, fmt.Errorf("ping database: %w", err)
 		}
 	}
 
@@ -100,10 +174,20 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 	// when VACUUM INTO (the pre-migrate backup) or a query walks the pages. On
 	// prod that backup failure is fatal, so systemd restart-loops the unit
 	// (a real outage: the counter hit 86 before manual recovery). Probe with a
-	// cheap quick_check up front and route any corruption to the SAME
-	// auto-recovery + reopen the failed-Ping branch above uses.
-	if cfg.LocalSQLite {
-		if qcErr := sqliteQuickCheck(db); qcErr != nil {
+	// quick_check up front and route any corruption to the SAME auto-recovery +
+	// reopen the failed-Ping branch above uses. quick_check reads every page, so
+	// it is skipped when the previous process closed this exact file cleanly
+	// and nothing has touched it since (db_clean_shutdown.go); every other open
+	// runs it.
+	if cfg.LocalSQLite && !markerVerifiedAt.IsZero() {
+		check.verifiedAt = markerVerifiedAt
+		log.Printf("  database: quick_check skipped - the previous process closed this file cleanly and it is unchanged (last full check %s)", markerVerifiedAt.UTC().Format(time.RFC3339))
+	} else if cfg.LocalSQLite {
+		log.Printf("  database: quick_check (%s)", markerReason)
+		checkedAt := time.Now()
+		if qcErr := retryDiskIO("quick_check", dir, func() error { return startupQuickCheck(db) }); qcErr == nil {
+			check.verifiedAt = checkedAt
+		} else {
 			log.Printf("DB CORRUPTION (quick_check) in %s: %v", dir, qcErr)
 			repaired := false
 			// 1) Try an in-place REINDEX FIRST. INDEX corruption ("wrong # of
@@ -115,6 +199,7 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 			if _, rxErr := db.Exec("REINDEX"); rxErr == nil && sqliteQuickCheck(db) == nil {
 				log.Printf("DB REPAIR: %s - rebuilt indexes via REINDEX (no data loss)", dir)
 				repaired = true
+				check.verifiedAt = time.Now()
 			}
 			// 2) Still bad → structural/table b-tree corruption REINDEX can't fix
 			//    (malformed / 2nd-reference-to-page) → restore from the newest
@@ -130,7 +215,14 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 					recovered, rErr = autoRestoreFromBackup(dir, qcErr)
 				}
 				if rErr == nil && recovered {
-					log.Printf("DB AUTO-RECOVERY: %s - restored from most recent valid backup; corrupt original moved to data.db.corrupt-*", dir)
+					log.Printf("DB AUTO-RECOVERY: %s - restored from most recent valid backup; corrupt original moved to .benmore/backups/data.db.corrupt-*", dir)
+				} else if errors.Is(rErr, errAutoRestoreRefused) {
+					// Only an old snapshot exists: fail closed with the original in
+					// place, so the router marks the app failed and a person
+					// chooses between that snapshot, PITR and a repair. Later
+					// starts fail at once while nothing changes.
+					recordRecoveryRefusal(dir, rErr)
+					return nil, check, fmt.Errorf("database corrupt (%v) and not restored: %w", qcErr, rErr)
 				} else {
 					// No usable backup. Reopen the original rather than returning
 					// a nil db - the app boots degraded instead of crashing on a
@@ -139,10 +231,10 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 				}
 				db, err = sql.Open(cfg.DriverName, cfg.DSN)
 				if err != nil {
-					return nil, fmt.Errorf("re-open after corruption recovery: %w", err)
+					return nil, check, fmt.Errorf("re-open after corruption recovery: %w", err)
 				}
 				if err := db.Ping(); err != nil {
-					return nil, fmt.Errorf("ping after corruption recovery: %w", err)
+					return nil, check, fmt.Errorf("ping after corruption recovery: %w", err)
 				}
 			}
 		}
@@ -160,14 +252,21 @@ func openDBWithPolicyLock(dir string, appEnv map[string]string, lease *appMCPAut
 	//
 	// SQLite creates these with the OS default umask (typically 0644 -
 	// world-readable). Best-effort: ignore errors on remote DBs (Turso).
+	//
+	// On a host with the router tenant-data lock (tenant_data_lock_marker.go)
+	// the files belong to this process's account alone: the mode is only
+	// narrowed (group and other bits cleared), never widened back to 0660.
 	if cfg.LocalSQLite {
 		dbPath := filepath.Join(dir, "data.db")
 		for _, suffix := range []string{"", "-wal", "-shm"} {
-			os.Chmod(dbPath+suffix, 0660)
+			_ = tightenAppDataFile(dbPath+suffix, 0660, os.Chmod)
+		}
+		if dev, ino, err := dbFileDevIno(dbPath); err == nil {
+			check.openedDev, check.openedIno, check.openedKnown = dev, ino, true
 		}
 	}
 
-	return db, nil
+	return db, check, nil
 }
 
 // LoadSchema reads the app's schema definition and executes it against
@@ -196,6 +295,13 @@ func LoadSchema(db *sql.DB, dir string) ([]Table, []string, error) {
 }
 
 func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byte, error), runtimeJournal bool) ([]Table, []string, error) {
+	return loadSchemaWithReaderCtx(context.Background(), db, dir, readSource, runtimeJournal, false)
+}
+
+// ctx bounds the tenant-authored migration files the Prisma step may adopt
+// (prisma_migrate_adopt.go); a validation load (tryLoadApp) passes a deadline
+// and checkOnly, which lets a migration reuse a recent pre-migrate snapshot.
+func loadSchemaWithReaderCtx(ctx context.Context, db *sql.DB, dir string, readSource func(string) ([]byte, error), runtimeJournal, checkOnly bool) ([]Table, []string, error) {
 	schemaSQL := ""
 	var prismaModels []PrismaModel
 	if data, err := readSource("schema.prisma"); err == nil {
@@ -207,7 +313,7 @@ func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byt
 		schemaSQL = EmitSQL(models)
 		// Generation, its safety backup, execution and the ledger must all
 		// succeed before the candidate schema can be published.
-		if name, err := applyPrismaMigration(db, dir, string(data), runtimeJournal); err != nil {
+		if name, err := applyPrismaMigrationCtx(ctx, db, dir, string(data), runtimeJournal, checkOnly); err != nil {
 			return nil, nil, fmt.Errorf("Prisma migration: %w", err)
 		} else if name != "" {
 			if runtimeJournal {
@@ -241,6 +347,7 @@ func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byt
 			if model.Table != tables[ti].Name {
 				continue
 			}
+			tables[ti].Relations = model.Relations
 			for ci := range tables[ti].Columns {
 				for _, field := range model.Fields {
 					if field.Column == tables[ti].Columns[ci].Name {
@@ -252,15 +359,25 @@ func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byt
 		}
 	}
 
-	// Execute schema. Auto-inject IF NOT EXISTS into CREATE TABLE / INDEX /
-	// VIEW / TRIGGER statements so hot-reloads are idempotent. Without this,
-	// any reload after the first would fail with "table already exists" -
-	// breaks the entire MCP-first workflow where every LLM file edit
-	// triggers a hot reload. Per-column migrations (ADD COLUMN for new
-	// columns on existing tables) are handled separately in Migrate().
-	statements := splitStatements(schemaSQL)
-	var deferred []string
-	for _, stmt := range statements {
+	immediate, deferred := schemaLoadStatements(schemaSQL)
+	for _, stmt := range immediate {
+		if _, err := db.Exec(stmt); err != nil {
+			return tables, deferred, fmt.Errorf("execute schema statement: %s: %w", truncate(stmt, 80), err)
+		}
+	}
+
+	return tables, deferred, nil
+}
+
+// schemaLoadStatements splits a schema source into what a load runs now and
+// what it defers. Auto-inject IF NOT EXISTS into CREATE TABLE / INDEX / VIEW /
+// TRIGGER statements so hot-reloads are idempotent. Without this, any reload
+// after the first would fail with "table already exists" - breaks the entire
+// MCP-first workflow where every LLM file edit triggers a hot reload.
+// Per-column migrations (ADD COLUMN for new columns on existing tables) are
+// handled separately in Migrate().
+func schemaLoadStatements(schemaSQL string) (immediate, deferred []string) {
+	for _, stmt := range splitStatements(schemaSQL) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
@@ -273,12 +390,9 @@ func loadSchemaWithReader(db *sql.DB, dir string, readSource func(string) ([]byt
 			deferred = append(deferred, stmt)
 			continue
 		}
-		if _, err := db.Exec(stmt); err != nil {
-			return tables, deferred, fmt.Errorf("execute schema statement: %s: %w", truncate(stmt, 80), err)
-		}
+		immediate = append(immediate, stmt)
 	}
-
-	return tables, deferred, nil
+	return immediate, deferred
 }
 
 // isDeferredDDL reports whether a schema statement creates an index, view, or
@@ -366,30 +480,6 @@ func DetectUUIDTables(tables []Table) map[string]bool {
 	return result
 }
 
-// LoadSeeds reads seeds.sql and executes it.
-func LoadSeeds(db *sql.DB, dir string) error {
-	seedPath := filepath.Join(dir, "seeds.sql")
-	data, err := os.ReadFile(seedPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read seeds.sql: %w", err)
-	}
-
-	statements := splitStatements(string(data))
-	for _, stmt := range statements {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" || strings.HasPrefix(stmt, "--") {
-			continue
-		}
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("execute seed: %s: %w", truncate(stmt, 80), err)
-		}
-	}
-	return nil
-}
-
 // QueryRows executes a SQL query and returns results as a slice of maps.
 type mutationQuerier interface {
 	Query(string, ...any) (*sql.Rows, error)
@@ -398,6 +488,12 @@ type mutationQuerier interface {
 type sqlExecutor interface {
 	Exec(string, ...any) (sql.Result, error)
 }
+
+// isNoSuchTable reports a SQLite "no such table" error.
+func isNoSuchTable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
 type mutationTx interface {
 	mutationQuerier
 	sqlExecutor
@@ -990,6 +1086,9 @@ func EnsureUsersTable(db *sql.DB) error {
 	if err := ensureSignInChallenges(db); err != nil {
 		return err
 	}
+	if err := ensureOTPTable(db); err != nil {
+		return err
+	}
 	ensureEmailGrandfathering(db)
 	// Backfill usernames for existing users that predate the username column
 	BackfillUsernames(db)
@@ -1117,7 +1216,9 @@ func ensureUserColumn(db *sql.DB, field, source string) {
 	var count int
 	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('_benmore_users') WHERE name=?", field).Scan(&count)
 	if count == 0 {
-		db.Exec(fmt.Sprintf("ALTER TABLE _benmore_users ADD COLUMN %s TEXT DEFAULT ''", field))
+		// Quoted: `group` or `order` is a valid field name the statement
+		// cannot take bare, and the signup INSERT writes it quoted too.
+		db.Exec(fmt.Sprintf("ALTER TABLE _benmore_users ADD COLUMN %s TEXT DEFAULT ''", quoteIdent(field)))
 		log.Printf("  users: auto-added column '%s' (referenced by %s)", field, source)
 	}
 }
@@ -1125,6 +1226,28 @@ func ensureUserColumn(db *sql.DB, field, source string) {
 // LoadUserFields loads all columns from _benmore_users for a given user ID.
 // Returns a map suitable for injection into template context as {{user.field}}.
 // Excludes password_hash for security.
+// AnonymousUserFields is the `user` object of an anonymous caller on an
+// `auth: optional` flow: every column LoadUserFields would return, each null,
+// so `${{ user.id }}` binds NULL instead of failing as unresolved.
+func AnonymousUserFields(db *sql.DB) map[string]any {
+	rows, err := db.Query("SELECT * FROM _benmore_users LIMIT 0")
+	if err != nil {
+		return map[string]any{"id": nil, "email": nil, "role": nil}
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return map[string]any{"id": nil, "email": nil, "role": nil}
+	}
+	result := make(map[string]any, len(cols))
+	for _, col := range cols {
+		if !isSensitiveUserColumn(col) {
+			result[col] = nil
+		}
+	}
+	return result
+}
+
 func LoadUserFields(db *sql.DB, userID int64) map[string]any {
 	rows, err := db.Query("SELECT * FROM _benmore_users WHERE id = ? LIMIT 1", userID)
 	if err != nil {
@@ -1213,7 +1336,7 @@ func insertAuditRowChecked(exec sqlExecutor, action, table, rowID string, sessio
 	if session != nil && session.ImpersonatorUserID != 0 {
 		if _, err := exec.Exec(
 			"INSERT INTO main._benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values, impersonator_user_id, impersonator_email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			action, table, rowID, userID, email, oldJSON, newJSON, session.ImpersonatorUserID, session.ImpersonatorEmail,
+			action, table, rowID, userID, email, auditValuesParam(oldJSON), auditValuesParam(newJSON), session.ImpersonatorUserID, session.ImpersonatorEmail,
 		); err != nil {
 			return err
 		}
@@ -1221,9 +1344,19 @@ func insertAuditRowChecked(exec sqlExecutor, action, table, rowID string, sessio
 	}
 	_, err := exec.Exec(
 		"INSERT INTO main._benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		action, table, rowID, userID, email, oldJSON, newJSON,
+		action, table, rowID, userID, email, auditValuesParam(oldJSON), auditValuesParam(newJSON),
 	)
 	return err
+}
+
+// auditValuesParam binds a side with no row (an insert's old values, a
+// delete's new values) as NULL. An empty string was neither absent nor JSON, so
+// `old_values IS NULL` missed it and json_extract on it raises an error.
+func auditValuesParam(values string) any {
+	if values == "" {
+		return nil
+	}
+	return values
 }
 
 // LogAudit records a CRUD mutation in the audit log.
@@ -1364,7 +1497,7 @@ func RegisterAuditAPI(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_audit", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
-			http.Error(w, `{"error":"admin required"}`, http.StatusForbidden)
+			httpError(w, "admin required", http.StatusForbidden)
 			return
 		}
 
@@ -1426,7 +1559,7 @@ func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_devices", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
-			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
 		// A registered device receives the account's push notifications from
@@ -1450,7 +1583,7 @@ func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 			AppVersion string `json:"app_version"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" || body.Platform == "" {
-			http.Error(w, `{"error":"token and platform required"}`, http.StatusBadRequest)
+			httpError(w, "token and platform required", http.StatusBadRequest)
 			return
 		}
 
@@ -1468,7 +1601,7 @@ func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("DELETE /api/_devices", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
-			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
 		// Nor may it unregister the owner's devices (an empty body removes
@@ -1871,6 +2004,47 @@ func walCheckpointMode(app *App, _ int64) string {
 	return "PASSIVE"
 }
 
+// walShippingConfiguredForApp reports whether the app asked for WAL shipping
+// and the process has somewhere to ship it: the operator's store credential
+// (BACKUP_S3_BUCKET), or, in a hosted app, a host that keeps WAL sessions.
+// The shipper starts on this; it ships only while walShippingEnabledForApp.
+func walShippingConfiguredForApp(app *App) bool {
+	return platformBuild && app != nil &&
+		os.Getenv("BENMORE_WAL_SHIP") == "1" &&
+		!IsDevSubdomain(filepath.Base(app.Dir)) &&
+		(os.Getenv("BACKUP_S3_BUCKET") != "" || walSessionFileFor(app) != "")
+}
+
+// walCoverageReport is the shipper's last word on PITR coverage.
+type walCoverageReport struct {
+	State       string    `json:"status"` // ok | degraded
+	Reason      string    `json:"reason,omitempty"`
+	LastShipped time.Time `json:"last_shipped,omitzero"`
+}
+
+// setWALCoverage records the shipper's coverage state; a successful upload
+// passes its time, which a later degraded report keeps.
+func (app *App) setWALCoverage(state, reason string, shipped time.Time) {
+	r := &walCoverageReport{State: state, Reason: reason, LastShipped: shipped}
+	if prev := app.walCoverage.Load(); prev != nil && shipped.IsZero() {
+		r.LastShipped = prev.LastShipped
+	}
+	app.walCoverage.Store(r)
+}
+
+// walCoverageHealth is the health check's "pitr" entry: present wherever WAL
+// shipping is configured, "starting" until the shipper first reports.
+func walCoverageHealth(app *App) (walCoverageReport, bool) {
+	if !walShippingConfiguredForApp(app) {
+		return walCoverageReport{}, false
+	}
+	r := walCoverageReport{State: "starting"}
+	if p := app.walCoverage.Load(); p != nil {
+		r = *p
+	}
+	return r, true
+}
+
 func walShippingEnabledForApp(app *App) bool {
 	// Require a configured object store too: without it StartWALShipper bails,
 	// but walCheckpointMode would otherwise keep returning PASSIVE forever
@@ -1878,9 +2052,29 @@ func walShippingEnabledForApp(app *App) bool {
 	// truncating the WAL - the exact bloat StartAppWALMaintenance exists to
 	// prevent. Gate on BACKUP_S3_BUCKET (what backupS3Store keys off) so a
 	// half-configured deployment still truncates. Inlined as an env check
-	// rather than calling backupS3Store(), which is platform-only.
-	return platformBuild && app != nil &&
-		os.Getenv("BENMORE_WAL_SHIP") == "1" &&
-		!IsDevSubdomain(filepath.Base(app.Dir)) &&
-		os.Getenv("BACKUP_S3_BUCKET") != ""
+	// rather than calling backupS3Store(), which is platform-only. A hosted
+	// app holds no store credential: it ships with a WAL session file the
+	// host's broker keeps (wal_session_store.go), and only on a host that
+	// has the broker installed, and only while its own session file exists:
+	// without one nothing could be uploaded, and maintenance keeps truncating.
+	return walShippingConfiguredForApp(app) &&
+		(os.Getenv("BACKUP_S3_BUCKET") != "" || walSessionUsable(walSessionFileFor(app)))
+}
+
+// walSessionFileFor is a hosted app's WAL session file, or "" where the host
+// keeps none (wal_session_store.go sets it in the platform edition).
+var walSessionFileFor = func(app *App) string { return "" }
+
+// walSessionUsable reports whether a hosted app's WAL session file holds a
+// session it can ship with (the platform edition parses it and checks its
+// expiry); an expired file left behind does not keep WAL checkpoints passive.
+var walSessionUsable = walSessionFilePresent
+
+// walSessionFilePresent reports whether a WAL session file exists.
+func walSessionFilePresent(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }

@@ -1,0 +1,37 @@
+# encrypted.yaml (preferred - lives next to app.yaml)
+tables:
+  ask_hr_messages:
+    fields:
+      - body                        # column name(s) to encrypt
+    unmask_roles:                   # who reads decrypted; everyone else sees masked
+      - admin
+      - platform_admin
+      - hr_admin
+
+  journal_entries:
+    fields: [body, title]
+    # self (alias owner) = the row's OWNER reads their OWN rows decrypted
+    # (per-row, matched on user_id). REQUIRED for per-user private data
+    # (journals, notes, health) - WITHOUT it an owner-scoped encrypted column
+    # is masked even from its owner, who just sees asterisks.
+    unmask_roles: [self, admin]
+
+  support_messages:
+    fields: [body, internal_notes]
+    unmask_roles: [admin, platform_admin]
+
+  contacts:
+    fields: [ssn, bank_account, email]
+    blind_index: [email]            # ALSO equality-searchable - must be in fields:
+    unmask_roles: [admin]
+
+  paychecks:
+    fields: [wages_cents]           # INTEGER column - round-trips to a number on read
+    blind_index: [wages_cents]
+
+# (Legacy alternative: a top-level 'encrypted:' key in app.yaml. It is
+# NOT this tree - it maps each table to a LIST of columns, each a name
+# or {column, roles}:  encrypted: { notes: [body], patients: [{column: ssn,
+# roles: [admin]}] }.  'roles' there plays unmask_roles; no blind_index.
+# A tables:/fields:/unmask_roles: tree inside app.yaml is refused.
+# encrypted.yaml takes precedence per table.)

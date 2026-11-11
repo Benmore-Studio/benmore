@@ -1,0 +1,9 @@
+[
+  "Scaffold: src/bm.d.ts is a small placeholder (api, auth.me/signOut/refreshMe, users, table, live, room) with no per-app types; the editor shows errors for everything else, the scaffold's own files included, until a schema or config push, or `benmore types`, replaces it",
+  "benmore push schema.prisma → fetches /_internal/bm.d.ts, writes to src/bm.d.ts",
+  "/_internal/bm.d.ts (alias /_internal/types.d.ts) is NOT public: it answers 403 unless the caller is an app admin on an unscoped credential (an admin's scoped API token is refused) or presents the short-lived X-Benmore-Types-Token that `benmore push` / `benmore types` mint on the platform for any app member. Don't fetch it from browser code.",
+  "benmore push app.yaml → same (access/roles/aggregates affect types)",
+  "benmore push flows.yaml / flows/*.yaml / workflows.yaml / hooks.yaml / i18n/*.yaml → same",
+  "Other pushes (static/*, env.yaml, seeds.sql) → no type refresh, no network hop",
+  "A nullable column is typed `col: T | null` in its table interface and in User, because a read returns the key with null. A column reads never return (a secret-shaped name such as `api_secret`, a blind-index sibling) is optional, `col?: T`. create/update take `Partial<Row>`, so a write may omit any column or send null to clear one. Assigning a nullable field to `T | undefined` needs `?? undefined`."
+]

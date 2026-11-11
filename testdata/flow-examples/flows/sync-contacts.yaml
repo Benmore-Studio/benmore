@@ -1,0 +1,33 @@
+# flows/sync-contacts.yaml - read every page of an upstream list, then store the rows
+on:
+  request:
+    method: POST
+    path: /api/contacts/sync
+    role: admin
+    mode: async                    # many pages can outlast a synchronous flow's time limit
+jobs:
+  sync:
+    steps:
+      - id: list
+        run: api
+        with:
+          url: https://api.example.com/v1/contacts
+          headers: { Authorization: "Bearer ${{ env.CRM_TOKEN }}" }
+          query: { limit: "100" }  # sent with every page
+          paginate:
+            strategy: cursor       # or: page
+            cursor_field: $.next   # where each answer carries the next cursor
+            cursor_param: after    # sent as ?after=<cursor> from the second page on
+            items_field: $.data    # the list inside each answer
+            max_pages: 20
+      - for_each: ${{ steps.list.outputs.items }}
+        as: c
+        steps:
+          - run: sql
+            with:
+              query: "INSERT INTO contacts (external_id, name, email) VALUES (:ext, :name, :email) ON CONFLICT (external_id) DO UPDATE SET name = excluded.name, email = excluded.email"
+              params: { ext: "${{ c.id }}", name: "${{ c.name }}", email: "${{ c.email || '' }}" }
+      - run: sql
+        with:
+          query: "INSERT INTO maintenance_runs (kind, changed) VALUES ('sync-contacts', :changed)"
+          params: { changed: "${{ steps.list.outputs.item_count }}" }

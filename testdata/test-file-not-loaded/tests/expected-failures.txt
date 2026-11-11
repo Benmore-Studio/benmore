@@ -1,0 +1,6 @@
+# benmore test fails each tests/ file it cannot load (result `load`) and still
+# runs the files that load. These were skipped without a word: the run printed
+# loads.yaml alone and exited 0.
+tests/list_under_json.yaml
+tests/comment_only.yaml
+tests/top_level_list.yaml

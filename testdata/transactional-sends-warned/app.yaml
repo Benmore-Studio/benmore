@@ -1,0 +1,10 @@
+site_name: "Transactional sends"
+theme: zinc
+mode: dark
+
+auth:
+  identifier: email
+  session_duration: "30d"
+
+frontend:
+  stack: html

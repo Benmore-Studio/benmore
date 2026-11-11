@@ -31,6 +31,22 @@ func ensureSignInChallenges(db *sql.DB) error {
 	return nil
 }
 
+// ensureOTPTable creates the emailed/SMS sign-in code table once, with an
+// index on the lookup key. It used to be created inside every OTP issuance
+// transaction, with no index (every verify and re-issue scanned the table)
+// and no cleanup (CleanExpiredSessions now removes expired codes).
+func ensureOTPTable(db *sql.DB) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)`,
+		`CREATE INDEX IF NOT EXISTS idx_benmore_otp_email ON _benmore_otp(email)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("ensure sign-in codes: %w", err)
+		}
+	}
+	return nil
+}
+
 type signInChallenge struct {
 	UserID                       int64
 	Email, OTPKey, Binding, Hash string
@@ -163,6 +179,54 @@ func createPasswordSignInSession(app *App, id int64, email, groupID, binding str
 		return "", err
 	}
 	return token, nil
+}
+
+// errSignInCredentialsChanged reports that the account's credential
+// generation moved between the password check and the session write.
+var errSignInCredentialsChanged = errors.New("credentials changed")
+
+// tokenExchangeSessionTx is createPasswordSignInSession for POST
+// /api/_auth/token. One writer transaction re-checks the generation captured
+// before bcrypt, spends the MFA code when one is given (badCode reports a
+// refused code, with nothing committed), re-checks that no enrollment is due
+// and inserts the exchange session (login_at = loginAtTokenExchange). The
+// exchange used to run bcrypt, consume the code on its own and then INSERT
+// the session, so a reset landing in between left a 30-day Bearer session
+// its revocation never saw.
+func tokenExchangeSessionTx(app *App, id int64, email, groupID, scopes, binding, mfaCode string) (token string, badCode bool, err error) {
+	tx, err := signInWriteTx(app.DB)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+	_, _, current, err := mfaSetupAccountState(app, tx, id, email)
+	if err != nil || binding == "" || !hmac.Equal([]byte(binding), []byte(current)) {
+		return "", false, errSignInCredentialsChanged
+	}
+	if mfaCode != "" {
+		if !validateMFACodeWith(tx, id, mfaCode) {
+			return "", true, nil
+		}
+	} else {
+		needsEnrollment, err := needsMFAEnrollmentWith(app, tx, id)
+		if err != nil {
+			return "", false, err
+		}
+		if needsEnrollment {
+			return "", false, errSignInCredentialsChanged
+		}
+	}
+	token, err = insertSessionRow(tx, id, email, groupID, app.SessionDuration, scopes, loginAtTokenExchange)
+	if err == nil {
+		_, err = tx.Exec("UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=?", id)
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return token, false, nil
 }
 
 // Inline password+MFA sign-in uses the same atomic successful-factor boundary

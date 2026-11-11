@@ -1,0 +1,8 @@
+on:
+  request: { method: POST, path: /api/patient-sweep, auth: none, mode: async, rate_limit: "30/minute per ip" }
+jobs:
+  sweep:
+    steps:
+      - run: sql
+        id: n
+        with: { query: "SELECT COUNT(*) AS n FROM patients" }

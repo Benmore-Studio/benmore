@@ -224,7 +224,7 @@ func carryForwardMCPFileProcessings(ctx context.Context, tx *sql.Tx, live map[st
 	defer stmt.Close()
 	var liveDB *sql.DB
 	if livePath != "" {
-		liveDB, err = sql.Open(sqliteMaintenanceDriver, sqliteRestoreURI(livePath, "ro"))
+		liveDB, err = openRestoreDB(sqliteMaintenanceDriver, livePath, "ro", "")
 		if err != nil {
 			return err
 		}

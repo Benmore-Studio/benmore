@@ -1,0 +1,1 @@
+A page that declares `<meta name="bm-cookie-banner" content="off">` (static HTML, or the content of an SSR page) is served without the consent banner, for embeds shown inside another product (a player unfurled in Slack). Analytics stays on for the rest of the app and the beacon still counts the page's views; no visitor cookie is set there because no one can accept it.

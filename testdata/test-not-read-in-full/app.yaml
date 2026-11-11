@@ -1,0 +1,3 @@
+site_name: "test-not-read-in-full"
+auth:
+  identifier: email

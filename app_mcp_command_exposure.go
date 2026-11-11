@@ -16,8 +16,9 @@ package main
 //     effect), apply (the business transaction, receipt included) and record
 //     (the attempt's terminal state and, for a non-success, its audit row, outside
 //     any rollback).
-//   - _status {operation_id} reads the durable state of one operation: prepared,
-//     approved, running, succeeded, failed, conflict, unknown or expired.
+//   - _status {operation_id} reads the state of one operation: prepared,
+//     approved, running, succeeded, failed, conflict, unknown or expired, or
+//     denied with the reason _commit would give its owner.
 // The framework tools start with "_", which the manifest name grammar forbids
 // for app tools, so they cannot collide. There is no approve tool.
 //
@@ -130,6 +131,7 @@ func appMCPCommandErrorClass(err error) string {
 	var failure *appMCPResultError
 	var hook *appMCPCommandHookError
 	var refusal *appMCPCommandRefusal
+	var final *appMCPCommandFinalError
 	switch {
 	case errors.As(err, &refusal):
 		return refusal.Code
@@ -137,6 +139,8 @@ func appMCPCommandErrorClass(err error) string {
 		return "hook_refused"
 	case errors.As(err, &unknown):
 		return "unknown_execution"
+	case errors.As(err, &final):
+		return final.Code
 	case appMCPCommandRowCountConflictOnly(err):
 		return "conflict"
 	case errors.Is(err, errAppMCPOperationExpired):
@@ -157,6 +161,38 @@ func appMCPCommandErrorClass(err error) string {
 	return "unavailable_provider"
 }
 
+// Why the caller's own unexpired operation cannot commit (see
+// appMCPOperationBlockedError).
+const (
+	appMCPBlockSourceChanged  = "source_changed"
+	appMCPBlockActorChanged   = "actor_changed"
+	appMCPBlockApprovalLapsed = "approval_lapsed"
+)
+
+// appMCPOperationBlockedError is errAppMCPOperationDenied for the caller an
+// operation is bound to, once it is past the binding check: _commit and _status
+// give that caller the same reason. Anyone else stops at appMCPBindOperation and
+// gets the bare denied, so nothing about another's operation leaks.
+type appMCPOperationBlockedError struct{ Reason string }
+
+func (e *appMCPOperationBlockedError) Error() string {
+	return "operation is blocked: " + e.Reason
+}
+func (e *appMCPOperationBlockedError) Unwrap() error { return errAppMCPOperationDenied }
+
+// message is the _commit failure text. Each case changed after prepare and may
+// change back, so it never says the operation is gone for good.
+func (e *appMCPOperationBlockedError) message() string {
+	switch e.Reason {
+	case appMCPBlockSourceChanged:
+		return e.Reason + ": the app's reviewed connector source changed after this operation was prepared. Prepare it again."
+	case appMCPBlockActorChanged:
+		return e.Reason + ": your role changed after this operation was prepared. Prepare it again."
+	default:
+		return e.Reason + ": the approval no longer holds (the approving session ended, or this connection may no longer apply it without asking). Prepare it again and have it approved."
+	}
+}
+
 // appMCPCommandRefusal is a prepare phase that refused the request with the
 // author's literal message (a `respond` with a 4xx status, see
 // commandRefusalStatus). Code is one of the stable codes; Message was checked
@@ -171,7 +207,7 @@ func (e *appMCPCommandRefusal) Error() string { return "command refused: " + e.M
 func appMCPLogCommandError(tool, id string, err error) string {
 	class := appMCPCommandErrorClass(err)
 	switch class {
-	case "unavailable_provider", "unknown_execution", "incomplete_result":
+	case "unavailable_provider", "unknown_execution", "incomplete_result", appMCPConstraintFailedCode, appMCPInvalidDeclarationCode:
 		if len(id) > 8 {
 			id = id[:8]
 		}
@@ -375,7 +411,10 @@ func appMCPOperationCommand(ctx context.Context, app *App, id string) (string, e
 // appMCPOperationCommandOwner is appMCPOperationCommand plus the id of the
 // user who prepared the operation.
 func appMCPOperationCommandOwner(ctx context.Context, app *App, id string) (string, int64, error) {
-	tx, err := app.DB.BeginTx(ctx, nil)
+	// A read: the framework driver runs a ReadOnly transaction as a deferred
+	// snapshot, so this lookup neither waits for nor holds the write lock
+	// (app.DB otherwise begins every transaction with BEGIN IMMEDIATE).
+	tx, err := app.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return "", 0, err // infrastructure: logged and reported as unavailable
 	}
@@ -425,20 +464,21 @@ func appMCPBindOperation(cap *appMCPCommandCapability, stored *appMCPStoredOpera
 }
 
 // appMCPBindSource additionally pins the operation to the live reviewed source.
-// Only an unfinished operation needs it. A receipt replay or a status read
-// skips this digest check, but still runs inside the coordinator, which needs
-// the current generation, revision enrollment and command declaration: they
-// survive a source change only while those remain current, not a removal.
+// Only an unfinished operation needs it. A receipt replay skips this digest
+// check, and a status read only reports its result, but both still run inside
+// the coordinator, which needs the current generation, revision enrollment and
+// command declaration: they survive a source change only while those remain
+// current, not a removal.
 func appMCPBindSource(cap *appMCPCommandCapability, stored *appMCPStoredOperation) error {
 	p := stored.Prepared
 	if p.DisclosureVersion != appMCPDisclosureVersion ||
 		!SecureCompare(p.ContractDigest, cap.generation.manifest.ContractDigest) || !SecureCompare(p.ExecutionDigest, cap.generation.manifest.ExecutionDigest) {
-		return errAppMCPOperationDenied
+		return &appMCPOperationBlockedError{Reason: appMCPBlockSourceChanged}
 	}
 	// ${{ user.role }} / ${{ user.is_admin }} are read live at each phase, so a
 	// role change after prepare would run SQL the approved preview never showed.
 	if p.Origin.ActorRole != "" && (p.Origin.ActorRole != cap.actor.Role || p.Origin.ActorAdmin != cap.actor.IsAdmin()) {
-		return errAppMCPOperationDenied
+		return &appMCPOperationBlockedError{Reason: appMCPBlockActorChanged}
 	}
 	return nil
 }
@@ -520,9 +560,14 @@ func appMCPOperationState(cap *appMCPCommandCapability, stored *appMCPStoredOper
 
 // appMCPAttemptRetryable is whether _commit may claim another attempt after the
 // latest one: after failed or conflict, or after a stale running claim (reported
-// unknown) that a retry supersedes; never after an unknown COMMIT outcome.
+// unknown) that a retry supersedes; never after an unknown COMMIT outcome, and
+// never after a failure that is deterministic (constraint_failed,
+// invalid_declaration), which appMCPClaimAttempt refuses with the same code.
 func appMCPAttemptRetryable(state string, latest *appMCPAttempt, attempts int, now time.Time) bool {
 	if latest == nil || attempts >= appMCPOperationAttemptLimit {
+		return false
+	}
+	if state == appMCPAttemptFailed && appMCPFinalErrorClass(latest.ErrorClass) {
 		return false
 	}
 	return state == appMCPAttemptFailed || state == appMCPAttemptConflict || state == appMCPAttemptUnknown && appMCPAttemptStale(latest, now)
@@ -802,9 +847,13 @@ func appMCPPrepareOperation(ctx context.Context, request appMCPCommandRequest, i
 // ---- review / approve ------------------------------------------------------
 
 type appMCPReview struct {
-	Tool, Description, Preview, State string
-	ExpiresAt                         int64
-	Effects                           []string
+	// State and Reason are appMCPDerivedOperationState's, as _status reports
+	// them. ByConsent marks an approval: grant approval (the connection's
+	// standing consent), which only that connection can judge.
+	Tool, Description, Preview, State, Reason string
+	ByConsent                                 bool
+	ExpiresAt                                 int64
+	Effects                                   []string
 	// Human-facing review text (#770). Title and Summary come from the
 	// manifest's title/review_summary, never from the model-facing
 	// description; empty means the manifest declares none. Changes is the
@@ -815,10 +864,12 @@ type appMCPReview struct {
 }
 
 // appMCPReviewChange is one labelled argument of a prepared change. Values are
-// display text already escaped like appMCPReviewPreviewText.
+// display text already escaped like appMCPReviewPreviewText. HasBefore marks a
+// before/after pair the prepare step read (its Before may be empty); every
+// other row is context and shows only its value.
 type appMCPReviewChange struct {
 	Label, Before, After string
-	Changed              bool
+	Changed, HasBefore   bool
 }
 
 // appMCPReviewPreviewText renders the stored preview as indented JSON for the
@@ -826,15 +877,21 @@ type appMCPReviewChange struct {
 // it (bidi controls, zero-width and other format characters, variation
 // selectors, fillers, control and non-ASCII space characters) is written as
 // its JSON \u escape, so a value the assistant chose cannot make the reviewed
-// text read as something else. The escaped text decodes to the same JSON:
-// outside strings MarshalIndent emits only ASCII.
+// text read as something else. Nothing else is escaped: & < > stay as written
+// (json.Marshal's HTML escaping showed "R\u0026D" for "R&D", r1104); the page
+// template HTML-escapes the whole text when it renders it. The escaped text
+// decodes to the same JSON: outside strings the encoder emits only ASCII.
 func appMCPReviewPreviewText(preview map[string]any) (string, error) {
-	pretty, err := json.MarshalIndent(preview, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(preview); err != nil {
 		return "", err
 	}
+	pretty := strings.TrimSuffix(buf.String(), "\n")
 	var out strings.Builder
-	for _, r := range string(pretty) {
+	for _, r := range pretty {
 		if r == '\n' || !appMCPHiddenRune(r) {
 			out.WriteRune(r)
 			continue
@@ -858,12 +915,17 @@ func appMCPReviewOperation(ctx context.Context, request appMCPCommandRequest, id
 		if err := appMCPBindOperation(cap, stored); err != nil {
 			return false, err
 		}
-		if stored.Receipt == nil {
-			if err := appMCPBindSource(cap, stored); err != nil {
-				return false, err
-			}
+		// The page shows what _status reports (attempts and the commit block
+		// included), never the bare stored state. A block is shown, not
+		// refused: the operation is the viewer's own, so its reason is theirs.
+		attempts, err := appMCPReadAttempts(cap, id)
+		if err != nil {
+			return false, err
 		}
-		state, _ := appMCPOperationState(cap, stored, approval, nil, now)
+		state, _, reason, err := appMCPDerivedOperationState(cap, stored, approval, attempts, now)
+		if err != nil {
+			return false, err
+		}
 		preview, err := appMCPDecodeObject(stored.Prepared.Preview)
 		if err != nil {
 			return false, err
@@ -876,20 +938,24 @@ func appMCPReviewOperation(ctx context.Context, request appMCPCommandRequest, id
 		if err != nil {
 			return false, err
 		}
-		review = &appMCPReview{Tool: cap.tool.Name, Description: cap.tool.Description, Preview: pretty, State: state, ExpiresAt: stored.Prepared.ExpiresAt, Effects: effects,
+		review = &appMCPReview{Tool: cap.tool.Name, Description: cap.tool.Description, Preview: pretty, State: state, Reason: reason, ExpiresAt: stored.Prepared.ExpiresAt, Effects: effects,
 			Title: cap.tool.Title, Summary: cap.tool.ReviewSummary, AutoApprove: stored.Prepared.ApprovalReason,
-			Changes: appMCPReviewChanges(cap.tool, cap.command.PreviewSchema, preview)}
+			ByConsent: approval != nil && approval.Approval.Domain == appMCPGrantApprovalDomain,
+			Changes:   appMCPReviewChanges(cap.tool, cap.command.PreviewSchema, preview)}
 		if challenge == "" {
 			return false, nil
 		}
-		if state == "expired" {
-			return false, errAppMCPOperationExpired
-		}
-		if state == "approved" {
-			return false, errAppMCPOperationApproved
-		}
-		if state != "prepared" {
+		switch {
+		case stored.Receipt != nil:
 			return false, errAppMCPOperationDenied // already committed
+		case state == "expired":
+			return false, errAppMCPOperationExpired
+		case approval != nil:
+			return false, errAppMCPOperationApproved
+		case reason != "":
+			return false, &appMCPOperationBlockedError{Reason: reason} // source or role changed: never approved
+		case state != "prepared":
+			return false, errAppMCPOperationDenied
 		}
 		// The transaction's own view of the session: a direct unscoped
 		// non-impersonated non-act-as login (not just the request's copy).
@@ -1051,36 +1117,92 @@ func appMCPCommitChecks(cap *appMCPCommandCapability, id string, now time.Time) 
 	if stored.Receipt != nil { // replay: same receipt, no second apply; identity only
 		return stored, approval, nil, nil
 	}
-	if err := appMCPBindSource(cap, stored); err != nil {
-		return nil, nil, nil, err
-	}
+	// Expiry (the clock, or an owner/write epoch rotated by switching the
+	// connector off and on) comes before the source check, as in _status: an
+	// owner who changed the reviewed source and re-enabled writes has rotated
+	// the epoch too. Either way it never applies.
 	if appMCPOperationExpired(cap, stored, now) {
 		return nil, nil, nil, errAppMCPOperationExpired
+	}
+	if err := appMCPCommitBlock(cap, stored, approval); err != nil {
+		return nil, nil, nil, err
 	}
 	if approval == nil {
 		return nil, nil, nil, errAppMCPOperationNotApproved
 	}
+	attempts, err := appMCPReadAttempts(cap, id)
+	return stored, approval, attempts, err
+}
+
+// appMCPCommitBlock is what stops the bound caller's unexpired, unfinished
+// operation from committing, shared by _commit and _status (and, through
+// appMCPDerivedOperationState, the review pages) so they cannot disagree: the source binding and, once approved, whether that approval still
+// holds. A database failure comes back as itself, never as a block.
+func appMCPCommitBlock(cap *appMCPCommandCapability, stored *appMCPStoredOperation, approval *appMCPCommandApprovalState) error {
+	if err := appMCPBindSource(cap, stored); err != nil {
+		return err
+	}
+	if approval == nil {
+		return nil
+	}
+	lapsed := &appMCPOperationBlockedError{Reason: appMCPBlockApprovalLapsed}
 	if approval.State != "approved" || approval.Approval.ApproverUserID != stored.Prepared.Origin.ActorID {
-		return nil, nil, nil, errAppMCPOperationDenied
+		return lapsed
 	}
 	switch approval.Approval.Domain {
 	case appMCPGrantApprovalDomain:
+		if cap.origin != appMCPCommandConnectorOrigin {
+			return errAppMCPConsentUnjudged
+		}
 		if !appMCPGrantApprovalLive(cap, approval) {
-			return nil, nil, nil, errAppMCPOperationDenied // consent, switch or declaration no longer allow it
+			return lapsed // consent, switch or declaration no longer allow it
 		}
 	case appMCPHumanApprovalDomain:
 		live, err := appMCPApproverSessionLive(cap, approval.Approval.ApproverSessionID, approval.Approval.ApproverUserID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("verify approving session: %w", err)
+			return fmt.Errorf("verify approving session: %w", err)
 		}
 		if !live {
-			return nil, nil, nil, errAppMCPOperationDenied // a revoked, expired or narrowed approving session
+			return lapsed // a revoked, expired or narrowed approving session
 		}
 	default:
-		return nil, nil, nil, errAppMCPOperationDenied
+		return lapsed
 	}
-	attempts, err := appMCPReadAttempts(cap, id)
-	return stored, approval, attempts, err
+	return nil
+}
+
+// errAppMCPConsentUnjudged is appMCPCommitBlock's answer for a standing-consent
+// (approval: grant) approval asked about by anything but its connection: that
+// approval holds only while the connection's own consent does
+// (appMCPGrantApprovalLive), which a browser session (the review pages) does
+// not carry. It is not a block, so nothing reports a live consent as lapsed;
+// and since it is an error, a commit that ever met it would fail closed.
+var errAppMCPConsentUnjudged = errors.New("standing consent can be judged only by its connection")
+
+// appMCPDerivedOperationState is the state _status reports and the review pages
+// show: the durable state (appMCPOperationState) and, for an unexpired
+// operation with no receipt, whatever appMCPCommitBlock says stops _commit, as
+// state denied with that block's reason. The review page once read the stored
+// state alone and told a person whose approving session had ended "Approved.
+// Your assistant can now apply this change." while _status and _commit said
+// denied/approval_lapsed (r1104). business stays as computed: a block stops
+// another commit, it does not settle an earlier attempt whose outcome is still
+// undetermined. A database failure comes back as itself.
+func appMCPDerivedOperationState(cap *appMCPCommandCapability, stored *appMCPStoredOperation, approval *appMCPCommandApprovalState, attempts []appMCPAttempt, now time.Time) (state, business, reason string, err error) {
+	state, business = appMCPOperationState(cap, stored, approval, attempts, now)
+	if stored.Receipt != nil || state == "expired" {
+		return state, business, "", nil
+	}
+	var blocked *appMCPOperationBlockedError
+	switch err := appMCPCommitBlock(cap, stored, approval); {
+	case errors.As(err, &blocked):
+		return "denied", business, blocked.Reason, nil
+	case errors.Is(err, errAppMCPConsentUnjudged):
+		return state, business, "", nil // the page says it was approved by consent, not that it holds
+	case err != nil:
+		return "", "", "", err
+	}
+	return state, business, "", nil
 }
 
 func appMCPReplayView(cap *appMCPCommandCapability, id string, stored *appMCPStoredOperation, approval *appMCPCommandApprovalState) (*appMCPCommitView, error) {
@@ -1130,6 +1252,12 @@ func appMCPClaimAttempt(ctx context.Context, request appMCPCommandRequest, id st
 					return false, &appMCPCommandOutcomeUnknownError{cause: errors.New("the previous attempt has no durable receipt")}
 				}
 				superseded = latest
+			case appMCPAttemptFailed:
+				// A constraint or declaration failure is deterministic: another
+				// attempt of the same operation fails the same way.
+				if appMCPFinalErrorClass(latest.ErrorClass) {
+					return false, appMCPRepeatedFinalFailure(latest.ErrorClass)
+				}
 			}
 		}
 		if len(attempts) >= appMCPOperationAttemptLimit {
@@ -1187,7 +1315,6 @@ func appMCPCommitOperation(ctx context.Context, request appMCPCommandRequest, id
 	}
 	var validUntil int64
 	var events []appMCPCommandBroadcast
-	var revokedUsers []int64
 	var workflowCompletions int64
 	outcome, err := appMCPWithCommandOutcome(ctx, request, func(cap *appMCPCommandCapability) (bool, error) {
 		now := appMCPClock()
@@ -1262,13 +1389,9 @@ func appMCPCommitOperation(ctx context.Context, request appMCPCommandRequest, id
 		}
 		view.Outcome = "applied"
 		events = appMCPCommandBroadcasts(request.generation.view, cap.writes, cap.hookRefresh, cap.actor)
-		revokedUsers = append([]int64(nil), cap.revokedUsers...)
 		return true, nil
 	}, appMCPBarrier(&validUntil))
 	view, err = appMCPSettleCommit(ctx, request, actor, id, attemptID, appMCPFinishOutcome(outcome, err), view, events)
-	if err == nil && view != nil && view.Outcome == "applied" {
-		appMCPAfterCommitRevocations(request.app, revokedUsers)
-	}
 	if err == nil && view != nil && view.Outcome == "applied" && workflowCompletions > 0 {
 		appMCPRecordWorkflowCompletions(request.app, request.toolName, request.generation.manifest.ContractDigest, request.generation.manifest.ExecutionDigest, appMCPTelemetrySchemaRevision(request.generation.manifest, request.generation.manifest.ExecutionDigest), workflowCompletions)
 	}
@@ -1299,9 +1422,9 @@ func appMCPSettleCommit(ctx context.Context, request appMCPCommandRequest, actor
 // ---- status ----------------------------------------------------------------
 
 type appMCPStatusView struct {
-	OperationID, State, Business string
-	Receipt, Attempt, Effects    map[string]any
-	Retryable                    bool
+	OperationID, State, Business, Reason string
+	Receipt, Attempt, Effects            map[string]any
+	Retryable                            bool
 }
 
 // appMCPStatusOperation reports durable state only. After an unknown commit it
@@ -1325,10 +1448,15 @@ func appMCPStatusOperation(ctx context.Context, request appMCPCommandRequest, id
 		if err != nil {
 			return false, err
 		}
-		state, business := appMCPOperationState(cap, stored, approval, attempts, now)
+		// What _commit would answer this caller, so the two agree; the review
+		// pages show the same derived state.
+		state, business, reason, err := appMCPDerivedOperationState(cap, stored, approval, attempts, now)
+		if err != nil {
+			return false, err
+		}
 		latest := appMCPLatestAttempt(attempts)
-		view = &appMCPStatusView{OperationID: id, State: state, Business: business, Attempt: appMCPAttemptView(latest, now, stored.Receipt != nil),
-			Retryable: appMCPAttemptRetryable(state, latest, len(attempts), now), Effects: map[string]any{"status": appMCPEffectNone, "items": []any{}}}
+		view = &appMCPStatusView{OperationID: id, State: state, Business: business, Reason: reason, Attempt: appMCPAttemptView(latest, now, stored.Receipt != nil),
+			Retryable: reason == "" && appMCPAttemptRetryable(state, latest, len(attempts), now), Effects: map[string]any{"status": appMCPEffectNone, "items": []any{}}}
 		if stored.Receipt != nil {
 			receipt, err := decodeAppMCPCommandReceipt(stored, approval)
 			if err != nil {
@@ -1359,6 +1487,22 @@ func appMCPCommandFailure(tool, id string, err error) *sdk.CallToolResult {
 	if errors.As(err, &refusal) {
 		return appMCPSDKFailure(&appMCPResultError{Code: refusal.Code, Message: refusal.Message})
 	}
+	var blocked *appMCPOperationBlockedError
+	if errors.As(err, &blocked) {
+		result := appMCPSDKFailure(&appMCPResultError{Code: "denied", Message: blocked.message()})
+		result.Meta["reason"] = blocked.Reason
+		return result
+	}
+	var input *appMCPResultError
+	if code == "invalid_input" && errors.As(err, &input) && input.Code == code {
+		return appMCPSDKFailure(input) // appMCPInvalidInputFailure: the schema path, never the value
+	}
+	// A deterministic failure keeps its own code and safe message, so a client
+	// can tell it from an outage and stop retrying.
+	var final *appMCPCommandFinalError
+	if errors.As(err, &final) && code == final.Code {
+		return appMCPSDKFailure(&appMCPResultError{Code: final.Code, Message: final.Message})
+	}
 	switch code {
 	case "unknown_execution", "expired_intent", "approval_required", "operation_limit", "in_progress", "invalid_input", "incomplete_result", "unavailable_provider", "conflict":
 	default:
@@ -1368,7 +1512,7 @@ func appMCPCommandFailure(tool, id string, err error) *sdk.CallToolResult {
 }
 
 func appMCPCommandResult(result map[string]any) *sdk.CallToolResult {
-	text, err := json.Marshal(result)
+	text, err := appMCPJSONText(result)
 	if err != nil || len(text) > appMCPResultLimit {
 		return appMCPSDKFailure(appMCPResultFailure("incomplete_result"))
 	}
@@ -1485,8 +1629,11 @@ func addAppMCPCommandTools(server *sdk.Server, app *App, generation *appMCPRunti
 			InputSchema: tool.InputSchema, OutputSchema: output, Annotations: &sdk.ToolAnnotations{DestructiveHint: &no, OpenWorldHint: &no}},
 			func(ctx context.Context, call *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 				input, ok := appMCPDecodeToolArguments(call.Params.Arguments)
-				if !ok || validateAppMCPSchemaValue(tool.InputSchema, input) != nil {
+				if !ok {
 					return appMCPSDKFailure(appMCPResultFailure("invalid_input")), nil
+				}
+				if err := validateAppMCPSchemaValue(tool.InputSchema, input); err != nil {
+					return appMCPSDKFailure(appMCPInvalidInputFailure(err)), nil // names the path, never the value
 				}
 				req, err := request(tool.Name, tool, false)
 				if err != nil {
@@ -1559,9 +1706,10 @@ func addAppMCPCommandTools(server *sdk.Server, app *App, generation *appMCPRunti
 				return map[string]any{"operation_id": view.OperationID, "outcome": view.Outcome, "receipt": view.Receipt}, nil
 			}), nil
 		})
-	server.AddTool(&sdk.Tool{Name: appMCPStatusTool, Description: "Read the durable state of one operation this connection prepared: prepared, approved, running, succeeded, failed, conflict, unknown or expired. Business commit and effect delivery are reported separately. For an unknown external push, this read may perform a bounded GET by the server-derived idempotency key and record a confirmed receipt; it never repeats the POST. Transfer effects include a durable phase and recovery reference when available. retryable says whether _commit may claim another attempt; an unknown COMMIT outcome is never committed again, and a receipt proves an operation succeeded.",
+	server.AddTool(&sdk.Tool{Name: appMCPStatusTool, Description: "Read the state of one operation this connection prepared: prepared, approved, running, succeeded, failed, conflict, unknown, expired, or denied with the reason _commit would give (source_changed, actor_changed, approval_lapsed). Business commit and effect delivery are reported separately. For an unknown external push, this read may perform a bounded GET by the server-derived idempotency key and record a confirmed receipt; it never repeats the POST. Transfer effects include a durable phase and recovery reference when available. retryable says whether _commit may claim another attempt; an unknown COMMIT outcome is never committed again, and a receipt proves an operation succeeded.",
 		InputSchema: idInput, OutputSchema: appMCPClosedObject(map[string]any{"operation_id": operationID,
-			"state":     map[string]any{"type": "string", "enum": []any{"prepared", "approved", "running", "succeeded", "failed", "conflict", "unknown", "expired"}},
+			"state":     map[string]any{"type": "string", "enum": []any{"prepared", "approved", "running", "succeeded", "failed", "conflict", "unknown", "expired", "denied"}},
+			"reason":    map[string]any{"anyOf": []any{map[string]any{"type": "string", "enum": []any{appMCPBlockSourceChanged, appMCPBlockActorChanged, appMCPBlockApprovalLapsed}}, map[string]any{"type": "null"}}},
 			"business":  map[string]any{"type": "string", "enum": []any{"committed", "not_committed", "undetermined"}},
 			"effects":   effects,
 			"retryable": map[string]any{"type": "boolean"},
@@ -1574,14 +1722,17 @@ func addAppMCPCommandTools(server *sdk.Server, app *App, generation *appMCPRunti
 				if err != nil {
 					return nil, err
 				}
-				var receipt, attempt any
+				var receipt, attempt, reason any
 				if view.Receipt != nil {
 					receipt = view.Receipt
 				}
 				if view.Attempt != nil {
 					attempt = view.Attempt
 				}
-				return map[string]any{"operation_id": view.OperationID, "state": view.State, "business": view.Business, "effects": view.Effects, "retryable": view.Retryable, "attempt": attempt, "receipt": receipt}, nil
+				if view.Reason != "" {
+					reason = view.Reason
+				}
+				return map[string]any{"operation_id": view.OperationID, "state": view.State, "reason": reason, "business": view.Business, "effects": view.Effects, "retryable": view.Retryable, "attempt": attempt, "receipt": receipt}, nil
 			}), nil
 		})
 }
@@ -1652,7 +1803,10 @@ func registerAppMCPWithheldRoutes(mux appRouteRegistrar, app *App) {
 		cookie, cookieErr := requestSessionCookie(r)
 		var session *Session
 		if cookieErr == nil && !hasAuthorization {
-			session = GetSessionFromDB(app.DB, cookie.Value)
+			session = getAppSession(app, r, cookie.Value)
+		}
+		if mfaEnrollmentWithheld(app, session) {
+			session = nil // held until the account enrolls MFA, as getSession holds it
 		}
 		if session == nil && r.Method == http.MethodGet && !hasAuthorization {
 			http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
@@ -1730,12 +1884,15 @@ func serveAppMCPOperation(w http.ResponseWriter, r *http.Request, app *App, reso
 		return
 	}
 	// Only a browser cookie session may review or approve: a bearer/connector
-	// credential, API token or edge identity is refused outright.
+	// credential or API token is refused outright.
 	hasAuthorization := len(r.Header.Values("Authorization")) > 0
 	cookie, cookieErr := requestSessionCookie(r)
 	var session *Session
 	if cookieErr == nil && !hasAuthorization {
-		session = GetSessionFromDB(app.DB, cookie.Value)
+		session = getAppSession(app, r, cookie.Value)
+	}
+	if mfaEnrollmentWithheld(app, session) {
+		session = nil // held until the account enrolls MFA, as getSession holds it
 	}
 	if session == nil && !approve && !hasAuthorization {
 		// Signed out: send the person to sign in, then back here.
@@ -1827,8 +1984,7 @@ func serveAppMCPOperation(w http.ResponseWriter, r *http.Request, app *App, reso
 		return
 	}
 	view := newAppMCPReviewView(review, id, appMCPClock())
-	view.Approvable = review.State == "prepared"
-	view.StateKind, view.StateText = appMCPReviewStateNote(review.State)
+	view.Approvable = review.State == "prepared" // a blocked operation reads denied, never prepared
 	if view.Approvable {
 		view.CSRF = authMintCSRFToken(appMCPCSRFBinding(cookie.Value, id)) // this session and this operation only
 		view.Action = appMCPOperationRoute + id + "/approve"

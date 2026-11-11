@@ -1,0 +1,9 @@
+{
+  "keys": [
+    "private_uploads",
+    "read_audit",
+    "workforce_reads",
+    "summary",
+    "controls"
+  ]
+}

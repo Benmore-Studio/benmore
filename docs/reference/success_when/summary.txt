@@ -1,0 +1,1 @@
+Predicate on `run: api` steps that fails the step when the upstream returns HTTP 2xx with an error envelope. Many APIs (rss2json, several CRMs, payment processors) reply 200 OK with `{"status":"error","reason":"..."}`. The HTTP status alone is a lie. (v2.7.37+)

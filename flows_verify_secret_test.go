@@ -18,22 +18,25 @@ func TestLegacyVerifySecretResolvesGHAEnvRefs(t *testing.T) {
 	dir := t.TempDir()
 	SetAppEnv(dir, "HOOK_SECRET", "real-secret-value")
 	t.Cleanup(func() { SetAppEnv(dir, "HOOK_SECRET", "") })
-	bearer := func(flow *Flow, token string) bool {
+	// The header form checks hex(HMAC-SHA256(secret, body)) in the named
+	// header, so a request signed with key authenticates only when key is
+	// the resolved secret.
+	signedWith := func(flow *Flow, key string) bool {
 		r := httptest.NewRequest("POST", "/api/hook", strings.NewReader(`{}`))
-		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("X-Hook-Signature", hmacHex(t, key, []byte(`{}`)))
 		return verifyWebhookSignature(flow, r, dir)
 	}
 	for _, secret := range []string{"${{ env.HOOK_SECRET }}", "${{env.HOOK_SECRET}}", "{{ env.HOOK_SECRET }}", "{{env.HOOK_SECRET}}"} {
 		flow := &Flow{Name: "hook", Verify: "X-Hook-Signature", Secret: secret}
-		if !bearer(flow, "real-secret-value") {
+		if !signedWith(flow, "real-secret-value") {
 			t.Errorf("secret %q: the real secret was rejected", secret)
 		}
-		if bearer(flow, secret) {
+		if signedWith(flow, secret) {
 			t.Errorf("secret %q: the unresolved template text authenticated", secret)
 		}
 	}
 	missing := &Flow{Name: "hook", Verify: "X-Hook-Signature", Secret: "${{ env.NOT_SET }}"}
-	if bearer(missing, "${{ env.NOT_SET }}") || bearer(missing, "{{env.NOT_SET}}") || bearer(missing, "") {
+	if signedWith(missing, "${{ env.NOT_SET }}") || signedWith(missing, "{{env.NOT_SET}}") || signedWith(missing, "") {
 		t.Error("a secret referencing an unset variable authenticated")
 	}
 }

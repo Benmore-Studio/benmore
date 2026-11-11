@@ -9,16 +9,21 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// verifyProviderNames are the `verify:` string values with a provider's
+// canonical check (the switch in verifyWebhookSignature, matched without
+// regard to case). Any other non-empty value is a header name.
+var verifyProviderNames = []string{"stripe", "github", "github_sha256", "shopify", "slack", "benmore"}
 
 func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
 	// secret: accepts ${{ env.NAME }} (the documented form) as well as
@@ -46,6 +51,10 @@ func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
 	switch strings.ToLower(flow.Verify) {
 	case "stripe":
 		return verifyStripeSignature(r.Header.Get("Stripe-Signature"), secret, r)
+	case "benmore":
+		// Another Benmore app's webhook subscription
+		// (webhookSubscriptionSignature, webhooks.go).
+		return verifyTimestampedSignature(r.Header.Get("X-Webhook-Signature"), secret, r, "v1")
 	case "github", "github_sha256":
 		return verifyPrefixedHMAC(r.Header.Get("X-Hub-Signature-256"), "sha256=", secret, r)
 	case "shopify":
@@ -54,35 +63,18 @@ func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
 		return verifySlackSignature(r.Header.Get("X-Slack-Signature"), r.Header.Get("X-Slack-Request-Timestamp"), secret, r)
 	}
 
-	// Generic verification: check common auth patterns. Compare in constant
-	// time (subtle.ConstantTimeCompare) - a plain `==` short-circuits on the
-	// first differing byte and leaks the secret to a timing side-channel, the
-	// same class of bug the HMAC paths already avoid with hmac.Equal.
-	// 1. Bearer token in Authorization header
-	if authHeader := r.Header.Get("Authorization"); subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+secret)) == 1 {
-		return true
-	}
-	// 2. Secret in X-Webhook-Secret header
-	if secretHeader := r.Header.Get("X-Webhook-Secret"); subtle.ConstantTimeCompare([]byte(secretHeader), []byte(secret)) == 1 {
-		return true
-	}
-	// 3. HMAC signature verification (works with any provider that uses HMAC-SHA256)
-	// Check common signature headers
-	for _, headerName := range []string{
-		flow.Verify, // Custom header name from verify: field (e.g., "X-Hub-Signature-256")
-		"X-Signature",
-		"X-Webhook-Signature",
-	} {
-		if headerName == "" {
-			continue
-		}
-		sig := r.Header.Get(headerName)
-		if sig != "" && verifyHMACSHA256(sig, secret, r) {
-			return true
-		}
-	}
-
-	return false
+	// Any other value names the header that carries
+	// hex(HMAC-SHA256(secret, raw body)) (a sha256=, v1= or sha1= prefix is
+	// stripped), and only that header is read. It used to fall back to
+	// `Authorization: Bearer <secret>`, `X-Webhook-Secret: <secret>` and a
+	// body HMAC in X-Signature or X-Webhook-Signature: headers the author
+	// never named, a bearer accepted with any body or none, and no
+	// timestamp. A typo such as `verify: strpe` landed here too, so a Stripe
+	// receiver refused Stripe's real signatures and accepted those instead.
+	// The write gate refuses names that are neither a provider nor a header
+	// (flowVerifyNameProblem).
+	sig := r.Header.Get(flow.Verify)
+	return sig != "" && verifyHMACSHA256(sig, secret, r)
 }
 
 // verifyStripeSignature validates a Stripe webhook per
@@ -93,6 +85,15 @@ func verifyWebhookSignature(flow *Flow, r *http.Request, appDir string) bool {
 // Signed payload is "<t>.<body>". Timestamps outside a 5 min window are
 // rejected (replay protection). Both v1 and v0 (legacy) are accepted.
 func verifyStripeSignature(header, secret string, r *http.Request) bool {
+	return verifyTimestampedSignature(header, secret, r, "v1", "v0")
+}
+
+// verifyTimestampedSignature checks a `t=<unix>,<scheme>=<hex>,...` header
+// whose signatures are hex(HMAC-SHA256(secret, "<t>.<body>")), reading only
+// the named schemes, with a 5-minute replay window either way. Stripe and a
+// Benmore webhook subscription (`verify: benmore`, v1 only: its optional v0
+// signs the body alone, with no timestamp) use this shape.
+func verifyTimestampedSignature(header, secret string, r *http.Request, schemes ...string) bool {
 	if header == "" {
 		return false
 	}
@@ -109,10 +110,10 @@ func verifyStripeSignature(header, secret string, r *http.Request) bool {
 		if len(kv) != 2 {
 			continue
 		}
-		switch kv[0] {
-		case "t":
+		switch {
+		case kv[0] == "t":
 			ts = kv[1]
-		case "v1", "v0":
+		case slices.Contains(schemes, kv[0]):
 			sigs = append(sigs, kv[1])
 		}
 	}

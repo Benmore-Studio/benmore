@@ -1,0 +1,27 @@
+# workflows.yaml spells the state column `Status`; the column is `status`.
+# A create naming a role-guarded state must still start in `initial`.
+create_cannot_skip_the_guard:
+  as_user: "u@test.com"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "x", status: "approved"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM orders WHERE title = 'x' AND status = 'draft'"
+      expect:
+        rows: 1
+
+# A deployed client may still call the route under the table spelling that
+# workflows.yaml used; both spellings answer (403: the role guard, not 404).
+transition_routes_keep_both_spellings:
+  as_user: "u@test.com"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "y"}
+      save: {oid: "id"}
+      expect: {status: 200}
+    - api: "POST /api/orders/{{oid}}/transition"
+      json: {to: "approved"}
+      expect: {status: 403}
+    - api: "POST /api/Orders/{{oid}}/transition"
+      json: {to: "approved"}
+      expect: {status: 403}

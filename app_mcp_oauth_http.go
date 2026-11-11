@@ -70,7 +70,7 @@ func appMCPOAuthMetadata(w http.ResponseWriter, r *http.Request, app *App, resou
 		httpJSON(w, 200, map[string]any{"resource": resource, "resource_name": appSiteName(app), "authorization_servers": []string{origin}, "scopes_supported": scopes, "bearer_methods_supported": []string{"header"}})
 		return
 	}
-	httpJSON(w, 200, map[string]any{"issuer": origin, "authorization_endpoint": origin + "/oauth/authorize", "token_endpoint": origin + "/oauth/token", "registration_endpoint": origin + "/oauth/register", "revocation_endpoint": origin + "/oauth/revoke", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}, "revocation_endpoint_auth_methods_supported": []string{"none"}, "scopes_supported": scopes, "resource_parameter_supported": true})
+	httpJSON(w, 200, map[string]any{"issuer": origin, "authorization_endpoint": origin + "/oauth/authorize", "token_endpoint": origin + "/oauth/token", "registration_endpoint": origin + "/oauth/register", "revocation_endpoint": origin + "/oauth/revoke", "response_types_supported": []string{"code"}, "grant_types_supported": appMCPOAuthGrantTypes, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}, "revocation_endpoint_auth_methods_supported": []string{"none"}, "scopes_supported": scopes, "resource_parameter_supported": true})
 }
 
 // Keep legacy registry/storage and registration behavior on apps without MCP.
@@ -84,7 +84,10 @@ func appMCPOAuthRegister(w http.ResponseWriter, r *http.Request, app *App, resou
 		httpJSON(w, 400, map[string]any{"error": "invalid_request"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if !oauthRegisterAllowed(w, r, app.Dir) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, oauthRegisterMaxBody)
 	raw, err := io.ReadAll(r.Body)
 	var request struct {
 		ClientName   string   `json:"client_name"`
@@ -125,8 +128,16 @@ func appMCPOAuthRegister(w http.ResponseWriter, r *http.Request, app *App, resou
 	raw, _ = json.Marshal(request)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	// Existing registration validates redirects and stores the client once.
-	appOAuthRegister(w, r, app)
+	// The connector token endpoint issues a refresh token with every code
+	// exchange and accepts grant_type=refresh_token, and the authorization
+	// server metadata says so; the registration answer must agree.
+	appOAuthRegisterGrants(w, r, app, appMCPOAuthGrantTypes)
 }
+
+// appMCPOAuthGrantTypes is what the connector authorization server supports
+// and registers for every client.
+var appMCPOAuthGrantTypes = []string{"authorization_code", "refresh_token"}
+
 func appMCPOAuthFields(p oauthAuthorizeParams) map[string]string {
 	return map[string]string{"response_type": "code", "client_id": p.ClientID, "redirect_uri": p.RedirectURI, "state": p.State, "scope": p.Scope, "code_challenge": p.CodeChallenge, "code_challenge_method": p.CodeChallengeMethod, "resource": p.Resource}
 }

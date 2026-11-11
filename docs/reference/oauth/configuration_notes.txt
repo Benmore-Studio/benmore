@@ -1,0 +1,1 @@
+auth is a scalar-value map; nesting oauth under auth is invalid. Built-in providers use their environment credentials. Custom provider definitions are scoped to the current app, add new names, and do not override built-in definitions. Both CLIENT_ID and CLIENT_SECRET must be present for BYO login controls and routes.

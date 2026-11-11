@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,9 +48,54 @@ func webhookSecretHint(secret string) string {
 	return "****" + secret[len(secret)-4:]
 }
 
+// webhookStatusKeyUnreadable marks a subscription whose stored signing
+// secret this app's key cannot open (GET /api/_webhooks `status`).
+const webhookStatusKeyUnreadable = "secret_unreadable"
+
+// webhookUnreadableKeyFix tells an admin what an unreadable signing secret
+// means and how to recover. The secret itself is gone: nothing can re-derive it.
+const webhookUnreadableKeyFix = "this subscription's signing secret was sealed under an encryption key the app no longer has (a key generated for a process that has since restarted, before the app saved one, or an ENCRYPTION_KEY changed without the rotation workflow), so every delivery fails. Delete it (DELETE /api/_webhooks/{id}) and create it again with the secret your receiver verifies."
+
+// webhookNoDurableKeyMessage answers a subscription create that cannot seal
+// the secret under a key that survives a restart (durableSealKey).
+const webhookNoDurableKeyMessage = "webhook subscription secrets are sealed under the app's ENCRYPTION_KEY, and this app has none that survives a restart: its generated key could not be saved to env.yaml. Set ENCRYPTION_KEY and restart the app (hosted, as the app owner: `benmore env <app> set ENCRYPTION_KEY=<64 hex characters> --env <dev|prod>` then `benmore restart <app> --env <dev|prod>`; self-hosted: env.yaml or the process environment), then create the subscription again."
+
+// openWebhookSubscriptionSecret returns the signing secret a subscription row
+// stores. A plaintext (pre-encryption) value is returned as is; a sealed one
+// this database's key cannot open is an error, never an empty secret.
+func openWebhookSubscriptionSecret(app *App, stored string) (string, error) {
+	return fieldDecryptForDB(app.DB, stored)
+}
+
+// webhookUnreadableWarned remembers the databases whose unreadable
+// subscription secrets were already reported (routes re-register on reload).
+var webhookUnreadableWarned sync.Map // *sql.DB → true
+
+// warnUnreadableWebhookSecrets logs, once per database per process, how many
+// active subscriptions have a signing secret this app's key cannot open.
+func warnUnreadableWebhookSecrets(app *App) {
+	rows, err := queryMetadataRows(app.DB, "SELECT id, secret FROM _benmore_webhooks WHERE active = 1")
+	if err != nil {
+		return
+	}
+	var unreadable []string
+	for _, row := range rows {
+		if _, err := openWebhookSubscriptionSecret(app, valueText(row["secret"])); err != nil {
+			unreadable = append(unreadable, "#"+valueText(row["id"]))
+		}
+	}
+	if len(unreadable) == 0 {
+		return
+	}
+	if _, warned := webhookUnreadableWarned.LoadOrStore(app.DB, true); !warned {
+		log.Printf("WEBHOOKS: WARN %d active subscription(s) (%s) have a signing secret this app cannot decrypt; their deliveries fail. GET /api/_webhooks marks them %s: %s", len(unreadable), strings.Join(unreadable, ", "), webhookStatusKeyUnreadable, webhookUnreadableKeyFix)
+	}
+}
+
 // RegisterWebhookRoutes sets up webhook subscription API endpoints.
 func RegisterWebhookRoutes(mux appRouteRegistrar, app *App) {
 	EnsureWebhooksTable(app.DB)
+	warnUnreadableWebhookSecrets(app)
 	registerWebhookRoutes(mux, app)
 }
 
@@ -135,12 +181,22 @@ func registerWebhookRoutes(mux appRouteRegistrar, app *App) {
 		}
 
 		// M-6: encrypt the subscriber secret at rest (parity with OAuth
-		// tokens, which already use fieldEncrypt). The secret is HMAC key
-		// material - storing it cleartext on disk is a direct compromise
-		// path if the DB file leaks. fieldEncrypt is a no-op when no
-		// ENCRYPTION_KEY is configured, so this stays backward-compatible.
+		// tokens). The secret is HMAC key material - storing it cleartext on
+		// disk is a direct compromise path if the DB file leaks. Every
+		// delivery decrypts it, so it is sealed only under a key that
+		// survives a restart: an app without a configured ENCRYPTION_KEY
+		// saves its generated key to env.yaml first, and when it can't the
+		// subscription is refused rather than sealed under a key the next
+		// restart loses (fieldEncryptForDB → durableSealKey).
 		encSecret, encErr := fieldEncryptForDB(app.DB, req.Secret)
 		if encErr != nil {
+			if errors.Is(encErr, errNoDurableEncryptionKey) {
+				serverErrorJSONBody(w, r, app, http.StatusServiceUnavailable, "_webhooks", fmt.Errorf("encrypt secret: %w", encErr), withRefusalDocs(map[string]any{
+					"error": webhookNoDurableKeyMessage,
+					"code":  "encryption_key_not_durable",
+				}, "encryption_key_not_durable"))
+				return
+			}
 			serverErrorJSON(w, r, app, "_webhooks", fmt.Errorf("encrypt secret: %w", encErr), "failed to create webhook")
 			return
 		}
@@ -184,12 +240,26 @@ func registerWebhookRoutes(mux appRouteRegistrar, app *App) {
 		// Mask secrets: show only last 4 chars. Decrypt first (M-6) so the
 		// last-4 hint reflects the real secret, not ciphertext bytes.
 		// fieldDecrypt passes through values that were stored cleartext
-		// (no encPrefix), so pre-encryption rows keep working.
+		// (no encPrefix), so pre-encryption rows keep working. A secret the
+		// app's key cannot open is reported, not shown as an ordinary `****`:
+		// every delivery of that subscription fails until it is re-created.
 		for _, row := range rows {
-			if secret, ok := row["secret"].(string); ok {
-				secret, _ = fieldDecryptForDB(app.DB, secret)
-				row["secret"] = webhookSecretHint(secret)
+			row["status"] = "active"
+			if valueText(row["active"]) != "1" {
+				row["status"] = "inactive"
 			}
+			stored, ok := row["secret"].(string)
+			if !ok {
+				continue
+			}
+			secret, err := openWebhookSubscriptionSecret(app, stored)
+			if err != nil {
+				row["secret"] = "****"
+				row["status"] = webhookStatusKeyUnreadable
+				row["fix"] = webhookUnreadableKeyFix
+				continue
+			}
+			row["secret"] = webhookSecretHint(secret)
 		}
 
 		httpJSON(w, http.StatusOK, map[string]any{"webhooks": rows})
@@ -232,89 +302,24 @@ func registerWebhookRoutes(mux appRouteRegistrar, app *App) {
 	})
 }
 
-// FireWebhookSubscriptions checks for matching webhook subscriptions and enqueues delivery jobs.
-// Called from the CRUD mutation handlers after hooks and flows fire on each CRUD mutation.
-func FireWebhookSubscriptions(app *App, event string, table string, row map[string]any, session *Session) {
-	// Don't fire webhooks for internal framework tables
-	if strings.HasPrefix(table, "_benmore_") {
-		return
-	}
-
-	// Query active webhooks that match this table and event
-	rows, err := queryMetadataRows(app.DB,
-		"SELECT id, user_id, url, tables, events FROM _benmore_webhooks WHERE active = 1",
-	)
-	if err != nil || len(rows) == 0 {
-		return
-	}
-	payloadRow := webhookPayloadRow(app, table, row)
-
-	// Deliver only for subscribers who are STILL active global admins: a
-	// subscription created before this check existed, or by a user since
-	// demoted or deactivated, must stop receiving other users' data.
-	adminCache := map[string]bool{}
-	for _, wh := range rows {
-		ownerKey := fmt.Sprintf("%v", wh["user_id"])
-		allowed, seen := adminCache[ownerKey]
-		if !seen {
-			allowed = webhookOwnerIsActiveAdmin(app, wh["user_id"])
-			adminCache[ownerKey] = allowed
-		}
-		if !allowed {
-			continue
-		}
-		whID := fmt.Sprintf("%v", wh["id"])
-		whURL := fmt.Sprintf("%v", wh["url"])
-		whTables := fmt.Sprintf("%v", wh["tables"])
-		whEvents := fmt.Sprintf("%v", wh["events"])
-
-		// Filter by table if specified
-		if whTables != "" && whTables != "<nil>" {
-			matched := false
-			for _, t := range strings.Split(whTables, ",") {
-				if strings.TrimSpace(t) == table {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
-		}
-
-		// Filter by event if specified
-		if whEvents != "" && whEvents != "<nil>" {
-			matched := false
-			for _, ev := range strings.Split(whEvents, ",") {
-				if strings.TrimSpace(ev) == event {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
-		}
-
-		// Enqueue webhook delivery as a job (async, never blocks the CRUD response)
-		EnqueueWebhookSubscriptionJob(app, whID, whURL, event, table, payloadRow, session)
-	}
-}
-
 // enqueueWebhookSubscriptionsTx stores matching deliveries with the mutation,
 // so a committed update cannot lose its webhook intent on a process crash.
+// row is the stored row before injectSessionContext (webhookDataRow).
 func enqueueWebhookSubscriptionsTx(tx mutationTx, app *App, event, table string, row map[string]any, session *Session) error {
 	if strings.HasPrefix(table, "_benmore_") {
 		return nil
 	}
 	rows, err := queryMetadataRows(tx, "SELECT id, user_id, url, tables, events FROM main._benmore_webhooks WHERE active = 1")
+	if isNoSuchTable(err) {
+		return nil // no subscription table, no subscriptions
+	}
 	if err != nil {
 		return fmt.Errorf("read webhook subscriptions: %w", err)
 	}
-	payloadRow := webhookPayloadRow(app, table, row)
+	payloadRow := webhookDataRow(app, table, row, session)
 	adminCache := map[string]bool{}
 	for _, wh := range rows {
-		ownerKey := fmt.Sprint(wh["user_id"])
+		ownerKey := valueText(wh["user_id"])
 		allowed, seen := adminCache[ownerKey]
 		if !seen {
 			var checkErr error
@@ -327,10 +332,10 @@ func enqueueWebhookSubscriptionsTx(tx mutationTx, app *App, event, table string,
 		if !allowed || !webhookSubscriptionMatches(wh, table, event) {
 			continue
 		}
-		// No signing secret in the job (see EnqueueWebhookSubscriptionJob):
-		// delivery reads it from the subscription row.
+		// No signing secret in the job: admins can read job payloads
+		// (GET /api/_jobs/{id}); delivery reads it from the subscription row.
 		payload := map[string]any{"_webhook_subscription": map[string]any{
-			"webhook_id": fmt.Sprint(wh["id"]), "url": fmt.Sprint(wh["url"]),
+			"webhook_id": valueText(wh["id"]), "url": valueText(wh["url"]),
 			"event": event, "table": table,
 		}, "_row": payloadRow}
 		if session != nil {
@@ -345,6 +350,34 @@ func enqueueWebhookSubscriptionsTx(tx mutationTx, app *App, event, table string,
 		}
 	}
 	return nil
+}
+
+// webhookDataRow is a subscription delivery's `data` for a row change. stored
+// is the row as the table holds it (with old_<col> copies on update), taken
+// before injectSessionContext. A receiver reads `data` as the changed row, so
+// a session-context name that is a column of the table keeps the row's own
+// value: an admin editing alice's ticket is delivered with alice's user_id,
+// not the admin's next to old_user_id = alice. Names that are not columns
+// carry the caller's session context, as they always have, except the
+// internal authorization flags (sessionInternalContextKeys), which never
+// leave the app. The actor is on the envelope (triggered_by,
+// triggered_by_user_id). Hook SQL, when:, templates and event flows keep
+// reading the actor under these names.
+func webhookDataRow(app *App, table string, stored map[string]any, session *Session) map[string]any {
+	data := copyRow(stored)
+	injectSessionContext(data, session)
+	for _, key := range sessionContextKeys {
+		own, present := stored[key]
+		switch {
+		case present:
+			data[key] = own
+		case hasColumn(app, table, key) || sessionInternalContextKey(key):
+			// A column this event didn't carry (a create that left it to
+			// its default): not the actor's value under the row's name.
+			delete(data, key)
+		}
+	}
+	return webhookPayloadRow(app, table, data)
 }
 
 // webhookPayloadRow is the row a subscription delivery carries. A delivery is
@@ -362,7 +395,7 @@ func webhookPayloadRow(app *App, table string, row map[string]any) map[string]an
 
 func webhookSubscriptionMatches(wh map[string]any, table, event string) bool {
 	for key, wanted := range map[string]string{"tables": table, "events": event} {
-		value := fmt.Sprint(wh[key])
+		value := valueText(wh[key])
 		if value == "" || value == "<nil>" {
 			continue
 		}
@@ -378,38 +411,6 @@ func webhookSubscriptionMatches(wh map[string]any, table, event string) bool {
 		}
 	}
 	return true
-}
-
-// EnqueueWebhookSubscriptionJob adds a webhook subscription delivery to the job queue.
-// The signing secret is not copied into the job: admins can read job payloads
-// (GET /api/_jobs/{id}), while the subscription list shows only its last four
-// characters. Delivery reads it from the subscription row. The row's
-// encrypted.yaml values are sealed (sealJobPayloadRow); a delivery whose row
-// can't be sealed is not queued.
-func EnqueueWebhookSubscriptionJob(app *App, webhookID, webhookURL, event, table string, row map[string]any, session *Session) {
-	payload := map[string]any{
-		"_webhook_subscription": map[string]any{
-			"webhook_id": webhookID,
-			"url":        webhookURL,
-			"event":      event,
-			"table":      table,
-		},
-		"_row": row,
-	}
-	if session != nil {
-		payload["_webhook_subscription"].(map[string]any)["user_email"] = session.Email
-		payload["_webhook_subscription"].(map[string]any)["user_id"] = session.UserID
-	}
-	if err := sealJobPayloadRow(app.DB, app, table, payload); err != nil {
-		log.Printf("WEBHOOK SUBSCRIPTION #%s not queued: %s", webhookID, err)
-		return
-	}
-
-	data, _ := json.Marshal(payload)
-	app.DB.Exec(
-		"INSERT INTO _benmore_jobs (job_type, flow_name, payload, run_at) VALUES ('webhook_subscription', 'webhook_subscription', ?, datetime('now'))",
-		string(data),
-	)
 }
 
 // executeWebhookSubscriptionJob delivers a webhook subscription payload.
@@ -429,7 +430,7 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 		subActive         int
 		subOwner          int64
 	)
-	webhookID := fmt.Sprintf("%v", whData["webhook_id"])
+	webhookID := valueText(whData["webhook_id"])
 	// A delivery that is dropped sent nothing. An ordinary job still completes
 	// (the subscriber asked for nothing more); a connector-command effect fails,
 	// so its status never reads delivered.
@@ -454,7 +455,7 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	case !webhookOwnerIsActiveAdmin(app, subOwner):
 		log.Printf("WEBHOOK SUBSCRIPTION #%s owner is no longer an active admin; delivery dropped", webhookID)
 		return dropped("subscription owner is no longer an active admin")
-	case fmt.Sprintf("%v", whData["url"]) != subURL:
+	case valueText(whData["url"]) != subURL:
 		log.Printf("WEBHOOK SUBSCRIPTION #%s URL changed after the delivery was queued; dropped", webhookID)
 		return dropped("subscription URL changed")
 	}
@@ -462,12 +463,15 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	// M-6: the secret is stored encrypted in the webhooks table; decrypt it
 	// here at the only point it's actually needed (HMAC signing).
 	// fieldDecrypt is a pass-through for cleartext (pre-encryption) values.
-	secret, decryptErr := fieldDecryptForDB(app.DB, subSecret)
+	// A secret the app's key cannot open stays unreadable on every retry, so
+	// the delivery fails once with the reason instead of retrying.
+	secret, decryptErr := openWebhookSubscriptionSecret(app, subSecret)
 	if decryptErr != nil {
-		return fmt.Errorf("webhook secret decryption failed")
+		log.Printf("WEBHOOK SUBSCRIPTION #%s: signing secret unreadable; delivery failed without retry: %s", webhookID, webhookUnreadableKeyFix)
+		return jobNotRetryable{fmt.Errorf("webhook subscription #%s %s: %s", webhookID, webhookStatusKeyUnreadable, webhookUnreadableKeyFix)}
 	}
-	event := fmt.Sprintf("%v", whData["event"])
-	table := fmt.Sprintf("%v", whData["table"])
+	event := valueText(whData["event"])
+	table := valueText(whData["table"])
 
 	// SSRF protection: re-validate at delivery time (URL could have been modified)
 	if isPrivateURL(whURL) {
@@ -475,9 +479,16 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 		return jobNotRetryable{errors.New(appMCPEffectBlockedPrefix + "private webhook destination")}
 	}
 
-	// Circuit breaker: skip if endpoint is known-dead
+	// Circuit breaker: skip if endpoint is known-dead. Nothing is sent, so
+	// the delivery waits for the cooldown without spending an attempt: an
+	// outage longer than the retry backoff used to fail every queued
+	// delivery without one request reaching the endpoint.
 	host := circuitKey(app, whURL)
 	if err := CheckCircuit(host); err != nil {
+		var open *circuitOpenError
+		if errors.As(err, &open) {
+			return jobDeferred{error: fmt.Errorf("circuit open: %s", err), until: open.retryAt}
+		}
 		return fmt.Errorf("circuit open: %s", err)
 	}
 
@@ -490,36 +501,12 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 		rowData = make(map[string]any)
 	}
 
-	// Build the payload
-	body := map[string]any{
-		"event":     event,
-		"table":     table,
-		"data":      rowData,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-	if userEmail, ok := whData["user_email"]; ok {
-		body["triggered_by"] = userEmail
-	}
-
-	bodyBytes, err := json.Marshal(body)
+	bodyBytes, err := json.Marshal(webhookSubscriptionBody(whData, event, table, rowData, time.Now()))
 	if err != nil {
 		return fmt.Errorf("failed to marshal webhook body: %s", err)
 	}
 
-	// Compute HMAC-SHA256 signature over `<timestamp>.<body>` - same
-	// envelope shape Stripe uses. The timestamp is the same value we put
-	// in the body but receivers need it OUTSIDE the body for replay
-	// protection (they reject deliveries where |now - ts| > 5min). The
-	// v1 prefix gives us room to rotate signature schemes later without
-	// breaking existing receivers; v0 is reserved for the previous
-	// body-only signature so legacy receivers can detect it explicitly.
 	ts := fmt.Sprintf("%d", time.Now().Unix())
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(ts))
-	mac.Write([]byte("."))
-	mac.Write(bodyBytes)
-	v1Sig := hex.EncodeToString(mac.Sum(nil))
-
 	// Legacy body-only v0 signature has NO timestamp binding, so a receiver
 	// that honors it is replayable indefinitely. It is now OFF by default
 	// (round-2): operators mid-migration can re-enable it for one transition
@@ -535,15 +522,7 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 		return jobNotRetryable{errors.New("webhook request could not be built")}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Stripe-style combined header so receivers can pick the version they
-	// trust without parsing two separate signature headers.
-	sigHeader := fmt.Sprintf("t=%s,v1=%s", ts, v1Sig)
-	if emitV0 {
-		macLegacy := hmac.New(sha256.New, []byte(secret))
-		macLegacy.Write(bodyBytes)
-		sigHeader = fmt.Sprintf("t=%s,v0=%s,v1=%s", ts, hex.EncodeToString(macLegacy.Sum(nil)), v1Sig)
-	}
-	req.Header.Set("X-Webhook-Signature", sigHeader)
+	req.Header.Set("X-Webhook-Signature", webhookSubscriptionSignature(secret, ts, bodyBytes, emitV0))
 	req.Header.Set("X-Webhook-Timestamp", ts)
 	req.Header.Set("X-Webhook-Event", event)
 	req.Header.Set("X-Webhook-Table", table)
@@ -558,6 +537,47 @@ func executeWebhookSubscriptionJob(data map[string]any, app *App) error {
 	RecordSuccess(host)
 	log.Printf("WEBHOOK SUBSCRIPTION [%s/%s] %s -> %d", event, table, webhookHostForLog(whURL), status)
 	return nil
+}
+
+// webhookSubscriptionSignature is a delivery's X-Webhook-Signature value:
+// `t=<ts>,v1=<hex(HMAC-SHA256(secret, ts + "." + body))>`, the envelope
+// shape Stripe uses. The timestamp is signed and sent outside the body so a
+// receiver can refuse a replay (`verify: benmore` allows 5 minutes either
+// way, flows_verify.go). The v1 prefix leaves room to rotate the scheme;
+// legacyV0 adds the old body-only signature as v0 for a receiver still
+// migrating off it (it binds no timestamp, so it is replayable).
+func webhookSubscriptionSignature(secret, ts string, body []byte, legacyV0 bool) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(ts))
+	mac.Write([]byte("."))
+	mac.Write(body)
+	v1 := hex.EncodeToString(mac.Sum(nil))
+	if !legacyV0 {
+		return fmt.Sprintf("t=%s,v1=%s", ts, v1)
+	}
+	legacy := hmac.New(sha256.New, []byte(secret))
+	legacy.Write(body)
+	return fmt.Sprintf("t=%s,v0=%s,v1=%s", ts, hex.EncodeToString(legacy.Sum(nil)), v1)
+}
+
+// webhookSubscriptionBody is the signed delivery envelope. `data` is the row
+// (webhookDataRow); who made the change is the envelope's: triggered_by (the
+// actor's email) and triggered_by_user_id, from the session that queued the
+// delivery. A sessionless change carries neither.
+func webhookSubscriptionBody(whData map[string]any, event, table string, rowData map[string]any, now time.Time) map[string]any {
+	body := map[string]any{
+		"event":     event,
+		"table":     table,
+		"data":      rowData,
+		"timestamp": now.UTC().Format(time.RFC3339),
+	}
+	if userEmail, ok := whData["user_email"]; ok {
+		body["triggered_by"] = userEmail
+	}
+	if userID, ok := whData["user_id"]; ok {
+		body["triggered_by_user_id"] = userID
+	}
+	return body
 }
 
 // webhookOwnerIsActiveAdmin mirrors Session.IsAdmin for a stored subscriber:

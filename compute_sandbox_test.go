@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dlclark/regexp2"
+	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
 )
 
@@ -106,14 +106,25 @@ func TestComputeRegexMatchesAreTimeBounded(t *testing.T) {
 	defer func() { regexp2.DefaultMatchTimeout = computeRegexMatchTimeout }()
 	vm := goja.New()
 	start := time.Now()
-	v, err := vm.RunString(`/^(?=(a+)+b)/.test('a'.repeat(40))`)
+	v, err := vm.RunString(`try { /^(?=(a+)+b)/.test('a'.repeat(40)); 'no error' } catch (e) { e.name }`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("backtracking match ran %v despite the match timeout", elapsed)
 	}
-	if v.ToBoolean() {
-		t.Fatal("timed-out match reported a match")
+	if got := v.String(); got != "RangeError" {
+		t.Fatalf("timed-out match = %q, want a thrown RangeError", got)
+	}
+
+	// Uncaught, the timeout fails the step without quoting the matched input.
+	app := writeComputeFixture(t, "re.ts",
+		`export function f(x: any): boolean { return /^(?=(a+)+b)/.test(x.s); }`)
+	_, err = RunCompute(app, "re", "f", map[string]any{"s": strings.Repeat("a", 40) + "-private-value"}, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "RangeError") || !strings.Contains(err.Error(), "input omitted") {
+		t.Fatalf("expected an input-free RangeError step error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "private-value") {
+		t.Fatalf("step error quotes the matched input: %v", err)
 	}
 }

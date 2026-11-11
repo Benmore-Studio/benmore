@@ -226,7 +226,7 @@ func PerAppUser(logicalSub string) string {
 }
 
 // Dev resource caps live in the dev systemd template
-// (scripts/benmore-dev@.service: MemoryMax=128M, MemoryHigh=96M), NOT in
-// generated config - locked decision #2 (dev caps < prod's 256M) is a
+// (scripts/benmore-dev@.service: MemoryMax=512M, MemoryHigh=384M), NOT in
+// generated config - locked decision #2 (dev caps < prod's 768M) is a
 // static property of the dev template, so there is nothing to compute at
 // provision time.

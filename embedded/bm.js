@@ -15,11 +15,22 @@
 
 const CSRF_META = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 
+// Requests the SDK sends with nobody at the tab (a live query's refetch after
+// a realtime event, heartbeats, the refresh when a tab becomes visible) carry
+// X-Benmore-Background: 1, so they do not count as activity for
+// auth.idle_timeout. inBackground marks every request fn starts synchronously.
+let _backgroundDepth = 0;
+function inBackground(fn) {
+  _backgroundDepth++;
+  try { return fn(); } finally { _backgroundDepth--; }
+}
+
 async function request(method, path, body, options) {
   const headers = new Headers({ Accept: 'application/json' });
   if (options?.headers) {
     new Headers(options.headers).forEach((value, name) => headers.set(name, value));
   }
+  if (_backgroundDepth > 0 || options?.background) headers.set('X-Benmore-Background', '1');
   const init = { method, credentials: 'same-origin', headers };
   if (options?.signal !== undefined) init.signal = options.signal;
   if (body !== undefined && body !== null) {
@@ -29,35 +40,92 @@ async function request(method, path, body, options) {
   if (method !== 'GET' && method !== 'HEAD') {
     headers.set('X-CSRF-Token', CSRF_META());
   }
-  const res = await fetch(path, init);
+  const started = Date.now();
+  let res;
+  try {
+    res = await fetch(path, init);
+  } catch (err) {
+    captureRequest(method, path, 0, started, null, err);
+    throw err;
+  }
   if (res.status === 204) {
+    captureRequest(method, path, res.status, started);
     observeSessionResponse(method, path, true, null);
     return { ok: true, status: 204, data: null };
   }
-  const text = await res.text();
-  const ct = (res.headers.get('content-type') || '').toLowerCase();
-  let data = null;
-  if (text) {
-    if (ct.includes('application/json')) {
-      try { data = JSON.parse(text); } catch { data = { error: text }; }
-    } else {
-      data = { error: text };
-    }
+  let data;
+  try {
+    data = await responseData(res, method);
+  } catch (err) {
+    captureRequest(method, path, res.status, started, res.headers.get('X-Request-Id'), err);
+    throw err;
   }
   observeSessionResponse(method, path, res.ok, data);
-  return { ok: res.ok, status: res.status, data };
+  captureRequest(method, path, res.status, started, (data && typeof data === 'object' && typeof data.request_id === 'string' && data.request_id) || res.headers.get('X-Request-Id'));
+  return { ok: res.ok, status: res.status, data, redirected: !!res.redirected, url: res.url || '' };
+}
+
+// responseData reads a response body by its Content-Type:
+//   JSON (application/json, any +json)  the parsed value ({error: text} if it does not parse;
+//                                       a failed one as below)
+//   2xx text/* (CSV, plain text, HTML)  the text, a string
+//   2xx of any other type               a Blob: an image, audio, PDF or ZIP from
+//                                       run: proxy or run: serve_file
+//   non-2xx that is not JSON            {error, body}: see failedText
+//   empty body, HEAD                    null
+// A non-JSON success used to come back as {error: text}, which made a flow
+// that answers an image resolve to {error: "<PNG bytes>"} with the bytes lost.
+async function responseData(res, method) {
+  if (method === 'HEAD') return null;
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  const type = ct.split(';', 1)[0].trim();
+  const json = ct.includes('application/json') || type.endsWith('+json');
+  if (res.ok && type && !json && !type.startsWith('text/')) return res.blob();
+  const text = await res.text();
+  if (!text) return null;
+  if (json) {
+    try { return JSON.parse(text); } catch { return res.ok ? { error: text } : failedText(res, type, text); }
+  }
+  return res.ok ? text : failedText(res, type, text);
+}
+
+// failedText is a failed answer whose body is not JSON (a 404 page, a
+// proxy's error page, a plain-text error) as {error, body}: body is the text
+// as received; error, which becomes the thrown Error's message, is that text
+// only when it is one short line of plain text, else "Request failed (HTTP
+// <status>)". The whole HTML page used to become the message, and a sign-in
+// form showed it to the person.
+function failedText(res, type, text) {
+  const line = text.trim();
+  const plain = type !== 'text/html' && line.length <= 200 && !/[\r\n<]/.test(line);
+  return { error: plain && line ? line : `Request failed (HTTP ${res.status})`, body: text };
+}
+
+// apiError builds the Error a failed request throws. The framework's JSON
+// errors carry a short code in `error` and, when there is more to say, the
+// explanation in `message` (a refused write, a flow that failed): the Error's
+// message is that explanation, else the code, else fallback, and err.code is
+// the code. err.status and err.body are the response as received (for a body
+// that is not JSON, {error, body} with the text in body: see failedText).
+function apiError(res, fallback) {
+  const data = res.data;
+  let text = fallback;
+  let code;
+  if (data && typeof data === 'object') {
+    if (typeof data.error === 'string' && data.error) { code = data.error; text = data.error; }
+    if (typeof data.message === 'string' && data.message) text = data.message;
+  }
+  const err = new Error(text);
+  err.status = res.status;
+  err.body = data;
+  if (code) err.code = code;
+  return err;
 }
 
 // Convenience: unwrap or throw. Most agent code wants this shape:
 //   const message = await bm.api.post('/api/messages', {...});
 async function unwrap(res) {
-  if (!res.ok) {
-    const msg = res.data?.error || `HTTP ${res.status}`;
-    const err = new Error(msg);
-    err.status = res.status;
-    err.body = res.data;
-    throw err;
-  }
+  if (!res.ok) throw apiError(res, `HTTP ${res.status}`);
   return res.data;
 }
 
@@ -137,6 +205,11 @@ function resetSessionState(profile = undefined) {
   const bus = _liveConns.get('__bus__');
   if (bus) bus.reconnect(profile !== null);
   _sessionListeners.forEach(reset => reset(profile !== null));
+  // Error context belongs to the session that recorded it: the next
+  // account's reports must not carry its console text, paths or tags.
+  errorCrumbs.length = 0;
+  errorSent.length = 0;
+  for (const key of Object.keys(errorTags)) delete errorTags[key];
 }
 
 // These native endpoints change the cookie session or its active tenant. A
@@ -185,13 +258,53 @@ async function refreshMe() {
 // Returns the user object on success; throws { status, body } on failure.
 async function signIn(identifier, password) {
   const res = await request('POST', '/login', { email: identifier, password });
-  if (!res.ok) {
-    const err = new Error(res.data?.error || 'Invalid credentials');
-    err.status = res.status;
-    err.body = res.data;
-    throw err;
-  }
+  if (!res.ok) throw apiError(res, 'Invalid credentials');
+  const step = signInStepURL('/login', res, _pageLocation());
+  if (step) return _goToSignInStep(step);
   return res.data?.user || null;
+}
+
+// A sign-in or sign-up that still needs a second step (the emailed or texted
+// code with auth.otp, an authenticator code with MFA, enrolling an
+// authenticator for a role in auth.require_mfa_for_roles) has not made a
+// session: the server answers {otp_required: true, redirect} (or mfa_required,
+// or mfa_setup_required), or redirects the request to the step's page. The
+// app serves those pages (the scaffold's static/verify-otp.html,
+// verify-mfa.html, mfa-setup.html). signInStepURL returns that page,
+// same-origin and carrying the current page's ?next=, else null (also when
+// there is no page: outside a browser the calls resolve null as before).
+// Callers send the browser there, as a form post would, and do not return: code written as
+// `await bm.auth.signIn(...); location.href = '/'` would otherwise leave the
+// person on a page with no session and the code already emailed.
+function signInStepURL(path, res, loc) {
+  if (!loc || typeof loc.assign !== 'function') return null;
+  const data = res && res.data;
+  let to = '';
+  if (data && typeof data === 'object' && (data.otp_required || data.mfa_required || data.mfa_setup_required) && typeof data.redirect === 'string') {
+    to = data.redirect;
+  } else if (res && res.redirected && typeof res.url === 'string' && loc.origin && res.url.startsWith(loc.origin + '/')) {
+    const target = res.url.slice(loc.origin.length);
+    if (target.split(/[?#]/, 1)[0] !== String(path).split(/[?#]/, 1)[0]) to = target;
+  }
+  if (!to || to[0] !== '/' || to[1] === '/' || to[1] === '\\') return null;
+  const m = /[?&]next=([^&#]*)/.exec(loc.search || '');
+  if (m && !/[?&]next=/.test(to)) {
+    let next = '';
+    try { next = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch { next = ''; }
+    if (next[0] === '/' && next[1] !== '/' && next[1] !== '\\') to += (to.includes('?') ? '&' : '?') + 'next=' + encodeURIComponent(next);
+  }
+  return to;
+}
+
+function _pageLocation() {
+  return typeof location === 'undefined' ? null : location;
+}
+
+// The page is leaving for the step; the caller's code after the await must
+// not run, so the promise never settles.
+function _goToSignInStep(url) {
+  location.assign(url);
+  return new Promise(() => {});
 }
 
 // signUp - POST /signup. Pass any extra signup_fields (configured in
@@ -200,11 +313,10 @@ async function signIn(identifier, password) {
 async function signUp(fields) {
   const res = await request('POST', '/signup', fields);
   if (!res.ok) {
-    const err = new Error(res.data?.error || 'Sign-up failed');
-    err.status = res.status;
-    err.body = res.data;
-    throw err;
+    throw apiError(res, 'Sign-up failed');
   }
+  const step = signInStepURL('/signup', res, _pageLocation());
+  if (step) return _goToSignInStep(step);
   return res.data?.user || null;
 }
 
@@ -234,10 +346,7 @@ function _bufToB64u(buf) {
 async function _passkeyCall(method, path, body, fallback) {
   const res = await request(method, path, body);
   if (!res.ok) {
-    const err = new Error(res.data?.error || fallback);
-    err.status = res.status;
-    err.body = res.data;
-    throw err;
+    throw apiError(res, fallback);
   }
   return res.data;
 }
@@ -282,6 +391,11 @@ const passkey = {
         userHandle: r.userHandle ? _bufToB64u(r.userHandle) : '',
       },
     }, 'Passkey sign-in failed');
+    // With auth.otp the passkey proves the account and the emailed code
+    // still has to be entered before there is a session; a role that requires
+    // MFA enrollment goes to the setup page first.
+    const step = signInStepURL('/api/_auth/passkeys/login', { data }, _pageLocation());
+    if (step) return _goToSignInStep(step);
     return data.user || null;
   },
   async list() {
@@ -368,6 +482,21 @@ function _seg(v) {
   return e;
 }
 
+// list() options it sends. Anything else (a filter written at the top level
+// instead of under where:, a misspelled option) never reaches the server, so
+// say so once per table and key instead of returning unfiltered rows quietly.
+const _LIST_OPTS = new Set(['limit', 'offset', 'cursor', 'q', 'sort', 'order', 'orderBy', 'order_by',
+  'include', 'fields', 'page', 'per_page', 'perPage', 'where']);
+const _warnedListOpts = new Set();
+function _warnUnknownListOpts(table, opts) {
+  for (const k of Object.keys(opts || {})) {
+    if (_LIST_OPTS.has(k) || _warnedListOpts.has(table + '\u0000' + k)) continue;
+    _warnedListOpts.add(table + '\u0000' + k);
+    console.warn(`bm.table('${table}').list(): option "${k}" is not sent. ` +
+      `Filters go under where: { ${k}: ... }; list options are ${[..._LIST_OPTS].join(', ')}.`);
+  }
+}
+
 export function table(name) {
   if (!name || typeof name !== 'string') {
     throw new Error('bm.table(name) requires a string table name');
@@ -386,9 +515,21 @@ export function table(name) {
       if (opts.q)      qs.set('q',      String(opts.q));
       if (opts.sort)   qs.set('sort',   String(opts.sort));
       if (opts.order)  qs.set('order',  String(opts.order));
+      // The REST list parameters under their REST names: orderBy=col:dir,
+      // include=rel,rel, page/per_page, fields=a,b. They used to be dropped
+      // here without a word, so the server never saw them.
+      const orderBy = opts.orderBy ?? opts.order_by;
+      if (orderBy) qs.set('orderBy', String(orderBy));
+      const csv = (v) => (Array.isArray(v) ? v.join(',') : String(v));
+      if (opts.include) qs.set('include', csv(opts.include));
+      if (opts.fields)  qs.set('fields',  csv(opts.fields));
+      if (opts.page != null) qs.set('page', String(opts.page));
+      const perPage = opts.per_page ?? opts.perPage;
+      if (perPage != null) qs.set('per_page', String(perPage));
       if (opts.where) {
         for (const [k, v] of Object.entries(opts.where)) qs.set(k, String(v));
       }
+      _warnUnknownListOpts(t, opts);
       const path = base + (qs.toString() ? '?' + qs : '');
       const r = await api.get(path);
       // Offset lists are bare arrays; cursor/page lists use { data: [...] }.
@@ -572,7 +713,7 @@ live.scoped = function liveScoped(tableOrStar, fetchAndRender, opts) {
     if (running) { queued = true; return; }
     running = true;
     try {
-      const result = fetchAndRender();
+      const result = inBackground(fetchAndRender);
       if (result && typeof result.then === 'function') {
         await result;
       }
@@ -636,64 +777,213 @@ live.scoped = function liveScoped(tableOrStar, fetchAndRender, opts) {
 //   const room = bm.room('lobby');
 //   room.on('hello',   (payload, from) => greet(from));
 //   room.onAny((payload, from) => log(payload));
+//   room.on('bm:status', s => setBadge(s.state));  // open / reconnecting / closed
+//   room.on('bm:error',  e => toast(e.message));     // e.g. not a member
 //   room.send({ kind: 'hello' });
 //   room.leave();
+//
+// One WebSocket per room. A dropped socket (app restart, env change, the
+// server's heartbeat close after sign-out or a tenant switch) reconnects with
+// jittered exponential backoff (0.5 s doubling, 30 s ceiling; ten stable
+// seconds start it over) and joins the room again. Messages others sent
+// while it was down are not replayed: refetch durable state on
+// {state:'open', reconnected:true}. It stops for good after leave(), a
+// refused join ({type:'error'} from the server: ws_rooms membership) or a
+// refused handshake (401/403). Sends while not open are queued (16 max,
+// sent in order after the join); send() throws once the room is closed or
+// the queue is full, so nothing is dropped silently. SDK events carry
+// from === null; peers' frames never do.
 // =================================================================
+
+const ROOM_QUEUE_MAX = 16;       // below the server's 20 frames/s per connection
+const ROOM_RETRY_BASE_MS = 500;
+const ROOM_RETRY_MAX_MS = 30000;
+const ROOM_STABLE_MS = 10000;
+
+// The server's refused-join bodies (websocket.go), as stable codes.
+function roomErrorCode(body) {
+  if (body === 'not a member of this room') return 'not_member';
+  if (body === 'too many rooms on this connection') return 'too_many_rooms';
+  return 'join_refused';
+}
+
+function roomError(code, message, name) {
+  const err = new Error(message);
+  err.code = code;
+  err.room = name;
+  return err;
+}
 
 export function room(name) {
   if (!name || typeof name !== 'string') {
     throw new Error('bm.room(name) requires a string room name');
   }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const url = `${proto}://${location.host}/ws`;
   const namedHandlers = new Map(); // kind -> Set<fn>
   const anyHandlers = new Set();
-  let queue = [];
-  let open = false;
+  let queue = [];          // serialized broadcast frames waiting for the next join
+  let ws = null;
+  let state = 'connecting'; // 'connecting' | 'open' | 'reconnecting' | 'closed'
+  let closedReason = null;
+  let attempt = 0;
+  let everOpened = false;
+  let timer = null;
+  let gen = 0;             // bumps on every new socket or close; stale callbacks compare
 
-  ws.onopen = () => {
-    open = true;
-    ws.send(JSON.stringify({ type: 'join', room: name }));
-    queue.forEach(p => ws.send(JSON.stringify({ type: 'broadcast', room: name, payload: p })));
-    queue = null;
-  };
-  ws.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type !== 'message' && msg.type !== 'presence') return;
-    const payload = msg.payload || {};
-    const from = msg.from;
-    const kind = payload.kind || msg.type; // 'presence' has no kind
+  const dispatch = (kind, payload, from) => {
     const set = namedHandlers.get(kind);
-    if (set) set.forEach(fn => { try { fn(payload, from); } catch (e) { console.error(e); } });
-    anyHandlers.forEach(fn => { try { fn(payload, from, kind); } catch (e) { console.error(e); } });
+    if (set) [...set].forEach(fn => { try { fn(payload, from); } catch (e) { console.error(e); } });
+    [...anyHandlers].forEach(fn => { try { fn(payload, from, kind); } catch (e) { console.error(e); } });
   };
+  const setStatus = (next, info) => {
+    state = next;
+    dispatch('bm:status', Object.assign({ state: next }, info), null);
+  };
+  const dropSocket = () => {
+    gen++;
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    if (ws && ws.readyState <= WebSocket.OPEN) { try { ws.close(1000); } catch { /* already closing */ } }
+  };
+  const finish = (reason, info) => {
+    if (state === 'closed') return;
+    if (reason === 'left' && ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'leave', room: name })); } catch { /* closing anyway */ }
+    }
+    dropSocket();
+    if (reason === 'left') _sessionListeners.delete(onSession);
+    const unsent = queue.length;
+    queue = [];
+    closedReason = reason;
+    setStatus('closed', Object.assign({ reason }, info, unsent ? { unsent } : {}));
+  };
+  const retry = (info) => {
+    const ceiling = Math.min(ROOM_RETRY_MAX_MS, ROOM_RETRY_BASE_MS * Math.pow(2, attempt));
+    const delay = Math.round(ceiling / 2 + Math.random() * ceiling / 2);
+    attempt++;
+    // Arm the timer before telling handlers, so a leave() from a status
+    // handler cancels it.
+    timer = setTimeout(connect, delay);
+    setStatus('reconnecting', Object.assign({ attempt, retryIn: delay }, info));
+  };
+  // A handshake that failed before opening: browsers hide the HTTP status,
+  // so ask /ws with a plain GET. 401/403 are the upgrade's own refusals and
+  // cannot change by retrying; 400 (it would upgrade), 429, 5xx and network
+  // errors (a restart in progress) are transient.
+  const probe = () => (typeof fetch === 'function'
+    ? fetch('/ws', { credentials: 'same-origin', cache: 'no-store' }).then(r => r.status, () => 0)
+    : Promise.resolve(0));
 
-  return {
+  function connect() {
+    timer = null;
+    if (state === 'closed') return;
+    const my = ++gen;
+    let openedAt = -1;
+    const sock = ws = new WebSocket(url);
+    sock.onopen = () => {
+      if (my !== gen) return;
+      openedAt = Date.now();
+      sock.send(JSON.stringify({ type: 'join', room: name }));
+      const pending = queue;
+      queue = [];
+      pending.forEach(frame => sock.send(frame));
+      const reconnected = everOpened;
+      everOpened = true;
+      setStatus('open', reconnected ? { reconnected: true } : {});
+    };
+    sock.onmessage = (ev) => {
+      if (my !== gen) return;
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'error') {
+        // The server's only error frames refuse a join; on this room's own
+        // connection that refusal is final.
+        const message = typeof msg.body === 'string' && msg.body ? msg.body : 'room error';
+        const code = roomErrorCode(msg.body);
+        dispatch('bm:error', { code, message, room: msg.room || name }, null);
+        if (!msg.room || msg.room === name) finish('refused');
+        return;
+      }
+      if (msg.type !== 'message' && msg.type !== 'presence') return;
+      const payload = msg.payload || {};
+      const from = msg.from;
+      const kind = payload.kind || msg.type; // 'presence' has no kind
+      dispatch(kind, payload, from);
+    };
+    sock.onerror = () => { /* onclose follows */ };
+    sock.onclose = (ev) => {
+      if (my !== gen) return;
+      const code = ev && ev.code;
+      if (openedAt >= 0) {
+        if (Date.now() - openedAt >= ROOM_STABLE_MS) attempt = 0;
+        retry({ code });
+        return;
+      }
+      probe().then((status) => {
+        if (my !== gen || state === 'closed') return;
+        if (status === 401 || status === 403) {
+          const reason = status === 401 ? 'unauthorized' : 'forbidden';
+          dispatch('bm:error', { code: reason, message: `the server refused the WebSocket connection (HTTP ${status})`, room: name }, null);
+          finish(reason);
+          return;
+        }
+        retry(status ? { code, http: status } : { code });
+      });
+    };
+  }
+
+  // The socket carries the session it opened with. When the page's session
+  // changes (bm.auth sign-in/out, tenant switch, act-as), open a fresh one,
+  // like the bm.live stream; a refused room gets another try with the new
+  // identity. A room the app left stays closed.
+  function onSession() {
+    if (closedReason === 'left') return;
+    dropSocket();
+    attempt = 0;
+    closedReason = null;
+    if (everOpened) setStatus('reconnecting', { attempt: 0, retryIn: 0 });
+    else state = 'connecting';
+    connect();
+  }
+  _sessionListeners.add(onSession);
+  connect();
+
+  const client = {
     name,
+    /** 'connecting' | 'open' | 'reconnecting' | 'closed' */
+    get state() { return state; },
+    /** The current (or last) WebSocket; it changes on reconnect. */
+    get raw() { return ws; },
     on(kind, fn) {
       if (!namedHandlers.has(kind)) namedHandlers.set(kind, new Set());
       namedHandlers.get(kind).add(fn);
-      return this;
+      return client;
     },
-    onAny(fn) { anyHandlers.add(fn); return this; },
+    onAny(fn) { anyHandlers.add(fn); return client; },
     off(kind, fn) {
       namedHandlers.get(kind)?.delete(fn);
-      return this;
+      return client;
     },
+    // true: written to the open socket; false: queued for the next join.
     send(payload) {
-      if (open) {
-        ws.send(JSON.stringify({ type: 'broadcast', room: name, payload }));
-      } else {
-        queue.push(payload);
+      if (state === 'closed') {
+        throw roomError('room_closed', `bm.room('${name}') is closed (${closedReason}); call bm.room() to join again`, name);
       }
+      const frame = JSON.stringify({ type: 'broadcast', room: name, payload });
+      if (state === 'open' && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(frame);
+        return true;
+      }
+      if (queue.length >= ROOM_QUEUE_MAX) {
+        throw roomError('room_queue_full', `bm.room('${name}') is not connected and already holds ${ROOM_QUEUE_MAX} unsent messages`, name);
+      }
+      queue.push(frame);
+      return false;
     },
-    leave() {
-      if (open) ws.send(JSON.stringify({ type: 'leave', room: name }));
-      ws.close();
-    },
-    raw: ws,
+    leave() { finish('left'); },
   };
+  return client;
 }
 
 // =================================================================
@@ -704,6 +994,12 @@ export function room(name) {
 // looking up a runtime registry written by the type generator at
 // /_internal/flows.json. We Proxy() the lookup so unknown names
 // throw a clear runtime error to match the TS error.
+//
+// params fill the route's :path segments; a GET or HEAD flow takes the rest
+// as its query string (it has no body): bm.flows.img({ id: 7, kind: 'png' })
+// → GET /api/img/7?kind=png. The call resolves what responseData reads: the
+// parsed JSON, the text of a text/* answer (a CSV), or a Blob for any other
+// type (the image or PDF a run: proxy or run: serve_file flow answers).
 // =================================================================
 
 let _flowsRegistry = null;
@@ -717,12 +1013,57 @@ async function loadFlowsRegistry() {
   return _flowsRegistry;
 }
 
-// Registry keys are camelCase (company_setup / company-setup → companySetup).
-// Accept snake_case and kebab-case aliases too - agents naturally write
-// bm.flows.company_setup when the file is flows/company-setup.yaml, and
-// making the obvious spelling work beats making them learn the mapping.
+// Registry keys are camelCase (company_setup / company-setup → companySetup;
+// bm_types.go flowSDKName is the same rule). Accept snake_case and
+// kebab-case spellings too - agents naturally write bm.flows.company_setup
+// when the file is flows/company-setup.yaml, and making the obvious spelling
+// work beats making them learn the mapping.
 function camelizeFlowName(name) {
-  return name.replace(/[-_]+([a-zA-Z0-9])/g, (_, c) => c.toUpperCase());
+  const parts = String(name).split(/[-_]+/).filter(Boolean);
+  if (!parts.length) return name;
+  return parts.map((p, i) => (i === 0 ? p.charAt(0).toLowerCase() : p.charAt(0).toUpperCase()) + p.slice(1)).join('');
+}
+
+// Own keys only: a name such as 'constructor' must not resolve through the
+// prototype chain of the parsed registry.
+function flowRegistryEntry(reg, name) {
+  const own = (k) => (Object.prototype.hasOwnProperty.call(reg, k) ? reg[k] : undefined);
+  return own(name) || own(camelizeFlowName(name));
+}
+
+// flowRequestPath builds the URL a flow call requests. Each `:name` path
+// segment takes params[name] (else query[name]) as one encoded segment (never '.' or '..').
+// For a GET or HEAD flow (`query` not null) the params no segment used go in
+// the query string, where the flow binds them, followed by the fields of
+// `query` (the body a caller passed; FlowForm and FlowButton pass one) that
+// params did not name. Objects and arrays travel as JSON text, as a JSON body
+// binds them; null and undefined are left out. A flow with a body passes null.
+function flowRequestPath(template, params, query) {
+  const used = new Set();
+  let path = String(template || '').split('/').map((seg) => {
+    if (seg[0] !== ':') return seg;
+    const name = seg.slice(1);
+    // A GET body naming the path parameter fills it too: repeating it in the
+    // query would conflict with the routed value (400).
+    const own = (o) => o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, name);
+    const src = own(params) ? params : (own(query) && query[name] != null ? query : null);
+    if (!src) return seg;
+    used.add(name);
+    return _seg(src[name]);
+  }).join('/');
+  if (!query) return path;
+  const pairs = [];
+  const add = (k, v) => {
+    if (used.has(k) || v === undefined || v === null) return;
+    used.add(k);
+    const text = typeof v !== 'object' ? String(v)
+      : typeof v.toJSON === 'function' ? String(v.toJSON()) : JSON.stringify(v);
+    pairs.push(encodeURIComponent(k) + '=' + encodeURIComponent(text));
+  };
+  for (const [k, v] of Object.entries(params)) add(k, v);
+  for (const [k, v] of Object.entries(query)) add(k, v);
+  if (pairs.length) path += (path.includes('?') ? '&' : '?') + pairs.join('&');
+  return path;
 }
 
 export const flows = new Proxy({}, {
@@ -730,19 +1071,20 @@ export const flows = new Proxy({}, {
     if (typeof flowName !== 'string') return undefined;
     return async (params = {}, body) => {
       let reg = await loadFlowsRegistry();
-      let entry = reg[flowName] || reg[camelizeFlowName(flowName)];
+      let entry = flowRegistryEntry(reg, flowName);
       if (!entry) {
         // The registry lists only flows THIS caller may call, so one loaded
         // before sign-in (or before a role grant) can be missing the flow.
         // Refetch once before reporting it as undeclared.
         _flowsRegistry = null;
         reg = await loadFlowsRegistry();
-        entry = reg[flowName] || reg[camelizeFlowName(flowName)];
+        entry = flowRegistryEntry(reg, flowName);
       }
       if (!entry) {
         const available = Object.keys(reg).sort();
+        const call = (n) => (/^[A-Za-z_$][\w$]*$/.test(n) ? `bm.flows.${n}()` : `bm.flows[${JSON.stringify(n)}]()`);
         const listing = available.length
-          ? `Available flows: ${available.map(n => `bm.flows.${n}()`).join(', ')}.`
+          ? `Available flows: ${available.map(call).join(', ')}.`
           : 'No flows are registered (flows.yaml / flows/*.yaml define none with on.request triggers).';
         throw new Error(
           `bm.flows.${flowName} is not declared in flows.yaml. ${listing} ` +
@@ -750,18 +1092,14 @@ export const flows = new Proxy({}, {
           `(file name, camelCased) - snake/kebab spellings of the same name also resolve.`
         );
       }
-      // Substitute :path params, each one encoded segment (never '.'/'..').
-      let path = entry.path;
-      for (const [k, v] of Object.entries(params)) {
-        if (path.includes(`:${k}`)) path = path.replace(`:${k}`, _seg(v));
-      }
       const method = (entry.method || 'POST').toUpperCase();
-      const res = await request(method, path, body);
-      if (!res.ok) {
-        const err = new Error(res.data?.error || `flow ${flowName} failed (${res.status})`);
-        err.status = res.status; err.body = res.data;
-        throw err;
+      const noBody = method === 'GET' || method === 'HEAD';
+      if (noBody && body !== undefined && body !== null && (typeof body !== 'object' || Array.isArray(body))) {
+        throw new Error(`bm.flows.${flowName} is a ${method} flow: pass its inputs as fields of params, which are sent as the query string (a ${method} request has no body).`);
       }
+      const path = flowRequestPath(entry.path, params || {}, noBody ? (body || {}) : null);
+      const res = await request(method, path, noBody ? undefined : body);
+      if (!res.ok) throw apiError(res, `flow ${flowName} failed (${res.status})`);
       // Async flows return {job_id, status_url} - wrap into a Job handle.
       if (res.data && res.data.job_id && res.data.status_url) {
         return makeJob(res.data.job_id, res.data.status_url);
@@ -786,12 +1124,22 @@ export function workflow(table, id) {
   return {
     table,
     id,
-    // Server expects { to: <newState> } (workflows.go handleTransition).
+    // Server expects { to: <newState> } (workflows.go handleTransition) and
+    // answers { status: 'transitioned', from, to, id }.
     transitionTo: (state) => api.post(`${base}/transition`, { to: state }),
+    // { current, transitions: [{ to, role? }] } (handleAvailableTransitions).
     available:    () => api.get(`${base}/transitions`),
+    // The transitions endpoint reads the workflow's own field (workflows.yaml
+    // field:), whatever it is named; reading row.state ?? row.status missed
+    // any other field. It needs a signed-in caller, so an anonymous reader of
+    // a public table falls back to the row.
     current:      async () => {
-      const row = await api.get(base);
-      return row.state ?? row.status;
+      const res = await request('GET', `${base}/transitions`);
+      if (res.status === 401) {
+        const row = await api.get(base);
+        return row?.state ?? row?.status;
+      }
+      return (await unwrap(res))?.current;
     },
   };
 }
@@ -964,8 +1312,9 @@ export async function upload(file, opts = {}) {
     body: fd,
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`upload failed (${res.status}): ${text}`);
+    // Same Error shape as bm.api: a proxy's HTML "413 Request Entity Too
+    // Large" page stays in err.body, not in the message.
+    throw apiError({ status: res.status, data: await responseData(res, 'POST') }, `upload failed (HTTP ${res.status})`);
   }
   return res.json();
 }
@@ -1018,11 +1367,17 @@ export const permissions = {
 // access policy (roles, perms, scopes, group/owner/ACL), not just a logged-in
 // session, then signs. Public / local files don't need it.
 //   await bm.signedUrl(doc.file_url, { record: { table: 'documents', id: doc.id } })
-export async function signedUrl(path, opts = 300) {
-  let ttlSeconds = 300, record = null;
+// Default lifetime: 5 minutes, except audio/video, which get the server's
+// playback lifetime (4h): a <video>/<audio> keeps range-requesting the URL
+// for as long as it plays, so a 5-minute link stalls a long video.
+const SIGNED_MEDIA_RE = /\.(mp4|m4v|mov|webm|ogv|mkv|3gp|mp3|m4a|aac|wav|flac|ogg|oga|opus|weba)([?#]|$)/i;
+export async function signedUrl(path, opts) {
+  let ttlSeconds, record = null;
   if (typeof opts === 'number') ttlSeconds = opts;
-  else if (opts && typeof opts === 'object') { ttlSeconds = opts.ttlSeconds ?? opts.ttl ?? 300; record = opts.record || null; }
-  const qs = new URLSearchParams({ path: String(path), expires_in: String(ttlSeconds) });
+  else if (opts && typeof opts === 'object') { ttlSeconds = opts.ttlSeconds ?? opts.ttl; record = opts.record || null; }
+  if (ttlSeconds == null && !SIGNED_MEDIA_RE.test(String(path))) ttlSeconds = 300;
+  const qs = new URLSearchParams({ path: String(path) });
+  if (ttlSeconds != null) qs.set('expires_in', String(ttlSeconds));
   if (record && record.table && record.id != null) {
     qs.set('record_table', String(record.table));
     qs.set('record_id', String(record.id));
@@ -1113,10 +1468,7 @@ function waitForICEGathering(pc) {
 async function broadcastSDPExchange(path, slug, sdpOffer) {
   const res = await request('POST', path, { slug, sdp: sdpOffer });
   if (!res.ok) {
-    const err = new Error(res.data?.error || 'broadcast: SDP exchange failed');
-    err.status = res.status;
-    err.body = res.data;
-    throw err;
+    throw apiError(res, 'broadcast: SDP exchange failed');
   }
   return res.data; // { sdp, session_id, slug }
 }
@@ -1260,7 +1612,7 @@ export const broadcast = {
     // Keep the slug claimed while live: a publisher that stops
     // heartbeating is treated as crashed and its slug can be taken over.
     const heartbeat = setInterval(() => {
-      if (!stopped) request('POST', '/api/_broadcast/heartbeat', { slug }).catch(() => {});
+      if (!stopped) request('POST', '/api/_broadcast/heartbeat', { slug }, { background: true }).catch(() => {});
     }, 60000);
     return {
       slug,
@@ -1375,7 +1727,9 @@ export const mfa = {
   // setup token path (require_mfa_for_roles) needs none.
   enroll:  (password) => api.post('/api/_auth/mfa/setup', password ? { password } : {}),
   verify:  (code)     => api.post('/api/_auth/mfa/verify', { code }),
-  disable: (password) => api.post('/api/_auth/mfa/disable', { password }),
+  // Turning the factor off takes a current authenticator code (not the
+  // password, and not a backup code): the endpoint reads { code }.
+  disable: (code)     => api.post('/api/_auth/mfa/disable', { code }),
 };
 
 // =================================================================
@@ -1588,7 +1942,7 @@ function presence(slug) {
   let heartbeatTimer = null;
   let onChangeUnsub = null;
 
-  const post = (action) => api.post('/api/_presence/heartbeat', { slug, action }).catch(() => {});
+  const post = (action) => api.post('/api/_presence/heartbeat', { slug, action }, action === 'heartbeat' ? { background: true } : undefined).catch(() => {});
   const sendBeaconLeave = () => {
     // Beacon survives tab close - fetch with keepalive is the right
     // primitive but sendBeacon is the only one with universal support.
@@ -1912,7 +2266,7 @@ function ensureQueryLiveInvalidation() {
     }
     const t = setTimeout(() => {
       _queryLiveTimers.delete(table);
-      const opts = { refetch: _queryLiveConfig.refetch };
+      const opts = { refetch: _queryLiveConfig.refetch, background: true };
       if (table) query.invalidateTable(table, opts);
       else {
         const keys = new Set([..._queryTableKeys.values()].flatMap(keys => [...keys]));
@@ -1961,7 +2315,7 @@ export const query = {
     e.staleTime = staleTime;
     const revision = e.revision;
     const pending = Promise.resolve()
-      .then(fetcher)
+      .then(opts.background ? () => inBackground(fetcher) : fetcher)
       .then((data) => {
         if (e.revision === revision) {
           e.revision++;
@@ -1989,10 +2343,10 @@ export const query = {
     notifyQuery(e);
     return pending;
   },
-  async refetch(key) {
+  async refetch(key, opts = {}) {
     const e = queryEntry(key);
     if (!e.fetcher) return e.data;
-    return query.fetch(e.rawKey, e.fetcher, { force: true, staleTime: e.staleTime });
+    return query.fetch(e.rawKey, e.fetcher, { force: true, staleTime: e.staleTime, background: !!opts.background });
   },
   invalidate(match, opts = {}) {
     const keys = [];
@@ -2021,7 +2375,7 @@ export const query = {
       e.updatedAt = 0;
       keys.push(stable);
       notifyQuery(e);
-      if (opts.refetch && e.fetcher) query.refetch(e.rawKey).catch(() => {});
+      if (opts.refetch && e.fetcher) query.refetch(e.rawKey, { background: !!opts.background }).catch(() => {});
     }
     return keys;
   },
@@ -2135,7 +2489,7 @@ const bm = {
   flows, workflow, aggregate, aggregates, jobs,
   notifications, upload, audit, permissions, signedUrl,
   t, mfa, webrtc, broadcast, markdown, markdownBatch, presence, cache,
-  createStore, query, html, raw,
+  createStore, query, html, raw, captureError, captureMessage, setTag,
 };
 export default bm;
 
@@ -2143,55 +2497,184 @@ export default bm;
 if (typeof window !== 'undefined') window.bm = bm;
 
 // =================================================================
-//  Client error capture → POST /api/_errors → _benmore_client_errors.
-//  Powers the get_client_errors MCP tool + Sentry/Slack forwarding.
-//  Installs window.onerror + unhandledrejection (the two ways JS
-//  surfaces an uncaught failure - the 404-from-a-fetch case is an
-//  unhandled rejection, so BOTH are required). Throttled + deduped so
-//  an error loop can't spam the endpoint.
+//  Same-origin error reporting. Context stays bounded and excludes URL
+//  queries and form contents; the app scrubs it again before export.
 // =================================================================
-if (typeof window !== 'undefined') {
-  let _errSent = 0, _errLast = '';
-  const _ERR_CAP = 25;
-  const _postErr = (p) => {
-    if (_errSent >= _ERR_CAP) return;
-    const key = (p.message || '') + '|' + (p.source || '') + '|' + (p.line || 0);
-    if (key === _errLast) return; // collapse immediate duplicates
-    _errLast = key; _errSent++;
-    try {
+const errorTags = Object.create(null),
+  errorCrumbs = [],
+  errorSent = [];
+const errorTagRE = /^[a-z0-9_.]{1,32}$/,
+  errorRequestIDRE = /^[0-9a-f]{8,32}$/;
+
+function validErrorTags(input) {
+  const out = Object.create(null);
+  if (!input || typeof input !== 'object') return out;
+  for (const [key, value] of Object.entries(input)) {
+    if (Object.keys(out).length >= 10) break;
+    if (errorTagRE.test(key) && typeof value === 'string' && Array.from(value).length <= 200) out[key] = value;
+  }
+  return out;
+}
+
+export function setTag(key, value) {
+  if (typeof key !== 'string' || !errorTagRE.test(key) || typeof value !== 'string' || Array.from(value).length > 200) return;
+  if (!Object.hasOwn(errorTags, key) && Object.keys(errorTags).length >= 10) return;
+  errorTags[key] = value;
+}
+
+function errorPath(value) {
+  try {
+    return new URL(value, typeof location === 'undefined' ? 'https://invalid.example' : location.href).pathname;
+  } catch {
+    return '';
+  }
+}
+
+function addErrorCrumb(type, message, data) {
+  errorCrumbs.push({
+    timestamp: new Date(Date.now()).toISOString(),
+    type,
+    message: String(message).slice(0, 300),
+    ...(data ? { data } : {}),
+  });
+  if (errorCrumbs.length > 30) errorCrumbs.shift();
+}
+
+function postError(payload) {
+  if (typeof fetch !== 'function') return;
+  try {
+    const now = Date.now();
+    while (errorSent.length && errorSent[0].time <= now - 600000) errorSent.shift();
+    const top = (payload.stack || '').split('\n').find((line) => /^\s*at\s/.test(line) || /@.*:\d+/.test(line)) || payload.source || '';
+    // A local warning must not hide a later error/fatal occurrence.
+    const key = (payload.level || 'error') + '|' + payload.message + '|' + top;
+    if (errorSent.length >= 25 || errorSent.some((item) => item.key === key)) return;
+    errorSent.push({ time: now, key });
+    const body = {
+      ...payload,
+      url: typeof location === 'undefined' ? '' : errorPath(location.href),
+      tags: validErrorTags({ ...payload.tags, ...errorTags }),
+      breadcrumbs: errorCrumbs.slice(),
+    };
+    Promise.resolve(
       fetch('/api/_errors', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(p),
+        // A report is not activity: a background refetch that keeps failing
+        // must not hold an idle session open (auth.idle_timeout).
+        headers: { 'Content-Type': 'application/json', 'X-Benmore-Background': '1' },
+        body: JSON.stringify(body),
         keepalive: true,
         credentials: 'same-origin',
-      }).catch(() => {}); // never let reporting throw (would loop)
-    } catch (_) {}
+      }),
+    ).catch(() => {});
+  } catch (_) {} // Reporting must never create another failure.
+}
+
+function errorPayload(err) {
+  return {
+    message: String(err?.message || (typeof err === 'string' ? err : 'Unknown error')).slice(0, 2000),
+    stack: typeof err?.stack === 'string' ? err.stack.slice(0, 8000) : '',
+    ...(typeof err?.status === 'number' ? { status: err.status } : {}),
+    ...(errorRequestIDRE.test(err?.body?.request_id || '') ? { request_id: err.body.request_id } : {}),
   };
+}
+
+export function captureError(err, options = {}) {
+  try {
+    postError({ ...errorPayload(err), kind: 'manual', level: 'error', tags: options?.tags });
+  } catch (_) {}
+}
+
+export function captureMessage(message, level = 'error') {
+  try {
+    postError({
+      kind: 'message',
+      message: String(message).slice(0, 2000),
+      level: ['warning', 'error', 'fatal'].includes(level) ? level : 'error',
+    });
+  } catch (_) {}
+}
+
+function captureRequest(method, path, status, started, requestID, err) {
+  try {
+    if (typeof location === 'undefined') return;
+    const url = new URL(path, location.href);
+    if (url.origin !== location.origin || url.pathname === '/api/_errors') return;
+    const cleanPath = url.pathname;
+    addErrorCrumb('http', method + ' ' + cleanPath, {
+      method,
+      path: cleanPath.slice(0, 300),
+      status,
+      ms: Math.max(0, Date.now() - started),
+    });
+    if (status >= 500 || err)
+      postError({
+        kind: 'http',
+        level: 'error',
+        message: method + ' ' + cleanPath + (err ? ' network failure' : ' ' + status),
+        method,
+        path: cleanPath,
+        status,
+        ...(errorRequestIDRE.test(requestID || '') ? { request_id: requestID } : {}),
+      });
+  } catch (_) {}
+}
+
+if (typeof window !== 'undefined') {
   window.addEventListener('error', (e) => {
     // Resource-load errors (img/script 404s) have no .message - skip them.
     if (!e || !e.message) return;
-    _postErr({
+    postError({
       kind: 'error',
       message: String(e.message).slice(0, 2000),
       stack: e.error && e.error.stack ? String(e.error.stack).slice(0, 8000) : '',
       source: e.filename || '',
       line: e.lineno || 0,
       col: e.colno || 0,
-      url: location.href,
     });
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e && e.reason;
-    const msg = r && r.message ? r.message : (typeof r === 'string' ? r : 'Unhandled promise rejection');
-    _postErr({
-      kind: 'unhandledrejection',
-      message: String(msg).slice(0, 2000),
-      stack: r && r.stack ? String(r.stack).slice(0, 8000) : '',
-      source: '',
-      line: 0,
-      col: 0,
-      url: location.href,
-    });
+    try {
+      postError({ ...errorPayload(r), kind: 'unhandledrejection' });
+    } catch (_) {}
   });
+  for (const name of ['pushState', 'replaceState']) {
+    const original = window.history?.[name];
+    if (typeof original !== 'function') continue;
+    window.history[name] = function (...args) {
+      const result = original.apply(this, args);
+      addErrorCrumb('navigation', errorPath(window.location.href));
+      return result;
+    };
+  }
+  window.addEventListener('popstate', () => addErrorCrumb('navigation', errorPath(window.location.href)));
+  for (const name of ['error', 'warn']) {
+    const original = console[name];
+    console[name] = function (...args) {
+      try {
+        const message = args
+          .map((arg) => {
+            try {
+              return typeof arg === 'string' ? arg : JSON.stringify(arg);
+            } catch {
+              return '[unserializable]';
+            }
+          })
+          .join(' ')
+          .slice(0, 300);
+        addErrorCrumb('console', message, { level: name });
+      } catch (_) {}
+      return original.apply(this, args);
+    };
+  }
+  window.document?.addEventListener(
+    'click',
+    (e) => {
+      const target = e.target;
+      if (!target || typeof target.getAttribute !== 'function') return;
+      addErrorCrumb('click', target.getAttribute('data-testid') || String(target.tagName || '') + (target.id ? '#' + target.id : ''));
+    },
+    true,
+  );
 }

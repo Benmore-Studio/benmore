@@ -1,0 +1,6 @@
+[
+  "The sweep runs about 5 seconds after the app starts or reloads, then every hour, so a row goes within about an hour of passing its ttl.",
+  "A row is deleted when its `column` is earlier than now minus `ttl`. Timestamps are compared as instants: SQLite's `YYYY-MM-DD HH:MM:SS` and RFC 3339, with or without an offset, are both read. A row whose `column` is NULL or is not a timestamp is kept.",
+  "It is a hard delete, also on a table with soft delete. On a table that has `deleted_at` the policy also removes rows that were soft-deleted longer ago than the ttl, whatever their `column` says: the ttl is how long the trash is kept too.",
+  "Policies run in file order. A table's expired rows are deleted in batches of 500, each batch in one transaction. An expired row that a row of another table still references through a declared relation is kept and the other rows go; the kept rows are counted (`rows_skipped`) and tried again at the next sweep. To delete them as well, give the child table its own policy and list it before the parent."
+]

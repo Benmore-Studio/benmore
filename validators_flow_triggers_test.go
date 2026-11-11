@@ -38,6 +38,8 @@ func TestFlowTriggerProblemsRefusedAtWriteTime(t *testing.T) {
 
 	for _, on := range []string{
 		"on:\n  schedule: { cron: \"*/15 * * * *\" }\n",
+		"on:\n  schedule: { cron: \"@daily\", transaction: true }\n",
+		"on:\n  schedule: { cron: \"@daily\", transaction: false }\n",
 		"on:\n  schedule: { cron: \"every 24h\" }\n",
 		"on:\n  event: { table: notes, op: delete }\n",
 		"on:\n  request: { method: POST, path: /api/sync, auth: none, mode: async }\n",

@@ -1,0 +1,5 @@
+[
+  "Only benmore api descriptions without --call are cached; --call, including an explicit empty object, always executes and never sends a conditional request.",
+  "Cache identity isolates account, platform origin, app, environment, and topic; filenames are opaque hashes and entries are private config files.",
+  "Missing, corrupt, partial, or unwritable cache entries fail open to a network response. Entries are pruned after 30 days and capped at 128."
+]

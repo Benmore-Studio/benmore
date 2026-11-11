@@ -1,0 +1,37 @@
+[
+  "Public form: anyone posts {name, email, message} to POST /api/contact without signing in. The flow validates the inputs, stores the message and queues an email to the owner in one transaction, and the sixth request an hour from one client address answers 429. The owner reads the messages signed in as an admin.",
+  {
+    "file": "app.yaml",
+    "content": "# Public contact form: anyone may send a message, the owner reads them signed\n# in as an admin and gets an email for each one.\nsite_name: \"Contact\"\nauth:\n  identifier: email\naccess:\n  messages: { all: admin }      # visitors write only through the flow"
+  },
+  {
+    "file": "schema.prisma",
+    "content": "model Message {\n  id         Int      @id @default(autoincrement())\n  name       String\n  email      String\n  body       String\n  notifiedAt String   @default(\"\") @map(\"notified_at\")   // when the owner was emailed\n  createdAt  DateTime @default(now()) @map(\"created_at\")\n  @@map(\"messages\")\n}"
+  },
+  {
+    "file": "flows/contact.yaml",
+    "content": "# flows/contact.yaml - the public form's endpoint: validate, store, queue the email\non:\n  request:\n    method: POST\n    path: /api/contact\n    auth: none\n    rate_limit: \"5/hour per ip\"     # 429 with Retry-After before any step runs\n    transaction: true               # the row and the queued email commit together\n    inputs:\n      name:    { type: text, required: true }\n      email:   { type: email, required: true }\n      message: { type: textarea, required: true }\njobs:\n  contact:\n    steps:\n      - id: saved\n        run: sql\n        with: { query: \"INSERT INTO messages (name, email, body) VALUES (:name, :email, :message) RETURNING id\" }\n      - run: enqueue\n        with:\n          flow: notify-owner\n          with: { message_id: \"${{ steps.saved.outputs.id }}\" }\n      - run: respond\n        with: { status: 201, json: { received: true } }"
+  },
+  {
+    "file": "flows/notify-owner.yaml",
+    "content": "# flows/notify-owner.yaml - queued by contact.yaml: email the owner about one message\non:\n  request:\n    method: POST\n    path: /api/contact/notify\n    role: admin                     # the queue runs it; only an admin may call it directly\njobs:\n  notify:\n    steps:\n      - id: m\n        run: sql\n        expect_rows: \"=1\"\n        with: { query: \"SELECT name, email, body FROM messages WHERE id = :message_id AND notified_at = ''\" }\n      - run: email\n        with:\n          to: \"${{ env.OWNER_EMAIL }}\"\n          reply_to: \"${{ steps.m.outputs.email }}\"\n          subject: \"New message from ${{ steps.m.outputs.name }}\"\n          text: \"${{ steps.m.outputs.body }}\"\n      - run: sql\n        with: { query: \"UPDATE messages SET notified_at = datetime('now') WHERE id = :message_id\" }"
+  },
+  {
+    "check": "A valid POST /api/contact answers 201 {received:true}, stores one `messages` row and one queued `notify-owner` job. An invalid address answers 422 {error:'flow input \"email\" must be a valid email address'} and stores nothing. The sixth request of the hour answers 429 with Retry-After, and refused inputs count toward it. When the job runs, the owner gets the message with the visitor as Reply-To and `notified_at` is set. GET /api/messages answers 200 for an admin, 404 for any other signed-in user and 401 signed out.",
+    "notes": [
+      "Set the owner's address once: `benmore env <app> set OWNER_EMAIL=<address>`. Without it the job fails (GET /api/_jobs lists it for an admin) and the message row is kept, unstamped.",
+      "The email is queued, not sent in the request: a `transaction: true` flow refuses `run: email`, and a mail failure never loses the visitor's message (`flows.transactional_sends`).",
+      "The limit is per client address, not per person; several visitors behind one address share it (`flows.gotchas_request_input`).",
+      "The form mails only the owner. Mailing an address a visitor typed lets a stranger cause bounces on your sender (`email.gotchas`).",
+      "From page code: `bm.flows.contact({}, { name, email, message })` (path parameters first, then the body)."
+    ],
+    "read_next": [
+      "flows.public_flows",
+      "flows.inputs",
+      "flows.gotchas_request_input",
+      "flows.enqueue",
+      "flows.email_step",
+      "email.zero_config"
+    ]
+  }
+]

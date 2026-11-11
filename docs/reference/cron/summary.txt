@@ -1,0 +1,1 @@
+cron.yaml schedules server-side work without a user session. Reference a named flow to reuse its steps; its HTTP authentication and async wrapper do not execute for cron.

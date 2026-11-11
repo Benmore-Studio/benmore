@@ -1,0 +1,4 @@
+// Use ONLY for ≤4-person video calls. For livestream use bm.broadcast above.
+const ice = await bm.webrtc.iceServers();
+const pc  = new RTCPeerConnection({ iceServers: ice });
+// signal SDP/ICE through bm.room('my-room') - see api({at:'websocket'}) webrtc_pattern.

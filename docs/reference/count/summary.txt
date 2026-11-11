@@ -1,0 +1,1 @@
+TRUE row count, ignoring the default 50-row LIMIT on /api/<table>. Two equivalent surfaces: bm.table(name).count() from the SDK, or ?count=true on the auto-CRUD list endpoint. Both walk the WHERE filters but skip pagination.

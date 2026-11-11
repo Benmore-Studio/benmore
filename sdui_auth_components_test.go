@@ -58,6 +58,7 @@ var fetched = [];
 function fetch(url, init) { fetched.push({url: url, init: init || {}}); return Promise.resolve({ok: true, status: 200, json: function () { return Promise.resolve({ok: true}); }}); }
 var me = {id: 7, email: 'member@example.test', mfa_enabled: false};
 var enrolled = [];
+var disabled = [];
 var fixtureBM = {
   auth: {
     me: function () { return Promise.resolve(me); },
@@ -73,7 +74,7 @@ var fixtureBM = {
       return Promise.resolve({secret: 'SECRETB32', otpauth_uri: 'otpauth://totp/App:member@example.test?secret=SECRETB32&issuer=App', backup_codes: ['bkp-one-1111', 'bkp-two-2222']});
     },
     verify: function () { return Promise.resolve({ok: true}); },
-    disable: function () { return Promise.resolve({ok: true}); },
+    disable: function (code) { disabled.push(code); return Promise.resolve({status: 'mfa_disabled'}); },
   },
   api: {raw: {post: function (path, body) {
     fetched.push({url: path, init: {method: 'POST', body: body}});
@@ -161,6 +162,22 @@ func TestSDUIMfaSetupEnrollsWithPasswordAndShowsBackupCodes(t *testing.T) {
 	}
 	if !strings.Contains(html, "6-digit code") {
 		t.Fatalf("enrollment view lacks the verify form: %s", html)
+	}
+}
+
+// compliance F6 (round 1110): the disable form asked for the password and
+// passed it to bm.mfa.disable, but the server turns the factor off only for a
+// current authenticator code, so the form could never succeed.
+func TestSDUIMfaSetupDisablesWithAnAuthenticatorCode(t *testing.T) {
+	vm := sduiAuthVM(t)
+	sduiRun(t, vm, `me.mfa_enabled = true; var el = mkEl('target'); sdui.MfaSetup(el, {});`)
+	html := vm.Get("el").ToObject(vm).Get("innerHTML").String()
+	if !strings.Contains(html, "Disable 2FA") || !strings.Contains(html, `name="code"`) || strings.Contains(html, `type="password"`) {
+		t.Fatalf("disable view must ask for an authenticator code, not a password: %s", html)
+	}
+	sduiRun(t, vm, `submit(el.kids['form'], {code: ' 123456 '});`)
+	if got := sduiRun(t, vm, `JSON.stringify(disabled)`).String(); got != `["123456"]` {
+		t.Fatalf("bm.mfa.disable called with %s, want the typed code", got)
 	}
 }
 

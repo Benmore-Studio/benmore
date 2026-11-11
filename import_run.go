@@ -22,6 +22,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -29,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -136,7 +138,8 @@ func importRunning(app *App) bool { return importFlagFor(app).Load() }
 // the owner token can import, and auto-CRUD create honors an explicit tenant
 // from exactly that caller. Without it every imported row of a tenant-keyed
 // table landed with a NULL tenant, visible to no tenant at all. The owner
-// column is never read from the file; runImportInner fills it like create.
+// column is never read from the file; runImportInner fills it like create,
+// and writes a workflow's `initial` state into its state column.
 func importableColumns(db *sql.DB, table string, app *App) ([]Column, error) {
 	cols, err := GetTableColumns(db, table)
 	if err != nil {
@@ -284,11 +287,11 @@ func runImport(app *App, sess *importSession) error {
 			if isStorageFullError(err) {
 				reason = storageFullMessage(app) + " (" + reason + "; the import was rolled back)"
 			}
-			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, reason)
+			changed, serr := saveImportStateIf(app.DB, sess.ID, importStateRunning, importStateFailed, 0, reason)
 			if serr != nil {
 				log.Printf("IMPORT %s: failed to persist failed state: %v", sess.ID, serr)
 			}
-			if !changed {
+			if !changed && !replaceLapsedFailure(app.DB, sess.ID, reason) {
 				return
 			}
 			// A "failed" session is terminal - the resume match
@@ -317,10 +320,17 @@ func runImport(app *App, sess *importSession) error {
 		// - the real admin email for an admin session, or the owner
 		// token's subject (verifyImportOwnerToken, import_sql.go) for a
 		// token-authenticated caller.
+		details := map[string]any{"rows": rows, "bytes": sess.BytesTotal, "sha256": sess.SHA256, "format": sess.Format}
+		if sess.OwnerUserID != 0 {
+			// The chosen owner (`--owner`) is part of the record: it decides
+			// who can read every imported row.
+			details["owner_user_id"] = sess.OwnerUserID
+			details["owner_email"] = sess.OwnerEmail
+		}
 		LogAudit(app, "import", sess.TableName, "",
 			&Session{UserID: sess.CreatedBy, Email: sess.CreatedBySubject},
 			nil,
-			map[string]any{"rows": rows, "bytes": sess.BytesTotal, "sha256": sess.SHA256, "format": sess.Format},
+			details,
 		)
 		Broadcast(app, sess.TableName, "insert", nil)
 		log.Printf("IMPORT %s: %d rows into %s", sess.ID, rows, sess.TableName)
@@ -378,6 +388,11 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// A table that requires an owner is refused before parsing when the
+	// session has none, instead of failing row 1 with a NOT NULL error.
+	if err := checkImportOwnerPlan(app.DB, sess.TableName, sess.CreatedBy, sess.OwnerUserID); err != nil {
+		return 0, err
+	}
 
 	raw, err := stagedRawReader(app, sess.ID)
 	if err != nil {
@@ -430,14 +445,23 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// The owner column is filled like an auto-CRUD create: the importing
+	// admin owns the rows. An owner-token import has no user in this app
+	// (CreatedBy is 0); its rows go to the app user the caller chose
+	// (OwnerUserID, `--owner`), else stay unowned, as an anonymous create's do.
+	owner := sess.CreatedBy
+	if sess.OwnerUserID != 0 {
+		owner = sess.OwnerUserID
+	}
 	// NDJSON silently ignores keys that are not importable columns; a command-owned
-	// key must instead fail the load.
+	// key, or a membership row naming someone other than the row's owner, must
+	// instead fail the load.
 	if ns, ok := src.(*ndjsonSource); ok {
-		if err := ns.refuseKeys(func(keys []string) error {
-			if v := ownedFieldViolation(app, sess.TableName, keys...); v != nil {
+		if err := ns.refuseObjects(func(obj map[string]any) error {
+			if v := ownedFieldViolation(app, sess.TableName, mapKeys(obj)...); v != nil {
 				return v
 			}
-			return nil
+			return membershipNamedIdentityDenial(app, sess.TableName, owner, owner != 0, obj)
 		}); err != nil {
 			return 0, err
 		}
@@ -449,24 +473,36 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 		names[i] = c.Name
 		marks[i] = "?"
 	}
-	// The owner column is filled like an auto-CRUD create: the importing
-	// admin owns the rows. An owner-token import has no user in this app
-	// (CreatedBy is 0), so its rows stay unowned, as an anonymous create's do.
 	ownerCol := ""
 	all, err := GetTableColumns(app.DB, sess.TableName)
 	if err != nil {
 		return 0, err
 	}
-	if sess.CreatedBy != 0 {
+	if owner != 0 {
 		for _, c := range all {
 			if identIs(c.Name, "user_id") {
 				ownerCol = c.Name
 			}
 		}
 	}
+	// Values the framework binds on every row, after the file's.
+	var fixed []any
 	if ownerCol != "" {
 		names = append(names, ownerCol)
 		marks = append(marks, "?")
+		fixed = append(fixed, owner)
+	}
+	// A workflow's state column is not importable (importableColumns), so the
+	// file never sets it; like every other create, each row starts in the
+	// workflow's `initial` state instead of the column default.
+	hasCol := func(name string) bool {
+		return slices.ContainsFunc(all, func(c Column) bool { return identIs(c.Name, name) })
+	}
+	stateCols, stateVals := workflowInitialColumns(app, sess.TableName, hasCol, names)
+	for i, name := range stateCols {
+		names = append(names, name)
+		marks = append(marks, "?")
+		fixed = append(fixed, stateVals[i])
 	}
 	// Mode A has its own prepared INSERT path. Omitted Prisma UUID defaults
 	// use the same compatibility rule as CRUD, evaluated separately per row.
@@ -489,7 +525,7 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		quoteIdent(sess.TableName), strings.Join(quoteIdents(names), ", "), strings.Join(marks, ", "))
 
-	tx, err := app.DB.Begin()
+	tx, err := app.DB.BeginTx(withLongWriteTx(context.Background(), "bulk import"), nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin: %w", err)
 	}
@@ -499,6 +535,20 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 			tx.Rollback()
 		}
 	}()
+	if sess.OwnerUserID != 0 {
+		if err := confirmImportOwnerTx(tx, sess.OwnerUserID); err != nil {
+			return 0, err
+		}
+	}
+
+	// Values for a column the published Prisma schema declares are checked
+	// and normalized like CRUD writes and NDJSON ingest (normalizePrismaValue):
+	// "abc" in an Int column is refused, true in a Boolean becomes 1. Tables
+	// of a SQL-only app keep SQLite's affinity rules.
+	prismaCols := map[string]Column{}
+	for name, c := range prismaWriteColumns(app, sess.TableName) {
+		prismaCols[strings.ToLower(name)] = c
+	}
 
 	stmt, err := tx.Prepare(insertSQL)
 	if err != nil {
@@ -519,21 +569,49 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("row %d: %w", parsed+1, err)
 		}
-		if ownerCol != "" {
+		if len(prismaCols) > 0 {
+			vals = append([]any(nil), vals...) // never write into a source's buffer
+			for i, c := range effective {
+				pc, ok := prismaCols[strings.ToLower(c.Name)]
+				if !ok || i >= len(vals) || vals[i] == importMissing {
+					continue
+				}
+				if vals[i], err = normalizePrismaValue(pc, vals[i]); err != nil {
+					return 0, fmt.Errorf("row %d: %w", parsed+1, err)
+				}
+			}
+		}
+		if len(fixed) > 0 {
 			// Full slice expression: never write into a source's reused buffer.
-			vals = append(vals[:len(vals):len(vals)], sess.CreatedBy)
+			vals = append(vals[:len(vals):len(vals)], fixed...)
 		}
 		// Source values precede any generated UUID SQL expressions in names.
 		// Prefix-looking encrypted inputs are plaintext, just as native CRUD.
 		if len(vals) > len(names) {
 			return 0, fmt.Errorf("row %d: source returned too many values", parsed+1)
 		}
-		sealedFields, sealedValues, err := sealNativeCiphertextLiterals(tx, app, sess.TableName, names[:len(vals)], vals)
+		// A key this NDJSON object left out is not in its INSERT, so the
+		// column takes its DEFAULT.
+		sourceLen := len(vals)
+		rowNames, rowVals := names[:sourceLen], vals
+		for _, v := range vals {
+			if v == importMissing {
+				rowNames, rowVals = nil, nil
+				for i, v := range vals {
+					if v != importMissing {
+						rowNames = append(rowNames, names[i])
+						rowVals = append(rowVals, v)
+					}
+				}
+				break
+			}
+		}
+		sealedFields, sealedValues, err := sealNativeCiphertextLiterals(tx, app, sess.TableName, rowNames, rowVals)
 		if err != nil {
 			return 0, fmt.Errorf("row %d: %w", parsed+1, err)
 		}
-		changed := len(sealedValues) != len(vals)
-		for i, value := range vals {
+		changed := len(rowVals) != sourceLen || len(sealedValues) != len(rowVals)
+		for i, value := range rowVals {
 			if text, ok := value.(string); ok && sealedValues[i] != text {
 				changed = true
 				break
@@ -544,9 +622,13 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 			for i := range boundMarks {
 				boundMarks[i] = "?"
 			}
-			boundMarks = append(boundMarks, marks[len(vals):]...)
-			sealedFields = append(sealedFields, names[len(vals):]...)
-			_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(sess.TableName), strings.Join(quoteIdents(sealedFields), ", "), strings.Join(boundMarks, ", ")), sealedValues...)
+			boundMarks = append(boundMarks, marks[sourceLen:]...)
+			sealedFields = append(sealedFields, names[sourceLen:]...)
+			if len(sealedFields) == 0 {
+				_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s DEFAULT VALUES", quoteIdent(sess.TableName)))
+			} else {
+				_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(sess.TableName), strings.Join(quoteIdents(sealedFields), ", "), strings.Join(boundMarks, ", ")), sealedValues...)
+			}
 		} else {
 			_, err = stmt.Exec(vals...)
 		}
@@ -594,7 +676,7 @@ func runImportInner(app *App, sess *importSession) (int64, error) {
 
 func completeImport(tx *sql.Tx, id string, rows int64) error {
 	res, err := tx.Exec(`UPDATE _benmore_imports
-		SET state = 'completed', rows_loaded = ?, error = '', completed_at = datetime('now')
+		SET state = 'completed', rows_loaded = ?, error = '', completed_at = datetime('now'), lease_expires_at = NULL
 		WHERE id = ? AND state = 'running'`, rows, id)
 	if err != nil {
 		return err

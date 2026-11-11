@@ -1,0 +1,1 @@
+Deploy a prebuilt Vite, Next.js static-export, or Create React App frontend without introducing a Node build inside the Benmore app. Build in the original project, then copy only the generated browser files into the Benmore app's static/ directory and deploy that app directory.

@@ -1,0 +1,5 @@
+[
+  "api({at:'frontend'})",
+  "api({at:'components'})",
+  "api({at:'uploads'})"
+]

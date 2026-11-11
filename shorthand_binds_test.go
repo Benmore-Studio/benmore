@@ -68,9 +68,10 @@ func TestShorthandRejectsUnknownIdentifiers(t *testing.T) {
 		"owned": {Route: "/o", RawHTML: `<query from="notes" pick="title" owned="{{param_col}}" as="rows">` + shorthandListTmpl + `</query>`},
 		"from":  {Route: "/f", RawHTML: `<query from="no_such_table" as="rows">` + shorthandListTmpl + `</query>`},
 	} {
-		out := ssrRender(t, app, page, &Session{UserID: 1}, map[string]any{"param_cols": "title, 1 AS x", "param_col": "user_id OR 1"})
-		if !strings.Contains(out, "benmore-error") || strings.Contains(out, "row-one") {
-			t.Errorf("%s: want an error block, got %s", name, out)
+		ctx := &RenderContext{Data: map[string]any{"param_cols": "title, 1 AS x", "param_col": "user_id OR 1"}, User: &Session{UserID: 1}, App: app, Page: page}
+		out, err := RenderTemplate(app, page, ctx)
+		if err == nil || strings.Contains(out, "row-one") {
+			t.Errorf("%s: want a failed render, got %q, %v", name, out, err)
 		}
 	}
 }

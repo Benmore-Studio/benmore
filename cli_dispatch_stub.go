@@ -3,8 +3,8 @@
 package main
 
 // Open-source framework stubs for the cloud CLI surface. The hosted-platform
-// client commands (login/signup, deploy, push/pull, the MCP thin-clients,
-// edges) live in the `cloud` and `platform` builds. In the pure framework
+// client commands (login/signup, deploy, push/pull, the MCP thin-clients)
+// live in the `cloud` and `platform` builds. In the pure framework
 // build they're absent, so dispatchPlatformCLI never handles a command,
 // the usage text has no deployed-apps section, and the docs-read gate ping
 // is a no-op (there is no hosted MCP to ping).
@@ -20,5 +20,8 @@ func isMCPConnectorSwitchCommand(args []string) bool { return false }
 func maybeAutoInstallSkill() {}
 
 func platformUsageText() string { return "" }
+
+// The framework edition has no hosted journey; its full list is short.
+func workflowUsageText() string { return usageText() }
 
 func markDocsRead(topic string) {}

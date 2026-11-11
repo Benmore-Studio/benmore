@@ -54,11 +54,13 @@ func insertAPITokenWithinCap(db apiTokenExecer, userID int64, name, tokenHash, s
 const apiTokenCapMessage = "this account already has the maximum number of API tokens (100): revoke one you no longer use (DELETE /api/_auth/api-tokens/{id}) and try again"
 
 // tokenExchangeSessionsSQL selects one account's sessions that came from the
-// Bearer token exchange (first argument: the user id): not a person's
-// interactive sign-in (login_at, set by createSignInSession), not a support
-// or delegated row, not a dashboard embed. Rows from before login_at existed
-// match too; they are the oldest an account has and age out with it.
-const tokenExchangeSessionsSQL = "user_id = ? AND COALESCE(login_at, 0) = 0 AND COALESCE(is_impersonation, 0) = 0 AND COALESCE(scopes, '') <> 'embed'"
+// Bearer token exchange (first argument: the user id): marked
+// loginAtTokenExchange, or unmarked (0) and not a person's interactive
+// sign-in (login_at > 0, set by createSignInSession), not a support or
+// delegated row, not a dashboard embed. Unmarked rows are the exchange's
+// sessions from before the marker and rows from before login_at existed; they
+// are the oldest an account has and age out with it.
+const tokenExchangeSessionsSQL = "user_id = ? AND COALESCE(login_at, 0) <= 0 AND COALESCE(is_impersonation, 0) = 0 AND COALESCE(scopes, '') <> 'embed'"
 
 // trimTokenExchangeSessions ends the account's oldest token-exchange sessions
 // beyond the newest maxTokenSessionsPerUser. Called after each exchange, so

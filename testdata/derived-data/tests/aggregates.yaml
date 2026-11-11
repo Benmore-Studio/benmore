@@ -1,0 +1,80 @@
+# api(at:"aggregates"): one cached value per aggregate for the whole app,
+# refreshed on a timer or on demand, read by admins through the API and by
+# every viewer of a server-rendered page. Run: benmore test <dir> --app
+
+# The list and the refresh are for admins.
+aggregates_api_is_admin_only:
+  as_user: "member@aggregates.test"
+  steps:
+    - get: "/api/_aggregates"
+      expect:
+        status: 403
+        contains: "admin required"
+    - api: "POST /api/_aggregates/refresh"
+      expect:
+        status: 403
+        contains: "admin required"
+
+aggregates_api_needs_sign_in:
+  anon: true
+  steps:
+    - get: "/api/_aggregates"
+      expect:
+        status: 401
+        contains: "authentication required"
+
+# A write does not move the cached value; a refresh does. The aggregate reads
+# the computed column line_total (4 x 2.5 = 10).
+refresh_recomputes_the_cached_value:
+  as_user: "admin@aggregates.test"
+  as_role: "admin"
+  setup:
+    - sql: "DELETE FROM items"
+    - sql: "DELETE FROM orders"
+  steps:
+    - api: "POST /api/_aggregates/refresh"
+      expect:
+        status: 200
+        contains: '"refreshed":["revenue"]'
+    - get: "/api/_aggregates"
+      expect:
+        status: 200
+        contains:
+          - '"name":"revenue"'
+          - '"stale":false'
+          - '"value":0'
+    - api: "POST /api/orders"
+      json: {title: "four at 2.50", quantity: 4, unit_price: 2.5}
+      expect:
+        status: 200
+        contains: '"line_total":10'
+    # Still the value of the last refresh.
+    - get: "/api/_aggregates"
+      expect:
+        status: 200
+        contains: '"value":0'
+    - api: "POST /api/_aggregates/refresh"
+      expect:
+        status: 200
+        contains: '"failed":[]'
+    - get: "/api/_aggregates"
+      expect:
+        status: 200
+        contains: '"value":10'
+    # The server-rendered page prints the cached value.
+    - get: "/stats"
+      expect:
+        status: 200
+        contains: "Revenue: 10"
+
+# A page shows the cached value to every viewer, signed in or not: it is one
+# number for the whole app.
+page_shows_the_cached_value_to_anonymous_viewers:
+  anon: true
+  setup:
+    - sql: "UPDATE _benmore_aggregates SET value = '1234.5' WHERE name = 'revenue'"
+  steps:
+    - get: "/stats"
+      expect:
+        status: 200
+        contains: "Revenue: 1234.5"

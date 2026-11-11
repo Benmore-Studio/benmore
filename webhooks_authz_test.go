@@ -12,9 +12,10 @@ import (
 // A non-admin end user must not be able to subscribe to the app's row
 // changes: a subscription receives every tenant's data.
 func TestWebhookCreateRequiresAdmin(t *testing.T) {
-	oldKey := appEncryptionKey
-	appEncryptionKey = make([]byte, 32) // secrets are encrypted at rest; fail-closed without a key
-	t.Cleanup(func() { appEncryptionKey = oldKey })
+	// Secrets are sealed at rest under a durable key; fail-closed without one.
+	oldKey, oldEphemeral := appEncryptionKey, appEncryptionKeyEphemeral
+	appEncryptionKey, appEncryptionKeyEphemeral = make([]byte, 32), false
+	t.Cleanup(func() { appEncryptionKey, appEncryptionKeyEphemeral = oldKey, oldEphemeral })
 	app, done := newTestApp(t)
 	defer done()
 	EnsureUsersTable(app.DB)
@@ -85,7 +86,7 @@ func TestWebhookPayloadOmitsHiddenColumns(t *testing.T) {
 	}
 	row := map[string]any{"id": 1, "name": "stripe2", "api_secret": "sk-new-secret", "refresh_token": "rt-new",
 		"old_api_secret": "sk-old-secret", "old_name": "stripe"}
-	FireWebhookSubscriptions(app, "update", "integrations", row, &Session{UserID: adminID, Email: "owner@example.com"})
+	_ = enqueueWebhookSubscriptionsTx(app.DB, app, "update", "integrations", row, &Session{UserID: adminID, Email: "owner@example.com"})
 
 	var payload string
 	if err := app.DB.QueryRow("SELECT payload FROM _benmore_jobs WHERE job_type = 'webhook_subscription'").Scan(&payload); err != nil {

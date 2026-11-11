@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const hookFiredOnUpdate = `on_update:
@@ -73,6 +73,68 @@ func TestAppMCPCommandHookOnUpdateFiresOnceInCommandTransaction(t *testing.T) {
 	}
 	if n := hookCount(t, app, `SELECT count(*) FROM activities WHERE event='completed'`); n != 1 {
 		t.Fatalf("the command's own activity write was lost: %d", n)
+	}
+}
+
+func TestAppMCPCommandSQLAfterHookGetsCapturedName(t *testing.T) {
+	hooks := strings.Replace(hookFiredOnUpdate, "'hook_fired'", "'{{_mcp_command_name}}'", 1)
+	app, sessionID, _ := newCommandProviderTaskFixtureWithPolicies(t, hookTaskFlow, hooks)
+	readback, err := runHookedCommand(t, app, sessionID)
+	if err != nil {
+		t.Fatalf("command with SQL after-hook: %v", err)
+	}
+	if _, leaked := readback["_mcp_command_name"]; leaked {
+		t.Fatalf("command identity leaked into row output: %#v", readback)
+	}
+	if n := hookCount(t, app, `SELECT count(*) FROM activities WHERE event='complete_item'`); n != 1 {
+		t.Fatalf("captured command name reached SQL after-hook %d times, want 1", n)
+	}
+
+	row := map[string]any{"id": int64(1), "user_id": int64(1), "user_email": "task-actor@example.com", "_mcp_command_name": "task_bulk_update"}
+	tx, err := app.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fireAfterHooksTx(tx, app, "update", "tasks", row); err != nil {
+		t.Fatalf("ordinary after-hook after command: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit ordinary after-hook: %v", err)
+	}
+	if row["_mcp_command_name"] != "task_bulk_update" {
+		t.Fatalf("after-hook mutated the event row: %#v", row)
+	}
+	if n := hookCount(t, app, `SELECT count(*) FROM activities WHERE event=''`); n != 1 {
+		t.Fatalf("ordinary after-hook inherited command identity or row spoof; empty-name rows=%d", n)
+	}
+}
+
+func TestOrdinaryAndLegacyAfterHookSQLCannotTrustCommandNameRow(t *testing.T) {
+	app, _, _ := newCommandProviderTaskFixtureWithPolicies(t, hookTaskFlow, "")
+	app.Hooks = &HookConfig{OnUpdate: map[string][]Hook{"tasks": {{SQL: `INSERT INTO activities(task_id,actor_user_id,actor_email,event) VALUES({{id}},{{user_id}},'{{user_email}}','{{_mcp_command_name}}')`}}}}
+	row := map[string]any{"id": int64(1), "user_id": int64(1), "user_email": "spoof@example.com", "_mcp_command_name": "task_bulk_update"}
+	tx, err := app.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fireAfterHooksTx(tx, app, "update", "tasks", row); err != nil {
+		t.Fatalf("ordinary after-hook: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit ordinary after-hook: %v", err)
+	}
+	if row["_mcp_command_name"] != "task_bulk_update" {
+		t.Fatalf("after-hook mutated the event row: %#v", row)
+	}
+	if n := hookCount(t, app, `SELECT count(*) FROM activities WHERE event=''`); n != 1 {
+		t.Fatalf("ordinary SQL after-hook saw a spoofed command name; empty-name rows=%d", n)
+	}
+
+	if err := executeHookResult(app, app.Hooks.OnUpdate["tasks"][0], "tasks", row); err != nil {
+		t.Fatalf("legacy after-hook: %v", err)
+	}
+	if n := hookCount(t, app, `SELECT count(*) FROM activities WHERE event=''`); n != 2 {
+		t.Fatalf("legacy SQL after-hook saw a spoofed command name; empty-name rows=%d", n)
 	}
 }
 

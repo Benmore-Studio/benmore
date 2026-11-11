@@ -1,0 +1,5 @@
+[
+  "Explicit `login --token-stdin` (or `--token`) validates the bearer through GET /platform/me before saving it.",
+  "BENMORE_TOKEN is always ephemeral, including `benmore login` and `benmore bootstrap`; it overrides a saved token for the process without replacing it.",
+  "`--token`/`--token-stdin` cannot be combined with `--email`/`--password`/`--password-stdin` (usage exit 2)."
+]

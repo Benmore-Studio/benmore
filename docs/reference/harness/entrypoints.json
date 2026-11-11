@@ -1,0 +1,7 @@
+[
+  "benmore docs harness",
+  "benmore docs build",
+  "benmore docs deploy",
+  "benmore skill install --agent codex",
+  "benmore skill install --agent all"
+]

@@ -1,0 +1,14 @@
+# flows/stripe-webhook.yaml - receive a Stripe webhook
+on:
+  request:
+    method: POST
+    path: /api/webhooks/stripe
+    verify: stripe                            # Stripe-Signature: t=…,v1=… with a 5-minute window
+    secret: "${{ env.STRIPE_WEBHOOK_SECRET }}"
+jobs:
+  stripe_webhook:
+    steps:
+      - id: record
+        query: "INSERT OR IGNORE INTO stripe_events (event_id, type) VALUES (:id, :type)"   # UNIQUE(event_id): providers retry
+      - run: respond
+        with: { status: 200, json: { received: true } }

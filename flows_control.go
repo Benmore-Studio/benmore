@@ -32,6 +32,14 @@ func execStepIf(ctx *FlowContext, step *FlowStep) error {
 }
 
 func execStepForEach(ctx *FlowContext, step *FlowStep) error {
+	// The loop variable is written into the flow's values, and its elements
+	// can come from the request. Under a name the runtime owns for the
+	// caller's identity or the app's environment (`as: user`), each element
+	// replaced `${{ user.* }}` for the rest of the flow. Such a loop does not
+	// run (the write gate refuses the name, flowLoopNameProblem).
+	if flowLoopNameReplacesIdentity(step.ForAs) {
+		return fmt.Errorf("for_each: the loop variable `as: %s` is a name the runtime owns (the signed-in caller's identity, or the app's environment), so the loop was not run. Rename the loop variable", step.ForAs)
+	}
 	items, ok := flowDataValue(ctx, step.ForEach)
 	if !ok {
 		// Compute and nested request values need not have pre-flattened keys
@@ -47,16 +55,13 @@ func execStepForEach(ctx *FlowContext, step *FlowStep) error {
 		return nil
 	}
 
-	var rows []map[string]any
-	switch v := items.(type) {
-	case []map[string]any:
-		rows = v
-	case []any:
-		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				rows = append(rows, m)
-			}
-		}
+	// Every element is an iteration: a row (an object) or a scalar (a string,
+	// number, boolean or nested list). Scalars used to be skipped, so a loop
+	// over `["a@example.com", "b@example.com"]` or `[1, 2, 3]` ran zero times and the
+	// flow reported success.
+	rows, err := forEachItems(ctx, step, items)
+	if err != nil {
+		return err
 	}
 
 	as := step.ForAs
@@ -73,19 +78,55 @@ func execStepForEach(ctx *FlowContext, step *FlowStep) error {
 	if ctx.secretRef("{{"+step.ForEach+"}}") != "" {
 		ctx.markSecret(as)
 	}
+	if ctx.sqlTextRef("{{"+step.ForEach+"}}") != "" {
+		ctx.markSQLText(as)
+	}
+	// The loop variable holds the request's own values when the loop
+	// iterates request input, and computed data otherwise (a SQL step's
+	// rows, even one keyed by request input): flows_request_text.go.
+	if ctx.exprReadsRequestKey(step.ForEach) {
+		ctx.unmarkComputed(as)
+	} else {
+		ctx.markComputed(as)
+	}
 
+	if len(rows) > flowForEachMaxItems {
+		return fmt.Errorf("for_each: %d items is over the %d a loop may iterate; page the source (LIMIT/OFFSET) or enqueue the work in batches", len(rows), flowForEachMaxItems)
+	}
+	// written holds the keys the previous iteration flattened in, and size
+	// the data's size after that write. While the body adds no top-level
+	// key, the reset deletes just those keys; otherwise it scans the whole
+	// map once, as it always did (the body may have written under as.*).
+	// The full scan on every iteration made a loop quadratic in the data.
+	var written []string
+	size := -1
 	for _, row := range rows {
 		// Replace the whole loop value, including flattened descendants.
 		// Otherwise fields absent from this row (or a shorter nested array)
 		// still resolve to the previous row's value in templates and SQL binds.
 		ctx.DataMu.Lock()
-		for key := range ctx.Data {
-			if strings.HasPrefix(key, as+".") {
+		if size == len(ctx.Data) {
+			for _, key := range written {
 				delete(ctx.Data, key)
 			}
+		} else {
+			for key := range ctx.Data {
+				if strings.HasPrefix(key, as+".") {
+					delete(ctx.Data, key)
+				}
+			}
 		}
+		written = written[:0]
 		ctx.Data[as] = row
-		flattenIntoCtx(ctx.Data, as, row)
+		if m, ok := row.(map[string]any); ok {
+			flat := map[string]any{}
+			flattenIntoCtx(flat, as, m)
+			for k, v := range flat {
+				ctx.Data[k] = v
+				written = append(written, k)
+			}
+		}
+		size = len(ctx.Data)
 		ctx.DataMu.Unlock()
 		ctx.markParallelOutput(as)
 		executeSteps(ctx, step.Steps)
@@ -94,6 +135,77 @@ func execStepForEach(ctx *FlowContext, step *FlowStep) error {
 		}
 	}
 	return nil
+}
+
+// flowForEachMaxItems bounds one for_each: each iteration runs the body's
+// steps (queries, calls), so an unbounded request array or result set held a
+// request (or the single job worker, for an async flow) for as long as it ran.
+const flowForEachMaxItems = 10000
+
+// forEachItems returns the elements a for_each iterates. A list is iterated as
+// it is; JSON text of an array (a json_group_array() column, a step's JSON-text
+// output) is decoded the way a respond body decodes it (keepRequestTextString),
+// so the loop sees the list respond shows. A string the caller sent is never
+// decoded. An empty, null or missing source runs zero times. Any other value
+// (other text, an object, a number, a boolean) fails the step: the loop used to
+// run zero times over it and the flow answered 200 having done nothing.
+func forEachItems(ctx *FlowContext, step *FlowStep, items any) ([]any, error) {
+	if b, ok := items.([]byte); ok {
+		items = string(b)
+	}
+	requestText := false
+	if s, ok := items.(string); ok && strings.TrimSpace(s) != "" {
+		requestText = ctx.exprReadsRequestText(step.ForEach, flatDataForCtx(ctx))
+		items = keepRequestTextString(s, requestText)
+	}
+	switch v := items.(type) {
+	case []any:
+		return v, nil
+	case []map[string]any:
+		rows := make([]any, len(v))
+		for i, m := range v {
+			rows[i] = m
+		}
+		return rows, nil
+	}
+	if isEmptyish(items) {
+		return nil, nil
+	}
+	if rv := reflect.ValueOf(items); rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+		rows := make([]any, rv.Len())
+		for i := range rows {
+			rows[i] = rv.Index(i).Interface()
+		}
+		return rows, nil
+	}
+	source := step.ForEachSource
+	if source == "" {
+		source = step.ForEach
+	}
+	kind := "a " + strings.TrimPrefix(fmt.Sprintf("%T", items), "*")
+	hint := ""
+	switch v := items.(type) {
+	case string:
+		kind = "text"
+		switch {
+		case requestText && jsonContainerText(v):
+			kind = "text the caller sent"
+			hint = " Text a request sends is never decoded into a list: send the list as a JSON array in a JSON body."
+		case requestText:
+			kind = "text the caller sent"
+			hint = " Send the list as a JSON array in a JSON body."
+		case jsonContainerText(v):
+			hint = " It is not a JSON array; check the value the step produces."
+		}
+	case map[string]any:
+		kind = "an object"
+		hint = " To loop over a list inside it, name the list (for example `${{ steps.call.outputs.json.results }}`)."
+	case bool:
+		kind = "a boolean"
+	case int, int64, int32, float64, float32, uint, uint64, uint32:
+		kind = "a number"
+	}
+	return nil, fmt.Errorf("for_each: the source %s is %s, not a list, so the loop cannot run over it.%s A loop runs once per element of a list (a JSON array, a SQL step's rows, or JSON text of an array such as a json_group_array() column); an empty, null or missing source runs zero times", source, kind, hint)
 }
 
 // flattenIntoCtx recursively flattens a map into dot-notation keys in ctx.Data.
@@ -144,10 +256,23 @@ func execStepSet(ctx *FlowContext, step *FlowStep) error {
 	}
 	ctx.DataMu.Unlock()
 	resolved := make(map[string]any, len(step.Set))
-	var tainted, secret []string
+	var tainted, secret, sqlText, text, computed []string
+	flat := flatDataForCtx(ctx)
 	for k, v := range step.Set {
 		val := interpolateCtx(v, ctx)
 		resolved[k] = val
+		// A value rendered from a string the caller sent is request text
+		// under its new names; JSON bodies never decode it
+		// (flows_request_text.go).
+		names := []string{k}
+		if step.Name != "" {
+			names = append(names, step.Name+"."+k)
+		}
+		if ctx.readsRequestText(v, flat) {
+			text = append(text, names...)
+		} else {
+			computed = append(computed, names...)
+		}
 		// A value computed from request input stays request input under its
 		// new names (`{{k}}` and `steps.<id>.outputs.k`), or sql_dynamic
 		// would see it as a trusted step output. A value computed from env
@@ -164,9 +289,15 @@ func execStepSet(ctx *FlowContext, step *FlowStep) error {
 				secret = append(secret, step.Name+"."+k)
 			}
 		}
+		if ctx.sqlTextRef(v) != "" {
+			sqlText = append(sqlText, names...)
+		}
 	}
 	ctx.markTainted(tainted...)
 	ctx.markSecret(secret...)
+	ctx.markSQLText(sqlText...)
+	ctx.unmarkComputed(text...)
+	ctx.markComputed(computed...)
 	ctx.DataMu.Lock()
 	for k, val := range resolved {
 		ctx.Data[k] = val
@@ -198,74 +329,200 @@ func execStepParse(ctx *FlowContext, step *FlowStep) error {
 			ctx.Data[name+"."+key] = value
 		}
 		ctx.markTainted(name) // request headers are untrusted caller input
+		ctx.unmarkComputed(name)
 		return nil
 	}
-	if step.Parse == "body" && ctx.Request != nil {
-		// Try form data first (Content-Type: application/x-www-form-urlencoded)
-		contentType := ctx.Request.Header.Get("Content-Type")
-		if strings.Contains(contentType, "form-urlencoded") || strings.Contains(contentType, "multipart") {
-			ctx.Request.ParseForm()
-			name := step.Name
-			if name == "" {
-				name = "form"
-			}
-			formData := make(map[string]any)
-			for k, v := range ctx.Request.Form {
-				if len(v) > 0 {
-					formData[k] = v[0]
-					ctx.Data[name+"."+k] = v[0]
-				}
-			}
-			ctx.Data[name] = formData
-			ctx.markTainted(name) // the parsed body IS request input
-			return nil
-		}
-
-		// Fall back to JSON
-		body, err := io.ReadAll(io.LimitReader(ctx.Request.Body, flowVerifyBodyMaxBytes))
-		if err != nil {
+	if step.Parse != "body" {
+		return nil
+	}
+	var parsed *flowParsedBody
+	switch {
+	case ctx.Request != nil:
+		var err error
+		if parsed, err = readFlowParseBody(ctx.Request, ctx.mcpReadConn != nil, ctx.verifiedRequest); err != nil {
 			return err
 		}
-		var data any
-		decode := func() error {
-			if ctx.mcpReadConn == nil {
-				return json.Unmarshal(body, &data)
+	case ctx.queuedBody != nil:
+		// An async flow's worker has no request; it reads the body the
+		// request carried, parsed when the flow was queued.
+		if ctx.queuedBody.Error != "" {
+			return fmt.Errorf("%s", ctx.queuedBody.Error)
+		}
+		parsed = ctx.queuedBody
+	default:
+		return nil
+	}
+	bindFlowParsedBody(ctx, step.Name, parsed)
+	return nil
+}
+
+// flowParsedBody is a request body as a `run: parse` body step reads it: the
+// form fields (first value of each) or the decoded JSON value. An async flow
+// queues it with its job (flowRequestBodyPayloadField) so the parse step can
+// run in the worker, where there is no request; Error then carries a decode
+// failure for the step to report when it runs, as it would inline.
+type flowParsedBody struct {
+	Form  bool   `json:"form,omitempty"`
+	Value any    `json:"value"`
+	Error string `json:"error,omitempty"`
+}
+
+// readFlowParseBody reads the request body the way a `run: parse` body step
+// does. Form and multipart bodies give their fields; anything else decodes as
+// JSON. A body over the cap is an errRequestBodyTooLarge (the flow answers
+// 413); invalid JSON is a "parse body" error.
+// bodyOnly (a `verify:` flow) keeps form fields to the body: no verifier
+// signs the query string, so it must not add or replace a field.
+func readFlowParseBody(r *http.Request, useNumber, bodyOnly bool) (*flowParsedBody, error) {
+	// Try form data first (Content-Type: application/x-www-form-urlencoded)
+	contentType := r.Header.Get("Content-Type")
+	if strings.Contains(contentType, "form-urlencoded") || strings.Contains(contentType, "multipart") {
+		// An oversized form would parse as no fields; fail the step (the
+		// flow answers 413) instead of running on with empty input.
+		if err := parseFormBody(r); err != nil {
+			if limit, tooLarge := requestBodyTooLarge(err); tooLarge {
+				return nil, &errRequestBodyTooLarge{limit: limit}
 			}
-			decoder := json.NewDecoder(bytes.NewReader(body))
-			decoder.UseNumber()
-			return decoder.Decode(&data)
 		}
-		if err := decode(); err != nil {
-			return fmt.Errorf("parse body: %w", err)
+		formData := make(map[string]any)
+		fields := r.Form
+		if bodyOnly {
+			fields = r.PostForm // the query is unsigned
 		}
-		name := step.Name
+		for k, v := range fields {
+			if len(v) > 0 {
+				formData[k] = v[0]
+			}
+		}
+		return &flowParsedBody{Form: true, Value: formData}, nil
+	}
+
+	// Fall back to JSON. Read one byte past the limit so an oversized
+	// body fails as too large (413) instead of as JSON cut mid-value.
+	var body []byte
+	if r.Body != nil {
+		read, err := io.ReadAll(io.LimitReader(r.Body, flowVerifyBodyMaxBytes+1))
+		if err != nil {
+			if limit, tooLarge := requestBodyTooLarge(err); tooLarge {
+				return nil, &errRequestBodyTooLarge{limit: limit}
+			}
+			return nil, err
+		}
+		body = read
+	}
+	if int64(len(body)) > flowVerifyBodyMaxBytes {
+		return nil, &errRequestBodyTooLarge{limit: flowVerifyBodyMaxBytes}
+	}
+	var data any
+	decode := func() error {
+		if !useNumber {
+			return json.Unmarshal(body, &data)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.UseNumber()
+		return decoder.Decode(&data)
+	}
+	if err := decode(); err != nil {
+		return nil, fmt.Errorf("parse body: %w", err)
+	}
+	return &flowParsedBody{Value: data}, nil
+}
+
+// bindFlowParsedBody stores a parsed body under the step's id (or `form` /
+// `body` without one), flattens its fields, and marks it request input.
+func bindFlowParsedBody(ctx *FlowContext, stepName string, parsed *flowParsedBody) {
+	name := stepName
+	if parsed.Form {
 		if name == "" {
-			name = "body"
+			name = "form"
 		}
-		ctx.Data[name] = data
+		formData, _ := parsed.Value.(map[string]any)
+		if formData == nil {
+			formData = map[string]any{}
+		}
+		for k, v := range formData {
+			ctx.Data[name+"."+k] = v
+		}
+		ctx.Data[name] = formData
 		ctx.markTainted(name) // the parsed body IS request input
-		if m, ok := data.(map[string]any); ok {
-			for k, v := range m {
-				ctx.Data[name+"."+k] = v
-			}
-			// Also flatten into data.object pattern for Stripe-style webhooks
-			if obj, ok := m["data"]; ok {
-				if om, ok := obj.(map[string]any); ok {
-					for k, v := range om {
-						ctx.Data[name+".data."+k] = v
-					}
-					if inner, ok := om["object"]; ok {
-						if im, ok := inner.(map[string]any); ok {
-							for k, v := range im {
-								ctx.Data[name+".data.object."+k] = v
-							}
+		ctx.unmarkComputed(name)
+		return
+	}
+	if name == "" {
+		name = "body"
+	}
+	data := parsed.Value
+	ctx.Data[name] = data
+	ctx.markTainted(name) // the parsed body IS request input
+	ctx.unmarkComputed(name)
+	if m, ok := data.(map[string]any); ok {
+		for k, v := range m {
+			ctx.Data[name+"."+k] = v
+		}
+		// Also flatten into data.object pattern for Stripe-style webhooks
+		if obj, ok := m["data"]; ok {
+			if om, ok := obj.(map[string]any); ok {
+				for k, v := range om {
+					ctx.Data[name+".data."+k] = v
+				}
+				if inner, ok := om["object"]; ok {
+					if im, ok := inner.(map[string]any); ok {
+						for k, v := range im {
+							ctx.Data[name+".data.object."+k] = v
 						}
 					}
 				}
 			}
 		}
 	}
-	return nil
+}
+
+// flowReadsRequestBody reports whether any step of the flow, nested ones
+// included, is a `run: parse` of the request body.
+func flowReadsRequestBody(steps []FlowStep) bool {
+	for _, s := range steps {
+		if s.Type == "parse" && s.Parse == "body" {
+			return true
+		}
+		if flowReadsRequestBody(s.Steps) || flowReadsRequestBody(s.ElseSteps) || flowReadsRequestBody(s.OnError) {
+			return true
+		}
+	}
+	return false
+}
+
+// queueFlowParseBody reads the body an async flow's parse step will need, so
+// the job carries it to the worker. Only a body over the cap is refused here
+// (it could never be queued); a body that does not decode is queued as its
+// error, which the parse step reports if and when the flow reaches it, as it
+// would inline.
+func queueFlowParseBody(r *http.Request, bodyOnly bool) (*flowParsedBody, error) {
+	parsed, err := readFlowParseBody(r, false, bodyOnly)
+	if err != nil {
+		if _, tooLarge := requestBodyTooLarge(err); tooLarge {
+			return nil, err
+		}
+		return &flowParsedBody{Error: err.Error()}, nil
+	}
+	return parsed, nil
+}
+
+// takeFlowQueuedBody removes the reserved body field from a job payload and
+// returns the body it carried, or nil when it carried none or is malformed.
+func takeFlowQueuedBody(data map[string]any) *flowParsedBody {
+	raw, ok := data[flowRequestBodyPayloadField]
+	if !ok {
+		return nil
+	}
+	delete(data, flowRequestBodyPayloadField)
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	parsed := &flowParsedBody{Value: m["value"]}
+	parsed.Form, _ = m["form"].(bool)
+	parsed.Error, _ = m["error"].(string)
+	return parsed
 }
 
 // execStepCompute runs a `run: compute` step (v2.7.67+) - server-side
@@ -343,7 +600,7 @@ func resolveComputeArgString(s string, ctx *FlowContext) any {
 		// did not return. Those arrive as null, as they did before 2.7.278.
 		// Anything else (a step id that is not in the flow, an unset env
 		// value, a request field the caller did not send) stops the flow.
-		if ctx.stepReached(flowRefRoot(inner)) {
+		if !flowValueExprUsesOperators(inner) && ctx.stepReached(flowRefRoot(inner)) {
 			return nil
 		}
 		ctx.noteMissingRef(inner)
@@ -533,7 +790,8 @@ func execStepCompute(ctx *FlowContext, step *FlowStep) error {
 		}
 		result, err = RunComputeContext(ctx.Request.Context(), ctx.App, step.Compute.Module, step.Compute.Function, argsValue, timeout)
 	} else {
-		result, err = RunCompute(ctx.App, step.Compute.Module, step.Compute.Function, argsValue, timeout)
+		// Bounded by a synchronous run's time limit too (flows_time_limit.go).
+		result, err = RunComputeContext(ctx.execContext(), ctx.App, step.Compute.Module, step.Compute.Function, argsValue, timeout)
 	}
 	// argsValue holds copies (cloneComputeArg), so the function cannot
 	// have edited ctx.Data; the cache is dropped anyway, as before.

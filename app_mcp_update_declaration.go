@@ -113,37 +113,63 @@ func appMCPSchemaAnyNullable(schema *AppMCPSchema) bool {
 }
 
 func validateBoundedUpdateSchema(schema *AppMCPSchema, depth int) error {
+	return validateBoundedSchemaAt(schema, depth, "")
+}
+
+// validateBoundedSchemaAt is validateBoundedUpdateSchema naming the failing
+// node by its path from where (input_schema.properties.note, say). Without the
+// path a builder had to search a whole schema for the one unbounded string.
+// Properties are checked in name order so the reported path is stable.
+func validateBoundedSchemaAt(schema *AppMCPSchema, depth int, where string) error {
+	fail := func(message string) error {
+		if where == "" {
+			return errors.New(message)
+		}
+		return fmt.Errorf("%s: %s", where, message)
+	}
 	if schema == nil || depth > 32 {
-		return errors.New("missing schema or excessive nesting")
+		return fail("missing schema or excessive nesting")
 	}
 	switch schema.Type {
 	case "string":
 		if schema.MaxLength == nil {
-			return errors.New("strings require a finite maxLength")
+			return fail("strings require a finite maxLength")
 		}
 	case "number", "integer":
 		if schema.Minimum == nil || schema.Maximum == nil {
-			return errors.New("numbers require finite minimum and maximum")
+			return fail("numbers require finite minimum and maximum")
 		}
 	case "array":
 		if schema.MaxItems == nil || schema.Items == nil {
-			return errors.New("arrays require finite maxItems and item schema")
+			return fail("arrays require finite maxItems and item schema")
 		}
-		return validateBoundedUpdateSchema(schema.Items, depth+1)
+		return validateBoundedSchemaAt(schema.Items, depth+1, appMCPSchemaPath(where, "items"))
 	case "object":
 		if schema.AdditionalProperties == nil || *schema.AdditionalProperties {
-			return errors.New("objects must reject additional properties")
+			return fail("objects must reject additional properties")
 		}
-		for _, child := range schema.Properties {
-			if err := validateBoundedUpdateSchema(child, depth+1); err != nil {
+		names := make([]string, 0, len(schema.Properties))
+		for name := range schema.Properties {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if err := validateBoundedSchemaAt(schema.Properties[name], depth+1, appMCPSchemaPath(where, "properties."+name)); err != nil {
 				return err
 			}
 		}
 	case "boolean", "null":
 	default:
-		return errors.New("unsupported schema type")
+		return fail("unsupported schema type")
 	}
 	return nil
+}
+
+func appMCPSchemaPath(where, child string) string {
+	if where == "" {
+		return child
+	}
+	return where + "." + child
 }
 
 func sameKeySchema(input, output *AppMCPSchema) bool {

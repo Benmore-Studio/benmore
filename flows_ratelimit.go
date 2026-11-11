@@ -88,17 +88,36 @@ func parseRateWindow(w string) time.Duration {
 // count and let an attacker burst again). Per-instance buckets: in a multi-
 // instance cluster the effective limit is rate × instances - acceptable for
 // abuse prevention (still bounded), and noted in the api(at:'flows') docs.
-var flowRateLimiters sync.Map // key string -> *RateLimiter
+//
+// One entry per (instance, flow): a changed rate_limit replaces the entry
+// and stops the old limiter's cleanup goroutine. Keyed by the config string
+// too, every edit added a limiter and a goroutine that lived for the process.
+var (
+	flowRateLimitersMu sync.Mutex
+	flowRateLimiters   = map[string]flowRateLimiterEntry{}
+)
+
+type flowRateLimiterEntry struct {
+	raw  string
+	lim  *RateLimiter
+	stop chan struct{}
+}
 
 func flowLimiterFor(app *App, flow *Flow) *RateLimiter {
 	rl := flow.RateLimit
-	key := app.Dir + "\x00" + flow.Name + "\x00" + rl.Raw
-	if v, ok := flowRateLimiters.Load(key); ok {
-		return v.(*RateLimiter)
+	key := app.Dir + "\x00" + flow.Name
+	flowRateLimitersMu.Lock()
+	defer flowRateLimitersMu.Unlock()
+	if e, ok := flowRateLimiters[key]; ok {
+		if e.raw == rl.Raw {
+			return e.lim
+		}
+		close(e.stop)
 	}
-	lim := NewRateLimiter(rl.Rate, rl.Window)
-	actual, _ := flowRateLimiters.LoadOrStore(key, lim)
-	return actual.(*RateLimiter)
+	stop := make(chan struct{})
+	lim := NewRateLimiterStoppable(rl.Rate, rl.Window, stop)
+	flowRateLimiters[key] = flowRateLimiterEntry{raw: rl.Raw, lim: lim, stop: stop}
+	return lim
 }
 
 // rateLimitKey derives the bucket key for a request under the given scope.

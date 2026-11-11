@@ -193,3 +193,55 @@ func TestJSONTemplateShape(t *testing.T) {
 		}
 	}
 }
+
+// A `run: api` text body written as a JSON document follows the webhook
+// body's rule: request input stays one value and cannot add or override keys
+// of the outbound call (an LLM or payment API's role or amount, say).
+func TestAPITextBodyJSONTemplateKeepsRequestValuesWhole(t *testing.T) {
+	app := secretTaintApp(t)
+	hookURL, got := jsonTemplateReceiver(t)
+	flow := Flow{Name: "relay", Trigger: FlowTrigger{Type: "http", Method: "GET", Path: "/api/relay"}, Steps: []FlowStep{
+		{Name: "q", Type: "sql", SQL: `SELECT json_array(1, 2) AS rows`},
+		{Name: "call", Type: "api", API: &FlowAPICall{Method: "POST", URL: hookURL,
+			Headers: map[string]string{"Content-Type": "application/json"}, Body: `{"from":"system","msg":"{{msg}}","n":{{n}},"rows":{{q.rows}}}`}},
+		{Type: "respond", Respond: &FlowRespond{Status: 200, Body: "ok"}}}}
+	rec := httptest.NewRecorder()
+	q := url.Values{"msg": {jsonTemplateSpoof}, "n": {`2,"from":"admin"`}}
+	if err := executeFlowHTTP(app, &flow, rec, httptest.NewRequest("GET", "/api/relay?"+q.Encode(), nil)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case body := <-got:
+		obj := decodeJSONObject(t, "run: api body", body)
+		if obj["from"] != "system" || obj["msg"] != jsonTemplateSpoof || obj["n"] != `2,"from":"admin"` || len(obj) != 4 {
+			t.Fatalf("request input changed the outbound body's keys: %s", body)
+		}
+		if rows, _ := obj["rows"].([]any); len(rows) != 2 {
+			t.Fatalf("JSON text in a value position must stay JSON: %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("api call not delivered")
+	}
+}
+
+// Text that is not a JSON document is still sent as written.
+func TestAPITextBodyPlainTextUnchanged(t *testing.T) {
+	app := secretTaintApp(t)
+	hookURL, got := jsonTemplateReceiver(t)
+	flow := Flow{Name: "relay", Trigger: FlowTrigger{Type: "http", Method: "GET", Path: "/api/relay"}, Steps: []FlowStep{
+		{Name: "call", Type: "api", API: &FlowAPICall{Method: "POST", URL: hookURL,
+			Headers: map[string]string{"Content-Type": "text/plain"}, Body: `note: {{msg}}`}},
+		{Type: "respond", Respond: &FlowRespond{Status: 200, Body: "ok"}}}}
+	rec := httptest.NewRecorder()
+	if err := executeFlowHTTP(app, &flow, rec, httptest.NewRequest("GET", "/api/relay?"+url.Values{"msg": {`say "hi"`}}.Encode(), nil)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case body := <-got:
+		if body != `note: say "hi"` {
+			t.Fatalf("plain text body = %q", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("api call not delivered")
+	}
+}

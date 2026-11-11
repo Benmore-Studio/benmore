@@ -13,7 +13,7 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestAppMCPApprovedWriteEpochIsSeparateAndFailClosed(t *testing.T) {

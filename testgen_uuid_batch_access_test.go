@@ -37,8 +37,27 @@ func TestGeneratedUUIDBatchRespectsWriteAccess(t *testing.T) {
 			if generated != tc.wantBatch {
 				t.Fatalf("UUID batch generated=%v for write=%q, want %v", generated, tc.write, tc.wantBatch)
 			}
-			if _, ok := file.Tests["uuid_create_user_badges"]; !ok {
-				t.Fatal("batch eligibility must not remove unrelated UUID cases")
+			// The UUID journeys need a row: a table the plain user may not
+			// write gets none, and create_<table> asserts the refusal instead.
+			_, created := file.Tests["uuid_create_user_badges"]
+			writable := tc.write == "self" || tc.write == "everyone" || tc.write == "anon"
+			if created != writable {
+				t.Fatalf("uuid_create generated=%v for write=%q, want %v", created, tc.write, writable)
+			}
+			if !writable {
+				refusal := generateCRUDTests(app).Tests["create_user_badges"]
+				// `off` answers like a missing route; any other refused
+				// write on a table the user may read answers 403.
+				want := http.StatusNotFound
+				if tc.write != "off" && tc.read != "off" {
+					want = http.StatusForbidden
+				}
+				if len(refusal.Steps) != 1 || refusal.Steps[0].Expect.Status != want {
+					t.Fatalf("create_user_badges must assert the declared refusal: %+v", refusal.Steps)
+				}
+				if result := runSingleTest(app, server.URL, "_framework_crud", "create_user_badges", refusal); !result.Pass {
+					t.Fatalf("declared refusal not observed: %+v", result)
+				}
 			}
 			if !generated {
 				return

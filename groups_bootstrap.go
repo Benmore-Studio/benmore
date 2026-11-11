@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -74,7 +75,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 		return
 	}
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
@@ -83,7 +84,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	// applies. Without it a read-only token could create a tenant.
 	for _, t := range []string{orgTable, group.Table} {
 		if err := checkScope(session, t, "write"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 	}
@@ -96,7 +97,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	// An email-keyed founding membership counts only for a verified address,
 	// so an unverified founder would create a tenant they can't enter.
 	if emailKeyedColumn(group.UserField) && sessionGrantEmail(session) == "" && !session.IsAdmin() {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "email_unverified", "message": "verify your email before creating an organization"})
+		httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{"error": "email_unverified", "message": "verify your email before creating an organization"}, "email_unverified"))
 		return
 	}
 	if reason, blocked := checkStorageCap(app, 0); blocked {
@@ -119,15 +120,17 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "expected a JSON object"})
+			if !answerIfRequestBodyTooLarge(w, err) {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "expected a JSON object"})
+			}
 			return
 		}
 		r.Form = make(map[string][]string)
 		for k, v := range body {
 			r.Form.Set(k, jsonToFormValue(v))
 		}
-	} else {
-		r.ParseForm()
+	} else if err := parseFormBody(r); answerIfRequestBodyTooLarge(w, err) {
+		return
 	}
 	values := map[string]string{}
 	for k := range r.Form {
@@ -175,6 +178,11 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		if protected.has(col.Name) {
 			continue
 		}
+		if initial, ok := workflowCreateInitial(app, orgTable, col.Name); ok {
+			fields = append(fields, col.Name)
+			args = append(args, initial)
+			continue
+		}
 		v, ok := values[col.Name]
 		if !ok || v == "" || workflowCreateStateRefused(app, orgTable, col.Name, v) {
 			continue
@@ -188,6 +196,18 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 			"error": fmt.Sprintf("no fields provided for %s - send at least one column (e.g. name)", orgTable),
 		})
 		return
+	}
+
+	memberCols, err := GetTableColumns(app.DB, group.Table)
+	if err != nil {
+		httpJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("groups.table %q does not exist", group.Table),
+		})
+		return
+	}
+	memberHasID := false
+	for _, c := range memberCols {
+		memberHasID = memberHasID || identIs(c.Name, "id")
 	}
 
 	memberVal := any(session.UserID)
@@ -233,7 +253,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		beforeRow[f] = args[i]
 	}
 	injectSessionContext(beforeRow, session)
-	if err := ValidateCrossField(app.validatorConfig(), orgTable, beforeRow); err != nil {
+	if err := ValidateCrossField(app.validatorConfig(), orgTable, beforeRow, orgCols); err != nil {
 		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}
@@ -282,9 +302,27 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		mFields = append(mFields, "user_id")
 		mArgs = append(mArgs, session.UserID)
 	}
+	// A workflow on the membership table: the founding row starts in its
+	// initial state, as the org row above does.
+	memberHas := func(name string) bool {
+		return slices.ContainsFunc(memberCols, func(c Column) bool { return identIs(c.Name, name) })
+	}
+	stateCols, stateVals := workflowInitialColumns(app, group.Table, memberHas, mFields)
+	mFields = append(mFields, stateCols...)
+	mArgs = append(mArgs, stateVals...)
 	mPlaceholders := strings.TrimSuffix(strings.Repeat("?, ", len(mFields)), ", ")
-	if _, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		quoteIdent(group.Table), strings.Join(quoteIdents(mFields), ", "), mPlaceholders), mArgs...); err != nil {
+	memberSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		quoteIdent(group.Table), strings.Join(quoteIdents(mFields), ", "), mPlaceholders)
+	// The membership row's id names it in the audit log and in the hooks,
+	// flows and webhooks below, as a CRUD insert's does. A membership table
+	// keyed only by a composite primary key has no id to report.
+	var memberID any
+	if memberHasID {
+		err = tx.QueryRow(memberSQL+" RETURNING id", mArgs...).Scan(&memberID)
+	} else {
+		_, err = tx.Exec(memberSQL, mArgs...)
+	}
+	if err != nil {
 		if respondStorageFull(w, app, err) {
 			return
 		}
@@ -292,6 +330,70 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 			"error": fmt.Sprintf("founding membership insert into %s failed: %s - the org row was rolled back", group.Table, publicConstraintMessage(app, "bootstrap insert "+group.Table, err)),
 		})
 		return
+	}
+	if b, ok := memberID.([]byte); ok {
+		memberID = string(b)
+	}
+
+	// Both rows are audited inside the transaction, like every CRUD insert:
+	// the audit rows commit or roll back with the rows they describe, with
+	// each row's id and every value written (the founding role included).
+	orgRow := map[string]any{"id": orgID}
+	for i, f := range fields {
+		orgRow[f] = args[i]
+	}
+	memberRow := make(map[string]any, len(mFields)+1)
+	for i, f := range mFields {
+		memberRow[f] = mArgs[i]
+	}
+	memberIDText := ""
+	if memberHasID {
+		memberRow["id"] = memberID
+		memberIDText = valueText(memberID)
+	}
+	idStr := valueText(orgID)
+	for _, a := range []struct {
+		table, id string
+		row       map[string]any
+	}{{orgTable, idStr, orgRow}, {group.Table, memberIDText, memberRow}} {
+		if err := LogAuditTx(tx, app, "insert", a.table, a.id, session, nil, a.row); err != nil {
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			serverErrorJSON(w, r, app, "_groups create", err, "audit write failed")
+			return
+		}
+	}
+
+	// Both inserts queue what a CRUD insert queues (handleCreate), in this
+	// transaction: on_insert hook jobs see the row plus the session context
+	// in the new tenant, webhook subscriptions get the row as stored (typed,
+	// with its defaults; the written values when it has no id).
+	inTenant := *session
+	inTenant.GroupID = valueText(orgID)
+	type insertEvent struct {
+		table string
+		row   map[string]any
+	}
+	var events []insertEvent
+	for _, e := range []insertEvent{{orgTable, orgRow}, {group.Table, memberRow}} {
+		row := e.row
+		if id, ok := e.row["id"]; ok && id != nil {
+			if rows, err := queryNativeRowsWith(tx, app, e.table, "SELECT * FROM "+quoteIdent(e.table)+" WHERE id = ?", id); err == nil && len(rows) == 1 {
+				row = rows[0]
+			}
+		}
+		stored := copyRow(row)
+		hookRow := copyRow(row)
+		injectSessionContext(hookRow, &inTenant)
+		if err := enqueueRowEffectsTx(tx, app, "insert", e.table, hookRow, stored, &inTenant); err != nil {
+			if respondStorageFull(w, app, err) {
+				return
+			}
+			serverErrorJSON(w, r, app, "_groups create", err, "effect queue write failed")
+			return
+		}
+		events = append(events, insertEvent{e.table, hookRow})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -304,25 +406,18 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 
 	// Attach the new tenant to the live session so the very next
 	// request scopes correctly (mirrors getSession's lazy-resolve).
-	groupID := fmt.Sprintf("%v", orgID)
+	groupID := valueText(orgID)
 	session.GroupID = groupID
 	if !strings.HasPrefix(session.ID, "apitoken:") {
 		app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", groupID, session.ID)
 	}
+	invalidateRequestSession(r)
 
-	// Post-commit bookkeeping - same signals a CRUD insert emits.
-	orgRow := map[string]any{"id": orgID}
-	for i, f := range fields {
-		orgRow[f] = args[i]
+	// Event flows and realtime readers of each table hear of both inserts.
+	for _, e := range events {
+		FireFlowsForEvent(app, "on_insert", e.table, e.row)
+		Broadcast(app, e.table, "insert", session)
 	}
-	idStr := fmt.Sprintf("%v", orgID)
-	LogAudit(app, "insert", orgTable, idStr, session, nil, orgRow)
-	LogAudit(app, "insert", group.Table, "", session, nil, map[string]any{
-		group.Key: orgID, group.UserField: memberVal,
-	})
-	FireHooks(app, "insert", orgTable, orgRow)
-	FireFlowsForEvent(app, "on_insert", orgTable, orgRow)
-	Broadcast(app, orgTable, "insert", session)
 
 	resp := map[string]any{"status": "created", "group_id": orgID}
 	if full, ok := loadInsertedRow(app, orgTable, idStr); ok {

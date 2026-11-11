@@ -54,7 +54,7 @@ func ExportCSV(app *App, sqlQuery, outPath string) error {
 	for _, row := range rows {
 		var record []string
 		for _, col := range cols {
-			record = append(record, csvSafeCell(fmt.Sprintf("%v", row[col])))
+			record = append(record, csvSafeCell(valueText(row[col])))
 		}
 		w.Write(record)
 	}

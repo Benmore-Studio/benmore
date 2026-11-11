@@ -1,0 +1,85 @@
+model Task {
+  id         Int      @id @default(autoincrement())
+  title      String
+  status     String   @default("open")
+  trackerUrl String   @default("") @map("tracker_url")
+  userId     Int      @map("user_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+  @@map("tasks")
+}
+
+model TaskEvent {
+  id        Int      @id @default(autoincrement())
+  taskId    Int      @map("task_id")
+  kind      String
+  actorId   Int?     @map("actor_id")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("task_events")
+}
+
+model TimeEntry {
+  id        Int      @id @default(autoincrement())
+  taskId    Int      @map("task_id")
+  hours     Float
+  kind      String   @default("dev")
+  billable  Boolean  @default(true)
+  workedOn  String   @default("") @map("worked_on")
+  note      String   @default("")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("time_entries")
+}
+
+model Attachment {
+  id        Int      @id @default(autoincrement())
+  taskId    Int      @map("task_id")
+  name      String
+  fileUrl   String   @map("file_url")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("attachments")
+}
+
+model Document {
+  id              Int      @id @default(autoincrement())
+  fileUrl         String   @map("file_url")
+  signatureUrl    String   @default("") @map("signature_url")
+  signedUrl       String   @default("") @map("signed_url")
+  signedSha256    String   @default("") @map("signed_sha256")
+  userId          Int      @map("user_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  @@map("documents")
+}
+
+model Contact {
+  id         Int    @id @default(autoincrement())
+  externalId String @unique @map("external_id")
+  name       String @default("")
+  email      String @default("")
+  @@map("contacts")
+}
+
+model FlowFailure {
+  id        Int      @id @default(autoincrement())
+  flow      String
+  detail    String   @default("")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("flow_failures")
+}
+
+model MaintenanceRun {
+  id      Int    @id @default(autoincrement())
+  kind    String
+  changed Int    @default(0)
+  firedAt String @default("") @map("fired_at")
+  @@map("maintenance_runs")
+}
+
+model DigestSubscription {
+  id               Int    @id @default(autoincrement())
+  userId           Int    @unique @map("user_id")
+  unsubscribeToken String @map("unsubscribe_token")
+  @@map("digest_subscriptions")
+}

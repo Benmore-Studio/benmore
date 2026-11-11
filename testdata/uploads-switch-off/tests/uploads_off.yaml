@@ -1,0 +1,73 @@
+# features.uploads: false turns file uploads off on every path. A create
+# that carries a file part is refused before anything is stored; the same
+# create without a file, or as JSON, is an ordinary create. The fixture
+# uploads-switch-on runs the same multipart create with the switch on.
+
+multipart_create_with_a_file_is_refused_and_leaves_nothing:
+  as_user: "member@test.com"
+  # The tests of a file run in no fixed order and share one database: the
+  # other tests here create notes, so "leaves nothing" starts from nothing.
+  setup:
+    - sql: "DELETE FROM notes"
+    - sql: "DELETE FROM _benmore_audit_log WHERE table_name = 'notes'"
+  steps:
+    - api: "POST /api/notes"
+      data: {title: "scan"}
+      files:
+        attachment: {name: "scan.txt", content: "hello upload"}
+      expect:
+        status: 403
+        json: {error: "uploads_disabled", field: "attachment"}
+        contains: "features.uploads: false"
+        headers: {Content-Type: "application/json"}
+    - sql: "SELECT id FROM notes"
+      expect: {rows: 0}
+    - sql: "SELECT path FROM _benmore_upload_owners"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'notes'"
+      expect: {rows: 0}
+    - get: "/api/notes"
+      expect: {status: 200, json_length: 0}
+
+multipart_create_without_a_file_works:
+  as_user: "member@test.com"
+  steps:
+    - api: "POST /api/notes"
+      data: {title: "fields only"}
+      files: {}
+      expect:
+        status: 200
+        json: {status: "created", title: "fields only", attachment: ""}
+    - sql: "SELECT id FROM notes WHERE title = 'fields only'"
+      expect: {rows: 1}
+
+json_and_form_creates_work:
+  as_user: "member@test.com"
+  steps:
+    - api: "POST /api/notes"
+      json: {title: "from json"}
+      expect:
+        status: 200
+        json: {status: "created", title: "from json"}
+    - api: "POST /api/notes"
+      data: {title: "from a form"}
+      expect:
+        status: 200
+        json: {status: "created", title: "from a form"}
+    - sql: "SELECT id FROM notes WHERE title IN ('from json', 'from a form')"
+      expect: {rows: 2}
+
+upload_routes_answer_not_found:
+  as_user: "member@test.com"
+  steps:
+    - api: "POST /api/_upload"
+      data: {kind: "files"}
+      files:
+        file: {name: "scan.txt", content: "hello upload"}
+      expect: {status: 404}
+    - api: "POST /api/_files"
+      files:
+        file: {name: "scan.txt", content: "hello upload"}
+      expect: {status: 404}
+    - sql: "SELECT path FROM _benmore_upload_owners"
+      expect: {rows: 0}

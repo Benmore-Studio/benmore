@@ -229,7 +229,7 @@ func writeFKTargetDenial(w http.ResponseWriter, err error) bool {
 	if !errors.As(err, &fkErr) {
 		return false
 	}
-	httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": fkErr.Error()})
+	httpJSON(w, http.StatusUnprocessableEntity, withRefusalDocs(map[string]any{"error": fkErr.Error()}, refusalForeignKey))
 	return true
 }
 
@@ -280,9 +280,12 @@ func mutationErrorResponse(app *App, context string, err error) (int, string) {
 	var fkErr *fkTargetError
 	var validationErr *mutationValidationError
 	var membershipErr *membershipManageError
+	var identityErr *membershipIdentityError
 	switch {
 	case errors.As(err, &membershipErr):
 		return http.StatusForbidden, membershipErr.Error()
+	case errors.As(err, &identityErr):
+		return http.StatusUnprocessableEntity, identityErr.Error()
 	case errors.As(err, &fkErr):
 		return http.StatusUnprocessableEntity, fkErr.Error()
 	case errors.As(err, &validationErr):

@@ -1,0 +1,39 @@
+# api(at:"payments") subscription_sync: auth.billing_provider: stripe mounts
+# three routes. Run: benmore test <dir> --app
+
+billing_me_is_the_callers_subscription:
+  as_user: "customer@switches.test"
+  steps:
+    - get: "/api/_billing/me"
+      expect:
+        status: 200
+        json: {status: "none"}
+    # The webhook has stored a subscription for this user.
+    - sql: "INSERT INTO _benmore_subscriptions (user_id, stripe_customer_id, stripe_subscription_id, status, plan) VALUES ({{user_id}}, 'cus_fixture', 'sub_fixture', 'active', 'Pro')"
+    - get: "/api/_billing/me"
+      expect:
+        status: 200
+        json:
+          stripe_subscription_id: "sub_fixture"
+          status: "active"
+          plan: "Pro"
+          cancel_at_period_end: false
+    # No Stripe key in this app's environment.
+    - api: "POST /api/_billing/portal"
+      json: {return_url: "/account"}
+      expect:
+        status: 503
+        contains: "STRIPE_SECRET_KEY env var is missing"
+
+billing_routes_need_their_credentials:
+  anon: true
+  steps:
+    - get: "/api/_billing/me"
+      expect:
+        status: 401
+    # No signing secret configured: the webhook refuses every delivery.
+    - api: "POST /api/_billing/webhook"
+      json: {id: "evt_fixture", type: "customer.subscription.updated"}
+      expect:
+        status: 503
+        contains: "STRIPE_WEBHOOK_SECRET env var is missing"

@@ -47,6 +47,32 @@ func TestDataEventRowIsRequestInputForSQLDynamic(t *testing.T) {
 	}
 }
 
+// The session keys (user_email, user_role, user_roles, user_group_id) are
+// trusted because injectSessionContext writes them over the row, but only
+// when a session made the write. A table column of the same name holds what a
+// sessionless caller sent, so it is request input.
+func TestDataEventSessionKeyColumnIsRequestInput(t *testing.T) {
+	app, done := newTestApp(t)
+	defer done()
+	mustExec(t, app.DB, `CREATE TABLE leads (id INTEGER PRIMARY KEY, user_email TEXT)`)
+	mustExec(t, app.DB, `CREATE TABLE audit_hits (id INTEGER PRIMARY KEY, v TEXT)`)
+	app.Tables = append(app.Tables, Table{Name: "leads", Columns: []Column{{Name: "id"}, {Name: "user_email"}}})
+	row := map[string]any{"id": 9, "user_email": "x'); DELETE FROM leads; --"}
+	injectSessionContext(row, nil) // a public, sessionless create
+	var ctx *FlowContext
+	runFlowEventWith(app, Flow{Name: "on-lead", Trigger: FlowTrigger{Type: "on_insert", Table: "leads"}, Steps: []FlowStep{
+		{Name: "pick", Type: "sql", SQL: "SELECT {{user_email}} AS e"},
+		{Name: "dyn", Type: "sql_dynamic", SQL: "INSERT INTO audit_hits (v) VALUES ('{{pick.e}}')"},
+	}}, row, func(c *FlowContext) { ctx = c })
+	if ctx == nil || ctx.Error == nil || !strings.Contains(ctx.Error.Error(), "request-sourced") {
+		t.Fatalf("a caller-written user_email column reached sql_dynamic as trusted: %v", ctxErr(ctx))
+	}
+	// On a table without such a column the key is the session's and stays trusted.
+	if tainted := flowEventRowTaint(app, "notes", map[string]any{"user_email": "a@example.com"}); tainted["user_email"] {
+		t.Fatal("user_email injected by the session on a table without that column must stay trusted")
+	}
+}
+
 func ctxErr(ctx *FlowContext) any {
 	if ctx == nil {
 		return "no context"

@@ -1,0 +1,18 @@
+on:
+  request: { method: POST, path: /api/documents/:id/extract-unscoped, auth: required, mode: async }
+jobs:
+  extract_unscoped:
+    steps:
+      - id: doc
+        run: sql
+        query: SELECT id, file_url FROM documents WHERE id = :id
+        expect_rows: 1
+      - id: text
+        run: extract_text
+        with:
+          source_path: "${{ steps.doc.outputs.first.file_url }}"
+          record: { table: documents, id: "${{ steps.doc.outputs.first.id }}" }
+        on_error:
+          - run: sql
+            query: UPDATE documents SET extract_error = :e WHERE id = :id
+            params: { e: "${{ error }}", id: "${{ params.id }}" }

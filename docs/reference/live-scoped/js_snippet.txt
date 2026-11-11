@@ -1,0 +1,12 @@
+import bm from 'bm';
+
+// Drop-in replacement for: bm.live('messages', refresh)  ←  use this instead.
+const unsub = bm.live.scoped('messages', refreshMessages, { debounce: 60 });
+
+async function refreshMessages() {
+  const rows = await bm.api.get('/api/messages?orderBy=id:asc&limit=200');
+  renderChat(rows);
+}
+
+// On unmount.
+unsub();

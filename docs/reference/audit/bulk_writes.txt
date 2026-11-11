@@ -1,0 +1,1 @@
+Every auto-CRUD create records action `insert`, whichever route made it: a single create, batch create, NDJSON ingest and an /api/_transaction insert each write one entry per created row, with its id, inside the write's transaction. Entries written before keep those actions, so a query over older history should match action IN ('insert','create','ingest').

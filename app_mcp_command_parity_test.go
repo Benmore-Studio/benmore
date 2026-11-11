@@ -148,7 +148,7 @@ CREATE TABLE activities (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, actor
 			if err != nil || crudActor == nil {
 				t.Fatalf("load actor session: %v", err)
 			}
-			crudAllows := hasWorkflowRole(app, crudActor, "approver")
+			crudAllows := hasWorkflowRole(app, crudActor, "tasks", "approver")
 			_, err = runHookedCommand(t, app, sessionID)
 			commandAllows := err == nil
 			if err != nil && !strings.Contains(err.Error(), "role 'approver' required") {
@@ -156,6 +156,134 @@ CREATE TABLE activities (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, actor
 			}
 			if stored == "approver" && !crudAllows {
 				t.Fatal("fixture membership role was not resolved by the CRUD route")
+			}
+			if commandAllows != crudAllows {
+				t.Fatalf("stored role %q: CRUD transition allows=%t, approved command allows=%t", stored, crudAllows, commandAllows)
+			}
+		})
+	}
+}
+
+// A role grant (_benmore_user_roles) satisfies a workflow transition's `role:`
+// in an approved command exactly when it does on the CRUD transition route:
+// a global grant or one for the caller's tenant on this tenant-keyed table
+// passes both, a grant for another tenant passes neither.
+func TestAppMCPCommandParityWorkflowRoleGrantMatchesCRUD(t *testing.T) {
+	for _, grant := range []string{"global", "tenant", "other-tenant"} {
+		stored := "member"
+		t.Run(grant, func(t *testing.T) {
+			app, sessionID, _ := newUnenrolledCommandProviderTaskFixtureWithManifest(t, hookTaskFlow, "", func(_ *AppMCPManifest, dir string) {
+				writeTestFile(t, dir, "schema.sql", `CREATE TABLE members (id INTEGER PRIMARY KEY, org_id TEXT NOT NULL, email TEXT NOT NULL, user_id INTEGER NOT NULL, role TEXT);
+CREATE TABLE projects (id INTEGER PRIMARY KEY, org_id TEXT NOT NULL);
+CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, org_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, completed_by INTEGER, completed_at TEXT);
+CREATE TABLE activities (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, actor_user_id INTEGER NOT NULL, actor_email TEXT NOT NULL, event TEXT NOT NULL);
+`)
+			})
+			if _, err := app.DB.Exec(`UPDATE members SET role=?`, stored); err != nil {
+				t.Fatal(err)
+			}
+			owner, err := loadStoredSessionChecked(app.DB, true, sessionID)
+			if err != nil || owner == nil {
+				t.Fatalf("load actor session: %v", err)
+			}
+			actorID := owner.UserID
+			var tenant string
+			if err := app.DB.QueryRow(`SELECT org_id FROM members WHERE user_id=? LIMIT 1`, actorID).Scan(&tenant); err != nil {
+				t.Fatal(err)
+			}
+			switch grant {
+			case "global":
+				mustExecArgs(t, app.DB, `INSERT INTO _benmore_user_roles (user_id, role) VALUES (?, 'approver')`, actorID)
+			case "tenant":
+				mustExecArgs(t, app.DB, `INSERT INTO _benmore_user_roles (user_id, role, group_id) VALUES (?, 'approver', ?)`, actorID, tenant)
+			case "other-tenant":
+				mustExecArgs(t, app.DB, `INSERT INTO _benmore_user_roles (user_id, role, group_id) VALUES (?, 'approver', ?)`, actorID, tenant+"-other")
+			}
+			if _, err := updateAppMCPEpoch(app.Dir, true, false, true); err != nil {
+				t.Fatal(err)
+			}
+			generation := snapshotAppMCPGeneration(app)
+			if _, err := initializeAppMCPRevisionEnrollment(context.Background(), app, generation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := enableAppMCPRevisionEnrolledWrites(context.Background(), app, generation); err != nil {
+				t.Fatal(err)
+			}
+			workflows := &WorkflowConfig{Workflows: map[string]*Workflow{"tasks": {
+				Name: "task-state", Table: "tasks", Field: "status", Initial: "open", States: []string{"open", "done"},
+				Transitions: map[string]map[string]Transition{"open": {"done": {Role: "approver"}}},
+			}}}
+			commandParityGeneration(app, func(generation *appMCPRuntimeGeneration) {
+				generation.workflows = workflows
+				generation.view.Workflows = workflows
+			})
+			crudActor, err := loadStoredSessionChecked(app.DB, true, sessionID)
+			if err != nil || crudActor == nil {
+				t.Fatalf("load actor session: %v", err)
+			}
+			crudAllows := hasWorkflowRole(app, crudActor, "tasks", "approver")
+			_, err = runHookedCommand(t, app, sessionID)
+			commandAllows := err == nil
+			if err != nil && !strings.Contains(err.Error(), "role 'approver' required") {
+				t.Fatalf("command failed for another reason: %v", err)
+			}
+			if want := grant != "other-tenant"; crudAllows != want {
+				t.Fatalf("%s grant: CRUD transition allows=%t, want %t", grant, crudAllows, want)
+			}
+			if commandAllows != crudAllows {
+				t.Fatalf("%s grant: CRUD transition allows=%t, approved command allows=%t", grant, crudAllows, commandAllows)
+			}
+		})
+	}
+}
+
+// A transition `role:` list is any-of in an approved command exactly as on the
+// CRUD transition route: a membership role naming any listed role passes
+// both, one naming none passes neither.
+func TestAppMCPCommandParityWorkflowRoleListMatchesCRUD(t *testing.T) {
+	const required = "lead, approver"
+	for _, stored := range []string{"approver", "lead", "member"} {
+		t.Run(stored, func(t *testing.T) {
+			app, sessionID, _ := newUnenrolledCommandProviderTaskFixtureWithManifest(t, hookTaskFlow, "", func(_ *AppMCPManifest, dir string) {
+				writeTestFile(t, dir, "schema.sql", `CREATE TABLE members (id INTEGER PRIMARY KEY, org_id TEXT NOT NULL, email TEXT NOT NULL, user_id INTEGER NOT NULL, role TEXT);
+CREATE TABLE projects (id INTEGER PRIMARY KEY, org_id TEXT NOT NULL);
+CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, org_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, completed_by INTEGER, completed_at TEXT);
+CREATE TABLE activities (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, actor_user_id INTEGER NOT NULL, actor_email TEXT NOT NULL, event TEXT NOT NULL);
+`)
+			})
+			if _, err := app.DB.Exec(`UPDATE members SET role=?`, stored); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := updateAppMCPEpoch(app.Dir, true, false, true); err != nil {
+				t.Fatal(err)
+			}
+			generation := snapshotAppMCPGeneration(app)
+			if _, err := initializeAppMCPRevisionEnrollment(context.Background(), app, generation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := enableAppMCPRevisionEnrolledWrites(context.Background(), app, generation); err != nil {
+				t.Fatal(err)
+			}
+			workflows := &WorkflowConfig{Workflows: map[string]*Workflow{"tasks": {
+				Name: "task-state", Table: "tasks", Field: "status", Initial: "open", States: []string{"open", "done"},
+				Transitions: map[string]map[string]Transition{"open": {"done": {Role: required}}},
+			}}}
+			commandParityGeneration(app, func(generation *appMCPRuntimeGeneration) {
+				generation.workflows = workflows
+				generation.view.Workflows = workflows
+			})
+			crudActor, err := loadStoredSessionChecked(app.DB, true, sessionID)
+			if err != nil || crudActor == nil {
+				t.Fatalf("load actor session: %v", err)
+			}
+			crudAllows := hasWorkflowRole(app, crudActor, "tasks", required)
+			_, err = runHookedCommand(t, app, sessionID)
+			commandAllows := err == nil
+			if err != nil && !strings.Contains(err.Error(), "one of the roles 'lead', 'approver' required") {
+				t.Fatalf("command failed for another reason: %v", err)
+			}
+			if want := stored != "member"; crudAllows != want {
+				t.Fatalf("stored role %q: CRUD transition allows=%t, want %t", stored, crudAllows, want)
 			}
 			if commandAllows != crudAllows {
 				t.Fatalf("stored role %q: CRUD transition allows=%t, approved command allows=%t", stored, crudAllows, commandAllows)

@@ -16,6 +16,15 @@ import (
 
 var pdfHomeKeys = []string{"HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"}
 
+// pdfPrivateHomeKeys are the keys runPDFChrome points into the job: every one
+// but HOME on macOS (chromeKeepsHome).
+func pdfPrivateHomeKeys() []string {
+	if chromeKeepsHome() {
+		return pdfHomeKeys[1:]
+	}
+	return pdfHomeKeys
+}
+
 func TestPDFChromeHomeFixture(t *testing.T) {
 	mode := os.Getenv("BENMORE_PDF_HOME_FIXTURE")
 	if mode == "" {
@@ -23,8 +32,10 @@ func TestPDFChromeHomeFixture(t *testing.T) {
 	}
 	observed := map[string]string{}
 	for _, key := range pdfHomeKeys {
+		observed[key] = os.Getenv(key)
+	}
+	for _, key := range pdfPrivateHomeKeys() {
 		dir := os.Getenv(key)
-		observed[key] = dir
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			os.Exit(41)
 		}
@@ -37,7 +48,7 @@ func TestPDFChromeHomeFixture(t *testing.T) {
 		os.Exit(43)
 	}
 	if strings.HasPrefix(mode, "cleanup-") {
-		locked := filepath.Join(os.Getenv("HOME"), "cleanup-denied")
+		locked := filepath.Join(os.Getenv("XDG_CACHE_HOME"), "cleanup-denied")
 		if err := os.Mkdir(locked, 0700); err != nil {
 			os.Exit(47)
 		}
@@ -117,7 +128,10 @@ func TestPDFChromeKeepsHomeStateInsideTemporaryJob(t *testing.T) {
 			if err := json.Unmarshal(raw, &observed); err != nil {
 				t.Fatal(err)
 			}
-			for _, key := range pdfHomeKeys {
+			if chromeKeepsHome() && observed["HOME"] != filepath.Join(appHome, "HOME") {
+				t.Errorf("HOME was replaced on macOS: %q", observed["HOME"])
+			}
+			for _, key := range pdfPrivateHomeKeys() {
 				dir := observed[key]
 				rel, err := filepath.Rel(job, dir)
 				if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
@@ -163,7 +177,7 @@ func TestPDFChromeHomeCleanupFailurePreservesRendererError(t *testing.T) {
 			// Register restoration before the child can create the directory,
 			// including when a later assertion fails or the fixture times out.
 			t.Cleanup(func() {
-				matches, err := filepath.Glob(filepath.Join(job, "chrome-home-*", "cleanup-denied"))
+				matches, err := filepath.Glob(filepath.Join(job, "chrome-home-*", "cache", "cleanup-denied"))
 				if err != nil {
 					t.Error(err)
 				}
@@ -189,7 +203,7 @@ func TestPDFChromeHomeCleanupFailurePreservesRendererError(t *testing.T) {
 			if err := json.Unmarshal(raw, &observed); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := os.ReadDir(filepath.Join(observed["HOME"], "cleanup-denied")); !errors.Is(err, os.ErrPermission) {
+			if _, err := os.ReadDir(filepath.Join(observed["XDG_CACHE_HOME"], "cleanup-denied")); !errors.Is(err, os.ErrPermission) {
 				t.Skipf("filesystem did not preserve a permission-denied cleanup fixture: %v", err)
 			}
 			if runErr == nil || !strings.Contains(runErr.Error(), "PDF runtime home cleanup:") || !errors.Is(runErr, os.ErrPermission) {

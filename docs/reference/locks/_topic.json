@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "row_ids",
+    "summary",
+    "endpoints",
+    "lifetime",
+    "rate_limit",
+    "conflict",
+    "expires_at",
+    "not_found",
+    "js_snippet"
+  ]
+}

@@ -1,0 +1,6 @@
+[
+  "GET /api/<table>/<id>/versions",
+  "GET /api/<table>/<id>/versions/<version>   (one snapshot; ?fields= projects it)",
+  "POST /api/<table>/<id>/revert/<version>",
+  "GET /api/<table>/<id>?as_of=2026-01-01T00:00:00Z   (point-in-time query)"
+]

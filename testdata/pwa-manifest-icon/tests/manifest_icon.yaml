@@ -1,0 +1,26 @@
+# The manifest used to list /static/icon-512.png whenever `pwa.icon` was not
+# set, a file this app (like every scaffolded app) does not have, so the icon
+# answered 404. It now lists an icon the app serves: static/favicon.svg, one
+# entry typed image/svg+xml with sizes "any".
+manifest_lists_an_icon_the_app_has:
+  anon: true
+  steps:
+    - get: "/manifest.json"
+      expect:
+        status: 200
+        contains:
+          - '"src": "/static/favicon.svg?v='
+          - '"type": "image/svg+xml"'
+          - '"sizes": "any"'
+          - '"name": "Icon fixture"'
+        not_contains:
+          - "icon-512.png"
+          - "192x192"
+    - get: "/static/favicon.svg"
+      expect:
+        status: 200
+        contains: "<svg"
+    # The path the manifest named before is still not a file here.
+    - get: "/static/icon-512.png"
+      expect:
+        status: 404

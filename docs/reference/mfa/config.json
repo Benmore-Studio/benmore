@@ -1,0 +1,6 @@
+[
+  "auth.require_mfa_for_roles: \"admin,manager\"  - comma-separated roles (\"*\" lists every account; the default under compliance: hipaa). After password login, and at sign-up, members of these roles get an MFA-setup token instead of a session; verify mints the real session on enrollment.",
+  "Social login (BYO and managed OAuth) follows the same rule: a listed role with no enrolled factor gets the MFA-setup token and /mfa-setup instead of a session (an already-enrolled user meets the second-factor step); a pending platform CLI login is not carried through enrollment, so the CLI retries after enrolling.",
+  "Passkey sign-in too: a passkey stands in for the TOTP step of an enrolled account but is not an enrolled factor, so a listed role with no TOTP factor gets 200 { mfa_setup_required: true, redirect } and the setup cookie instead of a session, and bm.auth.passkey.signIn() sends the browser to that page.",
+  "auth.mfa_setup_redirect: \"/mfa-setup\"          - the enrollment page /login (and the OTP step) send a role that must enroll to: a 303 for a form post, the JSON `redirect` for a JSON request (defaults to /mfa-setup)."
+]

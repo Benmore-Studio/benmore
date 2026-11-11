@@ -1,0 +1,14 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-enqueue-unique
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - id: queued
+        run: enqueue
+        with: { flow: noop, unique_key: "report:legacy" }
+      - run: respond
+        with: { json: { job_id: "${{ steps.queued.outputs.job_id }}", token: "${{ steps.queued.outputs.status_token }}" } }

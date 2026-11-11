@@ -1,0 +1,8 @@
+{
+  "ice": "GET /api/_webrtc/ice                                 - STUN + TURN list",
+  "publish": "POST /api/_broadcast/publish    { slug, sdp }       - server-proxied SDP exchange",
+  "subscribe": "POST /api/_broadcast/subscribe  { slug, sdp }       - pull tracks from a live publisher",
+  "stop": "POST /api/_broadcast/stop       { slug }            - tear down the slug → frees viewers",
+  "heartbeat": "POST /api/_broadcast/heartbeat  { slug }            - keep a live slug claimed (bm.broadcast.publish sends it every minute)",
+  "stats": "GET  /api/_broadcast/stats/{slug}                   - { live, viewers, started_at }"
+}

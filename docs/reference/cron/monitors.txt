@@ -1,0 +1,1 @@
+Opt in per job with `monitor: true` or `monitor: {checkin_margin: 5, max_runtime: 30}`; see api({at:'errors'}) → cron_monitors for delivery, schedule and timezone behavior.

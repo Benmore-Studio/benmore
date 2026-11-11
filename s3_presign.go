@@ -42,6 +42,38 @@ type PresignOptions struct {
 	ContentType string
 	MaxSize     int64 // bytes; 0 = no cap (don't do this in prod)
 	ExpiresIn   time.Duration
+	// ResponseContentDisposition and ResponseContentType, on a GET, are
+	// signed into the query (response-content-disposition / -type), so the
+	// store answers with those headers: a backup download names its file.
+	ResponseContentDisposition string
+	ResponseContentType        string
+	// SSEKMSKeyID, on a PUT, signs SSE-KMS under that key with S3 Bucket
+	// Keys off (presignedPutHeaders): the object's own ARN is then the
+	// encryption context, which a session's key permission is scoped by.
+	SSEKMSKeyID string
+	// IfNoneMatch, on a PUT, signs `If-None-Match: *`: the store refuses to
+	// replace an existing object (412). A WAL session may only write that
+	// way (backupSessionPolicy), so a key, once written, is never rewritten.
+	IfNoneMatch bool
+}
+
+// presignedPutHeaders are the headers a client must send with a PUT presigned
+// with opts, beyond Content-Type and Content-Length: they are signed, so the
+// store refuses the request without them.
+func presignedPutHeaders(opts PresignOptions) map[string]string {
+	h := map[string]string{}
+	if opts.SSEKMSKeyID != "" {
+		h["x-amz-server-side-encryption"] = "aws:kms"
+		h["x-amz-server-side-encryption-aws-kms-key-id"] = opts.SSEKMSKeyID
+		h["x-amz-server-side-encryption-bucket-key-enabled"] = "false"
+	}
+	if opts.IfNoneMatch {
+		h["if-none-match"] = "*"
+	}
+	if len(h) == 0 {
+		return nil
+	}
+	return h
 }
 
 // PresignS3PutURL returns a presigned PUT URL the client can use to
@@ -67,6 +99,15 @@ func PresignS3GetURL(bucket, region, key, accessKey, secretKey, sessionToken str
 }
 
 func presignS3URL(method, bucket, region, key, accessKey, secretKey, sessionToken string, opts PresignOptions) string {
+	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", bucket, region)
+	return presignSigV4("https", host, "/"+s3EscapePath(key), method, region, accessKey, secretKey, sessionToken, opts, time.Now())
+}
+
+// presignSigV4 signs one request in the query string (SigV4 query auth) for
+// the object at canonicalURI (already escaped) on scheme://host. The virtual-
+// host form above and the path-style form of an S3-compatible endpoint
+// (S3Storage.presignObjectURL) differ only in host and canonicalURI.
+func presignSigV4(scheme, host, canonicalURI, method, region, accessKey, secretKey, sessionToken string, opts PresignOptions, at time.Time) string {
 	if opts.ExpiresIn <= 0 {
 		opts.ExpiresIn = 5 * time.Minute
 	}
@@ -74,10 +115,9 @@ func presignS3URL(method, bucket, region, key, accessKey, secretKey, sessionToke
 		opts.ExpiresIn = 7 * 24 * time.Hour // S3 max is 7 days
 	}
 
-	now := time.Now().UTC()
+	now := at.UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
-	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", bucket, region)
 	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, region)
 
 	// Signed headers: just Host for GET. PUT also signs Content-Type
@@ -93,6 +133,11 @@ func presignS3URL(method, bucket, region, key, accessKey, secretKey, sessionToke
 	}
 	if method == "PUT" && opts.MaxSize > 0 {
 		headerMap["content-length"] = fmt.Sprintf("%d", opts.MaxSize)
+	}
+	if method == "PUT" {
+		for k, v := range presignedPutHeaders(opts) {
+			headerMap[k] = v
+		}
 	}
 	signedHeaderList := make([]string, 0, len(headerMap))
 	for k := range headerMap {
@@ -120,12 +165,16 @@ func presignS3URL(method, bucket, region, key, accessKey, secretKey, sessionToke
 	if sessionToken != "" {
 		query.Set("X-Amz-Security-Token", sessionToken)
 	}
+	if method == "GET" && opts.ResponseContentDisposition != "" {
+		query.Set("response-content-disposition", opts.ResponseContentDisposition)
+	}
+	if method == "GET" && opts.ResponseContentType != "" {
+		query.Set("response-content-type", opts.ResponseContentType)
+	}
 	canonicalQuery := canonicalQueryString(query)
 
 	// Canonical URI: the object path, URL-encoded per RFC 3986 except
-	// the slash separator. S3 normalizes "//" so we leave the leading
-	// slash and encode the rest of the key.
-	canonicalURI := "/" + s3EscapePath(key)
+	// the slash separator (the caller passes it escaped).
 
 	// For presigned URLs the payload hash is the literal string
 	// "UNSIGNED-PAYLOAD" - the client's PUT body is not signed (only the
@@ -154,8 +203,8 @@ func presignS3URL(method, bucket, region, key, accessKey, secretKey, sessionToke
 	kSigning := hmacSHA256(kService, "aws4_request")
 	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
 
-	return fmt.Sprintf("https://%s%s?%s&X-Amz-Signature=%s",
-		host, canonicalURI, canonicalQuery, signature)
+	return fmt.Sprintf("%s://%s%s?%s&X-Amz-Signature=%s",
+		scheme, host, canonicalURI, canonicalQuery, signature)
 }
 
 // canonicalQueryString builds the sigv4 canonical query string: keys

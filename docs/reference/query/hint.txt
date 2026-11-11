@@ -1,0 +1,1 @@
+Unknown column/fn/aggregate key → 400 (validated). For arbitrary cross-table joins, hand-write a flow.

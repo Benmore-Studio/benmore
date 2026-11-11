@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -93,5 +94,122 @@ func TestWebhookEmptyBodyToRequestURLAllowedForDirectAdmin(t *testing.T) {
 	}
 	if cfg := got["cfg"].(map[string]any); cfg["key"] != nil || cfg["region"] != "us" || got["to"] != "a@b.c" {
 		t.Fatalf("context without secrets = %v", got)
+	}
+}
+
+// webhookSecretSteps derive values from env (a `run: set` of an env value, a
+// SQL step binding one) and read a stored row that holds the env value,
+// next to ordinary values.
+const webhookSecretSteps = `      - id: creds
+        run: set
+        with:
+          tok: "${{ env.CLIENT_SECRET }}"
+          region: us-east
+      - id: lookup
+        run: sql
+        with:
+          query: SELECT :s AS secret
+          params:
+            s: "${{ env.CLIENT_SECRET }}"
+      - id: stored
+        run: sql
+        with:
+          query: SELECT v, 'kept' AS label FROM settings
+      - id: note
+        run: set
+        with:
+          plain: hello
+`
+
+func webhookSecretApp(t *testing.T) *App {
+	t.Helper()
+	app := secretTaintApp(t)
+	mustExec(t, app.DB, `CREATE TABLE settings (v TEXT)`)
+	mustExec(t, app.DB, `INSERT INTO settings (v) VALUES ('key=s3cret-value')`)
+	return app
+}
+
+// checkWebhookContextWithoutSecrets decodes a whole-context webhook body and
+// fails when it carries an env-derived value or lost an ordinary one.
+func checkWebhookContextWithoutSecrets(t *testing.T, surface, body string) {
+	t.Helper()
+	if strings.Contains(body, "s3cret-value") {
+		t.Fatalf("%s: the whole-context body carries the env value:\n%s", surface, body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("%s: body is not JSON: %v\n%s", surface, err, body)
+	}
+	for _, key := range []string{"tok", "creds.tok", "lookup"} {
+		if _, ok := got[key]; ok {
+			t.Errorf("%s: env-derived key %q was posted:\n%s", surface, key, body)
+		}
+	}
+	creds, _ := got["creds"].(map[string]any)
+	if creds == nil || creds["region"] != "us-east" || got["region"] != "us-east" || got["plain"] != "hello" {
+		t.Errorf("%s: ordinary values lost:\n%s", surface, body)
+	}
+	if !strings.Contains(body, `"label":"kept"`) {
+		t.Errorf("%s: the stored row's ordinary column was lost:\n%s", surface, body)
+	}
+}
+
+// With no body, `run: webhook` posts the whole flow context. Values derived
+// from env were left out only when a global admin named the URL; a literal
+// URL got them all (round 2026-11-04, hooks finding 5). Every whole-context
+// body now leaves out env-derived values and any value holding an env value.
+func TestWebhookDefaultBodyOmitsEnvDerivedValues(t *testing.T) {
+	app := webhookSecretApp(t)
+	steps := webhookSecretSteps + "      - run: webhook\n        with: { url: \"https://8.8.8.8/cb\" }\n"
+	_, sent, err := runStepValueFlow(t, app, stepKeyFlow(steps), "?id=7", nil)
+	if err != nil || len(sent) != 1 {
+		t.Fatalf("literal URL: err %v sent %+v", err, sent)
+	}
+	checkWebhookContextWithoutSecrets(t, "literal URL", sent[0].body)
+	if !strings.Contains(sent[0].body, `"id":"7"`) {
+		t.Errorf("literal URL: request field lost:\n%s", sent[0].body)
+	}
+
+	// The admin service account naming a delivery callback gets the same
+	// context: the URL choice is still allowed, the env values are not sent.
+	flow := parseExpectRowsFlow(t, app, stepKeyFlow(webhookSecretSteps+"      - run: webhook\n        with: { url: \"${{ params.callback_url }}\" }\n"))
+	callback := func(s *Session) (*FlowContext, []stepValueSent) {
+		var sent []stepValueSent
+		ctx := &FlowContext{App: app, Session: s,
+			Data:        map[string]any{"callback_url": "https://8.8.8.8/cb"},
+			Params:      map[string]string{"callback_url": "https://8.8.8.8/cb"},
+			RequestKeys: map[string]bool{"callback_url": true},
+			Writes:      newFlowWriteLog(),
+			apiClient:   stepValueClient(&sent)}
+		executeSteps(ctx, flow.Steps[:len(flow.Steps)-1])
+		return ctx, sent
+	}
+	// The URL is request input: a non-admin caller is refused, so the admin
+	// run below is the request-chosen-URL branch.
+	if ctx, sent := callback(&Session{UserID: 2, Role: "user"}); ctx.Error == nil || !strings.Contains(ctx.Error.Error(), "must set `body:`") || len(sent) != 0 {
+		t.Fatalf("non-admin callback: want the empty-body refusal, got %v (sent %+v)", ctx.Error, sent)
+	}
+	ctx, adminSent := callback(&Session{UserID: 1, Role: "admin"})
+	if ctx.Error != nil || len(adminSent) != 1 {
+		t.Fatalf("admin callback: err %v sent %+v", ctx.Error, adminSent)
+	}
+	checkWebhookContextWithoutSecrets(t, "admin callback URL", adminSent[0].body)
+}
+
+// An author who means to send a secret names it: a text `body:` or a
+// `payload:` is sent as written, env values included.
+func TestWebhookExplicitBodyStillSendsNamedSecret(t *testing.T) {
+	app := webhookSecretApp(t)
+	for name, c := range map[string]struct{ step, want string }{
+		"text body": {"      - run: webhook\n        with:\n          url: https://8.8.8.8/cb\n          body: '{\"key\": \"${{ steps.creds.outputs.tok }}\"}'\n", `{"key": "s3cret-value"}`},
+		"payload":   {"      - run: webhook\n        with:\n          url: https://8.8.8.8/cb\n          payload: { key: \"${{ env.CLIENT_SECRET }}\", row: \"${{ steps.lookup.outputs.rows.0.secret }}\" }\n", `{"key":"s3cret-value","row":"s3cret-value"}`},
+	} {
+		_, sent, err := runStepValueFlow(t, app, stepKeyFlow(webhookSecretSteps+c.step), "", nil)
+		if err != nil || len(sent) != 1 {
+			t.Fatalf("%s: err %v sent %+v", name, err, sent)
+		}
+		if !jsonEqual(t, sent[0].body, c.want) {
+			t.Errorf("%s: body = %s, want %s", name, sent[0].body, c.want)
+		}
 	}
 }

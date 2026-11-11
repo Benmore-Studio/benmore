@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -54,6 +55,10 @@ type Frontmatter struct {
 	// Bind params: :user_id, :user_email, :user_role, :user_group_id,
 	// :param_<name> (URL query string). All injected from the session.
 	Queries map[string]string `yaml:"queries"`
+
+	// Native single-table reports, authorized exactly like POST /api/_query.
+	// Results are always lists under .sources.<name>.
+	Sources map[string]reportSource `yaml:"sources"`
 }
 
 // frontmatterRe matches a YAML block at the start of a file fenced by
@@ -73,6 +78,9 @@ func ExtractFrontmatter(raw string) (*Frontmatter, string, error) {
 	var fm Frontmatter
 	if err := yamlUnmarshal([]byte(yamlText), &fm); err != nil {
 		return nil, raw, fmt.Errorf("frontmatter yaml: %w", err)
+	}
+	if err := validateReportSources(&fm); err != nil {
+		return nil, raw, err
 	}
 	return &fm, body, nil
 }
@@ -130,6 +138,9 @@ func ApplyFrontmatterToPage(p *Page, fm *Frontmatter) {
 // image opts + N+1 detection - those stages don't care which engine
 // produced the body content.
 func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter, body string) (string, error) {
+	if err := runReportSources(app, page, ctx, fm); err != nil {
+		return "", err
+	}
 	// 1. Execute named queries from frontmatter.
 	//
 	// Shape rule: if the SQL ends in `LIMIT 1`, the result is stored
@@ -145,16 +156,10 @@ func renderGoTemplate(app *App, page *Page, ctx *RenderContext, fm *Frontmatter,
 	for name, sql := range fm.Queries {
 		rows, err := runFrontmatterQuery(app, page, ctx, sql)
 		if err != nil {
-			if app.DevMode {
-				return "", fmt.Errorf("query %q: %w", name, err)
-			}
-			log.Printf("gotmpl query %q failed: %s", name, err)
-			if isSingleRowQuery(sql) {
-				ctx.Data[name] = map[string]any{}
-			} else {
-				ctx.Data[name] = []map[string]any{}
-			}
-			continue
+			// Never bind an empty value here: it renders as a successful page
+			// saying there is no data. The caller answers 5xx with the request
+			// id; the SQL error stays in the request log outside dev mode.
+			return "", fmt.Errorf("query %q: %w", name, err)
 		}
 		if isSingleRowQuery(sql) {
 			if len(rows) > 0 {
@@ -432,16 +437,25 @@ func isSingleRowQuery(sql string) bool {
 // A page with `scope: owner` gets the same owner clause as a mustache page's
 // <query> tags; the gotmpl runner used to ignore it and return every owner's
 // rows.
+//
+// Results are masked for the viewer, hidden columns stripped and audited tables
+// logged (page_query_reads.go), as /api/_query and sources: do.
 func runFrontmatterQuery(app *App, page *Page, ctx *RenderContext, sqlText string) ([]map[string]any, error) {
 	// Substitute :name placeholders with ? and collect args in order.
 	// Supports the same set the rest of the framework supports.
 	var args []any
+	var unbound []string
 	resolved := frontmatterBindRe.ReplaceAllStringFunc(sqlText, func(m string) string {
 		name := strings.TrimPrefix(m, ":")
 		val, ok := resolveBind(ctx, name)
 		if !ok {
 			// Unknown bind - leave the placeholder so the SQL parser
 			// gives a useful error rather than silently substituting NULL.
+			// (A colon inside a string literal is matched too and must stay
+			// as written, so this is not refused here.)
+			if !slices.Contains(unbound, m) {
+				unbound = append(unbound, m)
+			}
 			return m
 		}
 		args = append(args, val)
@@ -458,43 +472,60 @@ func runFrontmatterQuery(app *App, page *Page, ctx *RenderContext, sqlText strin
 		}
 		resolved = scoped
 	}
-	rows, err := QueryRows(app.DB, resolved, args...)
-	if err != nil {
-		return nil, err
+	// The source is proven from the authored text, where :user_id is the
+	// session user's id.
+	source := parsePageQuerySource(sqlText, gotmplViewerParam)
+	policy := newPageQueryPolicy(app, ctx.User, source, page != nil && page.Scope == "owner")
+	rows, _, err := runPageQuery(ctx.queryContext(), app, ctx.Request, ctx.User, policy, resolved, args...)
+	if err != nil && len(unbound) > 0 && strings.Contains(err.Error(), "not enough args") {
+		// The driver counts parameters without naming them; say which name
+		// had no value.
+		err = fmt.Errorf("%w (nothing binds %s: a page query binds :user_id, :user_email, :user_role, :user_group_id, :param_<name> and the page route's parameters)", err, strings.Join(unbound, ", "))
 	}
-	return rows, nil
+	return rows, err
 }
 
 // resolveBind maps a :name placeholder to its runtime value from the
 // session/request context. Returns ok=false if the name isn't a
 // recognized bind - the caller leaves it in place so the SQL error is
-// honest.
+// honest. The recognized names are the identity names below,
+// :param_<name> (URL query value <name>) and the parameters the page's
+// route declares (:id for /contacts/:id); each binds NULL without a value.
+//
+// The identity names always resolve: absent (no signed-in user, or a user in
+// no tenant for :user_group_id) they bind SQL NULL, as flows bind them for an
+// anonymous caller, so `WHERE org_id = :user_group_id` matches no row. Left
+// as a placeholder they made the query fail with "not enough args to execute
+// query: want 1 got 0", which pages showed as a render error once query
+// failures stopped being swallowed: a signed-in user in no tenant got a 500
+// instead of the page's empty state.
 func resolveBind(ctx *RenderContext, name string) (any, bool) {
 	switch name {
 	case "user_id":
 		if ctx.User != nil {
 			return ctx.User.UserID, true
 		}
-		return nil, false
+		return nil, true
 	case "user_email":
 		if ctx.User != nil {
 			return ctx.User.Email, true
 		}
-		return nil, false
+		return nil, true
 	case "user_role":
 		if ctx.User != nil {
 			return ctx.User.Role, true
 		}
-		return nil, false
+		return nil, true
 	case "user_group_id":
 		if ctx.User != nil && ctx.User.HasGroup() {
 			return ctx.User.GroupID, true
 		}
-		return nil, false
+		return nil, true
 	}
 	// param_<name> binds to a URL query string value.
-	if strings.HasPrefix(name, "param_") && ctx.Request != nil {
-		key := strings.TrimPrefix(name, "param_")
+	key, isParam := strings.CutPrefix(name, "param_")
+	isParam = isParam && key != ""
+	if isParam && ctx.Request != nil {
 		if v := ctx.Request.URL.Query().Get(key); v != "" {
 			return v, true
 		}
@@ -506,7 +537,31 @@ func resolveBind(ctx *RenderContext, name string) (any, bool) {
 			return v, true
 		}
 	}
+	// A URL value or route parameter the request does not carry, or carries
+	// empty, is SQL NULL: `(:param_status IS NULL OR status = :param_status)`
+	// is an optional filter, and an empty GET form field (?status=) means no
+	// filter as an absent one does. Left as a placeholder it failed the query
+	// ("not enough args to execute query: want 2 got 1"), which pages answer
+	// with a 500 since query failures stopped being swallowed. Bind
+	// COALESCE(:param_x, '') where an empty string must match.
+	if isParam || (ctx.Page != nil && pageRouteDeclaresParam(ctx.Page.Route, name)) {
+		return nil, true
+	}
 	return nil, false
+}
+
+// pageRouteDeclaresParam reports whether a page route (`/contacts/:id`)
+// declares the path parameter name, as registerAppPageRoutes reads it.
+func pageRouteDeclaresParam(route, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, part := range strings.Split(route, "/") {
+		if part == ":"+name {
+			return true
+		}
+	}
+	return false
 }
 
 // EnvLookup reads a single key from env.yaml. Returns "" if the file
@@ -529,7 +584,7 @@ func envLookupFromSource(data []byte, key string) string {
 		return ""
 	}
 	if v, ok := env[key]; ok {
-		return fmt.Sprintf("%v", v)
+		return valueText(v)
 	}
 	return ""
 }

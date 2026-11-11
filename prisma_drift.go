@@ -76,7 +76,7 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 			drifts = append(drifts, SchemaDrift{
 				Kind:   "missing_table",
 				Table:  table,
-				Detail: "declared in schema.prisma but not in the live database - has a migration not been applied? Restart the app or restart the app to apply pending migrations.",
+				Detail: "declared in schema.prisma but not in the live database - has a migration not been applied? Restart the app to apply pending migrations (hosted: `benmore restart <app> --env <env>`).",
 			})
 		}
 	}
@@ -110,6 +110,12 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 
 	// Per-table column drift. Only for tables present in BOTH -
 	// missing/extra-table cases above cover the table-level case.
+	// Columns the framework adds to app tables itself are never declared in
+	// schema.prisma; reporting them told developers to drop live machinery.
+	customFields, err := customFieldColumns(db)
+	if err != nil {
+		return drifts, fmt.Errorf("read custom fields: %w", err)
+	}
 	for table, model := range declaredTables {
 		// An explicit model must not make retained history metadata disposable.
 		if !liveTables[table] || historyTables[table] {
@@ -149,14 +155,18 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 		}
 		// Extra columns.
 		for col := range liveCols {
-			if _, ok := declaredCols[col]; !ok {
-				drifts = append(drifts, SchemaDrift{
-					Kind:   "extra_column",
-					Table:  table,
-					Column: col,
-					Detail: "exists in the live DB but not in schema.prisma. INFORMATIONAL - usually harmless: the old column lingers from a previous migration, queries against the new schema work fine without it. To drop the unused column, drop the unused column manually or restore the field to your Prisma model if it was removed accidentally.",
-				})
+			if _, ok := declaredCols[col]; ok {
+				continue
 			}
+			if frameworkManagedColumn(table, col, liveCols, customFields) {
+				continue
+			}
+			drifts = append(drifts, SchemaDrift{
+				Kind:   "extra_column",
+				Table:  table,
+				Column: col,
+				Detail: "exists in the live DB but not in schema.prisma. INFORMATIONAL - usually harmless: the old column lingers from a previous migration, queries against the new schema work fine without it. To remove it, drop it with a SQL file in migrations/ (`ALTER TABLE " + table + " DROP COLUMN " + col + ";`) after checking its data, or restore the field to your Prisma model if it was removed accidentally.",
+			})
 		}
 	}
 
@@ -171,6 +181,50 @@ func DetectSchemaDrift(db *sql.DB, models []PrismaModel) ([]SchemaDrift, error) 
 		return drifts[i].Kind < drifts[j].Kind
 	})
 	return drifts, nil
+}
+
+// frameworkManagedColumn reports an undeclared column of an app table that
+// the framework added and still uses, so it is not drift and must never be
+// dropped: a blind-index sibling `<col>_blind` beside its live `<col>`
+// (encrypted.yaml blind_index, the same rule apiHiddenColumn hides it by;
+// dropping it breaks equality search on the encrypted column, and its index
+// makes prune's DROP COLUMN fail), and a custom field recorded in
+// _benmore_custom_fields (POST /api/_schema/{table}/fields).
+func frameworkManagedColumn(table, col string, liveCols map[string]LiveColumn, customFields map[string]map[string]bool) bool {
+	if base, ok := strings.CutSuffix(col, blindColSuffix); ok && base != "" {
+		if _, live := liveCols[base]; live {
+			return true
+		}
+	}
+	return customFields[strings.ToLower(table)][strings.ToLower(col)]
+}
+
+// customFieldColumns returns table -> column for every custom field added
+// through the custom-fields API, lowercased (SQLite identifiers are
+// case-insensitive). An app that never used it has no tracking table.
+func customFieldColumns(db *sql.DB) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_benmore_custom_fields'").Scan(&n); err != nil || n == 0 {
+		return out, err
+	}
+	rows, err := db.Query("SELECT table_name, column_name FROM _benmore_custom_fields")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var table, col string
+		if err := rows.Scan(&table, &col); err != nil {
+			return nil, err
+		}
+		t := strings.ToLower(table)
+		if out[t] == nil {
+			out[t] = map[string]bool{}
+		}
+		out[t][strings.ToLower(col)] = true
+	}
+	return out, rows.Err()
 }
 
 // isFTSShadowTable reports whether `name` is one of the auxiliary

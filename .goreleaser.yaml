@@ -88,6 +88,16 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# Keyless Sigstore signature over checksums.txt, so a downloaded archive can be
+# tied to this repository's release workflow on its tag.
+signs:
+  - id: checksums-sigstore
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "--yes", "${artifact}"]
+    output: true
+
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 

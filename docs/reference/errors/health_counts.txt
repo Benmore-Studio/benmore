@@ -1,0 +1,1 @@
+Administrator /health detail includes checks.errors.last_24h (groups seen in the last day) and checks.errors.unresolved (all unresolved retained groups). These are group counts, not occurrence totals. Anonymous health and public /_status expose no error counts.

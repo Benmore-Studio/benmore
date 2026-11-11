@@ -1,0 +1,1 @@
+For files over ~50 MB or where all-or-nothing semantics matter, use api(at:"import") instead - /ingest is capped at 100 MB and 100k rows and skips bad rows rather than aborting.

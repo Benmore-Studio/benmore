@@ -1,0 +1,5 @@
+{
+  "quick": "the source-sync check (drift or conflict fails) plus journeys tagged smoke; no YAML tests",
+  "default": "source-sync checks, generated + app YAML tests in a disposable source copy, schema/OpenAPI fingerprints, and every journey",
+  "release": "default plus read-only status/doctor analysis; ordinary dev→prod code drift is informational, while destructive schema changes, missing prod env refs, key/payment mistakes, money-as-float, secrets, and PII exposure block"
+}

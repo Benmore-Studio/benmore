@@ -1,0 +1,5 @@
+[
+  "api({at:'access'}) - declarative access modes (orthogonal: encryption protects at-rest, access protects which API caller can read at all)",
+  "api({at:'audit'}) - audit rows keep encrypted fields as ciphertext (gotchas → Audit protection)",
+  "api({at:'signed-urls'}) - different problem (file access expiry) but adjacent: both are at-rest data-protection primitives"
+]

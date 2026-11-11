@@ -1,0 +1,56 @@
+[
+  {
+    "name": "hmac_sha256_body",
+    "use_for": "Generic body-only HMAC with a hex signature (GitHub's `sha256=<hex>`, custom partners). Shopify signs in base64: use the string form `verify: shopify`.",
+    "required": [
+      "header",
+      "secret"
+    ],
+    "optional": [
+      "prefix (e.g. 'sha256='; when declared the header must start with it)"
+    ],
+    "yaml": "on:\n  request:\n    method: POST\n    path: /api/webhooks/github\n    verify:\n      recipe: hmac_sha256_body\n      header: X-Hub-Signature-256\n      prefix: \"sha256=\"\n      secret: \"{{ env.GITHUB_WEBHOOK_SECRET }}\"",
+    "note": "expected = hex(hmac_sha256(secret, body)). Caller's signature is compared after prefix stripping, in constant time. A declared prefix is required: a header without it fails (401) and is not compared as bare hex."
+  },
+  {
+    "name": "hmac_timestamp_dot_body",
+    "use_for": "Senders that sign `<timestamp>.<body>` and send the timestamp in its own header. Includes replay-window protection. Not Slack (it signs `v0:<ts>:<body>`: use `verify: slack`), not Stripe (`verify: stripe`), not a Benmore subscription (`verify: benmore`).",
+    "required": [
+      "header",
+      "timestamp_header",
+      "secret"
+    ],
+    "optional": [
+      "skew_seconds (default 300, at most 86400)",
+      "prefix (required in the header when declared)"
+    ],
+    "yaml": "on:\n  request:\n    method: POST\n    path: /api/webhooks/notifier\n    verify:\n      recipe: hmac_timestamp_dot_body\n      header: X-Notifier-Signature\n      timestamp_header: X-Notifier-Timestamp\n      secret: \"{{ env.NOTIFIER_SECRET }}\"\n      skew_seconds: 300",
+    "note": "expected = hex(hmac_sha256(secret, ts + \".\" + body)). Stale timestamps (outside skew_seconds) are rejected even when the signature itself is valid - that's the replay-attack guard. skew_seconds 0 (or omitted) means 300. A negative skew_seconds disables the check only when the app's env sets WEBHOOK_SKEW_ALLOW_NEGATIVE=1 (meant for tests); without it a negative value is treated as 0, so the 300-second window stays on. skew_seconds above 86400 (one day) is refused at write time, and a saved flow with a larger value is held to 86400 at runtime; a declared prefix must start the signature header."
+  },
+  {
+    "name": "hmac_sha1_body",
+    "use_for": "Raw-body HMAC-SHA1 providers such as Autodesk Platform Services webhooks, with bounded current/previous-secret rotation.",
+    "required": [
+      "header",
+      "secret (env reference)"
+    ],
+    "optional": [
+      "prefix",
+      "previous_secret (env reference)"
+    ],
+    "yaml": "on:\n  request:\n    method: POST\n    path: /api/webhooks/autodesk\n    auth: none\n    verify:\n      recipe: hmac_sha1_body\n      header: X-Adsk-Signature\n      prefix: \"sha1hash=\"\n      secret: \"${{ env.AUTODESK_WEBHOOK_SECRET }}\"\n      previous_secret: \"${{ env.AUTODESK_WEBHOOK_SECRET_PREVIOUS }}\"",
+    "note": "expected = hex(hmac_sha1(secret, exact raw body)). The current and optional previous secret are both checked in constant time. Omit previous_secret after the provider's rotation overlap ends; if configured, it must resolve to a non-empty env value."
+  },
+  {
+    "name": "hmac_sha256_path_bearer",
+    "use_for": "Per-subscription webhook bearer credentials derived from an opaque URL handle without storing one secret per subscription (for example Procore destination_headers).",
+    "required": [
+      "secret (env reference)",
+      "prefix",
+      "path_param",
+      "context"
+    ],
+    "yaml": "on:\n  request:\n    method: POST\n    path: /api/webhooks/procore/:handle\n    auth: none\n    verify:\n      recipe: hmac_sha256_path_bearer\n      secret: \"${{ env.PROCORE_WEBHOOK_MASTER_SECRET }}\"\n      prefix: \"Bearer \"\n      path_param: handle\n      context: \"procore-webhook:\"",
+    "note": "Authorization must equal prefix + hex(hmac_sha256(master secret, context + path value)). path_param must name a dynamic segment in this route and match [A-Za-z_][A-Za-z0-9_]*. The opaque handle is routing data, not a credential; never put the derived bearer in a URL, response, or database."
+  }
+]

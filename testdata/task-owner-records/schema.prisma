@@ -1,0 +1,9 @@
+model Claim {
+  id          Int      @id @default(autoincrement())
+  title       String
+  amountCents Int      @map("amount_cents")
+  receiptUrl  String   @default("") @map("receipt_url")   // what POST /api/_upload returned
+  userId      Int      @map("user_id")                    // the owner, set by the framework
+  createdAt   DateTime @default(now()) @map("created_at")
+  @@map("claims")
+}

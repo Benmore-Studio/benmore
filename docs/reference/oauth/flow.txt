@@ -1,0 +1,1 @@
+Redirect the user to /auth/<provider>; the framework handles the callback at /auth/<provider>/callback and sets a session cookie on success.

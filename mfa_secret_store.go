@@ -25,8 +25,13 @@ package main
 // Key choice: only a DURABLE key seals. An app with no configured
 // ENCRYPTION_KEY runs on a key generated for the process alone, and a secret
 // sealed under it would be unreadable after a restart - every enrolled user
-// locked out of their own second factor. Such apps keep storing the secret
-// unsealed and the runtime warns at startup while any enrollment exists. The
+// locked out of their own second factor. So an enrollment, or the use of an
+// unsealed factor, first makes that generated key durable the way webhook
+// subscription secrets do (prepareTOTPSealKey → durableSealKey: saved to
+// env.yaml and read back the way the next start reads the environment). Only
+// where that fails does the secret stay unsealed, and the runtime warns at
+// startup while any such enrollment exists. Startup itself never saves a key
+// (it only seals under one that is already durable). The
 // server secret is deliberately not used as a fallback: it can be ephemeral
 // too, it differs between an app's dev and prod instances (so refresh_dev
 // copies would stop verifying), and nothing re-encrypts under it when it
@@ -76,6 +81,31 @@ func totpSealKey(db mutationQuerier) []byte {
 	return appEncryptionKey
 }
 
+// totpDurableKeyFailed remembers, per main database path, that its generated
+// key could not be made durable in this process, so a failing env.yaml is
+// tried (and logged) once, not on every enrollment and MFA sign-in.
+var totpDurableKeyFailed sync.Map // path → true
+
+// prepareTOTPSealKey runs before a TOTP secret is written or used. When db's
+// key was generated for this process it saves that key first (durableSealKey),
+// so the secret can be sealed and survives restarts; afterwards totpSealKey
+// returns it. When the key cannot be made durable the secret stays unsealed,
+// as before: it is never sealed under the per-process key, and enrollment is
+// never refused over key storage.
+func prepareTOTPSealKey(db mutationQuerier) {
+	if totpSealKey(db) != nil {
+		return
+	}
+	path, _ := mainDatabasePathForQuerier(db)
+	if _, failed := totpDurableKeyFailed.Load(path); failed {
+		return
+	}
+	if _, err := durableSealKey(db); err != nil {
+		totpDurableKeyFailed.Store(path, true)
+		log.Printf("MFA: WARN TOTP secrets stay unencrypted at rest: %v", err)
+	}
+}
+
 // sealTOTPSecret returns the stored form of an active base32 secret; prefix
 // it with totpPendingPrefix for an enrollment in progress.
 func sealTOTPSecret(db mutationQuerier, secretB32 string) (string, error) {
@@ -123,7 +153,10 @@ func logTOTPOpenFailure(err error) {
 // happens while the row still holds the value that was read, so it never
 // overwrites a concurrent enrollment or disable.
 func resealTOTPSecret(db mutationTx, userID int64, stored string) {
-	if stored == "" || totpSecretSealed(stored) || totpSealKey(db) == nil {
+	if stored == "" || totpSecretSealed(stored) {
+		return
+	}
+	if prepareTOTPSealKey(db); totpSealKey(db) == nil {
 		return
 	}
 	pending := strings.HasPrefix(stored, totpPendingPrefix)
@@ -156,7 +189,7 @@ func sealStoredTOTPSecrets(db *sql.DB) error {
 		}
 		return nil
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "TOTP secret sealing"), nil)
 	if err != nil {
 		return err
 	}

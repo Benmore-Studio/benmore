@@ -1,0 +1,13 @@
+const csrf = document.querySelector('meta[name="csrf-token"]').content;
+
+// Header-based (cleanest for fetch + JSON)
+await fetch('/api/notes', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+  body: JSON.stringify({ title: 'Hello' }),
+});
+
+// Native HTML form - the runtime auto-injects the hidden _csrf input.
+// You only need this if you want a known token:
+// <input type="hidden" name="_csrf" value="${csrf}">

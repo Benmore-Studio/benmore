@@ -1,0 +1,20 @@
+{
+  "table_events": {
+    "client_send": "{ type: 'subscribe' | 'unsubscribe', tables: ['notes', 'deals'] }",
+    "server_send": "{ type: 'change', table: 'notes', action: 'insert' | 'update' | 'delete' }  (owner-scoped tables send non-owners { type: 'change', action: 'refresh' })",
+    "use_for": "Live invalidation when auto-CRUD mutations or flow SQL writes happen. Same {table, action} as SSE 'change' events but bidirectional; never the row.",
+    "subscription": "`subscribe` narrows, it does not authorize. A connection that never sends `subscribe` (one opened only to join rooms, as bm.room() does) receives change events for EVERY table it may read, under the same audience rules as SSE. After a subscribe, named change events arrive only for the subscribed tables (unsubscribing from all of them restores the every-table default); the generic `{ type: 'change', action: 'refresh' }` names no table and still arrives. A room-only client can ignore `type: 'change'` frames."
+  },
+  "room_broadcast": {
+    "client_send": "{ type: 'join' | 'leave', room: 'chat-lobby' }  ←  join first\n              { type: 'broadcast', room: 'chat-lobby', payload: <any json> }",
+    "server_send": "{ type: 'message', room: 'chat-lobby', from: <sender user_id; absent for an anonymous sender>, payload: <any json> }\n              { type: 'message', room: 'chat-lobby', from: 'server', payload: <any json> }   ← a flow's run: broadcast\n              { type: 'presence', room: 'chat-lobby', from: <user_id>, payload: { join: true } | { leave: true } }",
+    "use_for": "Chat, presence indicators, WebRTC signaling (SDP/ICE), typing indicators, collaborative cursors.",
+    "note": "Clients SEND type 'broadcast' but RECEIVE type 'message' (bm.room() handles this for you). The sender does not get its own relay back."
+  },
+  "server_send_from_flow": {
+    "step": "`run: broadcast` with `with: { room, payload }` - see api({at:'flows'}) → broadcast_step for the copy-paste YAML.",
+    "frame": "{ type: 'message', room, from: 'server', payload } - the same frame a client relay produces, so `bm.room(name).on(kind, (payload, from) => …)` receives it unchanged (kind = payload.kind). `from` is the STRING 'server'; client relays carry the sender's numeric user id (or no `from` for an anonymous sender), so `from === 'server'` never matches a user.",
+    "reaches": "Every connection of THIS app that has joined the room right now and still passes the room's ws_rooms membership rule. In an app with `groups:` only the flow caller's tenant; a run with no signed-in session (cron, async job, public flow) fails there instead of reaching every tenant. Nothing is queued for clients that join later - store anything durable in a table.",
+    "limits": "Room: 1-128 characters of a-z A-Z 0-9 _ - . : after interpolation. Payload: at most 64 KiB of JSON; larger fails the step. Rooms are per process: in a multi-instance cluster (BENMORE_CLUSTER=true) a room message reaches only members connected to the instance that ran the flow, same as client relays."
+  }
+}

@@ -1,0 +1,1 @@
+`run: sql_dynamic` binds nothing, so `params` (at the step root or under `with:`) is refused when the file is written. Bind values in a `run: sql` step. A template that renders no statement (an empty generated query, only a comment) fails the step with `no SQL statement` instead of running nothing.

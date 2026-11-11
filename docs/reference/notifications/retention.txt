@@ -1,0 +1,1 @@
+Each user retains at most the newest 1,000 notifications, ordered by created_at and then id descending. Same-second inserts evict the oldest tied ID, regardless of read state, so a just-created notification is not discarded by an arbitrary timestamp tie. Retention remains separate from unread-first inbox display and live cursor delivery; it is not a durable delivery receipt.

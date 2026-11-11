@@ -10,5 +10,11 @@ import "context"
 // must be decoded explicitly, once, by the caller that owns that protocol.
 // This is not the decoder for app columns or arbitrary authored SQL.
 func queryMetadataRows(q mutationQuerier, query string, args ...any) ([]map[string]any, error) {
-	return queryRowsWithKeyContextDecrypt(context.Background(), q, nil, func(map[string]any, []byte) {}, query, args...)
+	return queryMetadataRowsContext(context.Background(), q, query, args...)
+}
+
+// queryMetadataRowsContext is queryMetadataRows bounded by ctx: a read that
+// outlives its caller's deadline is interrupted instead of running on.
+func queryMetadataRowsContext(ctx context.Context, q mutationQuerier, query string, args ...any) ([]map[string]any, error) {
+	return queryRowsWithKeyContextDecrypt(ctx, q, nil, func(map[string]any, []byte) {}, query, args...)
 }

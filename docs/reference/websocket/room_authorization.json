@@ -1,0 +1,13 @@
+{
+  "summary": "By default ANY authenticated user may join ANY room name (a room is separate per app and tenant, but not authorized per row). For private rooms - one WS room per channel / project - declare `ws_rooms:` in app.yaml: room-name patterns bound to a membership table. `join` on a matching room then requires a membership row (same semantics as the member-of: access mode); non-members get {type:'error', room, body:'not a member of this room'} and never receive broadcasts (broadcast requires having joined).",
+  "example_app_yaml": "ws_rooms:\n  \"room-:id\": room_members(room_id, member_id)\n  \"project-:id-chat\": project_members(project_id, member_id)\n  \"chat::id\": chat_members(chat_id, member_id)   # rooms named chat:42",
+  "behavior_notes": [
+    "The pattern holds one `:param` placeholder; its matched value is checked as the membership join value (room-42 → room_members.room_id = 42 AND member_id = <you>). A literal pattern (no placeholder) requires membership in ANY row of the table. A literal `:` may come directly before the placeholder: `chat::id` restricts rooms named like chat:42.",
+    "`*` is not a wildcard, and a pattern has one placeholder. The write gate and `benmore check` refuse a pattern that holds `*`, a second placeholder or any other `:` (`chat:*`, `team-:a-:b`) and name the pattern to write instead. An app.yaml that already holds such a pattern still loads, with the rooms it was written for closed: a room whose name starts with the pattern's text before its first `:` or `*`, and that no other pattern matches, refuses everyone but admins until the pattern is corrected.",
+    "Longest pattern matches first; rooms matching NO pattern stay open to any signed-in user - so adding ws_rooms never changes unrelated rooms.",
+    "Anonymous clients are always refused on declared rooms (even with features.ws_anonymous). Admins bypass, matching CRUD scoping. A malformed rule is refused: the write gate rejects the file (`app.yaml: ws_rooms.<pattern> must be a membership rule`) and an app that has one does not start or reload.",
+    "Tenant rule: when the room's membership table carries the groups: tenant key, only a membership row in the caller's effective tenant admits the join, and a caller with no tenant is refused - the member-of rule. A membership table without the key keeps the plain row check.",
+    "Pair with member-of: on the messages table so the DATA is gated the same way the TRANSPORT is - see api({at:'access'}) → member_of.",
+    "The same rules gate bm.broadcast slugs (publish, subscribe, stats) and bm.presence slugs (join, heartbeat, list): a slug is a room name."
+  ]
+}

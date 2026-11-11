@@ -70,6 +70,8 @@ type appMCPPDFResult struct {
 	ParserVersion string           `json:"parser_version"`
 	SHA256        string           `json:"sha256"`
 	Quality       []string         `json:"quality_flags"`
+	// PageCount is read by `run: extract_text`; the connector result omits it.
+	PageCount int `json:"-"`
 }
 
 // pdfExtractionAvailable reports whether the fixed tools are installed and a
@@ -395,6 +397,13 @@ func binaryBigEndianUint32(b []byte) uint32 {
 }
 
 func appMCPPDFExtract(ctx context.Context, appDir string, data []byte) (appMCPPDFResult, error) {
+	return appMCPPDFExtractOCR(ctx, appDir, data, true)
+}
+
+// appMCPPDFExtractOCR is appMCPPDFExtract with OCR switchable: with ocr false
+// a page with no native text is skipped (flagged native_text_only_pages) and
+// the result is not Complete.
+func appMCPPDFExtractOCR(ctx context.Context, appDir string, data []byte, ocr bool) (appMCPPDFResult, error) {
 	result := appMCPPDFResult{ParserVersion: appMCPPDFParserVersion, Complete: false}
 	if !bytes.HasPrefix(data, []byte("%PDF-")) || len(data) == 0 {
 		return result, ErrIngestUnsupported
@@ -441,10 +450,19 @@ func appMCPPDFExtract(ctx context.Context, appDir string, data []byte) (appMCPPD
 	if len(pages) > appMCPPDFMaxPages {
 		return result, ErrIngestLimit
 	}
+	result.PageCount = len(pages)
 	extractedBytes := int64(0)
+	skippedPages := false
 	for pageIdx, blocks := range pages {
 		if ctx.Err() != nil {
 			return failureResult(), ctx.Err()
+		}
+		if len(blocks) == 0 && !ocr {
+			skippedPages = true
+			if !slices.Contains(result.Quality, "native_text_only_pages") {
+				result.Quality = append(result.Quality, "native_text_only_pages")
+			}
+			continue
 		}
 		if len(blocks) == 0 {
 			prefix := filepath.Join(dir, "page")
@@ -502,6 +520,6 @@ func appMCPPDFExtract(ctx context.Context, appDir string, data []byte) (appMCPPD
 			return failureResult(), ErrIngestLimit
 		}
 	}
-	result.Complete = true
+	result.Complete = !skippedPages
 	return result, nil
 }

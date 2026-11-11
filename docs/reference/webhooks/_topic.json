@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "summary",
+    "outbound_authorization",
+    "outbound_payload",
+    "secret_storage",
+    "outbound_endpoints",
+    "outbound_signature",
+    "inbound_example",
+    "inbound_verify",
+    "js_snippet"
+  ]
+}

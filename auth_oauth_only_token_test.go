@@ -34,6 +34,9 @@ func TestOAuthOnlyRefusesTokenEndpoint(t *testing.T) {
 	app.Design = &DesignConfig{Auth: map[string]string{"oauth_only": "true"}}
 	w = httptest.NewRecorder()
 	handleTokenAuth(w, req(), app)
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("error cache policy = %q", w.Header().Get("Cache-Control"))
+	}
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("oauth_only must 403 the token endpoint, got %d: %s", w.Code, w.Body.String())
 	}

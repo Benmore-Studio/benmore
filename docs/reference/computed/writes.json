@@ -1,0 +1,5 @@
+[
+  "A create or PATCH that sends a computed column succeeds without it: the value is left out and the response header `X-Stripped-Fields` names the column (a PATCH also returns `stripped_fields` in its body). A PATCH that sends nothing else answers 400 `No fields to update`. A batch create leaves it out the same way.",
+  "GET /api/_schema marks computed columns `writable: false`, so schema-driven forms leave them out (api({at:'components'}) the_descriptor).",
+  "Rows that already exist when a field is declared keep the value they had; each is calculated at its next write. To fill a new `expr:` column at once, rewrite a column with itself (`UPDATE orders SET quantity = quantity`); for a `sql:` column touch the child rows (`UPDATE items SET order_id = order_id`). A parent with no child rows keeps the column's default."
+]

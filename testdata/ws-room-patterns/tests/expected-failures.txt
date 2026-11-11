@@ -1,0 +1,2 @@
+# The write gate refuses the ws_rooms pattern "talk:*"; the app still loads.
+app.yaml

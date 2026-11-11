@@ -1,0 +1,16 @@
+{
+  "keys": [
+    "record_ids",
+    "index_lifecycle",
+    "discovery",
+    "summary",
+    "matching",
+    "query_limits",
+    "endpoint",
+    "route_shape",
+    "encrypted",
+    "internal_tables",
+    "prisma_setup",
+    "js_snippet"
+  ]
+}

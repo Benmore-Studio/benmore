@@ -1,0 +1,360 @@
+# Every test here used to be unreachable: the app could not load with a
+# schema field named `order`, `group`, `from`, `to`, `index`, `values`,
+# `default`, `check`, `table`, `set`, `transaction`, `select`, `where` or
+# `unique`.
+
+create_read_update_a_row_with_reserved_word_columns:
+  as_user: "crud@reserved.test"
+  steps:
+    - api: "POST /api/plans"
+      json: {title: "crud plan"}
+      save: {plan: "id"}
+      expect: {status: 200}
+    - api: "POST /api/steps"
+      json:
+        group: "{{plan}}"
+        title: "crud step"
+        order: 7
+        from: "berlin"
+        to: "lisbon"
+        index: 1
+        values: "a,b"
+        default: true
+        table: "t1"
+        set: "s1"
+        transaction: "tx1"
+        select: "sel1"
+        where: "here"
+        unique: "u-crud"
+      save: {step: "id"}
+      expect: {status: 200}
+    - get: "/api/steps/{{step}}"
+      expect:
+        status: 200
+        json:
+          order: 7
+          from: "berlin"
+          to: "lisbon"
+          index: 1
+          values: "a,b"
+          default: true
+          table: "t1"
+          set: "s1"
+          transaction: "tx1"
+          select: "sel1"
+          where: "here"
+          unique: "u-crud"
+          # the computed column `check` is "order" * 2
+          check: 14
+    - api: "PATCH /api/steps/{{step}}"
+      json: {order: 9, to: "porto", select: "sel2", where: "there"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM steps WHERE \"order\" = 9 AND \"to\" = 'porto' AND \"select\" = 'sel2' AND \"where\" = 'there' AND \"check\" = 18 AND \"from\" = 'berlin'"
+      expect: {rows: 1}
+    # ?fields= on one row answered 404 for a row that exists
+    - get: "/api/steps/{{step}}?fields=order,to,select,where,from"
+      expect:
+        status: 200
+        contains: '{"from":"berlin","order":9,"select":"sel2","to":"porto","where":"there"}'
+
+filter_sort_count_and_project_on_reserved_word_columns:
+  as_user: "list@reserved.test"
+  steps:
+    - api: "POST /api/plans"
+      json: {title: "list plan"}
+      save: {plan: "id"}
+      expect: {status: 200}
+    - api: "POST /api/steps/batch"
+      json_array:
+        - {group: "{{plan}}", title: "second", order: 2, index: 2, from: "b", to: "y", select: "keep"}
+        - {group: "{{plan}}", title: "third", order: 3, index: 3, from: "c", to: "z", select: "drop"}
+        - {group: "{{plan}}", title: "first", order: 1, index: 1, from: "a", to: "x", select: "keep"}
+      expect: {status: 200}
+    - get: "/api/steps?sort=order&order=asc&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"first"},{"title":"second"},{"title":"third"}]'
+    - get: "/api/steps?orderBy=order:desc&fields=order"
+      expect:
+        status: 200
+        contains: '[{"order":3},{"order":2},{"order":1}]'
+    # `order` is also the sort-direction parameter, so the column is filtered
+    # with where[order] or an operator suffix
+    - get: "/api/steps?where[order]=2&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"second"}]'
+    - get: "/api/steps?order__gte=2&sort=order&order=asc&fields=title,order"
+      expect:
+        status: 200
+        contains: '[{"order":2,"title":"second"},{"order":3,"title":"third"}]'
+    - get: "/api/steps?select=keep&from__in=a,b&sort=index&order=desc&fields=from,to,select,index"
+      expect:
+        status: 200
+        contains: '[{"from":"b","index":2,"select":"keep","to":"y"},{"from":"a","index":1,"select":"keep","to":"x"}]'
+    - get: "/api/steps?group={{plan}}&select=keep&count=true"
+      expect:
+        status: 200
+        json: {count: 2}
+    - get: "/api/steps?to__like=z&page=1&per_page=10&fields=title"
+      expect:
+        status: 200
+        contains: '"title":"third"'
+        not_contains: '"title":"first"'
+    # keyset pages take the same filters and projection
+    - get: "/api/steps?cursor=0&limit=2&group={{plan}}&fields=order,from"
+      expect:
+        status: 200
+        contains: '"data":[{"from":"b","order":2},{"from":"c","order":3}]'
+    # the full-text index covers title and `to`
+    - get: "/api/steps?q=second&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"second"}]'
+    # two characters: the LIKE fallback over the indexed columns
+    - get: "/api/steps?q=zz&fields=title"
+      expect:
+        status: 200
+        contains: '[]'
+    - api: "POST /api/_query"
+      json:
+        table: "steps"
+        select: ["title", "order", "from"]
+        where: {order: {gte: 2}, select: "keep"}
+        order_by: [{col: "order", dir: "desc"}]
+      expect:
+        status: 200
+        contains: '"title":"second"'
+        not_contains: '"title":"first"'
+    - api: "POST /api/_query"
+      json:
+        table: "steps"
+        group_by: ["select"]
+        aggregates: [{fn: "sum", col: "order", as: "total"}]
+        order_by: [{col: "select", dir: "asc"}]
+      expect:
+        status: 200
+        contains:
+          - '"select":"drop"'
+          - '"total":3'
+
+computed_trigger_follows_a_reserved_word_foreign_key:
+  as_user: "computed@reserved.test"
+  steps:
+    - api: "POST /api/plans"
+      json: {title: "counted"}
+      save: {plan: "id"}
+      expect: {status: 200}
+    - api: "POST /api/steps"
+      json: {group: "{{plan}}", title: "one", index: 1}
+      save: {one: "id"}
+      expect: {status: 200}
+    - api: "POST /api/steps"
+      json: {group: "{{plan}}", title: "two", index: 2}
+      expect: {status: 200}
+    # plans.limit is the number of live steps whose `group` is the plan
+    - get: "/api/plans/{{plan}}?fields=limit"
+      expect:
+        status: 200
+        contains: '{"limit":2}'
+    - get: "/api/plans?sort=limit&order=desc&fields=title,limit"
+      expect:
+        status: 200
+        contains: '{"limit":2,"title":"counted"}'
+    - api: "DELETE /api/steps/{{one}}"
+      json: {}
+      expect: {status: 200}
+    - get: "/api/plans/{{plan}}?fields=limit"
+      expect:
+        status: 200
+        contains: '{"limit":1}'
+    - api: "POST /api/steps/{{one}}/restore"
+      json: {}
+      expect: {status: 200}
+    - get: "/api/plans/{{plan}}?fields=limit"
+      expect:
+        status: 200
+        contains: '{"limit":2}'
+    - get: "/api/plans/{{plan}}?include=steps"
+      expect:
+        status: 200
+        contains:
+          - '"title":"one"'
+          - '"title":"two"'
+    - get: "/api/steps/{{one}}?include=plan&fields=title,group"
+      expect:
+        status: 200
+        contains: '"title":"counted"'
+
+history_keeps_reserved_word_columns:
+  as_user: "history@reserved.test"
+  steps:
+    - api: "POST /api/plans"
+      json: {title: "versioned"}
+      save: {plan: "id"}
+      expect: {status: 200}
+    - api: "POST /api/steps"
+      json: {group: "{{plan}}", title: "v", order: 1, to: "before", index: 1}
+      save: {step: "id"}
+      expect: {status: 200}
+    - api: "PATCH /api/steps/{{step}}"
+      json: {order: 2, to: "after"}
+      expect: {status: 200}
+    - get: "/api/steps/{{step}}/versions"
+      expect:
+        status: 200
+        contains: '"_version":1'
+    - get: "/api/steps/{{step}}/versions/1?fields=order,to"
+      expect:
+        status: 200
+        contains: '{"order":1,"to":"before"}'
+    - api: "POST /api/steps/{{step}}/revert/1"
+      json: {}
+      expect: {status: 200}
+    - get: "/api/steps/{{step}}?fields=order,to,check"
+      expect:
+        status: 200
+        contains: '{"check":2,"order":1,"to":"before"}'
+
+transaction_and_ingest_write_reserved_word_columns:
+  as_user: "bulk@reserved.test"
+  steps:
+    - api: "POST /api/plans"
+      json: {title: "bulk"}
+      save: {plan: "id"}
+      expect: {status: 200}
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {table: "steps", action: "insert", data: {group: "{{plan}}", title: "tx a", order: 5, index: 1, from: "tx"}}
+          - {table: "steps", action: "insert", data: {group: "{{plan}}", title: "tx b", order: 6, index: 2, from: "tx"}}
+      expect: {status: 200}
+    - api: "POST /api/steps/ingest"
+      ndjson:
+        - {group: "{{plan}}", title: "in a", order: 7, index: 3, from: "ingest"}
+        - {group: "{{plan}}", title: "in b", order: 8, index: 4, from: "ingest"}
+      expect: {status: 200}
+    - get: "/api/steps?group={{plan}}&sort=order&order=asc&fields=order,from"
+      expect:
+        status: 200
+        contains: '[{"from":"tx","order":5},{"from":"tx","order":6},{"from":"ingest","order":7},{"from":"ingest","order":8}]'
+    # the declared uniqueness on (group, index) holds
+    - api: "POST /api/steps"
+      json: {group: "{{plan}}", title: "dup", index: 4}
+      expect:
+        status: 400
+        contains: "unique"
+
+# A custom field named with an SQL keyword was accepted (201) and then
+# answered 500 on sort, filter, count and ?fields=, and 404 on a single-row
+# read with ?fields=.
+custom_field_named_with_a_reserved_word:
+  as_user: "admin@reserved.test"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/_schema/plans/fields"
+      json: {name: "order", type: "INTEGER"}
+      bearer: true
+      expect: {status: 201}
+    - api: "POST /api/_schema/plans/fields"
+      json: {name: "group", type: "TEXT"}
+      bearer: true
+      expect: {status: 201}
+    - api: "POST /api/_schema/plans/fields"
+      json: {name: "select", type: "TEXT"}
+      bearer: true
+      expect: {status: 201}
+    - api: "POST /api/plans"
+      json: {title: "cf b", order: 2, group: "g1", select: "x"}
+      save: {b: "id"}
+      expect: {status: 200}
+    - api: "POST /api/plans"
+      json: {title: "cf a", order: 1, group: "g1", select: "y"}
+      expect: {status: 200}
+    - get: "/api/plans?group=g1&sort=order&order=asc&fields=title,order"
+      expect:
+        status: 200
+        contains: '[{"order":1,"title":"cf a"},{"order":2,"title":"cf b"}]'
+    - get: "/api/plans?where[order]=2&fields=id,select"
+      expect:
+        status: 200
+        contains: '"select":"x"'
+        not_contains: '"select":"y"'
+    - get: "/api/plans?select=x&count=true"
+      expect:
+        status: 200
+        json: {count: 1}
+    - get: "/api/plans/{{b}}?fields=title,select,group,order"
+      expect:
+        status: 200
+        contains: '{"group":"g1","order":2,"select":"x","title":"cf b"}'
+    - api: "PATCH /api/plans/{{b}}"
+      json: {order: 5, select: "z"}
+      expect: {status: 200}
+    - get: "/api/plans?order__gte=5&fields=select"
+      expect:
+        status: 200
+        contains: '[{"select":"z"}]'
+
+# A table named with a reserved word (@@map("order")).
+table_named_with_a_reserved_word:
+  as_user: "table@reserved.test"
+  steps:
+    - api: "POST /api/order"
+      json: {title: "second order", index: 2}
+      save: {second: "id"}
+      expect: {status: 200}
+    - api: "POST /api/order/batch"
+      json_array:
+        - {title: "first order", index: 1}
+        - {title: "third order", index: 3}
+      expect: {status: 200}
+    - get: "/api/order?sort=index&order=asc&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"first order"},{"title":"second order"},{"title":"third order"}]'
+    - get: "/api/order?index__gte=2&count=true"
+      expect:
+        status: 200
+        json: {count: 2}
+    - get: "/api/order?q=third&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"third order"}]'
+    - get: "/api/order?cursor=0&limit=2&fields=index"
+      expect:
+        status: 200
+        contains: '"data":[{"index":2},{"index":1}]'
+    - api: "PATCH /api/order/{{second}}"
+      json: {title: "second order, edited", index: 5}
+      expect: {status: 200}
+    - get: "/api/order/{{second}}?fields=index,title"
+      expect:
+        status: 200
+        contains: '{"index":5,"title":"second order, edited"}'
+    - get: "/api/order/{{second}}/versions/1?fields=index"
+      expect:
+        status: 200
+        contains: '{"index":2}'
+    - api: "POST /api/_query"
+      json:
+        table: "order"
+        select: ["title"]
+        where: {index: {gte: 3}}
+        order_by: [{col: "index", dir: "asc"}]
+      expect:
+        status: 200
+        contains: '"title":"third order"'
+        not_contains: '"title":"first order"'
+    - api: "DELETE /api/order/{{second}}"
+      json: {}
+      expect: {status: 200}
+    - get: "/api/order?count=true"
+      expect:
+        status: 200
+        json: {count: 2}
+    - api: "POST /api/order/{{second}}/restore"
+      json: {}
+      expect: {status: 200}
+    - sql: 'SELECT id FROM "order" WHERE deleted_at IS NULL'
+      expect: {rows: 3}

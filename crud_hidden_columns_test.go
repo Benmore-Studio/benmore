@@ -114,7 +114,7 @@ func TestSensitiveColumnsHiddenOnEveryReadSurface(t *testing.T) {
 
 // A *_hash column is a credential only when it hashes one (a code, token,
 // password...). Content checksums are ordinary data apps display and compare;
-// hiding them broke change-ledger style apps in 2.7.237.
+// hiding them broke apps that keep a ledger of changes in 2.7.237.
 func TestHashColumnsHiddenOnlyForCredentials(t *testing.T) {
 	for _, col := range []string{"password_hash", "code_hash", "otp_code_hash", "token_hash", "reset_hash", "api_key_hash", "pin_hash", "session_hash"} {
 		if !appSecretColumn(nil, "t", col) {

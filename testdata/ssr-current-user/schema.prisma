@@ -1,0 +1,8 @@
+model Note {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  title     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("notes")
+}

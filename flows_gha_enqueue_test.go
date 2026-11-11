@@ -13,6 +13,9 @@ const ghaEnqueueFixture = `on:
 jobs:
   queue:
     steps:
+      - id: read
+        run: sql
+        query: "SELECT 'owned' AS label"
       - id: queued
         run: enqueue
         with:
@@ -28,7 +31,13 @@ func parsedEnqueue(t *testing.T, source string) FlowStep {
 	if err := yamlUnmarshal([]byte(source), &file); err != nil {
 		t.Fatal(err)
 	}
-	return convertGHASteps(file.Jobs["queue"].Steps)[0]
+	for _, step := range convertGHASteps(file.Jobs["queue"].Steps) {
+		if step.Type == "enqueue" {
+			return step
+		}
+	}
+	t.Fatal("no enqueue step")
+	return FlowStep{}
 }
 
 func TestGHAEnqueueMapsCanonicalTransactionAndActiveUniqueKey(t *testing.T) {

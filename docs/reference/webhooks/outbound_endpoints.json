@@ -1,0 +1,5 @@
+[
+  "POST /api/_webhooks    body: { url, secret, tables?: 'notes,tasks', events?: 'insert,update,delete' } - tables and events are comma-separated strings (empty = all); an event name other than insert/update/delete is refused (400). Answers 201 `{id, status: 'created'}`. `url` and `secret` are required (400); a URL on a private or internal address is refused (400 `url must not point to a private or internal address`); at most 10 subscriptions per user (429 `maximum 10 webhooks per user`)",
+  "GET /api/_webhooks - the signing secret is listed masked (`****` plus its last 4 characters; a secret under 16 characters shows only `****`). Each row has `status`: `active`, `inactive`, or `secret_unreadable` with a `fix` text (see secret_storage)",
+  "DELETE /api/_webhooks/{id}"
+]

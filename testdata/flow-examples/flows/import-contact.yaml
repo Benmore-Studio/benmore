@@ -1,0 +1,33 @@
+# flows/import-contact.yaml - one outbound call: retried, a 404 handled, a failure recorded
+on:
+  request:
+    method: POST
+    path: /api/crm/contacts/:external_id/import
+    auth: required
+jobs:
+  import:
+    steps:
+      - id: c
+        run: api
+        retry: 3                        # three attempts in all
+        retry_delay: 500ms
+        with:
+          url: https://api.example.com/v1/contacts/${{ params.external_id }}
+          headers: { Authorization: "Bearer ${{ env.CRM_TOKEN }}" }
+          handled_statuses: [404]       # a 404 is an answer here; any other 4xx fails the step
+        on_error:                       # runs once, after the last attempt failed
+          - run: sql
+            with:
+              query: "INSERT INTO flow_failures (flow, detail) VALUES ('import-contact', :detail)"
+              params: { detail: "${{ error }}" }
+          - run: respond
+            with: { status: 503, json: { error: crm_unavailable } }
+      - if: ${{ steps.c.outputs.status }} == 404
+        run: respond
+        with: { status: 404, json: { error: contact_not_found } }
+      - run: sql
+        with:
+          query: "INSERT INTO contacts (external_id, name, email) VALUES (:ext, :name, :email) ON CONFLICT (external_id) DO UPDATE SET name = excluded.name, email = excluded.email"
+          params: { ext: "${{ steps.c.outputs.json.id }}", name: "${{ steps.c.outputs.json.name }}", email: "${{ steps.c.outputs.json.email || '' }}" }
+      - run: respond
+        with: { status: 200, json: { imported: "${{ steps.c.outputs.json.id }}" } }

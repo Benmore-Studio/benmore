@@ -1,0 +1,6 @@
+benmore import <app> <table> <file>              # CSV, NDJSON/.jsonl/.json, optionally .gz
+benmore import <app> notes notes.csv --owner ada@example.com   # rows owned by that app user
+benmore import <app> --sql <dump.sql[.gz]>       # Mode B: owner-only SQL restore
+benmore import <app> <table> <file> --dir PATH   # self-hosted target (<app> is an http(s):// URL)
+
+benmore import myapp catalog_products products.csv

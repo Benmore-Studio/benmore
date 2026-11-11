@@ -21,6 +21,9 @@ package main
 //              as: t
 //              steps:
 //                - email: { to: "{{t.email}}", template: "digest" }
+//        - id: expire_holds
+//          schedule: "every 15m"
+//          sql: "UPDATE holds SET expired = 1 WHERE until < datetime('now')"
 //
 //   2. Map shape (job-name → config, like flows.yaml top-level):
 //
@@ -31,6 +34,12 @@ package main
 //      sync_carriers:
 //        schedule: "every 15m"
 //        flow: sync_all         # reference a flow by name from flows.yaml
+//
+// Each job does exactly one of: `flow:` (a flow by name), `sql:` (one
+// statement, shorthand for a one-step `run:`), or an inline step list
+// (`run:`, or its alias `steps:`). Both shapes take the same keys; the
+// jobs list adds `id:`. (`sql:` used to work in the map shape only: in a
+// jobs list it was dropped and the job was refused as having no action.)
 //
 // The `flow: <name>` form looks up a named flow at execution time and
 // runs its steps. Eliminates step duplication between cron.yaml and
@@ -46,6 +55,7 @@ package main
 // context from a previous step instead.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -74,6 +84,7 @@ type CronJob struct {
 	// safe by default while letting idempotent work request retries
 	// (review finding #2).
 	MaxAttempts int
+	Monitor     *CronMonitor
 }
 
 // CronConfig holds an app's parsed cron.yaml. Stored on App so the
@@ -97,7 +108,9 @@ type cronJobYAML struct {
 	Run         []FlowStepYAML `yaml:"run"`
 	Steps       []FlowStepYAML `yaml:"steps"`
 	Flow        string         `yaml:"flow"`         // optional: reference a named flow from flows.yaml
+	SQL         string         `yaml:"sql"`          // one-liner shortcut, as in the map shape
 	MaxAttempts int            `yaml:"max_attempts"` // optional: opt into at-least-once retries (>1); default 1 = at-most-once
+	Monitor     *CronMonitor   `yaml:"monitor"`
 }
 
 type cronConfigYAML struct {
@@ -118,6 +131,7 @@ type cronMapEntry struct {
 	Flow        string         `yaml:"flow"`
 	SQL         string         `yaml:"sql"`          // one-liner shortcut
 	MaxAttempts int            `yaml:"max_attempts"` // optional: opt into at-least-once retries (>1); default 1 = at-most-once
+	Monitor     *CronMonitor   `yaml:"monitor"`
 }
 
 // LoadCron is the compatibility wrapper. Startup and reload propagate parse errors.
@@ -141,6 +155,9 @@ func parseCronYAML(data []byte) (*CronConfig, error) {
 	}
 	if len(shape) == 0 {
 		return nil, nil
+	}
+	if err := validateCronMonitorShape(shape); err != nil {
+		return nil, err
 	}
 	var jobs []cronJobYAML
 	if _, array := shape["jobs"]; array {
@@ -167,13 +184,7 @@ func parseCronYAML(data []byte) (*CronConfig, error) {
 		sort.Strings(names)
 		for _, name := range names {
 			entry := config[name]
-			if entry.SQL != "" {
-				if len(entry.Run) > 0 || len(entry.Steps) > 0 || entry.Flow != "" {
-					return nil, fmt.Errorf("cron.yaml: %s mixes sql with another action", name)
-				}
-				entry.Run = []FlowStepYAML{{SQL: entry.SQL}}
-			}
-			jobs = append(jobs, cronJobYAML{ID: name, Schedule: entry.Schedule, Run: entry.Run, Steps: entry.Steps, Flow: entry.Flow, MaxAttempts: entry.MaxAttempts})
+			jobs = append(jobs, cronJobYAML{ID: name, Schedule: entry.Schedule, Run: entry.Run, Steps: entry.Steps, Flow: entry.Flow, SQL: entry.SQL, MaxAttempts: entry.MaxAttempts, Monitor: entry.Monitor})
 		}
 	}
 	if len(jobs) == 0 {
@@ -199,8 +210,17 @@ func parseCronYAML(data []byte) (*CronConfig, error) {
 		if len(steps) == 0 {
 			steps = j.Steps
 		}
+		if j.SQL != "" {
+			if len(steps) > 0 || j.Flow != "" {
+				return nil, fmt.Errorf("cron.yaml: %s mixes sql with another action", j.ID)
+			}
+			steps = []FlowStepYAML{{SQL: j.SQL}}
+		}
 		if (j.Flow == "") == (len(steps) == 0) {
-			return nil, fmt.Errorf("cron.yaml: %s requires either flow or inline steps", j.ID)
+			if j.Flow != "" {
+				return nil, fmt.Errorf("cron.yaml: %s mixes flow with inline steps; use one", j.ID)
+			}
+			return nil, fmt.Errorf("cron.yaml: %s has nothing to run: give it one of flow: <flow name>, sql: \"<statement>\", or run: [steps]", j.ID)
 		}
 		if j.MaxAttempts < 0 {
 			return nil, fmt.Errorf("cron.yaml: %s max_attempts must not be negative", j.ID)
@@ -209,7 +229,7 @@ func parseCronYAML(data []byte) (*CronConfig, error) {
 		if err := checkConvertedSteps(converted); err != nil {
 			return nil, fmt.Errorf("cron.yaml: %s: %w", j.ID, err)
 		}
-		out.Jobs = append(out.Jobs, CronJob{ID: j.ID, Schedule: j.Schedule, Steps: converted, Flow: j.Flow, MaxAttempts: j.MaxAttempts})
+		out.Jobs = append(out.Jobs, CronJob{ID: j.ID, Schedule: j.Schedule, Steps: converted, Flow: j.Flow, MaxAttempts: j.MaxAttempts, Monitor: j.Monitor.enabled()})
 	}
 	return out, nil
 }
@@ -309,6 +329,9 @@ func StartCronScheduler(app *App) {
 	if app.Cron == nil || len(app.Cron.Jobs) == 0 {
 		return
 	}
+	app.mu.RLock()
+	warnCronFlowRefs(app)
+	app.mu.RUnlock()
 	// Ensure the persistence table exists. Best-effort - if it fails
 	// (read-only DB, weird perms) we fall back to in-memory and just
 	// lose the restart-survival guarantee. Cron still fires.
@@ -454,7 +477,10 @@ func ensureCronStateTable(app *App) error {
 
 // persistCronFire upserts the last_fire time for a job. Best-effort:
 // failure here just means a future restart might re-fire the job, not
-// a runtime crash. Logged but not returned.
+// a runtime crash. Logged but not returned. It only moves last_fire
+// forward: a cluster sibling whose clock runs behind would otherwise write
+// an older fire over a newer one and re-fire an `every` job early.
+// (RFC3339 UTC text is fixed-width, so the text comparison is a time one.)
 func persistCronFire(app *App, jobID string, t time.Time) {
 	if app == nil || app.DB == nil {
 		return
@@ -463,6 +489,7 @@ func persistCronFire(app *App, jobID string, t time.Time) {
 		INSERT INTO _benmore_cron_state (job_id, last_fire, updated_at)
 		VALUES (?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(job_id) DO UPDATE SET last_fire = excluded.last_fire, updated_at = CURRENT_TIMESTAMP
+		WHERE excluded.last_fire > _benmore_cron_state.last_fire
 	`, jobID, t.UTC().Format(time.RFC3339))
 	if err != nil {
 		log.Printf("cron: persist last_fire for %s failed: %s", jobID, err)
@@ -494,6 +521,7 @@ func (s *cronState) tick(app *App, now time.Time) {
 		stamp := now.Truncate(time.Minute)
 		if _, _, err := EnqueueCronJob(app.DB, j.ID, cronUniqueKey(j.ID, stamp), cronPayload(j, stamp), &stamp, cronMaxAttempts(j)); err != nil {
 			log.Printf("cron: enqueue %s failed: %s", j.ID, err)
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_enqueue", Message: jobErrorText(app, err.Error()), Handled: true, Tags: map[string]string{"cron": j.ID}})
 			continue
 		}
 		// Persist AFTER the queue row exists. If the process dies after
@@ -567,6 +595,7 @@ func executeCronJob(app *App, cronID string, data map[string]any) error {
 		// for work that simply no longer exists - mirroring the original
 		// goroutine path's log-and-skip intent (review finding #3).
 		log.Printf("CRON [%s] definition not found (removed/renamed) - completing as no-op", cronID)
+		reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "warning", Type: "cron_missing", Message: "cron definition not found", Handled: true, Tags: map[string]string{"cron": cronID}})
 		return nil
 	}
 	return runCronJob(app, j, data)
@@ -594,9 +623,12 @@ func findCronJob(app *App, cronID string) (CronJob, bool) {
 }
 
 func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
+	finishMonitor := beginCronMonitor(app, j)
+	defer func() { finishMonitor(err) }()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("CRON [%s] panic: %v", j.ID, r)
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "fatal", Type: "cron_panic", Message: jobErrorText(app, fmt.Sprint(r)), Mechanism: "panic", Frames: goFrames(1), Tags: map[string]string{"cron": j.ID}})
 			err = fmt.Errorf("cron %s panic: %v", j.ID, r)
 		}
 	}()
@@ -633,10 +665,12 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		}
 		if found == nil {
 			log.Printf("CRON [%s] flow %q not found in flows.yaml - skipping fire", j.ID, j.Flow)
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_flow_missing", Message: "cron flow not found", Handled: true, Tags: map[string]string{"cron": j.ID, "flow": j.Flow}})
 			return fmt.Errorf("flow not found: %s", j.Flow)
 		}
 		if len(found.Steps) == 0 {
 			log.Printf("CRON [%s] flow %q has zero steps - skipping fire", j.ID, j.Flow)
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_flow_empty", Message: "cron flow has zero steps", Handled: true, Tags: map[string]string{"cron": j.ID, "flow": j.Flow}})
 			return fmt.Errorf("flow %s has zero steps", j.Flow)
 		}
 		steps = found.Steps
@@ -652,10 +686,11 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		ctxData[k] = v
 	}
 	ctx := &FlowContext{
-		App:    app,
-		Data:   ctxData,
-		Params: map[string]string{},
-		Writes: newFlowWriteLog(),
+		App:           app,
+		Data:          ctxData,
+		Params:        map[string]string{},
+		Writes:        newFlowWriteLog(),
+		backgroundRun: true,
 	}
 
 	// Begin a transaction when the resolved flow asked for one, so SQL steps
@@ -674,8 +709,9 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 	// rolls back) BEFORE the outer recover() defer runs.
 	var guard *txCommitGuard
 	if wantTx {
-		tx, txErr := app.DB.Begin()
+		tx, txErr := app.DB.BeginTx(withWriteTxLabel(context.Background(), "cron:"+j.ID), nil)
 		if txErr != nil {
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_transaction", Message: jobErrorText(app, txErr.Error()), Handled: true, Tags: map[string]string{"cron": j.ID}})
 			return fmt.Errorf("cron %s: begin transaction: %w", j.ID, txErr)
 		}
 		ctx.Tx = tx
@@ -695,9 +731,11 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 			if rbErr != nil && rbErr != sql.ErrTxDone {
 				log.Printf("CRON [%s] tx rollback error: %s", j.ID, rbErr)
 			}
-			log.Printf("CRON [%s] rolled back (step %q failed): %s", j.ID, ctx.FailedStep, ctx.Error)
+			failure := flowRunFailure(ctx, ctx.Error)
+			log.Printf("CRON [%s] rolled back (step %q failed): %s", j.ID, ctx.FailedStep, failure)
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_step", Message: failure.Error(), Handled: true, Tags: map[string]string{"cron": j.ID, "step": ctx.FailedStep}})
 			announceFlowWrites(ctx, false)
-			return ctx.Error
+			return failure
 		}
 		commitErr := ctx.Tx.Commit()
 		// Whether Commit succeeded or failed, the tx is done from
@@ -706,16 +744,21 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 		guard.MarkHandled()
 		announceFlowWrites(ctx, commitErr == nil)
 		if commitErr != nil {
+			reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_transaction", Message: jobErrorText(app, commitErr.Error()), Handled: true, Tags: map[string]string{"cron": j.ID}})
 			return fmt.Errorf("cron %s: commit transaction: %w", j.ID, commitErr)
 		}
 		return nil
 	}
 
 	announceFlowWrites(ctx, false)
-	if ctx.Error != nil {
-		log.Printf("CRON [%s] step %q failed: %s", j.ID, ctx.FailedStep, ctx.Error)
+	// Logged, reported and returned (then stored on the job) redacted, as
+	// the synchronous path logs a flow failure.
+	failure := flowRunFailure(ctx, ctx.Error)
+	if failure != nil {
+		log.Printf("CRON [%s] step %q failed: %s", j.ID, ctx.FailedStep, failure)
+		reportError(app, errorEvent{Source: "server", Kind: "cron", Level: "error", Type: "cron_step", Message: failure.Error(), Handled: true, Tags: map[string]string{"cron": j.ID, "step": ctx.FailedStep}})
 	}
-	return ctx.Error
+	return failure
 }
 
 // cronShouldFire evaluates the schedule expression against `now`.

@@ -1,0 +1,13 @@
+# benmore test fails a test it cannot read in full without running it, and
+# still runs loads.yaml. Each file named here holds one test that reported
+# PASS before, with the part the runner did not read left out: a result is
+# listed by its file's name without the directory and the extension.
+misspelled_expect
+misspelled_steps
+unknown_expect_key
+no_steps
+step_without_action
+unknown_setup_key
+two_actions
+expect_on_sql_step
+number_under_contains

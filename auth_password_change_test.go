@@ -324,7 +324,7 @@ func TestRequiredPasswordChangeAfterOTPVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Synthetic proof exercises the existing OTP completion path without mail.
-	passwordChangeExec(t, app.DB, "CREATE TABLE _benmore_otp (email TEXT,code TEXT,attempts INTEGER DEFAULT 0,expires_at DATETIME)")
+	passwordChangeExec(t, app.DB, "CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT,code TEXT,attempts INTEGER DEFAULT 0,expires_at DATETIME)")
 	passwordChangeExec(t, app.DB, "INSERT INTO _benmore_otp(email,code,expires_at) VALUES (?,'123456',datetime('now','+10 minutes'))", email)
 	r := httptest.NewRequest("POST", app.Paths.VerifyOTP, strings.NewReader("code=123456"))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")

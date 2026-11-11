@@ -1,0 +1,6 @@
+[
+  "benmore email <app>                          # status: default sender, quota, 7d stats, domains, pause state",
+  "benmore email-domain <app> add <domain>      # register + get DKIM DNS records",
+  "benmore email-domain <app> verify <domain>   # re-check now",
+  "benmore email-domain <app> remove <domain>"
+]

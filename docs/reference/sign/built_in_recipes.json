@@ -1,0 +1,76 @@
+[
+  {
+    "name": "aws_sigv4",
+    "use_for": "Athena, S3, Bedrock, DynamoDB, SES - any AWS API",
+    "env_vars": [
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY"
+    ],
+    "bindings": [
+      "region",
+      "service"
+    ],
+    "outputs": "None. Sets `Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=host;x-amz-date, Signature=...` and `X-Amz-Date` on the request. A `sign:` block is either `recipe:` + bindings or inline `compute:`/`headers:`/`before:`/`query:`, never both, so the recipe's internal values cannot be read from your own compute.",
+    "yaml": "- run: api\n  with:\n    url: https://athena.us-east-1.amazonaws.com/\n    method: POST\n    sign:\n      recipe: aws_sigv4\n      region: us-east-1\n      service: athena\n    headers:\n      X-Amz-Target: AmazonAthena.StartQueryExecution\n      Content-Type: application/x-amz-json-1.1\n    json:\n      QueryString: \"SELECT * FROM shipments LIMIT 10\"\n      WorkGroup: primary",
+    "note": "Static IAM keys only - STS session tokens are not supported."
+  },
+  {
+    "name": "stripe_webhook_hmac",
+    "use_for": "Outbound Stripe-style webhook signing - t=...,v1=hmac(t.body)",
+    "env_vars": [
+      "STRIPE_WEBHOOK_SECRET"
+    ],
+    "outputs": "None. Sets the `Stripe-Signature: t=<ts>,v1=<hmac>` header on the request.",
+    "yaml": "- run: api\n  with:\n    url: https://api.example.com/webhooks/inbound\n    method: POST\n    sign:\n      recipe: stripe_webhook_hmac\n    json:\n      event: \"{{event}}\""
+  },
+  {
+    "name": "hmac_sha256_body",
+    "use_for": "Generic HMAC-SHA256 over the body, hex-encoded.",
+    "params": [
+      "secret (optional - defaults to env.WEBHOOK_SECRET)",
+      "header (optional - defaults to X-Signature)",
+      "prefix (optional - defaults to '')"
+    ],
+    "env_vars": [
+      "WEBHOOK_SECRET (fallback if no `secret:` passed)"
+    ],
+    "outputs": "None. Sets the `<header>: <prefix><hmac-hex>` header on the request (default `X-Signature: <hex>`).",
+    "yaml": "# Per-integration secret - recommended when one app talks to several\n# HMAC-auth partners (each with its own secret).\n- run: api\n  with:\n    url: ${{ env.SHIPPING_URL }}/shipments\n    method: POST\n    sign:\n      recipe: hmac_sha256_body\n      secret: \"${{ env.SHIPPING_SECRET }}\"\n    json: { limit: 500 }\n\n# GitHub-style: custom header name and \"sha256=\" prefix.\n- run: api\n  with:\n    url: https://api.github.com/repos/o/r/hooks/test\n    method: POST\n    sign:\n      recipe: hmac_sha256_body\n      secret: \"${{ env.GITHUB_WEBHOOK_SECRET }}\"\n      header: X-Hub-Signature-256\n      prefix: \"sha256=\""
+  },
+  {
+    "name": "oauth_client_credentials",
+    "use_for": "Auth0 / Okta / Stripe Connect M2M / Salesforce - POST creds to a token URL, cache the Bearer until expiry",
+    "env_vars": [
+      "OAUTH_CLIENT_ID",
+      "OAUTH_CLIENT_SECRET"
+    ],
+    "bindings": [
+      "token_url",
+      "scope (optional)"
+    ],
+    "outputs": {
+      "header_set": "Authorization: Bearer <access_token>",
+      "recipe_internal_bindings": [
+        "access_token - the token returned by the token endpoint",
+        "ttl - expires_in value (seconds), populated when the token endpoint returns it"
+      ],
+      "note": "access_token and ttl are internal to the recipe: a `sign:` block cannot combine `recipe:` with its own `compute:`/`headers:`, and bindings do not cross step boundaries. To use the token in your own headers or compute, copy the before/extract shape from before_step_example into an inline block; a later step that needs a token you already hold in env uses the bearer_token recipe."
+    },
+    "yaml": "- run: api\n  with:\n    url: https://api.example.com/v1/resource\n    method: GET\n    sign:\n      recipe: oauth_client_credentials\n      token_url: https://auth.example.com/oauth/token\n      scope: read:resources",
+    "note": "Token caches bind the app, rendered request credentials and extraction schema as well as cache_key. Credential changes force a new exchange. Token URLs must pass public-address checks and guarded dialing/redirects; private/internal token endpoints are rejected. Cache lifetime is capped at 24 hours with an expiry buffer. Request input may not choose the scheme or host of the token URL (it receives OAUTH_CLIENT_SECRET) - the same rule as the API `url:`. Keep `token_url` literal or in env; a request value is allowed only in its path or query, where it is escaped. The rule also covers an inline `before.request.url` built from sign bindings; request input inside a composed one (`https://{{params.x}}.auth…`) is refused."
+  },
+  {
+    "name": "bearer_token",
+    "use_for": "Long-lived API token already issued elsewhere - just attach as Bearer.",
+    "params": [
+      "token (optional - defaults to env.API_TOKEN)",
+      "header (optional - defaults to Authorization)",
+      "prefix (optional - defaults to 'Bearer ' when omitted; `prefix: \"\"` sends the raw token, e.g. with `header: x-api-key`)"
+    ],
+    "env_vars": [
+      "API_TOKEN (fallback if no `token:` passed)"
+    ],
+    "outputs": "None. Sets the `<header>: <prefix><token>` header on the request (default `Authorization: Bearer <token>`).",
+    "yaml": "# Per-integration token - recommended when one app talks to several\n# Bearer-auth APIs (each with its own token name in env).\n- run: api\n  with:\n    url: ${{ env.FREIGHTWISE_URL }}/customers\n    method: GET\n    sign:\n      recipe: bearer_token\n      token: \"${{ env.FREIGHTWISE_API_TOKEN }}\""
+  }
+]

@@ -21,7 +21,10 @@ package main
 //                       + Go html/template parse (for gotmpl pages)
 //
 //   schema.prisma       ParsePrismaSchema - surface parse errors with
-//                       the model name and the offending line
+//                       the model name and the offending line; a first
+//                       model that would take the place of the app's
+//                       schema.sql while leaving out tables it declares
+//                       (schema_file_switch.go)
 //
 //   flows.yaml          LoadFlowsGHA (or legacy parser); reject empty
 //                       jobs/triggers; reject step types we don't know
@@ -35,8 +38,22 @@ package main
 //   *.yaml              gets a fallback YAML syntax check so a missing
 //                       colon doesn't silently break the app at boot
 //
+//   schema.yaml         shorthand that would replace a hand-written
+//                       schema.sql while leaving out tables it declares
+//                       (schema_file_switch.go)
+//
 //   app.yaml            validateAppYAML (existing) - unknown top-level
 //                       keys, unknown auth.* keys, etc.
+//
+//   schema.prisma, schema.sql, app.yaml, encrypted.yaml, computed.yaml
+//                       encrypted, versioned and computed tables/columns
+//                       the load would not find, in the file or broken by
+//                       it in another (validators_load_refs.go)
+//
+//   schema.prisma, app.yaml, encrypted.yaml, computed.yaml
+//                       computed expr:/sql: and app.yaml aggregates: that
+//                       read an encrypted column, which they would compute
+//                       on as ciphertext (validators_encrypted_compute.go)
 
 import (
 	"errors"
@@ -192,14 +209,81 @@ func autoFixMissingWhereTrue(content string) (int, string) {
 // cross-file checks resolve correctly even when the file's path is
 // relative. The CLI's RunCompleteCheck passes the app dir likewise.
 func ValidateOnWriteIn(appDir, path, content string) string {
+	return validateOnWriteIn(appDir, path, content, true)
+}
+
+// ValidateOnWriteInPending is ValidateOnWriteIn for a write that defers its
+// reload to later writes of the same batch: pending names those files. A
+// reference the app's load refuses that this write breaks in one of them is
+// left to that file's own write (validators_load_refs.go); excused lists
+// those files, for the write's answer.
+func ValidateOnWriteInPending(appDir, path, content string, pending []string) (string, []string) {
+	return ValidateOnWriteInBatch(appDir, path, content, true, pending)
+}
+
+// ValidateOnWriteInBatch is the write gate of write_file. deferred: the write
+// defers its reload to later writes of its batch (reload:false), which may
+// supply a module a bundle imports or a partial a page includes, so those
+// are left to the post-write check (bundle_check.go, include_check.go);
+// pending is as for ValidateOnWriteInPending.
+func ValidateOnWriteInBatch(appDir, path, content string, deferred bool, pending []string) (string, []string) {
+	var set map[string]bool
+	if deferred {
+		set = map[string]bool{}
+		for _, p := range pending {
+			set[filepath.ToSlash(filepath.Clean(p))] = true
+		}
+	}
+	return validateOnWriteInPending(appDir, path, content, true, deferred, set)
+}
+
+// validateOnWriteIn is the dispatcher. gate runs the write gate's per-file
+// preflights that `benmore check` runs app-wide instead: flow routes
+// (flowRouteCollisionFindings), browser bundles (bundleCheckFindings) and
+// <include> targets (includeCheckFindings), all in app_check.go.
+func validateOnWriteIn(appDir, path, content string, gate bool) string {
+	msg, _ := validateOnWriteInPending(appDir, path, content, gate, false, nil)
+	return msg
+}
+
+// cleanWritePath is the path a write lands at (safeJoin cleans it), in slash
+// form. The validators are chosen by the path's base name and extension, so
+// they must judge this form: `flows.yaml/.` has base "." and skipped every
+// typed validator while the file landed at flows.yaml.
+func cleanWritePath(path string) string {
+	if path == "" {
+		return path
+	}
+	return filepath.ToSlash(filepath.Clean(path))
+}
+
+func validateOnWriteInPending(appDir, path, content string, gate, deferred bool, pending map[string]bool) (string, []string) {
+	verdict, excused := writeGateVerdict(appDir, path, content, gate, deferred, pending)
+	return verdict.Refusal, excused
+}
+
+// writeGateVerdict runs the validators on one file. Its verdict holds the
+// refusal as the validators word it and, for the text a refused write
+// answers, the same with the documentation address of each issue's rule
+// (refusal_docs.go). Every issue is raised through add with its rule.
+func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending map[string]bool) (gateVerdict, []string) {
+	path = cleanWritePath(path)
 	base := strings.ToLower(filepath.Base(path))
 	ext := strings.ToLower(filepath.Ext(path))
+
+	var issues []string
+	rules := map[int]gateRule{} // the rule behind issues[i]
+	add := func(rule gateRule, msg string) {
+		rules[len(issues)] = rule
+		issues = append(issues, msg)
+	}
 
 	// Path-based hard rejects. These fire BEFORE any content inspection
 	// because the file's existence itself is the violation - there's
 	// no "right" content for a package.json in a Benmore app.
 	if msg := validateForbiddenPath(path); msg != "" {
-		return msg
+		add(gateForbiddenPath, msg)
+		return newGateVerdict(issues, rules, nil, ""), nil
 	}
 
 	// Refuse over-budget YAML once before credential scans and the independent
@@ -208,65 +292,95 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 	// write gate itself expensive. Syntax errors still go to normal validators.
 	if ext == ".yaml" || ext == ".yml" {
 		if err := checkYAMLShape([]byte(content)); err != nil {
-			return fmt.Sprintf("yaml resource limit in %s: %v\n\n%s", path, err, writeRejectionFooter)
+			add(gateYAMLLimit, fmt.Sprintf("yaml resource limit in %s: %v", path, err))
+			return newGateVerdict(issues, rules, nil, writeRejectionFooter), nil
 		}
 	}
-
-	var issues []string
 
 	// Hardcoded-credential gate (any file type): a committed secret leaks into
 	// per-app git history. High-confidence shapes only, so a normal push is
 	// never blocked by a false positive.
 	if msg := validateNoCommittedSecrets(path, content); msg != "" {
-		issues = append(issues, msg)
+		add(gateSecret, msg)
 	}
 
-	// React+TS source files (src/*.tsx, *.jsx, *.ts, *.js) get the SPA
+	// TS/JS source files (src/*.tsx, *.jsx, *.ts, *.js) get the browser
 	// antipattern sweep. Same detectFrameworkAntipatterns dispatcher
 	// the .html branch uses, so cross-file antipatterns (CDN imports,
 	// ReactDOM.createRoot, etc.) surface in the same shape.
 	if isSPASourceFile(path) {
 		if msg := detectFrameworkAntipatterns(path, content); msg != "" {
-			issues = append(issues, msg)
+			add(gateBrowserSource, msg)
+		}
+	}
+	if msg := hipaaUploadKindProblem(appDir, path, content); msg != "" { // compliance.go
+		add(gateHIPAAUpload, msg)
+	}
+	if msg := validateScriptSyntax(path, content); msg != "" {
+		add(gateScriptSyntax, msg)
+	} else if gate {
+		// The bundles this file is part of must build: every import inside
+		// static/ and resolvable (bundle_check.go).
+		if msg := bundleWriteRefusal(appDir, path, content, deferred); msg != "" {
+			add(gateBundle, msg)
 		}
 	}
 
 	switch {
 	case ext == ".html":
 		if msg := validatePageContract(path, content); msg != "" {
-			issues = append(issues, msg)
+			add(gatePage, msg)
+		}
+		// A root page's filename is its route: a `:` must be a well-formed
+		// path parameter that registers (page_path_params.go).
+		if msg := validatePageRouteFile(appDir, path); msg != "" {
+			add(gatePageRoute, msg)
 		}
 		// gotmpl-specific: compile the body with html/template to
 		// catch syntax errors before render. Strip frontmatter first
 		// so YAML doesn't confuse the parser.
 		if msg := validateGotmplParseIn(appDir, path, content); msg != "" {
-			issues = append(issues, msg)
+			add(gateGotmpl, msg)
 		}
 		// engine-mode mixup: raw pages that contain {{ template syntax
 		// or gotmpl pages that contain SPA-only constructs. Both
 		// silently fail to render the way the agent intended.
 		if msg := validateEngineMixup(path, content); msg != "" {
-			issues = append(issues, msg)
+			add(gatePageEngine, msg)
 		}
 		// <video autoplay> without muted = the iOS / Chrome autoplay
 		// block. Black screen until the user finds the hidden play
 		// button on the element. Surfaces in livestream apps the agent writes.
 		if msg := validateVideoAutoplay(path, content); msg != "" {
-			issues = append(issues, msg)
+			add(gateVideoAutoplay, msg)
+		}
+		// <include> tags the runtime would leave unexpanded or render as an
+		// "Include error" (include_check.go).
+		if gate {
+			if msg := includeWriteRefusal(appDir, path, content, deferred); msg != "" {
+				add(gateInclude, msg)
+			}
 		}
 
 	case base == "schema.prisma":
 		if msg := validateSchemaPrisma(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateSchemaPrisma, msg)
 		}
 		if appDir != "" {
 			if msg := validateFulltextEncryptedConflict(content, LoadEncryptedFieldsConfig(appDir), nil); msg != "" {
-				issues = append(issues, msg)
+				add(gateFulltextEnc, msg)
 			}
 			// A schema edit can turn a member-of child into a table the
 			// rule no longer fits (validators_authz.go).
 			if msg := validateMemberOfShape(readAppFileOrNil(appDir, "app.yaml"), []byte(content)); msg != "" {
-				issues = append(issues, msg)
+				add(gateMemberOfShape, msg)
+			}
+			// The first model in the schema.prisma of an app whose schema
+			// is schema.sql replaces that schema (schema_file_switch.go).
+			if strings.EqualFold(appRelativeFile(appDir, path), "schema.prisma") {
+				if msg := schemaPrismaSwitchRefusal(appDir, content); msg != "" {
+					add(gateSchemaFile, msg)
+				}
 			}
 		}
 
@@ -274,13 +388,19 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 		if commandDeclarationPresent(content) {
 			commandPath, pathErr := commandWritePath(appDir, path)
 			if pathErr != nil {
-				issues = append(issues, pathErr.Error())
+				add(gateCommandFlow, pathErr.Error())
 			} else {
 				definitions, err := appMCPSchemaTableDefinitions(appDir)
 				if err != nil {
-					issues = append(issues, fmt.Sprintf("command schema inventory: %v", err))
-				} else if _, err := parseFlowCommandFileColumns(commandPath, []byte(content), eligibleCRUDTables(definitions), commandColumnInventory(definitions)); err != nil {
-					issues = append(issues, fmt.Sprintf("command declaration: %v", err))
+					add(gateCommandFlow, fmt.Sprintf("command schema inventory: %v", err))
+				} else if flow, err := parseFlowCommandFileColumns(commandPath, []byte(content), eligibleCRUDTables(definitions), commandColumnInventory(definitions)); err != nil {
+					add(gateCommandFlow, fmt.Sprintf("command declaration: %v", err))
+				} else if err := appMCPCheckCommandDependencyShapes(func(name string) ([]byte, error) { return readOptionalConfig(appDir, name) }, []Flow{flow}); err != nil {
+					// A dependency that cannot return one id column would fail every prepare.
+					add(gateCommandFlow, fmt.Sprintf("command declaration: %v", err))
+				} else if err := appMCPCheckCommandSQLFunctions(func(name string) ([]byte, error) { return readOptionalConfig(appDir, name) }, []Flow{flow}, nil); err != nil {
+					// A function the command authorizer refuses fails that statement on every run.
+					add(gateCommandFlow, fmt.Sprintf("command declaration: %v", err))
 				}
 			}
 			break
@@ -289,7 +409,7 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 		// agents commonly split flows across multiple files (one flow
 		// per file under flows/) and those need the same validation.
 		if msg := validateFlowsYAML(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateFlows, msg)
 		}
 		// Auto-CRUD route collision is a write-time HARD ERROR (not
 		// a post-write warning) because shipping it crashes the app
@@ -303,76 +423,114 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 			tables := loadSchemaTableNames(appDir)
 			if len(tables) > 0 {
 				if msg := detectFlowCRUDConflictsInContent(content, tables); msg != "" {
-					issues = append(issues, msg)
+					add(gateFlowRoutes, msg)
+				}
+			}
+			// An event flow on a name that is no table of the app never
+			// starts (validators_flow_ignored_values.go).
+			if msg := flowEventTableViolation(appDir, content, pending); msg != "" {
+				add(gateFlowEventTable, msg)
+			}
+			// Every other framework route (per-table share, permissions,
+			// versions, lock, transition ...; framework paths), found by
+			// running the app's real route registration from source
+			// (route_collisions.go). Such a flow used to crash the app at
+			// load when the framework route registered after it. `benmore
+			// check` runs the app-wide form (flowRouteCollisionFindings).
+			if gate {
+				if msg := flowRouteCollisionViolation(appDir, path, content); msg != "" {
+					add(gateFlowRoutes, msg)
 				}
 			}
 		}
 
 	case base == "hooks.yaml":
 		if msg := validateHooksYAML(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateHooks, msg)
 		} else if msg := hooksSubKeyViolation(content); msg != "" {
 			// Write gate and `benmore check` only (validateHooksYAML also
 			// runs in the loader; this must not refuse a file at boot).
-			issues = append(issues, msg)
+			add(gateHooks, msg)
 		} else if msg := validateWhenConditions(appDir, base, content); msg != "" {
 			// Write gate and `benmore check` only: the loader never
 			// refuses a file over a `when:` (warnWhenConditions logs).
-			issues = append(issues, msg)
+			add(gateWhen, msg)
 		}
 
 	case base == "mcp.yaml":
-		manifest, err := parseAppMCPManifest([]byte(content))
-		if err == nil && appDir != "" {
-			var flows []Flow
-			flows, err = loadFlowsChecked(appDir, true)
-			if err == nil {
-				err = validateAppMCPBindings(appDir, manifest, flows)
-				if err == nil {
-					err = validateAppMCPDigests(appDir, manifest)
-				}
-			}
+		var err error
+		if appDir != "" {
+			// Stage the proposed manifest with the same captured-source snapshot
+			// used by runtime loading. Command declarations can reference sealed
+			// compute modules, so validating bindings against a bare parsed
+			// manifest (with no sourceHashes) falsely reports those modules absent.
+			_, err = loadRuntimeConfigWithManifest(appDir, []byte(content))
+		} else {
+			_, err = parseAppMCPManifest([]byte(content))
 		}
 		if err != nil {
-			issues = append(issues, err.Error())
+			add(gateMCPManifest, err.Error())
 		}
 
 	case base == "cron.yaml":
-		if _, err := parseCronYAML([]byte(content)); err != nil {
-			issues = append(issues, err.Error())
+		if cfg, err := parseCronYAML([]byte(content)); err != nil {
+			add(gateCron, err.Error())
 		} else if problems := cronShapeProblems(content); len(problems) > 0 {
 			// Write gate and `benmore check` only: a deployed file with
 			// ignored keys still loads (warnCronShape logs them).
-			issues = append(issues, strings.Join(problems, "\n"))
+			add(gateCron, strings.Join(problems, "\n"))
+		} else if problems := cronFlowRefProblems(appDir, cfg); len(problems) > 0 {
+			// Same: a deployed file naming a missing flow still loads
+			// (warnCronFlowRefs logs it) and each run fails.
+			add(gateCron, strings.Join(problems, "\n"))
 		}
 
 	case base == "workflows.yaml":
 		if _, err := parseWorkflowsYAML([]byte(content)); err != nil {
-			issues = append(issues, err.Error())
+			add(gateWorkflows, err.Error())
 		} else {
 			// Write gate and `benmore check` only: a deployed file with
 			// these problems still loads (warnWorkflowShape logs them).
 			if msg := validateWorkflowsShape(appDir, content); msg != "" {
-				issues = append(issues, msg)
+				add(gateWorkflows, msg)
 			}
 			if msg := validateWhenConditions(appDir, base, content); msg != "" {
-				issues = append(issues, msg)
+				add(gateWhen, msg)
 			}
 		}
 
 	case base == "app.yaml":
 		if msg := validateAppYAML(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateAppYAML, msg)
+		}
+		// versioned: and encrypted: take the app's own tables only
+		// (config_framework_tables.go). The load ignores such an entry.
+		if msg := frameworkTableConfigViolation("app.yaml", content); msg != "" {
+			add(gateFrameworkTable, msg)
+		}
+		if msg := hipaaReadAuditTablesProblem(appDir, content); msg != "" {
+			add(gateHIPAAReadAudit, msg)
+		}
+		if msg := workflowEncryptedStateIssue(appDir, readAppFileOrNil(appDir, "encrypted.yaml"), []byte(content)); msg != "" {
+			add(gateWorkflowState, msg)
 		}
 		if msg := validateAuthzAppYAML(content); msg != "" { // validators_authz.go
-			issues = append(issues, msg)
+			add(gateAuthz, msg)
 		}
 		if msg := validateSignupFields(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateSignupFields, msg)
+		}
+		if msg := complianceRemovalProblem(appDir, content); msg != "" { // compliance.go
+			add(gateCompliance, msg)
+		}
+		// aggregates: the load's own reader, plus the read-only rule the
+		// refresher applies (aggregates.go).
+		if msg := aggregatesSectionViolation(content); msg != "" {
+			add(gateAggregates, msg)
 		}
 		if appDir != "" {
 			if msg := validateMemberOfShape([]byte(content), readAppFileOrNil(appDir, "schema.prisma")); msg != "" { // validators_authz.go
-				issues = append(issues, msg)
+				add(gateMemberOfShape, msg)
 			}
 			// Only tables whose encryption comes from this app.yaml
 			// (encrypted.yaml wins per table).
@@ -389,19 +547,26 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 			}
 			if len(own) > 0 {
 				if msg := validateFulltextEncryptedConflict(string(readAppFileOrNil(appDir, "schema.prisma")), merged, own); msg != "" {
-					issues = append(issues, msg)
+					add(gateFulltextEnc, msg)
 				}
 			}
 		}
 
 	case base == "encrypted.yaml":
 		if msg := validateEncryptedYAML(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateEncryptedYAML, msg)
+		} else if msg := frameworkTableConfigViolation("encrypted.yaml", content); msg != "" {
+			// The app's own tables only (config_framework_tables.go). The
+			// load ignores such an entry.
+			add(gateFrameworkTable, msg)
+		}
+		if msg := workflowEncryptedStateIssue(appDir, []byte(content), readAppFileOrNil(appDir, "app.yaml")); msg != "" {
+			add(gateWorkflowState, msg)
 		}
 		if appDir != "" {
 			if enc := parseEncryptedFieldsConfig([]byte(content), nil); enc != nil {
 				if msg := validateFulltextEncryptedConflict(string(readAppFileOrNil(appDir, "schema.prisma")), enc, nil); msg != "" {
-					issues = append(issues, msg)
+					add(gateFulltextEnc, msg)
 				}
 			}
 		}
@@ -410,29 +575,126 @@ func ValidateOnWriteIn(appDir, path, content string) string {
 		// Write gate and `benmore check` only: the loader keeps loading
 		// rules this refuses (validators_crossfield.go).
 		if msg := validatorsYAMLViolation(appDir, content); msg != "" {
-			issues = append(issues, msg)
+			add(gateValidatorsYAML, msg)
+		}
+
+	case writesAppRootFile(appDir, path, "computed.yaml"):
+		// The load's own checks (computed_document.go). A deployed file
+		// whose fields install nothing still loads.
+		if msg := computedYAMLViolation(appDir, content); msg != "" {
+			add(gateComputedYAML, msg)
+		}
+
+	case writesAppRootFile(appDir, path, "retention.yaml"):
+		// The load's own reader (retention_document.go), so the gate and
+		// the load cannot disagree. A deployed file with a problem still
+		// loads: the policy it concerns does not run.
+		if msg := retentionYAMLViolation(appDir, content); msg != "" {
+			add(gateRetentionYAML, msg)
 		}
 
 	case ext == ".yaml" || ext == ".yml":
 		if msg := validateYAMLSyntax(content); msg != "" {
-			issues = append(issues, fmt.Sprintf("yaml syntax in %s: %s", path, msg))
+			add(gateYAMLSyntax, fmt.Sprintf("yaml syntax in %s: %s", path, msg))
+		}
+		// A schema.yaml beside a hand-written schema.sql makes the next
+		// load overwrite that file (schema_file_switch.go).
+		if appDir != "" && strings.EqualFold(appRelativeFile(appDir, path), "schema.yaml") {
+			if msg := schemaYAMLWriteRefusal(appDir, content); msg != "" {
+				add(gateSchemaFile, msg)
+			}
 		}
 
 	case base == "tsconfig.json":
 		if msg := validateTSConfig(content); msg != "" {
-			issues = append(issues, msg)
+			add(gateTSConfig, msg)
 		}
 	}
 
+	// A table named like a framework route (`_upload`, `_jobs`, ...): its
+	// auto-CRUD routes cannot register next to the framework's, so the app
+	// would not load (table_route_collisions.go). Write gate and `benmore
+	// check` only.
+	if msg := tableRouteCollisionViolation(appDir, path, content); msg != "" {
+		add(gateTableRoute, msg)
+	}
+
+	// References the app's load refuses: an encrypted, versioned or computed
+	// table or column the schema does not have, in this file or broken by it
+	// in another (validators_load_refs.go).
+	refusal, excused := loadRefWriteCheck(appDir, path, content, pending)
+	if refusal != "" {
+		add(gateLoadRefs, refusal)
+	}
+	// Computed fields and aggregates that read an encrypted column compute on
+	// ciphertext (validators_encrypted_compute.go). Write gate and `benmore
+	// check` only: the load keeps such a field.
+	if msg := encryptedComputeWriteCheck(appDir, path, content, pending); msg != "" {
+		add(gateEncryptedRead, msg)
+	}
+
 	if len(issues) == 0 {
-		return ""
+		return gateVerdict{}, excused
 	}
 	// Append a recovery footer: agents that hit a rejection often
 	// fall back to Edit instead of re-Writing the corrected content,
 	// which leaves the file partially-old (the rest of the intended
 	// rewrite never lands). The fix is to re-Write with the correction.
-	body := strings.Join(issues, "\n\n---\n\n")
-	return body + "\n\n" + writeRejectionFooter
+	var rename func(string) string
+	if isFlowsSubdirFile(path) {
+		label := flowFileLabel(appDir, path)
+		rename = func(body string) string { return nameFlowFile(body, label) }
+	}
+	return newGateVerdict(issues, rules, rename, writeRejectionFooter), nil
+}
+
+// writesAppRootFile reports whether path is the app's own <name> at the app
+// root, the file the load reads, and not one that only shares its name
+// (tests/retention.yaml is a test file).
+func writesAppRootFile(appDir, path, name string) bool {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if filepath.IsAbs(path) && appDir != "" {
+		if rel, err := filepath.Rel(appDir, path); err == nil {
+			clean = filepath.ToSlash(rel)
+		}
+	}
+	return strings.EqualFold(clean, name)
+}
+
+// nameFlowFile puts the flow file's own path where a flow validator's message
+// names the file. The flow validators serve flows.yaml and every
+// flows/<name>.yaml alike and begin each message (and each line of a joined
+// list) with "flows.yaml", so a refusal of flows/v1ping.yaml named a file the
+// app may not even have. Only a leading file name is replaced; advice that
+// mentions flows.yaml further on is left as written.
+func nameFlowFile(msg, file string) string {
+	if file == "" || file == "flows.yaml" {
+		return msg
+	}
+	lines := strings.Split(msg, "\n")
+	for i, line := range lines {
+		if rest, ok := strings.CutPrefix(line, "flows.yaml"); ok && (rest == "" || rest[0] == ':' || rest[0] == ' ') {
+			lines[i] = file + rest
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// flowFileLabel is a flow file's path as the app names it: relative to the
+// app directory (flows/<name>.yaml).
+func flowFileLabel(appDir, path string) string {
+	if filepath.IsAbs(path) && appDir != "" {
+		if rel, err := filepath.Rel(appDir, path); err == nil && filepath.IsLocal(rel) {
+			path = rel
+		}
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if filepath.IsAbs(path) {
+		if i := strings.LastIndex(clean, "/flows/"); i >= 0 {
+			clean = clean[i+1:]
+		}
+	}
+	return clean
 }
 
 // committedSecretRes are high-confidence credential shapes (specific provider
@@ -445,6 +707,12 @@ var committedSecretRes = []struct {
 	re   *regexp.Regexp
 }{
 	{"Stripe secret/restricted key", regexp.MustCompile(`(?i)\b[rs]k_(live|test)_[0-9a-zA-Z]{20,}`)},
+	// Webhook signing secrets: Stripe's (whsec_ + 32 base62, or 64 hex from
+	// the Stripe CLI) and Svix's (whsec_ + base64; Clerk, Resend and other
+	// Svix senders). A `secret: "whsec_..."` beside `verify:` used to pass.
+	{"webhook signing secret (whsec_)", regexp.MustCompile(`\bwhsec_[0-9A-Za-z+/]{24,}`)},
+	// Shopify app secret (verifies Shopify webhooks) and access tokens.
+	{"Shopify app secret or access token", regexp.MustCompile(`\bshp(ss|at|ca|pa)_[0-9a-fA-F]{32}\b`)},
 	{"AWS access key id", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
 	{"GitHub token", regexp.MustCompile(`\bgh[pousr]_[0-9A-Za-z]{36,}`)},
 	{"Google API key", regexp.MustCompile(`\bAIza[0-9A-Za-z_\-]{35}\b`)},
@@ -455,7 +723,11 @@ var committedSecretRes = []struct {
 	// OpenAI: sk-proj-<...> OR classic sk-<32+ base62, NO hyphens> - so kebab-case CSS
 	// classes like `sk-btn-primary-rounded-lg` (hyphens in the tail) never match.
 	{"OpenAI API key", regexp.MustCompile(`\bsk-(proj-[0-9A-Za-z_\-]{20,}|[0-9A-Za-z]{32,})\b`)},
-	{"Private key block", regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)},
+	// The header alone is not a key: code and comments name the format
+	// ("-----BEGIN PRIVATE KEY-----" when parsing one from env, or building
+	// one around an env value). A key's base64 body follows the header
+	// directly, after a newline or an escaped \n in a JSON or env string.
+	{"Private key block", regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\s|\\[nr])*[A-Za-z0-9+/]{32,}`)},
 }
 
 // validateNoCommittedSecrets rejects a write whose content embeds a literal
@@ -541,26 +813,26 @@ func validateForbiddenPath(path string) string {
 	// Hard rejects - these files actively break the framework's build.
 	switch base {
 	case "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb":
-		return "forbidden path: " + path + " doesn't belong in a Benmore app. There's no npm step - React, ReactDOM, Lucide, and bm.js are embedded in the framework binary and resolved by the compiler's globals plugin at build. If you wanted to add a dependency: imports of 'react', 'react-dom', 'lucide' / 'lucide-react', 'bm', 'bm/ui' all just work without any package.json. For anything else, write a flow in flows.yaml (calls run server-side) or copy the source into src/ and import it relatively."
+		return "forbidden path: " + path + " doesn't belong in a Benmore app. There's no npm step: the framework compiles browser modules with embedded esbuild and serves its own modules, 'bm' (/_internal/bm.js) and 'sdui' (/_internal/sdui.js), through the page's import map. It ships no React or other npm package, and a bare import of one (`import ... from 'react'`) fails to build. To use a library, copy its ES module files under static/ and import them relatively; for server-side work, write a flow in flows.yaml."
 	case ".npmrc", ".yarnrc", ".pnpmrc":
 		return "forbidden path: " + path + " - Benmore has no npm step. Drop the file."
 	case "webpack.config.js", "vite.config.js", "vite.config.ts", "rollup.config.js", "esbuild.config.js":
 		return "forbidden path: " + path + " - Benmore runs esbuild internally with the right config for /static/<entry>.<hash>.js bundles. No custom build config is needed; don't try to override it."
 	}
 	if clean == "node_modules" || strings.HasPrefix(clean, "node_modules/") || strings.Contains(clean, "/node_modules/") {
-		return "forbidden path: " + path + " - Benmore has no node_modules. Imports of 'react', 'react-dom', 'lucide', 'bm', 'bm/ui' resolve to embedded window globals at build time. Don't try to add packages this way."
+		return "forbidden path: " + path + " - Benmore has no node_modules. The framework serves 'bm' and 'sdui' as bare imports (the import map); copy any other library's ES module files under static/ and import them relatively, or map a bare name to such a file with a tsconfig.json `paths` entry."
 	}
 	if strings.HasPrefix(clean, "dist/") || strings.HasPrefix(clean, "build/") {
 		return "forbidden path: " + path + " - Benmore emits content-hashed bundles into static/ automatically (e.g. static/app.<hash>.js). You don't write build artifacts by hand."
 	}
 	// Soft warnings - file is allowed to exist but agent's edit is futile.
 	if clean == "types/bm.d.ts" {
-		return "types/bm.d.ts is auto-overwritten on every `benmore dev` / `benmore serve` boot from the framework's embedded `bm.d.ts` source. Hand-edits are silently reverted. If you want different types: the d.ts the framework ships covers every bm.* hook and bm/ui component. If something's missing, ask for it in the framework, don't patch it locally."
+		return "types/bm.d.ts is auto-overwritten on every `benmore dev` / `benmore serve` boot from the framework's embedded `bm.d.ts` source. Hand-edits are silently reverted. If you want different types: the d.ts the framework ships covers the whole bm SDK (bm.table, bm.auth, bm.live, bm.query, ...). If something's missing, ask for it in the framework, don't patch it locally."
 	}
 	return ""
 }
 
-// isSPASourceFile returns true if the path is a React/TS bundle entry
+// isSPASourceFile returns true if the path is a TS/JS browser module
 // or imported source file. Anything under src/ with a JS/TS/JSX/TSX
 // extension qualifies - that's the surface esbuild compiles.
 func isSPASourceFile(path string) bool {
@@ -573,10 +845,7 @@ func isSPASourceFile(path string) bool {
 }
 
 // validateTSConfig surfaces tsconfig.json edits that break the
-// framework's esbuild contract. The compiler expects React.createElement
-// as the JSX factory (NOT the new automatic runtime, which would try
-// to import 'react/jsx-runtime' from a module the globals plugin
-// doesn't know about). Catch the most common drift.
+// framework's esbuild contract (esbuild, not tsc, emits the bundle).
 func validateTSConfig(content string) string {
 	if strings.TrimSpace(content) == "" {
 		return ""
@@ -607,7 +876,7 @@ func validateGotmplParse(path, content string) string {
 // validateEngineMixup catches the most common engine-mode confusion:
 // agents put mustache `{{var}}` syntax inside an `engine: raw` page
 // expecting it to render server-side, but engine: raw means "ship the
-// HTML untouched and let React mount into #root" - template tags are
+// HTML untouched and let the page's own script render it" - template tags are
 // emitted as literal text. Similarly, putting JSX-only constructs
 // (<script type="module" src="/static/app...">) into an engine: gotmpl
 // page can produce confusing render-order bugs.
@@ -625,7 +894,7 @@ func validateEngineMixup(path, content string) string {
 	hasFrameworkMustache := strings.Contains(body, "{{csrf}}") || strings.Contains(body, "{{user_email}}")
 	if engine == "raw" && hasMustache && !hasFrameworkMustache {
 		return fmt.Sprintf(
-			"%s: declares `engine: raw` but contains mustache `{{var}}` syntax. Raw pages do NOT process mustache - the template tags will render literally as text. Either:\n  (a) move dynamic data into src/*.tsx and use bm.useTable() / bm.useRecord() to fetch it client-side (the React idiom), or\n  (b) change frontmatter to `engine: gotmpl` if you need server-rendered HTML (typical for marketing/SEO pages, not for app UI).",
+			"%s: declares `engine: raw` but contains mustache `{{var}}` syntax. Raw pages do NOT process mustache - the template tags will render literally as text. Either:\n  (a) fetch the data client-side in a TSX module with bm.table('<table>').list() / .get(id) and render it into the page, or\n  (b) change frontmatter to `engine: gotmpl` if you need server-rendered HTML (typical for marketing/SEO pages, not for app UI).",
 			path)
 	}
 	return ""
@@ -798,6 +1067,10 @@ func validateSchemaPrisma(content string) string {
 	if problems := prismaIgnoredSchemaProblems(content, models); len(problems) > 0 {
 		return strings.Join(problems, "\n")
 	}
+	// The load refuses these (validators_load_refs.go).
+	if problems := prismaFullTextProblems(models); len(problems) > 0 {
+		return strings.Join(problems, "\n")
+	}
 	return ""
 }
 
@@ -861,6 +1134,19 @@ func validateFlowsYAML(content string) string {
 		if msg := validateGHAFlowsContents(ghaFile); msg != "" {
 			return msg
 		}
+		// SQL in a parallel block of a transactional flow: the app does not
+		// register the flow (validators_flow_ignored_values.go). Here and not
+		// in validateGHAFlowsContents, which the loader shares: a deployed
+		// file still loads its other jobs.
+		if problems := flowParallelSQLInTransactionProblems(ghaFile); len(problems) > 0 {
+			return strings.Join(problems, "\n")
+		}
+		// A guard reading an output its SQL step does not return never sees
+		// it (validators_step_outputs.go). Write gate and check only: a live
+		// app with such a guard keeps loading.
+		if guards, _ := stepOutputRefProblems(ghaFile); len(guards) > 0 {
+			return "flows.yaml: " + guards[0]
+		}
 		if msg := flowUnknownKeyViolation(content); msg != "" {
 			return msg
 		}
@@ -882,7 +1168,22 @@ func validateFlowsYAML(content string) string {
 		if msg := flowUnreachableResponseViolation(ghaFile); msg != "" {
 			return msg
 		}
-		return ghaDeadConditionViolation(ghaFile)
+		// A `${{ }}` value expression that doesn't parse never resolves
+		// (flows_value_expr.go).
+		if msg := ghaValueExpressionViolation(ghaFile); msg != "" {
+			return msg
+		}
+		if msg := ghaDeadConditionViolation(ghaFile); msg != "" {
+			return msg
+		}
+		// A `steps.<id>` naming no step in the flow reads as empty: a guard
+		// on it never fires (validators_step_ids.go). Checked after the
+		// file's structure, whose problems are named first. Write gate and
+		// check only: a live app with such a reference keeps loading.
+		if problems := unknownStepRefProblems(ghaFile); len(problems) > 0 {
+			return strings.Join(problems, "\n")
+		}
+		return ""
 	}
 	if err := rejectLegacyHandledStatuses([]byte(content)); err != nil {
 		return "flows.yaml: " + err.Error()
@@ -916,6 +1217,15 @@ func validateFlowInputs(inputs map[string]FlowInput) string {
 		}
 		if in.Type != "enum" && len(in.Values) > 0 {
 			return fmt.Sprintf("flows.yaml: input %q sets `values:` but its type is %q - `values:` only applies to `type: enum`.", name, in.Type)
+		}
+		// A default is bound when the caller omits the input
+		// (bindFlowInputDefaults), so it must be a value the caller could
+		// have sent.
+		if in.Default != nil {
+			check := map[string]FlowInput{name: {Type: in.Type, Values: in.Values, Min: in.Min, Max: in.Max}}
+			if err := validateFlowInputValues(check, map[string]any{name: flowInputDefaultValue(in.Default)}); err != nil {
+				return fmt.Sprintf("flows.yaml: input %q has `default: %v`, which is not a valid %s value: %v. The default is bound when a caller omits the input, so it must pass the same check a sent value does.", name, in.Default, in.Type, err)
+			}
 		}
 	}
 	return ""
@@ -1231,7 +1541,11 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 		case nil, string:
 			// Empty and legacy named/header verifiers retain their existing shape.
 		case map[string]any:
-			if err := validateFlowVerifyConfig(parseVerifyMap(raw), file.On.Request.Path); err != nil {
+			verify := parseVerifyMap(raw)
+			if err := validateFlowVerifyConfig(verify, file.On.Request.Path); err != nil {
+				return "flows.yaml: invalid verify config: " + err.Error()
+			}
+			if err := verifySkewWithinLimit(verify); err != nil {
 				return "flows.yaml: invalid verify config: " + err.Error()
 			}
 		default:
@@ -1246,6 +1560,11 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 				"flows.yaml: rate_limit %q is malformed. Use `<count>/<window> [per <scope>]` - e.g. `5/hour per ip`, `100/min per user`, `10/h`. Windows: s/sec, m/min, h/hour, d/day (or a Go duration like 30s). Scopes: ip (default), user, email, group.",
 				file.On.Request.RateLimit)
 		}
+	}
+	// `run: proxy` steps: where they may run and what they take
+	// (validators_flow_proxy.go).
+	if msg := ghaProxyViolation(file); msg != "" {
+		return msg
 	}
 	for jobName, job := range file.Jobs {
 		if len(job.Steps) == 0 {
@@ -1272,6 +1591,9 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 		if msg := ghaBroadcastViolation(jobName, "", job.Steps); msg != "" {
 			return msg
 		}
+		if msg := ghaNotifyViolation(jobName, "", job.Steps); msg != "" {
+			return msg
+		}
 		if msg := ghaReservedStepIDViolation(jobName, job.Steps); msg != "" {
 			return msg
 		}
@@ -1282,7 +1604,7 @@ func validateGHAFlowsContents(file FlowFileGHA) string {
 			if !knownRun[strings.ToLower(strings.TrimSpace(s.Run))] {
 				return fmt.Sprintf(
 					"flows.yaml: job %q step %d has `run: %s` which isn't a known step type.\n"+
-						"Known: sql, sql_dynamic, api, email, webhook, redirect, respond, parse, set, parallel, broadcast.\n"+
+						"Known: sql, sql_dynamic, api, email, sms, webhook, redirect, respond, parse, set, parallel, broadcast, notify.\n"+
 						"Shorthand: `query: SELECT ...` (auto-becomes `run: sql`), `if: ${{ ... }}` (conditional wrapper), `for_each: ${{ ... }}` (iteration wrapper).\n"+
 						"`sql_dynamic` is the opt-in escape hatch for AI-generated queries (text-interpolated, not param-bound) - use only for SQL assembled by trusted internal callers.",
 					jobName, i, s.Run)
@@ -1847,11 +2169,24 @@ func validateSQLDynamicSafetyAt(jobName, stepLabel string, s FlowStepGHA) string
 		tok := strings.TrimSpace(rest[open+2 : open+2+close])
 		// Strip a GHA `${{ }}` leading `$`-less form; tolerate a leading "${".
 		tok = strings.TrimPrefix(tok, "$")
-		if tok != "" && !strings.Contains(tok, ".") {
+		// `params.X` is namespaced but is the request itself: the runtime
+		// taint guard refuses it on every request, so the flow could never
+		// run (it used to pass the write gate and fail when called).
+		// An expression (`a && params.x`, `x == 'y'`) is checked ref by ref:
+		// the runtime guard reads every ref in it (flowValueExprRefPaths).
+		if flowValueExprUsesOperators(tok) {
+			for _, ref := range flowValueExprRefs(tok, true) {
+				if !strings.Contains(ref, ".") || strings.HasPrefix(ref, "params.") {
+					tok = ref
+					break
+				}
+			}
+		}
+		if base, _, _ := strings.Cut(tok, "|"); tok != "" && (!strings.Contains(tok, ".") || strings.HasPrefix(strings.TrimSpace(base), "params.")) {
 			return fmt.Sprintf(
 				"flows.yaml: job %q %s (`run: sql_dynamic`) interpolates a bare `{{%s}}` directly into the query.\n"+
 					"sql_dynamic substitutes values as raw SQL TEXT, not bound parameters - a bare reference fed from request input is a SQL-injection hole.\n"+
-					"For request input, use `run: sql` (or `query:`) where `${{ %s }}` / `:%s` bind as ? placeholders. Reserve sql_dynamic for SQL assembled from server-trusted values (`{{env.X}}`, `{{steps.<id>.<field>}}`).",
+					"For request input, use `run: sql` (or `query:`) where `${{ %s }}` / `:%s` bind as ? placeholders. Reserve sql_dynamic for SQL assembled from server-trusted values (`${{ env.X }}`, `${{ steps.<id>.outputs.<column> }}`).",
 				jobName, stepLabel, tok, tok, tok)
 		}
 		rest = rest[open+2+close+2:]
@@ -2011,7 +2346,7 @@ func upsertSelectNeedsWhere(query string) bool {
 var reservedPathPrefixes = []string{
 	"/api/_",      // /api/_audit, /api/_auth, /api/_notifications, /api/_files, /api/_docs, etc.
 	"/api/v1/",    // platform API
-	"/_internal/", // embedded React/ReactDOM/bm.js
+	"/_internal/", // embedded bm.js, sdui.js and other framework assets
 	"/_admin",     // admin panel
 	"/login",      // auth path
 	"/signup",     // auth path

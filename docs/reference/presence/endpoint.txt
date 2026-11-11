@@ -1,0 +1,2 @@
+POST /api/_presence/heartbeat   {slug, action: 'join'|'heartbeat'|'leave'}  → {ok: true, members: <count>, expires_in_s, heartbeat_s}
+GET  /api/_presence?slug=...    → {slug, count, members: [{user_id, joined_at, last_seen_at}]}

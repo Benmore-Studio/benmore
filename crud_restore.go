@@ -65,7 +65,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request, app *App, table strin
 	if actor != nil {
 		for _, action := range []string{"read", "write"} {
 			if err := checkScope(actor, table, action); err != nil {
-				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 				return
 			}
 		}
@@ -116,7 +116,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request, app *App, table strin
 	injectSessionContext(eventRow, actor)
 	FireFlowsForEvent(app, "on_update", table, eventRow)
 	Broadcast(app, table, "update", actor)
-	broadcastHookRefreshes(app, refreshTables, []transactionResult{{Table: table, Action: "update"}})
+	broadcastHookRefreshes(app, actor, refreshTables, []transactionResult{{Table: table, Action: "update"}})
 	appendHXTrigger(w, "benmore:changed")
 	sanitizeResponseRows(app, table, []map[string]any{after}, actor)
 	httpJSON(w, http.StatusOK, after)

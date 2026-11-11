@@ -1,0 +1,1 @@
+TSX-by-default. The framework serves files from static/, compiles *.tsx → *.js on-the-fly with its built-in esbuild (no Node), and resolves `import 'bm'` via an import map to /_internal/bm.js. Per-app TypeScript types come from src/bm.d.ts (auto-regenerated on push). Clean URLs, the SPA fallback and CSRF meta injection are described in how_routing_works and what_is_injected.

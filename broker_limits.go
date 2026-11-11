@@ -131,8 +131,11 @@ var (
 const brokerUIDCacheMax = 4096
 
 // prefixForUID maps a connecting uid to its app key prefix. Returns
-// (prefix, firstParty). firstParty=true for the shared "benmore" user (the
-// router and the _platform app), which is trusted to supply its own prefix.
+// (prefix, firstParty). firstParty=true for the router's "benmore" user
+// (and the _platform dashboard while it still runs as that user), which is
+// trusted to supply its own prefix. Once the dashboard runs as
+// benmore-app-_platform it maps like any tenant, to its own "_platform"
+// prefix, and cannot name another app's.
 func prefixForUID(uid int) (prefix string, firstParty bool) {
 	now := brokerUIDNow()
 	brokerUIDMu.Lock()

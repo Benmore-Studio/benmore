@@ -1,0 +1,5 @@
+{
+  "async": "In a `mode: async` flow the body step reads the body the job carried from the request. See api({at:'async-flows'}) → parse_body.",
+  "source": "`body` is the default. `headers` reads the inbound request headers into canonical names with all values preserved as arrays. Any other value - `query`, `Body`, a `${{ }}` ref to another step's output, a value that is not text - is refused when the file is written and by `benmore check`.",
+  "other_keys": "`source` is the only option. Any other `with:` key (`body:`, `format:`) is refused when the file is written. Two are accepted and ignored, and the app logs a `WARNING` for each: `with.from`, and `as:` at the step root (the outputs are named by the step's `id:`)."
+}

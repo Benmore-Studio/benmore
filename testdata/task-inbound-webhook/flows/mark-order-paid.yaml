@@ -1,0 +1,14 @@
+# flows/mark-order-paid.yaml - queued by payment-webhook.yaml; safe to run twice
+on:
+  request:
+    method: POST
+    path: /api/orders/mark-paid
+    role: admin                     # the queue runs it; only an admin may call it directly
+jobs:
+  mark:
+    steps:
+      - run: sql
+        expect_rows: "=1"           # an order id that names nothing fails the job
+        with: { query: "UPDATE orders SET status = 'paid', paid_at = CASE WHEN paid_at = '' THEN datetime('now') ELSE paid_at END WHERE id = :order_id" }
+      - run: respond
+        with: { status: 200, json: { paid: true } }

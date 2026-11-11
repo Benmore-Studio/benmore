@@ -1,0 +1,1 @@
+5 requests per minute per user. The next one answers 429 `{"error":"Rate limit exceeded. Try again later."}` with a Retry-After header (whole seconds until the window resets) and reads none of the body.

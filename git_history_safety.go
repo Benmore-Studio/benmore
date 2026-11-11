@@ -19,6 +19,11 @@ func gitProtectedPath(path string) bool {
 	if len(parts) > 0 && parts[0] == "Benmore" {
 		return true
 	}
+	// A restore's copies of a database, including a stage an older release
+	// left at the top of the app directory (restore_stage.go).
+	if restoreStagePath(path) {
+		return true
+	}
 	// Database sidecars are files. A source directory such as data.db-tools
 	// must remain usable, matching the source manifest's filename rule.
 	if len(parts) > 0 && strings.HasPrefix(parts[len(parts)-1], "data.db") {
@@ -131,7 +136,11 @@ func gitCheckCurrentTree(dir string) error {
 }
 
 // Mandatory rules are appended after app rules and restored after source mirrors.
-// Atomic replacement also rejects symlinked .gitignore files.
+// Atomic replacement also rejects symlinked .gitignore files. The file is
+// written with the shared source mode: under the router tenant-data lock,
+// `benmore-appctl own` hands the tree to the app's user and never widens an
+// owner-only file, so a 0600 .gitignore became unreadable to the router and
+// every later history commit failed ("openat .gitignore: permission denied").
 func gitProtectHistory(dir string) error {
 	exists, err := gitAppRepoExists(dir)
 	if err != nil {
@@ -163,13 +172,13 @@ func gitProtectHistory(dir string) error {
 	}
 	data = append(data, []byte("\n"+gitignoreContents)...)
 	name := ".history-ignore-" + generateToken(12)
-	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, appSourceFileMode)
 	if err != nil {
 		return err
 	}
 	defer root.Remove(name)
 	_, err = f.Write(data)
-	if err = errors.Join(err, f.Sync(), f.Close()); err != nil {
+	if err = errors.Join(err, f.Chmod(appSourceFileMode), f.Sync(), f.Close()); err != nil {
 		return err
 	}
 	return root.Rename(name, ".gitignore")

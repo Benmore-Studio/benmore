@@ -1,0 +1,1 @@
+Descriptive benmore api responses use authenticated ETags and a bounded local byte cache so a 304 replays the exact previous response bytes, preserving stable agent context. Calls that execute an API operation are never cached.

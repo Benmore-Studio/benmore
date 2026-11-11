@@ -44,7 +44,7 @@ func TestValidateOnWriteYAMLResourceGuardPreservesOtherChecks(t *testing.T) {
 	if msg := ValidateOnWriteIn(dir, "settings.yml", secret); !strings.Contains(msg, "[secrets]") {
 		t.Fatalf("credential check lost: %q", msg)
 	}
-	if msg := ValidateOnWriteIn(dir, "pnpm-lock.yaml", flatYAML(20_001)); msg != validateForbiddenPath("pnpm-lock.yaml") {
+	if msg := ValidateOnWriteIn(dir, "pnpm-lock.yaml", flatYAML(20_001)); msg != gateRefusal(gateForbiddenPath, validateForbiddenPath("pnpm-lock.yaml")) {
 		t.Fatalf("forbidden path no longer takes precedence: %q", msg)
 	}
 	if msg := ValidateOnWriteIn(dir, "notes.txt", flatYAML(20_001)); msg != "" {
@@ -63,13 +63,20 @@ func TestYAMLResourceRefusalSharedBySourceAndCompleteChecks(t *testing.T) {
 	if !strings.Contains(want, "too many keys") {
 		t.Fatalf("write accepted over-budget content: %q", want)
 	}
+	// A finding carries the refusal's text, and its address as `docs`
+	// instead of the write answer's `docs:` line (refusal_docs.go).
+	verdict, _ := writeGateVerdict(dir, path, content, true, false, nil)
+	if verdict.Refusal != want || verdict.Docs == "" {
+		t.Fatalf("the write gate's verdict is not the refusal a write answers: %+v", verdict)
+	}
+	want = verdict.Message
 	for name, check := range map[string]func(string, string) CheckReport{
 		"source": RunSourceCheck, "complete": RunCompleteCheck,
 	} {
 		t.Run(name, func(t *testing.T) {
 			report := check(dir, path)
 			for _, f := range report.Findings {
-				if f.File == path && f.Severity == "error" && f.Source == "syntax" && f.Message == want {
+				if f.File == path && f.Severity == "error" && f.Source == "syntax" && f.Message == want && f.Docs == verdict.Docs {
 					return
 				}
 			}

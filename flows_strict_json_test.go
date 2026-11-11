@@ -69,10 +69,13 @@ jobs:
 			}
 			w := httptest.NewRecorder()
 			mux.ServeHTTP(w, r)
-			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "Invalid JSON request") {
+			// The answer is exactly the fixed JSON refusal, so no part of the
+			// request can be echoed in it (a JSON body always holds "{", so a
+			// substring check against a one-character request proves nothing).
+			if w.Code != http.StatusBadRequest || strings.TrimSpace(w.Body.String()) != `{"error":"Invalid JSON request"}` {
 				t.Fatalf("status/body = %d %q, want safe 400", w.Code, w.Body.String())
 			}
-			if strings.Contains(w.Body.String(), tc.body) || strictJSONEffectCount(t, app) != before {
+			if strictJSONEffectCount(t, app) != before {
 				t.Fatal("invalid request was echoed or executed a flow step")
 			}
 		})

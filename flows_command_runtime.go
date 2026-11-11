@@ -33,6 +33,7 @@ type appMCPCommandExecution struct {
 	allowedWrites              map[string]bool
 	verifiedFTSWrites          map[string]bool
 	verifiedFTSPriming         map[string]bool
+	foreignKeyScanReads        map[string]bool
 	hookWrites                 map[string]bool
 	jobInsert                  bool
 	internal                   bool
@@ -45,6 +46,9 @@ type appMCPCommandExecution struct {
 	cleanupErr                 error
 	discardConn                bool
 	resultBytes                int
+	// refusedFunction is the last SQL function the authorizer refused while a
+	// command phase's own statement was compiled (guard only, under policyMu).
+	refusedFunction string
 	// generated holds the values prepare drew for this command (nil in every
 	// other phase, where they arrive inside the sealed arguments).
 	generated map[string]any
@@ -60,9 +64,14 @@ type appMCPCommandAuthorizerPolicy struct {
 	allowedWrites      map[string]bool
 	verifiedFTSWrites  map[string]bool
 	verifiedFTSPriming map[string]bool
-	metadataOp         appMCPCommandMetadataOp
-	finalizing         bool
-	hookWrites         map[string]bool
+	// foreignKeyScanReads holds "child\x00column" keys (identifier-folded):
+	// the child-table key columns SQLite's foreign-key enforcement reads while
+	// a write statement changes a parent this phase may write. Set only for an
+	// apply-phase write statement.
+	foreignKeyScanReads map[string]bool
+	metadataOp          appMCPCommandMetadataOp
+	finalizing          bool
+	hookWrites          map[string]bool
 	// jobInsert admits one INSERT into _benmore_jobs, and only while framework
 	// code enqueues a hook/webhook effect inside a hook-write scope.
 	jobInsert bool
@@ -94,16 +103,17 @@ const (
 func (g *appMCPCommandExecution) authorizerPolicy() appMCPCommandAuthorizerPolicy {
 	g.policyMu.RLock()
 	policy := appMCPCommandAuthorizerPolicy{
-		internal:           g.internal,
-		phase:              g.phase,
-		allowedReads:       g.allowedReads,
-		allowedWrites:      g.allowedWrites,
-		verifiedFTSWrites:  g.verifiedFTSWrites,
-		verifiedFTSPriming: g.verifiedFTSPriming,
-		metadataOp:         g.metadataOp,
-		finalizing:         g.finalizing,
-		hookWrites:         g.hookWrites,
-		jobInsert:          g.jobInsert,
+		internal:            g.internal,
+		phase:               g.phase,
+		allowedReads:        g.allowedReads,
+		allowedWrites:       g.allowedWrites,
+		verifiedFTSWrites:   g.verifiedFTSWrites,
+		verifiedFTSPriming:  g.verifiedFTSPriming,
+		foreignKeyScanReads: g.foreignKeyScanReads,
+		metadataOp:          g.metadataOp,
+		finalizing:          g.finalizing,
+		hookWrites:          g.hookWrites,
+		jobInsert:           g.jobInsert,
 	}
 	g.policyMu.RUnlock()
 	return policy
@@ -117,13 +127,14 @@ func (g *appMCPCommandExecution) swapInternal(internal bool) bool {
 	return previous
 }
 
-func (g *appMCPCommandExecution) publishAuthorizerPolicy(internal bool, phase string, reads, writes, verifiedFTSWrites map[string]bool) {
+func (g *appMCPCommandExecution) publishAuthorizerPolicy(internal bool, phase string, reads, writes, verifiedFTSWrites, foreignKeyScanReads map[string]bool) {
 	g.policyMu.Lock()
 	g.internal = internal
 	g.phase = phase
 	g.allowedReads = reads
 	g.allowedWrites = writes
 	g.verifiedFTSWrites = verifiedFTSWrites
+	g.foreignKeyScanReads = foreignKeyScanReads
 	g.policyMu.Unlock()
 }
 
@@ -135,6 +146,7 @@ func (g *appMCPCommandExecution) restoreAuthorizerPolicy(policy appMCPCommandAut
 	g.allowedWrites = policy.allowedWrites
 	g.verifiedFTSWrites = policy.verifiedFTSWrites
 	g.verifiedFTSPriming = policy.verifiedFTSPriming
+	g.foreignKeyScanReads = policy.foreignKeyScanReads
 	g.metadataOp = policy.metadataOp
 	g.finalizing = policy.finalizing
 	g.hookWrites = policy.hookWrites
@@ -149,6 +161,7 @@ func (g *appMCPCommandExecution) publishNativeMetadataPolicy(internal bool, op a
 	g.allowedReads = nil
 	g.allowedWrites = nil
 	g.verifiedFTSWrites = nil
+	g.foreignKeyScanReads = nil
 	g.hookWrites = nil
 	g.jobInsert = false
 	g.metadataOp = op
@@ -180,6 +193,7 @@ func (g *appMCPCommandExecution) beginFinalizingPolicy() {
 	g.allowedReads = nil
 	g.allowedWrites = nil
 	g.verifiedFTSWrites = nil
+	g.foreignKeyScanReads = nil
 	g.metadataOp = 0
 	g.finalizing = false
 	g.policyMu.Unlock()
@@ -191,6 +205,7 @@ func (g *appMCPCommandExecution) finishFinalizingPolicy() {
 	g.phase = ""
 	g.allowedReads = nil
 	g.allowedWrites = nil
+	g.foreignKeyScanReads = nil
 	g.metadataOp = 0
 	g.finalizing = false
 	g.finalizingPreviousInternal = false
@@ -211,7 +226,7 @@ func (cap *appMCPCommandCapability) installConnectionGuard() error {
 		return err
 	}
 	if err := cap.conn.Raw(func(raw any) error {
-		conn, ok := raw.(*sqlite3.SQLiteConn)
+		conn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("command connection is not a SQLite connection")
 		}
@@ -235,7 +250,7 @@ func (cap *appMCPCommandCapability) restoreConnectionGuard() error {
 		guard.markConnectionUncertain(err)
 	}
 	if err := cap.conn.Raw(func(raw any) error {
-		conn, ok := raw.(*sqlite3.SQLiteConn)
+		conn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("command connection is not a SQLite connection")
 		}
@@ -288,8 +303,13 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 		return sqlite3.SQLITE_OK
 	}
 	if action == sqlite3.SQLITE_FUNCTION {
-		if commandAllowedSQLFunction(arg2) || policy.phase == "apply" && commandVerifiedTriggerFunction(arg2) {
+		if commandPhaseSQLFunctionAllowed(policy.phase, arg2) {
 			return sqlite3.SQLITE_OK
+		}
+		// Remembered so the failed statement is reported as a declaration that
+		// cannot run instead of an outage (refusedFunctionFailure).
+		if !policy.internal && policy.phase != "" {
+			g.noteRefusedFunction(arg2)
 		}
 		return sqlite3.SQLITE_DENY
 	}
@@ -322,6 +342,15 @@ func (g *appMCPCommandExecution) authorize(action int, arg1, arg2, database stri
 			return sqlite3.SQLITE_DENY
 		}
 		if policy.allowedReads[sqliteIdentifierFold(arg1)] || policy.allowedWrites[sqliteIdentifierFold(arg1)] {
+			return sqlite3.SQLITE_OK
+		}
+		// SQLite's foreign-key enforcement scans each child table's key column
+		// when a parent row is inserted, deleted or re-keyed by a multi-write
+		// statement (any table with revision triggers). Admit exactly those
+		// columns, and only during an apply write: authored SQL cannot name an
+		// undeclared table (validateSQLPhase), so this opens no read to it.
+		if policy.phase == "apply" && arg2 != "" && strings.EqualFold(database, "main") &&
+			policy.foreignKeyScanReads[appMCPForeignKeyScanKey(arg1, arg2)] {
 			return sqlite3.SQLITE_OK
 		}
 		return sqlite3.SQLITE_DENY
@@ -563,16 +592,48 @@ func commandVerifiedTriggerFunction(name string) bool {
 	// clock read with no external state or authority effects.
 	// Ciphertext authentication is also allowed only while a verified trigger
 	// runs: exposing it to command SQL would create a key-validity oracle.
-	return strings.EqualFold(name, "raise") || strings.EqualFold(name, "benmore_encrypt") || strings.EqualFold(name, "benmore_encrypt_plaintext") || strings.EqualFold(name, "benmore_ciphertext_matches") || strings.EqualFold(name, "current_timestamp")
+	// benmore_ciphertext_holds compares a sealed value with a plaintext, so it
+	// is trigger-only for the same reason (a computed field over an encrypted
+	// column, computedSeal).
+	return strings.EqualFold(name, "raise") || strings.EqualFold(name, "benmore_encrypt") || strings.EqualFold(name, "benmore_encrypt_plaintext") || strings.EqualFold(name, "benmore_ciphertext_matches") || strings.EqualFold(name, "benmore_ciphertext_holds") || strings.EqualFold(name, "current_timestamp")
 }
 
-func commandAllowedSQLFunction(name string) bool {
-	switch strings.ToLower(name) {
-	case "abs", "avg", "char", "coalesce", "concat", "concat_ws", "count", "date", "datetime", "benmore_today", "glob", "hex", "ifnull", "instr", "length", "like", "lower", "ltrim", "max", "min", "nullif", "printf", "quote", "replace", "round", "rtrim", "sign", "soundex", "sqlite_version", "substr", "substring", "sum", "time", "total", "trim", "typeof", "unicode", "upper", "zeroblob", "json", "json_array", "json_array_length", "json_group_array", "json_extract", "json_insert", "json_object", "json_patch", "json_remove", "json_replace", "json_type", "json_valid", "json_quote", "julianday", "strftime":
-		return true
-	default:
-		return false
+// commandAllowedSQLFunctions is the one list of SQL functions a command's own
+// SQL may call, in every phase. The command authorizer enforces it when SQLite
+// compiles a statement (commandPhaseSQLFunctionAllowed), and review, `mcp
+// check` and the write gate read the same list to refuse a command before it
+// is approved (app_mcp_command_sql_functions.go). Add a function here and
+// nowhere else, and only one the bundled SQLite has: soundex was listed, but
+// SQLite compiles it in only with SQLITE_SOUNDEX, which this build does not
+// set, so a command that called it passed review and could never run.
+var commandAllowedSQLFunctions = []string{
+	"abs", "avg", "char", "coalesce", "concat", "concat_ws", "count", "date", "datetime", "benmore_today",
+	"glob", "hex", "ifnull", "instr", "length", "like", "lower", "ltrim", "max", "min", "nullif", "printf",
+	"quote", "replace", "round", "rtrim", "sign", "sqlite_version", "substr", "substring", "sum",
+	"time", "total", "trim", "typeof", "unicode", "upper", "zeroblob",
+	"json", "json_array", "json_array_length", "json_group_array", "json_extract", "json_insert", "json_object",
+	"json_patch", "json_remove", "json_replace", "json_set", "json_type", "json_valid", "json_quote",
+	"julianday", "strftime",
+}
+
+var commandAllowedSQLFunctionSet = func() map[string]bool {
+	set := make(map[string]bool, len(commandAllowedSQLFunctions))
+	for _, name := range commandAllowedSQLFunctions {
+		set[name] = true
 	}
+	return set
+}()
+
+func commandAllowedSQLFunction(name string) bool {
+	return commandAllowedSQLFunctionSet[strings.ToLower(name)]
+}
+
+// commandPhaseSQLFunctionAllowed is the command authorizer's whole decision
+// for one function in one phase: the allowlist, plus, while apply runs, the
+// functions the framework's own verified triggers call. The review-time check
+// asks this same function, so review refuses exactly what a commit refuses.
+func commandPhaseSQLFunctionAllowed(phase, name string) bool {
+	return commandAllowedSQLFunction(name) || phase == "apply" && commandVerifiedTriggerFunction(name)
 }
 
 func (cap *appMCPCommandCapability) enterReadPhase(phase string, tables []string) error {
@@ -591,9 +652,13 @@ func (cap *appMCPCommandCapability) enterPhase(phase string, reads, writes []str
 		return err
 	}
 	guard := cap.guard
-	var verifiedFTSWrites map[string]bool
+	var verifiedFTSWrites, foreignKeyScanReads map[string]bool
 	if phase == "apply" && !readOnly {
 		var err error
+		foreignKeyScanReads, err = cap.foreignKeyChildScanReads(writes)
+		if err != nil {
+			return fmt.Errorf("derive foreign-key child scan reads: %w", err)
+		}
 		verifiedFTSWrites, err = appMCPCommandFullTextTriggerWrites(cap.generation, writes)
 		if err != nil {
 			return fmt.Errorf("derive verified full-text trigger writes: %w", err)
@@ -618,7 +683,7 @@ func (cap *appMCPCommandCapability) enterPhase(phase string, reads, writes []str
 			return err
 		}
 	}
-	guard.publishAuthorizerPolicy(false, phase, commandTableSet(reads), commandTableSet(writes), verifiedFTSWrites)
+	guard.publishAuthorizerPolicy(false, phase, commandTableSet(reads), commandTableSet(writes), verifiedFTSWrites, foreignKeyScanReads)
 	guard.phaseActive = true
 	return nil
 }
@@ -638,7 +703,7 @@ func (cap *appMCPCommandCapability) leavePhase() {
 	if _, err := cap.tx.ExecContext(cleanupCtx, "PRAGMA query_only=ON"); err != nil {
 		guard.markConnectionUncertain(err)
 	}
-	guard.publishAuthorizerPolicy(false, "", nil, nil, nil)
+	guard.publishAuthorizerPolicy(false, "", nil, nil, nil, nil)
 	guard.phaseActive = false
 }
 
@@ -688,6 +753,95 @@ func commandTableSet(tables []string) map[string]bool {
 		set[sqliteIdentifierFold(table)] = true
 	}
 	return set
+}
+
+func appMCPForeignKeyScanKey(table, column string) string {
+	return sqliteIdentifierFold(table) + "\x00" + sqliteIdentifierFold(column)
+}
+
+// foreignKeyChildScanReads returns the child-table key columns that SQLite's
+// foreign-key enforcement reads when one of writes changes a parent row: the
+// "from" columns of every foreign key whose parent is a written table. They
+// come from the live schema, which is what SQLite enforces, read once per
+// command transaction (the transaction's snapshot fixes the schema, and
+// command SQL cannot run DDL). Framework and sqlite_ tables are never
+// children here; the authorizer refuses them before this set is consulted.
+func (cap *appMCPCommandCapability) foreignKeyChildScanReads(writes []string) (map[string]bool, error) {
+	if cap == nil || cap.tx == nil {
+		return nil, errors.New("command capability has no transaction")
+	}
+	if cap.foreignKeyChildren == nil {
+		children, err := cap.loadForeignKeyChildren()
+		if err != nil {
+			return nil, err
+		}
+		cap.foreignKeyChildren = children
+	}
+	reads := make(map[string]bool)
+	for parent := range commandTableSet(writes) {
+		for key := range cap.foreignKeyChildren[parent] {
+			reads[key] = true
+		}
+	}
+	return reads, nil
+}
+
+// loadForeignKeyChildren maps each folded parent table name to the folded
+// "child\x00column" keys that reference it.
+func (cap *appMCPCommandCapability) loadForeignKeyChildren() (map[string]map[string]bool, error) {
+	children := make(map[string]map[string]bool)
+	err := cap.withInternalRead(func() error {
+		rows, err := cap.tx.QueryContext(cap.ctx, `SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_benmore\_%' ESCAPE '\' ORDER BY name`)
+		if err != nil {
+			return err
+		}
+		var tables []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return err
+			}
+			tables = append(tables, name)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, child := range tables {
+			rows, err := cap.tx.QueryContext(cap.ctx, "PRAGMA main.foreign_key_list("+quoteIdent(child)+")")
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var id, seq int
+				var parent, from string
+				var to, onUpdate, onDelete, match sql.NullString
+				if err := rows.Scan(&id, &seq, &parent, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+					rows.Close()
+					return err
+				}
+				folded := sqliteIdentifierFold(parent)
+				if children[folded] == nil {
+					children[folded] = make(map[string]bool)
+				}
+				children[folded][appMCPForeignKeyScanKey(child, from)] = true
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return children, nil
 }
 
 // appMCPCommandFullTextTriggerIndexes returns only FTS virtual indexes
@@ -779,7 +933,7 @@ func validateAppMCPCommandRuntimePhase(phase FlowCommandPhase, name string, writ
 func validateAppMCPCommandRuntimeSteps(steps []FlowStep, phase string, writes []string) error {
 	for i := range steps {
 		step := &steps[i]
-		if step.Retry != 0 || step.RetryDelay != 0 || len(step.OnError) != 0 || step.Type == "parallel" || step.Type == "api" || step.Type == "webhook" || step.Type == "ws" || step.Type == "broadcast" || step.Type == "enqueue" || step.Type == "email" || step.Type == "sms" || step.Type == "redirect" || step.Type == "serve_file" || step.Type == "delete_upload" || step.Type == "inspect_private_upload" || step.Type == "render_pdf_signatures" || step.Type == "parse" || step.Type == "purge_current_user" || step.Type == "transcribe" || step.Type == "sql_dynamic" {
+		if step.Retry != 0 || step.RetryDelay != 0 || len(step.OnError) != 0 || step.Type == "parallel" || step.Type == "api" || step.Type == "webhook" || step.Type == "ws" || step.Type == "broadcast" || step.Type == "notify" || step.Type == "enqueue" || step.Type == "email" || step.Type == "sms" || step.Type == "redirect" || step.Type == "serve_file" || step.Type == "proxy" || step.Type == "delete_upload" || step.Type == "inspect_private_upload" || step.Type == "extract_text" || step.Type == "render_pdf_signatures" || step.Type == "parse" || step.Type == "purge_current_user" || step.Type == "transcribe" || step.Type == "sql_dynamic" {
 			return fmt.Errorf("command phase contains an unsupported or external-effect step %q", step.Type)
 		}
 		switch step.Type {
@@ -927,13 +1081,9 @@ func validateCommandRuntimeSQLText(query, phase string, writes []string) error {
 }
 
 func validateCommandAuthoredSQLFunctions(query string) error {
-	tokens := sqlTokenize(stripSQLComments(query))
-	for i := 0; i+1 < len(tokens); i++ {
-		if (tokens[i].kind == sqlTokWord || tokens[i].kind == sqlTokIdent) && tokens[i+1].kind == sqlTokPunct && tokens[i+1].text == "(" {
-			if commandVerifiedTriggerFunction(tokens[i].text) {
-				return fmt.Errorf("command SQL cannot call trigger-only function %q", tokens[i].text)
-			}
-		}
+	if name := commandTriggerOnlyCall(query); name != "" {
+		// The text is fixed by the reviewed source, so no retry can pass.
+		return commandRefusedFunctionError("SQL", name, fmt.Errorf("command SQL cannot call trigger-only function %q", name))
 	}
 	return nil
 }
@@ -984,7 +1134,26 @@ func (exec *appMCPCommandExecution) guardStep(step *FlowStep) error {
 	return nil
 }
 
+// executeSQL runs one command SQL step. A declarative constraint failure of
+// the command's own apply SQL is deterministic: it is classified as
+// constraint_failed (appMCPCommandConstraintFailure) instead of an outage.
+//
+// A statement the authorizer refused because it calls a function outside the
+// command allowlist fails the same way on every attempt, so it is classified
+// as invalid_declaration (refusedFunctionFailure), in every phase. So does a
+// statement SQLite cannot compile because it names a function or a column the
+// database does not have (commandUnresolvedNameFailure, where the statement
+// is handed to SQLite).
 func (exec *appMCPCommandExecution) executeSQL(ctx *FlowContext, step *FlowStep) error {
+	exec.capability.forgetRefusedFunction()
+	err := exec.capability.refusedFunctionFailure(exec.executeSQLStatement(ctx, step), exec.phase+" SQL")
+	if exec.phase == "apply" {
+		return appMCPCommandConstraintFailure(err)
+	}
+	return err
+}
+
+func (exec *appMCPCommandExecution) executeSQLStatement(ctx *FlowContext, step *FlowStep) error {
 	cap := exec.capability
 	if err := cap.validateSQLPhase(step.SQL, exec.phase, append(append([]string(nil), appMCPCommandReadTables(cap.command, exec.phase)...), cap.command.Writes...)); err != nil {
 		return err
@@ -1061,7 +1230,15 @@ func (exec *appMCPCommandExecution) executeSQL(ctx *FlowContext, step *FlowStep)
 		}
 		return exec.storeStepResult(ctx, step, result)
 	}
-	result, err := cap.tx.ExecContext(cap.ctx, step.SQL, args...)
+	// The same value-length bound as the row-producing path: allowlisted
+	// zeroblob/printf/replace in a write without RETURNING could otherwise
+	// build values up to SQLite's 1 GB default inside the app process.
+	var result sql.Result
+	err = cap.withCommandLengthLimit(func() error {
+		var execErr error
+		result, execErr = cap.tx.ExecContext(cap.ctx, step.SQL, args...)
+		return commandUnresolvedNameFailure(execErr, exec.phase+" SQL")
+	})
 	if err != nil {
 		return err
 	}
@@ -1128,7 +1305,7 @@ func (exec *appMCPCommandExecution) scanStatementWithDecrypt(query string, args 
 	err := cap.withCommandLengthLimit(func() error {
 		rows, err := cap.tx.QueryContext(cap.ctx, query, args...)
 		if err != nil {
-			return err
+			return commandUnresolvedNameFailure(err, exec.phase+" SQL")
 		}
 		var key []byte
 		keyErr := cap.withInternalRead(func() error {
@@ -1179,7 +1356,7 @@ func (cap *appMCPCommandCapability) withCommandLengthLimit(run func() error) (re
 	}
 	oldLimit := 0
 	err := cap.conn.Raw(func(raw any) error {
-		conn, ok := raw.(*sqlite3.SQLiteConn)
+		conn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("command connection is not a SQLite connection")
 		}
@@ -1195,7 +1372,7 @@ func (cap *appMCPCommandCapability) withCommandLengthLimit(run func() error) (re
 	}
 	defer func() {
 		if err := cap.conn.Raw(func(raw any) error {
-			conn, ok := raw.(*sqlite3.SQLiteConn)
+			conn, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("command connection is not a SQLite connection")
 			}

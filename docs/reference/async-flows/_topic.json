@@ -1,0 +1,20 @@
+{
+  "keys": [
+    "cli",
+    "job_durability",
+    "ordering",
+    "execution_context",
+    "payload_validation",
+    "parse_body",
+    "summary",
+    "retries",
+    "why",
+    "yaml_example",
+    "client_pattern",
+    "identity",
+    "error_redaction",
+    "status_endpoint",
+    "retention",
+    "hint"
+  ]
+}

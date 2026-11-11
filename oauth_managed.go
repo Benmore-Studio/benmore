@@ -231,21 +231,46 @@ func managedJTIFresh(jti string, exp int64) bool {
 	return true
 }
 
+// managedOAuthSettings says where an app's managed sign-in is brokered and
+// which key verifies the broker's handoff assertion. An empty secret means
+// the process's own server secret (read when the assertion arrives).
+type managedOAuthSettings struct {
+	brokerURL string
+	providers []string
+	appName   string
+	secret    string
+}
+
+// managedOAuthSettingsFor returns app's settings: its own when the process
+// set them (the router's dashboard sign-in app), else the router-written
+// environment every hosted app reads.
+func managedOAuthSettingsFor(app *App) managedOAuthSettings {
+	if app != nil && app.managedOAuth != nil {
+		return *app.managedOAuth
+	}
+	return managedOAuthSettings{
+		brokerURL: managedBrokerURL(),
+		providers: managedBrokerProviders(),
+		appName:   strings.TrimSpace(os.Getenv("BENMORE_APP_NAME")),
+	}
+}
+
 // registerManagedOAuthRoutes wires the broker-backed login routes for
 // every platform-served provider the app hasn't configured its own
 // credentials for. Returns the provider names it registered (for the
 // login-page button list). Called from RegisterOAuthRoutes.
 func registerManagedOAuthRoutes(mux appRouteRegistrar, app *App, byoConfigured map[string]bool) []string {
-	broker := managedBrokerURL()
+	settings := managedOAuthSettingsFor(app)
+	broker := settings.brokerURL
 	if broker == "" {
 		return nil
 	}
-	appName := strings.TrimSpace(os.Getenv("BENMORE_APP_NAME"))
+	appName := settings.appName
 	if appName == "" {
 		return nil
 	}
 	var registered []string
-	for _, name := range managedBrokerProviders() {
+	for _, name := range settings.providers {
 		if byoConfigured[name] {
 			continue // BYO credentials always win
 		}
@@ -270,7 +295,11 @@ func registerManagedOAuthRoutes(mux appRouteRegistrar, app *App, byoConfigured m
 	}
 
 	mux.HandleFunc("GET /auth/managed/callback", func(w http.ResponseWriter, r *http.Request) {
-		payload, ok := brokerVerify(r.URL.Query().Get("token"), serverSecret)
+		secret := settings.secret
+		if secret == "" {
+			secret = serverSecret
+		}
+		payload, ok := brokerVerify(r.URL.Query().Get("token"), secret)
 		if !ok {
 			http.Error(w, "invalid sign-in token", http.StatusBadRequest)
 			return

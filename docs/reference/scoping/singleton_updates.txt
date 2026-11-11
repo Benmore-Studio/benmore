@@ -1,0 +1,1 @@
+An ID-less PATCH /api/<table> uses the per-user singleton path only when a global unique index consists solely of user_id. Partial indexes and composite expression indexes do not establish that invariant; those tables require the record ID. A real single-column unique index, including descending order, retains singleton behavior.

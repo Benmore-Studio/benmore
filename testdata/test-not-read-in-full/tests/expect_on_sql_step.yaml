@@ -1,0 +1,8 @@
+# A `sql:` step checks `rows` and nothing else from `expect:`; the text asked
+# for here would never be compared with the result.
+sql_result_holds_a_text:
+  anon: true
+  steps:
+    - sql: "SELECT 'draft' AS status"
+      expect:
+        contains: "published"

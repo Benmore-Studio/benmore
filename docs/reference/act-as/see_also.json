@@ -1,0 +1,5 @@
+[
+  "api({at:'scoping'}) - how group + owner scoping is enforced at the CRUD layer, INCLUDING the tenant-root self-scope pattern (group_id = id) you need so the root table composes with act-as",
+  "api({at:'access'}) - declarative per-model access modes that the act-as caller respects",
+  "api({at:'audit'}) - querying `_benmore_audit_log` for governance"
+]

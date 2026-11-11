@@ -341,9 +341,9 @@ func appMCPPDFConfineFilesystemForExec(runDir, executable string) error {
 	if int(abi) < appMCPPDFLandlockMinABI {
 		return errors.New("landlock ABI is too old to confine truncate")
 	}
-	attr := unix.LandlockRulesetAttr{Access_fs: appMCPPDFLandlockHandled}
+	attr := unix.LandlockRulesetAttr{Handled_access_fs: appMCPPDFLandlockHandled}
 	// Only handled_access_fs is passed: the size every Landlock ABI accepts.
-	rulesetFD, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr.Access_fs), 0)
+	rulesetFD, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr.Handled_access_fs), 0)
 	if errno != 0 {
 		return errno
 	}

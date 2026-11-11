@@ -47,13 +47,13 @@ func TestIncludesFollowPublicReadPolicyForParentsAndChildren(t *testing.T) {
 			}
 			for _, session := range sessions {
 				parentRows := []map[string]any{{"id": int64(1), "post_id": int64(1)}}
-				ResolveIncludes(app, "comments", parentRows, "post", session)
+				ResolveIncludes(app, nil, "comments", parentRows, "post", session)
 				parent, ok := parentRows[0]["post"].(map[string]any)
 				if !ok || parent["title"] != "public" {
 					t.Fatalf("public parent omitted for session %#v: %v", session, parentRows)
 				}
 				childRows := []map[string]any{{"id": int64(1)}}
-				ResolveIncludes(app, "posts", childRows, "comments", session)
+				ResolveIncludes(app, nil, "posts", childRows, "comments", session)
 				children, _ := childRows[0]["comments"].([]map[string]any)
 				want := 3
 				if mode == "self" {
@@ -77,11 +77,11 @@ func TestIncludesRetainTableTokenTenantAndSoftDeleteGuards(t *testing.T) {
 		app.Access.rules[table] = map[AccessOp]string{OpRead: "self"}
 	}
 	for _, table := range []string{"posts", "comments"} {
-		if got := batchFetchByIDs(app, table, map[string]bool{"3": true}, user); len(got) != 0 {
+		if got := batchFetchByIDs(app, table, map[string]bool{"3": true}, user, &includeAudit{}); len(got) != 0 {
 			t.Fatalf("cross-tenant own row visible: %v", got)
 		}
 	}
-	if got := batchFetchByFK(app, "comments", "post_id", map[string]bool{"1": true}, user); len(got) != 0 {
+	if got := batchFetchByFK(app, "comments", "post_id", map[string]bool{"1": true}, user, &includeAudit{}); len(got) != 0 {
 		t.Fatalf("private children visible: %v", got)
 	}
 	for _, mode := range []string{"admin", "off", "anon"} {
@@ -94,14 +94,14 @@ func TestIncludesRetainTableTokenTenantAndSoftDeleteGuards(t *testing.T) {
 			copy.Scopes = "unrelated:read"
 			session = &copy
 		}
-		if got := batchFetchByIDs(app, "posts", map[string]bool{"1": true}, session); len(got) != 0 {
+		if got := batchFetchByIDs(app, "posts", map[string]bool{"1": true}, session, &includeAudit{}); len(got) != 0 {
 			t.Fatalf("mode/scope %s bypassed: %v", mode, got)
 		}
-		if got := batchFetchByFK(app, "comments", "post_id", map[string]bool{"1": true}, session); len(got) != 0 {
+		if got := batchFetchByFK(app, "comments", "post_id", map[string]bool{"1": true}, session, &includeAudit{}); len(got) != 0 {
 			t.Fatalf("child mode/scope %s bypassed: %v", mode, got)
 		}
 	}
-	if got := batchFetchByIDs(app, "posts", map[string]bool{"4": true}, nil); len(got) != 0 {
+	if got := batchFetchByIDs(app, "posts", map[string]bool{"4": true}, nil, &includeAudit{}); len(got) != 0 {
 		t.Fatalf("soft-deleted public parent visible: %v", got)
 	}
 }

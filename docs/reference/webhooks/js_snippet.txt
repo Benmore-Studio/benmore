@@ -1,0 +1,12 @@
+// Register an outbound webhook from a settings page
+await fetch('/api/_webhooks', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+  body: JSON.stringify({
+    url: 'https://hooks.zapier.com/...',
+    tables: 'notes',            // comma-separated; omit for every table
+    events: 'insert,update',    // comma-separated insert|update|delete; omit for all
+    secret: 'your-shared-secret',
+  }),
+});

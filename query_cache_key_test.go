@@ -9,14 +9,20 @@ import (
 
 func TestQueryCacheKeyIsUnambiguous(t *testing.T) {
 	sql := "SELECT ? , ?"
-	if queryCacheKey("/apps/a", sql, []any{"1", "23"}) == queryCacheKey("/apps/a", sql, []any{"12", "3"}) {
+	if queryCacheKey("/apps/a", sql, []any{"1", "23"}, "") == queryCacheKey("/apps/a", sql, []any{"12", "3"}, "") {
 		t.Errorf("argument lists (1,23) and (12,3) share a cache key")
 	}
-	if queryCacheKey("/apps/a", sql, []any{int64(1)}) == queryCacheKey("/apps/a", sql, []any{"1"}) {
+	if queryCacheKey("/apps/a", sql, []any{int64(1)}, "") == queryCacheKey("/apps/a", sql, []any{"1"}, "") {
 		t.Errorf("an integer and a string argument share a cache key")
 	}
-	if queryCacheKey("/apps/a", sql, nil) == queryCacheKey("/apps/b", sql, nil) {
+	if queryCacheKey("/apps/a", sql, nil, "") == queryCacheKey("/apps/b", sql, nil, "") {
 		t.Errorf("two apps share a cache key for the same SQL")
+	}
+	if queryCacheKey("/apps/a", sql, nil, "a") == queryCacheKey("/apps/a", sql, nil, "b") {
+		t.Errorf("two unmask classes share a cache key")
+	}
+	if queryCacheKey("/apps/a", sql, []any{"x"}, "") == queryCacheKey("/apps/a", sql, nil, `"x"`) {
+		t.Errorf("an argument and a class share a cache key")
 	}
 }
 

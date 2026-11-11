@@ -1,0 +1,15 @@
+site_name: "extract-text fixture"
+auth:
+  identifier: email
+# Tables with no owner or tenant column: the read mode is their whole rule.
+access:
+  contracts:
+    read: admin
+    write: admin
+    update: admin
+    delete: admin
+  briefs:
+    read: "role:legal"
+    write: "role:legal"
+    update: "role:legal"
+    delete: "role:legal"

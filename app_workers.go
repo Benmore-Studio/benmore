@@ -2,7 +2,10 @@
 
 package main
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // workerStopGeneration snapshots the current generation before an untracked
 // worker is spawned. A delayed goroutine must not join a later reload's channel.
@@ -46,6 +49,14 @@ func (app *App) startTrackedWorker(wg *sync.WaitGroup, name string, fn func(<-ch
 	safeGo(name, func() {
 		defer wg.Done()
 		defer close(done)
+		defer func() {
+			if rec := recover(); rec != nil {
+				if name != "errors.reporter" {
+					reportError(app, errorEvent{Level: "fatal", Source: "server", Kind: "worker", Type: "worker_panic", Message: jobErrorText(app, fmt.Sprint(rec)), Mechanism: "panic", Frames: goFrames(1), Tags: map[string]string{"worker": name}})
+				}
+				panic(rec)
+			}
+		}()
 		fn(stop)
 	})
 	return done

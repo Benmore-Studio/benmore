@@ -1,0 +1,10 @@
+on:
+  request:
+    method: POST
+    path: /api/noop
+    auth: required
+jobs:
+  go:
+    steps:
+      - run: respond
+        with: { json: { ok: true } }

@@ -1,0 +1,6 @@
+[
+  "A benmore.ai account is deleted by its holder in the browser: Account → Security → Delete account (GET/POST /settings/account-deletion on the dashboard). There is no CLI or MCP command; an agent should not try to drive it.",
+  "Refused while the account owns any app that is not deleted (delete each app first: `benmore delete <app> --confirm` or its settings page; deleting the account never deletes apps), while a Stripe subscription can still charge (cancel it in the billing portal; one set to end at its period end does not block), and for operator accounts.",
+  "Needs the account's own direct sign-in (not an API token, scoped, support or act-as session), `confirm=DELETE`, and the current password or, for an account that signs in with Google, a sign-in from the last 10 minutes.",
+  "Deleting ends the CLI token (commands then exit 4), every MCP connection and approved device sign-in, the GitHub connection and memberships on other people's apps. The address may sign up again and gets a new, empty account."
+]

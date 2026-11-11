@@ -1,0 +1,7 @@
+[
+  "module:   looks up static/<module>.ts, then .js, .tsx, .jsx. A subdir works - module: compute/par → static/compute/par.ts. Paths containing .. are rejected.",
+  "function: a named export from that module. A missing export errors with the list of what IS exported, so typos are easy to fix.",
+  "args:     interpolated through the flow template engine, then JSON-parsed if it's a JSON string, else passed as-is. The function receives ONE argument - wrap multiple inputs in an object literal at the call site.",
+  "env in args: `key: \"${{ env.SIGNING_KEY }}\"` (or `{{env.X}}`, or `${{ env.X | default:'' }}`) passes the app's env value to the module. This is the way to hand a secret to server-side code - the module still cannot read env or files itself. Never return the secret from the function: its result is step data a later `respond` could echo.",
+  "timeout:  wall-clock cap, default 5s. goja interrupts at the next statement boundary so even a tight infinite loop halts. A step-level `timeout:` (next to `run:`) is the same cap and wins over `with.timeout`."
+]

@@ -1,0 +1,17 @@
+myapp/
+├── app.yaml, schema.prisma, AGENTS.md, CLAUDE.md
+├── tsconfig.json     # paths: { "bm": ["./src/bm.d.ts"] }
+├── src/
+│   └── bm.d.ts       # AUTO-REGEN per-app TS types - do NOT edit
+├── tests/journeys/home.yaml
+└── static/
+    ├── index.html    # GET /  (has <script type="importmap">)
+    ├── login.html, signup.html, forgot-password.html, reset-password.html,
+    │   verify-otp.html, verify-mfa.html, mfa-setup.html
+    ├── partials/head.html   # shared <head>: meta, Tailwind, styles.css, favicon
+    ├── app.tsx       # thin entry - imports lib/ + views/
+    ├── lib/auth.ts, lib/dom.ts
+    ├── components/ui.tsx
+    ├── views/notes.tsx
+    ├── favicon.svg
+    └── styles.css

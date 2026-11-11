@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -87,6 +88,29 @@ type EmailOpts struct {
 	Attachments         []EmailAttachment // when set: multipart/mixed with base64 file parts
 }
 
+// appMailSenders maps an app directory (cleaned) to the function that sends
+// its mail when the process sends for it directly: only the platform router,
+// for the dashboard sign-in it serves itself. Every other app sends through
+// the gateway or SMTP below.
+var appMailSenders sync.Map // string -> func(EmailOpts) error
+
+func registerAppMailSender(appDir string, send func(EmailOpts) error) {
+	if appDir == "" || send == nil {
+		return
+	}
+	appMailSenders.Store(filepath.Clean(appDir), send)
+}
+
+func appMailSenderFor(appDir string) func(EmailOpts) error {
+	if appDir == "" {
+		return nil
+	}
+	if v, ok := appMailSenders.Load(filepath.Clean(appDir)); ok {
+		return v.(func(EmailOpts) error)
+	}
+	return nil
+}
+
 func SendEmailOpts(appDir string, opts EmailOpts) error {
 	if err := validateEmailHeaders(opts.From, opts.To, opts.CC, opts.BCC, opts.ReplyTo, opts.Subject, opts.UnsubscribeURL, opts.ConfigurationSet); err != nil {
 		return err
@@ -119,6 +143,13 @@ func SendEmailOpts(appDir string, opts EmailOpts) error {
 	}
 	opts.To = strings.Join(to, ", ")
 	opts.CC = strings.Join(cc, ", ")
+
+	// An app whose mail the process sends itself (the router's dashboard
+	// sign-in, platform_dashboard_identity.go) never reaches the gateway,
+	// whose peer check would not know it, or SMTP.
+	if send := appMailSenderFor(appDir); send != nil {
+		return send(opts)
+	}
 
 	// Provider priority: platform SES gateway (hosted platform - ALWAYS
 	// wins when reachable) > SMTP (AWS SES SMTP creds or generic).

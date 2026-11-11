@@ -3,9 +3,11 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -23,26 +25,102 @@ import (
 
 // querySpec is the request body.
 type querySpec struct {
-	Table      string                 `json:"table"`
-	Select     []string               `json:"select"`
-	Where      map[string]interface{} `json:"where"`
-	GroupBy    []string               `json:"group_by"`
-	Aggregates []queryAgg             `json:"aggregates"`
-	OrderBy    []queryOrder           `json:"order_by"`
-	Limit      int                    `json:"limit"`
+	Table      string                 `json:"table" yaml:"table"`
+	Select     []string               `json:"select" yaml:"select"`
+	Where      map[string]interface{} `json:"where" yaml:"where"`
+	GroupBy    []string               `json:"group_by" yaml:"group_by"`
+	Aggregates []queryAgg             `json:"aggregates" yaml:"aggregates"`
+	OrderBy    []queryOrder           `json:"order_by" yaml:"order_by"`
+	Limit      int                    `json:"limit" yaml:"limit"`
 }
 type queryAgg struct {
-	Fn  string `json:"fn"`  // count | sum | avg | min | max
-	Col string `json:"col"` // empty for count(*)
-	As  string `json:"as"`
+	Fn  string `json:"fn" yaml:"fn"`   // count | sum | avg | min | max
+	Col string `json:"col" yaml:"col"` // empty for count(*)
+	As  string `json:"as" yaml:"as"`
+	// Field is not part of the spec. It is read only so that an aggregate
+	// whose column was written under `field:` is refused with an error
+	// naming `col`, instead of "unknown aggregate column: " with no name.
+	Field string `json:"field,omitempty" yaml:"field,omitempty"`
 }
+
+// queryAggKeys are the keys an aggregate reads, as the refusal lists them.
+var queryAggKeys = []string{"fn", "col", "as"}
+
+// errQueryAggUnknownKeys names the keys of one aggregate that nothing reads.
+// hint, when set, is the corrected aggregate for a column written under
+// `field:` (the most common slip), so the refusal still shows the fix.
+type errQueryAggUnknownKeys struct {
+	keys []string
+	hint string
+}
+
+func (e *errQueryAggUnknownKeys) Error() string {
+	quoted := make([]string, len(e.keys))
+	for i, k := range e.keys {
+		quoted[i] = strconv.Quote(k)
+	}
+	noun := "key"
+	if len(quoted) > 1 {
+		noun = "keys"
+	}
+	return "unknown aggregate " + noun + " " + strings.Join(quoted, ", ") + ": accepted keys are " + strings.Join(queryAggKeys, ", ") + e.hint
+}
+
+// UnmarshalJSON refuses a key the aggregate does not read. Dropping it was
+// worse than an error: `{fn:'count', field:'x'}` ran as COUNT(*) and answered
+// a number that looked right. Keys match case-insensitively, as encoding/json
+// matches the fields themselves.
+func (a *queryAgg) UnmarshalJSON(data []byte) error {
+	type plainQueryAgg queryAgg
+	var plain plainQueryAgg
+	if err := json.Unmarshal(data, &plain); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	var unknown []string
+	for key := range fields {
+		if !slices.ContainsFunc(queryAggKeys, func(known string) bool { return strings.EqualFold(known, key) }) {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		refusal := &errQueryAggUnknownKeys{keys: unknown}
+		if plain.Field != "" && plain.Col == "" {
+			refusal.hint = fmt.Sprintf("; aggregates take \"col\": {fn:'%s', col:'%s'}", plain.Fn, plain.Field)
+		}
+		return refusal
+	}
+	*a = queryAgg(plain)
+	return nil
+}
+
 type queryOrder struct {
-	Col string `json:"col"`
-	Dir string `json:"dir"` // asc | desc
+	Col string `json:"col" yaml:"col"`
+	Dir string `json:"dir" yaml:"dir"` // asc | desc
 }
 
 var queryAggFns = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
 var queryOps = map[string]string{"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "like": "LIKE"}
+
+// queryTextMatchOps are the where operators that match their value as
+// literal text, each with the LIKE pattern it builds around the escaped
+// value. `like` keeps its older meaning (the value is wrapped in %...% and
+// any % or _ in it is still a wildcard), because apps rely on it; these
+// operators are how a caller asks for a prefix, a suffix or a literal
+// substring. Like `like`, they compare ASCII letters case-insensitively.
+var queryTextMatchOps = map[string]func(escaped string) string{
+	"contains":    func(s string) string { return "%" + s + "%" },
+	"starts_with": func(s string) string { return s + "%" },
+	"ends_with":   func(s string) string { return "%" + s },
+}
+
+// queryLikeEscaper escapes a value for `LIKE ? ESCAPE '\'` so that it
+// matches only itself: the escape character and both wildcards.
+var queryLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func queryAggregateAlias(a queryAgg) string {
 	if a.As != "" {
@@ -110,80 +188,141 @@ func RegisterQueryAPI(mux appRouteRegistrar, app *App) {
 	registerQueryAPI(mux, app)
 }
 
+// executeAuthorizedQuery is the complete native single-table read path. All
+// callers supply the original request so access, connector and token scopes
+// use the real actor. Failures are written to w; success returns sanitized rows.
+// ownerOnly adds a report-page restriction; it can never broaden native scope.
+func executeAuthorizedQuery(w http.ResponseWriter, r *http.Request, app *App, spec querySpec, ownerOnly bool) ([]map[string]any, bool) {
+	return executeAuthorizedQueryWithPolicy(w, r, app, spec, queryReadPolicy{ownerOnly: ownerOnly})
+}
+
+// Private report restrictions are never decoded from the public query request.
+// They only narrow the native read policy and its bounded result contract.
+type queryReadPolicy struct {
+	ownerOnly      bool
+	currentTenant  bool
+	rejectOverflow bool
+}
+
+func executeAuthorizedQueryWithPolicy(w http.ResponseWriter, r *http.Request, app *App, spec querySpec, policy queryReadPolicy) ([]map[string]any, bool) {
+	// Internal masking projections must not mutate a reusable authored spec.
+	spec.Select = slices.Clone(spec.Select)
+	cols := columnSet(app, spec.Table)
+	if cols == nil {
+		// Exactly the answer EnforceCRUDAccess gives a table the caller may
+		// not read (security.md 14f); "unknown table: x" told the two apart.
+		writeUnmatchedAPINotFound(w)
+		return nil, false
+	}
+	// Read-access gate (same as auto-CRUD list).
+	if !EnforceCRUDAccess(w, r, app, spec.Table, OpRead, 0) {
+		return nil, false
+	}
+	session := getSession(app, r)
+	if session != nil {
+		if err := checkScope(session, spec.Table, "read"); err != nil {
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
+			return nil, false
+		}
+	}
+	if (policy.ownerOnly || policy.currentTenant) && session == nil {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return nil, false
+	}
+	if policy.currentTenant {
+		if err := reportTenantColumn(app, cols); err != nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return nil, false
+		}
+		if !session.EffectiveHasGroup() {
+			httpJSON(w, http.StatusForbidden, map[string]any{"error": "report source requires a current tenant"})
+			return nil, false
+		}
+	}
+
+	// Owner-based unmasking needs user_id even when the caller projects
+	// only encrypted fields. Strip this internal projection after masking.
+	hiddenOwner := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && cols["user_id"] && !slices.Contains(spec.Select, "user_id")
+	if hiddenOwner {
+		spec.Select = append(spec.Select, "user_id")
+	}
+	// Standard projections can carry the source tenant internally. This
+	// preserves same-tenant unmask without adding fields to the response.
+	tenantCol := encryptedTenantColumn(app, spec.Table)
+	hiddenTenant := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && tenantCol != "" && cols[tenantCol] && !slices.Contains(spec.Select, tenantCol)
+	if hiddenTenant {
+		spec.Select = append(spec.Select, tenantCol)
+	}
+
+	sqlText, args, err := buildQueryWithPolicy(app, &spec, cols, session, policy)
+	if err != nil {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return nil, false
+	}
+	sourceTable := spec.Table
+	if len(spec.Aggregates) > 0 || len(spec.GroupBy) > 0 {
+		sourceTable = "" // Aggregate aliases are not source columns.
+	}
+	rows, err := queryNativeRowsWith(app.DB, app, sourceTable, sqlText, args...)
+	if err != nil {
+		serverErrorJSON(w, r, app, "_query", err, "query failed")
+		return nil, false
+	}
+	// Grouped outputs have already passed source-field authorization.
+	// Their aliases are derived values, not columns of the source table.
+	// Applying source masks by alias would hide or drop valid counts.
+	grouped := len(spec.GroupBy) > 0 || len(spec.Aggregates) > 0
+	if !grouped {
+		MaskEncryptedFields(app, spec.Table, rows, session)
+	}
+	for _, row := range rows {
+		if hiddenOwner {
+			delete(row, "user_id")
+		}
+		if hiddenTenant {
+			delete(row, tenantCol)
+		}
+		for col := range row {
+			if !grouped && apiHiddenColumn(app, spec.Table, col) {
+				delete(row, col)
+			}
+		}
+	}
+	if IsReadAudited(app, spec.Table) {
+		if err := LogReadAccess(app, r, spec.Table, "", "query", session); err != nil {
+			readAuditRefused(w, r, app, spec.Table, err)
+			return nil, false
+		}
+	}
+	if policy.rejectOverflow && len(rows) > queryResultLimit(spec.Limit) {
+		httpJSON(w, http.StatusUnprocessableEntity, withRefusalDocs(map[string]any{"error": "report_source_limit_exceeded"}, "report_source_limit_exceeded"))
+		return nil, false
+	}
+	return rows, true
+}
+
+func reportTenantColumn(app *App, cols map[string]bool) error {
+	if app.Group == nil || !safeIdent(app.Group.Key) || !cols[app.Group.Key] {
+		return fmt.Errorf("report source tenant_scope: current requires a configured physical group column on its table")
+	}
+	return nil
+}
+
 func registerQueryAPI(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_query", func(w http.ResponseWriter, r *http.Request) {
 		var spec querySpec
 		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			var unknownKeys *errQueryAggUnknownKeys
+			if errors.As(err, &unknownKeys) {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": unknownKeys.Error()})
+				return
+			}
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
 			return
 		}
-		cols := columnSet(app, spec.Table)
-		if cols == nil {
-			httpJSON(w, http.StatusNotFound, map[string]any{"error": "unknown table: " + spec.Table})
+		rows, ok := executeAuthorizedQuery(w, r, app, spec, false)
+		if !ok {
 			return
-		}
-		// Read-access gate (same as auto-CRUD list).
-		if !EnforceCRUDAccess(w, r, app, spec.Table, OpRead, 0) {
-			return
-		}
-		session := getSession(app, r)
-		if session != nil {
-			if err := checkScope(session, spec.Table, "read"); err != nil {
-				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
-				return
-			}
-		}
-
-		// Owner-based unmasking needs user_id even when the caller projects
-		// only encrypted fields. Strip this internal projection after masking.
-		hiddenOwner := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && cols["user_id"] && !slices.Contains(spec.Select, "user_id")
-		if hiddenOwner {
-			spec.Select = append(spec.Select, "user_id")
-		}
-		// Standard projections can carry the source tenant internally. This
-		// preserves same-tenant unmask without adding fields to the response.
-		tenantCol := encryptedTenantColumn(app, spec.Table)
-		hiddenTenant := len(spec.Select) > 0 && len(spec.Aggregates) == 0 && len(spec.GroupBy) == 0 && tenantCol != "" && cols[tenantCol] && !slices.Contains(spec.Select, tenantCol)
-		if hiddenTenant {
-			spec.Select = append(spec.Select, tenantCol)
-		}
-
-		sqlText, args, err := buildQuery(app, &spec, cols, session)
-		if err != nil {
-			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		sourceTable := spec.Table
-		if len(spec.Aggregates) > 0 || len(spec.GroupBy) > 0 {
-			sourceTable = "" // Aggregate aliases are not source columns.
-		}
-		rows, err := queryNativeRowsWith(app.DB, app, sourceTable, sqlText, args...)
-		if err != nil {
-			serverErrorJSON(w, r, app, "_query", err, "query failed")
-			return
-		}
-		// Grouped outputs have already passed source-field authorization.
-		// Their aliases are derived values, not columns of the source table.
-		// Applying source masks by alias would hide or drop valid counts.
-		grouped := len(spec.GroupBy) > 0 || len(spec.Aggregates) > 0
-		if !grouped {
-			MaskEncryptedFields(app, spec.Table, rows, session)
-		}
-		for _, row := range rows {
-			if hiddenOwner {
-				delete(row, "user_id")
-			}
-			if hiddenTenant {
-				delete(row, tenantCol)
-			}
-			for col := range row {
-				if !grouped && apiHiddenColumn(app, spec.Table, col) {
-					delete(row, col)
-				}
-			}
-		}
-		if IsReadAudited(app, spec.Table) {
-			LogReadAccess(app, spec.Table, "", "query", session)
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"rows": rows, "count": len(rows)})
 	})
@@ -208,7 +347,8 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		if !validateCSRF(r) {
+		// CSRF check (skip for Bearer-only requests; a session cookie keeps it).
+		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
 		}
@@ -234,7 +374,8 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
-		if !validateCSRF(r) {
+		// CSRF check (skip for Bearer-only requests; a session cookie keeps it).
+		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
 		}
@@ -245,7 +386,26 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 
 // buildQuery turns a validated spec into parameterized SQL.
 func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Session) (string, []any, error) {
+	return buildQueryWithOwner(app, spec, cols, session, false)
+}
+
+func buildQueryWithOwner(app *App, spec *querySpec, cols map[string]bool, session *Session, ownerOnly bool) (string, []any, error) {
+	return buildQueryWithPolicy(app, spec, cols, session, queryReadPolicy{ownerOnly: ownerOnly})
+}
+
+func buildQueryWithPolicy(app *App, spec *querySpec, cols map[string]bool, session *Session, policy queryReadPolicy) (string, []any, error) {
 	t := spec.Table
+	if policy.ownerOnly && (session == nil || !cols["user_id"]) {
+		return "", nil, fmt.Errorf("scope: owner report sources require a signed-in user and a user_id column")
+	}
+	if policy.currentTenant {
+		if err := reportTenantColumn(app, cols); err != nil {
+			return "", nil, err
+		}
+		if session == nil || !session.EffectiveHasGroup() {
+			return "", nil, fmt.Errorf("report source requires a current tenant")
+		}
+	}
 	// Filtering, sorting and aggregation can disclose protected values even
 	// when the final projection is masked. Reject those uses before SQL runs.
 	fieldScope, fieldArgs, err := queryFieldAccessScope(app, spec, session)
@@ -301,6 +461,12 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 		if a.Fn == "count" && a.Col == "" {
 			expr = "COUNT(*)"
 		} else {
+			if a.Col == "" {
+				if a.Field != "" {
+					return "", nil, fmt.Errorf("aggregate %s names its column with \"field\"; aggregates take \"col\": {fn:'%s', col:'%s'}", a.Fn, a.Fn, a.Field)
+				}
+				return "", nil, fmt.Errorf("aggregate %s needs \"col\", the column it reads (only count may omit it, for COUNT(*))", a.Fn)
+			}
 			if !cols[a.Col] {
 				return "", nil, fmt.Errorf("unknown aggregate column: %s", a.Col)
 			}
@@ -331,6 +497,16 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	// WHERE: scope + field authorization + soft-delete + caller filters.
 	var conds []string
 	var args []any
+	if policy.ownerOnly {
+		conds = append(conds, qcol("user_id")+" = ?")
+		args = append(args, session.UserID)
+	}
+	if policy.currentTenant {
+		// This report constraint is independent of native admin bypass and
+		// never replaces an authored filter, owner restriction or ACL scope.
+		conds = append(conds, qcol(app.Group.Key)+" = ?")
+		args = append(args, session.EffectiveGroupID())
+	}
 	if fieldScope != "" {
 		conds = append(conds, fieldScope)
 		args = append(args, fieldArgs...)
@@ -342,6 +518,17 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 	if cols["deleted_at"] {
 		conds = append(conds, qt+".deleted_at IS NULL")
 	}
+	// Boolean columns store 1/0; "true"/"false" text matched nothing.
+	boolCols := queryBooleanFilterColumns(app, t)
+	boolValue := func(col string, v any) (any, error) {
+		if kind := boolCols[col]; kind != 0 {
+			return booleanQueryValue(kind, col, v)
+		}
+		return v, nil
+	}
+	// DateTime columns: a value that parses as an instant is compared as one
+	// (crud_datetime_filter.go), whatever spelling each row was stored in.
+	instantCols := queryInstantFilterColumns(app, t)
 	for col, raw := range spec.Where {
 		if !cols[col] {
 			return "", nil, fmt.Errorf("unknown where column: %s", col)
@@ -359,9 +546,31 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 					if !ok || len(list) == 0 {
 						return "", nil, fmt.Errorf("'in' on %s needs a non-empty array", col)
 					}
+					if instantCols[col] {
+						if cond, instantArgs, ok := instantQueryIn(qcol(col), list); ok {
+							conds = append(conds, cond)
+							args = append(args, instantArgs...)
+							continue
+						}
+					}
 					ph := strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
 					conds = append(conds, fmt.Sprintf("%s IN (%s)", qcol(col), ph))
-					args = append(args, list...)
+					for _, item := range list {
+						v, err := boolValue(col, item)
+						if err != nil {
+							return "", nil, err
+						}
+						args = append(args, v)
+					}
+					continue
+				}
+				if pattern, ok := queryTextMatchOps[op]; ok {
+					text, isText := val.(string)
+					if !isText {
+						return "", nil, fmt.Errorf("'%s' on %s needs a string", op, col)
+					}
+					conds = append(conds, qcol(col)+` LIKE ? ESCAPE '\'`)
+					args = append(args, pattern(queryLikeEscaper.Replace(text)))
 					continue
 				}
 				sqlOp, ok := queryOps[op]
@@ -377,11 +586,20 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 					continue
 				}
 				if op == "like" {
+					// A substring match with the value's own % and _ left as
+					// wildcards (see queryTextMatchOps for literal matches).
 					conds = append(conds, qcol(col)+" LIKE ?")
 					args = append(args, fmt.Sprintf("%%%v%%", val))
+				} else if cond, instantArgs, ok := queryInstantComparison(instantCols, col, qcol(col), sqlOp, val); ok {
+					conds = append(conds, cond)
+					args = append(args, instantArgs...)
 				} else {
+					v, err := boolValue(col, val)
+					if err != nil {
+						return "", nil, err
+					}
 					conds = append(conds, fmt.Sprintf("%s %s ?", qcol(col), sqlOp))
-					args = append(args, val)
+					args = append(args, v)
 				}
 			}
 		} else if raw == nil {
@@ -390,8 +608,17 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 			if err := rejectEncryptedValue(col); err != nil {
 				return "", nil, err
 			}
+			if cond, instantArgs, ok := queryInstantComparison(instantCols, col, qcol(col), "=", raw); ok {
+				conds = append(conds, cond)
+				args = append(args, instantArgs...)
+				continue
+			}
+			v, err := boolValue(col, raw)
+			if err != nil {
+				return "", nil, err
+			}
 			conds = append(conds, qcol(col)+" = ?")
-			args = append(args, raw)
+			args = append(args, v)
 		}
 	}
 	if len(conds) > 0 {
@@ -427,18 +654,39 @@ func buildQuery(app *App, spec *querySpec, cols map[string]bool, session *Sessio
 				// A selected aggregate takes precedence over a physical column
 				// with the same name: sum(amount) AS amount sorts by the sum.
 				ref = quoteIdent(o.Col)
+			} else if querySortsByInstant(app, t, o.Col, instantCols) {
+				// A DateTime column a client can write sorts by instant, not
+				// by stored spelling; created_at and updated_at keep the
+				// plain sort.
+				obs = append(obs, instantOrderBy(ref, dir))
+				continue
 			}
 			obs = append(obs, ref+" "+dir)
 		}
 		sqlText += " ORDER BY " + strings.Join(obs, ", ")
 	}
 
-	limit := spec.Limit
-	if limit <= 0 || limit > 1000 {
-		limit = 200
+	limit := queryResultLimit(spec.Limit)
+	if policy.rejectOverflow {
+		limit++
 	}
 	sqlText += fmt.Sprintf(" LIMIT %d", limit)
 	return sqlText, args, nil
+}
+
+// queryResultLimit is the row cap for /api/_query and report sources: 200 when
+// unset, otherwise the requested limit capped at 1000. An oversized limit is
+// clamped, not reset to the default, so asking for more never returns fewer
+// rows. overflow: error sources never reach the clamp: authoring validation
+// refuses their limits outside 1..1000.
+func queryResultLimit(limit int) int {
+	if limit <= 0 {
+		return 200
+	}
+	if limit > 1000 {
+		return 1000
+	}
+	return limit
 }
 
 func validateQueryFieldAccess(app *App, spec *querySpec, session *Session) error {

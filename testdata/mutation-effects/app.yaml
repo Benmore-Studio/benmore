@@ -1,0 +1,3 @@
+site_name: "mutation-effects fixture"
+auth:
+  identifier: email

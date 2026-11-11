@@ -1,0 +1,5 @@
+[
+  "GET /llms.txt (this app's index: static/llms.txt, else its generated public-page list)",
+  "GET /.well-known/llms.txt (byte-identical alias)",
+  "GET /llms-full.txt (only when the app ships static/llms-full.txt; 404 otherwise)"
+]

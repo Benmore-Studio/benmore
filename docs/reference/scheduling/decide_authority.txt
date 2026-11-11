@@ -1,0 +1,1 @@
+An admin decides an approval assigned to someone else only on an unscoped credential (a sign-in, or a session/API token whose own scopes are empty or '*'). An admin's scoped API token or scoped Bearer session decides the approvals assigned to that account and gets 403 `not the assigned approver` for any other id, existing or not. See api({at:'auth'}) → admin_actions_on_others.

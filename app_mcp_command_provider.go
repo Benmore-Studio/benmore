@@ -62,10 +62,11 @@ type appMCPCommandCapability struct {
 	operationID   string
 	subscriptions []map[string]any
 	// run: revoke_user_sessions (app_mcp_command_revoke.go): which targets
-	// held a live membership in the tenant when the apply began, and the
-	// users whose credentials the apply ended (edge grants follow the commit).
+	// held a live membership in the tenant when the apply began.
 	revokeMembers map[int64]bool
-	revokedUsers  []int64
+	// Live foreign keys by folded parent table (foreignKeyChildScanReads),
+	// loaded on the first apply write.
+	foreignKeyChildren map[string]map[string]bool
 }
 
 type appMCPCommandComputeKey struct{}
@@ -330,8 +331,11 @@ func (cap *appMCPCommandCapability) prepareWithinSourcePhase(intent map[string]a
 		return nil, err
 	}
 	canonicalIntent, err := cloneCommandObject(intent)
-	if err != nil || validateAppMCPSchemaValue(cap.tool.InputSchema, canonicalIntent) != nil {
+	if err != nil {
 		return nil, appMCPResultFailure("invalid_input")
+	}
+	if err := validateAppMCPSchemaValue(cap.tool.InputSchema, canonicalIntent); err != nil {
+		return nil, appMCPInvalidInputFailure(err)
 	}
 	inputBytes, err := json.Marshal(canonicalIntent)
 	if err != nil || len(inputBytes) > appMCPInputLimit {

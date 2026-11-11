@@ -1,0 +1,4 @@
+tables:
+  orders:
+    fields: [tax_id]
+    blind_index: [tax_id]

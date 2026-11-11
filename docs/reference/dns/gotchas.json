@@ -1,0 +1,7 @@
+[
+  "Creating a zone needs proof, at the zone apex, that the app controls the domain: the domain itself (not a subdomain of it) attached as a VERIFIED custom domain or email sending domain of the same app, or the app's ownership TXT record at `_benmore-challenge.<domain>`; otherwise the create answers 403 naming that TXT record and value. Only the app owner creates zones, at most 5 per app and 20 per account (409 beyond).",
+  "An unverified custom-domain claim blocks other apps from claiming the same domain for 72 hours from when it was made; after that another app may take it. The domain's owner can take it over at any time: the refused attach (409) names a TXT record (`_benmore-challenge.<domain>` = a value specific to the claiming app); publish it and attach again. That record also verifies the new claim. A verified claim is never taken over.",
+  "Once the zone exists, the ONE manual step left is the registrar nameserver change - that's at the registrar (where the domain was bought), not in DNS.",
+  "Removing the zone deletes all its records - the domain's DNS goes dark until the registrar's nameservers are changed back.",
+  "Managed DNS composes with email + custom domains: a custom domain or email sending domain attached before the zone is created has its records in the zone from the start. One attached afterwards gets its records at the zone's next check: when the nameserver change is detected, or within 24 hours for a zone that is already active."
+]

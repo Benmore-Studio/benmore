@@ -40,6 +40,29 @@ type SourceManifest struct {
 	// reads this list only to name them (they still count toward an MCP
 	// review's execution digest).
 	PullDenied []SourceManifestFile `json:"pull_denied,omitempty"`
+	// FailedMigrations names, outside Files, the failed generated migrations
+	// the instance keeps for inspection (isGeneratedFailedMigration). They are
+	// runtime debris, not source: never pulled, never drift. sync-status lists
+	// them so a migration that keeps failing is not invisible.
+	FailedMigrations []string `json:"failed_migrations,omitempty"`
+}
+
+// generatedFailedMigrationSuffix ends the file the Prisma migration generator
+// keeps when its migration fails (it renames NNNN_x.sql to NNNN_x.sql.failed).
+// The user-migration runner's quarantine is a different file,
+// NNNN_x.sql.failed.sql: that one is the author's own SQL, to be fixed and
+// renamed back by hand, so it stays app source.
+const generatedFailedMigrationSuffix = ".sql.failed"
+
+// isGeneratedFailedMigration reports whether rel (a slash path from the app
+// root) is a failed generated migration. The instance removes it once its
+// schema migrates (removeResolvedFailedMigrations); until then the source
+// manifest, the pull archive and the promote copy leave it out. It used to
+// read as remote_only drift that pull copied into every workspace and that
+// stayed on prod for good (round-2 finding L13).
+func isGeneratedFailedMigration(rel string) bool {
+	name, ok := strings.CutPrefix(filepath.ToSlash(rel), "migrations/")
+	return ok && name != "" && !strings.Contains(name, "/") && strings.HasSuffix(name, generatedFailedMigrationSuffix)
 }
 
 type SourceManifestFile struct {
@@ -95,6 +118,7 @@ func BuildSourceManifest(dir string, opts SourceManifestOptions) (SourceManifest
 		m.Partial = true
 	}
 	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Path < m.Files[j].Path })
+	sort.Strings(m.FailedMigrations)
 	return m, nil
 }
 
@@ -137,6 +161,10 @@ func walkSourceManifest(dir *treeDir, absDir, rel string, m *SourceManifest) err
 			continue
 		}
 		if !info.Mode().IsRegular() {
+			continue
+		}
+		if isGeneratedFailedMigration(path) {
+			m.FailedMigrations = append(m.FailedMigrations, path)
 			continue
 		}
 		sourceManifestBeforeHash(filepath.Join(absDir, name))
@@ -221,6 +249,10 @@ func sourceManifestExcluded(rel string, isDir bool) bool {
 	if rel == "." || rel == "" {
 		return false
 	}
+	// A restore's copies of a database (restore_stage.go).
+	if restoreStagePath(rel) {
+		return true
+	}
 	if isDir {
 		switch base {
 		case ".git", ".benmore", "uploads", "logs", "node_modules", "Benmore", ".claude", ".codex", ".agents":
@@ -260,11 +292,26 @@ func manifestFileMap(m SourceManifest) map[string]SourceManifestFile {
 	return out
 }
 
-func writeRemoteManifest(dir string, m SourceManifest) error {
+// workspaceSyncBase is a workspace's .benmore/remote.json. The top level is
+// the workspace's own baseline, in the SourceManifest shape every CLI version
+// reads: the instance it was last pulled from (or first written to).
+// OtherInstances holds, by instance subdomain, the baseline of each other
+// instance this workspace wrote to, such as prod after a `push --env prod`
+// hotfix from a dev workspace. A write used to replace the whole file with
+// the other instance and only the written file, so the next push to the
+// workspace's own instance had no baseline and was refused as a conflict.
+// A file without other_instances (every older CLI's) loads unchanged, and an
+// older CLI reading this file sees only the top level.
+type workspaceSyncBase struct {
+	SourceManifest
+	OtherInstances map[string]SourceManifest `json:"other_instances,omitempty"`
+}
+
+func writeWorkspaceSyncBase(dir string, ws workspaceSyncBase) error {
 	if dir == "" {
 		return fmt.Errorf("workspace dir is required")
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
+	data, err := json.MarshalIndent(ws, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -275,19 +322,32 @@ func writeRemoteManifest(dir string, m SourceManifest) error {
 	return os.WriteFile(filepath.Join(meta, "remote.json"), append(data, '\n'), 0644)
 }
 
-func readRemoteManifest(dir string) (SourceManifest, bool, error) {
+func readWorkspaceSyncBase(dir string) (workspaceSyncBase, bool, error) {
 	data, err := os.ReadFile(filepath.Join(dir, ".benmore", "remote.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return SourceManifest{}, false, nil
+			return workspaceSyncBase{}, false, nil
 		}
-		return SourceManifest{}, false, err
+		return workspaceSyncBase{}, false, err
 	}
-	var m SourceManifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return SourceManifest{}, false, err
+	var ws workspaceSyncBase
+	if err := json.Unmarshal(data, &ws); err != nil {
+		return workspaceSyncBase{}, false, err
 	}
-	return m, true, nil
+	return ws, true, nil
+}
+
+// writeRemoteManifest replaces .benmore/remote.json with m as the
+// workspace's own baseline and no other instance's.
+func writeRemoteManifest(dir string, m SourceManifest) error {
+	return writeWorkspaceSyncBase(dir, workspaceSyncBase{SourceManifest: m})
+}
+
+// readRemoteManifest returns the workspace's own baseline (the top level of
+// .benmore/remote.json).
+func readRemoteManifest(dir string) (SourceManifest, bool, error) {
+	ws, ok, err := readWorkspaceSyncBase(dir)
+	return ws.SourceManifest, ok, err
 }
 
 type SyncFileStatus string
@@ -301,6 +361,10 @@ const (
 	SyncStatusRemoteOnly    SyncFileStatus = "remote_only"
 	SyncStatusDeletedLocal  SyncFileStatus = "deleted_local"
 	SyncStatusDeletedRemote SyncFileStatus = "deleted_remote"
+	// SyncStatusInstanceMigration is a migration only the deployed instance
+	// holds that it wrote itself while applying the same schema (see
+	// markInstanceMigrations). It is reported, but it is not drift.
+	SyncStatusInstanceMigration SyncFileStatus = "instance_migration"
 )
 
 type SyncFileDiff struct {
@@ -329,6 +393,10 @@ type SyncReport struct {
 	// different content. They are not drift; delivering a reviewed mcp.yaml
 	// is blocked on them because its digest could not match the server.
 	UnpulledSources []string `json:"unpulled_sources,omitempty"`
+	// FailedMigrations are the instance's failed generated migrations
+	// (SourceManifest.FailedMigrations). Not drift: the instance removes
+	// them once its schema migrates.
+	FailedMigrations []string `json:"failed_migrations,omitempty"`
 }
 
 func DiffSourceManifests(base SourceManifest, hasBase bool, local SourceManifest, remote SourceManifest) SyncReport {

@@ -1,0 +1,4 @@
+{
+  "what": "`else:` is a list of steps next to a step's `if:`; it runs when that condition is false. It goes on an `if:` block (`if:` with `steps:`) and on a single gated step (`if:` with `run:`) alike. There is no `elif` or `then` (both refused): nest another `if:` step inside `else:`. An `else:` on a step with no `if:`, or on a loop, is refused, and it must be a list, not one step written as a map.",
+  "yaml_example": "- if: ${{ params.amount }} > 1000\n  steps:\n    - run: set\n      with: { tier: review }\n  else:\n    - if: ${{ params.vip }}\n      run: set\n      with: { tier: priority }\n      else:\n        - run: set\n          with: { tier: standard }\n- run: respond\n  with: { status: 200, json: { tier: \"${{ tier }}\" } }"
+}

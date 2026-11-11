@@ -256,11 +256,12 @@ func prepareAppMCPOAuthConsentFor(ctx context.Context, app *App, session *Sessio
 	}
 	p.Scope = actor.Scopes
 	grant.Scopes = p.Scope
-	offer, offerEpoch := appMCPAutoApproveOffer(app, snapshotAppMCPGeneration(app), grant.Scopes)
+	generation := snapshotAppMCPGeneration(app)
+	offer, offerEpoch := appMCPAutoApproveOffer(app, generation, grant.Scopes)
 	grant.AutoApprove, grant.AutoApproveEpoch = strings.Join(offer, " "), offerEpoch
 	var offerNames []string
 	for _, entry := range offer {
-		offerNames = append(offerNames, appMCPAutoApproveDisplayName(entry))
+		offerNames = append(offerNames, appMCPAutoApproveConsentLabel(generation, appMCPAutoApproveDisplayName(entry)))
 	}
 	nonce, err := appMCPRandomToken("bmcs_")
 	if err != nil {
@@ -381,7 +382,7 @@ func openAppMCPOAuthRead(ctx context.Context, app *App) (*appMCPActorQuerier, fu
 		return nil, nil, err
 	}
 	closeRead := func() { rollbackAppMCPReadConn(conn); closeConn(); cancel() }
-	if err = conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPOAuth); return nil }); err == nil {
+	if err = conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPOAuth); return nil }); err == nil {
 		_, err = conn.ExecContext(ctx, "BEGIN")
 	}
 	if err != nil {

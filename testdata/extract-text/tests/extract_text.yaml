@@ -1,0 +1,45 @@
+extract_text_job_reaches_the_step:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO documents (id, file_url, user_id) VALUES (1, 'uploads/private/sample.pdf', {{user_id}})"
+  steps:
+    - api: "POST /api/documents/1/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    # uploads/ is not copied into the test workspace, so the step reaches the
+    # private read and stops there; the fixed provider code needs a real file
+    # and a Linux host (see the PR).
+    - sql: "SELECT id FROM documents WHERE id = 1 AND extract_error = 'extract_text: unsupported_file'"
+      expect:
+        rows: 1
+
+# The write gate refuses a step without `record:`; a deployed file still
+# loads and the step refuses when it runs.
+extract_text_refuses_a_step_without_record:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO documents (id, file_url, user_id) VALUES (2, 'uploads/private/sample.pdf', {{user_id}})"
+  steps:
+    - api: "POST /api/extract-path"
+      json:
+        path: "uploads/private/sample.pdf"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM documents WHERE id = 2 AND extract_error LIKE 'extract_text: name the row that owns the file%'"
+      expect:
+        rows: 1
+
+extract_text_refuses_a_record_the_caller_cannot_read:
+  as_user: "intruder@test.com"
+  setup:
+    - sql: "INSERT INTO documents (id, file_url, user_id) VALUES (3, 'uploads/private/sample.pdf', 99999)"
+  steps:
+    - api: "POST /api/documents/3/extract-unscoped"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM documents WHERE id = 3 AND extract_error = 'extract_text refused: the signed-in caller cannot read the `record:` row'"
+      expect:
+        rows: 1

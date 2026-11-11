@@ -5,7 +5,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -151,7 +150,7 @@ func serveAppMCP(w http.ResponseWriter, r *http.Request, app *App, resource stri
 			if err != nil {
 				return appMCPSDKFailure(err), nil
 			}
-			text, err := json.Marshal(result)
+			text, err := appMCPJSONText(result)
 			if err != nil {
 				return appMCPSDKFailure(err), nil
 			}
@@ -166,7 +165,7 @@ func serveAppMCP(w http.ResponseWriter, r *http.Request, app *App, resource stri
 		})
 	}
 	addAppMCPCommandTools(server, app, generation, grant, actor, raw, resource)
-	appMCPRegisterArtifactTools(server, app, generation, grant, actor)
+	appMCPRegisterArtifactTools(server, app, generation, grant, actor, resource)
 	appMCPRegisterReadArtifactTool(server, app, generation, grant, actor, raw, resource)
 	appMCPRegisterResourceTools(server, app, generation, grant, actor, raw, resource)
 	appMCPRegisterFileTools(server, app, generation, grant, actor, raw, resource)
@@ -210,7 +209,9 @@ func appMCPSDKFailure(err error) *sdk.CallToolResult {
 			code, message = failure.Code, failure.Message
 		}
 	}
-	return &sdk.CallToolResult{Meta: sdk.Meta{"error_code": code, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}, IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: code + ": " + message}}}
+	// `docs` is where the code is documented (refusal_docs.go), for the app's
+	// builder; the text an assistant reads stays the code and its message.
+	return &sdk.CallToolResult{Meta: sdk.Meta{"error_code": code, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "docs": refusalDocsAt(refusalConnectorError, code)}, IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: code + ": " + message}}}
 }
 
 // The reviewed schema describes rows; the wire schema describes the complete

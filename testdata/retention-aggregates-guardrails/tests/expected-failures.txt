@@ -1,0 +1,4 @@
+# Deployed on purpose: the write gate refuses both files, the app still loads,
+# and the tests prove the refused parts do nothing at run time.
+app.yaml
+retention.yaml

@@ -4,6 +4,8 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -30,6 +32,19 @@ const maxIncludeChildrenPerParent = 100
 // `?include=`. Each entry runs a batched query per nesting level, so an
 // unbounded list let one request run thousands of them.
 const maxIncludeSpecs = 32
+
+// maxIncludeRowsPerRequest caps the related rows one request's `?include=`
+// expansion fetches in total, across every entry and nesting level. The
+// per-parent cap alone multiplied: per_page=327&include=tasks.comments bound
+// 32,700 task ids into one IN (...) and could hold ~3.3M comment rows in
+// memory, and each of the 32 entries did the same independently.
+const maxIncludeRowsPerRequest = 10000
+
+// maxIncludeParentsPerFetch caps the ids bound into one batched IN (...).
+// Larger id sets are fetched in chunks: SQLite refuses a statement with more
+// than 32,766 bound values, and the fetch helpers answer nil on any query
+// error, so an over-wide IN used to drop the whole include silently.
+const maxIncludeParentsPerFetch = 2000
 
 // normalizeIncludeSpec trims every dotted segment of every `?include=` entry,
 // drops empty and duplicate entries (a duplicate resolves to exactly the same
@@ -80,96 +95,300 @@ func markIncludeTruncated(row map[string]any, name string) {
 // auditIncludeRead records an `?include=` expansion of an audited table:
 // one entry per batched fetch, like a list read, so related rows a caller
 // pulled in through an include are not invisible to the read audit.
-func auditIncludeRead(app *App, table string, rows []map[string]any, session *Session) {
-	if len(rows) > 0 && IsReadAudited(app, table) {
-		LogReadAccess(app, table, "", "include", session)
+func auditIncludeRead(app *App, table string, rows []map[string]any, session *Session, ia *includeAudit) {
+	if len(rows) > 0 && IsReadAudited(app, table) && ia.err == nil {
+		ia.err = LogReadAccess(app, ia.r, table, "", "include", session)
 	}
 }
 
-func ResolveIncludes(app *App, table string, rows []map[string]any, includeSpec string, session *Session) {
-	resolveIncludesDepth(app, table, rows, includeSpec, session, 0)
+// includeAudit carries one expansion's request (for the reader's address),
+// its first read-audit failure, which fails the whole read under compliance:
+// hipaa, and the related rows fetched so far against maxIncludeRowsPerRequest.
+type includeAudit struct {
+	r    *http.Request
+	err  error
+	used int
 }
 
-func resolveIncludesDepth(app *App, table string, rows []map[string]any, includeSpec string, session *Session, depth int) {
+// remaining is what is left of the request's include row budget.
+func (ia *includeAudit) remaining() int {
+	return max(0, maxIncludeRowsPerRequest-ia.used)
+}
+
+// orderedIncludeIDs returns the distinct non-NULL values of col in rows, in
+// row order, so a chunked fetch cut by the budget expands the first rows of
+// the answer, deterministically.
+func orderedIncludeIDs(rows []map[string]any, col string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, row := range rows {
+		if val, ok := row[col]; ok && val != nil {
+			key := valueText(val)
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, key)
+			}
+		}
+	}
+	return out
+}
+
+func includeIDSet(ids []string) map[string]bool {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
+// ResolveIncludes expands includeSpec into rows. The error is a read-audit
+// write that failed under compliance: hipaa; the caller must not answer rows.
+func ResolveIncludes(app *App, r *http.Request, table string, rows []map[string]any, includeSpec string, session *Session) error {
+	ia := &includeAudit{r: r}
+	resolveIncludesDepth(app, table, rows, includeSpec, session, ia, 0)
+	return ia.err
+}
+
+func resolveIncludesDepth(app *App, table string, rows []map[string]any, includeSpec string, session *Session, ia *includeAudit, depth int) {
 	if includeSpec == "" || len(rows) == 0 || depth >= maxIncludeDepth {
 		return
 	}
 
-	// Parse include spec: "contact,tasks" or "deals.tasks"
-	includes := strings.Split(includeSpec, ",")
-	for _, inc := range includes {
+	// Parse include spec: "contact,tasks" or "deals.tasks". Entries that
+	// share a first segment ("tasks,tasks.comments,tasks.owner") resolve that
+	// relation ONCE, with the remainders as one nested spec ("comments,owner"):
+	// each entry used to fetch "tasks" again and spend the budget again.
+	var order []string
+	nestedFor := map[string][]string{}
+	for _, inc := range strings.Split(includeSpec, ",") {
 		inc = strings.TrimSpace(inc)
 		if inc == "" {
 			continue
 		}
-
-		// Handle nested: "deals.tasks" → resolve "deals" first, then "tasks" on each deal
 		parts := strings.SplitN(inc, ".", 2)
 		name := parts[0]
-		nested := ""
-		if len(parts) > 1 {
-			nested = parts[1]
+		if _, seen := nestedFor[name]; !seen {
+			order = append(order, name)
+			nestedFor[name] = nil
 		}
-
-		resolveInclude(app, table, rows, name, nested, session, depth)
+		if len(parts) > 1 && parts[1] != "" && !slices.Contains(nestedFor[name], parts[1]) {
+			nestedFor[name] = append(nestedFor[name], parts[1])
+		}
+	}
+	for _, name := range order {
+		resolveInclude(app, table, rows, name, strings.Join(nestedFor[name], ","), session, ia, depth)
 	}
 }
 
 // resolveInclude fetches related records for a single include name and attaches them to rows.
-func resolveInclude(app *App, table string, rows []map[string]any, name string, nested string, session *Session, depth int) {
-	// Strategy 1: Parent include - this table has a FK column pointing to the included table.
-	// Example: deals has contact_id → include "contact" fetches from contacts table.
-	if parentFK, parentTable := findParentFK(app, table, name); parentFK != "" {
-		resolveParentInclude(app, rows, name, parentFK, parentTable, nested, session, depth)
+func resolveInclude(app *App, table string, rows []map[string]any, name string, nested string, session *Session, ia *includeAudit, depth int) {
+	rel, ok := resolveIncludeRelation(app, table, name)
+	if !ok {
 		return
 	}
+	if rel.parent {
+		resolveParentInclude(app, rows, name, rel.fkCol, rel.table, nested, session, ia, depth)
+		return
+	}
+	resolveChildInclude(app, rows, name, rel.table, rel.fkCol, nested, session, ia, depth)
+}
 
-	// Strategy 2: Child include - another table has a FK pointing to this table.
-	// Example: contacts include "deals" → deals table has contact_id pointing to contacts.
-	if childTable, childFK := findChildFK(app, table, name); childTable != "" {
-		resolveChildInclude(app, rows, name, childTable, childFK, nested, session, depth)
-		return
+// includeRelation is what one `?include=` name resolves to: a parent (rows
+// hold fkCol, pointing at table.id) or children (table.fkCol points at the
+// rows' id).
+type includeRelation struct {
+	parent bool
+	table  string
+	fkCol  string
+}
+
+// resolveIncludeRelation resolves an include name on table. Table-name
+// matching comes first, so every include that resolved before resolves the
+// same way:
+//  1. parent: a `<name>_id` FK, or an FK whose target table is `name`
+//     ("contact" or "contacts" on deals → contacts);
+//  2. child: a table named `name` (or `name`+"s", or `name` minus a trailing
+//     "s") with an FK to this table ("deals" on contacts → deals);
+//  3. the model's Prisma relation field named `name`: a pointer through its
+//     `fields:` column, a back-relation (`notes CaseNote[]`) through the
+//     other model's pointer to this one.
+func resolveIncludeRelation(app *App, table, name string) (includeRelation, bool) {
+	if parentFK, parentTable := findParentFK(app, table, name); parentFK != "" {
+		return includeRelation{parent: true, table: parentTable, fkCol: parentFK}, true
 	}
+	if childTable, childFK := findChildFK(app, table, name); childTable != "" {
+		return includeRelation{table: childTable, fkCol: childFK}, true
+	}
+	return prismaRelationInclude(app, table, name)
+}
+
+// tableRelations returns the Prisma relation fields of table's model.
+func tableRelations(app *App, table string) []PrismaRelation {
+	for _, t := range app.Tables {
+		if t.Name == table {
+			return t.Relations
+		}
+	}
+	return nil
+}
+
+// prismaRelationInclude resolves `name` as a Prisma relation field of
+// table's model. Only relations keyed on the related row's id resolve, the
+// same key the include fetches by, and never to a framework or SQLite table
+// (a model @@map'd onto one is not an auto-CRUD table).
+func prismaRelationInclude(app *App, table, name string) (includeRelation, bool) {
+	for _, rel := range tableRelations(app, table) {
+		if rel.Name != name {
+			continue
+		}
+		if strings.HasPrefix(rel.Table, "_") || strings.HasPrefix(strings.ToLower(rel.Table), "sqlite_") {
+			return includeRelation{}, false
+		}
+		if rel.Column != "" {
+			if rel.References != "id" || !hasColumn(app, table, rel.Column) || !hasColumn(app, rel.Table, "id") {
+				return includeRelation{}, false
+			}
+			return includeRelation{parent: true, table: rel.Table, fkCol: rel.Column}, true
+		}
+		if fk := backRelationFK(app, table, rel); fk != "" && hasColumn(app, table, "id") {
+			return includeRelation{table: rel.Table, fkCol: fk}, true
+		}
+		return includeRelation{}, false
+	}
+	return includeRelation{}, false
+}
+
+// backRelationFK finds the column on rel.Table that points at table.id for
+// the back-relation rel: the related model's pointer to this model with the
+// same relation label, else its only pointer to this model, else the only
+// declared foreign key from rel.Table to table.id. Ambiguity resolves to "".
+func backRelationFK(app *App, table string, rel PrismaRelation) string {
+	var labelled, all []string
+	for _, other := range tableRelations(app, rel.Table) {
+		if other.Table != table || other.Column == "" || other.References != "id" {
+			continue
+		}
+		all = append(all, other.Column)
+		if other.Label == rel.Label {
+			labelled = append(labelled, other.Column)
+		}
+	}
+	pick := func(cols []string) string {
+		if len(cols) == 1 && hasColumn(app, rel.Table, cols[0]) {
+			return cols[0]
+		}
+		return ""
+	}
+	if len(labelled) > 0 {
+		return pick(labelled)
+	}
+	if len(all) > 0 {
+		return pick(all)
+	}
+	var declared []string
+	for col, fk := range app.joinMapSnapshot()[rel.Table] {
+		if fk.Table == table && fk.Column == "id" {
+			declared = append(declared, col)
+		}
+	}
+	return pick(declared)
+}
+
+// ignoredIncludeEntries returns the `?include=` entries (normalized) that
+// expand nothing, each as "include=<entry>" for X-Ignored-Params: a segment
+// that names no relation of the table it is resolved on, or a segment past
+// maxIncludeDepth. Resolution is by schema, not by rows: an include that
+// resolves but finds no related row the caller may read is applied (a
+// has-many include still answers []).
+func ignoredIncludeEntries(app *App, table, spec string) []string {
+	if spec == "" {
+		return nil
+	}
+	var ignored []string
+	for _, entry := range strings.Split(spec, ",") {
+		cur := table
+		for i, seg := range strings.Split(entry, ".") {
+			rel, ok := includeRelation{}, false
+			if i < maxIncludeDepth {
+				rel, ok = resolveIncludeRelation(app, cur, seg)
+			}
+			if !ok {
+				ignored = append(ignored, "include="+entry)
+				break
+			}
+			cur = rel.table
+		}
+	}
+	return ignored
+}
+
+// allIncludeEntries names every `?include=` entry as ignored, for a read
+// that applies no include (a point-in-time read).
+func allIncludeEntries(spec string) []string {
+	if spec == "" {
+		return nil
+	}
+	var out []string
+	for _, entry := range strings.Split(spec, ",") {
+		out = append(out, "include="+entry)
+	}
+	return out
 }
 
 // resolveParentInclude fetches parent records and nests them.
 // Example: 20 deals each have contact_id → fetch all unique contacts in one query.
-func resolveParentInclude(app *App, rows []map[string]any, name string, fkCol string, parentTable string, nested string, session *Session, depth int) {
-	// Collect unique parent IDs
-	idSet := make(map[string]bool)
-	for _, row := range rows {
-		if val, ok := row[fkCol]; ok && val != nil {
-			idSet[fmt.Sprintf("%v", val)] = true
-		}
-	}
-	if len(idSet) == 0 {
+func resolveParentInclude(app *App, rows []map[string]any, name string, fkCol string, parentTable string, nested string, session *Session, ia *includeAudit, depth int) {
+	// Collect unique parent IDs, in row order
+	ids := orderedIncludeIDs(rows, fkCol)
+	if len(ids) == 0 {
 		return
 	}
 
-	// Batch fetch parents: SELECT * FROM contacts WHERE id IN (...)
-	parentRows := batchFetchByIDs(app, parentTable, idSet, session)
+	// Batch fetch parents: SELECT * FROM contacts WHERE id IN (...), in
+	// chunks of at most maxIncludeParentsPerFetch ids, each within what is
+	// left of the request's row budget (a parent fetch returns at most one
+	// row per id). Ids the budget does not reach are not fetched.
+	var parentRows []map[string]any
+	fetchedIDs := map[string]bool{}
+	for len(ids) > 0 {
+		n := min(min(len(ids), maxIncludeParentsPerFetch), ia.remaining())
+		if n == 0 {
+			break
+		}
+		got := batchFetchByIDs(app, parentTable, includeIDSet(ids[:n]), session, ia)
+		ia.used += len(got)
+		parentRows = append(parentRows, got...)
+		for _, id := range ids[:n] {
+			fetchedIDs[id] = true
+		}
+		ids = ids[n:]
+	}
 
 	// Index by ID for O(1) lookup
 	parentIndex := make(map[string]map[string]any)
 	for _, pr := range parentRows {
 		if id, ok := pr["id"]; ok {
-			parentIndex[fmt.Sprintf("%v", id)] = pr
+			parentIndex[valueText(id)] = pr
 		}
 	}
 
-	// Attach to each row
+	// Attach to each row. A row whose parent the budget did not reach is
+	// flagged under includeTruncatedKey, as a cut has-many list is, so it
+	// is not mistaken for a row with no readable parent.
 	for _, row := range rows {
 		if val, ok := row[fkCol]; ok && val != nil {
-			key := fmt.Sprintf("%v", val)
+			key := valueText(val)
 			if parent, found := parentIndex[key]; found {
 				row[name] = parent
+			} else if !fetchedIDs[key] {
+				markIncludeTruncated(row, name)
 			}
 		}
 	}
 
 	// Resolve nested includes on the parent records
 	if nested != "" && len(parentRows) > 0 {
-		resolveIncludesDepth(app, parentTable, parentRows, nested, session, depth+1)
+		resolveIncludesDepth(app, parentTable, parentRows, nested, session, ia, depth+1)
 	}
 	// Strip hidden columns (apiHiddenColumn) after nested includes, which
 	// read FK values that may themselves carry a hidden name.
@@ -178,23 +397,38 @@ func resolveParentInclude(app *App, rows []map[string]any, name string, fkCol st
 
 // resolveChildInclude fetches child records and nests them as arrays.
 // Example: 5 contacts → fetch all deals WHERE contact_id IN (1,2,3,4,5) in one query.
-func resolveChildInclude(app *App, rows []map[string]any, name string, childTable string, childFK string, nested string, session *Session, depth int) {
-	// Collect parent IDs
-	idSet := make(map[string]bool)
-	for _, row := range rows {
-		if val, ok := row["id"]; ok && val != nil {
-			idSet[fmt.Sprintf("%v", val)] = true
-		}
-	}
-	if len(idSet) == 0 {
+func resolveChildInclude(app *App, rows []map[string]any, name string, childTable string, childFK string, nested string, session *Session, ia *includeAudit, depth int) {
+	// Collect parent IDs, in row order
+	ids := orderedIncludeIDs(rows, "id")
+	if len(ids) == 0 {
 		return
 	}
 
 	// Batch fetch children: SELECT * FROM deals WHERE contact_id IN (...) AND deleted_at IS NULL
 	// Scoping: only include children the user has access to
 	// batchFetchByFK returns at most maxIncludeChildrenPerParent+1 rows per
-	// parent; the extra one only signals that the list was cut.
-	fetched := batchFetchByFK(app, childTable, childFK, idSet, session)
+	// parent; the extra one only signals that the list was cut. So a chunk
+	// of n parents returns at most n*(cap+1) rows, and n is chosen so that
+	// stays within what is left of the request's row budget: the total of
+	// one request's includes is bounded by maxIncludeRowsPerRequest, not by
+	// parents x 101 at every level. Parents the budget does not reach get
+	// no list and are flagged under includeTruncatedKey.
+	perParent := maxIncludeChildrenPerParent + 1
+	var fetched []map[string]any
+	fetchedParents := map[string]bool{}
+	for len(ids) > 0 {
+		n := min(min(len(ids), maxIncludeParentsPerFetch), ia.remaining()/perParent)
+		if n == 0 {
+			break
+		}
+		got := batchFetchByFK(app, childTable, childFK, includeIDSet(ids[:n]), session, ia)
+		ia.used += len(got)
+		fetched = append(fetched, got...)
+		for _, id := range ids[:n] {
+			fetchedParents[id] = true
+		}
+		ids = ids[n:]
+	}
 
 	// Group by FK value, keeping the first maxIncludeChildrenPerParent.
 	childGroups := make(map[string][]map[string]any)
@@ -202,7 +436,7 @@ func resolveChildInclude(app *App, rows []map[string]any, name string, childTabl
 	childRows := make([]map[string]any, 0, len(fetched))
 	for _, cr := range fetched {
 		if val, ok := cr[childFK]; ok && val != nil {
-			key := fmt.Sprintf("%v", val)
+			key := valueText(val)
 			if len(childGroups[key]) >= maxIncludeChildrenPerParent {
 				truncated[key] = true
 				continue
@@ -217,7 +451,11 @@ func resolveChildInclude(app *App, rows []map[string]any, name string, childTabl
 	// includeTruncatedKey so a client knows to page the child table itself.
 	for _, row := range rows {
 		if val, ok := row["id"]; ok && val != nil {
-			key := fmt.Sprintf("%v", val)
+			key := valueText(val)
+			if !fetchedParents[key] {
+				markIncludeTruncated(row, name)
+				continue
+			}
 			if children, found := childGroups[key]; found {
 				row[name] = children
 			} else {
@@ -231,7 +469,7 @@ func resolveChildInclude(app *App, rows []map[string]any, name string, childTabl
 
 	// Resolve nested includes on the child records
 	if nested != "" && len(childRows) > 0 {
-		resolveIncludesDepth(app, childTable, childRows, nested, session, depth+1)
+		resolveIncludesDepth(app, childTable, childRows, nested, session, ia, depth+1)
 	}
 	// Strip hidden columns only now: grouping and nested includes above
 	// read FK values that may themselves carry a hidden name.
@@ -253,27 +491,59 @@ func findParentFK(app *App, table string, name string) (fkCol string, parentTabl
 	}
 
 	// Try matching the FK's target table name directly (e.g., include "contacts" matches contact_id → contacts)
+	var cols []string
 	for col, fk := range fks {
 		if fk.Table == name {
-			return col, fk.Table
+			cols = append(cols, col)
 		}
+	}
+	if col := pickIncludeFK(cols, name); col != "" {
+		return col, fks[col].Table
 	}
 
 	return "", ""
 }
 
+// pickIncludeFK chooses among several FK columns that point at the same
+// table: the conventional `<singular target>_id` when present, else the
+// first by name. Map order used to decide, so a table with two FKs to one
+// parent (patient_id, referred_by_id) expanded a different one per request.
+// A Prisma relation field name (`notes`, `referrals`) names one exactly.
+func pickIncludeFK(cols []string, target string) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	conventional := singularize(target) + "_id"
+	if slices.Contains(cols, conventional) {
+		return conventional
+	}
+	slices.Sort(cols)
+	return cols[0]
+}
+
 // findChildFK checks if another table has a FK pointing to `table`, matching `name`.
 // Matches: "deals" on contacts → deals table has contact_id → contacts
 func findChildFK(app *App, table string, name string) (childTable string, childFK string) {
-	// Walk all tables in JoinMap looking for FKs pointing to our table
-	for candidateTable, fks := range app.joinMapSnapshot() {
-		for col, fk := range fks {
+	// Walk all tables in JoinMap looking for FKs pointing to our table,
+	// in name order so the answer does not depend on map iteration.
+	joins := app.joinMapSnapshot()
+	candidates := make([]string, 0, len(joins))
+	for candidateTable := range joins {
+		// Check if the candidate table name matches the include name
+		if candidateTable == name || candidateTable == name+"s" || strings.TrimSuffix(candidateTable, "s") == name {
+			candidates = append(candidates, candidateTable)
+		}
+	}
+	slices.Sort(candidates)
+	for _, candidateTable := range candidates {
+		var cols []string
+		for col, fk := range joins[candidateTable] {
 			if fk.Table == table && fk.Column == "id" {
-				// Check if the candidate table name matches the include name
-				if candidateTable == name || candidateTable == name+"s" || strings.TrimSuffix(candidateTable, "s") == name {
-					return candidateTable, col
-				}
+				cols = append(cols, col)
 			}
+		}
+		if col := pickIncludeFK(cols, table); col != "" {
+			return candidateTable, col
 		}
 	}
 	return "", ""
@@ -281,7 +551,7 @@ func findChildFK(app *App, table string, name string) (childTable string, childF
 
 // batchFetchByIDs fetches rows from a table where id IN (...).
 // Respects soft deletes and owner/group scoping.
-func batchFetchByIDs(app *App, table string, ids map[string]bool, session *Session) []map[string]any {
+func batchFetchByIDs(app *App, table string, ids map[string]bool, session *Session, ia *includeAudit) []map[string]any {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -317,7 +587,7 @@ func batchFetchByIDs(app *App, table string, ids map[string]bool, session *Sessi
 	if err != nil {
 		return nil
 	}
-	auditIncludeRead(app, table, rows, session)
+	auditIncludeRead(app, table, rows, session, ia)
 	// Mask encrypted columns on the INCLUDED (parent) rows with the
 	// requesting session's role - identical to the primary read path
 	// (crud_read.go handleList/handleRead). QueryRows returns DB-trigger-
@@ -331,7 +601,7 @@ func batchFetchByIDs(app *App, table string, ids map[string]bool, session *Sessi
 
 // batchFetchByFK fetches rows from a table where fkCol IN (...).
 // Respects soft deletes.
-func batchFetchByFK(app *App, table string, fkCol string, fkValues map[string]bool, session *Session) []map[string]any {
+func batchFetchByFK(app *App, table string, fkCol string, fkValues map[string]bool, session *Session, ia *includeAudit) []map[string]any {
 	if len(fkValues) == 0 {
 		return nil
 	}
@@ -378,7 +648,7 @@ func batchFetchByFK(app *App, table string, fkCol string, fkValues map[string]bo
 	for _, row := range rows {
 		delete(row, includeRankColumn)
 	}
-	auditIncludeRead(app, table, rows, session)
+	auditIncludeRead(app, table, rows, session, ia)
 	// Mask encrypted columns on the INCLUDED (child) rows with the requesting
 	// session's role - identical to the primary read path (crud_read.go). Without
 	// this, `?include=children` on a table whose child rows carry an

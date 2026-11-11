@@ -1,0 +1,1 @@
+The local group key is also Sentry's complete custom fingerprint. Local-only warnings, absent DSNs and active category backoff do not consume a group's five-minute delivery claim. Browser deduplication includes severity so a warning cannot hide a later fatal/error report. Response-body network failures preserve the original rejection and add a report.

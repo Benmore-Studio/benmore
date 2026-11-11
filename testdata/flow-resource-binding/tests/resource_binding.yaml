@@ -1,0 +1,83 @@
+query_cannot_replace_path_resource:
+  anon: true
+  steps:
+    - get: "/api/probe/alpha?resourceId=beta"
+      expect:
+        status: 400
+        contains: "Conflicting flow path parameter"
+    - get: "/api/probe/alpha?resourceId=alpha&resourceId=beta"
+      expect:
+        status: 400
+    - get: "/api/probe/alpha?resourceId=alpha"
+      expect:
+        status: 200
+        json:
+          resourceId: alpha
+    - get: "/api/probe/alpha"
+      expect:
+        status: 200
+        json:
+          resourceId: alpha
+
+form_cannot_replace_path_resource:
+  as_user: "binder@test.com"
+  setup:
+    - sql: "DELETE FROM probe_writes"
+  steps:
+    - api: "POST /api/probe/alpha"
+      data:
+        resourceId: beta
+      expect:
+        status: 400
+        contains: "Conflicting flow path parameter"
+    - sql: "SELECT value FROM probe_writes"
+      expect:
+        rows: 0
+    - api: "POST /api/probe/alpha"
+      data:
+        resourceId: alpha
+      expect:
+        status: 200
+        json:
+          resourceId: alpha
+    - sql: "SELECT value FROM probe_writes WHERE value = 'alpha'"
+      expect:
+        rows: 1
+
+json_body_value_is_ignored_path_wins:
+  as_user: "binder@test.com"
+  setup:
+    - sql: "DELETE FROM probe_writes"
+  steps:
+    - api: "POST /api/probe/alpha"
+      json:
+        resourceId: beta
+      expect:
+        status: 200
+        json:
+          resourceId: alpha
+    - api: "POST /api/probe/alpha"
+      json:
+        resourceId: null
+      expect:
+        status: 200
+        json:
+          resourceId: alpha
+    - sql: "SELECT value FROM probe_writes WHERE value = 'alpha'"
+      expect:
+        rows: 2
+    - sql: "SELECT value FROM probe_writes WHERE value = 'beta'"
+      expect:
+        rows: 0
+
+# The secret is set, so the 401 is the missing/invalid signature. The runner
+# cannot send request headers, so a validly signed request with a conflicting
+# query (expected 200 with the path value) cannot be written here.
+verified_flow_bad_signature_is_401_before_any_conflict_check:
+  anon: true
+  steps:
+    - api: "POST /api/hook/evt_1?eventId=evt_2"
+      json:
+        action: ping
+      expect:
+        status: 401

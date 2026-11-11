@@ -1,0 +1,1 @@
+There is no generated /api/<table>/search alias. That path may be an app-authored flow or the ordinary single-row route for a text id named search. Use the list endpoint with q or bm.table(table).list({q}).

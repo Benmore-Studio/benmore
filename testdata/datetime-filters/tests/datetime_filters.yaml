@@ -1,0 +1,142 @@
+# DateTime filters and sorts compare instants. A DateTime column holds whatever
+# spelling its writer sent (CURRENT_TIMESTAMP's "2026-01-15 10:00:00", a
+# browser's "...T...Z", an offset, a bare date) and a read returns each as
+# RFC 3339 UTC. The stored text used to be compared as text, so a filter value
+# in the form the API returns matched the wrong rows.
+
+# The API returns `due` as 2026-03-04T20:00:00Z; filtering by that value must
+# find the row, whatever offset it was written with.
+filter_matches_the_value_the_api_returned:
+  as_user: "returned@datetime.test"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "due-offset", due: "2026-03-05T01:00:00+05:00"}
+      expect:
+        status: 200
+        contains: '"due":"2026-03-04T20:00:00Z"'
+    - get: "/api/tasks?due=2026-03-04T20:00:00Z"
+      expect:
+        status: 200
+        contains: "due-offset"
+    - get: "/api/tasks?due__in=2026-03-04T20:00:00Z,2026-03-09T00:00:00Z"
+      expect:
+        status: 200
+        contains: "due-offset"
+    # 20:00Z is before 21:30Z, although the stored text sorts after it.
+    - get: "/api/tasks?due__gte=2026-03-04T21:30:00Z"
+      expect:
+        status: 200
+        not_contains: "due-offset"
+    - get: "/api/tasks?due__ne=2026-03-04T20:00:00Z"
+      expect:
+        status: 200
+        not_contains: "due-offset"
+
+# A row made at 10:00 UTC, stored the way CURRENT_TIMESTAMP writes it. "Since
+# midnight that day", built the way a browser does (toISOString()), must
+# include it, "before midnight" must not, and count must agree with the list.
+created_since_midnight_includes_the_row_made_that_day:
+  as_user: "midnight@datetime.test"
+  setup:
+    - sql: "INSERT INTO tasks (user_id, title, created_at, updated_at) VALUES ({{user_id}}, 'made-at-10', '2026-01-15 10:00:00', '2026-01-15 10:00:00')"
+  steps:
+    - get: "/api/tasks?fields=title,created_at"
+      expect:
+        status: 200
+        contains: '"created_at":"2026-01-15T10:00:00Z"'
+    - get: "/api/tasks?created_at__gte=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        contains: "made-at-10"
+    - get: "/api/tasks?created_at__lt=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        not_contains: "made-at-10"
+    - get: "/api/tasks?created_at=2026-01-15T10:00:00Z"
+      expect:
+        status: 200
+        contains: "made-at-10"
+    - get: "/api/tasks?count=true&created_at__gte=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        json: {count: 1}
+    - get: "/api/tasks?count=true&created_at__lt=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        json: {count: 0}
+    - get: "/api/tasks?page=1&per_page=10&created_at__gte=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        contains:
+          - "made-at-10"
+          - '"total":1'
+    - get: "/api/tasks?cursor=0&created_at__gte=2026-01-15T00:00:00.000Z"
+      expect:
+        status: 200
+        contains: "made-at-10"
+    - api: "POST /api/_query"
+      json: {table: "tasks", select: ["title"], where: {created_at: {gte: "2026-01-15T00:00:00Z", lt: "2026-01-16T00:00:00Z"}}}
+      expect:
+        status: 200
+        contains:
+          - "made-at-10"
+          - '"count":1'
+    - api: "POST /api/_query"
+      json: {table: "tasks", select: ["title"], where: {created_at: {lt: "2026-01-15T00:00:00Z"}}}
+      expect:
+        status: 200
+        contains: '"count":0'
+
+# Two rows due at 20:00Z (written with +05:00) and 22:00Z. Ascending by due
+# must put 20:00Z first; the stored text orders them the other way round.
+sort_orders_by_instant:
+  as_user: "sort@datetime.test"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "A-20h", due: "2026-03-05T01:00:00+05:00"}
+      expect: {status: 200}
+    - api: "POST /api/tasks"
+      json: {title: "B-22h", due: "2026-03-04T22:00:00Z"}
+      expect: {status: 200}
+    - get: "/api/tasks?sort=due&order=asc&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"A-20h"},{"title":"B-22h"}]'
+    - get: "/api/tasks?orderBy=due:desc&fields=title"
+      expect:
+        status: 200
+        contains: '[{"title":"B-22h"},{"title":"A-20h"}]'
+    - api: "POST /api/_query"
+      json: {table: "tasks", select: ["title"], order_by: [{col: "due", dir: "asc"}]}
+      expect:
+        status: 200
+        contains: '[{"title":"A-20h"},{"title":"B-22h"}]'
+
+# A date-only value and a date-time at midnight are the same instant, and a
+# value that is no date is still compared as text.
+date_only_values_and_text_operands:
+  as_user: "dateonly@datetime.test"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "all-day", due: "2026-06-01"}
+      expect: {status: 200}
+    - get: "/api/tasks?due=2026-06-01T00:00:00Z"
+      expect:
+        status: 200
+        contains: "all-day"
+    - get: "/api/tasks?due=2026-06-01"
+      expect:
+        status: 200
+        contains: "all-day"
+    - get: "/api/tasks?due__gte=2026-06-01T00:00:00Z&due__lt=2026-06-02T00:00:00Z"
+      expect:
+        status: 200
+        contains: "all-day"
+    - get: "/api/tasks?due__like=2026-06%25"
+      expect:
+        status: 200
+        contains: "all-day"
+    - get: "/api/tasks?due=someday"
+      expect:
+        status: 200
+        not_contains: "all-day"

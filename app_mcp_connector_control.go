@@ -153,12 +153,19 @@ type appMCPConnectorStatus struct {
 	// only ones auto-approval can apply.
 	GrantApprovalTools int `json:"grant_approval_tools"`
 	// Enrollment is none, pending, active, stale (active for an older owner
-	// epoch; enable --writes re-enrolls it), retired (ledger removed when the
-	// connector was disabled; enable --writes re-enrolls it) or unavailable.
+	// epoch; enable --writes re-enrolls it), changed (active, but the reviewed
+	// commands now read or write a different set of tables; enable --writes
+	// re-enrolls it), retired (ledger removed when the connector was disabled;
+	// enable --writes re-enrolls it), out_of_order (active, but another trigger
+	// on an enrolled table fires before its revision triggers, so inserts that
+	// trigger rewrites fail and verification refuses the enrollment; enable
+	// --writes or a reload puts them first) or unavailable.
 	Enrollment string `json:"revision_enrollment"`
-	// ApprovedWritesOffReason is set only while a restart's suspension of
-	// approved writes is still recorded and writes did not resume (changed
-	// reviewed digests, stale review, unverified enrollment). Fixed phrase.
+	// ApprovedWritesOffReason is set while a restart's suspension of approved
+	// writes is still recorded and writes did not resume (changed reviewed
+	// digests, stale review, unverified enrollment), or after a hot reload of
+	// this process turned writes or auto-approve off and the owner has not
+	// changed a switch since. Fixed phrase.
 	ApprovedWritesOffReason string `json:"approved_writes_off_reason,omitempty"`
 	// Problem is a fixed phrase, never raw error text or a filesystem path.
 	Problem string `json:"problem,omitempty"`
@@ -222,10 +229,15 @@ func appMCPConnectorStatusFor(ctx context.Context, app *App) (st appMCPConnector
 		st.Enrollment = "retired"
 	case enrollment.OwnerEpoch != state.Epoch:
 		st.Enrollment = "stale"
+	case appMCPRevisionUniverseChanged(ctx, app, snapshotAppMCPGeneration(app), enrollment):
+		st.Enrollment = "changed"
+	case appMCPRevisionTriggersOutOfOrder(ctx, app.DB, enrollment.TableNames):
+		st.Enrollment = "out_of_order"
+		st.Problem = "another trigger on an enrolled table fires before its revision triggers, so inserts that trigger rewrites fail; run enable --writes or reload the app to put the revision triggers first"
 	default:
 		st.Enrollment = "active"
 	}
-	st.ApprovedWritesOffReason = appMCPWritesOffReason(st, state, snapshotAppMCPGeneration(app), withheld)
+	st.ApprovedWritesOffReason = appMCPWritesOffReason(st, state, snapshotAppMCPGeneration(app), withheld, app.mcpWritesOffByReload.Load())
 	return st
 }
 
@@ -238,7 +250,14 @@ func appMCPConnectorStatusFor(ctx context.Context, app *App) (st appMCPConnector
 // rotates the write epoch, so an approved but uncommitted operation can never
 // run, including after a later re-enable; stored operations, approvals and
 // audit rows are left in place.
-func appMCPConnectorApply(ctx context.Context, app *App, req appMCPConnectorRequest) error {
+func appMCPConnectorApply(ctx context.Context, app *App, req appMCPConnectorRequest) (err error) {
+	defer func() {
+		if err == nil && app != nil {
+			// The owner has set the switches since: a reload no longer
+			// explains their state.
+			app.mcpWritesOffByReload.Store(0)
+		}
+	}()
 	action, writes := req.Action, req.Writes
 	if os.Getenv("BENMORE_MCP_AUTHORITY_DIR") == "" {
 		return errors.New("connector authority directory is not configured for this instance")
@@ -378,7 +397,7 @@ func appMCPConnectorApply(ctx context.Context, app *App, req appMCPConnectorRequ
 	}); err != nil {
 		return err
 	}
-	err := appMCPEnrollAndEnableWrites(ctx, app, generation)
+	err = appMCPEnrollAndEnableWrites(ctx, app, generation)
 	if err == nil && req.AutoApprove {
 		// After writes are on: enabling writes rotates the write epoch, which
 		// ends auto-approval. The new switch always gets a fresh epoch.
@@ -436,6 +455,11 @@ func appMCPNothingToDisable(app *App, err error) error {
 // An enrollment recorded for an older owner epoch (after a revoke or a
 // restore) is re-enrolled; one stuck pending needs an operator.
 func appMCPEnrollAndEnableWrites(ctx context.Context, app *App, generation *appMCPRuntimeGeneration) error {
+	// Loads keep the revision triggers first; this repairs an order a load did
+	// not. It recreates them with the same text, so the enrollment stays valid.
+	if err := reseatAppMCPRevisionTriggersDB(ctx, app.DB); err != nil {
+		return fmt.Errorf("put revision triggers first: %w", err)
+	}
 	_, release, lease, err := acquireAppMCPWritePolicy(ctx, app.Dir)
 	if err != nil {
 		return err
@@ -455,7 +479,12 @@ func appMCPEnrollAndEnableWrites(ctx context.Context, app *App, generation *appM
 		return errors.New("revision enrollment record is unusable; an operator must repair it before approved writes can be enabled")
 	case enrollment.State == "pending":
 		return errors.New("revision enrollment is pending from an interrupted attempt; an operator must repair it before approved writes can be enabled")
-	case enrollment.State == "retired" || enrollment.OwnerEpoch != state.Epoch:
+	case enrollment.State == "retired" || enrollment.OwnerEpoch != state.Epoch || appMCPRevisionUniverseChanged(ctx, app, generation, enrollment):
+		// A reviewed change to which tables the commands read or write (a new
+		// command, a removed model) leaves the enrollment covering the old set;
+		// verification refused it ("universe changed; explicit repair is
+		// required") and no command offered that repair. The owner's enable
+		// --writes is the explicit action, as it is for a stale epoch.
 		if _, err := repairAppMCPRevisionEnrollment(ctx, app, generation); err != nil {
 			return fmt.Errorf("revision re-enrollment failed: %w", err)
 		}

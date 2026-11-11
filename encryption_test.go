@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestEncryptedFieldYAMLSimpleFormat(t *testing.T) {
@@ -97,20 +97,36 @@ encrypted:
 	}
 }
 
+// A masked value must carry nothing of the plaintext: no characters, no
+// length, no emptiness and no type. The old mask kept the last four bytes
+// (50000 -> "*0000", "bob secret" -> "******cret", multibyte text cut into
+// invalid UTF-8) and padded to the plaintext's byte length.
 func TestMaskValue(t *testing.T) {
 	tests := []struct {
-		input, expected string
+		name  string
+		input any
+		want  any
 	}{
-		{"123-45-6789", "*******6789"},
-		{"abc", "****"},
-		{"", "****"},
-		{"secret data here", "************here"},
+		{"ascii", "bob secret", encryptedFieldMask},
+		{"ssn", "123-45-6789", encryptedFieldMask},
+		{"digits", "98765", encryptedFieldMask},
+		{"short", "abc", encryptedFieldMask},
+		{"multibyte", "ключ-日本", encryptedFieldMask},
+		{"empty", "", encryptedFieldMask},
+		{"null", nil, nil},
+		{"integer column", int64(50000), encryptedFieldMask},
+		{"real column", 98765.5, encryptedFieldMask},
+		{"boolean column", false, encryptedFieldMask},
+		{"blob", []byte("raw bytes"), encryptedFieldMask},
 	}
 	for _, tt := range tests {
 		got := maskValue(tt.input)
-		if got != tt.expected {
-			t.Errorf("maskValue(%q) = %q, want %q", tt.input, got, tt.expected)
+		if got != tt.want {
+			t.Errorf("%s: maskValue(%#v) = %#v, want %#v", tt.name, tt.input, got, tt.want)
 		}
+	}
+	if encryptedFieldMask != "****" {
+		t.Fatalf("documented mask is \"****\", got %q", encryptedFieldMask)
 	}
 }
 

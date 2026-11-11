@@ -1,0 +1,1 @@
+Pair with role-gated routes - the AI flow itself should be authed (`auth: required`, `role: admin` or similar) so untrusted users can't reach the sql_dynamic step transitively.

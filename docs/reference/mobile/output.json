@@ -1,0 +1,7 @@
+[
+  "package.json                - Capacitor 6 deps (core, app, splash-screen, status-bar, cli, ios, android, typescript)",
+  "capacitor.config.ts         - server.url points at <app>.benmore.ai; allowNavigation pinned to the origin",
+  "www/index.html              - offline fallback with 4s auto-retry (only shown when server.url is unreachable)",
+  ".gitignore                  - excludes ios/, android/, node_modules/",
+  "README.md                   - build commands, icon/splash recipes, push notification + store distribution"
+]

@@ -1,0 +1,28 @@
+# flows/payment-webhook.yaml - receive {id, type, order_id}: verify, record once, queue the work
+on:
+  request:
+    method: POST
+    path: /api/webhooks/payments
+    auth: none
+    verify:                         # 401 before any step unless the body is signed
+      recipe: hmac_sha256_body
+      header: X-Signature-256
+      prefix: "sha256="
+      secret: "${{ env.PAYMENTS_WEBHOOK_SECRET }}"
+    transaction: true               # the event row and the queued job commit together
+jobs:
+  receive:
+    steps:
+      - id: event
+        run: sql
+        with: { query: "INSERT INTO webhook_events (event_id, kind) VALUES (:id, :type) ON CONFLICT (event_id) DO NOTHING RETURNING id" }
+      - if: ${{ !steps.event.outputs.rows }}      # a redelivery: answer 200, do nothing twice
+        run: respond
+        with: { status: 200, json: { received: true, duplicate: true } }
+      - run: enqueue
+        with:
+          flow: mark-order-paid
+          unique_key: "payment-${{ params.id }}"
+          with: { order_id: "${{ params.order_id }}" }
+      - run: respond
+        with: { status: 200, json: { received: true } }

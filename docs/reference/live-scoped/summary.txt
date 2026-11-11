@@ -1,0 +1,1 @@
+Debounced `bm.live` refresh. Each subscription serializes its fetchAndRender callbacks; events during pending work queue one trailing refresh. An older callback therefore cannot finish after a newer callback from that subscription and overwrite its render. The default 60ms trailing-edge debounce coalesces SSE bursts; mount and return to a visible tab request a refresh.

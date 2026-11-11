@@ -1,0 +1,16 @@
+// Publisher (broadcaster):
+const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+const pub = await bm.broadcast.publish('my-stream-slug', stream);
+// … pub.stop() when done
+
+// Viewer:
+const videoEl = document.querySelector('video');
+videoEl.muted = true;   // CRITICAL - browsers block autoplay-with-sound
+const sub = await bm.broadcast.subscribe('my-stream-slug');
+videoEl.srcObject = sub.stream;
+
+// Surface a "Tap to unmute" overlay button so the viewer can opt into audio:
+unmuteBtn.onclick = async () => { videoEl.muted = false; await videoEl.play(); };
+
+// Viewer count (safe to poll every 3s):
+const { live, viewers } = await bm.broadcast.stats('my-stream-slug');

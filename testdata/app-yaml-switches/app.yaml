@@ -1,0 +1,27 @@
+site_name: "Switches fixture"
+# Read by nothing: the page description is seo.description.
+description: "ignored top-level description"
+seo:
+  description: "The description pages carry"
+# Server-rendered pages bring their own CSS: no Tailwind, no Alpine.
+css: none
+
+auth:
+  identifier: email
+  redirect: /home
+  signup_redirect: /welcome
+  # Opens nothing: public reads are access.<table>.read: anon.
+  public_api: "notes"
+  # Built-in Stripe subscription mirror (api(at:"payments") subscription_sync).
+  billing_provider: stripe
+
+# /sse/events and /ws are not served.
+features:
+  sse: false
+  ws: false
+
+# The csp: lines of api(at:"csp") app_yaml_example for a stylesheet and its
+# fonts on another origin.
+csp:
+  style_src: "https://cdn.example.com"
+  font_src: "https://cdn.example.com"

@@ -1,0 +1,1 @@
+PITR covers an instance only from its first successful base upload. A failed base is retried, with a 1-second to 1-minute delay. PITR must be enabled for the app by the platform operator and needs backup storage. Once it is turned on, shipping starts within ten minutes.

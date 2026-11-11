@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -93,6 +94,15 @@ func startFakeMediaBroker(t *testing.T, reply map[string]any) *fakeMediaBroker {
 
 func serveFileForTest(t *testing.T, app *App, raw string) *httptest.ResponseRecorder {
 	t.Helper()
+	if app.DB == nil {
+		// serve_file reads the app's upload ownership records.
+		db, err := sql.Open("sqlite3", filepath.Join(app.Dir, "data.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		app.DB = db
+	}
 	rec := httptest.NewRecorder()
 	ctx := &FlowContext{App: app, Writer: rec, Request: httptest.NewRequest(http.MethodGet, "/f/doc", nil), Data: map[string]any{}, Params: map[string]string{}}
 	if err := execStepServeFile(ctx, &FlowStep{Type: "serve_file", ServeFile: &FlowServeFile{Path: raw}}); err != nil {

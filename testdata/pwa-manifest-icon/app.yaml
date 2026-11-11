@@ -1,0 +1,8 @@
+site_name: "pwa-manifest-icon fixture"
+# A `pwa:` section written from the documented keys, with no `icon`: the app
+# has static/favicon.svg and no static/icon-512.png.
+pwa:
+  name: "Icon fixture"
+  short_name: "Icons"
+  theme_color: "#18181b"
+  background_color: "#ffffff"

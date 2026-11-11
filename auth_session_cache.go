@@ -14,8 +14,8 @@ package main
 // Correctness rules:
 //   - Entries are keyed by app and by the exact credential the request
 //     carries (session cookie value and Authorization header), so an
-//     in-process sub-request with another identity never reads them. Edge
-//     bridge and private connector identities are never cached.
+//     in-process sub-request with another identity never reads them.
+//     Private connector identities are never cached.
 //   - Every hit returns a copy: callers adjust the Session they get.
 //   - An entry lives at most requestSessionCacheTTL. Long-lived streams
 //     (WebSocket, SSE) re-check their session on every event to see
@@ -68,6 +68,20 @@ func requestIsLongLivedStream(r *http.Request) bool {
 		strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
+// requestIsBackgroundPoll is a call the framework's browser SDK makes on its own
+// timer, not because a person did something: the bm.presence and bm.broadcast
+// heartbeats and a record-lock acquire/renew. They must not keep a session
+// alive past auth.idle_timeout. A timer in the app's own code cannot be told
+// apart from a click and still counts.
+func requestIsBackgroundPoll(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	p := r.URL.Path
+	return p == "/api/_presence/heartbeat" || p == "/api/_broadcast/heartbeat" ||
+		(strings.HasPrefix(p, "/api/") && strings.HasSuffix(p, "/lock"))
+}
+
 func requestSessionHolderFor(r *http.Request) *requestSessionHolder {
 	if r == nil {
 		return nil
@@ -76,17 +90,13 @@ func requestSessionHolderFor(r *http.Request) *requestSessionHolder {
 	return h
 }
 
-// requestSessionCredential is the cache key for the identity r presents, or
-// false when that identity must be resolved every time.
-func requestSessionCredential(r *http.Request) (string, bool) {
-	if r.Header.Get("X-Benmore-Edge-User") != "" {
-		return "", false // edge bridge: a signed, time-boxed per-request assertion
-	}
+// requestSessionCredential is the cache key for the identity r presents.
+func requestSessionCredential(r *http.Request) string {
 	cookie := ""
 	if c, err := requestSessionCookie(r); err == nil {
 		cookie = c.Value
 	}
-	return cookie + "\x00" + r.Header.Get("Authorization"), true
+	return cookie + "\x00" + r.Header.Get("Authorization")
 }
 
 func cloneSession(s *Session) *Session {

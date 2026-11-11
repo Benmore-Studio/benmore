@@ -29,7 +29,7 @@ package main
 // hmac_sha256_path_bearer derives an Authorization bearer from a route
 // handle without consuming the request body.
 //
-// Legacy named providers (stripe / github / slack / shopify) keep
+// Named providers (stripe / github / slack / shopify / benmore) keep
 // flowing through verifyWebhookSignature in flows_verify.go for back-compat -
 // the rich shape is opt-in by writing `verify:` as a YAML map.
 
@@ -72,8 +72,9 @@ type FlowVerify struct {
 	TimestampHeader string
 
 	// SkewSeconds bounds how old a signed payload may be. Default 300
-	// (5 minutes) when zero. Negative values are clamped to zero (no
-	// replay protection - only allowed for tests).
+	// (5 minutes) when zero, at most verifySkewMaxSeconds (refused above
+	// it at write time, cut to it at runtime). Negative values are clamped
+	// to zero (no replay protection - only allowed for tests).
 	SkewSeconds int
 
 	// Secret is env-interpolated at request time (so rotation in
@@ -87,9 +88,9 @@ type FlowVerify struct {
 	PreviousSecret string
 	previousSet    bool
 
-	// Prefix, when non-empty, is stripped from the actual signature
-	// header value before comparison. Lets `verify:` consume formats
-	// like `sha256=<hex>` without bespoke parsing.
+	// Prefix, when non-empty, must start the signature header value and is
+	// removed before comparison. Lets `verify:` consume formats like
+	// `sha256=<hex>` without bespoke parsing; a value without it fails.
 	Prefix string
 
 	// PathParam names the dynamic route segment used by
@@ -100,6 +101,22 @@ type FlowVerify struct {
 	// Context domain-separates path-derived bearer credentials. The
 	// expected token is hex(HMAC-SHA256(secret, context + path value)).
 	Context string
+}
+
+// verifySkewMaxSeconds bounds skew_seconds. A replay window is meant to absorb
+// clock drift and a sender's retry delay, and senders re-sign their retries;
+// 315360000 used to be accepted and verified a five-year-old signature.
+const verifySkewMaxSeconds = 86400
+
+// verifySkewWithinLimit is the write-time half of the skew_seconds bound. It
+// is not in validateFlowVerifyConfig, which the runtime also runs: a flow
+// saved before the bound keeps loading, and the runtime cuts its window to
+// verifySkewMaxSeconds instead.
+func verifySkewWithinLimit(v *FlowVerify) error {
+	if v != nil && v.SkewSeconds > verifySkewMaxSeconds {
+		return fmt.Errorf("verify: skew_seconds %d is over the limit of %d (one day); a replay window only needs to cover clock drift and retry delay", v.SkewSeconds, verifySkewMaxSeconds)
+	}
+	return nil
 }
 
 // validateFlowVerifyConfig is shared by the write-time gate and runtime
@@ -302,9 +319,9 @@ func verifyHMACBody(v *FlowVerify, r *http.Request, body []byte, secret string) 
 	if v.Header == "" {
 		return fmt.Errorf("verify: header: is required for hmac_sha256_body")
 	}
-	actual := stripPrefix(r.Header.Get(v.Header), v.Prefix)
-	if actual == "" {
-		return fmt.Errorf("verify: header %q missing or empty", v.Header)
+	actual, err := requiredPrefixedSignature(r.Header.Get(v.Header), v.Prefix, v.Header)
+	if err != nil {
+		return err
 	}
 	expected := hmacSHA256Hex(secret, body)
 	if !hmac.Equal([]byte(expected), []byte(actual)) {
@@ -399,6 +416,9 @@ func verifyHMACTimestampDotBody(v *FlowVerify, r *http.Request, body []byte, sec
 	if skew == 0 {
 		skew = 300 // 5 minutes default
 	}
+	if skew > verifySkewMaxSeconds {
+		skew = verifySkewMaxSeconds
+	}
 	if skew > 0 {
 		delta := time.Now().Unix() - ts
 		if delta < 0 {
@@ -408,9 +428,9 @@ func verifyHMACTimestampDotBody(v *FlowVerify, r *http.Request, body []byte, sec
 			return fmt.Errorf("verify: timestamp drift %ds exceeds skew_seconds=%d (replay protection)", delta, skew)
 		}
 	}
-	actual := stripPrefix(r.Header.Get(v.Header), v.Prefix)
-	if actual == "" {
-		return fmt.Errorf("verify: header %q missing or empty", v.Header)
+	actual, err := requiredPrefixedSignature(r.Header.Get(v.Header), v.Prefix, v.Header)
+	if err != nil {
+		return err
 	}
 	// Signing input is `timestamp + "." + body` - literal "." separator.
 	signedInput := make([]byte, 0, len(tsStr)+1+len(body))
@@ -438,11 +458,4 @@ func hmacSHA1(secret string, msg []byte) []byte {
 	mac := hmac.New(sha1.New, []byte(secret))
 	_, _ = mac.Write(msg)
 	return mac.Sum(nil)
-}
-
-func stripPrefix(value, prefix string) string {
-	if prefix != "" && strings.HasPrefix(value, prefix) {
-		return value[len(prefix):]
-	}
-	return value
 }

@@ -1,0 +1,6 @@
+[
+  "**Nullable DateTime → JSON null**. A null/empty DateTime column serializes as JSON `null`, NOT a zero date such as `\"0001-01-01T00:00:00Z\"`. Guard for null before formatting (`row.shipped_at && new Date(row.shipped_at)`); don't render the year-1 sentinel.",
+  "POST /api/<table> returns the full inserted row after response filtering. A real status column keeps its stored value, including null; only tables without that column receive the `status: created` marker. Use the response directly instead of re-fetching.",
+  "SSE payload is always {table, action} - never the row. Re-fetch the row data on the event (see api({at:'sse'})).",
+  "src/bm.d.ts is auto-regenerated on schema/config pushes - never hand-edit it; your edits are clobbered on the next push."
+]

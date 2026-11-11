@@ -1,0 +1,68 @@
+an_unsigned_delivery_is_refused_and_changes_nothing:
+  anon: true
+  setup:
+    - sql: "INSERT INTO orders (id, item, user_id) VALUES (4001, 'Unpaid lamp', 99999)"
+  steps:
+    - api: "POST /api/webhooks/payments"
+      json: { id: "evt_unsigned", type: "payment.succeeded", order_id: 4001 }
+      expect:
+        status: 401
+        contains: "Invalid signature"
+    - sql: "SELECT id FROM webhook_events WHERE event_id = 'evt_unsigned'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'mark-order-paid'"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM orders WHERE id = 4001 AND status = 'pending'"
+      expect: { rows: 1 }
+
+the_job_marks_an_order_paid_and_is_safe_to_repeat:
+  as_user: "ops@orders.test"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO orders (id, item, user_id) VALUES (4002, 'Desk', 99999)"
+  steps:
+    - api: "POST /api/orders/mark-paid"
+      json: { order_id: 4002 }
+      expect:
+        status: 200
+        json: { paid: true }
+    - sql: "SELECT id FROM orders WHERE id = 4002 AND status = 'paid' AND paid_at != ''"
+      save: { first: "id" }
+      expect: { rows: 1 }
+    - api: "POST /api/orders/mark-paid"
+      json: { order_id: 4002 }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM orders WHERE id = 4002 AND status = 'paid'"
+      expect: { rows: 1 }
+    - api: "POST /api/orders/mark-paid"
+      json: { order_id: 999999 }
+      expect: { status: 500 }
+
+a_customer_sees_their_order_but_cannot_mark_it_paid:
+  as_user: "cara@orders.test"
+  setup:
+    - sql: "INSERT INTO orders (id, item, user_id) VALUES (4003, 'Chair', {{user_id}})"
+    - sql: "INSERT INTO orders (id, item, user_id) VALUES (4004, 'Someone else''s sofa', 99999)"
+  steps:
+    - get: "/api/orders"
+      expect:
+        status: 200
+        contains: "Chair"
+        not_contains: "sofa"
+    - api: "PATCH /api/orders/4003"
+      json: { status: "paid" }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - api: "POST /api/orders"
+      json: { item: "Free table", status: "paid" }
+      expect: { status: 403 }
+    - api: "POST /api/orders/mark-paid"
+      json: { order_id: 4003 }
+      expect: { status: 403 }
+    - get: "/api/webhook_events"
+      expect: { status: 404 }
+    - sql: "SELECT id FROM orders WHERE id = 4003 AND status = 'pending'"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM orders WHERE item = 'Free table'"
+      expect: { rows: 0 }

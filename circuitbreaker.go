@@ -65,18 +65,33 @@ func CheckCircuit(host string) error {
 			c.lastAttempt = time.Now()
 			return nil // allow one probe request
 		}
-		return fmt.Errorf("circuit open for %s (%d consecutive failures, cooldown %s remaining)",
-			circuitHost(host), c.failures, (cbCooldown - time.Since(c.lastFailure)).Round(time.Second))
+		return &circuitOpenError{
+			msg: fmt.Sprintf("circuit open for %s (%d consecutive failures, cooldown %s remaining)",
+				circuitHost(host), c.failures, (cbCooldown - time.Since(c.lastFailure)).Round(time.Second)),
+			retryAt: c.lastFailure.Add(cbCooldown),
+		}
 	case cbStateHalfOpen:
 		// Only one request allowed in half-open - block others
 		if time.Since(c.lastAttempt) < 5*time.Second {
-			return fmt.Errorf("circuit half-open for %s (probe in progress)", circuitHost(host))
+			return &circuitOpenError{
+				msg:     fmt.Sprintf("circuit half-open for %s (probe in progress)", circuitHost(host)),
+				retryAt: c.lastAttempt.Add(5 * time.Second),
+			}
 		}
 		c.lastAttempt = time.Now()
 		return nil // allow another probe
 	}
 	return nil
 }
+
+// circuitOpenError is CheckCircuit's refusal: no request was sent, and the
+// circuit lets one through again at retryAt.
+type circuitOpenError struct {
+	msg     string
+	retryAt time.Time
+}
+
+func (e *circuitOpenError) Error() string { return e.msg }
 
 // RecordSuccess resets the circuit to closed.
 func RecordSuccess(host string) {
@@ -101,6 +116,9 @@ func RecordFailure(host string) {
 
 	c, exists := globalBreaker.circuits[host]
 	if !exists {
+		if len(globalBreaker.circuits) >= cbMaxCircuits {
+			globalBreaker.pruneLocked(time.Now())
+		}
 		c = &circuit{state: cbStateClosed}
 		globalBreaker.circuits[host] = c
 	}
@@ -118,6 +136,35 @@ func RecordFailure(host string) {
 	if c.failures >= cbFailureThreshold && c.state == cbStateClosed {
 		c.state = cbStateOpen
 		log.Printf("CIRCUIT BREAKER: %s tripped open after %d consecutive failures (cooldown %s)", circuitHost(host), c.failures, cbCooldown)
+	}
+}
+
+// cbMaxCircuits bounds the circuits kept per process. A circuit is added on
+// every failure and was never removed, so failing calls to request-chosen
+// hosts (a run: api URL a caller picks, wildcard DNS answering 5xx) grew the
+// map without limit.
+const cbMaxCircuits = 4096
+
+// pruneLocked drops circuits that are closed, or open with their cooldown
+// long over (their next call starts afresh either way); if the map is still
+// full, it drops the oldest failure first. The caller holds b.mu.
+func (b *circuitBreaker) pruneLocked(now time.Time) {
+	for host, c := range b.circuits {
+		if c.state == cbStateClosed || now.Sub(c.lastFailure) > 2*cbCooldown {
+			delete(b.circuits, host)
+		}
+	}
+	for len(b.circuits) >= cbMaxCircuits {
+		oldest, at := "", now
+		for host, c := range b.circuits {
+			if c.lastFailure.Before(at) {
+				oldest, at = host, c.lastFailure
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		delete(b.circuits, oldest)
 	}
 }
 

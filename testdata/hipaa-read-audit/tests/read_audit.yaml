@@ -1,0 +1,116 @@
+# compliance: hipaa audits reads of every table (no read_audit key), writes
+# each event before the read answers, and records the client address.
+list_read_is_audited_with_ip:
+  as_user: "doc@test.com"
+  steps:
+    - get: "/api/patients"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'list' AND user_email = 'doc@test.com' AND client_ip IS NOT NULL AND client_ip <> '' LIMIT 1"
+      expect:
+        rows: 1
+
+flow_sql_read_is_audited:
+  as_user: "flowdoc@test.com"
+  steps:
+    - get: "/api/patient-count"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'flow_sql' AND user_email = 'flowdoc@test.com' LIMIT 1"
+      expect:
+        rows: 1
+
+sessionless_flow_sql_read_is_audited_as_system:
+  anon: true
+  steps:
+    - api: "POST /api/patient-sweep"
+      expect:
+        status_in: [200, 202]
+    - flush: "jobs"
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'flow_sql' AND user_id = 0 AND user_email = 'system:flow_sql' LIMIT 1"
+      expect:
+        rows: 1
+
+admin_panel_read_is_audited:
+  as_user: "admin@test.com"
+  as_role: "admin"
+  steps:
+    - get: "/_admin/patients"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'admin_list' AND user_email = 'admin@test.com' LIMIT 1"
+      expect:
+        rows: 1
+
+failed_audit_write_fails_the_read:
+  as_user: "doc@test.com"
+  steps:
+    - sql: "CREATE TRIGGER audit_down BEFORE INSERT ON _benmore_read_audit BEGIN SELECT RAISE(ABORT, 'audit down'); END"
+    - get: "/api/patients"
+      expect:
+        status: 500
+    - get: "/api/patient-count"
+      expect:
+        status_in: [500, 502]
+    - sql: "DROP TRIGGER audit_down"
+    - get: "/api/patients"
+      expect:
+        status: 200
+
+# A transactional flow holds the write lock after its INSERT: the read event
+# is written right after the transaction ends, not on a second connection
+# while the lock is held (which would wait it out and fail the read).
+transactional_flow_read_is_audited:
+  as_user: "txdoc@test.com"
+  steps:
+    - api: "POST /api/patient-admit"
+      json: {}
+      expect:
+        status: 200
+        contains: '"n"'
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'flow_sql' AND user_email = 'txdoc@test.com' LIMIT 1"
+      expect:
+        rows: 1
+
+# Under hipaa a transactional flow whose read event cannot be written after
+# its transaction ends never releases the rows it buffered: 5xx, no count.
+transactional_flow_failed_audit_withholds_rows:
+  as_user: "txdown@test.com"
+  steps:
+    - sql: "CREATE TRIGGER audit_down_tx BEFORE INSERT ON _benmore_read_audit BEGIN SELECT RAISE(ABORT, 'audit down'); END"
+    - api: "POST /api/patient-admit"
+      json: {}
+      expect:
+        status_in: [500, 502]
+        not_contains: '"n"'
+    - sql: "DROP TRIGGER audit_down_tx"
+
+# A transactional flow that reads and then fails rolls its writes back, but
+# the read happened (the rows may already have left through a run: api step):
+# the event is written after the transaction ends, committed or not.
+rolled_back_flow_read_is_still_audited:
+  as_user: "leak@test.com"
+  steps:
+    - api: "POST /api/patient-leak"
+      json: {}
+      expect:
+        status_in: [400, 422, 500, 502]
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'flow_sql' AND user_email = 'leak@test.com'"
+      expect:
+        rows: 1
+
+# Public data (read: anon) is not PHI: anonymous reads of it are not recorded,
+# signed-in reads still are.
+anonymous_read_of_public_table_is_not_audited:
+  anon: true
+  setup:
+    - sql: "INSERT INTO notices (title) VALUES ('open hours')"
+  steps:
+    - get: "/api/notices"
+      expect:
+        status: 200
+        contains: "open hours"
+    # Absence asserted as one row (NOT EXISTS).
+    - sql: "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM _benmore_read_audit WHERE table_name = 'notices' AND user_email = 'anonymous')"
+      expect:
+        rows: 1

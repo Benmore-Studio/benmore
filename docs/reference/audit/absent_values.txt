@@ -1,0 +1,1 @@
+old_values and new_values hold JSON, or NULL when that side has no row: an insert's old_values and a delete's new_values, so GET /api/_audit returns null for them. Rows written by an older runtime hold '' instead, so a query over older history should test `COALESCE(old_values,'') = ''`; json_extract on '' raises malformed JSON, so guard old rows with json_valid().

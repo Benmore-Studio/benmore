@@ -24,7 +24,7 @@ func TestOTPFailuresLockAcrossCodes(t *testing.T) {
 	app.Paths = DiscoverAuthPaths(nil)
 	// The step completes only for an existing account under its own email.
 	mustExec(t, app.DB, "INSERT INTO _benmore_users (id, username, email, password_hash) VALUES (7, 'u', 'u@example.com', 'x')")
-	mustExec(t, app.DB, "CREATE TABLE _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
+	mustExec(t, app.DB, "CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
 	issue := func(code string) {
 		mustExec(t, app.DB, "DELETE FROM _benmore_otp WHERE email = 'u@example.com'")
 		mustExec(t, app.DB, "INSERT INTO _benmore_otp (email, code, expires_at) VALUES ('u@example.com', '"+code+"', datetime('now', '+10 minutes'))")

@@ -169,9 +169,27 @@ func RequireMiddleware(app *App, page *Page, next http.HandlerFunc) http.Handler
 	}
 }
 
-// SetUserRole updates a user's role (admin function).
-// Roles are developer-defined - any non-empty string is valid.
-func SetUserRole(db *sql.DB, userID int64, role string) error {
+// undeclaredRoleError refuses a role name the app does not declare. `user`
+// and `admin` always exist; when app.yaml has a roles: block, any other name
+// must be one of its entries. The grant API (POST /api/_auth/users/{id}/roles)
+// and the admin panel's primary-role change (POST /_admin/set-role) share it,
+// so neither turns a typo, or a tenant role name (groups.role_field, such as
+// a founding_role of owner), into a role no roles: entry defines. An app
+// without a roles: block has no catalogue to check against.
+func undeclaredRoleError(app *App, role string) error {
+	if role == "admin" || role == "user" || app == nil || app.Roles == nil {
+		return nil
+	}
+	if _, ok := app.Roles.Roles[role]; ok {
+		return nil
+	}
+	return fmt.Errorf("role %q is not defined in app.yaml under roles:", role)
+}
+
+// SetUserRole updates a user's role (admin function), on the database or in
+// the caller's transaction. Roles are developer-defined; callers check them
+// with undeclaredRoleError.
+func SetUserRole(db sqlExecutor, userID int64, role string) error {
 	role = strings.TrimSpace(strings.ToLower(role))
 	if role == "" {
 		return fmt.Errorf("role cannot be empty")

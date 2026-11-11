@@ -181,7 +181,7 @@ func appMCPRegisterFileTools(server *sdk.Server, app *App, generation *appMCPRun
 			if err != nil {
 				return appMCPSDKFailure(err), nil
 			}
-			text, err := json.Marshal(result)
+			text, err := appMCPJSONText(result)
 			if err != nil {
 				return appMCPSDKFailure(appMCPResultFailure("incomplete_result")), nil
 			}
@@ -528,77 +528,99 @@ func validateAppMCPFileColumnBindings(manifest *AppMCPManifest, definitions []cr
 	return nil
 }
 
-func validateAppMCPFileUploadTenantBindings(manifest *AppMCPManifest, group *GroupConfig, definitions []crudTableDefinition) error {
-	if manifest == nil {
+// validateAppMCPFileUploadTenantBinding and
+// validateAppMCPFileMembershipConstraintBinding check what one file handler
+// needs from the rest of the reviewed source: the app's groups configuration
+// and the schema. The strict loaders (review, check, inspect, the mcp.yaml
+// write gate, archive checks) refuse a manifest that fails them; a served load
+// keeps the manifest and reports the tool (appMCPFileRequirementProblems),
+// which then answers `denied` to every call (runAppMCPFileTool).
+func validateAppMCPFileUploadTenantBinding(tool AppMCPTool, group *GroupConfig, definitions []crudTableDefinition) error {
+	if tool.Handler.UploadTenant == nil {
 		return nil
 	}
-	for _, tool := range manifest.Tools {
-		if tool.Handler.UploadTenant == nil {
-			continue
+	if *tool.Handler.UploadTenant != "current" || tool.Handler.Kind != "file" || tool.Handler.FileColumn == "" || group == nil || !safeIdent(group.Table) || !safeIdent(group.Key) || !safeIdent(group.UserField) {
+		return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires current, a file_column, and configured groups.table/key/user_field", tool.Name)
+	}
+	var sourceTable, membershipTable *crudTableDefinition
+	for i := range definitions {
+		if definitions[i].name == tool.Handler.Table {
+			sourceTable = &definitions[i]
 		}
-		if *tool.Handler.UploadTenant != "current" || tool.Handler.Kind != "file" || tool.Handler.FileColumn == "" || group == nil || !safeIdent(group.Table) || !safeIdent(group.Key) || !safeIdent(group.UserField) {
-			return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires current, a file_column, and configured groups.table/key/user_field", tool.Name)
+		if definitions[i].name == group.Table {
+			membershipTable = &definitions[i]
 		}
-		var sourceTable, membershipTable *crudTableDefinition
-		for i := range definitions {
-			if definitions[i].name == tool.Handler.Table {
-				sourceTable = &definitions[i]
+	}
+	if sourceTable == nil || !sourceTable.columns[group.Key] || membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
+		return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires the configured tenant key on its source row and canonical groups table", tool.Name)
+	}
+	return nil
+}
+
+func validateAppMCPFileMembershipConstraintBinding(tool AppMCPTool, group *GroupConfig, encrypted *EncryptedFieldConfig, definitions []crudTableDefinition) error {
+	constraints := tool.Handler.MembershipConstraints
+	if len(constraints) == 0 {
+		return nil
+	}
+	if err := validateAppMCPFileMembershipConstraints(constraints); err != nil {
+		return fmt.Errorf("mcp.yaml: tool %q membership_constraints: %w", tool.Name, err)
+	}
+	if tool.Handler.Kind != "file" || group == nil || !membershipIdentRe.MatchString(group.Table) || !membershipIdentRe.MatchString(group.Key) || !membershipIdentRe.MatchString(group.UserField) {
+		return fmt.Errorf("mcp.yaml: tool %q membership_constraints require configured groups.table, groups.key, and groups.user_field", tool.Name)
+	}
+	var membershipTable *crudTableDefinition
+	for i := range definitions {
+		if definitions[i].name == group.Table {
+			membershipTable = &definitions[i]
+			break
+		}
+	}
+	if membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
+		return fmt.Errorf("mcp.yaml: tool %q membership_constraints must use the configured canonical groups table and key columns", tool.Name)
+	}
+	var sealed []EncryptedFieldDef
+	if encrypted != nil {
+		sealed = encrypted.Fields[group.Table]
+	}
+	// Sorted so the same manifest always names the same column first.
+	columns := make([]string, 0, len(constraints))
+	for column := range constraints {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	for _, column := range columns {
+		if !membershipTable.columns[column] || apiHiddenColumn(nil, group.Table, column) {
+			return fmt.Errorf("mcp.yaml: tool %q membership constraint %q is not a canonical readable groups column", tool.Name, column)
+		}
+		if strings.HasSuffix(column, blindColSuffix) {
+			return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use a blind index", tool.Name, column)
+		}
+		for _, field := range sealed {
+			if field.Column == column {
+				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use an encrypted column", tool.Name, column)
 			}
-			if definitions[i].name == group.Table {
-				membershipTable = &definitions[i]
-			}
-		}
-		if sourceTable == nil || !sourceTable.columns[group.Key] || membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
-			return fmt.Errorf("mcp.yaml: tool %q upload_tenant requires the configured tenant key on its source row and canonical groups table", tool.Name)
 		}
 	}
 	return nil
 }
 
-func validateAppMCPFileMembershipConstraintBindings(dir string, manifest *AppMCPManifest, group *GroupConfig, definitions []crudTableDefinition) error {
+// appMCPFileRequirementProblems returns, per file tool, the first unmet
+// requirement of the two validators above, in manifest order.
+func appMCPFileRequirementProblems(manifest *AppMCPManifest, group *GroupConfig, encrypted *EncryptedFieldConfig, definitions []crudTableDefinition) []string {
 	if manifest == nil {
 		return nil
 	}
+	var problems []string
 	for _, tool := range manifest.Tools {
-		constraints := tool.Handler.MembershipConstraints
-		if len(constraints) == 0 {
-			continue
+		err := validateAppMCPFileMembershipConstraintBinding(tool, group, encrypted, definitions)
+		if err == nil {
+			err = validateAppMCPFileUploadTenantBinding(tool, group, definitions)
 		}
-		if err := validateAppMCPFileMembershipConstraints(constraints); err != nil {
-			return fmt.Errorf("mcp.yaml: tool %q membership_constraints: %w", tool.Name, err)
-		}
-		if tool.Handler.Kind != "file" || group == nil || !membershipIdentRe.MatchString(group.Table) || !membershipIdentRe.MatchString(group.Key) || !membershipIdentRe.MatchString(group.UserField) {
-			return fmt.Errorf("mcp.yaml: tool %q membership_constraints require configured groups.table, groups.key, and groups.user_field", tool.Name)
-		}
-		var membershipTable *crudTableDefinition
-		for i := range definitions {
-			if definitions[i].name == group.Table {
-				membershipTable = &definitions[i]
-				break
-			}
-		}
-		if membershipTable == nil || !membershipTable.columns[group.Key] || !membershipTable.columns[group.UserField] {
-			return fmt.Errorf("mcp.yaml: tool %q membership_constraints must use the configured canonical groups table and key columns", tool.Name)
-		}
-		var encrypted []EncryptedFieldDef
-		if config := LoadEncryptedFieldsConfig(dir); config != nil {
-			encrypted = config.Fields[group.Table]
-		}
-		for column := range constraints {
-			if !membershipTable.columns[column] || apiHiddenColumn(nil, group.Table, column) {
-				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q is not a canonical readable groups column", tool.Name, column)
-			}
-			if strings.HasSuffix(column, blindColSuffix) {
-				return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use a blind index", tool.Name, column)
-			}
-			for _, field := range encrypted {
-				if field.Column == column {
-					return fmt.Errorf("mcp.yaml: tool %q membership constraint %q cannot use an encrypted column", tool.Name, column)
-				}
-			}
+		if err != nil {
+			problems = append(problems, err.Error())
 		}
 	}
-	return nil
+	return problems
 }
 
 func appMCPFileColumnReadable(q appMCPFileSnapshotQueryer, app *App, table, column string) bool {
@@ -738,7 +760,7 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 	if marshalErr != nil || len(encodedInput) > appMCPInputLimit || len(fileRef) > 4096 {
 		return nil, appMCPResultFailure("invalid_input")
 	}
-	logical, err := privateLogicalUploadPath(fileRef)
+	logical, err := appMCPFileReferencePath(app, fileRef)
 	if err != nil {
 		return nil, appMCPResultFailure("invalid_input")
 	}
@@ -869,7 +891,14 @@ func runAppMCPFileTool(ctx context.Context, origin *App, generation *appMCPRunti
 			quality := append([]string(nil), result.Quality...)
 			if parseErr != nil {
 				if errors.Is(parseErr, ErrIngestEncrypted) {
-					quality = append(quality, "encrypted_pdf")
+					flag := "encrypted_file"
+					switch strings.ToLower(filepath.Ext(logical)) {
+					case ".pdf":
+						flag = "encrypted_pdf"
+					case ".docx", ".pptx", ".xlsx", ".xlsm":
+						flag = QualityEncryptedOOXML
+					}
+					quality = append(quality, flag)
 				}
 				if processingID, err = appMCPRecordFileProcessing(app, actor.UserID, logical, result.SHA256, "private_upload", result.SHA256, contentType, limits, false, quality); err != nil {
 					return nil, appMCPResultFailure("incomplete_result")
@@ -1020,6 +1049,34 @@ func appMCPAuthorizeFileRecordForTool(app *App, actor *Session, table, id, logic
 	return appMCPAuthorizeFileRecord(app, actor, table, id, logical)
 }
 
+// appMCPFileReferencePath turns a file tool's file_ref into the logical
+// uploads/private/... path. A row stores what /api/_upload returned: on the
+// platform media CDN that is this app's own private CDN URL, so the URL form
+// is accepted too, but only when the app's storage backend is that CDN and
+// only through the delete_upload rule (privateUploadPath: https, the exact CDN
+// host, this app's private prefix, no userinfo, query, fragment, encoding or
+// dot segments), and the URL must be exactly the one the upload produced for
+// that path (no doubled slash or other spelling). Every other URL stays
+// refused.
+func appMCPFileReferencePath(app *App, raw string) (string, error) {
+	logical, err := privateLogicalUploadPath(raw)
+	if err == nil || app == nil || !strings.Contains(raw, "://") {
+		return logical, err
+	}
+	cdn, ok := storageBackendForApp(app).(*CDNStorage)
+	if !ok {
+		return "", err
+	}
+	logical, err = privateUploadPath(app, cdn, raw)
+	if err != nil {
+		return "", err
+	}
+	if raw != "https://"+cdn.CDNDomain+"/"+cdn.cdnKeyFor(logical) {
+		return "", errors.New("file reference is not this app's canonical private media URL")
+	}
+	return logical, nil
+}
+
 func appMCPReadAuthorizedPrivateUpload(ctx context.Context, app *App, actor *Session, table, id, logical string, maxBytes int64, fileColumns ...string) ([]byte, string, error) {
 	if !appMCPAuthorizeFileRecord(app, actor, table, id, logical, fileColumns...) {
 		return nil, "", appMCPResultFailure("denied")
@@ -1119,6 +1176,25 @@ func appMCPParsePrivateUpload(logical, contentType string, data []byte, limits I
 		result, err := IngestXLSX(bytes.NewReader(data), int64(len(data)), limits)
 		if err == nil && ((ext == ".xlsm") != (result.Format == IngestFormatXLSM)) {
 			return failedIngest(result.Format), ErrIngestUnsupported
+		}
+		return result, err
+	case ".docx", ".pptx":
+		if len(data) < 4 || !bytes.Equal(data[:4], []byte{'P', 'K', 3, 4}) || http.DetectContentType(data[:min(len(data), 512)]) != "application/zip" {
+			return failedIngest(strings.TrimPrefix(ext, ".")), ErrIngestUnsupported
+		}
+		wantType := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		if ext == ".pptx" {
+			wantType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		}
+		if contentType != wantType {
+			return failedIngest(strings.TrimPrefix(ext, ".")), ErrIngestUnsupported
+		}
+		var result IngestResult
+		var err error
+		if ext == ".docx" {
+			result, err = IngestDOCX(bytes.NewReader(data), int64(len(data)), limits)
+		} else {
+			result, err = IngestPPTX(bytes.NewReader(data), int64(len(data)), limits)
 		}
 		return result, err
 	default:
@@ -1267,6 +1343,8 @@ func appMCPFileParserAndLimits(fileID string, limits IngestLimits) (string, []by
 				"max_extracted_bytes":         appMCPPDFMaxExtractedBytes,
 			},
 		}
+	} else if strings.EqualFold(filepath.Ext(fileID), ".docx") || strings.EqualFold(filepath.Ext(fileID), ".pptx") {
+		parser = IngestOOXMLTextParserVersion
 	}
 	encoded, err := json.Marshal(persistedLimits)
 	return parser, encoded, err
@@ -1405,7 +1483,7 @@ func appMCPDecodeFileProcessingLimits(parser, encoded string) (any, error) {
 	decoder := json.NewDecoder(strings.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	var limits IngestLimits
-	if parser == IngestParserVersion {
+	if parser == IngestParserVersion || parser == IngestOOXMLTextParserVersion {
 		if err := decoder.Decode(&limits); err != nil {
 			return nil, errors.New("file processing limits metadata is invalid")
 		}

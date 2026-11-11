@@ -1,0 +1,1 @@
+Self-busting client-side cache for pre-paint patterns. `bm.cache.namespaced(name, version)` uses sessionStorage (per-tab); `bm.cache.persistent(name, version)` uses localStorage (cross-tab, survives reload). Old versions read as miss after a version bump, so cache invalidation is a single string change in code.

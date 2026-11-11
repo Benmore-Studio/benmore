@@ -1,0 +1,6 @@
+[
+  "Setup token is HMAC-signed (server secret), 15-minute TTL, single-purpose (only /setup + /verify accept it).",
+  "Setup token cannot reset an already-enrolled account - /setup rejects it when MFA is already active. Disable via a real session first.",
+  "Re-enrollment via /setup is allowed during the pending state (before /verify), so a user who mistyped their authenticator can restart enrollment.",
+  "CSRF is enforced for cookie-session callers; Bearer and setup-token callers each carry their own integrity proof and skip it."
+]

@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"runtime"
@@ -20,10 +21,26 @@ type appRouteMux struct {
 	patterns []string
 	sources  map[string]string
 	flows    map[string]string
+	// authoredFrom indexes patterns: those before it are framework-owned,
+	// the rest are the app's flows and pages (beginAuthoredRoutes).
+	authoredFrom int
+	// flowCollisions are the http flows RegisterFlows skipped.
+	flowCollisions []flowRouteCollision
+	// preflight is a route-only build (no handler is served): RegisterFlows
+	// records collisions without logging them as load errors.
+	preflight bool
+	// initErr is startup work the served build could not finish and must
+	// not serve without (buildAppMuxChecked returns it), such as a hipaa
+	// app's append-only audit triggers.
+	initErr error
 }
 
 func (mux *appRouteMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
-	mux.ServeMux.HandleFunc(pattern, handler)
+	// Without a ServeMux the patterns are only recorded (tableRoutePatterns):
+	// a ServeMux would panic on the collision that caller is looking for.
+	if mux.ServeMux != nil {
+		mux.ServeMux.HandleFunc(pattern, handler)
+	}
 	mux.patterns = append(mux.patterns, pattern)
 	if mux.sources == nil {
 		mux.sources = make(map[string]string)
@@ -54,4 +71,14 @@ func registerAppMCPRouteReservation(mux appRouteRegistrar) {
 	mux.HandleFunc("POST "+appMCPBatchRoute+"/approve", http.NotFound)
 	mux.HandleFunc("GET "+appMCPGrantsRoute, http.NotFound)
 	mux.HandleFunc("DELETE "+appMCPGrantsRoute+"/{id}", http.NotFound)
+}
+
+// routeInfof logs a route group's registration, except in a route-only
+// preflight build (the write gate, `benmore check`, connector review), which
+// registers nothing that serves.
+func routeInfof(mux appRouteRegistrar, format string, args ...any) {
+	if recorder, ok := mux.(*appRouteMux); ok && recorder.preflight {
+		return
+	}
+	log.Printf(format, args...)
 }

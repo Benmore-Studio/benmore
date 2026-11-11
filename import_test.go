@@ -696,39 +696,63 @@ func TestRecoverInterruptedImportsSweepsAbandonedStaging(t *testing.T) {
 	}
 }
 
-// TestRecoverInterruptedImportsDoesNotSweepUnderClusterMode is the
-// MEDIUM-4 fix: cluster mode (BENMORE_CLUSTER=true) is a supported
-// configuration where two processes share one data.db for the same app.
-// A "running" row this process didn't start might be a load genuinely
-// IN FLIGHT on a sibling instance right now - a sweep can't tell the two
-// apart, so it must not run at all under cluster mode, even though the
-// per-app.DB scoping already makes it safe against cross-TENANT damage.
-func TestRecoverInterruptedImportsDoesNotSweepUnderClusterMode(t *testing.T) {
+// TestRecoverInterruptedImportsClusterModeSweepsOnlyLapsedLeases: under
+// BENMORE_CLUSTER=true two processes share one data.db, so a "running" row
+// may be a sibling's live load and the sweep must leave a row whose lease is
+// current alone. A row whose lease lapsed (its process died) used to stay
+// running forever there (only manual SQL cleared it); it is failed now, at
+// startup and on the next call that loads it.
+func TestRecoverInterruptedImportsClusterModeSweepsOnlyLapsedLeases(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	EnsureImportsTable(app)
 
-	if _, err := writeImportChunk(app, "recover04", 0, strings.NewReader("x")); err != nil {
-		t.Fatal(err)
+	for _, id := range []string{"recover04", "recover06", "recover07"} {
+		if _, err := writeImportChunk(app, id, 0, strings.NewReader("x")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := app.DB.Exec(`INSERT INTO _benmore_imports
-		(id, table_name, format, gzip, bytes_total, sha256, null_as, state, created_by)
-		VALUES ('recover04','products','csv',0,1,'deadbeef','','running',1)`); err != nil {
+		(id, table_name, format, gzip, bytes_total, sha256, null_as, state, created_by, lease_expires_at) VALUES
+		('recover04','products','csv',0,1,'deadbeef','','running',1, datetime('now','+2 minutes')),
+		('recover06','products','csv',0,1,'deadbeef','','running',1, datetime('now','-1 minute')),
+		('recover07','products','csv',0,1,'deadbeef','','running',1, datetime('now','+2 minutes'))`); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Setenv("BENMORE_CLUSTER", "true")
 	EnsureImportsTable(app) // simulates a SIBLING instance starting up in cluster mode
 
-	sess, err := loadImportSession(app.DB, "recover04")
+	live, err := loadImportSession(app.DB, "recover04")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sess.State != "running" {
-		t.Fatalf("state after a cluster-mode EnsureImportsTable call = %q, want running (unswept - another instance may genuinely own this load)", sess.State)
+	if live.State != "running" {
+		t.Fatalf("a cluster-mode sweep failed a row with a current lease: state = %q", live.State)
 	}
 	if _, err := os.Stat(importStagingDir(app, "recover04")); err != nil {
-		t.Fatal("staging must survive: a cluster-mode sweep must not purge a row it cannot prove is actually interrupted")
+		t.Fatal("staging of a row with a current lease must survive a cluster-mode sweep")
+	}
+	dead, err := loadImportSession(app.DB, "recover06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dead.State != "failed" || dead.Error == "" {
+		t.Fatalf("a lapsed lease must be failed in cluster mode, got state=%q error=%q", dead.State, dead.Error)
+	}
+	if _, err := os.Stat(importStagingDir(app, "recover06")); !os.IsNotExist(err) {
+		t.Fatalf("a swept row's staging must be purged, stat err = %v", err)
+	}
+
+	// The lease of recover07 lapses after startup: the next load of it fails it.
+	if _, err := app.DB.Exec(`UPDATE _benmore_imports SET lease_expires_at = datetime('now','-1 second') WHERE id = 'recover07'`); err != nil {
+		t.Fatal(err)
+	}
+	if !failLapsedImport(app, "recover07") {
+		t.Fatal("a lapsed running import was not failed on its next load")
+	}
+	if failLapsedImport(app, "recover04") {
+		t.Fatal("a running import with a current lease was failed")
 	}
 }
 

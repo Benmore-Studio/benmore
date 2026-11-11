@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Only the trusted Notes starter is bound automatically. Existing app edits
 // require explicit review; this does not enable owner-controlled exposure.
 func writeAppMCPStarter(dir string) error {
-	manifest, err := parseAppMCPManifest([]byte(`version: 1
+	source := []byte(`version: 1
 connector: {id: notes-starter, name: Notes, version: '1'}
 contract_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 execution_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -43,16 +41,19 @@ tools:
     component: none
 resources: []
 connections: []
-`))
+`)
+	manifest, err := parseAppMCPManifest(source)
 	if err != nil {
 		return fmt.Errorf("MCP starter: %w", err)
 	}
 	manifest.ExecutionSources = appMCPExecutionSourcesRuntime
-	manifest.ContractDigest, manifest.ExecutionDigest, err = appMCPDigests(dir, manifest)
+	contract, execution, err := appMCPDigests(dir, manifest)
 	if err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(manifest)
+	// Written like a review: the two-space source above with only the review
+	// keys set, so the app's first edit can follow the file's own style.
+	data, err := appMCPReviewedManifestBytes(source, contract, execution)
 	if err != nil {
 		return fmt.Errorf("MCP starter: %w", err)
 	}

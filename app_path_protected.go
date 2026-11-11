@@ -12,6 +12,10 @@ func appPathProtected(rel string) bool {
 	if rel == "." || rel == "" {
 		return false
 	}
+	// A restore's copies of a database (restore_stage.go).
+	if restoreStagePath(strings.ToLower(rel)) {
+		return true
+	}
 	segs := strings.Split(rel, "/")
 	for _, seg := range segs {
 		switch strings.ToLower(seg) {

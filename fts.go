@@ -6,8 +6,9 @@ package main
 // in schema.prisma. Apps don't write SQL - the framework creates a
 // <table>_fts virtual table + INSERT/UPDATE/DELETE triggers + a
 // /api/<table>?q=foo handler path. Search filters the ordinary list,
-// retaining its ordering and row scope. Short queries use LIKE over the
-// indexed visible columns when trigram MATCH cannot tokenize them.
+// retaining its ordering and row scope. Every word of the query must match:
+// words of three or more characters through the trigram index, shorter ones
+// (which trigram cannot tokenize) through LIKE over the same visible columns.
 //
 // Schema example:
 //
@@ -29,12 +30,15 @@ package main
 // become FTS rowids. Rows live in the canonical table; FTS stores tokens.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // annotateFullTextFromPrisma reads schema.prisma (if present) and
@@ -182,13 +186,18 @@ func makeFTSDefinitionWithRowID(table string, cols []string, rowID string) (ftsI
 		`CREATE VIRTUAL TABLE %s USING fts5(%s, content='%s', content_rowid='%s', tokenize='trigram')`,
 		d.index, strings.Join(cols, ", "), table, rowID,
 	)
-	colList := strings.Join(cols, ", ")
+	// The stored text is the index's fingerprint (matches), so names are
+	// written as they always were, except an SQL reserved word, which the
+	// triggers can only take quoted (ddlIdent). fts5 reads its own column
+	// arguments and takes a reserved word bare.
+	colList := strings.Join(ddlIdents(cols), ", ")
 	newRefs, oldRefs := make([]string, len(cols)), make([]string, len(cols))
 	changes := []string{"old." + rowID + " IS NOT new." + rowID}
 	for i, col := range cols {
-		newRefs[i], oldRefs[i] = "new."+col, "old."+col
+		newRefs[i], oldRefs[i] = "new."+ddlIdent(col), "old."+ddlIdent(col)
 		changes = append(changes, oldRefs[i]+" IS NOT "+newRefs[i])
 	}
+	source := ddlIdent(table)
 	// Storage triggers can UPDATE an unrelated encrypted/blind/version field
 	// before this row's AFTER INSERT trigger has indexed it. FTS5's delete
 	// command would then remove a nonexistent posting and abort the INSERT.
@@ -196,11 +205,11 @@ func makeFTSDefinitionWithRowID(table string, cols []string, rowID string) (ftsI
 	// the UPDATE column list: SQLite also exposes id through rowid aliases.
 	d.triggers = []ftsTriggerDefinition{
 		{d.index + "_ai", fmt.Sprintf(`CREATE TRIGGER %s_ai AFTER INSERT ON %s BEGIN INSERT INTO %s(rowid, %s) VALUES (new.%s, %s); END`,
-			d.index, table, d.index, colList, rowID, strings.Join(newRefs, ", "))},
+			d.index, source, d.index, colList, rowID, strings.Join(newRefs, ", "))},
 		{d.index + "_ad", fmt.Sprintf(`CREATE TRIGGER %s_ad AFTER DELETE ON %s BEGIN INSERT INTO %s(%s, rowid, %s) VALUES('delete', old.%s, %s); END`,
-			d.index, table, d.index, d.index, colList, rowID, strings.Join(oldRefs, ", "))},
+			d.index, source, d.index, d.index, colList, rowID, strings.Join(oldRefs, ", "))},
 		{d.index + "_au", fmt.Sprintf(`CREATE TRIGGER %s_au AFTER UPDATE ON %s WHEN %s BEGIN INSERT INTO %s(%s, rowid, %s) VALUES('delete', old.%s, %s); INSERT INTO %s(rowid, %s) VALUES (new.%s, %s); END`,
-			d.index, table, strings.Join(changes, " OR "), d.index, d.index, colList, rowID, strings.Join(oldRefs, ", "), d.index, colList, rowID, strings.Join(newRefs, ", "))},
+			d.index, source, strings.Join(changes, " OR "), d.index, d.index, colList, rowID, strings.Join(oldRefs, ", "), d.index, colList, rowID, strings.Join(newRefs, ", "))},
 	}
 	return d, nil
 }
@@ -314,7 +323,7 @@ func ensureOneFTS(db *sql.DB, table string, cols []string) error {
 	if err != nil || (indexMatches && triggersMatch) {
 		return err
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "full-text index "+table), nil)
 	if err != nil {
 		return err
 	}
@@ -378,42 +387,92 @@ func ensureOneFTS(db *sql.DB, table string, cols []string) error {
 // custom flow that exec's the MATCH expression directly. The auto-CRUD
 // path optimizes for the 99% case: "find rows containing this string."
 func escapeFTS5Query(q string) string {
-	tokens := strings.Fields(q)
-	if len(tokens) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		escaped := strings.ReplaceAll(t, `"`, `""`)
-		parts = append(parts, `"`+escaped+`"`)
+	return ftsMatchPhrases(ftsQueryWords(q))
+}
+
+// ftsMatchPhrases quotes each word as an FTS5 phrase; the phrases join as
+// implicit AND.
+func ftsMatchPhrases(words []string) string {
+	parts := make([]string, 0, len(words))
+	for _, w := range words {
+		parts = append(parts, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
 	}
 	return strings.Join(parts, " ")
 }
 
-// ftsTrigramUsable reports whether every whitespace token in q is ≥3 runes -
-// the minimum the trigram tokenizer can index/match. A query with any shorter
-// token (e.g. "ab", or "ab cdef") can't be served by trigram MATCH (the short
-// token's phrase matches nothing → AND yields zero rows), so the CRUD path
-// falls back to LIKE for those.
-func ftsTrigramUsable(q string) bool {
-	toks := strings.Fields(q)
-	if len(toks) == 0 {
-		return false
-	}
-	for _, t := range toks {
-		if len([]rune(t)) < 3 {
-			return false
-		}
-	}
-	return true
+// ftsQueryWords splits a search string into its words. Whitespace separates
+// words and so does every other control character: SQLite reads a MATCH
+// expression and a LIKE pattern as C strings, so a NUL inside a word ended
+// it early. `rep\x00` failed MATCH with "unterminated string" (a 500), and
+// the LIKE pattern `%a\x00%` was read as `%a` (rows ending in a). Tab and
+// newline are control characters that already separated words.
+func ftsQueryWords(q string) []string {
+	return strings.FieldsFunc(q, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
 }
 
-// buildFTSLikeFallback builds a case-insensitive substring WHERE clause across
-// the FTS columns, for queries too short for trigram. %/_/\ in the query are
-// escaped so they're literal, not LIKE wildcards. Not index-accelerated, but
-// sub-3-char queries are rare and result sets are bounded.
-func buildFTSLikeFallback(table string, cols []string, q string) (string, []any) {
-	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+// ftsTrigramMinRunes is the shortest word the trigram tokenizer can index or
+// match. A shorter phrase in a MATCH expression matches no row.
+const ftsTrigramMinRunes = 3
+
+// ftsMaxShortWords bounds the distinct words shorter than ftsTrigramMinRunes
+// one ?q= may hold. Each adds a LIKE group over every searched column to the
+// statement and a comparison per scanned row, so an unbounded count let one
+// long query build an arbitrarily large statement. A request past the bound
+// is refused (handleList, 400): dropping the extra words would return rows
+// that do not hold every word. Longer words are not counted: they all travel
+// in one bound MATCH argument and never grow the statement. Eight keeps a
+// worst case (every short word in every row of a public table, so no word
+// narrows the scan) near the cost of a single __like filter; 32 measured
+// about ten times one short word on 300,000 rows.
+const ftsMaxShortWords = 8
+
+// ftsQueryPlan is a ?q= split by what can match each word. Every word must
+// match (AND): long ones together in one trigram MATCH, each short one in its
+// own LIKE group.
+type ftsQueryPlan struct {
+	long  []string // ftsTrigramMinRunes or more runes
+	short []string // 1-2 runes
+}
+
+func (p ftsQueryPlan) empty() bool { return len(p.long) == 0 && len(p.short) == 0 }
+
+// planFTSQuery sorts the words of q into the plan, in query order. A word
+// repeated in any ASCII case is tested once: LIKE and the trigram index both
+// ignore ASCII case, and LIKE ignores no other, so `É` and `é` stay two words.
+func planFTSQuery(q string) ftsQueryPlan {
+	var plan ftsQueryPlan
+	words := ftsQueryWords(q)
+	if len(words) == 0 {
+		return plan // every list request without ?q= takes this path
+	}
+	seen := make(map[string]bool, len(words))
+	for _, word := range words {
+		folded := []byte(word)
+		for i, c := range folded {
+			if c >= 'A' && c <= 'Z' {
+				folded[i] = c + ('a' - 'A')
+			}
+		}
+		if seen[string(folded)] {
+			continue
+		}
+		seen[string(folded)] = true
+		if utf8.RuneCountInString(word) >= ftsTrigramMinRunes {
+			plan.long = append(plan.long, word)
+		} else {
+			plan.short = append(plan.short, word)
+		}
+	}
+	return plan
+}
+
+// buildFTSLikeFallback builds a case-insensitive substring condition for one
+// word across the searched columns, for a word too short for trigram. %/_/\
+// in the word are escaped so they're literal, not LIKE wildcards. Not
+// index-accelerated: it is evaluated on the rows the rest of the WHERE
+// clause (scope, soft delete, the MATCH of the longer words) leaves.
+func buildFTSLikeFallback(table string, cols []string, word string) (string, []any) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(word)
 	like := "%" + esc + "%"
 	parts := make([]string, 0, len(cols))
 	args := make([]any, 0, len(cols))
@@ -421,7 +480,7 @@ func buildFTSLikeFallback(table string, cols []string, q string) (string, []any)
 		if !safeIdent(c) {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf(`%s.%s LIKE ? ESCAPE '\'`, table, c))
+		parts = append(parts, fmt.Sprintf(`%s LIKE ? ESCAPE '\'`, quoteColumn(table, c)))
 		args = append(args, like)
 	}
 	if len(parts) == 0 {

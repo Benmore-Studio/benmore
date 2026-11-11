@@ -1,0 +1,7 @@
+[
+  "benmore github <app>                        # sync status",
+  "benmore github <app> connect                # prints the browser URL for the OAuth connect",
+  "benmore github <app> link [owner/repo]      # create-or-attach (--public, --no-create)",
+  "benmore github <app> push [--force]         # mirror now",
+  "benmore github <app> unlink                 # stop mirroring"
+]

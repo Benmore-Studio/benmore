@@ -1,0 +1,1 @@
+A data-event flow using transaction: true rolls back an unfinished transaction when a step panics, and its uncommitted writes are not announced. Normal error/commit behavior is unchanged; already-completed external effects are not rolled back.

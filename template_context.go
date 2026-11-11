@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -416,6 +417,16 @@ func escapeMustacheValue(c *htmlCtx, raw any, s string, jsonPipe bool) string {
 			// as a whole document, so the value is escaped for that
 			// document and again for the attribute.
 			out = html.EscapeString(html.EscapeString(s))
+		case string(c.tag) == "fetch" && (name == "url" || name == "headers"):
+			// A <fetch> tag's url and headers are sent by the server with the
+			// app's credentials (security.md 4): each value is escaped for the
+			// part of the URL it lands in, and a header value may not add a
+			// header (fetchAttrValue).
+			prefix := ""
+			if c.state == hsAttrValue {
+				prefix = html.UnescapeString(string(c.attrVal))
+			}
+			out = html.EscapeString(fetchAttrValue(name, prefix, s))
 		case urlAttrs[name]:
 			prefix := ""
 			if c.state == hsAttrValue {
@@ -538,7 +549,7 @@ func jsEscapeForState(lx *jsLexer, raw any, s string, jsonPipe bool) string {
 		default:
 			// Numbers, booleans, maps and slices keep their JSON shape; a
 			// pipe that rewrote the value keeps its string result.
-			if jsonPipe || s == fmt.Sprintf("%v", raw) {
+			if jsonPipe || s == valueText(raw) {
 				v = raw
 			}
 		}
@@ -838,5 +849,52 @@ func (lx *jsLexer) feed(b byte) {
 			return
 		}
 		lx.prevStar = b == '*'
+	}
+}
+
+// fetchRefusedValue replaces a value substituted into a <fetch> url or
+// headers attribute that would change the request's shape; ExpandFetchTagsAsync
+// refuses a tag that holds it (a value that spells it out only fails its own
+// tag). Plain text: the renderer replaces control characters.
+const fetchRefusedValue = "bm-fetch-value-refused"
+
+// fetchAttrValue escapes a value rendered into a <fetch> attribute. prefix is
+// the attribute text before the value. In url: a value in the authority must
+// be host characters only (it may not pick another host: "evil.com/#"), in
+// the path it is one escaped segment (never "." or ".."), and in the query or
+// fragment it is query-escaped, so `&`, `=`, `?` and `#` cannot add
+// parameters or move the boundary. In headers (a "Name: value, Name: value"
+// list) a value may not hold the list's separators or a line break. A value
+// before the scheme (the whole URL from data) is left to the SSRF guard.
+func fetchAttrValue(attr, prefix, s string) string {
+	if attr == "headers" {
+		if strings.ContainsAny(s, ",:\r\n") {
+			return fetchRefusedValue
+		}
+		return s
+	}
+	i := strings.Index(prefix, "://")
+	if i < 0 {
+		return s
+	}
+	rest := prefix[i+3:]
+	switch {
+	case strings.ContainsRune(rest, '?') || strings.ContainsRune(rest, '#'):
+		return url.QueryEscape(s)
+	case !strings.ContainsRune(rest, '/'):
+		for _, r := range s {
+			if !(r == '.' || r == '-' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+				return fetchRefusedValue
+			}
+		}
+		if strings.Contains(s, "..") {
+			return fetchRefusedValue
+		}
+		return s
+	default:
+		if s == "." || s == ".." {
+			return fetchRefusedValue
+		}
+		return url.PathEscape(s)
 	}
 }

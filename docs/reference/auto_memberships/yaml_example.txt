@@ -1,0 +1,18 @@
+# app.yaml
+auto_memberships:
+  channels:
+    table: channel_members      # defaults to <parent>_members
+    parent: channel_id          # defaults to <parent_singular>_id
+    members: all_users          # default; OR a SQL WHERE fragment like "role = 'editor'"
+
+# Equivalent (synthesized) hook:
+# on_insert:
+#   channels:
+#     - sql: |
+#         INSERT INTO channel_members (channel_id, user_id, created_at)
+#         SELECT NEW.id, id, CURRENT_TIMESTAMP FROM _benmore_users
+#         WHERE deactivated_at IS NULL  -- the "all_users" filter
+#         AND NOT EXISTS (              -- idempotency
+#           SELECT 1 FROM channel_members
+#           WHERE channel_id = NEW.id AND user_id = _benmore_users.id
+#         )

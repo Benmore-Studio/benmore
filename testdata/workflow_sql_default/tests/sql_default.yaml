@@ -1,0 +1,41 @@
+# schema.sql spells the orders state default `DEFAULT "draft"` and the tickets
+# one `DEFAULT NULL`. Both are right for these workflows: SQLite stores the
+# text draft for the first, and an explicit NULL default is the same as none.
+# The state-default check used to refuse workflows.yaml over each of them
+# ("would start in "draft", not "draft""), which fails this app's source check
+# before any test runs.
+sql_insert_takes_the_quoted_default:
+  as_user: "u@test.com"
+  setup:
+    - sql: "INSERT INTO orders (title, user_id) VALUES ('by sql', {{user_id}})"
+  steps:
+    - sql: "SELECT id FROM orders WHERE title = 'by sql' AND status = 'draft'"
+      expect:
+        rows: 1
+    - api: "POST /api/orders"
+      json: {title: "by api"}
+      save: {oid: "id"}
+      expect: {status: 200}
+    - api: "POST /api/orders/{{oid}}/transition"
+      json: {to: "done"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM orders WHERE title = 'by api' AND status = 'done'"
+      expect:
+        rows: 1
+
+null_default_starts_in_initial:
+  as_user: "u@test.com"
+  steps:
+    - api: "POST /api/tickets"
+      json: {title: "t"}
+      save: {tid: "id"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM tickets WHERE title = 't' AND status = 'new'"
+      expect:
+        rows: 1
+    - api: "POST /api/tickets/{{tid}}/transition"
+      json: {to: "closed"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM tickets WHERE title = 't' AND status = 'closed'"
+      expect:
+        rows: 1

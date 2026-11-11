@@ -1,0 +1,14 @@
+# Both kinds of computed column, each with reserved-word names: the computed
+# column itself (plans.limit, steps.check) and the trigger's foreign key
+# (steps.group). The expression and the query are the app's own SQL, so they
+# quote the names themselves.
+plans:
+  limit:
+    sql: 'SELECT COUNT(*) FROM steps WHERE "group" = ? AND deleted_at IS NULL'
+    triggers:
+      - table: steps
+        on: [insert, update, delete]
+        fk: group
+steps:
+  check:
+    expr: '"order" * 2'

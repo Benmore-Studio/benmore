@@ -1,0 +1,24 @@
+// Tables for the retention and aggregate guardrails fixture.
+
+model Event {
+  id        Int      @id @default(autoincrement())
+  title     String
+  userId    Int?     @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+}
+
+model Draft {
+  id        Int      @id @default(autoincrement())
+  title     String
+  userId    Int?     @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+}
+
+model Note {
+  id        Int       @id @default(autoincrement())
+  title     String
+  userId    Int?      @map("user_id")
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+}

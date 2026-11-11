@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPReadFlowRetainsEnvironmentAcrossSteps(t *testing.T) {
@@ -79,7 +77,7 @@ jobs:
 		t.Fatal(err)
 	}
 	err = conn.Raw(func(raw any) error {
-		return raw.(*sqlite3.SQLiteConn).RegisterFunc("rotate_fixture_environment", func() int {
+		return mustSQLiteConn(raw).RegisterFunc("rotate_fixture_environment", func() int {
 			SetAppEnv(app.Dir, "REVIEWED", "late")
 			SetAppEnv(app.Dir, "LATE_ONLY", "late-only")
 			return 1

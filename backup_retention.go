@@ -22,6 +22,16 @@ type backupObjectStore interface {
 // nil is unavailable, never an assertion that all apps have been removed.
 type backupAppInventory func() (map[string]bool, error)
 
+// backupPrefixStore lists the bucket's top-level prefixes and streams a
+// prefix page by page; *S3Storage does. With it the sweep lists and prunes
+// one instance prefix at a time, so a prefix that cannot be listed (one that
+// grew past the complete-listing budget) blocks only itself. Without it (test
+// stores) the sweep lists the whole bucket at once.
+type backupPrefixStore interface {
+	ListPrefixes(prefix string) ([]string, error)
+	ListPages(prefix string, fn func([]S3Object) error) error
+}
+
 func runRetentionSweep(store backupObjectStore, inventory backupAppInventory) (int, error) {
 	if inventory == nil {
 		return 0, errors.New("backup retention requires an app inventory")
@@ -33,18 +43,75 @@ func runRetentionSweep(store backupObjectStore, inventory backupAppInventory) (i
 	if before == nil {
 		return 0, errors.New("backup retention app inventory unavailable")
 	}
-	objs, err := store.List("")
-	if err != nil {
-		return 0, err
+	ps, perPrefix := store.(backupPrefixStore)
+	if !perPrefix {
+		objs, err := store.List("")
+		if err != nil {
+			return 0, err
+		}
+		active, err := retentionActiveApps(before, inventory)
+		if err != nil {
+			return 0, err
+		}
+		keys, junk := retentionPlan(objs, time.Now().UTC(), active)
+		n, err := retentionApply(store, keys)
+		m, jerr := retentionApply(store, junk)
+		return n + m, errors.Join(err, jerr)
 	}
-	// Listing can take time. Preserve apps present at either boundary rather
-	// than treating a route change during enumeration as proof of retirement.
+	prefixes, err := ps.ListPrefixes("")
+	if err != nil {
+		return 0, fmt.Errorf("backup retention prefixes: %w", err)
+	}
+	sort.Strings(prefixes)
+	total := 0
+	var errs []error
+	for _, prefix := range prefixes {
+		objs, err := store.List(prefix)
+		if errors.Is(err, errS3ListBudget) {
+			// Too many objects to list whole: never decide generations from
+			// a partial view, but clear what cannot belong to any (keys that
+			// do not parse, older than the PITR window), page by page.
+			n, cerr := retentionSweepJunk(store, ps, prefix, time.Now().UTC())
+			total += n
+			errs = append(errs, fmt.Errorf("%s: too many objects to list whole (%d unparseable old object(s) deleted; the rest needs an operator): %w", strings.TrimSuffix(prefix, "/"), n, errors.Join(err, cerr)))
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", strings.TrimSuffix(prefix, "/"), err))
+			continue
+		}
+		active, err := retentionActiveApps(before, inventory)
+		if err != nil {
+			// The inventory is global: stop rather than guess for the rest.
+			return total, errors.Join(append(errs, err)...)
+		}
+		keys, junk := retentionPlan(objs, time.Now().UTC(), active)
+		// Snapshots and generations first, the junk in its own call: a
+		// refused or failed junk delete never holds up the real pruning.
+		n, err := retentionApply(store, keys)
+		total += n
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", strings.TrimSuffix(prefix, "/"), err))
+		}
+		n, err = retentionApply(store, junk)
+		total += n
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s litestream/ cleanup: %w", strings.TrimSuffix(prefix, "/"), err))
+		}
+	}
+	return total, errors.Join(errs...)
+}
+
+// retentionActiveApps re-reads the inventory after a listing and keeps apps
+// present at either boundary rather than treating a route change during
+// enumeration as proof of retirement.
+func retentionActiveApps(before map[string]bool, inventory backupAppInventory) (map[string]bool, error) {
 	after, err := inventory()
 	if err != nil {
-		return 0, fmt.Errorf("backup retention inventory recheck: %w", err)
+		return nil, fmt.Errorf("backup retention inventory recheck: %w", err)
 	}
 	if after == nil {
-		return 0, errors.New("backup retention app inventory unavailable after listing")
+		return nil, errors.New("backup retention app inventory unavailable after listing")
 	}
 	active := make(map[string]bool, len(before)+len(after))
 	for _, snapshot := range []map[string]bool{before, after} {
@@ -54,21 +121,111 @@ func runRetentionSweep(store backupObjectStore, inventory backupAppInventory) (i
 			}
 		}
 	}
-	now := time.Now().UTC()
-	keys := retentionKeysToDeleteForApps(objs, now, active)
+	return active, nil
+}
+
+// retentionPlan is what a sweep deletes from a complete listing: snapshots
+// and PITR generations (keys), and unusable litestream/ objects (junk), which
+// go in a separate call.
+func retentionPlan(objs []S3Object, now time.Time, active map[string]bool) (keys, junk []string) {
+	keys = retentionKeysToDeleteForApps(objs, now, active)
 	// PITR (litestream) objects live under <sub>/litestream/ and are GC'd
 	// separately, by generation - parseBackupSnapshotKey deliberately ignores
 	// them (they have 4-5 path segments, not 2). Without this they accumulate
 	// forever (~8.6k WAL segments/app/day).
 	keys = append(keys, litestreamKeysToDelete(objs, now)...)
-	dryRun := os.Getenv("BENMORE_RETENTION_DRYRUN") == "1"
+	return keys, litestreamJunkKeys(objs, now)
+}
+
+// retentionKeyRefused reports a key the delete path would refuse (the
+// hosted router: one a tenant's backup-prune helper does not take). Such
+// keys are never sent, so they cannot fail a call that carries others, and a
+// dry run reports them exactly as the real run does.
+var retentionKeyRefused = func(string) bool { return false }
+
+// retentionApply deletes keys (or, in a dry run, logs what the real run
+// would do), skipping and reporting refused ones.
+func retentionApply(store backupObjectStore, keys []string) (int, error) {
+	var send, refused []string
 	for _, key := range keys {
-		if dryRun {
+		if retentionKeyRefused(key) {
+			refused = append(refused, key)
+		} else {
+			send = append(send, key)
+		}
+	}
+	var refusal error
+	if len(refused) > 0 {
+		refusal = fmt.Errorf("%d key(s) the prune helper refuses were not deleted (first: %s)", len(refused), refused[0])
+	}
+	if os.Getenv("BENMORE_RETENTION_DRYRUN") == "1" {
+		for _, key := range send {
 			log.Printf("backup: retention dry-run would delete %s", key)
+		}
+		for _, key := range refused {
+			log.Printf("backup: retention dry-run would NOT delete %s (refused by the prune helper)", key)
+		}
+		return len(send), refusal
+	}
+	if len(send) == 0 {
+		return 0, refusal
+	}
+	n, err := retentionDeleteKeys(store, send)
+	return n, errors.Join(err, refusal)
+}
+
+// litestreamJunkKeys are objects under <instance>/litestream/ that no PITR
+// plan can use (parseLitestreamKey refuses their key) and that are older than
+// the PITR window. A WAL session can create any key under that prefix, so
+// these are what a misbehaving app leaves; nothing else would remove them.
+func litestreamJunkKeys(objs []S3Object, now time.Time) []string {
+	window := pitrRetentionWindow()
+	var del []string
+	for _, obj := range objs {
+		parts := strings.SplitN(obj.Key, "/", 3)
+		if len(parts) < 3 || parts[1] != "litestream" {
 			continue
 		}
+		if _, _, _, ok := parseLitestreamKey(obj.Key); ok {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, obj.LastModified)
+		if err != nil || now.Sub(t) <= window {
+			continue // an unreadable time is kept
+		}
+		del = append(del, obj.Key)
+	}
+	sort.Strings(del)
+	return del
+}
+
+// retentionSweepJunk deletes a prefix's litestreamJunkKeys page by page, for
+// a prefix too large to list whole.
+func retentionSweepJunk(store backupObjectStore, ps backupPrefixStore, prefix string, now time.Time) (int, error) {
+	total := 0
+	var applyErrs []error
+	err := ps.ListPages(prefix+"litestream/", func(page []S3Object) error {
+		n, err := retentionApply(store, litestreamJunkKeys(page, now))
+		total += n
+		if err != nil {
+			// Keep going: a refused or failed page does not stop the rest.
+			applyErrs = append(applyErrs, err)
+		}
+		return nil
+	})
+	if len(applyErrs) > 3 {
+		applyErrs = append(applyErrs[:3], fmt.Errorf("and %d more", len(applyErrs)-3))
+	}
+	return total, errors.Join(append([]error{err}, applyErrs...)...)
+}
+
+// retentionDeleteKeys deletes the sweep's keys and returns how many it
+// deleted. The hosted router replaces it: a tenant app's keys are deleted
+// with a session scoped to that app's prefix (backup_session_router.go).
+var retentionDeleteKeys = func(store backupObjectStore, keys []string) (int, error) {
+	for i, key := range keys {
 		if err := store.Delete(key); err != nil {
-			return 0, fmt.Errorf("delete %s: %w", key, err)
+			return i, fmt.Errorf("delete %s: %w", key, err)
 		}
 	}
 	return len(keys), nil

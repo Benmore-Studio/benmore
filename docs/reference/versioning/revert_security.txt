@@ -1,0 +1,1 @@
+Reverts use the CRUD transaction pipeline: current update policy, write scopes, edit ACLs, locks, validation and before/after hooks apply. Protected ownership, tenant and identity fields are not restored from history, nor are command-owned columns, a workflow's state column (it moves only through its transitions) or hidden credential columns (revert_hidden). See revert_kept.

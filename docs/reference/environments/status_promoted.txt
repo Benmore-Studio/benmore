@@ -1,0 +1,1 @@
+`benmore status` (GET /platform/app-status) reports `prod_last_promoted` as the time of the latest promote and `prod_first_promoted` as the first publish.

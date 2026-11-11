@@ -26,6 +26,14 @@ type rowSource interface {
 	Next() ([]any, error)
 }
 
+// importMissing stands in for a key a later NDJSON object leaves out. The
+// loader drops that column from the row's INSERT, so SQLite applies its
+// DEFAULT, as it does for a column no object carries; a key written as null
+// is NULL.
+type importMissingValue struct{}
+
+var importMissing any = importMissingValue{}
+
 // isTextAffinity reports whether a declared SQLite type has TEXT affinity.
 // SQLite's rule: TEXT affinity when the declared type contains "CHAR",
 // "CLOB" or "TEXT". We only need to separate text from everything else,
@@ -182,24 +190,24 @@ type ndjsonSource struct {
 	// derive the effective column list; the first Next() call drains it
 	// instead of reading the decoder again.
 	pending map[string]any
-	// refuse, when set, rejects an object naming a column the table does not
-	// let a bulk import write (command-owned columns: a hard error, not a
-	// silent drop). Set by the loader through refuseKeys.
-	refuse func(keys []string) error
+	// refuse, when set, rejects an object the table does not let a bulk import
+	// write (a command-owned column, a membership row naming another member: a
+	// hard error, not a silent drop). Set by the loader through refuseObjects.
+	refuse func(obj map[string]any) error
 }
 
-// refuseKeys installs the per-object key check and applies it to the buffered
+// refuseObjects installs the per-object check and applies it to the buffered
 // first object.
-func (s *ndjsonSource) refuseKeys(check func(keys []string) error) error {
+func (s *ndjsonSource) refuseObjects(check func(obj map[string]any) error) error {
 	s.refuse = check
-	return s.checkKeys(s.pending)
+	return s.checkObject(s.pending)
 }
 
-func (s *ndjsonSource) checkKeys(obj map[string]any) error {
+func (s *ndjsonSource) checkObject(obj map[string]any) error {
 	if s.refuse == nil {
 		return nil
 	}
-	return s.refuse(mapKeys(obj))
+	return s.refuse(obj)
 }
 
 // newNDJSONSource streams newline-delimited JSON objects. JSON has no
@@ -217,9 +225,10 @@ func (s *ndjsonSource) checkKeys(obj map[string]any) error {
 // hand back. A later object introducing a key that IS in cols but was NOT
 // in the first object is also an error naming that key: silently dropping
 // it would lose that column's data the same way an unhandled table column
-// would, just discovered a row later. JSON is already typed, so present
-// values are handed to the driver as their JSON type - the CSV empty/NULL
-// coercion contract does not apply.
+// would, just discovered a row later. A later object that leaves out a key
+// the first one had yields importMissing for it (the column takes its
+// DEFAULT for that row). JSON is already typed, so present values are handed
+// on as their JSON type - the CSV empty/NULL coercion contract does not apply.
 func newNDJSONSource(r io.Reader, cols []Column) (rowSource, []Column, error) {
 	dec := json.NewDecoder(r)
 	dec.UseNumber()
@@ -267,7 +276,7 @@ func (s *ndjsonSource) Next() ([]any, error) {
 		if err := s.dec.Decode(&obj); err != nil {
 			return nil, err // io.EOF passes through; a parse error aborts the load
 		}
-		if err := s.checkKeys(obj); err != nil {
+		if err := s.checkObject(obj); err != nil {
 			return nil, err
 		}
 		for k := range obj {
@@ -280,6 +289,8 @@ func (s *ndjsonSource) Next() ([]any, error) {
 	for i, c := range s.cols {
 		if v, ok := obj[c.Name]; ok {
 			out[i] = v
+		} else {
+			out[i] = importMissing
 		}
 	}
 	return out, nil

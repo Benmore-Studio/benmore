@@ -1,0 +1,1 @@
+A queued hook (every on_insert and on_delete hook, and any on_update hook that does more than SQL) binds the row's whole numbers as integers, as a hook run in the write transaction does: `{{id}}` stores 4 and 'Invoice #{{id}}' renders 'Invoice #4'. A column with REAL affinity keeps its float ('2.0').

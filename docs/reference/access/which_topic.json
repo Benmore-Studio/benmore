@@ -1,0 +1,13 @@
+[
+  "Who may see or change this row? The answer is spread over access, scoping, rbac, permissions and act-as (signing in is `auth`). Find the form of the question below and read the keys it names, each with api(at:\"<topic>.<key>\").",
+  "Public, or any signed-in user: `access.how` (modes `anon` and `everyone`), `access.defaults` (what a table with no rule gets), `access.operations` (read, write, update and delete resolve separately). Only some rows of a table: `scoping.how` (`public_read_when`).",
+  "Only the row's owner: `access.how` (`self`) and `scoping.how` (the user_id column). What a refused caller is answered: `access.behavior_notes`.",
+  "Everyone in the tenant (group scoping): `scoping.how` (`groups:`), `scoping.tenant_bootstrap` (creating the organisation with its first member), `scoping.membership_identity`, `scoping.live_membership`, `scoping.missing_group` (a user with no tenant).",
+  "Members of one room, project or channel (`member-of:`): `access.member_of`. Who may change the membership table itself: `scoping.membership_management`.",
+  "The owner sees their own rows and a role sees more (`owner_or_role:`): `access.owner_or_elevated_pattern`, and `access.role_mode_rows` for why `role:` alone leaves a holder with only their own rows.",
+  "Roles and permissions (`role:`, `perm:`): `rbac.summary`, `rbac.roles_yaml`, `rbac.gotchas`. A role held inside one tenant: `scoping.tenant_roles`, `access.tenant_root_role_scope`.",
+  "One record shared with one user: `permissions.summary`, `permissions.grant_actions`, `permissions.sharing_authority`, `permissions.tenant_boundary`.",
+  "What an admin sees, and what an admin stepped into a tenant sees: `scoping.summary`, `act-as.summary`, `act-as.behavior`.",
+  "What an API token's scopes add: nothing beyond its account; they narrow it. `auth.credential_limits`, `rbac.gotchas`, and for a custom route `flows.permissions`.",
+  "What a deployed table enforces, per operation: `access.describe`."
+]

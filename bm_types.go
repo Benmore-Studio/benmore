@@ -54,7 +54,7 @@ func GenerateBMTypes(app *App) string {
 //
 //   bm.table('notes').list({where:{user_id:5}})    typed CRUD reads
 //   bm.table('notes').create({title:'x'})          typed CRUD writes
-//   bm.store / bm.query                            app state + cached reads
+//   bm.createStore(initial) / bm.query             app state + cached reads
 //   bm.live.scoped('notes', refresh)               SSE subs (debounced)
 //   bm.auth.me() / bm.auth.signOut()               session
 //   bm.upload(file)                                multipart upload → {path}
@@ -106,7 +106,7 @@ func GenerateBMTypes(app *App) string {
 	visibleTables := sortedTables(app)
 	for _, t := range visibleTables {
 		tableNames = append(tableNames, t.Name)
-		writeTableInterface(&b, t)
+		writeTableInterface(&b, app, t)
 		b.WriteString("\n")
 	}
 
@@ -135,18 +135,38 @@ func GenerateBMTypes(app *App) string {
   /** Column to order by (snake_case, as stored). */
   sort?: string;
   order?: 'asc' | 'desc';
+  /** REST shorthand for sort + order: 'starts_at:asc'. Ignored when sort is set. */
+  orderBy?: string;
+  /** Related rows to embed (?include=): 'author' or ['author', 'comments']. */
+  include?: string | string[];
+  /** Columns to return (?fields=). */
+  fields?: string | string[];
+  /** Page number for page/per_page pagination (list() still returns the rows only). */
+  page?: number;
+  per_page?: number;
+  /** Equality filters (col: value) and operator filters (col__gte: value). Other top-level keys are not sent. */
   where?: Record<string, string | number | boolean>;
 }
 
 export interface ApiResult<T = unknown> {
   ok: boolean;
   status: number;
+  /**
+   * Parsed JSON; the text of a 2xx text/* answer; a Blob for a 2xx answer of
+   * any other type (an image, PDF or ZIP); {error, body} for a failed answer
+   * that is not JSON (body is the text as received; error is that text when it
+   * is one short line of plain text, else "Request failed (HTTP <status>)", so
+   * an HTML error page never becomes a thrown Error's message); null for an
+   * empty body.
+   */
   data: T | null;
 }
 
 export interface ApiRequestOptions {
   headers?: HeadersInit;
   signal?: AbortSignal;
+  /** Sent with nobody at the tab (polling): X-Benmore-Background: 1, not activity for auth.idle_timeout. */
+  background?: boolean;
 }
 
 /**
@@ -197,11 +217,17 @@ export interface VersionHistory {
   id: string;
   versions: VersionMetadata[];
 }
+export interface RevertKeptColumn {
+  column: string;
+  reason: 'command_owned' | 'workflow_state' | 'protected' | 'hidden' | 'not_in_version';
+}
 export interface RevertReceipt {
   status: 'reverted';
   id: string;
   reverted_to_version: string;
   owned_fields_kept: string[] | null;
+  /** Columns that kept their current value instead of the version's, and why. */
+  kept: RevertKeptColumn[];
 }
 export interface RecordPermissionGrant {
   id: number;
@@ -244,14 +270,45 @@ export type TableClient<Row, Features extends { softDelete: boolean; fulltext: b
   & (Features['softDelete']  extends true ? SoftDeleteTable<Row> : {})
   & (Features['versioned']   extends true ? VersionedTable<Row>  : {});
 
+/** bm.room() connection state, delivered as the 'bm:status' event (from is null). */
+export interface RoomStatus {
+  state: 'open' | 'reconnecting' | 'closed';
+  /** 'open' after a reconnect: messages sent while it was down are not replayed. */
+  reconnected?: boolean;
+  /** 'reconnecting': retry number, delay in ms, and the socket's close code. */
+  attempt?: number;
+  retryIn?: number;
+  code?: number;
+  /** 'reconnecting' after a failed handshake: the GET /ws answer (429, 502, ...). */
+  http?: number;
+  /** 'closed': why the room ended for good. */
+  reason?: 'left' | 'refused' | 'unauthorized' | 'forbidden';
+  /** 'closed': queued messages that were never sent. */
+  unsent?: number;
+}
+
+/** A refused join or handshake, delivered as the 'bm:error' event (from is null). The room then closes. */
+export interface RoomError {
+  code: 'not_member' | 'too_many_rooms' | 'join_refused' | 'unauthorized' | 'forbidden';
+  message: string;
+  room: string;
+}
+
 export interface RoomClient {
   readonly name: string;
+  /** Reconnects with backoff after a drop; 'closed' is final (leave, refused join, 401/403). */
+  readonly state: 'connecting' | 'open' | 'reconnecting' | 'closed';
+  on(kind: 'bm:status', fn: (status: RoomStatus, from: null) => void): this;
+  on(kind: 'bm:error', fn: (error: RoomError, from: null) => void): this;
   // from: the sender's user id, or 'server' for a flow's run: broadcast.
   on(kind: string, fn: (payload: any, from: number | 'server') => void): this;
-  onAny(fn: (payload: any, from: number | 'server', kind: string) => void): this;
+  onAny(fn: (payload: any, from: number | 'server' | null, kind: string) => void): this;
   off(kind: string, fn: Function): this;
-  send(payload: any): void;
+  /** true: sent; false: queued (16 max) until the room is open again.
+   *  Throws (code 'room_closed' or 'room_queue_full') instead of dropping. */
+  send(payload: any): boolean;
   leave(): void;
+  /** The current WebSocket; a reconnect replaces it. */
   readonly raw: WebSocket;
 }
 
@@ -323,7 +380,13 @@ export interface RoomClient {
     me(): Promise<User | null>;
     signOut(): Promise<void>;
     refreshMe(): Promise<User | null>;
-    /** Sign in with the configured identifier (email/phone/username) + password. Throws on failure. */
+    /**
+     * Sign in with the configured identifier (email/phone/username) + password. Throws on failure.
+     * When the sign-in still needs a step (server answers {otp_required | mfa_required |
+     * mfa_setup_required, redirect}: an emailed code, an authenticator code, or enrolling an
+     * authenticator for a role in auth.require_mfa_for_roles), the browser goes to that page
+     * (/verify-otp, /verify-mfa, /mfa-setup, keeping ?next=) and the promise does not settle.
+     */
     signIn(identifier: string, password: string): Promise<User | null>;
     /** Sign up. Pass 'email' + 'password' plus any auth.signup_fields configured in app.yaml. Throws on failure. */
     signUp(fields: { email: string; password: string; [extraField: string]: unknown }): Promise<User | null>;
@@ -360,9 +423,10 @@ export interface RoomClient {
 
   // Strongly-typed: bm.table('messages') returns TableClient<Message, TableFeatures['messages']>.
   // Unknown table names are a TYPE ERROR (intentional - catches the
-  // Prisma → snake_case_plural naming gotcha at compile time, not at
-  // runtime). The escape hatch when you need a dynamic string is
-  // bm.api.get('/api/<name>') directly.
+  // Prisma → snake_case_plural naming gotcha in your editor or with
+  // "tsc --noEmit"; push and the runtime's esbuild compile do not
+  // type-check, so an unchecked typo is a 404 at runtime). The escape
+  // hatch when you need a dynamic string is bm.api.get('/api/<name>').
   export function table<T extends keyof TableTypeMap>(
     name: T
   ): TableClient<TableTypeMap[T], TableFeatures[T]>;
@@ -448,8 +512,8 @@ export interface RoomClient {
    * For styling + live diagrams, add <link rel="stylesheet"
    * href="/_internal/markdown.css"> (wrap output in class="benmark"),
    * load /_internal/mermaid.js, and run hydrate() from
-   * /_internal/markdown-hydrate.js - or just use the <Markdown> bm/ui
-   * component, which does all of that. See api({ at: 'markdown' }). */
+   * /_internal/markdown-hydrate.js - or just use Markdown(target, { text })
+   * from 'sdui', which does all of that. See api({ at: 'markdown' }). */
   export function markdown(text: string, opts?: { inline?: boolean }): Promise<string>;
   /** Render many strings in ONE round-trip (POST /_internal/markdown/batch).
    *  items are strings or { text, inline }; returns HTML aligned by index. */
@@ -557,7 +621,7 @@ export interface RoomClient {
 
   // ── query - key-based cached reads + optimistic mutations ──────────
   export interface QueryAgg { fn: 'count' | 'sum' | 'avg' | 'min' | 'max'; col?: string; as?: string; }
-  export interface QueryWhere { [col: string]: string | number | boolean | { eq?: any; ne?: any; gt?: any; gte?: any; lt?: any; lte?: any; like?: string; in?: any[] }; }
+  export interface QueryWhere { [col: string]: string | number | boolean | { eq?: any; ne?: any; gt?: any; gte?: any; lt?: any; lte?: any; like?: string; contains?: string; starts_with?: string; ends_with?: string; in?: any[] }; }
   export interface QueryOrder { col: string; dir?: 'asc' | 'desc'; }
   export interface QuerySpec { table: TableName; select?: string[]; where?: QueryWhere; group_by?: string[]; aggregates?: QueryAgg[]; order_by?: QueryOrder[]; limit?: number; }
   export interface QuerySnapshot<T = any> {
@@ -573,6 +637,8 @@ export interface RoomClient {
     /** @deprecated Alias for staleTime; prefer staleTime. */
     staleMs?: number;
     force?: boolean;
+    /** The fetcher's requests are polling (X-Benmore-Background: 1), not activity for auth.idle_timeout. */
+    background?: boolean;
     live?: boolean;
   }
   export interface QueryMutateOpts<T = any> {
@@ -591,16 +657,17 @@ export interface RoomClient {
     set<T = any>(key: unknown, data: T): T;
     subscribe<T = any>(key: unknown, fn: (snapshot: QuerySnapshot<T>) => void): StoreUnsubscribe;
     fetch<T = any>(key: unknown, fetcher: () => Promise<T> | T, opts?: QueryFetchOpts): Promise<T>;
-    refetch<T = any>(key: unknown): Promise<T | undefined>;
-    invalidate(match: unknown | ((rawKey: unknown, stableKey: string) => boolean), opts?: { refetch?: boolean }): string[];
+    refetch<T = any>(key: unknown, opts?: { background?: boolean }): Promise<T | undefined>;
+    invalidate(match: unknown | ((rawKey: unknown, stableKey: string) => boolean), opts?: { refetch?: boolean; background?: boolean }): string[];
     tableKey(table: TableName, spec?: Record<string, unknown>): unknown[];
     read<T = any>(spec: QuerySpec, opts?: QueryFetchOpts): Promise<T[]>;
     table<T = any>(table: TableName, opts?: Omit<QuerySpec, 'table'> & QueryFetchOpts): Promise<T[]>;
-    invalidateTable(table: TableName, opts?: { refetch?: boolean }): string[];
+    invalidateTable(table: TableName, opts?: { refetch?: boolean; background?: boolean }): string[];
     mutate<T = any>(opts: QueryMutateOpts<T>): Promise<T>;
   };
 
   // ── flows (from flows.yaml - typed per HTTP-triggered flow) ─────────
+  // Resolves parsed JSON, the text of a text/* answer, or a Blob (see FlowMap).
   export const flows: FlowMap;
 
   // ── workflows (from workflows.yaml - typed state machines) ──────────
@@ -608,9 +675,26 @@ export interface RoomClient {
     table: T, id: number | string
   ): WorkflowClient<T>;
 
+  /** POST /api/<table>/<id>/transition answer. */
+  export interface WorkflowTransitionResult<S extends string = string> {
+    status: 'transitioned';
+    from: S;
+    to: S;
+    /** The row id as it appeared in the URL (a string). */
+    id: string;
+  }
+
+  /** GET /api/<table>/<id>/transitions answer: the row's state and the moves this caller may make. */
+  export interface WorkflowAvailable<S extends string = string> {
+    current: S;
+    /** role is set when the transition is role-gated (the caller holds it). */
+    transitions: Array<{ to: S; role?: string }>;
+  }
+
   export interface WorkflowClient<T extends keyof WorkflowMap> {
-    transitionTo(state: WorkflowMap[T]['states']): Promise<{ state: WorkflowMap[T]['states'] }>;
-    available(): Promise<WorkflowMap[T]['states'][]>;
+    transitionTo(state: WorkflowMap[T]['states']): Promise<WorkflowTransitionResult<WorkflowMap[T]['states']>>;
+    available(): Promise<WorkflowAvailable<WorkflowMap[T]['states']>>;
+    /** The state stored in the workflow's own field (workflows.yaml field:). */
     current(): Promise<WorkflowMap[T]['states']>;
   }
 
@@ -672,7 +756,8 @@ export interface RoomClient {
   // PRIVATE files on the media CDN require the 'record' option - the
   // row that owns the file. The signature is authorized against that record's
   // access policy (roles, perms, scopes, group/owner/ACL), not just a logged-in
-  // session. Public/local files don't need it.
+  // session. Public/local files don't need it. Default lifetime 300s;
+  // audio/video default to 4h so playback does not outlive the link (max 6h).
   //   await bm.signedUrl(doc.file_url, { record: { table: 'documents', id: doc.id } })
   export function signedUrl(
     path: string,
@@ -685,9 +770,12 @@ export interface RoomClient {
   // ── mfa (TOTP enrollment + verification) ─────────────────────────────
   export const mfa: {
     /** From a signed-in session pass the current password (required). */
-    enroll(password?: string): Promise<{ qr_data_url: string; secret: string; backup_codes: string[] }>;
-    verify(code: string): Promise<{ ok: boolean }>;
-    disable(password: string): Promise<{ ok: boolean }>;
+    /** On the /mfa-setup page after a sign-in that requires enrollment, pass nothing: the setup cookie is the proof. Backup codes are shown once. */
+    enroll(password?: string): Promise<{ secret: string; otpauth_uri: string; backup_codes: string[] }>;
+    /** Turns the factor on. After a sign-in that required enrollment it also signs the person in (token, user_id, email). */
+    verify(code: string): Promise<{ status: 'mfa_enabled'; token?: string; user_id?: number; email?: string }>;
+    /** Turns the factor off. Takes a current 6-digit code from the authenticator (not the password, not a backup code). */
+    disable(code: string): Promise<{ status: 'mfa_disabled' }>;
   };
 
   // ── broadcast (SFU-backed 1:N livestream) ────────────────────────────
@@ -744,7 +832,14 @@ export interface RoomClient {
     iceServers(): Promise<IceServer[]>;
   };
 
+export function captureError(err: unknown, options?: { tags?: Record<string, string> }): void;
+export function captureMessage(message: string, level?: 'warning' | 'error' | 'fatal'): void;
+export function setTag(key: string, value: string): void;
+
 declare const bm: {
+  captureError: typeof captureError;
+  captureMessage: typeof captureMessage;
+  setTag: typeof setTag;
   api: ApiCalls;
   auth: AuthCalls;
   users: UsersCalls;
@@ -881,7 +976,7 @@ declare module 'sdui' {
   export function Reset(target: string | HTMLElement, opts?: { token?: string }): Handle;
   /** Edit the current user's profile (GET/PATCH /api/_auth/profile); protected fields filtered. */
   export function ProfileForm(target: string | HTMLElement, opts?: { onSaved?: (user: any) => void }): Promise<Handle>;
-  /** TOTP enrollment (asks for the current password, shows secret, otpauth URI and backup codes) + verify + disable (bm.mfa). */
+  /** TOTP enrollment (asks for the current password, shows secret, otpauth URI and backup codes) + verify + disable, which asks for a current authenticator code (bm.mfa). */
   export function MfaSetup(target: string | HTMLElement, opts?: {}): Promise<Handle>;
   /** OAuth connection controls. Configuration, sign-in semantics, and limits: api(at:"oauth"). */
   export function OAuthConnect(target: string | HTMLElement, opts?: { providers?: string[] }): Promise<Handle>;
@@ -900,7 +995,7 @@ declare module 'sdui' {
   export function RecordLock(target: string | HTMLElement, opts: { table: TableName; id: string | number }): Promise<Handle>;
   /** Per-record ACL share dialog (bm.permissions). */
   export function ShareDialog(target: string | HTMLElement, opts: { table: TableName; id: string | number }): Promise<Handle>;
-  /** Export every readable table as a JSON download. */
+  /** Download the signed-in user's own data (GET /api/_my-data: profile, the rows they own, their audit events) as my-data.json. */
   export function DownloadMyData(target: string | HTMLElement, opts?: { label?: string }): Promise<Handle>;
 
   /** Time-limited signed <img> (bm.signedUrl). */
@@ -939,7 +1034,7 @@ declare module 'sdui' {
 
   // ─── Wave 3a: cross-table read/query layer (POST /api/_query) ──────
   export interface QueryAgg { fn: 'count' | 'sum' | 'avg' | 'min' | 'max'; col?: string; as?: string; }
-  export interface QueryWhere { [col: string]: string | number | boolean | { eq?: any; ne?: any; gt?: any; gte?: any; lt?: any; lte?: any; like?: string; in?: any[] }; }
+  export interface QueryWhere { [col: string]: string | number | boolean | { eq?: any; ne?: any; gt?: any; gte?: any; lt?: any; lte?: any; like?: string; contains?: string; starts_with?: string; ends_with?: string; in?: any[] }; }
   export interface QueryOrder { col: string; dir?: 'asc' | 'desc'; }
   export interface QuerySpec { table: TableName; select?: string[]; where?: QueryWhere; group_by?: string[]; aggregates?: QueryAgg[]; order_by?: QueryOrder[]; limit?: number; }
   /** Run a declarative, scoped, column-validated read. Returns rows. */
@@ -1024,7 +1119,7 @@ declare module 'sdui' {
   export function DetailHeader(target: string | HTMLElement, opts: { title: string; subtitle?: string; meta?: string[]; badge?: string | { label: string; variant?: string }; actions?: { label: string; onClick?: () => void; variant?: 'primary'; danger?: boolean }[] }): { destroy: () => void };
   /** Master/detail two-pane layout; returns the two mount elements. */
   export function SplitLayout(target: string | HTMLElement, opts?: { leftWidth?: string; gap?: string }): { left: HTMLElement; right: HTMLElement; destroy: () => void };
-  /** Leaflet + OSM map. Needs the app CSP to allow unpkg.com + *.tile.openstreetmap.org. */
+  /** Leaflet + OSM map. The framework allows the Leaflet files it loads; the OSM tiles need app.yaml csp.img_src "https://*.tile.openstreetmap.org". */
   export function Map(target: string | HTMLElement, opts: { lat?: number; lng?: number; zoom?: number; markers?: { lat: number; lng: number; label?: string }[]; height?: string; label?: string }): Promise<{ map: any; destroy: () => void }>;
   /** Number input with a currency prefix. */
   export function MoneyInput(target: string | HTMLElement, opts?: { value?: number; currency?: string; width?: string; onChange?: (v: number | null) => void }): { readonly value: number | null; destroy: () => void };
@@ -1086,7 +1181,7 @@ declare module 'sdui' {
   /** Hide the target unless a module is enabled. */
   export function ModuleGate(target: string | HTMLElement, opts: { module: string; enabled: string[] | (() => Promise<string[]>) }): Promise<boolean>;
   /** Export a table (or filtered subset) to a CSV download. */
-  export function ExportButton(target: string | HTMLElement, opts: { table: TableName; columns?: string; where?: Record<string, string | number | boolean>; filename?: string; label?: string; limit?: number }): { destroy: () => void };
+  export function ExportButton(target: string | HTMLElement, opts: { table: TableName; columns?: string; where?: Record<string, string | number | boolean>; q?: string; filename?: string; label?: string; maxRows?: number; /** older name for maxRows */ limit?: number }): { destroy: () => void };
   /** Toggle which columns are visible (for driving a DataTable). */
   export function ColumnChooser(target: string | HTMLElement, opts: { columns: (string | { name: string; label?: string })[]; value?: string[]; onChange?: (cols: string[]) => void }): { value: () => string[]; destroy: () => void };
   /** Cookie-consent banner (localStorage-backed). */
@@ -1139,23 +1234,99 @@ declare module 'sdui' {
 // writeRoleUnion emits a TS union of all roles the app knows about.
 // Framework defaults (user, admin) are always included. Anything from
 // app.yaml `roles:` is added on top, deduped + sorted for stability.
+//
+// session.Roles (me().roles) also carries tenant roles: the membership row's
+// groups.role_field value and group-scoped grants. Every role the app names
+// in config is listed - the bootstrap founding_role, access `role:` and
+// `owner_or_role:` modes, workflow transition roles and flow `role:` gates -
+// so `me.roles.includes('staff')` type-checks. A role_field value is data,
+// not config, so with groups.role_field set the union also admits any
+// string (`string & {}` keeps the listed names in autocomplete).
 func writeRoleUnion(b *strings.Builder, app *App) {
+	out := typesKnownRoles(app)
+	union := quotedUnion(out)
+	if app.Group != nil && strings.TrimSpace(app.Group.RoleField) != "" {
+		b.WriteString("/** Listed roles plus any in-tenant role stored in the membership table's role field. */\n")
+		union += " | (string & {})"
+	}
+	fmt.Fprintf(b, "export type Role = %s;\n", union)
+}
+
+// typesKnownRoles returns, sorted, every role name the app's config names.
+func typesKnownRoles(app *App) []string {
 	roles := map[string]bool{"user": true, "admin": true}
+	add := func(list string) {
+		for _, r := range splitCommaList(list) {
+			if isTypesRoleName(r) {
+				roles[r] = true
+			}
+		}
+	}
 	if app.Roles != nil {
 		for name := range app.Roles.Roles {
 			roles[name] = true
 		}
+	}
+	if app.Group != nil && app.Group.Bootstrap != nil {
+		add(app.Group.Bootstrap.FoundingRole)
+	}
+	if app.Access != nil {
+		for _, ops := range app.Access.rules {
+			for _, mode := range ops {
+				for _, prefix := range []string{"role:", "owner_or_role:"} {
+					if rest, ok := strings.CutPrefix(mode, prefix); ok {
+						add(rest)
+					}
+				}
+			}
+		}
+	}
+	if app.Workflows != nil {
+		for _, wf := range app.Workflows.Workflows {
+			if wf == nil {
+				continue
+			}
+			for _, tos := range wf.Transitions {
+				for _, t := range tos {
+					add(t.Role)
+				}
+			}
+		}
+	}
+	for _, f := range app.Flows {
+		add(f.Role)
 	}
 	out := make([]string, 0, len(roles))
 	for r := range roles {
 		out = append(out, r)
 	}
 	sort.Strings(out)
-	fmt.Fprintf(b, "export type Role = %s;\n", quotedUnion(out))
+	return out
 }
 
-// writeTableInterface emits the TS interface for one table.
-func writeTableInterface(b *strings.Builder, t Table) {
+// isTypesRoleName keeps a role name that can sit in a single-quoted TS
+// literal; config values are free text, and a quote or backslash would break
+// the generated file.
+func isTypesRoleName(r string) bool {
+	if r == "" || r == "public" {
+		return false
+	}
+	for _, c := range r {
+		if c == '\'' || c == '\\' || c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// writeTableInterface emits the TS interface for one table: the row a read
+// returns. A nullable column is always present and may be null (`T | null`);
+// it used to be declared optional (`col?: T`), which said a read could omit it
+// but never return null, the opposite of the wire. A column reads never return
+// (apiHiddenColumn: secret-shaped names, blind-index siblings) stays optional,
+// since create/update still accept it. Writes take Partial<Row>, so every
+// column can be omitted there and a nullable one can be sent as null.
+func writeTableInterface(b *strings.Builder, app *App, t Table) {
 	interfaceName := pascalCase(singularize(t.Name))
 	fmt.Fprintf(b, "/** Table: %s */\n", t.Name)
 	fmt.Fprintf(b, "export interface %s {\n", interfaceName)
@@ -1163,12 +1334,21 @@ func writeTableInterface(b *strings.Builder, t Table) {
 		// Sensitive cols on _benmore_users specifically are filtered in
 		// the User interface, not here; this is the raw table shape.
 		optional := ""
-		if !col.NotNull && !col.PK {
+		if apiHiddenColumn(app, t.Name, col.Name) {
 			optional = "?"
 		}
-		fmt.Fprintf(b, "  %s%s: %s;\n", col.Name, optional, prismaToTS(col.Type))
+		fmt.Fprintf(b, "  %s%s: %s;\n", col.Name, optional, nullableTS(prismaToTS(col.Type), col))
 	}
 	b.WriteString("}\n")
+}
+
+// nullableTS adds `| null` to a column's TS type unless the column is NOT
+// NULL or the primary key.
+func nullableTS(ts string, col Column) string {
+	if col.NotNull || col.PK {
+		return ts
+	}
+	return ts + " | null"
 }
 
 // writeUserInterface emits the User shape used by bm.auth.me() and
@@ -1192,13 +1372,13 @@ func writeUserInterface(b *strings.Builder, app *App) {
 			if isSensitiveUserColumn(col.Name) {
 				continue
 			}
-			optional := ""
-			if !col.NotNull && !col.PK {
-				optional = "?"
+			if app.Group != nil && col.Name == "group_id" {
+				continue // the profile's tenant id replaces it (declared below)
 			}
 			// Special-cased columns:
 			//   id   → UserId brand (so MessageId can't be passed where UserId expected)
 			//   role → Role union (so r === 'superadmin' is a TS error)
+			// A nullable column comes back as null, never absent (LoadUserFields).
 			typeStr := prismaToTS(col.Type)
 			if col.PK {
 				typeStr = "UserId"
@@ -1206,7 +1386,7 @@ func writeUserInterface(b *strings.Builder, app *App) {
 			if col.Name == "role" {
 				typeStr = "Role"
 			}
-			fmt.Fprintf(b, "  %s%s: %s;\n", col.Name, optional, typeStr)
+			fmt.Fprintf(b, "  %s: %s;\n", col.Name, nullableTS(typeStr, col))
 		}
 	} else {
 		// Fallback when the user table wasn't discovered (app.Tables
@@ -1214,16 +1394,16 @@ func writeUserInterface(b *strings.Builder, app *App) {
 		// whether LoadSchema introspected them). Use canonical shape.
 		b.WriteString("  id: UserId;\n")
 		b.WriteString("  email: string;\n")
-		b.WriteString("  first_name?: string;\n")
-		b.WriteString("  last_name?: string;\n")
-		b.WriteString("  username?: string;\n")
-		b.WriteString("  phone?: string;\n")
-		b.WriteString("  avatar_url?: string;\n")
+		b.WriteString("  first_name: string | null;\n")
+		b.WriteString("  last_name: string | null;\n")
+		b.WriteString("  username: string | null;\n")
+		b.WriteString("  phone: string | null;\n")
+		b.WriteString("  avatar_url: string | null;\n")
 		b.WriteString("  role: Role;\n")
 		b.WriteString("  verified: number;\n")
-		b.WriteString("  deactivated_at?: string;\n")
+		b.WriteString("  deactivated_at: string | null;\n")
 		b.WriteString("  created_at: string;\n")
-		b.WriteString("  last_login_at?: string;\n")
+		b.WriteString("  last_login_at: string | null;\n")
 	}
 	// Multi-role RBAC (v2.7.54+). /api/_auth/profile already returns these
 	// alongside the legacy `role`, and bm.auth.me() passes the full payload
@@ -1236,6 +1416,11 @@ func writeUserInterface(b *strings.Builder, app *App) {
 	b.WriteString("  primary_role: Role;\n")
 	b.WriteString("  /** Unioned permission scopes (`resource:action`) across all held roles. */\n")
 	b.WriteString("  permissions: string[];\n")
+	if app.Group != nil {
+		// GET /api/_auth/profile adds it for a groups: app (settings.go).
+		fmt.Fprintf(b, "  /** Your current tenant: the %s value every scoped read uses (an admin's act-as tenant while stepped in); null before you join or found one. */\n", strings.ReplaceAll(app.Group.Key, "*/", ""))
+		b.WriteString("  group_id: string | null;\n")
+	}
 	b.WriteString("}\n")
 }
 
@@ -1523,7 +1708,7 @@ func writeFlowsType(b *strings.Builder, app *App) {
 	b.WriteString("// ─── Flows (from flows.yaml) ────────────────────────────────\n")
 	httpFlows := []Flow{}
 	for _, f := range app.Flows {
-		if f.Trigger.Type == "http" || f.Trigger.Type == "" {
+		if isHTTPFlow(f) {
 			httpFlows = append(httpFlows, f)
 		}
 	}
@@ -1532,10 +1717,22 @@ func writeFlowsType(b *strings.Builder, app *App) {
 		return
 	}
 	sort.Slice(httpFlows, func(i, j int) bool { return httpFlows[i].Name < httpFlows[j].Name })
-	b.WriteString("/** Custom HTTP flows. Async flows return Job<T>; call .wait() to block. */\n")
+	keys := flowRegistryKeys(httpFlows)
+	// Keys already emitted, so a name alias never repeats a member.
+	emitted := map[string]bool{}
+	for _, k := range keys {
+		emitted[k] = true
+	}
+	b.WriteString("/**\n")
+	b.WriteString(" * Custom HTTP flows. Async flows return Job<T>; call .wait() to block.\n")
+	b.WriteString(" * A call resolves the parsed JSON answer, the text of a text/* answer (a CSV),\n")
+	b.WriteString(" * or a Blob for any other type (the image or PDF of run: proxy / serve_file).\n")
+	b.WriteString(" * GET and HEAD flows take no body: params fill the :path segments and the\n")
+	b.WriteString(" * rest is sent as the query string.\n")
+	b.WriteString(" */\n")
 	b.WriteString("export interface FlowMap {\n")
 	for _, f := range httpFlows {
-		method := f.Trigger.Method
+		method := strings.ToUpper(f.Trigger.Method)
 		if method == "" {
 			method = "POST"
 		}
@@ -1582,11 +1779,68 @@ func writeFlowsType(b *strings.Builder, app *App) {
 				bodyParam = "body?: " + bodyType
 			}
 		}
-		flowKey := camelCase(f.Name)
-		fmt.Fprintf(b, "  %s: (params: %s, %s) => Promise<%s>;\n",
-			tsKeyForTable(flowKey), paramsType, bodyParam, returnType)
+		flowKey := keys[f.Name]
+		signature := fmt.Sprintf("(params: %s, %s) => Promise<%s>", paramsType, bodyParam, returnType)
+		if method == "GET" || method == "HEAD" {
+			// No body: a browser refuses one on GET/HEAD, and bm.flows sends
+			// these params as the path and query string.
+			signature = fmt.Sprintf("(%s) => Promise<%s>", flowQueryParamsTS(params, f.Trigger.Inputs), returnType)
+		}
+		fmt.Fprintf(b, "  %s: %s;\n", tsKeyForTable(flowKey), signature)
+		// The key older types emitted (camelCase split on underscores only,
+		// so bm.flows['save-quote']) still resolves at runtime; keep it typed
+		// so code written against those types keeps compiling.
+		if legacy := camelCase(f.Name); legacy != flowKey && !emitted[legacy] {
+			emitted[legacy] = true
+			fmt.Fprintf(b, "  /** Alias of %s. */\n  %s: %s;\n", flowKey, tsKeyForTable(legacy), signature)
+		}
 	}
 	b.WriteString("}\n\n")
+}
+
+// flowQueryParamsTS is the params argument of a GET or HEAD flow: its path
+// parameters and its declared inputs (both required where they must be
+// sent). A flow that declares no inputs may read any query field, so its
+// params also admit other keys.
+func flowQueryParamsTS(pathParams []string, inputs map[string]FlowInput) string {
+	fields := make([]string, 0, len(pathParams)+len(inputs))
+	seen := map[string]bool{}
+	required := false
+	for _, p := range pathParams {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		required = true
+		fields = append(fields, fmt.Sprintf("%s: string | number", tsKeyForTable(p)))
+	}
+	if len(inputs) > 0 {
+		names := make([]string, 0, len(inputs))
+		for n := range inputs {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if seen[n] {
+				continue
+			}
+			in := inputs[n]
+			opt := "?"
+			if in.Required {
+				opt = ""
+				required = true
+			}
+			fields = append(fields, fmt.Sprintf("%s%s: %s", tsKeyForTable(n), opt, flowInputTS(in)))
+		}
+		if required {
+			return "params: { " + strings.Join(fields, "; ") + " }"
+		}
+		return "params?: { " + strings.Join(fields, "; ") + " }"
+	}
+	if len(fields) == 0 {
+		return "params?: Record<string, unknown>"
+	}
+	return "params: { " + strings.Join(fields, "; ") + " } & Record<string, unknown>"
 }
 
 // flowInputTS maps a declared FlowInput type to its TypeScript type for
@@ -1701,6 +1955,74 @@ func camelCase(s string) string {
 	return strings.ToLower(string([]rune(p)[0])) + p[1:]
 }
 
+// flowSDKName is the camelCase spelling of a flow name: hyphens and
+// underscores both separate words (save-quote and save_quote → saveQuote).
+// embedded/bm.js camelizeFlowName and sdui.js flowRegistryDef apply the same
+// rule to the name a caller writes. camelCase splits on underscores only,
+// so a flow file named save-quote.yaml used to register as 'save-quote' and
+// the documented bm.flows.saveQuote threw "not declared".
+func flowSDKName(name string) string {
+	parts := strings.FieldsFunc(name, func(r rune) bool { return r == '-' || r == '_' })
+	if len(parts) == 0 {
+		return name
+	}
+	for i, p := range parts {
+		r := []rune(p)
+		if i == 0 {
+			r[0] = []rune(strings.ToLower(string(r[0])))[0]
+		} else {
+			r[0] = []rune(strings.ToUpper(string(r[0])))[0]
+		}
+		parts[i] = string(r)
+	}
+	return strings.Join(parts, "")
+}
+
+// isHTTPFlow reports whether bm.flows can call f (an on.request flow).
+func isHTTPFlow(f Flow) bool {
+	return f.Trigger.Type == "http" || f.Trigger.Type == ""
+}
+
+// flowRegistryKeys maps each HTTP flow's name to its key in bm.flows, the
+// generated FlowMap and /_internal/flows.json: the camelCase name. When two
+// flows camelCase to the same key (save-quote and save_quote), the one
+// already spelled that way keeps it, else the first by name; the other is
+// keyed by its own name, so every flow stays reachable. Computed over all
+// flows, not the caller's subset, so a key never depends on who asks.
+func flowRegistryKeys(flows []Flow) map[string]string {
+	var names []string
+	seen := map[string]bool{}
+	for _, f := range flows {
+		if isHTTPFlow(f) && !seen[f.Name] {
+			seen[f.Name] = true
+			names = append(names, f.Name)
+		}
+	}
+	sort.Strings(names)
+	byKey := map[string][]string{}
+	for _, n := range names {
+		k := flowSDKName(n)
+		byKey[k] = append(byKey[k], n)
+	}
+	out := make(map[string]string, len(names))
+	for k, group := range byKey {
+		winner := group[0]
+		for _, n := range group {
+			if n == k {
+				winner = n
+			}
+		}
+		for _, n := range group {
+			if n == winner {
+				out[n] = k
+			} else {
+				out[n] = n
+			}
+		}
+	}
+	return out
+}
+
 func asyncSuffix(async bool) string {
 	if async {
 		return "   (async - returns Job<T>)"
@@ -1758,8 +2080,9 @@ func RegisterBMTypesRoute(mux appRouteRegistrar, app *App) {
 		setPrivateMetadataCacheHeaders(w)
 		session := getSession(app, r)
 		entries := make(map[string]map[string]any)
+		keys := flowRegistryKeys(app.Flows)
 		for _, f := range app.Flows {
-			if f.Trigger.Type != "http" && f.Trigger.Type != "" {
+			if !isHTTPFlow(f) {
 				continue
 			}
 			if !flowListedFor(f, session) {
@@ -1777,7 +2100,7 @@ func RegisterBMTypesRoute(mux appRouteRegistrar, app *App) {
 			if len(f.Trigger.Inputs) > 0 {
 				entry["inputs"] = f.Trigger.Inputs
 			}
-			entries[camelCase(f.Name)] = entry
+			entries[keys[f.Name]] = entry
 		}
 		// json.Marshal sorts map string keys → stable output, and handles
 		// the nested `inputs` object the old manual fmt.Fprintf (which only

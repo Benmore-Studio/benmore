@@ -16,10 +16,14 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -85,7 +90,13 @@ type importSession struct {
 	// write path in the feature" - is attributable to a real actor
 	// instead of dropping to an empty string.
 	CreatedBySubject string
-	stop             <-chan struct{}
+	// OwnerUserID / OwnerEmail are the app user an owner-token import assigns
+	// every row to (the create request's "owner", `benmore import --owner`).
+	// 0 means no chosen owner: an admin-session import owns its rows itself
+	// (CreatedBy) and an owner-token import leaves them unowned.
+	OwnerUserID int64
+	OwnerEmail  string
+	stop        <-chan struct{}
 }
 
 // EnsureImportsTable creates the import bookkeeping table and recovers
@@ -102,7 +113,7 @@ func EnsureImportsTable(app *App) {
 		bytes_total INTEGER NOT NULL,
 		sha256 TEXT NOT NULL,
 		null_as TEXT NOT NULL DEFAULT '',
-		state TEXT NOT NULL DEFAULT 'staging',
+		state TEXT NOT NULL DEFAULT 'staging', -- importStates: staging | running | completed | failed | cancelled
 		rows_loaded INTEGER NOT NULL DEFAULT 0,
 		error TEXT NOT NULL DEFAULT '',
 		created_by INTEGER NOT NULL DEFAULT 0,
@@ -124,6 +135,10 @@ func EnsureImportsTable(app *App) {
 	// column name", which is the expected, harmless outcome.
 	db.Exec(`ALTER TABLE _benmore_imports ADD COLUMN uncompressed_bytes INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE _benmore_imports ADD COLUMN created_by_subject TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE _benmore_imports ADD COLUMN owner_user_id INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE _benmore_imports ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''`)
+	// The lease a running row carries (importLeaseTTL).
+	db.Exec(`ALTER TABLE _benmore_imports ADD COLUMN lease_expires_at DATETIME`)
 	recoverInterruptedImports(app)
 }
 
@@ -147,108 +162,176 @@ const importStagingSweepAge = 24 * time.Hour
 //
 // Two sweeps, both terminal-izing rows nothing else will ever move:
 //
-//  1. A "running" row: its transaction died with the old process (SQLite
-//     has no way to resume an in-flight write across a restart, and WAL
-//     recovery on next open rolls back anything not committed), so the
-//     target table already has zero rows from it - marking the
-//     bookkeeping row "failed" here just makes it match reality instead
-//     of wedging permanently (commit 409s "already running", cancel
-//     409s "running is refused", status polls a frozen row count
-//     forever, with no client action able to clear any of it).
+//  1. A "running" row whose load is gone: its transaction died with its
+//     process (SQLite has no way to resume an in-flight write across a
+//     restart, and WAL recovery on next open rolls back anything not
+//     committed), so the target table already has zero rows from it -
+//     marking the bookkeeping row "failed" here just makes it match
+//     reality instead of wedging permanently (commit 409s "already
+//     running", cancel 409s "running is refused", status polls a frozen
+//     row count forever, with no client action able to clear any of it).
+//     A single process owns every load of its app, so at its start every
+//     running row is gone. Under BENMORE_CLUSTER=true two processes share
+//     one data.db and a row may be a sibling's live load, so only a row
+//     whose lease has lapsed (importLeaseLapsedSQL) is swept there.
 //  2. A "staging" row older than importStagingSweepAge: see that
 //     constant's comment - an abandoned upload otherwise never leaves
 //     staging.
 //
-// Both branches purge staging unconditionally; purgeImportStaging wraps
-// os.RemoveAll, so purging an already-clean directory is a no-op.
-//
-// MEDIUM-4: gated on !IsClusterMode(). This function is scoped to app.DB,
-// so it can never touch another TENANT's data - but cluster mode
-// (BENMORE_CLUSTER=true, pubsub.go) is a supported configuration where TWO
-// PROCESSES share the SAME data.db for the SAME app. A sweep cannot tell
-// "interrupted by my own restart" apart from "running right now in another
-// instance of this same process": a second instance starting up would
-// otherwise sweep the FIRST instance's genuinely in-flight "running" import
-// to "failed" and os.RemoveAll its staging out from under it - killing a
-// live multi-minute load. A boot-id/PID stamp on the "running" row (so the
-// sweep only reclaims rows IT started) would be strictly better, but that
-// widens this fix well past a targeted patch (a new column, a stamp write
-// on every startImport, a comparison here); the environmental gate is the
-// contained fix and cluster deployments already accept that some
-// process-restart bookkeeping is coarser than single-instance mode (see
-// ratelimit.go's own cluster-mode carve-out).
-//
-// The consequence, stated plainly (this trade-off is invisible anywhere
-// else - the api(at:"import") "resume" topic does not mention cluster mode
-// at all): under BENMORE_CLUSTER=true, NEITHER sweep ever runs, for any
-// row, ever. A wedged "running" row from a crashed process is not merely
-// slower to clear than single-instance mode's "next restart" - it is
-// PERMANENTLY unrecoverable by anything client-visible: commit keeps
-// 409ing "already running", cancel keeps refusing a "running" row, and
-// GET /api/_import/{id}/status polls a frozen row count forever, because
-// no process restart is ever safe to treat as "my own crash" in a
-// multi-process deployment. Same story for a "staging" row abandoned past
-// importStagingSweepAge - it never ages out. The only recovery path is a
-// manual operator intervention: `benmore sql <app> "UPDATE
-// _benmore_imports SET state='failed' WHERE id='<id>'" --write` (and,
-// separately, remove the row's staged bytes under
-// .benmore/imports/<id>/ if disk needs reclaiming - the sweep's
-// purgeImportStaging call is exactly what never runs here).
+// Both branches purge staging; purgeImportStaging wraps os.RemoveAll, so
+// purging an already-clean directory is a no-op. Every sweep write goes
+// through failImportsNoWait.
 func recoverInterruptedImports(app *App) {
-	if IsClusterMode() {
-		return
-	}
 	flag := importFlagFor(app)
 	if !flag.CompareAndSwap(false, true) {
 		return
 	}
 	defer flag.Store(false)
-	db := app.DB
 
-	// selectAndFail collects the ids matching `where` BEFORE mutating
-	// anything (so it never conflates a row this call is about to fail
-	// with one a prior sweep already failed for a different reason), then
-	// transitions each to "failed" and purges its staging. Selecting
-	// first, rather than matching on the error text an UPDATE just wrote,
-	// keeps the two sweeps independent of each other's error strings.
-	selectAndFail := func(where, errMsg string, args ...any) {
-		rows, err := db.Query(`SELECT id FROM _benmore_imports WHERE `+where, args...)
-		if err != nil {
-			return
-		}
-		var ids []string
-		for rows.Next() {
-			var id string
-			if rows.Scan(&id) == nil {
-				ids = append(ids, id)
-			}
-		}
-		rows.Close()
-		for _, id := range ids {
-			res, err := db.Exec(`UPDATE _benmore_imports
-				SET state='failed', rows_loaded=0, error=?, completed_at=datetime('now')
-				WHERE id=? AND `+where, append([]any{errMsg, id}, args...)...)
-			if err != nil {
-				continue
-			}
-			if n, _ := res.RowsAffected(); n == 1 {
-				purgeImportStaging(app, id)
-			}
-		}
+	// 1. Running -> failed (see the doc comment above).
+	if IsClusterMode() {
+		failImportsNoWait(app, "state='running' AND "+importLeaseLapsedSQL, importLapsedMessage,
+			time.Now().UTC().Format("2006-01-02 15:04:05"))
+	} else {
+		failImportsNoWait(app, "state='running'", "interrupted by a process restart")
 	}
-
-	// 1. Running -> failed. Its transaction died with the old process, so
-	// the target table already has zero rows from it (see the doc comment
-	// above) - this just makes the bookkeeping row match reality.
-	selectAndFail("state='running'", "interrupted by a process restart")
 
 	// 2. Staging older than importStagingSweepAge -> failed. Computed in
 	// Go (not a SQL 'now', '-24 hours' literal) so the cutoff stays tied
 	// to the one named constant rather than drifting from it.
 	cutoff := time.Now().Add(-importStagingSweepAge).UTC().Format("2006-01-02 15:04:05")
-	selectAndFail("state='staging' AND created_at < ?",
+	failImportsNoWait(app, "state='staging' AND created_at < ?",
 		fmt.Sprintf("staging abandoned - no commit within %s of creation", importStagingSweepAge),
 		cutoff)
+}
+
+// importLeaseTTL is the lease a commit writes on the row it moves to
+// running. It only has to cover the moments the runner does NOT hold the
+// database's write lock: from the commit to its load transaction's BEGIN
+// (a few reads), and from a rolled-back load to its "failed" write. While
+// the load transaction is open the lock itself proves the load is alive: no
+// other connection can write the row, so a sweep of a live load fails with
+// SQLITE_BUSY and leaves it alone (failImportsNoWait), and the transaction
+// moves the row to completed before it releases the lock. A heartbeat
+// written through another connection could not land during the load
+// either, for the same reason.
+const importLeaseTTL = 2 * time.Minute
+
+// importLeaseLapsedSQL matches a running row whose lease has passed (the
+// argument is now) or that has none (a commit by a binary older than
+// leases).
+const importLeaseLapsedSQL = "(lease_expires_at IS NULL OR lease_expires_at < ?)"
+
+const importLapsedMessage = "interrupted: the process running the load stopped (its lease lapsed)"
+
+// replaceLapsedFailure lets a runner's own failure win over the lapsed-lease
+// marker a sweep wrote while the runner was between its rolled-back load and
+// its failed write (a load longer than importLeaseTTL has no lease left
+// then): the sweep's guess must not hide why the load really failed.
+func replaceLapsedFailure(db *sql.DB, id, reason string) bool {
+	res, err := db.Exec(`UPDATE _benmore_imports SET error = ? WHERE id = ? AND state = 'failed' AND error = ?`, reason, id, importLapsedMessage)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
+}
+
+// failLapsedImport fails one running import whose lease has lapsed, so a
+// row left by a process that died is cleared by the next status, commit or
+// cancel call (in cluster mode no restart of this process may ever sweep
+// it). A load this process is running is skipped outright.
+func failLapsedImport(app *App, id string) bool {
+	if _, live := importProgressOf(id); live {
+		return false
+	}
+	return failImportsNoWait(app, "id=? AND state='running' AND "+importLeaseLapsedSQL, importLapsedMessage,
+		id, time.Now().UTC().Format("2006-01-02 15:04:05")) > 0
+}
+
+// failImportsNoWait moves the rows matching where to failed and purges
+// their staging. It collects the ids BEFORE mutating anything (so it never
+// conflates a row this call is about to fail with one a prior sweep already
+// failed for a different reason), then fails each with the guard repeated,
+// on a connection that does not wait for the write lock: a live load holds
+// that lock for its whole transaction, so SQLITE_BUSY means the row's load
+// may be alive and it is left alone. Returns the rows failed.
+func failImportsNoWait(app *App, where, errMsg string, args ...any) int {
+	db := app.DB
+	rows, err := db.Query(`SELECT id FROM _benmore_imports WHERE `+where, args...)
+	if err != nil {
+		return 0
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0
+	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0
+	}
+	defer conn.Close()
+	var wait int
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&wait); err != nil {
+		return 0
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
+		return 0
+	}
+	defer func() {
+		// A pooled connection left at busy_timeout=0 would fail ordinary
+		// writes with "database is locked"; drop it instead.
+		if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout="+strconv.Itoa(wait)); err != nil {
+			log.Printf("IMPORT sweep: could not restore busy_timeout (%v); discarding the connection", err)
+			conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+	failed := 0
+	for _, id := range ids {
+		res, err := conn.ExecContext(ctx, `UPDATE _benmore_imports
+			SET state='failed', rows_loaded=0, error=?, completed_at=datetime('now'), lease_expires_at=NULL
+			WHERE id=? AND `+where, append([]any{errMsg, id}, args...)...)
+		if err != nil {
+			continue
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			failed++
+			purgeImportStaging(app, id)
+		}
+	}
+	return failed
+}
+
+// Import states (_benmore_imports.state). The table predates CHECK
+// constraints and is not rebuilt for one; writers keep to this set.
+const (
+	importStateStaging   = "staging"
+	importStateRunning   = "running"
+	importStateCompleted = "completed"
+	importStateFailed    = "failed"
+	importStateCancelled = "cancelled"
+)
+
+// importLocks serialize a chunk upload's check-write-recheck (read lock,
+// so chunks still upload in parallel) with a commit of the same import
+// (write lock) in this process: a chunk PUT racing a commit used to see the
+// commit's running state after its write and remove the part the load was
+// about to read, failing the import. Striped by app dir + id hash (one
+// `benmore host` process serves many apps), so the set never grows.
+var importLocks [64]sync.RWMutex
+
+func importLockFor(app *App, id string) *sync.RWMutex {
+	h := fnv.New32a()
+	h.Write([]byte(app.Dir + "\x00" + id))
+	return &importLocks[h.Sum32()%uint32(len(importLocks))]
 }
 
 // importStagingDir returns the per-import staging directory.
@@ -723,11 +806,11 @@ func loadImportSession(db *sql.DB, id string) (*importSession, error) {
 	var gz int
 	err := db.QueryRow(`SELECT id, table_name, format, gzip, bytes_total,
 		uncompressed_bytes, sha256, null_as, state, rows_loaded, error,
-		created_by, created_by_subject
+		created_by, created_by_subject, owner_user_id, owner_email
 		FROM _benmore_imports WHERE id = ?`, id).
 		Scan(&s.ID, &s.TableName, &s.Format, &gz, &s.BytesTotal,
 			&s.UncompressedBytes, &s.SHA256, &s.NullAs, &s.State, &s.RowsLoaded,
-			&s.Error, &s.CreatedBy, &s.CreatedBySubject)
+			&s.Error, &s.CreatedBy, &s.CreatedBySubject, &s.OwnerUserID, &s.OwnerEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -749,7 +832,7 @@ func saveImportState(db *sql.DB, id, state string, rows int64, errMsg string) er
 
 func saveImportStateIf(db *sql.DB, id, from, state string, rows int64, errMsg string) (bool, error) {
 	res, err := db.Exec(`UPDATE _benmore_imports
-		SET state = ?, rows_loaded = ?, error = ?,
+		SET state = ?, rows_loaded = ?, error = ?, lease_expires_at = NULL,
 		    completed_at = CASE WHEN ? IN ('completed','failed','cancelled')
 		                        THEN datetime('now') ELSE completed_at END
 		WHERE id = ? AND state = ?`, state, rows, errMsg, state, id, from)

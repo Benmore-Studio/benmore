@@ -1,0 +1,7 @@
+[
+  "Keys are scoped per user, login/API credential, table and key; at most 256 bytes. Keep the same credential and input for retries.",
+  "Access, scope and CSRF checks run before replay. The response and row commit atomically; failed mutations do not consume the key.",
+  "Unverifiable pre-upgrade entries return 409. Verify the original operation before retrying; use a fresh key only for a new operation.",
+  "Default TTL is 24h - after that the key can be reused.",
+  "Stored responses: a create on a table with encrypted.yaml fields keeps its response (the row as the creator read it, encrypted fields decrypted for that caller) sealed in `_benmore_idempotency`, under the app's ENCRYPTION_KEY and bound to that user and key; a retry opens it and answers the original bytes. `rotate_encryption_key` re-seals live entries, so retries after a rotation still answer. A stored response that cannot be opened (the key was changed outside a rotation, or the app ran on a per-process key and restarted) answers 409 `idempotency key already used, but its stored response can no longer be read: verify the original operation before retrying` and never inserts again. Tables without encrypted fields and batch responses (`{ids, count}`) are stored unsealed."
+]

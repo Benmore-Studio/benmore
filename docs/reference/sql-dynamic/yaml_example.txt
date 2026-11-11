@@ -1,0 +1,32 @@
+# Pattern: AI writes the SQL for a question the flow's author fixed, then we execute it.
+# The prompt must not read request input: a model's answer to a prompt that holds a
+# request value is request input too, and sql_dynamic refuses it on every request.
+on:
+  request:
+    method: POST
+    path: /api/ai/orders-by-status
+    auth: required
+    role: admin
+
+jobs:
+  ask:
+    steps:
+      - id: ai
+        run: api
+        with:
+          url: https://api.anthropic.com/v1/messages
+          method: POST                      # api steps default to GET
+          headers:                          # bearer_token would send "x-api-key: Bearer …"
+            x-api-key: "${{ env.ANTHROPIC_API_KEY }}"
+            anthropic-version: "2023-06-01"
+          json:
+            model: claude-haiku-4-5
+            max_tokens: 1024
+            messages:
+              - role: user
+                content: "Write one SQLite SELECT that counts the rows of the orders table per status. Reply with the SQL only."
+      - id: result
+        run: sql_dynamic
+        query: "${{ steps.ai.outputs.json.content[0].text }}"
+      - run: respond
+        with: { status: 200, json: { rows: "${{ steps.result.outputs.rows }}" } }

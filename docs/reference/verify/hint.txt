@@ -1,0 +1,1 @@
+Make the receiver idempotent: put a UNIQUE constraint on the event id and insert with `INSERT OR IGNORE` (providers retry on 5xx). See topic 'webhooks' for the inverse direction (outbound webhook subscriptions Benmore SENDS).

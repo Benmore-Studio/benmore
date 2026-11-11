@@ -1,0 +1,16 @@
+{
+  "summary": "Columns whose NAME marks them as a secret are never returned by auto-CRUD, whoever asks (owner and admin included): list, cursor list, single read, ?as_of=, ?include= rows, the create response, ?fields= projections, version snapshots, /api/_query and the data export all apply the same rule. ?q= full-text search never matches them even when listed in @@fulltext (an index of only hidden columns answers 400), since a match would confirm the value. The /_admin panel neither shows nor searches them (its create form still accepts them; the edit form leaves them unchanged), and on _benmore_users it hides password hashes, TOTP secrets and backup codes. They are still writable, and flows/hooks can read them. A version revert keeps their current value instead of restoring the snapshot's (api(at:'versioning') → revert_hidden).",
+  "hidden_names": [
+    "TEXT columns only, exact: password, password_hash, salt, session_id, csrf_token, totp_secret, backup_codes, recovery_codes, secret, token, api_key, private_key, secret_key, access_key, signing_key, and any mfa_* column",
+    "TEXT columns only, suffix: *_secret, *_token, *_password, *_pin, *_api_key, *_private_key, *_secret_key, *_access_key, *_signing_key, and *_hash when the name before _hash contains a credential word (password, pass, passcode, pin, code, otp, token, secret, key, session, reset, recovery, backup, verify, verification, auth, credential, invite, magic, login, api, mfa, totp) - e.g. otp_code_hash, token_hash",
+    "blind-index siblings: <col>_blind next to <col>"
+  ],
+  "not_hidden": [
+    "numeric, boolean and date columns (secret_id, wants_secret) - a secret is text",
+    "a bare *_key (playbook_key, sort_key, cache_key) - usually a lookup key; name credentials api_key / *_secret_key / *_private_key etc.",
+    "content checksums (content_hash, payload_hash, file_hash, commit_hash) - a *_hash is hidden only when its name says it hashes a credential",
+    "names starting public_ or publishable_ (publishable_key, public_signing_key) - the explicit 'safe for clients' marker",
+    "columns declared in encrypted.yaml WITH unmask roles (unmask_roles / roles): their visibility is the roles you declared (masked for everyone else). A secret-named column encrypted with NO unmask roles stays hidden - declare unmask roles, e.g. unmask_roles: [owner], to show it"
+  ],
+  "deliberate_return": "To hand such a value to a client on purpose (an API key shown once after creation, a share token), return it from a flow that selects the column by name for exactly that caller - or rename the column with a public_ prefix if it is genuinely public."
+}

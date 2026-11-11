@@ -11,7 +11,7 @@ package main
 // granted to an address they don't control (any invite or share for an email
 // that has no account yet). A change now takes effect only after the new
 // address proves control by opening a single-use, one-hour link; applying it
-// revokes every session, API token, OAuth code, connector and edge grant (and
+// revokes every session, API token, OAuth code and connector grant (and
 // unused reset links for the old address), so all grants are re-resolved
 // under the new identity.
 
@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"html"
 	htmltemplate "html/template"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -169,17 +170,22 @@ func confirmEmailChange(app *App, token string) (int64, string, string, error) {
 	if err := app.DB.QueryRow("SELECT user_id, new_email, expires_at FROM _benmore_email_changes WHERE token_hash = ?", hashResetToken(token)).Scan(&userID, &newEmail, &expires); err != nil {
 		return 0, "", "", errors.New("this link is invalid or was already used")
 	}
-	// Single use, whatever happens next.
-	app.DB.Exec("DELETE FROM _benmore_email_changes WHERE token_hash = ?", hashResetToken(token))
+	// A link that can never apply is spent now; one that can is spent only
+	// in the transaction that applies it, so a failed update (a concurrent
+	// sign-up taking the address) leaves the link usable.
+	spend := func() { app.DB.Exec("DELETE FROM _benmore_email_changes WHERE token_hash = ?", hashResetToken(token)) }
 	if t, err := time.Parse(time.RFC3339, expires); err != nil || time.Now().After(t) {
+		spend()
 		return 0, "", "", errors.New("this link has expired - request the change again")
 	}
 	// Checked again at confirmation: a change requested under an older rule
 	// must not install an address the current one refuses.
 	if !validAuthEmail(newEmail) {
+		spend()
 		return 0, "", "", errors.New("this link is invalid or was already used")
 	}
 	if allowed, _ := emailAllowedForApp(app, newEmail); !allowed {
+		spend()
 		return 0, "", "", errors.New("this link is invalid or was already used")
 	}
 	if emailTakenByOther(app.DB, newEmail, userID) {
@@ -204,6 +210,14 @@ func confirmEmailChange(app *App, token string) (int64, string, string, error) {
 		return 0, "", "", errors.New("could not update the email")
 	}
 	defer tx.Rollback()
+	// Single use: the link is spent with the change, by exactly one caller.
+	spent, err := tx.Exec("DELETE FROM _benmore_email_changes WHERE token_hash = ?", hashResetToken(token))
+	if err != nil {
+		return 0, "", "", errors.New("could not update the email")
+	}
+	if n, err := spent.RowsAffected(); err != nil || n != 1 {
+		return 0, "", "", errors.New("this link is invalid or was already used")
+	}
 	if err := revokePasswordCredentials(tx, userID); err != nil {
 		return 0, "", "", errors.New("could not update the email")
 	}
@@ -213,9 +227,12 @@ func confirmEmailChange(app *App, token string) (int64, string, string, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, "", "", errors.New("could not update the email")
 	}
-	revokeEdgeGrantsAfterCredentialChange(app, userID)
 	if setVerified != "" {
-		activateEmailInvites(app, userID, newEmail)
+		// The change is committed; a failed invite write is logged, and a
+		// later verification link or OTP sign-in attaches the invites.
+		if err := activateEmailInvites(app, userID, newEmail); err != nil {
+			log.Printf("auth: email change of account %d did not attach the new address's pending invites: %v", userID, err)
+		}
 	}
 	return userID, oldEmail, newEmail, nil
 }
@@ -315,7 +332,7 @@ func emailChangeSessionOwner(app *App, r *http.Request, userID int64) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	s := GetSessionFromDB(app.DB, c.Value)
+	s := getAppSession(app, r, c.Value)
 	return s != nil && s.UserID == userID && directLoginSession(app, s)
 }
 

@@ -1,0 +1,16 @@
+{
+  "keys": [
+    "cli",
+    "read_coverage",
+    "append_only",
+    "read_history",
+    "summary",
+    "buffer_lifecycle",
+    "endpoint",
+    "bulk_writes",
+    "values_format",
+    "absent_values",
+    "control_plane",
+    "impersonation"
+  ]
+}

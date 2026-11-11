@@ -1,0 +1,86 @@
+# DELETE /api/_scheduled/{id} answers what is stored. It used to answer
+# 200 {"status":"cancelled"} in every case below.
+# `json: {}` makes the runner send the CSRF token in X-CSRF-Token with the
+# session cookie, as the browser SDK does (a DELETE's form body is not read).
+cancel_pending_and_blocked_tasks:
+  as_user: "canceller@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status) VALUES (6001, {{user_id}}, 'reminder', 'Ping', '2999-01-01T00:00:00Z', 'pending')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, last_error) VALUES (6002, {{user_id}}, 'flow', 'no_such_flow', '2999-01-01T00:00:00Z', 'blocked', 'scheduled flow no longer exists')"
+  steps:
+    - api: "DELETE /api/_scheduled/6001"
+      json: {}
+      expect: {status: 200, json: {status: "cancelled"}}
+    - api: "DELETE /api/_scheduled/6002"
+      json: {}
+      expect: {status: 200, json: {status: "cancelled"}}
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id IN (6001, 6002) AND status = 'cancelled'"
+      expect: {rows: 2}
+    # A cancelled task is never fired.
+    - sql: "UPDATE _benmore_scheduled_tasks SET run_at = '2000-01-01T00:00:00Z' WHERE id = 6001"
+    - flush: "scheduled"
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 6001 AND status = 'cancelled' AND fired_at IS NULL"
+      expect: {rows: 1}
+    # Cancelling it again changes nothing and says so.
+    - api: "DELETE /api/_scheduled/6001"
+      json: {}
+      expect: {status: 409, json: {status: "cancelled"}}
+cancel_of_a_fired_reminder_is_refused:
+  as_user: "late@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status) VALUES (6101, {{user_id}}, 'reminder', 'Ping', '2000-01-01T00:00:00Z', 'pending')"
+  steps:
+    - flush: "scheduled"
+    - api: "DELETE /api/_scheduled/6101"
+      json: {}
+      expect:
+        status: 409
+        json: {status: "done"}
+        contains: "scheduled task already done"
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 6101 AND status = 'done' AND fired_at IS NOT NULL"
+      expect: {rows: 1}
+    # The reminder was delivered; the answer did not claim otherwise.
+    - sql: "SELECT id FROM _benmore_notifications WHERE user_id = {{user_id}} AND title = 'Ping'"
+      expect: {rows: 1}
+cancel_of_a_running_or_failed_task_is_refused:
+  as_user: "busy@test.com"
+  setup:
+    # A fresh claim (a live worker): the sweep leaves it running.
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, claimed_at) VALUES (6201, {{user_id}}, 'flow', 'safe_sync', '2999-01-01T00:00:00Z', 'running', strftime('%Y-%m-%dT%H:%M:%S.000000000Z', 'now'))"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, last_error) VALUES (6202, {{user_id}}, 'flow', 'unsafe_sync', '2999-01-01T00:00:00Z', 'failed', 'flow execution failed; see server log')"
+  steps:
+    - api: "DELETE /api/_scheduled/6201"
+      json: {}
+      expect: {status: 409, json: {status: "running"}}
+    - api: "DELETE /api/_scheduled/6202"
+      json: {}
+      expect: {status: 409, json: {status: "failed"}}
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE (id = 6201 AND status = 'running') OR (id = 6202 AND status = 'failed')"
+      expect: {rows: 2}
+cancel_of_a_task_that_is_not_the_callers_or_missing_is_404:
+  as_user: "prober@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status) VALUES (6301, 999999, 'reminder', 'Not yours', '2999-01-01T00:00:00Z', 'pending')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status) VALUES (6302, 999999, 'reminder', 'Not yours either', '2999-01-01T00:00:00Z', 'done')"
+  steps:
+    # Another user's pending task, another user's finished task and an id that
+    # does not exist get the same answer, so ids and their states cannot be probed.
+    - api: "DELETE /api/_scheduled/6301"
+      json: {}
+      expect:
+        status: 404
+        json: {error: "scheduled task not found"}
+        not_contains: "cancelled"
+    - api: "DELETE /api/_scheduled/6302"
+      json: {}
+      expect:
+        status: 404
+        json: {error: "scheduled task not found"}
+        not_contains: "done"
+    - api: "DELETE /api/_scheduled/424242"
+      json: {}
+      expect:
+        status: 404
+        json: {error: "scheduled task not found"}
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE (id = 6301 AND status = 'pending') OR (id = 6302 AND status = 'done')"
+      expect: {rows: 2}

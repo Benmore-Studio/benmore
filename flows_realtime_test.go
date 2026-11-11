@@ -321,6 +321,71 @@ func TestSessionlessFlowWritesStayInTheirTenant(t *testing.T) {
 	}
 }
 
+// A cron job has no session and no trigger tenant, so its write to a tenant
+// table reached admins only and every member's live view stayed stale. A
+// write that RETURNs the tenant column now reaches each tenant its rows name:
+// the values are the written rows' own. Without it, or in a run that carries
+// any request input, the write still reaches admins only.
+func TestCronWriteReachesTheTenantsItsRowsReturn(t *testing.T) {
+	app := flowRealtimeApp(t)
+	EnsureJobsTable(app.DB)
+	mustExec(t, app.DB, "INSERT INTO orgdocs (id, org_id, title) VALUES (3, 'tenant-a', 'second-a')")
+	mustExec(t, app.DB, "INSERT INTO members (org_id, email) VALUES ('tenant-a', 'a@example.com'), ('tenant-b', 'b@example.com'), ('tenant-c', 'c@example.com')")
+	subA := subscribeFlowRealtime(t, app, createCrudScopeSession(t, app, "a@example.com", "user", "tenant-a", ""))
+	subB := subscribeFlowRealtime(t, app, createCrudScopeSession(t, app, "b@example.com", "user", "tenant-b", ""))
+	subC := subscribeFlowRealtime(t, app, createCrudScopeSession(t, app, "c@example.com", "user", "tenant-c", ""))
+	admin := subscribeFlowRealtime(t, app, createCrudScopeSession(t, app, "boss@example.com", "admin", "", ""))
+	app.Flows = []Flow{
+		{Name: "stale_tx", Transaction: true, Steps: []FlowStep{
+			{Type: "sql", SQL: "UPDATE orgdocs SET title = title || '.' WHERE org_id = 'tenant-b' RETURNING org_id"},
+		}},
+		{Name: "stale_job", Steps: []FlowStep{
+			{Type: "sql", SQL: "UPDATE orgdocs SET title = title || '?' WHERE org_id = 'tenant-a' RETURNING org_id"},
+		}},
+	}
+	event := `{"table":"orgdocs","action":"update"}`
+	for _, c := range []struct {
+		name     string
+		run      func() error
+		toA, toB bool
+	}{
+		{name: "returns every tenant it wrote", toA: true, toB: true, run: func() error {
+			return runCronJob(app, CronJob{ID: "stale", Steps: []FlowStep{{Type: "sql", SQL: "UPDATE orgdocs SET title = title || '!' RETURNING org_id"}}}, nil)
+		}},
+		{name: "returns one tenant", toA: true, run: func() error {
+			return runCronJob(app, CronJob{ID: "stale", Steps: []FlowStep{{Name: "marked", Type: "sql", SQL: "UPDATE orgdocs SET title = title || '!' WHERE org_id = 'tenant-a' RETURNING id, org_id"}}}, nil)
+		}},
+		{name: "transactional flow job", toB: true, run: func() error {
+			return runCronJob(app, CronJob{ID: "stale", Flow: "stale_tx"}, nil)
+		}},
+		{name: "no RETURNING", run: func() error {
+			return runCronJob(app, CronJob{ID: "stale", Steps: []FlowStep{{Type: "sql", SQL: "UPDATE orgdocs SET title = title || '!' WHERE org_id = 'tenant-a'"}}}, nil)
+		}},
+		{name: "returns no tenant column", run: func() error {
+			return runCronJob(app, CronJob{ID: "stale", Steps: []FlowStep{{Type: "sql", SQL: "UPDATE orgdocs SET title = title || '!' WHERE org_id = 'tenant-a' RETURNING id"}}}, nil)
+		}},
+		{name: "job carrying request input", run: func() error {
+			return executeFlowJob(app, "stale_job", map[string]any{"note": "x", flowRequestKeysPayloadField: []any{"note"}})
+		}},
+	} {
+		if err := c.run(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		for _, s := range []struct {
+			sub  *flowRealtimeSubscriber
+			want bool
+		}{{subA, c.toA}, {subB, c.toB}, {subC, false}} {
+			sse, _ := s.sub.drain()
+			if got := reflect.DeepEqual(sse, []string{event}); got != s.want {
+				t.Errorf("%s: subscriber %q got %q, want event=%v", c.name, s.sub.sse.groupID, sse, s.want)
+			}
+		}
+		if sse, _ := admin.drain(); len(sse) == 0 || sse[0] != event {
+			t.Errorf("%s: admin got %q, want the event", c.name, sse)
+		}
+	}
+}
+
 func TestSQLWriteTargets(t *testing.T) {
 	cases := []struct {
 		sql   string

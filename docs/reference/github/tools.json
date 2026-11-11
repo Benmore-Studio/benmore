@@ -1,0 +1,6 @@
+[
+  "github_status(app)                                   # connected account, linked repo, per-env last push + errors",
+  "github_link(app, owner?, repo?, create?, private?)   # create-or-attach + start mirroring (owner defaults to your login; pass an org login for org repos)",
+  "github_push(app, force?)                             # mirror now; force overwrites a diverged remote branch",
+  "github_unlink(app)                                   # stop mirroring (the GitHub repo is NOT deleted)"
+]

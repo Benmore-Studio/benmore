@@ -137,7 +137,7 @@ func startAppMCPReadFlow(ctx *FlowContext) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPReadFlow); return nil }); err != nil {
+	if err = conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPReadFlow); return nil }); err != nil {
 		closeConn()
 		return nil, err
 	}
@@ -311,7 +311,7 @@ func appMCPComputeArgs(value any) (any, error) {
 // returned to the app pool; shared lease cleanup restores the authorizer.
 func rollbackAppMCPReadConn(conn *sql.Conn) {
 	_ = conn.Raw(func(raw any) error {
-		sqlite := raw.(*sqlite3.SQLiteConn)
+		sqlite := mustSQLiteConn(raw)
 		if !sqlite.AutoCommit() {
 			if _, err := sqlite.Exec("ROLLBACK", nil); err != nil {
 				return driver.ErrBadConn

@@ -1,0 +1,4 @@
+[
+  "Native Benmore app: import bm, { type Contact } from 'bm'",
+  "External frontend: import bm from '@benmore/bm'"
+]

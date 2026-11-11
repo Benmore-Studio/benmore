@@ -1,0 +1,72 @@
+# A ws_rooms pattern restricts the rooms it names or closes them: it never
+# leaves them open. "room-:id" and "chat::id" (rooms named chat:<id>) admit a
+# member of that room only. "talk:*" matches no room, so the write gate
+# refuses it (expected-failures.txt); this deployed copy still loads, and
+# rooms whose name starts with "talk" refuse everyone but admins. A slug is a
+# room name, so a presence join answers what a WebSocket join answers.
+
+member_joins_only_their_rooms:
+  as_user: "member@fixture.test"
+  setup:
+    - sql: "INSERT INTO room_members (room_id, member_id) VALUES (5, {{user_id}})"
+  steps:
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "room-5", action: "join"}
+      expect:
+        status: 200
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "chat:5", action: "join"}
+      expect:
+        status: 200
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "chat:6", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "talk:5", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "lobby", action: "join"}
+      expect:
+        status: 200
+
+non_member_is_refused_everywhere_a_pattern_names:
+  as_user: "outsider@fixture.test"
+  steps:
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "room-5", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "chat:5", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "talk:5", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "talk-anything", action: "join"}
+      expect:
+        status: 403
+        json: {error: "not a member of this room"}
+    - api: "POST /api/_presence/heartbeat"
+      bearer: true
+      json: {slug: "lobby", action: "join"}
+      expect:
+        status: 200

@@ -1,0 +1,40 @@
+reminder_claim_stamp_and_result:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status) VALUES (5001, {{user_id}}, 'reminder', 'Ping', '2000-01-01T00:00:00Z', 'pending')"
+  steps:
+    - flush: "scheduled"
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5001 AND status = 'done' AND length(claimed_at) = 30 AND claimed_at LIKE '____-__-__T__:__:__.%Z'"
+      expect: {rows: 1}
+blocked_path_uses_the_same_stamp_format:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status) VALUES (5002, {{user_id}}, 'flow', 'no_such_flow', '2000-01-01T00:00:00Z', 'pending')"
+  steps:
+    - flush: "scheduled"
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5002 AND status = 'blocked' AND length(claimed_at) = 30"
+      expect: {rows: 1}
+orphaned_flow_task_fails_closed_unless_idempotent:
+  as_user: "owner@test.com"
+  setup:
+    # run_at is far in the future so the sweep's own claim pass leaves the
+    # recovered rows pending and the test sees what recovery did.
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, claimed_at) VALUES (5101, {{user_id}}, 'flow', 'unsafe_sync', '2999-01-01T00:00:00Z', 'running', '2000-01-01T00:00:00.000000000Z')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, claimed_at) VALUES (5102, {{user_id}}, 'flow', 'safe_sync', '2999-01-01T00:00:00Z', 'running', '2000-01-01T00:00:00.000000000Z')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, title, run_at, status, claimed_at) VALUES (5103, {{user_id}}, 'reminder', 'Ping', '2999-01-01T00:00:00Z', 'running', '2000-01-01T00:00:00.000000000Z')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, claimed_at) VALUES (5104, {{user_id}}, 'flow', NULL, '2999-01-01T00:00:00Z', 'running', '2000-01-01T00:00:00.000000000Z')"
+    - sql: "INSERT INTO _benmore_scheduled_tasks (id, user_id, kind, flow, run_at, status, claimed_at) VALUES (5105, {{user_id}}, 'flow', 'unsafe_sync', '2999-01-01T00:00:00Z', 'running', strftime('%Y-%m-%dT%H:%M:%S.000000000Z', 'now'))"
+  steps:
+    - flush: "scheduled"
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5101 AND status = 'failed' AND recoveries = 0 AND last_error LIKE '%not marked idempotent%'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5102 AND status = 'pending' AND recoveries = 1"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5103 AND status = 'pending' AND recoveries = 1"
+      expect: {rows: 1}
+    # a flow task with no flow name is not idempotent either
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5104 AND status = 'failed'"
+      expect: {rows: 1}
+    # a fresh claim (live worker) is left alone
+    - sql: "SELECT id FROM _benmore_scheduled_tasks WHERE id = 5105 AND status = 'running'"
+      expect: {rows: 1}

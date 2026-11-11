@@ -1,0 +1,8 @@
+import bm from 'bm';
+async function chooseLanguage(lang) {
+  const response = await fetch('/api/_i18n/' + encodeURIComponent(lang));
+  if (!response.ok) throw new Error('Language unavailable');
+  window.__bm_i18n = { lang, strings: await response.json() };
+  // Re-render the app's translated labels after selecting the dictionary.
+}
+document.querySelector('#greeting').textContent = bm.t('welcome', {name: 'Avery'});

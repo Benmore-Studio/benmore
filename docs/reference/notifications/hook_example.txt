@@ -1,0 +1,7 @@
+# hooks.yaml - fire a notification on assignment
+on_update:
+  tasks:
+    - notify: "{{assigned_to}}"
+      when: "old_assigned_to != assigned_to"
+      notify_title: "New task assigned"
+      notify_body: "{{title}}"

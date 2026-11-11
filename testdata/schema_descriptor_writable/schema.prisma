@@ -1,0 +1,53 @@
+// One column of every kind a generic create or PATCH treats differently.
+// orders:      plain columns, a same-row computed column (line_total), an
+//              aggregate computed column (item_count), a workflow state
+//              column (status), an encrypted column with a blind index
+//              (tax_id, sibling tax_id_blind), owner, timestamps, soft delete.
+// projects:    the tenant key (org_id).
+// org_members: the groups membership table (identity and role columns).
+model Order {
+  id        Int         @id @default(autoincrement())
+  userId    Int         @map("user_id")
+  title     String
+  note      String?
+  qty       Int         @default(1)
+  unitPrice Float       @default(0) @map("unit_price")
+  lineTotal Float       @default(0) @map("line_total")
+  itemCount Int         @default(0) @map("item_count")
+  status    String      @default("draft")
+  taxId     String?     @map("tax_id")
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @default(now()) @updatedAt @map("updated_at")
+  deletedAt DateTime?   @map("deleted_at")
+  items     OrderItem[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id      Int    @id @default(autoincrement())
+  orderId Int    @map("order_id")
+  order   Order  @relation(fields: [orderId], references: [id])
+  userId  Int    @map("user_id")
+  label   String
+
+  @@map("order_items")
+}
+
+model Project {
+  id     Int    @id @default(autoincrement())
+  orgId  Int?   @map("org_id")
+  userId Int    @map("user_id")
+  name   String
+
+  @@map("projects")
+}
+
+model OrgMember {
+  id         Int    @id @default(autoincrement())
+  orgId      Int    @map("org_id")
+  email      String
+  memberRole String @default("member") @map("member_role")
+
+  @@map("org_members")
+}

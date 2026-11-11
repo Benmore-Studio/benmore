@@ -1,0 +1,11 @@
+{
+  "keys": [
+    "boolean_values",
+    "cross_table_transaction",
+    "summary",
+    "limits",
+    "per_item_gates",
+    "endpoints",
+    "js_snippet"
+  ]
+}

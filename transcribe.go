@@ -246,6 +246,11 @@ func execStepTranscribe(ctx *FlowContext, step *FlowStep) error {
 	file := strings.TrimSpace(interpolateCtx(cfg.File, ctx))
 	model := strings.TrimSpace(interpolateCtx(cfg.Model, ctx))
 	language := strings.TrimSpace(interpolateCtx(cfg.Language, ctx))
+	// A reference with no value stops the step before the file is fetched
+	// (an https `file:` is an outbound call) or decoded (flows_steps.go).
+	if err := ctx.unresolvedRefsBeforeEffect(step); err != nil {
+		return err
+	}
 
 	goCtx := context.Background()
 	if ctx.Request != nil {
@@ -254,10 +259,11 @@ func execStepTranscribe(ctx *FlowContext, step *FlowStep) error {
 	// Step-level `timeout:` (parsed for every step by flows_gha.go, same
 	// as `run: api` consumes at execStepAPI) caps this call too. It nests
 	// OUTSIDE RunTranscribe's own TRANSCRIBE_TIMEOUT context, so the
-	// effective deadline is the SMALLER of the two.
-	if step.Timeout > 0 {
+	// effective deadline is the SMALLER of the two. A synchronous run's time
+	// limit caps it as well (flows_time_limit.go).
+	if timeout := ctx.boundStepTimeout(step.Timeout); timeout > 0 {
 		var cancel context.CancelFunc
-		goCtx, cancel = context.WithTimeout(goCtx, step.Timeout)
+		goCtx, cancel = context.WithTimeout(goCtx, timeout)
 		defer cancel()
 	}
 	res, err := RunTranscribe(goCtx, ctx.App, file, model, language)

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -106,4 +107,91 @@ func openTestSQLite(t *testing.T, path string) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// Review finding (router tenant-data lock): repairAppSourceModes ran os.Chmod
+// on schema.sql and migrations/*.sql, which follows a link, so a source file
+// linked to data.db widened the database to 0664 at every start. Links are
+// left alone now, and writeAppSourceFile refuses to write through one.
+func TestAppSourceModesNeverFollowALink(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "data.db")
+	if err := os.WriteFile(db, []byte("SQLite format 3\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "migrations"), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []string{"schema.sql", "migrations/0001_init.sql"} {
+		if err := os.Symlink(db, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repairAppSourceModes(dir)
+	if info, err := os.Stat(db); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("data.db behind a linked schema.sql/migration became %v (%v), want 600", info.Mode().Perm(), err)
+	}
+
+	link := filepath.Join(dir, "migrations", "0001_init.sql")
+	if err := writeAppSourceFile(link, []byte("CREATE TABLE x (id INTEGER);")); err == nil {
+		t.Fatal("writeAppSourceFile wrote through a link")
+	}
+	if body, _ := os.ReadFile(db); string(body) != "SQLite format 3\x00" {
+		t.Fatalf("data.db behind the link was rewritten: %q", body)
+	}
+	if info, _ := os.Stat(db); info.Mode().Perm() != 0o600 {
+		t.Fatalf("data.db behind the link became %v, want 600", info.Mode().Perm())
+	}
+}
+
+// The history .gitignore an older router wrote 0600 is widened by the app,
+// which owns it under the tenant-data lock; a linked one is left alone.
+func TestRepairAppSourceModesWidensHistoryGitignore(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, ".gitignore")
+	if err := os.WriteFile(p, []byte(gitignoreContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(p, 0o600)
+	repairAppSourceModes(dir)
+	if info, err := os.Stat(p); err != nil || info.Mode().Perm() != appSourceFileMode {
+		t.Fatalf(".gitignore mode = %v (%v), want %v", info.Mode().Perm(), err, appSourceFileMode)
+	}
+	other := t.TempDir()
+	target := filepath.Join(other, "secret")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(other, ".gitignore")); err != nil {
+		t.Fatal(err)
+	}
+	repairAppSourceModes(other)
+	if info, _ := os.Stat(target); info.Mode().Perm() != 0o600 {
+		t.Fatalf("a linked .gitignore widened its target to %v", info.Mode().Perm())
+	}
+}
+
+// The router writes the history .gitignore with the shared source mode, even
+// under a narrow umask: an owner-only one is never widened once the tree
+// belongs to the app's user.
+func TestGitProtectHistoryWritesASharedModeGitignore(t *testing.T) {
+	if !gitAvailable() {
+		t.Skip("git required")
+	}
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitProtectHistory(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, ".gitignore"))
+	if err != nil || info.Mode().Perm() != appSourceFileMode {
+		t.Fatalf(".gitignore mode = %v (%v), want %v", info.Mode().Perm(), err, appSourceFileMode)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); !strings.HasPrefix(string(data), "node_modules/\n") || !strings.HasSuffix(string(data), gitignoreContents) {
+		t.Fatalf(".gitignore lost the app's rules or the mandatory ones: %q", data)
+	}
 }

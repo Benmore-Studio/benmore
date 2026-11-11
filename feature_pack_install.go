@@ -3,6 +3,7 @@ package main
 // Feature-pack installation planning, collision checks, and application.
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 		DryRun:          opts.DryRun,
 		Replace:         opts.Replace,
 		DeleteMissing:   opts.DeleteMissing,
+		AllowTableDrop:  opts.AllowTableDrop,
 		RoutePrefix:     normalizedRoutePrefix(opts.RoutePrefix),
 		ModelPrefix:     normalizedModelPrefix(opts.ModelPrefix),
 		RouteMap:        sortedStringMap(opts.RouteMap),
@@ -80,9 +82,18 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 		}
 	}
 	packFilePresent := map[string]bool{}
+	packPrismaLoads := false
+	// schemaWrites are the pack files the install would write that decide
+	// what the app's schema step does at its next load: the root schema.prisma
+	// and schema.yaml, and migrations/*.sql.
+	schemaWrites := map[string][]byte{}
 	for p, body := range files {
 		p = filepath.ToSlash(p)
 		packFilePresent[p] = true
+		clean := filepath.ToSlash(filepath.Clean(p))
+		if strings.EqualFold(clean, "schema.prisma") && prismaSourceLoads(body) {
+			packPrismaLoads = true
+		}
 		if featurePackPathProtected(p) || strings.HasPrefix(filepath.ToSlash(p), "files/") {
 			plan.Collisions = append(plan.Collisions, p+": protected path")
 			continue
@@ -110,11 +121,16 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 			plan.Collisions = append(plan.Collisions, p+": "+err.Error())
 			continue
 		}
+		_, isMigration := userMigrationFileName(clean)
+		if clean == "schema.prisma" || clean == "schema.yaml" || isMigration {
+			schemaWrites[clean] = body
+		}
 		if _, err := os.Stat(abs); err == nil {
 			if opts.Replace {
 				plan.FileUpdates = append(plan.FileUpdates, filepath.ToSlash(p))
 			} else {
 				plan.Collisions = append(plan.Collisions, p+": file exists")
+				delete(schemaWrites, clean)
 			}
 			continue
 		} else if !os.IsNotExist(err) {
@@ -123,10 +139,12 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 			// file without replace consent, and a failed install's cleanup
 			// would then delete it as a phantom FileAdd.
 			plan.Collisions = append(plan.Collisions, p+": "+err.Error())
+			delete(schemaWrites, clean)
 			continue
 		}
 		if hashBytesSHA256(body) == "" {
 			plan.Collisions = append(plan.Collisions, p+": empty hash")
+			delete(schemaWrites, clean)
 			continue
 		}
 		plan.FileAdds = append(plan.FileAdds, filepath.ToSlash(p))
@@ -164,6 +182,80 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 		}
 		plan.SchemaAdds = append(plan.SchemaAdds, m.Name)
 	}
+	// An install never changes which schema file the app loads. The pack's
+	// models are appended to schema.prisma, and a schema.prisma that declares
+	// a model is loaded instead of schema.sql: in an app whose schema is
+	// schema.sql (or schema.yaml) the app's own tables would stop being
+	// declared (schema_file_switch.go). Refused here, before any write,
+	// whatever replace and delete_missing say.
+	if len(pack.SchemaModels) > 0 || packPrismaLoads {
+		current, err := readSchemaFileSet(dir)
+		if err != nil {
+			return plan, fmt.Errorf("read existing schema for install: %w", err)
+		}
+		if msg := featureInstallSchemaSwitch(current, len(pack.SchemaModels) > 0, packPrismaLoads); msg != "" {
+			plan.Collisions = append(plan.Collisions, msg)
+		}
+	}
+	// Nor does a pack's schema.yaml replace a hand-written schema.sql: the
+	// next load would write schema.sql from it (schemaYAMLOverwriteProblem).
+	if body, ok := schemaWrites["schema.yaml"]; ok {
+		current, err := readSchemaFileSet(dir)
+		if err != nil {
+			return plan, fmt.Errorf("read existing schema for install: %w", err)
+		}
+		if msg := schemaYAMLOverwriteProblem(current, body); msg != "" {
+			plan.Collisions = append(plan.Collisions, msg+" Nothing is installed.")
+		}
+	}
+	// An install never makes the app drop data without the consent a pushed
+	// schema.prisma or migrations/ file needs. The pack's schema.prisma takes
+	// the place of the app's, and the app drops the table of every model it
+	// leaves out when it reloads; it also applies every migrations/ file its
+	// ledger lacks. Both are judged by the write gate's own checks against
+	// the instance's database (opts.DataDrops): what would be dropped is
+	// listed in the plan, and blocks it unless allow_table_drop was given. A
+	// file the target already holds unchanged is not the install's doing.
+	if opts.DataDrops != nil {
+		var rels []string
+		migrations := 0
+		for rel, body := range schemaWrites {
+			if rel == "schema.yaml" || featureInstallTargetHolds(dir, rel, body) {
+				continue
+			}
+			if rel != "schema.prisma" {
+				migrations++
+			}
+			rels = append(rels, rel)
+		}
+		sort.Strings(rels)
+		// More migration files than one install has the instance judge
+		// (featureInstallMigrationCheckLimit): none is, and the plan asks
+		// for the consent on that ground.
+		unchecked := migrations > featureInstallMigrationCheckLimit
+		if unchecked {
+			plan.TableDrops = append(plan.TableDrops, fmt.Sprintf("migrations/: %d migration files not checked for data loss (an install checks at most %d)", migrations, featureInstallMigrationCheckLimit))
+			if !opts.AllowTableDrop {
+				plan.Collisions = append(plan.Collisions, fmt.Sprintf("migrations/: the pack adds or changes %d migration files, and an install checks at most %d for data they would drop when the app applies them. Nothing is installed. Push the files first (`benmore push migrations/<file>` checks each one), or install again with allow_table_drop (`--allow-table-drop`) to add them unchecked; a backup is taken before the migrations run.", migrations, featureInstallMigrationCheckLimit))
+			}
+		}
+		for _, rel := range rels {
+			if unchecked && rel != "schema.prisma" {
+				continue
+			}
+			body := schemaWrites[rel]
+			drops := opts.DataDrops(rel, string(body))
+			if len(drops) == 0 {
+				continue
+			}
+			for _, drop := range drops {
+				plan.TableDrops = append(plan.TableDrops, rel+": "+drop)
+			}
+			if !opts.AllowTableDrop {
+				plan.Collisions = append(plan.Collisions, featureInstallDropCollision(rel, drops))
+			}
+		}
+	}
 	if opts.DeleteMissing && deleteMissingAllowed {
 		targetManifest, err := BuildSourceManifest(dir, SourceManifestOptions{})
 		if err != nil {
@@ -185,6 +277,32 @@ func PlanFeatureInstallWithOptions(dir string, pack FeaturePack, files map[strin
 	sortFeaturePackRenames(plan.ModelRenames)
 	plan.Blocked = len(plan.Collisions) > 0 || len(plan.RequiredOptions) > 0
 	return plan, nil
+}
+
+// featureInstallTargetHolds reports whether the target app already holds body
+// at rel, read through the app's root as the regular file it is.
+func featureInstallTargetHolds(dir, rel string, body []byte) bool {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	checked, err := featurePackCheckedPath(root, rel)
+	if err != nil {
+		return false
+	}
+	existing, err := readRegularInRoot(root, checked, int64(len(body)))
+	return err == nil && bytes.Equal(existing, body)
+}
+
+// featureInstallDropCollision is the plan collision for data the app would
+// drop when it reloads with the pack's file at rel, in the words the write
+// gate uses for the same file (schemaWriteDropRefusal).
+func featureInstallDropCollision(rel string, drops []string) string {
+	if rel == "schema.prisma" {
+		return fmt.Sprintf("schema.prisma: the pack's schema.prisma removes the model of a table that still holds data, and the app drops a removed model's table when it reloads: %s. Nothing is installed. To keep the data, keep the model. To drop the table, install again with allow_table_drop (`--allow-table-drop`); a backup is taken before the drop and `benmore restore` can bring it back.", strings.Join(drops, ", "))
+	}
+	return fmt.Sprintf("%s: it drops data this app still holds, and the app applies a new migration file when it reloads: %s. Nothing is installed. To keep the data, take those statements out of the pack's file. To drop it, install again with allow_table_drop (`--allow-table-drop`); a backup is taken before the migration runs and `benmore restore` can bring it back.", rel, strings.Join(drops, ", "))
 }
 
 func featurePackIncludesWholeSourceRoot(files map[string]FeaturePackFile) bool {

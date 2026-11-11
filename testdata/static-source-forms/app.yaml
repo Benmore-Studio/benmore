@@ -1,0 +1,6 @@
+site_name: "static-source-forms fixture"
+# No mcp.yaml: static/ is served from the directory, at /static/<path> and at
+# the URL root (/<path>). Script source and `run: compute` modules are refused
+# at both; compiled output and ordinary assets are served.
+frontend:
+  stack: html

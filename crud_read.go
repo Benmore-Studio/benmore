@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -128,6 +129,21 @@ func crudMaskingProjection(app *App, table, fields string) (string, []string) {
 	return strings.Join(selected, ", "), hidden
 }
 
+// selectListSQL writes a projection (crudSelectFields / crudMaskingProjection:
+// "*" or column names joined with ", ") as a select list. Each name is quoted
+// and qualified with its table, so a column named like an SQL keyword (`order`,
+// `select`) is read as the column.
+func selectListSQL(table, fields string) string {
+	if fields == "*" {
+		return fields
+	}
+	names := strings.Split(fields, ", ")
+	for i, name := range names {
+		names[i] = quoteColumn(table, name)
+	}
+	return strings.Join(names, ", ")
+}
+
 func stripMaskingProjection(rows []map[string]any, hidden []string) {
 	for _, row := range rows {
 		for _, col := range hidden {
@@ -216,7 +232,7 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// Scope enforcement
 	if session != nil {
 		if err := checkScope(session, table, "read"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 	}
@@ -229,10 +245,21 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		return
 	}
 
+	if col, why := encryptedListParamProblem(r, app, table); col != "" {
+		httpJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("%s.%s is encrypted: %s.", table, col, why),
+		})
+		return
+	}
+
 	if col := hiddenListParam(r, app, table); col != "" {
 		httpJSON(w, http.StatusBadRequest, map[string]any{
 			"error": fmt.Sprintf("%s.%s is a hidden column and cannot be filtered or sorted on; the filter would be ignored and return unfiltered rows. Look the row up by another column or a flow.", table, col),
 		})
+		return
+	}
+	if param, col, value := invalidBooleanListParam(r, app, table); param != "" {
+		writeInvalidBooleanFilter(w, table, param, col, value)
 		return
 	}
 	include, err := normalizeIncludeSpec(r.URL.Query().Get("include"))
@@ -243,7 +270,10 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Read audit logging (batched, non-blocking)
 	if IsReadAudited(app, table) {
-		LogReadAccess(app, table, "", "list", session)
+		if err := LogReadAccess(app, r, table, "", "list", session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 
 	// Field selection: ?fields=name,email (default: all). Intersected with
@@ -252,7 +282,8 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// write-backs (M-5).
 	fields := crudSelectFields(r, app, table, "*")
 	fields, hiddenMasking := crudMaskingProjection(app, table, fields)
-	baseSQL := fmt.Sprintf("SELECT %s FROM %s", fields, quoteIdent(table))
+	selectList := selectListSQL(table, fields)
+	baseSQL := fmt.Sprintf("SELECT %s FROM %s", selectList, quoteIdent(table))
 
 	// Soft delete filter: exclude deleted rows if table has deleted_at
 	hasWhere := false
@@ -324,10 +355,16 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// can't break out of the query - but FTS5 has its OWN syntax for
 	// the MATCH expression where `.`, `:`, `*`, `@`, etc. are special.
 	// A raw `alice.garcia@cyberdyne.ai` triggers `fts5: syntax error
-	// near "."` (a real app session). escapeFTS5Query wraps each
-	// whitespace-separated token as a quoted phrase, which makes any
-	// special chars literal while preserving multi-word AND-search.
-	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
+	// near "."` (a real app session). ftsMatchPhrases wraps each word as
+	// a quoted phrase, which makes any special chars literal.
+	//
+	// Every word of the query must match (AND), whatever its length. The
+	// trigram index cannot match a word shorter than three characters, so
+	// those are tested with LIKE and the longer ones with one MATCH. A
+	// query holding any short word used to be matched whole, as one
+	// literal phrase: "third in quarter" found nothing in a row holding
+	// all three words. Control characters separate words (ftsQueryWords).
+	if plan := planFTSQuery(r.URL.Query().Get("q")); !plan.empty() {
 		ftsTable, ftsCols := FTSTableFor(app.Tables, table)
 		// A hidden column in @@fulltext would make ?q= a substring oracle
 		// for a value no response returns (the round-9 filter/sort rule),
@@ -339,11 +376,17 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 			})
 			return
 		}
+		if ftsTable != "" && len(plan.short) > ftsMaxShortWords {
+			httpJSON(w, http.StatusBadRequest, map[string]any{
+				"error": fmt.Sprintf("q holds %d different words shorter than %d characters; one search takes at most %d, because each is matched by its own scan instead of the index. Remove some of the short words.", len(plan.short), ftsTrigramMinRunes, ftsMaxShortWords),
+			})
+			return
+		}
 		if ftsTable != "" {
-			var clause string
-			if ftsTrigramUsable(q) {
+			var conds []string
+			if len(plan.long) > 0 {
 				// Trigram MATCH: indexed substring search (contains).
-				match := escapeFTS5Query(q)
+				match := ftsMatchPhrases(plan.long)
 				if len(searchCols) < len(ftsCols) {
 					match = "{" + strings.Join(searchCols, " ") + "} : (" + match + ")"
 				}
@@ -357,14 +400,18 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 					serverErrorJSON(w, r, app, "search identity", err, "search failed")
 					return
 				}
-				clause = fmt.Sprintf("%s IN (SELECT rowid FROM %s WHERE %s MATCH ?)", quoteColumn(table, rowID), quoteIdent(ftsTable), quoteIdent(ftsTable))
+				conds = append(conds, fmt.Sprintf("%s IN (SELECT rowid FROM %s WHERE %s MATCH ?)", quoteColumn(table, rowID), quoteIdent(ftsTable), quoteIdent(ftsTable)))
 				scopeArgs = append(scopeArgs, match)
-			} else if lc, largs := buildFTSLikeFallback(table, searchCols, q); lc != "" {
-				// Sub-3-char query - trigram can't tokenize it; LIKE fallback.
-				clause = lc
-				scopeArgs = append(scopeArgs, largs...)
 			}
-			if clause != "" {
+			// One LIKE group per word trigram can't tokenize.
+			for _, word := range plan.short {
+				if lc, largs := buildFTSLikeFallback(table, searchCols, word); lc != "" {
+					conds = append(conds, lc)
+					scopeArgs = append(scopeArgs, largs...)
+				}
+			}
+			if len(conds) > 0 {
+				clause := strings.Join(conds, " AND ")
 				if hasWhere {
 					baseSQL += " AND " + clause
 				} else {
@@ -379,16 +426,20 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
 		cols, _ := crudTableColumns(r, app, table)
 		colAllowlist := listColumnAllowlist(app, table, cols)
+		// A cursor page is always ordered by id, so any sort parameter is
+		// unapplied.
+		setIgnoredListParamsHeader(w, r, colAllowlist, append(listSortParamsPresent(r), ignoredIncludeEntries(app, table, include)...)...)
 		// Apply the same filters as offset/count before adding the keyset.
 		cursorSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, session, colAllowlist)
 		cursorArgs := append(append([]any{}, scopeArgs...), whereArgs...)
 		hiddenID := fields != "*" && !slices.Contains(strings.Split(fields, ", "), "id")
 		if hiddenID {
-			cursorSQL = strings.Replace(cursorSQL, "SELECT "+fields+" FROM ", "SELECT "+fields+", id FROM ", 1)
+			cursorSQL = strings.Replace(cursorSQL, "SELECT "+selectList+" FROM ", "SELECT "+selectList+", id FROM ", 1)
 		}
 		limit := queryInt(r, "limit", 20)
-		if limit > 500 {
-			limit = 500
+		if limit > listPageMax {
+			limit = listPageMax
+			w.Header().Set(listLimitCappedHeader, strconv.Itoa(listPageMax))
 		}
 		if strings.Contains(cursorSQL, " WHERE ") {
 			cursorSQL += " AND id > ?"
@@ -404,7 +455,10 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		}
 		// Relationship includes on cursor-paginated results
 		if include != "" {
-			ResolveIncludes(app, table, rows, include, session)
+			if err := ResolveIncludes(app, r, table, rows, include, session); err != nil {
+				readAuditRefused(w, r, app, table, err)
+				return
+			}
 		}
 		// Mask encrypted columns on the PRIMARY rows, same as the offset-
 		// pagination path below. The keyset (cursor) branch returns early with
@@ -433,6 +487,14 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// Apply filtering, sorting, pagination from query params
 	cols, _ := crudTableColumns(r, app, table)
 	colAllowlist := listColumnAllowlist(app, table, cols)
+	countOnly := isTruthyQuery(r, "count") || isTruthyQuery(r, "count_only")
+	if countOnly {
+		// A count applies no sort and no include; only filters are reported.
+		setIgnoredListParamsHeader(w, r, colAllowlist)
+	} else {
+		unapplied := resolveAPIListSort(r, table, app, session, colAllowlist).ignored
+		setIgnoredListParamsHeader(w, r, colAllowlist, append(unapplied, ignoredIncludeEntries(app, table, include)...)...)
+	}
 
 	// `?count=true` (alias: `?count_only=true`) short-circuits the row
 	// fetch and returns just `{count: N}` - the true total of rows that
@@ -444,7 +506,7 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	// in one round-trip without re-deriving via a custom flow. WHERE
 	// filters (`?where[col]=val`, `?col__op=val`, `?q=…`) ARE honored
 	// - pass them to count a filtered subset.
-	if isTruthyQuery(r, "count") || isTruthyQuery(r, "count_only") {
+	if countOnly {
 		whereSQL, whereArgs := applyAPIWhereWithApp(baseSQL, r, table, app, session, colAllowlist)
 		countSQL := "SELECT COUNT(*) FROM (" + whereSQL + ")"
 		countArgs := append(scopeArgs, whereArgs...)
@@ -462,6 +524,9 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
 		return
 	}
+	if offsetListLimitCapped(r) {
+		w.Header().Set(listLimitCappedHeader, strconv.Itoa(listPageMax))
+	}
 	sql, filterArgs := applyAPIFiltersWithApp(baseSQL, r, table, app, session, colAllowlist)
 	allArgs := append(scopeArgs, filterArgs...)
 
@@ -473,7 +538,10 @@ func handleList(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Relationship includes: ?include=contact,tasks (batched, no N+1)
 	if include != "" {
-		ResolveIncludes(app, table, rows, include, session)
+		if err := ResolveIncludes(app, r, table, rows, include, session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 
 	// Mask encrypted fields for unauthorized roles (v2.7.58+: pass
@@ -565,7 +633,7 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		return
 	}
 	if !rowIDCanonical(app, table, id) {
-		http.NotFound(w, r)
+		httpError(w, "Not found", http.StatusNotFound) // a missing row's answer, not Go's text 404
 		return
 	}
 	include, err := normalizeIncludeSpec(r.URL.Query().Get("include"))
@@ -582,7 +650,7 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		}
 		if session != nil {
 			if err := checkScope(session, table, "read"); err != nil {
-				httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 				return
 			}
 		}
@@ -603,7 +671,10 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		// audited table records it (this branch returns before the live
 		// read's LogReadAccess below).
 		if IsReadAudited(app, table) {
-			LogReadAccess(app, table, id, "as_of", session)
+			if err := LogReadAccess(app, r, table, id, "as_of", session); err != nil {
+				readAuditRefused(w, r, app, table, err)
+				return
+			}
 		}
 		// Mask encrypted columns exactly as the live read path below does
 		// (v2.7 parity). The point-in-time row is either a decrypted history
@@ -611,18 +682,24 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 		// READ the row but is NOT in the column's unmask_roles would get the
 		// plaintext through `?as_of=` that a plain GET masks.
 		sanitizeResponseRows(app, table, []map[string]any{row}, session)
+		// ?fields= as on the live read, applied after masking ran on the
+		// whole row (it was ignored here).
+		projectResponseRows([]map[string]any{row}, crudSelectFields(r, app, table, "*"))
+		// A snapshot is not expanded: ?include= is named as unapplied.
+		setIgnoredParamsHeader(w, allIncludeEntries(include))
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(row)
 		return
 	}
 
-	// SECURITY: enforce scoping on reads
-	fields := "*"
-	if _, private := r.Context().Value(appMCPPrivateKey{}).(*appMCPPrivateRead); private {
-		fields = crudSelectFields(r, app, table, "*")
-	}
+	// Field selection: ?fields=name,email, resolved exactly as handleList
+	// does (schema allowlist, hidden columns dropped, nothing projectable
+	// falls back to every column). Only connector reads applied it before,
+	// so a browser asking for two columns got the whole row.
+	fields := crudSelectFields(r, app, table, "*")
 	fields, hiddenMasking := crudMaskingProjection(app, table, fields)
-	readSQL := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", fields, quoteIdent(table))
+	// SECURITY: enforce scoping on reads
+	readSQL := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", selectListSQL(table, fields), quoteIdent(table))
 	readArgs := []any{id}
 	// Soft delete filter
 	if hasColumn(app, table, "deleted_at") {
@@ -634,13 +711,16 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	}
 	if session != nil {
 		if err := checkScope(session, table, "read"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 	}
 	// Read audit logging (batched, non-blocking)
 	if IsReadAudited(app, table) {
-		LogReadAccess(app, table, id, "read", session)
+		if err := LogReadAccess(app, r, table, id, "read", session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 	// Same row filter handleList applies, so a row the list shows can be
 	// fetched by id and nothing else can: `anon`/`everyone` read modes
@@ -665,7 +745,10 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 
 	// Relationship includes: ?include=contact,tasks
 	if include != "" {
-		ResolveIncludes(app, table, rows, include, session)
+		if err := ResolveIncludes(app, r, table, rows, include, session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 
 	// Mask encrypted fields for unauthorized roles (v2.7.58+:
@@ -673,6 +756,29 @@ func handleRead(w http.ResponseWriter, r *http.Request, app *App, table string) 
 	sanitizeResponseRows(app, table, rows, session)
 	stripMaskingProjection(rows, hiddenMasking)
 
+	setIgnoredParamsHeader(w, ignoredIncludeEntries(app, table, include))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rows[0])
+}
+
+// projectResponseRows keeps only the columns of a ?fields= projection (a
+// crudSelectFields result) in rows that were read whole: a history snapshot
+// carries the history table's columns, so the projection cannot be the
+// SELECT list. It runs after sanitizeResponseRows, so masking saw the
+// row's own owner and tenant. "*" keeps every column.
+func projectResponseRows(rows []map[string]any, fields string) {
+	if fields == "*" {
+		return
+	}
+	keep := map[string]bool{}
+	for _, f := range strings.Split(fields, ", ") {
+		keep[f] = true
+	}
+	for _, row := range rows {
+		for k := range row {
+			if !keep[k] {
+				delete(row, k)
+			}
+		}
+	}
 }

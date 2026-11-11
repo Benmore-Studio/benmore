@@ -1,0 +1,13 @@
+---
+engine: gotmpl
+layout: none
+title: Viewer
+---
+<p id="plain">[{{.current_user}}]</p>
+<p id="v">[{{printf "%v" .current_user}}]</p>
+<p id="plusv">[{{printf "%+v" .current_user}}]</p>
+<p id="s">[{{printf "%s" .current_user}}]</p>
+<p id="tostring">[{{toString .current_user}}]</p>
+<p id="attr" title="{{.current_user}}">attr</p>
+<p id="if">[{{if .current_user}}IF-IN{{else}}IF-OUT{{end}}]</p>
+<p id="with">[{{with .current_user}}WITH-IN{{else}}WITH-OUT{{end}}]</p>

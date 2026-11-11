@@ -125,6 +125,32 @@ func TestRecipe_BearerToken(t *testing.T) {
 	}
 }
 
+// `prefix: ""` sends the raw token, as the recipe documents (Anthropic-style
+// `x-api-key`). The empty prefix used to be replaced by the default, so the
+// header carried "Bearer <token>". An omitted prefix keeps the default.
+func TestRecipe_BearerTokenEmptyPrefixSendsRawToken(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sign   map[string]any
+		header string
+		want   string
+	}{
+		{"empty prefix", map[string]any{"recipe": "bearer_token", "token": "tok_raw", "header": "X-Api-Key", "prefix": ""}, "X-Api-Key", "tok_raw"},
+		{"omitted prefix", map[string]any{"recipe": "bearer_token", "token": "tok_raw", "header": "X-Api-Key"}, "X-Api-Key", "Bearer tok_raw"},
+		{"custom prefix", map[string]any{"recipe": "bearer_token", "token": "tok_raw", "prefix": "Token "}, "Authorization", "Token tok_raw"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "https://api.example.com/v1/foo", nil)
+			if err := applySigner(req, nil, withToSign(tc.sign), nil); err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			if got := req.Header.Get(tc.header); got != tc.want {
+				t.Fatalf("%s = %q, want %q", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
 // Required pipe surfaces a friendly error when env is missing - catches
 // the case where a YAML typo silently produces a 403 from upstream.
 func TestRecipe_MissingCredentialsFailLoudly(t *testing.T) {

@@ -1,0 +1,1 @@
+A reload (a push while an import runs) can cancel the import; cancellation remains terminal and rolls back that file's pending rows. A cancelled import is not resumed.

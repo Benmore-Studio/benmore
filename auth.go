@@ -22,8 +22,8 @@ import (
 var serverSecret string
 
 func init() {
-	// Prefer a stable env-provided secret so CSRF tokens, signed URLs,
-	// and edge-auth tokens survive process restarts and (more importantly)
+	// Prefer a stable env-provided secret so CSRF tokens and signed URLs
+	// survive process restarts and (more importantly)
 	// validate consistently across cluster instances. Falls back to a
 	// random per-process value when the env var is missing - convenient
 	// for single-instance dev, but a noisy warning lands so production
@@ -44,7 +44,7 @@ func init() {
 		// parse. Keep the legacy BENMORE_SUPPRESS_SECRET_WARN escape
 		// hatch so existing systemd drop-ins still work.
 		if os.Getenv("BENMORE_SUPPRESS_SECRET_WARN") == "" && needsStableSecret(os.Args) {
-			log.Printf("WARN: BENMORE_SERVER_SECRET not set (or <32 chars); using ephemeral per-process value. CSRF/signed-URL/edge tokens will not survive restart and will fail across cluster instances. Set BENMORE_SERVER_SECRET to a 32+ char random string.")
+			log.Printf("WARN: BENMORE_SERVER_SECRET not set (or <32 chars); using ephemeral per-process value. CSRF tokens and signed URLs will not survive restart and will fail across cluster instances. Set BENMORE_SERVER_SECRET to a 32+ char random string.")
 		}
 	}
 }
@@ -101,8 +101,13 @@ func RegisterAuthRoutes(mux appRouteRegistrar, app *App) {
 	// Apply configurable session duration from app.yaml - stored per-app, not global
 	app.SessionDuration = defaultSessionDuration
 	if app.Design != nil {
-		if dur := app.Design.Auth["session_duration"]; dur != "" {
-			app.SessionDuration = ParseSessionDuration(dur)
+		// A value that is not an accepted form is logged, never refused: apps
+		// carrying one loaded before the check existed. The write gate and
+		// `benmore check` refuse it (sessionDurationSetting).
+		var problem string
+		app.SessionDuration, problem = sessionDurationSetting(app.Design.Auth["session_duration"])
+		if problem != "" {
+			log.Printf("  WARNING: app.yaml: %s", problem)
 		}
 	}
 
@@ -248,8 +253,19 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
 			return
 		}
-		app.DB.Exec("DELETE FROM _benmore_sessions WHERE id = ? AND user_id = ?", realID, session.UserID)
+		// The answer is what the DELETE did: it used to be "revoked" for a
+		// write that failed and for one that removed nothing.
+		res, err := app.DB.Exec("DELETE FROM _benmore_sessions WHERE id = ? AND user_id = ?", realID, session.UserID)
+		if err != nil {
+			serverErrorJSON(w, r, app, "sessions", err, "revoke failed")
+			return
+		}
 		invalidateRequestSession(r) // the revoked session may be this one
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			// Listed a moment ago, gone now: it ended some other way.
+			httpJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+			return
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": "revoked"})
 	})
 
@@ -257,8 +273,11 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_auth/impersonate", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		// The result is a full-access session as someone else, so a scoped
-		// credential can't start it (same rule as role grants).
-		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+		// credential can't start it (same rule as role grants). The
+		// credential's own scopes decide (IsAdminConsole), not the
+		// role-derived session scopes: a roles: block that declares admin
+		// with narrow scopes narrows those for the app's own admin.
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
@@ -317,6 +336,13 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				adminSessionID = session.ID
 			}
 		}
+		// The session this one is started from, cookie or Bearer: the
+		// support session ends when it does (supportSessionStarterLive). An
+		// API token is not a session row and names none.
+		startedBy := ""
+		if isSessionStorageKey(session.ID) {
+			startedBy = session.ID
+		}
 
 		// Create impersonation session with 1-hour TTL (shorter than normal sessions)
 		groupID := ResolveGroupID(app.DB, app.Group, email)
@@ -338,8 +364,21 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			serverErrorJSON(w, r, app, "impersonation", errors.New("the impersonation session could not be created"), "could not start impersonation")
 			return
 		}
-		if _, err := app.DB.Exec("UPDATE _benmore_sessions SET is_impersonation = 1, impersonator_session_id = ?, impersonator_user_id = ?, impersonator_email = ? WHERE id = ?",
-			adminSessionID, session.UserID, session.Email, sessionStorageKey(impersonatedSessionID)); err != nil {
+		if _, err := app.DB.Exec("UPDATE _benmore_sessions SET is_impersonation = 1, impersonator_session_id = ?, impersonator_user_id = ?, impersonator_email = ?, started_by_session_id = ? WHERE id = ?",
+			adminSessionID, session.UserID, session.Email, startedBy, sessionStorageKey(impersonatedSessionID)); err != nil {
+			DeleteSessionFromDB(app.DB, impersonatedSessionID)
+			serverErrorJSON(w, r, app, "impersonation", err, "could not start impersonation")
+			return
+		}
+		// An UPDATE that matches no row is not an error, so read the marker
+		// back: a session row that does not carry it (and the admin's id) is
+		// deleted, never handed out as an ordinary session as the target.
+		var marked int
+		if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id = ? AND is_impersonation = 1 AND impersonator_user_id = ?",
+			sessionStorageKey(impersonatedSessionID), session.UserID).Scan(&marked); err != nil || marked != 1 {
+			if err == nil {
+				err = errors.New("the impersonation session row does not carry its marker")
+			}
 			DeleteSessionFromDB(app.DB, impersonatedSessionID)
 			serverErrorJSON(w, r, app, "impersonation", err, "could not start impersonation")
 			return
@@ -350,19 +389,11 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 		LogAudit(app, "impersonate", "_benmore_users", fmt.Sprintf("%d", body.UserID),
 			session, nil, map[string]any{"impersonated_by": session.Email, "target_user": email})
 
-		// Set the impersonation session cookie server-side (replaces admin session).
-		// Use protoOf(r) so the Secure flag tracks the public-facing scheme - behind
-		// a TLS-terminating proxy r.TLS is always nil even when the user's transport
-		// is https. See issue #18.
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieNameFor(protoOf(r) == "https"),
-			Value:    impersonatedSessionID,
-			Path:     "/",
-			MaxAge:   3600, // 1 hour
-			HttpOnly: true,
-			Secure:   protoOf(r) == "https",
-			SameSite: http.SameSiteLaxMode,
-		})
+		// Set the impersonation session cookie server-side (replaces admin
+		// session), under the name sign-in used: named by the request's
+		// scheme it landed next to the admin's cookie on plain HTTP in
+		// production mode, and the browser stayed the admin.
+		replaceSessionCookie(w, app, impersonatedSessionID, impersonationDuration)
 
 		// NOTE: the originating admin session id is NOT returned. end-impersonation
 		// restores it server-side from impersonator_session_id on the impersonation
@@ -395,20 +426,30 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
 			return
 		}
-		cookieKey, ok := presentedSessionKey(cookie.Value)
-		if !ok {
+		// The support cookie must be a live credential the way any session
+		// cookie is: an expired or idle one (auth.idle_timeout), or one whose
+		// admin or starting session is gone, ends nothing and restores
+		// nothing. Its row just awaits cleanup.
+		var impersonationID string
+		if support := getAppSession(app, r, cookie.Value); support != nil {
+			impersonationID = support.ID
+		} else if id, ok := supportSessionOfBlockedCustomer(app, cookie.Value); ok {
+			// The customer was deactivated or sent to a password change
+			// while the support session ran, which stops the session
+			// resolving. It still ends, and the admin's own session is
+			// restored under every check below; otherwise the admin was
+			// left holding a dead cookie.
+			impersonationID = id
+		} else {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
 			return
 		}
-		var impersonationID string
-		var isImpersonation int
 		var impersonatorSessionID string
 		app.DB.QueryRow(
-			// An expired impersonation ends nothing; its row just awaits cleanup.
-			"SELECT id, COALESCE(is_impersonation, 0), COALESCE(impersonator_session_id, '') FROM _benmore_sessions WHERE id IN (?, ?) AND datetime(expires_at) > datetime('now')",
-			cookieKey, cookie.Value,
-		).Scan(&impersonationID, &isImpersonation, &impersonatorSessionID)
-		if isImpersonation != 1 || impersonatorSessionID == "" {
+			"SELECT COALESCE(impersonator_session_id, '') FROM _benmore_sessions WHERE id = ? AND COALESCE(is_impersonation, 0) = 1",
+			impersonationID,
+		).Scan(&impersonatorSessionID)
+		if impersonatorSessionID == "" {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not in an impersonation session"})
 			return
 		}
@@ -445,21 +486,21 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusConflict, map[string]any{"error": "originating admin session is no longer valid - please log in again"})
 			return
 		}
+		// The admin was at work in the support session, which no request
+		// counted on their own row: under auth.idle_timeout the restored
+		// session would be idle on its first request. The live support
+		// session checked above is the activity; an idle one never gets here.
+		if _, err := tx.Exec("UPDATE _benmore_sessions SET last_seen_at = ? WHERE id = ?", time.Now().Unix(), sessionStorageKey(restoredToken)); err != nil {
+			serverErrorJSON(w, r, app, "impersonation", err, "could not end impersonation")
+			return
+		}
 		if err := tx.Commit(); err != nil {
 			serverErrorJSON(w, r, app, "impersonation", err, "could not end impersonation")
 			return
 		}
 		invalidateRequestSession(r) // this request's session row is gone
-		// Restore admin session cookie (see #18 - protoOf for proxy-correct Secure flag).
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieNameFor(protoOf(r) == "https"),
-			Value:    restoredToken,
-			Path:     "/",
-			MaxAge:   int(app.SessionDuration.Seconds()),
-			HttpOnly: true,
-			Secure:   protoOf(r) == "https",
-			SameSite: http.SameSiteLaxMode,
-		})
+		// Restore the admin session cookie, under the name sign-in used.
+		replaceSessionCookie(w, app, restoredToken, app.SessionDuration)
 		httpJSON(w, http.StatusOK, map[string]any{"status": "restored", "email": adminSession.Email})
 	})
 
@@ -553,8 +594,8 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				httpJSON(w, http.StatusNotFound, map[string]any{"error": "no tenant with that group_id"})
 				return
 			}
-			// Step-in lives on the session row. An API token or edge identity
-			// has none, so the UPDATE matches nothing: answering "acting_as"
+			// Step-in lives on the session row. An API token has none, so
+			// the UPDATE matches nothing: answering "acting_as"
 			// then left the caller with its cross-tenant bypass while it
 			// believed it was scoped to one tenant.
 			res, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = ? WHERE id = ?", target, session.ID)
@@ -563,7 +604,7 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				return
 			}
 			if n, err := res.RowsAffected(); err != nil || n != 1 {
-				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "step-in needs a sign-in session: an API token or edge identity can't hold it (sign in, or exchange the password at POST /api/_auth/token for a session token)"})
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "step-in needs a sign-in session: an API token can't hold it (sign in, or exchange the password at POST /api/_auth/token for a session token)"})
 				return
 			}
 			invalidateRequestSession(r)
@@ -607,8 +648,21 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				return
 			}
 			prev := session.ActingAsGroup
-			app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = '' WHERE id = ?", session.ID)
+			// The audit row and "cleared" follow the UPDATE's result: they
+			// used to be written for a failed write, leaving a session that
+			// was told it had left the tenant still scoped to it.
+			res, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = '' WHERE id = ?", session.ID)
+			if err != nil {
+				serverErrorJSON(w, r, app, "act_as", err, "failed to clear act_as")
+				return
+			}
 			invalidateRequestSession(r)
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				// No row: the session ended after this request resolved it,
+				// so there is no step-in left to end and nobody signed in.
+				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+				return
+			}
 			log.Printf("act_as: user_id=%d exited group_id=%s", session.UserID, prev)
 			LogAudit(app, "act_as_end", "_benmore_sessions", session.ID, session, nil,
 				map[string]any{"prior_group_id": prev, "user_email": session.Email})
@@ -677,3 +731,31 @@ func NeedsAuth(app *App) bool {
 
 // Ensure imports are used
 var _ = sql.ErrNoRows
+
+// supportSessionOfBlockedCustomer is the stored id of the unexpired support
+// (impersonation) session the cookie names when only its customer's state
+// keeps it from resolving: the customer is deactivated or must change their
+// password. End-impersonation then still ends it; the admin and starting
+// session checks that follow are unchanged.
+func supportSessionOfBlockedCustomer(app *App, cookieValue string) (string, bool) {
+	key, ok := presentedSessionKey(cookieValue)
+	if !ok {
+		return "", false
+	}
+	var id string
+	err := app.DB.QueryRow(`SELECT s.id FROM _benmore_sessions s JOIN _benmore_users u ON u.id = s.user_id
+		WHERE s.id = ? AND COALESCE(s.is_impersonation, 0) = 1 AND datetime(s.expires_at) > datetime('now')
+		  AND (COALESCE(u.deactivated_at, '') <> '' OR COALESCE(u.password_change_required, 0) = 1)`, key).Scan(&id)
+	if err != nil || id == "" {
+		return "", false
+	}
+	// auth.idle_timeout holds here as for any session: an idle support
+	// cookie is never traded for the admin's session.
+	if timeout := idleTimeoutFor(app); timeout > 0 {
+		last, err := sessionIdleLast(app.DB, "_benmore_sessions", id)
+		if err != nil || time.Now().Unix()-last > int64(timeout.Seconds()) {
+			return "", false
+		}
+	}
+	return id, true
+}

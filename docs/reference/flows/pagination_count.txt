@@ -1,0 +1,1 @@
+API pagination pages_fetched counts successful HTTP page responses, including an empty terminal page; it is independent of item count and bounded by max_pages.

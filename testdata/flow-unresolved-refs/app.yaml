@@ -1,0 +1,5 @@
+site_name: "Flow unresolved refs"
+auth:
+  identifier: email
+frontend:
+  stack: html

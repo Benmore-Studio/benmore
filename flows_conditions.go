@@ -5,7 +5,6 @@ package main
 // Flow condition evaluation and literal comparisons.
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 )
@@ -52,16 +51,38 @@ func evaluateFlowCondition(condition string, ctx *FlowContext) bool {
 		if strings.Contains(lhs, "&&") || conditionHasConnective(rhs) {
 			return false
 		}
+		// The references of each side are read from the author's text and
+		// resolved before anything is rendered, so "this side has no value"
+		// never depends on what a value looks like. A side with no value was
+		// compared as the reference's own text (`{{t.token}}`), which a
+		// caller could send (flows_condition_unresolved.go). Both sides are
+		// still rendered as before, which records the missing reference for
+		// the step's own check.
+		_, rightMissing, rightRequest := condTemplateRefs(rhs, row)
 		rhs = strings.Trim(interpolateCtx(rhs, ctx), `"'`)
 		if conditionLHSNeedsResolution(lhs) {
 			expr := lhs
 			if !strings.Contains(expr, "{{") {
 				expr = "{{" + expr + "}}"
 			}
-			return compareLiteralCondition(interpolateCtx(expr, ctx), op, rhs)
+			_, leftMissing, _ := condTemplateRefs(expr, row)
+			left := interpolateCtx(expr, ctx)
+			if leftMissing || rightMissing {
+				return condNoValue(op)
+			}
+			return compareLiteralCondition(left, op, rhs)
 		}
 		if !conditionFieldName(lhs) {
 			return false
+		}
+		if rightMissing {
+			return condNoValue(op)
+		}
+		// A missing value on the left compares as empty, except a value of
+		// the flow's own against a request field read with no fallback: an
+		// empty or omitted token must not match a row that does not exist.
+		if _, found := flowLookup(row, lhs); !found && rightRequest && !flowRefReadsRequest(lhs, "", row) {
+			return condNoValue(op)
 		}
 		return compareLiteralCondition(conditionRowValue(row, lhs), op, rhs)
 	}
@@ -126,7 +147,7 @@ func isTruthyCondition(v any) bool {
 	case map[string]any:
 		return len(t) > 0
 	}
-	s := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
+	s := strings.ToLower(strings.TrimSpace(valueText(v)))
 	switch s {
 	// includes the stringified empty-collection forms ("[]", "map[]", "{}")
 	// so `if: ${{ steps.x.outputs.rows }}` is FALSE on an empty result.
@@ -249,7 +270,7 @@ func conditionRowValue(row map[string]any, field string) string {
 	if !ok || v == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", v)
+	return valueText(v)
 }
 
 // conditionLHSNeedsResolution returns true when the LHS of a flow

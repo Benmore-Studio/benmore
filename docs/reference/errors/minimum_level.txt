@@ -1,0 +1,1 @@
+SENTRY_MIN_LEVEL accepts error (default) or warning. Fatal/error forward by default; warnings always store locally and forward only with warning configured. SENTRY_DSN accepts HTTPS public-network hosts only and is validated at env-set as well as delivery; benmore check warns about stored invalid values. Invalid settings never include a DSN key in the error message.

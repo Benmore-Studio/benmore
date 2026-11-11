@@ -66,7 +66,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // FlowFileGHA is the top-level shape of the new flows.yaml.
@@ -95,7 +95,8 @@ type FlowTriggerGHA struct {
 // FlowScheduleTrigger fires on a cron schedule. Same parser the legacy
 // `trigger: cron <expr>` shape used.
 type FlowScheduleTrigger struct {
-	Cron string `yaml:"cron"`
+	Cron        string `yaml:"cron"`
+	Transaction bool   `yaml:"transaction"`
 }
 
 // FlowEventTrigger fires when a row mutates. `table` + one of
@@ -137,17 +138,27 @@ type FlowRequestTrigger struct {
 	// the flow inline on the request goroutine. "async" enqueues the
 	// flow onto the background worker and returns {job_id, status_url}
 	// immediately - required when carrier fan-outs / report generation
-	// push wall time past Cloudflare's 30s edge timeout.
+	// push wall time past a synchronous flow's time limit (Timeout below).
 	Mode string `yaml:"mode"`
+	// MaxAttempts is how many runs a queued job of this flow may take in
+	// all (its `mode: async` jobs and `run: enqueue` jobs naming it), 1 to
+	// flowJobMaxAttemptsCap; absent means one run. A run is repeated from
+	// step 1 only after a failure a later run can change. See
+	// flows_job_attempts.go.
+	MaxAttempts *int `yaml:"max_attempts"`
 	// RateLimit caps invocation frequency, e.g. "5/hour per ip". See
 	// flows_ratelimit.go / api(at:'flows').
 	RateLimit string `yaml:"rate_limit"`
+	// Timeout is a synchronous flow's time limit: a Go duration or whole
+	// seconds (default 30s, at most 95s hosted). See flows_time_limit.go.
+	Timeout string `yaml:"timeout"`
 	// Inputs optionally declares the flow's expected inputs - a typed
 	// signature, keyed by input name. Values are checked before execution;
 	// path/query/body binding is unchanged. Declaring them lets the
 	// frontend derive a form - bm.flows.<name>() gets a typed body and
 	// the FlowForm component renders controls from this. See FlowInput.
-	Inputs map[string]FlowInput `yaml:"inputs"`
+	Inputs   map[string]FlowInput `yaml:"inputs"`
+	Contract yaml.Node            `yaml:"contract"`
 }
 
 // FlowInput is one declared input on a request-triggered flow. The
@@ -164,9 +175,10 @@ type FlowInput struct {
 	Max      *float64 `yaml:"max" json:"max,omitempty"`
 }
 
-// FlowJobGHA holds the linear step list. Multiple jobs are allowed but
-// they currently execute in series (no parallelism); we use the map
-// shape to keep the GHA familiarity intact for the agent.
+// FlowJobGHA holds the linear step list. Each job unrolls to its own Flow
+// on the file's trigger, so several jobs on one request trigger share a
+// route and only one can register (route_collisions.go refuses that); we
+// use the map shape to keep the GHA familiarity intact for the agent.
 type FlowJobGHA struct {
 	Steps []FlowStepGHA `yaml:"steps"`
 }
@@ -382,6 +394,11 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	for _, problem := range flowTriggerProblems(file) {
 		log.Printf("WARNING: %s: %s", path, problem)
 	}
+	// A step id that is an identity name: accepted with a warning at write
+	// time; the caller's values win over its outputs.
+	for _, problem := range ghaIdentityStepIDWarnings(string(data)) {
+		log.Printf("WARNING: %s: %s", path, problem)
+	}
 	// Also refused at write time. A deployed file still loads, and the log
 	// names each expect_rows that is not the assertion its author wrote.
 	for _, problem := range flowExpectRowsProblems(string(data), file) {
@@ -395,15 +412,27 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	}
 	// Step values that cannot be sent as written (a refused response
 	// header, two bodies): refused at write time, dropped here with a log.
-	for _, problem := range flowStepValueProblems(file) {
+	// A send inside a `transaction: true` flow is logged the same way: it
+	// still runs, and is a warning at write time.
+	valueProblems, transactionalSends := flowStepValueFindings(file)
+	for _, problem := range append(valueProblems, transactionalSends...) {
 		log.Printf("WARNING: %s: %s", path, problem)
+	}
+	// Bounds declared on an input that is not a number are not checked: a
+	// warning at write time, since deployed files carry them.
+	if file.On.Request != nil {
+		for _, problem := range flowInputBoundsProblems(file.On.Request.Inputs) {
+			log.Printf("WARNING: %s: %s", path, problem)
+		}
 	}
 	// Build the FlowTrigger from whichever `on:` shape was set.
 	var trigger FlowTrigger
 	var verify, secret, auth, role string
 	var permissions []string
 	var transaction, async bool
+	maxAttempts := 1
 	var rateLimit *FlowRateLimit
+	var timeout time.Duration
 	var verifyConfig *FlowVerify
 	switch {
 	case file.On.Request != nil:
@@ -412,6 +441,12 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 			Method: strings.ToUpper(file.On.Request.Method),
 			Path:   file.On.Request.Path,
 			Inputs: file.On.Request.Inputs,
+		}
+		// A bad contract is refused at write time and logged above
+		// (flowTriggerProblems); at load it only drops the description,
+		// never the app's other flows.
+		if contract, err := parseFlowOpenAPIContract(file.On.Request); err == nil {
+			trigger.Contract = contract
 		}
 		strictJSON, err := flowStrictJSONFlag(file.On.Request.StrictJSON)
 		if err != nil {
@@ -441,6 +476,17 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 		permissions = file.On.Request.Permissions
 		async = strings.EqualFold(strings.TrimSpace(file.On.Request.Mode), "async")
 		rateLimit = parseRateLimit(file.On.Request.RateLimit)
+		maxAttempts = flowLoadedMaxAttempts(file.On.Request.MaxAttempts, path)
+		// Refused at write time when unreadable or out of range; a deployed
+		// file keeps the default limit (or the maximum) and logs it.
+		if d, err := parseFlowRequestTimeout(file.On.Request.Timeout); err != nil {
+			log.Printf("WARNING: %s: on.request.timeout %q: %s; using the default %s", path, file.On.Request.Timeout, err, flowTimeoutDefault)
+		} else {
+			timeout = d
+			if max := flowRequestTimeoutMax(); d > max {
+				log.Printf("WARNING: %s: on.request.timeout %s is over the maximum %s; the flow runs with %s", path, d, max, max)
+			}
+		}
 		if verifyConfig != nil {
 			if err := validateFlowVerifyConfig(verifyConfig, trigger.Path); err != nil {
 				return nil, fmt.Errorf("%s: invalid verify config: %w", path, err)
@@ -448,6 +494,7 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 		}
 	case file.On.Schedule != nil:
 		trigger = FlowTrigger{Type: "cron", Cron: file.On.Schedule.Cron}
+		transaction = file.On.Schedule.Transaction
 	case file.On.Event != nil:
 		op := strings.ToLower(file.On.Event.Op)
 		if op != "insert" && op != "update" && op != "delete" {
@@ -485,7 +532,9 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 			Permissions:  permissions,
 			Async:        async,
 			Idempotent:   file.Idempotent,
+			MaxAttempts:  maxAttempts,
 			RateLimit:    rateLimit,
+			Timeout:      timeout,
 			Steps:        convertGHASteps(job.Steps),
 		}
 		if flowRequestSignedIn(file.On.Request) {
@@ -504,6 +553,11 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 // explicit opt-out now requires sign-in, the same rule pages follow
 // (normalizePageAuth).
 func normalizeFlowAuth(auth, where string) string {
+	// `auth: optional` (flows only): a signed-in caller gets the full
+	// identity of an auth-required flow, an anonymous one is let through.
+	if strings.EqualFold(strings.TrimSpace(auth), "optional") {
+		return "optional"
+	}
 	norm, known := canonicalAuthValue(auth)
 	if !known {
 		log.Printf("WARNING flow %s: unknown auth=%q; treating it as auth: required", where, auth)
@@ -601,9 +655,11 @@ var flowRunTypes = map[string]bool{
 	"webhook": true, "enqueue": true, "redirect": true, "respond": true, "parse": true, "set": true,
 	"parallel": true, "compute": true, "if": true, "for_each": true,
 	"serve_file": true, "delete_upload": true, "purge_current_user": true, "transcribe": true,
-	"inspect_private_upload": true, "render_pdf_signatures": true,
+	"inspect_private_upload": true, "render_pdf_signatures": true, "extract_text": true,
 	"revoke_user_sessions": true,
 	"broadcast":            true,
+	"notify":               true,
+	"proxy":                true,
 }
 
 // ghaStepRunType is the step type a GHA step resolves to. Shorthand shapes:
@@ -679,7 +735,10 @@ func ghaStepExpectRows(s FlowStepGHA) (expr, conflict string) {
 func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 	var out []FlowStep
 	for _, s := range steps {
-		fs := FlowStep{Name: s.ID}
+		// An id that is one of the runtime's identity names (`id: user`)
+		// stores its outputs under a key of its own, so the step cannot take
+		// the place of the signed-in caller (flows_step_identity_ids.go).
+		fs := FlowStep{Name: flowStepOutputKey(s.ID)}
 
 		// Determine the step type (shorthand shapes: ghaStepRunType).
 		runType := ghaStepRunType(s)
@@ -794,10 +853,33 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			if n, ok := s.With["filename"].(string); ok {
 				fs.ServeFile.Filename = normalizeGHARefs(n)
 			}
+			// An invalid value is refused at write time and logged at load
+			// (serveFileValueProblems); the step keeps the default lifetime.
+			if v, ok := s.With["expires_in"]; ok {
+				if d, err := parseSignedLinkLifetime(v); err == nil {
+					fs.ServeFile.ExpiresIn = d
+				}
+			}
+			if v, ok := s.With["record"]; ok {
+				fs.UploadRecord = ghaUploadRecord(v)
+			}
+		case "proxy":
+			// `run: proxy` - stream an outside service's answer to the caller
+			// (flows_proxy.go). Values keep their normalized `${{ }}` refs;
+			// with.timeout caps the call like an api step's, and a step-level
+			// `timeout:` (mapped after the switch) wins.
+			fs.Type = "proxy"
+			fs.Proxy = withToProxy(s.With)
+			if d := withDuration(s.With, "timeout"); d > 0 {
+				fs.Timeout = d
+			}
 		case "delete_upload":
 			fs.Type = "delete_upload"
 			if p, ok := s.With["path"].(string); ok {
 				fs.DeleteUpload = normalizeGHARefs(p)
+			}
+			if v, ok := s.With["record"]; ok {
+				fs.UploadRecord = ghaUploadRecord(v)
 			}
 		case "inspect_private_upload":
 			fs.Type = "inspect_private_upload"
@@ -807,6 +889,18 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			}
 			if k, ok := s.With["kind"].(string); ok {
 				fs.InspectPrivateUpload.Kind = strings.ToLower(strings.TrimSpace(k))
+			}
+		case "extract_text":
+			fs.Type = "extract_text"
+			fs.ExtractText = &FlowExtractText{}
+			if p, ok := s.With["source_path"].(string); ok {
+				fs.ExtractText.SourcePath = normalizeGHARefs(p)
+			}
+			if ocr, ok := s.With["ocr"].(bool); ok {
+				fs.ExtractText.OCR = &ocr
+			}
+			if v, ok := s.With["record"]; ok {
+				fs.UploadRecord = ghaUploadRecord(v)
 			}
 		case "render_pdf_signatures":
 			fs.Type = "render_pdf_signatures"
@@ -868,6 +962,18 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			if p, ok := s.With["payload"]; ok {
 				fs.Broadcast.Payload = normalizeRefsInTree(p)
 				fs.Broadcast.HasPayload = true
+			}
+		case "notify":
+			// `run: notify` - an in-app notification for one user, stored
+			// and announced like a hooks.yaml `notify:` (execStepNotify,
+			// flows_notify.go). Validated by ghaNotifyViolation.
+			fs.Type = "notify"
+			fs.Notify = &FlowNotify{
+				UserID: ghaNotifyText(s.With["user_id"]),
+				Title:  ghaNotifyText(s.With["title"]),
+				Body:   ghaNotifyText(s.With["body"]),
+				Type:   ghaNotifyText(s.With["type"]),
+				Link:   ghaNotifyText(s.With["link"]),
 			}
 		case "parse":
 			fs.Type = "parse"
@@ -931,6 +1037,7 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 			fs.Steps = convertGHASteps(s.Steps)
 		case "for_each":
 			fs.Type = "for_each"
+			fs.ForEachSource = strings.TrimSpace(s.ForEach)
 			fs.ForEach = normalizeGHARefs(s.ForEach)
 			// Strip the `{{ }}` braces the normalizer added - the
 			// runtime's for_each expects a bare key (e.g. "rows" not
@@ -975,9 +1082,10 @@ func convertGHASteps(steps []FlowStepGHA) []FlowStep {
 		if flowRunTypeCountsRows(fs.Type) {
 			fs.ExpectRows, fs.ExpectRowsConflict = ghaStepExpectRows(s)
 		}
-		if s.RetryDelay != "" {
-			fs.RetryDelay, _ = time.ParseDuration(s.RetryDelay)
-		}
+		// A Go duration or whole seconds, like `timeout`. Anything else is
+		// refused at write time and logged at load (flowStepRetryProblems);
+		// the step then waits the default.
+		fs.RetryDelay, _ = parseFlowRetryDelay(s.RetryDelay)
 		if d := parseFlexDuration(s.Timeout); d > 0 {
 			fs.Timeout = d
 		}
@@ -1061,16 +1169,25 @@ func withToAPI(with map[string]any) *FlowAPICall {
 	}
 	// Keep nested arrays/objects (normalizing ${{ }} refs on string leaves)
 	// instead of flattening to map[string]string - mirrors withToRespond's
-	// body handling. See benmore-go #94. A list is a JSON array body (it
+	// body handling. A list is a JSON array body (it
 	// used to be dropped).
 	api.JSON, api.JSONArray = jsonBodyTree(with["json"])
+	// `json:` written as one `${{ }}` reference sends the value it names.
+	// Other text is refused at write time and not sent.
+	if v, ok := with["json"].(string); ok {
+		if ref := normalizeGHARefs(v); ref != "" {
+			if _, sole := soleFlowExpr(ref); sole {
+				api.JSONRef = ref
+			}
+		}
+	}
 	if f, ok := with["form"].(map[string]any); ok {
 		api.Form = stringMap(f)
 	}
 	// `body:` written as a map or list is a JSON body too; it used to send
 	// no body at all. Next to `json:` or `form:` the write gate refuses it
 	// and a deployed file keeps sending the json or form body.
-	if _, form := with["form"]; api.JSON == nil && api.JSONArray == nil && !form {
+	if _, form := with["form"]; api.JSON == nil && api.JSONArray == nil && api.JSONRef == "" && !form {
 		api.JSON, api.JSONArray = jsonBodyTree(with["body"])
 	}
 	// `sign:` sub-block - the outbound-auth recipe. Pre-v2.5.8 the GHA
@@ -1144,9 +1261,12 @@ func parseHandledStatuses(raw any) ([]int, error) {
 	return statuses, nil
 }
 
-// withToPaginate maps `with.paginate:` to FlowAPIPaginate. Defaults
-// fill in the common shapes: cursor strategy with `?cursor=` param
-// and `$.next_cursor` extraction.
+// withToPaginate maps `with.paginate:` to FlowAPIPaginate. The paginator
+// fills in the defaults (execStepAPIPaginated): the cursor strategy, the
+// `cursor` / `page` query parameter, `$.items`, 50 pages from page 1. There is
+// no default `cursor_field`: a cursor strategy without one fails when it runs.
+// flowPaginateKeys lists the keys read here; a value of another type is left
+// unset, refused at write time and logged at load (paginateValueProblems).
 func withToPaginate(raw map[string]any) *FlowAPIPaginate {
 	p := &FlowAPIPaginate{}
 	if v, ok := raw["strategy"].(string); ok {
@@ -1161,8 +1281,8 @@ func withToPaginate(raw map[string]any) *FlowAPIPaginate {
 	if v, ok := raw["page_param"].(string); ok {
 		p.PageParam = v
 	}
-	if v, ok := raw["page_start"].(int); ok {
-		p.PageStart = v
+	if v, ok := raw["page_start"].(int); ok && v >= 0 {
+		p.PageStart, p.PageStartSet = v, true
 	}
 	if v, ok := raw["items_field"].(string); ok {
 		p.ItemsField = v
@@ -1314,13 +1434,16 @@ func withToEmail(with map[string]any) *FlowEmail {
 		e.Data[k] = normalizeGHARefs(v)
 	}
 	// attachments: [{filename, content_type?, content}] — content is base64
-	// (or a ${{ }} ref resolving to base64). Non-object entries are skipped.
-	if raw, ok := with["attachments"].([]any); ok {
+	// (or a ${{ }} ref resolving to base64). A value that names no file (not
+	// a list, an entry that is not a map or has no content) used to be
+	// skipped, and the message went out without the file: the step now
+	// carries the reason and fails before it sends (buildEmailOpts).
+	if raw, set := with["attachments"]; set {
+		e.AttachmentsError = emailAttachmentUnresolvable(raw)
+	}
+	if raw, ok := with["attachments"].([]any); ok && e.AttachmentsError == "" {
 		for _, item := range raw {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
+			m, _ := item.(map[string]any)
 			att := FlowAttachment{}
 			if s, ok := m["filename"].(string); ok {
 				att.Filename = normalizeGHARefs(s)
@@ -1331,9 +1454,7 @@ func withToEmail(with map[string]any) *FlowEmail {
 			if s, ok := m["content"].(string); ok {
 				att.Content = normalizeGHARefs(s)
 			}
-			if att.Content != "" {
-				e.Attachments = append(e.Attachments, att)
-			}
+			e.Attachments = append(e.Attachments, att)
 		}
 	}
 	return e
@@ -1517,7 +1638,9 @@ func translateGHAExpr(expr string) string {
 		// for the single-row case so author-friendly templates like
 		// `steps.user.outputs.email` work after a `WHERE id = :id`
 		// query).
-		rest := strings.TrimPrefix(expr, "steps.")
+		// The key the step stores its outputs under: its id, or for an id
+		// that is an identity name a key of its own (flowStepOutputKey).
+		rest := flowStepRefOutputKey(strings.TrimPrefix(expr, "steps."))
 		// Both .outputs.rows and .outputs.* mean "the result set."
 		rest = ghaStripOutputsRows(rest)
 		rest = strings.Replace(rest, ".outputs.*", "", 1)

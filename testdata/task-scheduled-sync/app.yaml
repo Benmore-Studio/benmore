@@ -1,0 +1,8 @@
+# Scheduled sync: every hour the app reads a supplier's product list, page by
+# page, and stores it. Signed-in users read the products; only the sync writes.
+site_name: "Catalogue"
+auth:
+  identifier: email
+access:
+  products: { read: everyone, write: admin, update: admin, delete: admin }
+  sync_runs: { all: admin }

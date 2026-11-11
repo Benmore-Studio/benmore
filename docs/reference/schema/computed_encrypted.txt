@@ -1,0 +1,1 @@
+A computed.yaml `expr:`/`sql:` field or an app.yaml `aggregates:` sql that reads an encrypted column is refused when written and is an error in `benmore check` (it would compute on ciphertext); a null test and COUNT(col) stay allowed. An app that already has one keeps loading. See api(at:"encryption") → computed_aggregates.

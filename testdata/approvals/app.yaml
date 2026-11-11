@@ -1,0 +1,3 @@
+site_name: "approvals fixture"
+auth:
+  identifier: email

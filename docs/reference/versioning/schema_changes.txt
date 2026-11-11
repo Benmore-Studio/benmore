@@ -1,0 +1,1 @@
+History adds newly introduced source columns before replacing its triggers; older versions have NULL for fields that did not exist. Existing history columns remain available. History setup failures stop startup or reject reload instead of leaving writes with broken triggers. See encryption.encrypted_history for encrypted snapshots.

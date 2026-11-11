@@ -741,12 +741,16 @@ func TestXLSXSerialErrorHoldsNoValue(t *testing.T) {
 }
 
 func TestAppMCPReadArtifactPDFRendersThroughSandbox(t *testing.T) {
-	if findChrome() == "" {
+	chrome := findChrome()
+	if chrome == "" {
 		if os.Getenv("BENMORE_REQUIRE_CHROME_ARTIFACT") == "1" {
 			t.Fatal("mandatory Chrome artifact renderer is unavailable")
 		}
 		t.Skip("Chrome is required for PDF artifact rendering")
 	}
+	// The version probe's 10 s and the render's 30 s are for printing on a
+	// running host, not for a cold disk.
+	warmTestChrome(t, chrome)
 	e := newReadArtifactEnv(t, readArtifactYAML())
 	out, code := e.create(map[string]any{"tool": "forecast", "format": "pdf"})
 	if code != "" {

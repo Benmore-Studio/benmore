@@ -1,0 +1,6 @@
+[
+  "Triggers only fire on INSERT/UPDATE, so rows that existed BEFORE encrypted.yaml was deployed stay plaintext until they get UPDATEd.",
+  "CLI: `benmore encrypt-backfill <app> <table>.<col> --as <admin-email>` finds the rows still in plaintext and PATCHes each one as that admin; `--dry-run` only counts them.",
+  "To migrate them: PATCH each row through the auto-CRUD API with its current body. The update fires the encryption trigger - fastest reliable path.",
+  "`benmore sql <app> \"UPDATE <table> SET <col> = <col>\" --write --confirm` works for encrypted columns: it encrypts under the app's own ENCRYPTION_KEY, so the app reads the result back."
+]

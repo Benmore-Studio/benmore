@@ -1,0 +1,32 @@
+[
+  "Multi-tenant app: each organisation is a tenant, its members hold a role in it, and every project belongs to one organisation. A signed-in user founds an organisation with POST /api/_groups/create and becomes its `org_admin`; that admin adds existing accounts with POST /api/org/members; members read and write only their own organisation's projects, and only an `org_admin` or `manager` deletes one.",
+  {
+    "file": "app.yaml",
+    "content": "# Multi-tenant app: each organisation is a tenant, its members hold a role in\n# it, and every project belongs to one organisation.\nsite_name: \"Team projects\"\nauth:\n  identifier: email\ngroups:\n  table: org_members            # one row per member of an organisation\n  key: org_id                   # the tenant column on every tenant table\n  user_field: user_id\n  role_field: member_role       # the member's role inside the organisation\n  bootstrap:\n    org_table: organizations    # POST /api/_groups/create founds one\n    founding_role: org_admin\naccess:\n  organizations:\n    read: member-of:org_members(org_id, user_id)   # members read their own organisation\n    write: off                  # founded only through /api/_groups/create\n    update: role:org_admin\n    delete: off\n  org_members:\n    read: group                 # the roster of the caller's organisation\n    write: off                  # added by the bootstrap and flows/add-member.yaml only\n    update: off\n    delete: role:org_admin\n  projects:\n    read: group                 # every member of the organisation\n    write: group\n    update: group\n    delete: role:org_admin,manager"
+  },
+  {
+    "file": "schema.prisma",
+    "content": "model Organization {\n  id        Int      @id @default(autoincrement())\n  name      String\n  createdAt DateTime @default(now()) @map(\"created_at\")\n  @@map(\"organizations\")\n}\n\nmodel OrgMember {\n  id         Int      @id @default(autoincrement())\n  orgId      Int      @map(\"org_id\")\n  userId     Int      @map(\"user_id\")\n  memberRole String   @default(\"member\") @map(\"member_role\")\n  createdAt  DateTime @default(now()) @map(\"created_at\")\n  @@unique([orgId, userId])\n  @@map(\"org_members\")\n}\n\nmodel Project {\n  id        Int      @id @default(autoincrement())\n  orgId     Int      @map(\"org_id\")\n  name      String\n  userId    Int      @map(\"user_id\")\n  createdAt DateTime @default(now()) @map(\"created_at\")\n  @@map(\"projects\")\n}"
+  },
+  {
+    "file": "flows/add-member.yaml",
+    "content": "# flows/add-member.yaml - an organisation admin adds an existing account to\n# their organisation. Generic CRUD cannot write another user's membership.\non:\n  request:\n    method: POST\n    path: /api/org/members\n    auth: required\n    transaction: true\n    inputs:\n      email: { type: email, required: true }\n      role:  { type: enum, values: [member, manager], default: member }\njobs:\n  add:\n    steps:\n      - id: me\n        run: sql\n        with:\n          query: \"SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'org_admin'\"\n          params: { org: \"${{ user.group_id }}\" }\n      - if: ${{ !steps.me.outputs.rows }}\n        run: respond\n        with: { status: 403, json: { error: not_org_admin } }\n      - id: account\n        run: sql\n        with: { query: \"SELECT id FROM _benmore_users WHERE email = :email\" }\n      - if: ${{ !steps.account.outputs.rows }}\n        run: respond\n        with: { status: 404, json: { error: no_such_account } }\n      - id: added\n        run: sql\n        with:\n          query: \"INSERT INTO org_members (org_id, user_id, member_role) VALUES (:org, :member, :role) ON CONFLICT (org_id, user_id) DO NOTHING RETURNING id\"\n          params: { org: \"${{ user.group_id }}\", member: \"${{ steps.account.outputs.id }}\" }\n      - if: ${{ !steps.added.outputs.rows }}\n        run: respond\n        with: { status: 409, json: { error: already_a_member } }\n      - run: respond\n        with: { status: 201, json: { id: \"${{ steps.added.outputs.id }}\", role: \"${{ params.role }}\" } }"
+  },
+  {
+    "check": "As a new user, POST /api/_groups/create {name} answers 200 {status:'created', group_id, founding_role:'org_admin'} and a second call 409. GET /api/projects, GET /api/organizations and GET /api/org_members list only the caller's organisation; another tenant's row answers 404, and so does a POST to /api/org_members. A `member` creates and edits projects, and gets 403 {error:'forbidden'} on DELETE and on PATCH of the organisation. POST /api/org/members {email, role} answers 201 for the admin, 403 {error:'not_org_admin'} for anyone else, 404 for an unknown address, 409 for a member, and 422 for a role outside `member` and `manager`.",
+    "notes": [
+      "Membership is keyed by user id (`user_field: user_id`), so generic CRUD cannot write another user's membership row: the flow adds the member after checking the caller's own role (`scoping.membership_management`).",
+      "Flow SQL does not add the tenant key: the flow binds `org_id` from `${{ user.group_id }}` itself (`flows.gotchas_sql_steps`).",
+      "`write: off` on the organisation table leaves /api/_groups/create as the only way to found one, and on the membership table leaves the flow as the only way to add a member. `role:org_admin` on the organisation table reaches only the caller's own organisation row (`access.tenant_root_role_scope`).",
+      "The enum on `role` is what stops an admin's request from granting `org_admin`; change a member's role in a flow of the same shape."
+    ],
+    "read_next": [
+      "scoping.tenant_bootstrap",
+      "scoping.tenant_roles",
+      "scoping.membership_management",
+      "access.member_of",
+      "access.which_topic",
+      "flows.inputs"
+    ]
+  }
+]

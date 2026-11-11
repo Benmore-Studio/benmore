@@ -1,0 +1,12 @@
+on:
+  request:
+    method: POST
+    path: /api/async-identity
+    auth: required
+    mode: async
+jobs:
+  go:
+    steps:
+      - run: sql
+        with:
+          query: "INSERT INTO notes (title, body, user_id) VALUES ('async', :user_email, :user_id)"

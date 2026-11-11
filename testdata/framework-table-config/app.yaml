@@ -1,0 +1,21 @@
+# `benmore test` on this app must FAIL its source check for app.yaml,
+# encrypted.yaml, workflows.yaml and computed.yaml
+# (tests/expected-failures.txt): each names a framework table, which a push
+# refuses. A deployed copy still loads, and tests/ proves what it does then:
+# the entries on framework tables do nothing, and the entries on the app's own
+# table in the same files keep working.
+site_name: "Framework tables in config fixture"
+auth:
+  identifier: email
+
+access:
+  notes: everyone
+  # With the workflow in workflows.yaml, this rule let any signed-in user make
+  # any account an admin. The rule alone opens no route that writes.
+  _benmore_users:
+    read: everyone
+    update: everyone
+
+versioned:
+  - notes
+  - _benmore_users

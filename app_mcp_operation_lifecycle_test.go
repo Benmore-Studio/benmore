@@ -14,7 +14,7 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func setAppLifecycleEnvironment(app *App, env map[string]string) {
@@ -1408,7 +1408,7 @@ func TestAppMCPOperationLifecycleMarkerCreateFailureRollsBackPair(t *testing.T) 
 	}
 	markerCreateDenied := false
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
+		mustSQLiteConn(raw).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
 			if action == sqlite3.SQLITE_CREATE_TABLE && arg1 == "_benmore_encryption_state" {
 				markerCreateDenied = true
 				return sqlite3.SQLITE_DENY
@@ -1427,7 +1427,7 @@ func TestAppMCPOperationLifecycleMarkerCreateFailureRollsBackPair(t *testing.T) 
 	cleanup, cleanupErr := app.DB.Conn(context.Background())
 	if cleanupErr == nil {
 		cleanupErr = cleanup.Raw(func(raw any) error {
-			raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil)
+			mustSQLiteConn(raw).RegisterAuthorizer(nil)
 			return nil
 		})
 		_ = cleanup.Close()
@@ -1460,7 +1460,7 @@ func TestAppMCPApprovalCreateFailureRollsBackFirstTable(t *testing.T) {
 	}
 	denied, operationsCreateReached := false, false
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
+		mustSQLiteConn(raw).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
 			if action == sqlite3.SQLITE_CREATE_TABLE && arg1 == "_benmore_mcp_operations" {
 				operationsCreateReached = true
 			}
@@ -1484,7 +1484,7 @@ func TestAppMCPApprovalCreateFailureRollsBackFirstTable(t *testing.T) {
 		_ = app.DB.Close()
 		t.Fatal(err)
 	}
-	cleanupErr := cleanup.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil); return nil })
+	cleanupErr := cleanup.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(nil); return nil })
 	if closeErr := cleanup.Close(); cleanupErr == nil {
 		cleanupErr = closeErr
 	}
@@ -1578,7 +1578,7 @@ func TestAppMCPOperationLifecycleCommitRefusalRollsBackPair(t *testing.T) {
 	}
 	commitDenied := false
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
+		mustSQLiteConn(raw).RegisterAuthorizer(func(action int, arg1, _, _ string) int {
 			if action == sqlite3.SQLITE_TRANSACTION && arg1 == "COMMIT" {
 				commitDenied = true
 				return sqlite3.SQLITE_DENY
@@ -1597,7 +1597,7 @@ func TestAppMCPOperationLifecycleCommitRefusalRollsBackPair(t *testing.T) {
 	cleanup, cleanupErr := app.DB.Conn(context.Background())
 	if cleanupErr == nil {
 		cleanupErr = cleanup.Raw(func(raw any) error {
-			raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil)
+			mustSQLiteConn(raw).RegisterAuthorizer(nil)
 			return nil
 		})
 		_ = cleanup.Close()

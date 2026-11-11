@@ -20,8 +20,8 @@ func flowUnreachableResponseViolation(file FlowFileGHA) string {
 	walk = func(path string, steps []FlowStep) string {
 		for i, step := range steps {
 			where := fmt.Sprintf("%s step %d", path, i)
-			if step.Type == "respond" && i+1 < len(steps) {
-				return where + ": steps after an unconditional `run: respond` cannot run. Move required work before the response, or put a conditional response inside an `if:` branch. See api({at:'flows'})."
+			if (step.Type == "respond" || step.Type == "proxy") && i+1 < len(steps) {
+				return where + fmt.Sprintf(": steps after an unconditional `run: %s` cannot run. Move required work before the response, or put a conditional response inside an `if:` branch. See api({at:'flows'}).", step.Type)
 			}
 			for _, branch := range []struct {
 				name  string

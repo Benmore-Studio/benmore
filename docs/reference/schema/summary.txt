@@ -1,0 +1,1 @@
+schema.prisma is Benmore's Prisma-style data model, compiled by the in-tree parser into SQLite migrations. It is a supported subset, not a Prisma client or a PostgreSQL connection configuration.

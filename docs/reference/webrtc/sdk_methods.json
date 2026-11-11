@@ -1,0 +1,6 @@
+[
+  "bm.broadcast.publish(slug, mediaStream) → { slug, sessionId, pc, stop() }",
+  "bm.broadcast.subscribe(slug, { waitForPublisher?: ms (default 30000; 0 = fail at once), signal?: AbortSignal }) → { slug, sessionId, pc, stream, stop() } - while the slug is not live (404) or the SFU answers 503 it retries until waitForPublisher runs out, then throws",
+  "bm.broadcast.stats(slug)                → { live: boolean, viewers: number, started_at?: string }",
+  "bm.webrtc.iceServers()                  → [{ urls, username?, credential? }, …] - STUN + TURN"
+]

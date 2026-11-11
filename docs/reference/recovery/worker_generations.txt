@@ -1,0 +1,1 @@
+A reload replaces the app's background workers (presence, expired-session, role and lock cleanup, audit shipping, cron) together with its configuration; a worker of the old configuration never runs against the new one. A reload does not cancel an external effect that is already running, and it is not a transaction.

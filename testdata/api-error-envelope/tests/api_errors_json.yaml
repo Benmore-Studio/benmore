@@ -1,0 +1,88 @@
+# /api/ refusals answer the JSON envelope api(at:"errors") describes, with
+# the JSON content type: these answered text/plain, or JSON text under
+# text/plain, so a client's res.json() threw or found no `error`.
+
+# Admin-only routes, asked by a signed-in member.
+admin_routes_refuse_a_member_in_json:
+  as_user: "member@test.com"
+  steps:
+    - get: "/api/_analytics/summary"
+      expect:
+        status: 403
+        json: {error: "admin required"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/_analytics/funnels"
+      expect:
+        status: 403
+        json: {error: "admin required"}
+        headers: {Content-Type: "application/json"}
+    - api: "POST /api/_analytics/funnel"
+      json: {name: "signup", steps: ["/", "/signup"]}
+      expect:
+        status: 403
+        json: {error: "admin required"}
+        headers: {Content-Type: "application/json"}
+    - sql: "SELECT id FROM _benmore_funnels"
+      expect: {rows: 0}
+    - get: "/api/_audit"
+      expect:
+        status: 403
+        json: {error: "admin required"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/_schema/notes/fields"
+      expect:
+        status: 403
+        json: {error: "admin required"}
+        headers: {Content-Type: "application/json"}
+
+# The per-caller schema descriptor is never served anonymously.
+anonymous_schema_is_refused_in_json:
+  anon: true
+  steps:
+    - get: "/api/_schema"
+      expect:
+        status: 401
+        json: {error: "authentication required"}
+        headers: {Content-Type: "application/json"}
+
+# A device registration without token and platform stores nothing.
+device_registration_names_what_is_missing:
+  as_user: "phone@test.com"
+  steps:
+    - api: "POST /api/_devices"
+      json: {app_version: "1.0"}
+      expect:
+        status: 400
+        json: {error: "token and platform required"}
+        headers: {Content-Type: "application/json"}
+    - sql: "SELECT id FROM _benmore_devices"
+      expect: {rows: 0}
+
+# A row id that is not its canonical spelling (01 for row 1) answers what a
+# missing row does, not Go's text "404 page not found".
+padded_id_reads_like_a_missing_row:
+  as_user: "reader@test.com"
+  steps:
+    - api: "POST /api/notes"
+      json: {title: "mine"}
+      save: {nid: "id"}
+      expect: {status: 200}
+    - get: "/api/notes/{{nid}}"
+      expect:
+        status: 200
+        json: {title: "mine"}
+    - get: "/api/notes/999999"
+      expect:
+        status: 404
+        json: {error: "Not found"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/notes/0{{nid}}"
+      expect:
+        status: 404
+        json: {error: "Not found"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/notes/{{nid}}.0"
+      expect:
+        status: 404
+        json: {error: "Not found"}
+        headers: {Content-Type: "application/json"}

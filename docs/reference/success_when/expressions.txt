@@ -1,0 +1,1 @@
+success_when takes the same conditions as `if:`, including `&&`, `||`, `!` and parentheses (v2.7.247): `success_when: "${{ steps.fetch.outputs.json.status }} == 'ok' && ${{ steps.fetch.outputs.json.items | length }} > 0"`. See api({at:'flows'}) for the semantics.

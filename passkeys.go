@@ -92,6 +92,17 @@ func EnsurePasskeysTable(db *sql.DB) error {
 		_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_benmore_passkeys_user ON _benmore_passkeys(user_id)`)
 	}
 	if err == nil {
+		// user_handle: the WebAuthn user.id the authenticator was given when
+		// the passkey was registered, so sign-in keeps accepting it when the
+		// key it was derived from changes (a rotated server secret, a store
+		// moved to another process). NULL for passkeys registered before the
+		// column existed: their handle is derived (passkeyUserHandle).
+		var n int
+		if err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_benmore_passkeys') WHERE name = 'user_handle'`).Scan(&n); err == nil && n == 0 {
+			_, err = db.Exec(`ALTER TABLE _benmore_passkeys ADD COLUMN user_handle TEXT`)
+		}
+	}
+	if err == nil {
 		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_passkey_challenges (
 			challenge_hash TEXT PRIMARY KEY,
 			purpose TEXT NOT NULL CHECK(purpose IN ('register','login')),
@@ -180,7 +191,13 @@ func passkeyServerError(w http.ResponseWriter, r *http.Request, app *App, err er
 // passkeyUserHandle is the opaque per-user id handed to the authenticator
 // (WebAuthn user.id): stable for the app, not the row id or the email.
 func passkeyUserHandle(app *App, userID int64) []byte {
-	mac := tempCookieMAC(app, "passkey-user|"+strconv.FormatInt(userID, 10))
+	return passkeyUserHandleWith(serverSecret, tempCookieAudience(app), userID)
+}
+
+// passkeyUserHandleWith is passkeyUserHandle under an explicit secret and
+// audience (the app directory, absolute).
+func passkeyUserHandleWith(secret, audience string, userID int64) []byte {
+	mac := tempCookieMACWith(secret, audience, "passkey-user|"+strconv.FormatInt(userID, 10))
 	if len(mac) > 32 {
 		mac = mac[:32]
 	}
@@ -463,9 +480,12 @@ func passkeyRegister(app *App) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		res, err := tx.Exec(`INSERT INTO _benmore_passkeys (user_id, credential_id, public_key, alg, sign_count, name)
-			SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM _benmore_passkeys WHERE user_id=?) < ?`,
-			sess.UserID, b64urlEncode(reg.CredentialID), reg.PublicKey, reg.Alg, reg.SignCount, name, sess.UserID, passkeyMaxPerUser)
+		// The user handle the authenticator was just given is kept with the
+		// passkey, so sign-in keeps accepting it if the derivation's key
+		// changes (a rotated server secret, a store moved to another process).
+		res, err := tx.Exec(`INSERT INTO _benmore_passkeys (user_id, credential_id, public_key, alg, sign_count, name, user_handle)
+			SELECT ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM _benmore_passkeys WHERE user_id=?) < ?`,
+			sess.UserID, b64urlEncode(reg.CredentialID), reg.PublicKey, reg.Alg, reg.SignCount, name, string(passkeyUserHandle(app, sess.UserID)), sess.UserID, passkeyMaxPerUser)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				passkeyJSONError(w, http.StatusConflict, "this passkey is already registered")
@@ -619,9 +639,10 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			pkID, userID int64
 			publicKey    []byte
 			signCount    int64
+			storedHandle string
 		)
-		if err := app.DB.QueryRow(`SELECT id, user_id, public_key, sign_count FROM _benmore_passkeys WHERE credential_id = ?`,
-			b64urlEncode(rawID)).Scan(&pkID, &userID, &publicKey, &signCount); err != nil {
+		if err := app.DB.QueryRow(`SELECT id, user_id, public_key, sign_count, COALESCE(user_handle, '') FROM _benmore_passkeys WHERE credential_id = ?`,
+			b64urlEncode(rawID)).Scan(&pkID, &userID, &publicKey, &signCount, &storedHandle); err != nil {
 			fail()
 			return
 		}
@@ -631,7 +652,11 @@ func passkeyLogin(app *App) http.HandlerFunc {
 		}
 		if body.Response.UserHandle != "" {
 			userHandle, err := b64url(body.Response.UserHandle)
-			if err != nil || subtle.ConstantTimeCompare(userHandle, passkeyUserHandle(app, userID)) != 1 {
+			want := passkeyUserHandle(app, userID)
+			if storedHandle != "" {
+				want = []byte(storedHandle)
+			}
+			if err != nil || subtle.ConstantTimeCompare(userHandle, want) != 1 {
 				fail()
 				return
 			}
@@ -670,6 +695,8 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			passkeyJSONError(w, http.StatusForbidden, grandfatheredVerifyMessage)
 			return
 		}
+		// Resolved before the transaction: it reads through the pool.
+		groupID := ResolveGroupID(app.DB, app.Group, email)
 		tx, err := app.DB.Begin()
 		if err != nil {
 			fail()
@@ -697,6 +724,25 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			fail()
 			return
 		}
+		// When the ceremony ends in a session (no auth.otp step, no enrollment
+		// due) the session is written in this transaction, behind the
+		// sign_count compare-and-swap. It used to be inserted after the commit,
+		// so a password reset (which deletes the passkeys and revokes every
+		// session) landing in between left a session behind.
+		var sessionID string
+		if !otpLoginEnabled(app) {
+			needsEnrollment, err := needsMFAEnrollmentWith(app, tx, userID)
+			if err != nil {
+				fail()
+				return
+			}
+			if !needsEnrollment {
+				if sessionID, err = createSignInSessionTx(tx, userID, email, groupID, app.SessionDuration); err != nil {
+					fail()
+					return
+				}
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			fail()
 			return
@@ -710,9 +756,22 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			startLoginOTP(w, r, app, userID, email, loginValue)
 			return
 		}
+		// A passkey stands in for the TOTP step of an enrolled account, but
+		// does not enroll one: an account whose role is listed in
+		// auth.require_mfa_for_roles and has no factor gets the setup grant a
+		// password or social sign-in gets, never a session (the transaction
+		// above wrote none).
+		if sessionID == "" {
+			token := mintMFASetupToken(app, userID, email)
+			if token == "" {
+				passkeyJSONError(w, http.StatusUnauthorized, "credentials changed; sign in again")
+				return
+			}
+			setFlowCookie(w, flowCookieMFASetup, token, !app.DevMode, int(mfaSetupTokenTTL.Seconds()))
+			httpJSON(w, http.StatusOK, map[string]any{"mfa_setup_required": true, "redirect": mfaSetupPagePath(app)})
+			return
+		}
 
-		groupID := ResolveGroupID(app.DB, app.Group, email)
-		sessionID := createSignInSession(app.DB, userID, email, groupID, app.SessionDuration)
 		AttachSessionContext(app.DB, sessionID, r)
 		http.SetCookie(w, sessionCookie(sessionID, app.DevMode, app.SessionDuration))
 		redirectTo := "/"

@@ -1,0 +1,4 @@
+[
+  "YAML anchors work in a flow file: put the anchor on the first use (`query: &member_guard \"SELECT EXISTS (SELECT 1 FROM room_members …) AS ok\"`) and repeat that value with `query: *member_guard`, or reuse a whole `with:` map (`with: &lookup { query: … }`, then `with: { <<: *lookup }`) - within ONE file. A top-level key that only holds fragments (`x-guards:`) is refused as an unknown key. There is no cross-file fragment include.",
+  "For the membership-EXISTS guard specifically, prefer `access: member-of:` (api({at:'access'}) → member_of) - it deletes the hand-written guards entirely."
+]

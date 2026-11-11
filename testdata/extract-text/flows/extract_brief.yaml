@@ -1,0 +1,21 @@
+# Any signed-in user may call this; the step itself must refuse a caller the
+# table's read mode refuses (briefs has no owner column to scope rows by).
+on:
+  request: { method: POST, path: /api/briefs/:id/extract, auth: required, mode: async }
+jobs:
+  extract_brief:
+    steps:
+      - id: doc
+        run: sql
+        query: SELECT id, file_url FROM briefs WHERE id = :id
+        expect_rows: 1
+      - id: text
+        run: extract_text
+        with:
+          source_path: "${{ steps.doc.outputs.first.file_url }}"
+          ocr: false
+          record: { table: briefs, id: "${{ steps.doc.outputs.first.id }}" }
+        on_error:
+          - run: sql
+            query: UPDATE briefs SET extract_error = :e WHERE id = :id
+            params: { e: "${{ error }}", id: "${{ params.id }}" }

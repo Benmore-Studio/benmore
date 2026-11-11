@@ -5,6 +5,8 @@ package main
 // Batch review page (first-party fallback): one page lists every pending,
 // unexpired operation one connection (grant) prepared for the signed-in
 // person, so several first_party writes need one browser visit, not one each.
+// Unexpired ones that can no longer be applied (an approval that lapsed, a role
+// or reviewed-source change) are listed apart with the reason _status gives.
 //   - GET  /api/_mcp/operations/batch?grant=<id>
 //   - POST /api/_mcp/operations/batch/approve   (grant, op..., _csrf)
 // The gates are the single-operation page's: browser cookie session only
@@ -15,6 +17,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/url"
 	"slices"
@@ -48,7 +51,8 @@ type appMCPPendingOperation struct {
 // ponytail: decrypts every unfinished operation, bounded like the prepare scan
 // by the per-actor cap and the expiry sweep.
 func appMCPPendingOperations(ctx context.Context, app *App, actorID int64, grantID string, now time.Time) ([]appMCPPendingOperation, error) {
-	tx, err := app.DB.BeginTx(ctx, nil)
+	// A read: a deferred snapshot (ReadOnly), not app.DB's BEGIN IMMEDIATE.
+	tx, err := app.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +137,10 @@ func serveAppMCPOperationBatch(w http.ResponseWriter, r *http.Request, app *App,
 	cookie, cookieErr := requestSessionCookie(r)
 	var session *Session
 	if cookieErr == nil && !hasAuthorization {
-		session = GetSessionFromDB(app.DB, cookie.Value)
+		session = getAppSession(app, r, cookie.Value)
+	}
+	if mfaEnrollmentWithheld(app, session) {
+		session = nil // held until the account enrolls MFA, as getSession holds it
 	}
 	if session == nil && !approve && !hasAuthorization {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
@@ -219,7 +226,11 @@ func serveAppMCPOperationBatch(w http.ResponseWriter, r *http.Request, app *App,
 	if len(pending) > 0 && r.Header.Get("Sec-Fetch-Site") != "cross-site" && limits.review.refuse(w, app, "mcp-operation-review:"+uid) {
 		return
 	}
-	var items []appMCPBatchItem
+	// Items wait for approval. Blocked are this person's own unexpired changes
+	// that _status reports denied (approval lapsed, role or reviewed source
+	// changed): listed with the single page's reason so the page agrees with
+	// it, never offered for approval. Approved and applied ones are not listed.
+	var items, blocked []appMCPBatchItem
 	now := appMCPClock()
 	for _, op := range pending {
 		review, err := appMCPReviewOperation(r.Context(), request(op.Command), op.ID, "")
@@ -228,12 +239,14 @@ func serveAppMCPOperationBatch(w http.ResponseWriter, r *http.Request, app *App,
 				serverSide(class)
 				return
 			}
-			continue // foreign tenant, stale source and refusals are not shown
+			continue // foreign tenant and refusals are not shown
 		}
-		if review.State != "prepared" {
-			continue
+		switch review.State {
+		case "prepared":
+			items = append(items, newAppMCPReviewView(review, op.ID, now))
+		case "denied":
+			blocked = append(blocked, newAppMCPReviewView(review, op.ID, now))
 		}
-		items = append(items, newAppMCPReviewView(review, op.ID, now))
 	}
 	// The notices only echo this page's own post-approval redirect: a link from
 	// another site cannot make the page claim changes were approved.
@@ -247,7 +260,7 @@ func serveAppMCPOperationBatch(w http.ResponseWriter, r *http.Request, app *App,
 		csrf = authMintCSRFToken(appMCPBatchBinding(cookie.Value, grantID)) // this session and this grant only
 	}
 	writeAppMCPPage(w, app, http.StatusOK, appMCPBatchReviewPage, appMCPPageOpts{Title: "Review requested changes", Wide: true, Referrer: "same-origin"},
-		map[string]any{"Items": items, "CSRF": csrf, "Grant": grantID, "Action": appMCPBatchRoute + "/approve",
+		map[string]any{"Items": items, "Blocked": blocked, "CSRF": csrf, "Grant": grantID, "Action": appMCPBatchRoute + "/approve",
 			"NoneTicked": ownRedirect && r.URL.Query().Get("notice") == "none", "Approved": approvedNotice})
 }
 

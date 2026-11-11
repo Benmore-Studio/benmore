@@ -1,0 +1,13 @@
+[
+  "POST /login",
+  "POST /signup",
+  "POST /logout",
+  "POST /verify-mfa  (authenticator or backup code after the password; the app serves the GET page)",
+  "POST /verify-otp  (auth.otp emailed or texted code)",
+  "POST /forgot-password",
+  "POST /reset-password",
+  "GET /api/_auth/profile",
+  "PATCH /api/_auth/profile",
+  "POST /api/_auth/token  (Bearer for non-browser clients)",
+  "GET /api/_csrf"
+]

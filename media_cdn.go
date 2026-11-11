@@ -15,6 +15,9 @@ package main
 //                                has authorized the request (serve_file → 302
 //                                to a short-TTL signed URL).
 //
+// <app> is the instance: <sub> for prod, <sub>-dev for the dev instance
+// (appMediaPrefix). Objects from before the split stay under <sub>.
+//
 // Falls back to local disk when the platform block is unset, so nothing changes
 // for self-hosted / unconfigured deployments.
 //
@@ -143,18 +146,52 @@ func (c *PlatformMediaConfig) canSign() bool {
 // mediaCDNEnabled reports whether the platform CDN media backend is active.
 func mediaCDNEnabled() bool { return getPlatformMedia() != nil }
 
-// appMediaPrefix is the per-app key namespace under the bucket - the app's
-// subdomain in host mode (basename of its dir), sanitized.
+// appMediaInstance is the instance subdomain an app process serves: the
+// basename of its dir (<sub> for prod, <sub>-dev for the dev instance).
+func appMediaInstance(app *App) string {
+	if app == nil {
+		return ""
+	}
+	return filepath.Base(strings.TrimRight(app.Dir, "/"))
+}
+
+// appMediaPrefix is the instance's own key namespace under the bucket: its
+// subdomain, sanitized - <sub> for prod and <sub>-dev for the dev instance.
+// Everything an instance writes or deletes is under it, and a logical
+// uploads/... path resolves to it.
+//
+// Dev and prod used to share <sub>, so a dev instance's delete_upload and
+// serve_file acted on production's objects (refresh-dev --with-data copies
+// rows that reference them). A dev instance still READS the shared prefix
+// (appMediaReadPrefixes): its own uploads from before the split and the
+// production references copied into it stay servable.
 func appMediaPrefix(app *App) string {
 	if app == nil {
 		return "_unknown"
 	}
-	base := filepath.Base(strings.TrimRight(app.Dir, "/"))
-	// Media is keyed by the LOGICAL app, shared across dev/prod - a dev
-	// instance (<sub>-dev) must use the SAME CDN prefix (<sub>) as prod, or
-	// files uploaded/stored under <sub> (incl. prod data copied into dev via
-	// refresh-dev) sign to a <sub>-dev key that doesn't exist → CloudFront 403.
-	base = LogicalSubdomain(base)
+	return mediaPrefixForSubdomain(appMediaInstance(app))
+}
+
+// appMediaReadPrefixes are the prefixes whose objects this instance may
+// serve and sign: its own and, for a dev instance, the logical app's shared
+// prefix (read only - privateUploadPath and the broker keep writes and
+// deletes on the instance's own). The router's presign broker grants the
+// same set to a request proven to come from the dev instance
+// (presignCallerScope).
+func appMediaReadPrefixes(app *App) []string {
+	own := appMediaPrefix(app)
+	if instance := appMediaInstance(app); IsDevSubdomain(instance) {
+		if shared := mediaPrefixForSubdomain(LogicalSubdomain(instance)); shared != own && shared != "_unknown" {
+			return []string{own, shared}
+		}
+	}
+	return []string{own}
+}
+
+// mediaPrefixForSubdomain maps an instance subdomain to its media key prefix
+// (the dev instance keeps its -dev suffix). App deletion purges both of a
+// logical app's prefixes by the same rule (app_delete_media.go).
+func mediaPrefixForSubdomain(base string) string {
 	base = strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
@@ -205,8 +242,11 @@ func uploadContentMeta(ext, sniffed, downloadName string) (contentType, disposit
 // per-visibility key prefix and returns the CloudFront URL.
 type CDNStorage struct {
 	s3        *S3Storage
-	Prefix    string // per-app namespace
+	Prefix    string // per-instance namespace (appMediaPrefix)
 	CDNDomain string
+	// Instance is the instance subdomain the presign broker is asked to
+	// verify (presign_instance.go); empty sends no instance proof.
+	Instance string
 }
 
 func newCDNStorage(app *App) *CDNStorage {
@@ -220,6 +260,7 @@ func newCDNStorage(app *App) *CDNStorage {
 		s3:        &S3Storage{Bucket: cfg.Bucket, Region: cfg.Region, Key: cfg.S3Key, Secret: cfg.S3Secret},
 		Prefix:    appMediaPrefix(app),
 		CDNDomain: cfg.CDNDomain,
+		Instance:  appMediaInstance(app),
 	}
 }
 
@@ -283,11 +324,13 @@ func cdnURLForServe(app *App, raw string, cfg *PlatformMediaConfig) (url string,
 		// TENANT CLAMP: the signing key is deployment-wide, so a flow could
 		// otherwise hand serve_file another app's CDN URL and get it
 		// signed (→ caller 404s). The router's broker applies the same rule.
-		vis, ok := mediaKeyVisibility(key, appMediaPrefix(app))
-		if !ok {
-			return "", false, false
+		// A dev instance may also serve the shared (prod) prefix, read only.
+		for _, p := range appMediaReadPrefixes(app) {
+			if vis, ok := mediaKeyVisibility(key, p); ok {
+				return clean, vis == "private", true
+			}
 		}
-		return clean, vis == "private", true
+		return "", false, false
 	}
 	p := strings.TrimPrefix(raw, "/")
 	if strings.HasPrefix(p, "uploads/") && !cdnKeyUnsafe(p) {
@@ -321,9 +364,10 @@ func mediaKeyVisibility(key, prefix string) (visibility string, ok bool) {
 // resolved for app.
 //
 // Whenever the presign broker socket is reachable the router signs it: the
-// app sends the object key and requested lifetime, the router checks the key
-// against the connecting uid's own prefix, caps the lifetime and signs with
-// the key only it holds. A broker refusal is final. A hosted tenant process
+// app sends the object key, requested lifetime and its instance proof, the
+// router checks the key against the prefixes that instance of the
+// connecting uid's app may read, caps the lifetime and signs with the key
+// only it holds. A broker refusal is final. A hosted tenant process
 // (hostedTenantProcess) never signs locally and fails closed when the broker
 // is unreachable. Self-hosted `benmore serve` and single-process `benmore
 // host` have no broker and sign with the key in their own environment.
@@ -341,7 +385,7 @@ func signPrivateMediaURL(app *App, cfg *PlatformMediaConfig, cdnURL string, ttl 
 			Prefix:    appMediaPrefix(app),
 			Path:      key,
 			ExpiresIn: int64(ttl / time.Second),
-		})
+		}, appMediaInstance(app))
 		if err != nil {
 			return "", fmt.Errorf("media: sign private URL: %w", err)
 		}

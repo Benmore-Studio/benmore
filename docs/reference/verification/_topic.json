@@ -1,0 +1,22 @@
+{
+  "keys": [
+    "security_scan",
+    "test_matches_push",
+    "test_account_holds",
+    "flush_steps",
+    "test_file_parts",
+    "test_json_csrf",
+    "test_workspace_copy",
+    "yaml_resource_limits",
+    "failure_report",
+    "summary",
+    "test_keys",
+    "test_file_load",
+    "commands",
+    "profiles",
+    "contract",
+    "failure_contract",
+    "generated_tests",
+    "see_also"
+  ]
+}

@@ -1,0 +1,8 @@
+[
+  "GET / → static/index.html",
+  "GET /<x> → static/<x>.html  (or static/<x>/index.html)",
+  "GET /<x>/<y> → static/<x>/<y>.html",
+  "GET /static/<name>.js → check for static/<name>.tsx → compile (or pass through if real .js)",
+  "Anything else (Accept: text/html) → static/index.html  (SPA fallback)",
+  "Asset-extension paths (.js, .css, .png, etc.) → real 404 if missing AND no .tsx counterpart"
+]

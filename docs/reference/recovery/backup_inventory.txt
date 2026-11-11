@@ -1,0 +1,1 @@
+A backup listing is complete or an error: one that cannot be read in full returns an error rather than a partial list. The dashboard's Backups view lists ordinary snapshots, the newest 1000, with count, total and truncated; PITR objects are not offered as downloads.

@@ -101,8 +101,8 @@ func TestExpectRowsWriteGate(t *testing.T) {
 		"same in both positions":    sqlStep("UPDATE items SET qty = 1 WHERE id = :id", "          expect_rows: 1\n        expect_rows: 1\n"),
 		"script of writes":          sqlStep("UPDATE items SET qty = 1; DELETE FROM log", "        expect_rows: \">=0\"\n"),
 		"comment-led select":        "      - id: s\n        run: sql\n        with:\n          query: |\n            -- the open ones\n            SELECT id FROM items WHERE qty > 0\n        expect_rows: \">0\"\n",
-		"references are parameters": sqlStep("UPDATE items SET name = ${{ steps.returning.outputs.name }} WHERE id = ${{ steps.insert.outputs.id }}", "        expect_rows: \"=1\"\n"),
-		"sql_dynamic":               "      - id: s\n        run: sql_dynamic\n        with:\n          query: \"${{ steps.plan.outputs.sql }}\"\n          expect_rows: \">0\"\n",
+		"references are parameters": "      - id: returning\n        run: sql\n        with: { query: \"SELECT 'n' AS name\" }\n      - id: insert\n        run: sql\n        with: { query: \"SELECT 1 AS id\" }\n" + sqlStep("UPDATE items SET name = ${{ steps.returning.outputs.name }} WHERE id = ${{ steps.insert.outputs.id }}", "        expect_rows: \"=1\"\n"),
+		"sql_dynamic":               "      - id: plan\n        run: compute\n        with: { module: m, function: f, args: {} }\n      - id: s\n        run: sql_dynamic\n        with:\n          query: \"${{ steps.plan.outputs.sql }}\"\n          expect_rows: \">0\"\n",
 		"if-gated sql":              "      - id: s\n        if: ${{ 1 == 1 }}\n        run: sql\n        with: { query: \"UPDATE items SET qty = 1\" }\n        expect_rows: \">0\"\n",
 		"no expect_rows on ddl":     sqlStep("CREATE TABLE IF NOT EXISTS made (id INTEGER)", ""),
 		// On `run: set` a `with:` key is a variable, whatever its name.

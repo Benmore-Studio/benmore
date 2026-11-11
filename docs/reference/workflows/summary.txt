@@ -1,0 +1,1 @@
+State machines defined in workflows.yaml. Auto-registers POST /api/<table>/{id}/transition and GET /api/<table>/{id}/transitions.

@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/plain-sms
+    auth: required
+    transaction: false
+jobs:
+  go:
+    steps:
+      - run: sms
+        with: { to: "+15555550100", body: hi }
+      - run: respond
+        with: { json: { ok: true } }

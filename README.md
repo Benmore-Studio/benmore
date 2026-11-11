@@ -49,8 +49,8 @@ import of the same instructions. Framework guides describe self-hosting; hosted
 - **The guide** - [`docs/agent/build.md`](docs/agent/build.md): the model, app
   structure, schema, config, the `bm` SDK, auto-CRUD, auth, flows/hooks, and the
   dev loop. The same guide is built into the binary - run `benmore docs`.
-- **CLI** - `benmore help` lists the commands (`new`, `serve`, `docs`,
-  `version`).
+- **CLI** - `benmore help` lists the commands (`new`, `serve`, `test`, `mcp`,
+  `docs`, `version`).
 
 ## What you get
 

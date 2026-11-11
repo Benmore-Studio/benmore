@@ -1,0 +1,8 @@
+# The step has an `expect:` and no action (`get:`, `api:`, `sql:`, ...). It
+# was sent as a GET for the empty path, which this app answers 404, so the
+# expectation matched a request the test never named.
+expects_without_a_request:
+  anon: true
+  steps:
+    - expect:
+        status: 404

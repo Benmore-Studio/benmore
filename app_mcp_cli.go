@@ -12,8 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 type appMCPInventoryEntry struct {
@@ -39,6 +37,9 @@ type appMCPInspection struct {
 	Inventory        []appMCPInventoryEntry `json:"inventory"`
 	ReviewedTools    []map[string]any       `json:"reviewed_tools,omitempty"`
 	Unmeasured       []string               `json:"unmeasured"`
+	// Warnings name requirements the source meets but this environment does
+	// not (they do not fail the check: a hosted restart can supply them).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func runAppMCPCLI(args []string, out io.Writer) error {
@@ -134,22 +135,15 @@ func reviewAppMCPSource(dir string) (*appMCPInspection, error) {
 		return nil, err
 	}
 	manifest.ExecutionSources = appMCPExecutionSourcesRuntime // review always writes the runtime-source form
-	// Bind the representation that will be written and loaded. YAML emits omitted
-	// optional slices as []; hashing the pre-serialization nil slices would seal
-	// JSON null instead and make our own output fail its strict source check.
-	serialized, err := yaml.Marshal(manifest)
+	// Bind the authored text: only the three review keys change in the written
+	// file (app_mcp_review_write.go), which is checked to decode to exactly this
+	// manifest, so integers, indentation and comments are kept and the strict
+	// source check below recomputes these digests from the written bytes.
+	contract, execution, err := appMCPDigests(dir, manifest)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err = parseAppMCPManifestForReview(serialized)
-	if err != nil {
-		return nil, err
-	}
-	manifest.ContractDigest, manifest.ExecutionDigest, err = appMCPDigests(dir, manifest)
-	if err != nil {
-		return nil, err
-	}
-	updated, err := yaml.Marshal(manifest)
+	updated, err := appMCPReviewedManifestBytes(data, contract, execution)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +202,18 @@ func inspectAppMCPSource(dir string) (report *appMCPInspection, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return inspectAppMCPSourceStaged(dir, config)
+	report, err = inspectAppMCPSourceStaged(dir, config)
+	if err != nil {
+		return nil, err
+	}
+	// The load of this source refuses to start without a durable key; say so
+	// here rather than after a deploy whose reload is refused.
+	if needed, _ := appMCPCommandNeeded(config); needed {
+		if has, known := appEnvironmentHasEncryptionKey(dir); known && !has {
+			report.Warnings = append(report.Warnings, appMCPCommandKeyMessage)
+		}
+	}
+	return report, nil
 }
 
 func validateAppMCPDeployableSources(dir string) error {
@@ -263,8 +268,14 @@ func validateAppMCPDeployableSources(dir string) error {
 }
 
 func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMCPInspection, err error) {
-	definitions, err := appMCPSchemaTableDefinitionsWithReader(func(name string) ([]byte, error) { return config.schemaSource(dir, name) })
+	readSchema := func(name string) ([]byte, error) { return config.schemaSource(dir, name) }
+	definitions, err := appMCPSchemaTableDefinitionsWithReader(readSchema)
 	if err != nil {
+		return nil, err
+	}
+	// Review, check and inspect refuse a dependency query whose result shape
+	// would fail every prepare (app_mcp_command_dependency_shape.go).
+	if err := appMCPCheckCommandDependencyShapes(readSchema, config.flows); err != nil {
 		return nil, err
 	}
 	tables := eligibleCRUDTables(definitions)
@@ -290,7 +301,9 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 			if len(tool.Handler.MembershipConstraints) > 0 {
 				handler["membership_constraints"] = tool.Handler.MembershipConstraints
 			}
-			report.ReviewedTools = append(report.ReviewedTools, map[string]any{"name": tool.Name, "description": tool.Description, "handler": handler, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema, "permissions": tool.Permissions, "effect": tool.Effect, "approval": tool.Approval, "idempotency": tool.Idempotency, "reconciliation": tool.Reconciliation, "output_projection": tool.Output.Include, "component": tool.Component})
+			reviewed := map[string]any{"name": tool.Name, "description": tool.Description, "handler": handler, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema, "permissions": tool.Permissions, "effect": tool.Effect, "approval": tool.Approval, "idempotency": tool.Idempotency, "reconciliation": tool.Reconciliation, "output_projection": tool.Output.Include, "component": tool.Component}
+			appMCPInspectReviewText(reviewed, tool)
+			report.ReviewedTools = append(report.ReviewedTools, reviewed)
 		}
 	}
 	names := make([]string, 0, len(tables))
@@ -298,6 +311,7 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	canonicalizeWorkflowTableNames(config.workflows, names)
 	app := &App{Dir: dir, Pages: pages, Paths: DiscoverAuthPaths(pages), Design: config.design, Flows: config.flows, Workflows: config.workflows, Hooks: config.hooks, MCP: config.mcp, sourceFiles: config.sourceFiles, Group: config.group, Access: config.access, routeEnv: map[string]string{}}
 	defer func() {
 		if recover() != nil {
@@ -469,4 +483,57 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 		report.Inventory[i].Source = filepath.ToSlash(report.Inventory[i].Source)
 	}
 	return report, nil
+}
+
+// appMCPInspectReviewText adds the reviewed text and layout a tool declares:
+// the approver's title, summary, labels and before/after pairs, the artifact
+// layout and a transfer binding. They are contract-digest content, so a
+// reviewer reading inspect must see them; keys appear only when declared, so
+// the output of a manifest without them is unchanged.
+func appMCPInspectReviewText(out map[string]any, tool AppMCPTool) {
+	if tool.Title != "" {
+		out["title"] = tool.Title
+	}
+	if tool.ReviewSummary != "" {
+		out["review_summary"] = tool.ReviewSummary
+	}
+	if len(tool.Labels) > 0 {
+		out["labels"] = tool.Labels
+	}
+	if len(tool.ReviewChanges) > 0 {
+		changes := make([]map[string]any, 0, len(tool.ReviewChanges))
+		for _, pair := range tool.ReviewChanges {
+			change := map[string]any{"before": pair.Before, "after": pair.After}
+			if pair.Field != "" {
+				change["field"] = pair.Field
+			}
+			if pair.Label != "" {
+				change["label"] = pair.Label
+			}
+			changes = append(changes, change)
+		}
+		out["review_changes"] = changes
+	}
+	if tool.Artifact != nil {
+		sheets := make([]map[string]any, 0, len(tool.Artifact.Sheets))
+		for _, sheet := range tool.Artifact.Sheets {
+			columns := make([]map[string]any, 0, len(sheet.Columns))
+			for _, column := range sheet.Columns {
+				entry := map[string]any{"field": column.Field, "label": column.Label}
+				if column.Format != "" {
+					entry["format"] = column.Format
+				}
+				columns = append(columns, entry)
+			}
+			entry := map[string]any{"name": sheet.Name, "columns": columns}
+			if sheet.Source != "" {
+				entry["source"] = sheet.Source
+			}
+			sheets = append(sheets, entry)
+		}
+		out["artifact"] = map[string]any{"title": tool.Artifact.Title, "formats": tool.Artifact.Formats, "sheets": sheets}
+	}
+	if tool.Transfer != nil {
+		out["transfer"] = tool.Transfer
+	}
 }

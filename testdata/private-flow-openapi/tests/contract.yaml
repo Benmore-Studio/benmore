@@ -1,0 +1,77 @@
+anonymous_export_denied:
+  steps:
+    - get: /api/_openapi
+      expect:
+        status: 401
+        headers: {Cache-Control: 'private, no-store'}
+user_export_denied:
+  as_user: user@contract.test
+  steps:
+    - get: /api/_openapi
+      expect: {status: 403}
+admin_private_export:
+  as_user: developer@contract.test
+  setup:
+    - sql: "UPDATE _benmore_users SET role='admin' WHERE id={{user_id}}"
+  steps:
+    - get: /api/_openapi
+      expect:
+        status: 200
+        headers: {Cache-Control: 'private, no-store'}
+        contains: ['"openapi":"3.1.0"', '"/api/contract/{ref_code}"', '"anyOf"', '"403"', '"in":"query"', '"in":"path"', '"requestBody"', '"flow_read"', '"flow_send"', '"in":"header","name":"Idempotency-Key","required":true,"schema":{"type":"string"}']
+        json:
+          paths./api/contract/{ref_code}.post.parameters[1].schema.pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+          paths./api/plain-contract.get.responses.200.content.text/plain.schema.type: string
+          paths./api/plain-contract.get.responses.200.content.application/json: null
+          paths./api/plain-contract.get.responses.500.content.text/plain.schema.type: string
+          paths./api/plain-contract.get.responses.500.content.application/json.schema.properties.error.type: string
+          paths./api/public-contract.post.security: []
+          paths./api/public-contract.post.requestBody.required: false
+          paths./api/public-contract.post.requestBody.content.application/x-www-form-urlencoded.schema.properties.code.maxLength: 12
+          paths./api/public-contract.post.responses.200.content.application/json.schema.properties.labels.maxItems: 3
+          paths./api/public-contract.post.responses.200.content.application/json.schema.properties.count.minimum: 1
+        not_contains: ['"/api/notes"', '"/api/notes/{id}"', '"/api/contract/{other_ref}"']
+    - get: /api/contract/REF-SYNTH
+      expect:
+        status: 200
+        contains: ['"rows":[]']
+    - api: POST /api/contract/REF-SYNTH
+      bearer: true
+      json: {label: Synthetic}
+      expect:
+        status: 200
+        contains: ['"accepted":true']
+    - get: /openapi.json
+      expect: {status: 404}
+    - get: /api/openapi.json
+      expect: {status: 404}
+    - get: /api/_docs
+      expect: {status: 404}
+    - get: /docs
+      expect: {status: 404}
+scoped_admin_export_denied:
+  as_user: scoped@contract.test
+  setup:
+    - sql: "UPDATE _benmore_users SET role='admin' WHERE id={{user_id}}"
+    - sql: "INSERT INTO _benmore_api_tokens (user_id,name,token_hash,scopes) VALUES ({{user_id}},'contract smoke','48ca77cf8c7d26483f3546e9606c67ccfbd8bca5a66538abe2a5347a6cfce5cb','notes:read')"
+  steps:
+    - set_auth: bmr_synthetic-contract-scoped-token
+    - get: /api/_openapi
+      expect: {status: 403}
+public_optional_body_media:
+  steps:
+    - api: POST /api/public-contract?code=ABC
+      expect: {status: 200}
+    - api: POST /api/public-contract
+      json: {code: ABC}
+      expect: {status: 200}
+    - api: POST /api/public-contract
+      data: {code: ABC}
+      expect: {status: 200}
+public_plaintext_response:
+  steps:
+    - get: /api/plain-contract
+      expect:
+        status: 200
+        contains: Ready
+        headers: {Content-Type: text/plain}

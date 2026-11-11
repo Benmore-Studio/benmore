@@ -1,0 +1,1 @@
+Everywhere benmore writes to an outbound HTTP endpoint that requires auth, the same primitive applies: (optional) fetch a token, compute derived values (hmac, hash, encoding), mutate request headers/query. Recipes ARE the per-protocol config - adding a new protocol is a YAML literal, not a framework change.

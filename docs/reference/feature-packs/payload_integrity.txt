@@ -1,0 +1,1 @@
+Declared file SHA-256 hashes are checked against the original archive bytes before route/model prefixes or exact maps rewrite them. A mismatch blocks both preview and apply before target source changes. Verified transformed bytes receive their own updated hashes; the original input manifest and payload remain unchanged.

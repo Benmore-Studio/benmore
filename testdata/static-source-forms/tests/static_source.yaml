@@ -1,0 +1,322 @@
+# Script source (.ts, .tsx, .jsx) and `run: compute` modules under static/ are
+# never served: not at /static/<path>, not at the URL-root alias /<path>, and
+# not under another spelling of either. A refused request gets the answer
+# /static/<path> gives, a plain 404, so the two forms cannot be told apart.
+# Compiled output and ordinary assets are served as before.
+#
+# The files: app.tsx imports lib/label.ts (browser code); flows/sign.yaml runs
+# server/sign.ts, which imports server/key.ts, and server/plain.js (server
+# code); widget.jsx is source nothing imports; assets/x.js and styles.css are
+# ordinary assets.
+#
+# Three expectations are written once and reused by alias:
+#   refused       the plain 404 /static/<path> answers with, no source text
+#   refused_head  the same for HEAD (no body to read)
+#   not_served    a 404 of either kind with no source text, for a spelling
+#                 that names the file only on a case-insensitive file system
+#
+# Byte ranges, conditional requests and a link inside static/ are covered by
+# the Go tests in static_source_url_forms_test.go (this runner sends no
+# request headers).
+
+# The control as it was: /static/<path>.
+source_is_refused_at_static:
+  anon: true
+  steps:
+    - {get: "/static/app.tsx", expect: &refused {status: 404, contains: "404 page not found", not_contains: ["SOURCE-ONLY", "SERVER-ONLY", "import ", "export "], headers: {Cache-Control: "no-store", Content-Type: "text/plain; charset=utf-8"}}}
+    - {get: "/static/lib/label.ts", expect: *refused}
+    - {get: "/static/widget.jsx", expect: *refused}
+    - {get: "/static/server/sign.ts", expect: *refused}
+    - {get: "/static/server/key.ts", expect: *refused}
+    - {get: "/static/server/sign.js", expect: *refused}
+    - {get: "/static/server/key.js", expect: *refused}
+    - {get: "/static/server/plain.js", expect: *refused}
+
+# The same files by their root alias, with the same answer.
+source_is_refused_at_the_url_root:
+  anon: true
+  steps:
+    - {get: "/app.tsx", expect: *refused}
+    - {get: "/lib/label.ts", expect: *refused}
+    - {get: "/widget.jsx", expect: *refused}
+    - {get: "/server/sign.ts", expect: *refused}
+    - {get: "/server/key.ts", expect: *refused}
+    - {get: "/server/sign.js", expect: *refused}
+    - {get: "/server/key.js", expect: *refused}
+    - {get: "/server/plain.js", expect: *refused}
+
+# HEAD says as little as GET.
+head_requests_are_refused:
+  anon: true
+  steps:
+    - {api: "HEAD /static/app.tsx", expect: &refused_head {status: 404, headers: {Cache-Control: "no-store", Content-Type: "text/plain; charset=utf-8"}}}
+    - {api: "HEAD /app.tsx", expect: *refused_head}
+    - {api: "HEAD /static/lib/label.ts", expect: *refused_head}
+    - {api: "HEAD /lib/label.ts", expect: *refused_head}
+    - {api: "HEAD /static/widget.jsx", expect: *refused_head}
+    - {api: "HEAD /widget.jsx", expect: *refused_head}
+    - {api: "HEAD /static/server/sign.ts", expect: *refused_head}
+    - {api: "HEAD /server/sign.ts", expect: *refused_head}
+    - {api: "HEAD /static/server/key.ts", expect: *refused_head}
+    - {api: "HEAD /server/key.ts", expect: *refused_head}
+    - {api: "HEAD /static/server/sign.js", expect: *refused_head}
+    - {api: "HEAD /server/sign.js", expect: *refused_head}
+    - {api: "HEAD /static/server/key.js", expect: *refused_head}
+    - {api: "HEAD /server/key.js", expect: *refused_head}
+    - {api: "HEAD /static/server/plain.js", expect: *refused_head}
+    - {api: "HEAD /server/plain.js", expect: *refused_head}
+
+# A trailing slash and a query string name the same file.
+trailing_slash_and_query_forms_are_refused:
+  anon: true
+  steps:
+    - {get: "/static/app.tsx/", expect: *refused}
+    - {get: "/static/app.tsx?download=1", expect: *refused}
+    - {get: "/static/app.tsx?v=0123456789ab", expect: *refused}
+    - {get: "/app.tsx/", expect: *refused}
+    - {get: "/app.tsx?download=1", expect: *refused}
+    - {get: "/app.tsx?v=0123456789ab", expect: *refused}
+    - {get: "/static/lib/label.ts/", expect: *refused}
+    - {get: "/static/lib/label.ts?download=1", expect: *refused}
+    - {get: "/static/lib/label.ts?v=0123456789ab", expect: *refused}
+    - {get: "/lib/label.ts/", expect: *refused}
+    - {get: "/lib/label.ts?download=1", expect: *refused}
+    - {get: "/lib/label.ts?v=0123456789ab", expect: *refused}
+    - {get: "/static/widget.jsx/", expect: *refused}
+    - {get: "/static/widget.jsx?download=1", expect: *refused}
+    - {get: "/static/widget.jsx?v=0123456789ab", expect: *refused}
+    - {get: "/widget.jsx/", expect: *refused}
+    - {get: "/widget.jsx?download=1", expect: *refused}
+    - {get: "/widget.jsx?v=0123456789ab", expect: *refused}
+    - {get: "/static/server/sign.ts/", expect: *refused}
+    - {get: "/static/server/sign.ts?download=1", expect: *refused}
+    - {get: "/static/server/sign.ts?v=0123456789ab", expect: *refused}
+    - {get: "/server/sign.ts/", expect: *refused}
+    - {get: "/server/sign.ts?download=1", expect: *refused}
+    - {get: "/server/sign.ts?v=0123456789ab", expect: *refused}
+    - {get: "/static/server/key.ts/", expect: *refused}
+    - {get: "/static/server/key.ts?download=1", expect: *refused}
+    - {get: "/static/server/key.ts?v=0123456789ab", expect: *refused}
+    - {get: "/server/key.ts/", expect: *refused}
+    - {get: "/server/key.ts?download=1", expect: *refused}
+    - {get: "/server/key.ts?v=0123456789ab", expect: *refused}
+    - {get: "/static/server/sign.js/", expect: *refused}
+    - {get: "/static/server/sign.js?download=1", expect: *refused}
+    - {get: "/static/server/sign.js?v=0123456789ab", expect: *refused}
+    - {get: "/server/sign.js/", expect: *refused}
+    - {get: "/server/sign.js?download=1", expect: *refused}
+    - {get: "/server/sign.js?v=0123456789ab", expect: *refused}
+    - {get: "/static/server/key.js/", expect: *refused}
+    - {get: "/static/server/key.js?download=1", expect: *refused}
+    - {get: "/static/server/key.js?v=0123456789ab", expect: *refused}
+    - {get: "/server/key.js/", expect: *refused}
+    - {get: "/server/key.js?download=1", expect: *refused}
+    - {get: "/server/key.js?v=0123456789ab", expect: *refused}
+    - {get: "/static/server/plain.js/", expect: *refused}
+    - {get: "/static/server/plain.js?download=1", expect: *refused}
+    - {get: "/static/server/plain.js?v=0123456789ab", expect: *refused}
+    - {get: "/server/plain.js/", expect: *refused}
+    - {get: "/server/plain.js?download=1", expect: *refused}
+    - {get: "/server/plain.js?v=0123456789ab", expect: *refused}
+
+# An encoded dot, slash or letter decodes to the same path.
+percent_encoded_forms_are_refused:
+  anon: true
+  steps:
+    - {get: "/static/app%2etsx", expect: *refused}
+    - {get: "/static/app.ts%78", expect: *refused}
+    - {get: "/app%2etsx", expect: *refused}
+    - {get: "/app.ts%78", expect: *refused}
+    - {get: "/static/lib/label%2ets", expect: *refused}
+    - {get: "/static/lib%2flabel.ts", expect: *refused}
+    - {get: "/static/lib/label.t%73", expect: *refused}
+    - {get: "/lib/label%2ets", expect: *refused}
+    - {get: "/lib%2flabel.ts", expect: *refused}
+    - {get: "/lib/label.t%73", expect: *refused}
+    - {get: "/static/widget%2ejsx", expect: *refused}
+    - {get: "/static/widget.js%78", expect: *refused}
+    - {get: "/widget%2ejsx", expect: *refused}
+    - {get: "/widget.js%78", expect: *refused}
+    - {get: "/static/server/sign%2ets", expect: *refused}
+    - {get: "/static/server%2fsign.ts", expect: *refused}
+    - {get: "/static/server/sign.t%73", expect: *refused}
+    - {get: "/server/sign%2ets", expect: *refused}
+    - {get: "/server%2fsign.ts", expect: *refused}
+    - {get: "/server/sign.t%73", expect: *refused}
+    - {get: "/static/server/key%2ets", expect: *refused}
+    - {get: "/static/server%2fkey.ts", expect: *refused}
+    - {get: "/static/server/key.t%73", expect: *refused}
+    - {get: "/server/key%2ets", expect: *refused}
+    - {get: "/server%2fkey.ts", expect: *refused}
+    - {get: "/server/key.t%73", expect: *refused}
+    - {get: "/static/server/sign%2ejs", expect: *refused}
+    - {get: "/static/server%2fsign.js", expect: *refused}
+    - {get: "/static/server/sign.j%73", expect: *refused}
+    - {get: "/server/sign%2ejs", expect: *refused}
+    - {get: "/server%2fsign.js", expect: *refused}
+    - {get: "/server/sign.j%73", expect: *refused}
+    - {get: "/static/server/key%2ejs", expect: *refused}
+    - {get: "/static/server%2fkey.js", expect: *refused}
+    - {get: "/static/server/key.j%73", expect: *refused}
+    - {get: "/server/key%2ejs", expect: *refused}
+    - {get: "/server%2fkey.js", expect: *refused}
+    - {get: "/server/key.j%73", expect: *refused}
+    - {get: "/static/server/plain%2ejs", expect: *refused}
+    - {get: "/static/server%2fplain.js", expect: *refused}
+    - {get: "/static/server/plain.j%73", expect: *refused}
+    - {get: "/server/plain%2ejs", expect: *refused}
+    - {get: "/server%2fplain.js", expect: *refused}
+    - {get: "/server/plain.j%73", expect: *refused}
+
+# A case-insensitive file system opens server/key.ts as SERVER/KEY.TS, and as
+# server/key.t%C5%BF (U+017F, the long s, folds to s). Where a spelling names
+# no file at all (a case-sensitive file system) the answer is that form's
+# ordinary 404; either way nothing is served.
+case_variants_are_refused:
+  anon: true
+  steps:
+    - {get: "/static/app.TSX", expect: *refused}
+    - {get: "/static/APP.TSX", expect: *refused}
+    - {get: "/app.TSX", expect: *refused}
+    - {get: "/APP.TSX", expect: *refused}
+    - {get: "/static/lib/label.TS", expect: *refused}
+    - {get: "/static/LIB/LABEL.TS", expect: *refused}
+    - {get: "/lib/label.TS", expect: *refused}
+    - {get: "/LIB/LABEL.TS", expect: *refused}
+    - {get: "/static/widget.JSX", expect: *refused}
+    - {get: "/static/WIDGET.JSX", expect: *refused}
+    - {get: "/widget.JSX", expect: *refused}
+    - {get: "/WIDGET.JSX", expect: *refused}
+    - {get: "/static/server/sign.TS", expect: *refused}
+    - {get: "/static/SERVER/SIGN.TS", expect: *refused}
+    - {get: "/server/sign.TS", expect: *refused}
+    - {get: "/SERVER/SIGN.TS", expect: *refused}
+    - {get: "/static/server/key.TS", expect: *refused}
+    - {get: "/static/SERVER/KEY.TS", expect: *refused}
+    - {get: "/server/key.TS", expect: *refused}
+    - {get: "/SERVER/KEY.TS", expect: *refused}
+    - {get: "/static/app.t%C5%BFx", expect: *refused}
+    - {get: "/app.t%C5%BFx", expect: *refused}
+    - {get: "/static/lib/label.t%C5%BF", expect: *refused}
+    - {get: "/lib/label.t%C5%BF", expect: *refused}
+    - {get: "/static/widget.j%C5%BFx", expect: *refused}
+    - {get: "/widget.j%C5%BFx", expect: *refused}
+    - {get: "/static/server/key.t%C5%BF", expect: *refused}
+    - {get: "/server/key.t%C5%BF", expect: *refused}
+    - {get: "/static/LIB/label.ts", expect: &not_served {status: 404, not_contains: ["SOURCE-ONLY", "SERVER-ONLY", "import ", "export "]}}
+    - {get: "/LIB/label.ts", expect: *not_served}
+    - {get: "/static/SERVER/sign.ts", expect: *not_served}
+    - {get: "/SERVER/sign.ts", expect: *not_served}
+    - {get: "/static/SERVER/key.ts", expect: *not_served}
+    - {get: "/SERVER/key.ts", expect: *not_served}
+    - {get: "/static/SERVER/sign.js", expect: *not_served}
+    - {get: "/static/SERVER/SIGN.JS", expect: *not_served}
+    - {get: "/static/server/sign.JS", expect: *not_served}
+    - {get: "/SERVER/sign.js", expect: *not_served}
+    - {get: "/SERVER/SIGN.JS", expect: *not_served}
+    - {get: "/server/sign.JS", expect: *not_served}
+    - {get: "/static/SERVER/key.js", expect: *not_served}
+    - {get: "/static/SERVER/KEY.JS", expect: *not_served}
+    - {get: "/static/server/key.JS", expect: *not_served}
+    - {get: "/SERVER/key.js", expect: *not_served}
+    - {get: "/SERVER/KEY.JS", expect: *not_served}
+    - {get: "/server/key.JS", expect: *not_served}
+    - {get: "/static/SERVER/plain.js", expect: *not_served}
+    - {get: "/static/SERVER/PLAIN.JS", expect: *not_served}
+    - {get: "/static/server/plain.JS", expect: *not_served}
+    - {get: "/SERVER/plain.js", expect: *not_served}
+    - {get: "/SERVER/PLAIN.JS", expect: *not_served}
+    - {get: "/server/plain.JS", expect: *not_served}
+    - {get: "/static/%C5%BFerver/key.js", expect: *not_served}
+    - {get: "/%C5%BFerver/key.js", expect: *not_served}
+    - {get: "/static/server/%C5%BFign.js", expect: *not_served}
+    - {get: "/server/%C5%BFign.js", expect: *not_served}
+    - {get: "/static/%C5%BFerver/plain.js", expect: *not_served}
+    - {get: "/%C5%BFerver/plain.js", expect: *not_served}
+
+# Double slashes and dot segments are redirected to the clean path, which is
+# refused above; a backslash is not a path separator.
+rewritten_paths_are_not_served:
+  anon: true
+  steps:
+    - {get: "/static/server//key.ts", expect: {status: 307, redirect: "/static/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/server//key.ts", expect: {status: 307, redirect: "/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/static/server/./key.ts", expect: {status: 307, redirect: "/static/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/server/./key.ts", expect: {status: 307, redirect: "/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/static/x/../server/key.ts", expect: {status: 307, redirect: "/static/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/x/../server/key.ts", expect: {status: 307, redirect: "/server/key.ts", not_contains: "SERVER-ONLY"}}
+    - {get: "/static/server%5ckey.ts", expect: *not_served}
+    - {get: "/server%5ckey.ts", expect: *not_served}
+
+# What stays served, exactly as before: the compiled bundle under /static/
+# only, ordinary files at both forms, pages, and the compute flow itself.
+compiled_output_and_assets_are_served:
+  anon: true
+  steps:
+    - get: "/static/app.js"
+      expect:
+        status: 200
+        contains: "browser bundle text"
+        not_contains: ["SERVER-ONLY", "signed:"]
+        headers:
+          Content-Type: "application/javascript; charset=utf-8"
+    - get: "/static/lib/label.js"
+      expect:
+        status: 200
+        contains: "browser bundle text"
+    - get: "/static/assets/x.js"
+      expect:
+        status: 200
+        contains: "ordinary root-relative script"
+    - get: "/assets/x.js"
+      expect:
+        status: 200
+        contains: "ordinary root-relative script"
+    - get: "/assets%2fx.js"
+      expect:
+        status: 200
+        contains: "ordinary root-relative script"
+    - api: "HEAD /assets/x.js"
+      expect:
+        status: 200
+    - get: "/static/styles.css"
+      expect:
+        status: 200
+        contains: "ordinary stylesheet"
+    - get: "/styles.css"
+      expect:
+        status: 200
+        contains: "ordinary stylesheet"
+    - get: "/styles.css?v=1"
+      expect:
+        status: 200
+        contains: "ordinary stylesheet"
+    - get: "/"
+      expect:
+        status: 200
+        contains: "source forms home"
+    - get: "/index.html"
+      expect:
+        status: 200
+        contains: "source forms home"
+    # A client route falls back to the page; a missing asset does not.
+    - get: "/some/client/route"
+      expect:
+        status: 200
+        contains: "source forms home"
+    - get: "/assets/missing.js"
+      expect:
+        status: 404
+    # Compiled output is served under /static/ only.
+    - get: "/app.js"
+      expect:
+        status: 404
+        not_contains: "browser bundle text"
+    - get: "/lib/label.js"
+      expect:
+        status: 404
+    # The compute modules still run; what a flow returns is the app's choice.
+    - get: "/api/sign"
+      expect:
+        status: 200
+        contains: "signed:SERVER-ONLY-KEY"

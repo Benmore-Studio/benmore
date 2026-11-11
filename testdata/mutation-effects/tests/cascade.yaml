@@ -1,0 +1,35 @@
+# A soft-deleted parent takes its live children with it in the same
+# transaction; the children's hook jobs are queued before the parent's.
+soft_delete_cascades_with_effects_in_order:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO folders (id, name, user_id) VALUES (7001, 'f-parent', {{user_id}})"
+    - sql: "INSERT INTO pages (id, name, folder_id, user_id) VALUES (7002, 'p-child', 7001, {{user_id}})"
+  steps:
+    - api: "DELETE /api/folders/7001"
+      json: {}
+      expect: {status: 200}
+    - sql: "SELECT id FROM pages WHERE id = 7002 AND deleted_at IS NOT NULL"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action = 'delete' AND ((table_name = 'folders' AND row_id = '7001') OR (table_name = 'pages' AND row_id = '7002'))"
+      expect: {rows: 2}
+    - sql: "SELECT c.id FROM _benmore_jobs c, _benmore_jobs p WHERE c.payload LIKE '%p-child%' AND p.payload LIKE '%f-parent%' AND c.id < p.id"
+      expect: {rows: 1}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'delete' AND ref IN ('f-parent', 'p-child')"
+      expect: {rows: 2}
+
+parent_delete_fails_when_a_child_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+    - sql: "INSERT INTO folders (id, name, user_id) VALUES (7101, 'f-ok', {{user_id}})"
+    - sql: "INSERT INTO pages (id, name, folder_id, user_id) VALUES (7102, 'jobfail-child', 7101, {{user_id}})"
+  steps:
+    - api: "DELETE /api/folders/7101"
+      json: {}
+      expect: {status: 500}
+    - sql: "SELECT id FROM folders WHERE id = 7101 AND deleted_at IS NULL"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM pages WHERE id = 7102 AND deleted_at IS NULL"
+      expect: {rows: 1}

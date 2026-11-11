@@ -1,0 +1,20 @@
+# The write gate refuses this file (tests/expected-failures.txt): `user_id` is
+# a reserved identity name. A deployed copy still loads, and the step does not
+# queue the key.
+on:
+  request:
+    method: POST
+    path: /api/enqueue-identity
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: q
+        run: enqueue
+        with:
+          flow: job_writes_identity
+          with:
+            label: "enq"
+            user_id: "${{ params.victim }}"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

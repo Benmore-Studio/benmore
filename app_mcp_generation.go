@@ -346,6 +346,100 @@ func snapshotAppMCPGeneration(app *App) *appMCPRuntimeGeneration {
 	return appMCPGenerationFromAppLocked(app)
 }
 
+// realtimePolicySnapshot captures the immutable policy view used for one
+// realtime fan-out. The atomic publication keeps the inline dispatch path
+// lock-free when its caller already holds app.mu. Directly assembled test
+// fixtures fall back to a nonblocking read lock; an unpublished fixture with
+// a contended lock has no safe snapshot and must fail closed.
+func realtimePolicySnapshot(app *App) *App {
+	if app == nil {
+		return nil
+	}
+	if view := app.realtimePolicyView.Load(); view != nil {
+		return view
+	}
+	if !app.mu.TryRLock() {
+		return nil
+	}
+	defer app.mu.RUnlock()
+	if app.mcpGeneration != nil {
+		return app.mcpGeneration.view
+	}
+	return realtimePolicyViewFromAppLocked(app)
+}
+
+// realtimePolicyViewFromAppLocked copies only the fields used to classify
+// realtime audiences and authorize table reads. Directly assembled App
+// fixtures may update unrelated fields such as Hooks and Flows without using
+// app.mu; copying those fields here would race even though realtime delivery
+// never reads them.
+func realtimePolicyViewFromAppLocked(app *App) *App {
+	if app == nil {
+		return nil
+	}
+	tables := make([]Table, len(app.Tables))
+	for i, table := range app.Tables {
+		tables[i] = table
+		tables[i].Columns = append([]Column(nil), table.Columns...)
+	}
+	var group *GroupConfig
+	if app.Group != nil {
+		copyGroup := *app.Group
+		copyGroup.Shared = append([]string(nil), app.Group.Shared...)
+		if app.Group.Bootstrap != nil {
+			bootstrap := *app.Group.Bootstrap
+			copyGroup.Bootstrap = &bootstrap
+		}
+		group = &copyGroup
+	}
+	var roles *RolesConfig
+	if app.Roles != nil {
+		copyRoles := *app.Roles
+		copyRoles.Roles = make(map[string]RoleDef, len(app.Roles.Roles))
+		for name, role := range app.Roles.Roles {
+			role.Inherits = append([]string(nil), role.Inherits...)
+			copyRoles.Roles[name] = role
+		}
+		copyRoles.accessTables = make(map[string]bool, len(app.Roles.accessTables))
+		for table, allowed := range app.Roles.accessTables {
+			copyRoles.accessTables[table] = allowed
+		}
+		roles = &copyRoles
+	}
+	var access *AccessConfig
+	if app.Access != nil {
+		copyAccess := &AccessConfig{rolesDeclared: app.Access.rolesDeclared, rules: make(map[string]map[AccessOp]string, len(app.Access.rules))}
+		for table, rules := range app.Access.rules {
+			copyRules := make(map[AccessOp]string, len(rules))
+			for op, mode := range rules {
+				copyRules[op] = mode
+			}
+			copyAccess.rules[table] = copyRules
+		}
+		access = copyAccess
+	}
+	joins := make(JoinMap, len(app.JoinMap))
+	for table, foreignKeys := range app.JoinMap {
+		copyForeignKeys := make(map[string]ForeignKey, len(foreignKeys))
+		for column, foreignKey := range foreignKeys {
+			copyForeignKeys[column] = foreignKey
+		}
+		joins[table] = copyForeignKeys
+	}
+	return &App{DB: app.DB, Tables: tables, Group: group, Roles: roles, Access: access, JoinMap: joins}
+}
+
+// publishAppMCPRuntimeGeneration must be called while app.mu is held, except
+// during cold load before the App is published to other goroutines.
+func publishAppMCPRuntimeGeneration(app *App, generation *appMCPRuntimeGeneration) {
+	app.mcpGeneration = generation
+	if generation == nil {
+		app.realtimePolicyView.Store(nil)
+		return
+	}
+	app.realtimePolicyView.Store(generation.view)
+}
+
 func appMCPGenerationCurrent(origin *App, generation *appMCPRuntimeGeneration) bool {
 	if origin == nil || generation == nil || generation.origin != origin {
 		return false

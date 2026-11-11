@@ -1,0 +1,4 @@
+# Keep the delivery log 90 days.
+messages:
+  ttl: 90d
+  column: created_at

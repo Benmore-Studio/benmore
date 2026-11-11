@@ -1,0 +1,1 @@
+TOTP-based two-factor auth with backup codes. Two flows: voluntary enrollment by a signed-in user, OR mandatory enrollment at login for selected roles via `auth.require_mfa_for_roles` (the user can't get a full session until they enroll, and sessions and API tokens the account already holds stop working until it does; see existing_credentials).

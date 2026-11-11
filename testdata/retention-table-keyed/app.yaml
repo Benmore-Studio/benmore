@@ -1,0 +1,8 @@
+# retention.yaml in this app is keyed by table name instead of being a
+# `policies:` list. That form is read as no policy: nothing is deleted, the
+# source check carries a warning with the corrected file (not an error, so
+# `benmore test`, a push and a deploy all go through), and the admin health
+# report lists "retention.yaml: no policy is running".
+site_name: "Retention table-keyed fixture"
+auth:
+  identifier: email

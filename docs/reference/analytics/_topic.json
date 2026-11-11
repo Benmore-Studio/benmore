@@ -1,0 +1,11 @@
+{
+  "keys": [
+    "cli",
+    "summary",
+    "endpoints",
+    "storage",
+    "limits",
+    "banner_opt_out",
+    "consent_banner"
+  ]
+}

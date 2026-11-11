@@ -1,0 +1,1 @@
+`expect_rows` (step root, or under `with:`) is checked on a sql_dynamic step too: against the statement as rendered - rows returned for a SELECT or a RETURNING write, rows affected for any other write. A rendered statement with no row count (DDL, a mix of statements) refuses to run. See api({at:'flows'}) → gotchas.

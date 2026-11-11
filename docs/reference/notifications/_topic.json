@@ -1,0 +1,17 @@
+{
+  "keys": [
+    "retention",
+    "session_boundary",
+    "live_delivery",
+    "summary",
+    "flow_step",
+    "flow_sql_insert",
+    "link_safety",
+    "endpoints",
+    "credentials",
+    "missing_recipient",
+    "hook_keys",
+    "hook_example",
+    "js_snippet"
+  ]
+}

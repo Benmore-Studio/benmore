@@ -17,7 +17,7 @@ import (
 const appMCPExecutionSourcesRuntime = "runtime"
 
 // Top-level files a loader reads by name (stageRuntimeConfig and the loaders
-// it feeds, LoadSeeds for `reset-seed`, the favicon route, and the app's own
+// it feeds, readTenantSeeds for the resets, the favicon route, and the app's own
 // tsconfig.json/package.json, which the captured browser/compute builds plant
 // beside the sources). Root *.html files are pages (loadPagesFromSources).
 var appMCPRuntimeRootFiles = map[string]bool{

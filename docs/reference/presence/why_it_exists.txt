@@ -1,0 +1,1 @@
+A chat, a live document and a huddle all need the same heartbeat, pagehide leave and server sweep; only the slug differs.

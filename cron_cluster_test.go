@@ -34,3 +34,22 @@ func TestCronIntervalJobFiresOnceAcrossSchedulersSharingADatabase(t *testing.T) 
 		t.Fatalf("next interval fire missing: %d fires", fires)
 	}
 }
+
+// last_fire only moves forward: a sibling whose clock runs behind cannot
+// write an older fire over a newer one (and re-fire an every job early).
+func TestPersistCronFireIsMonotonic(t *testing.T) {
+	app := newJobsTestApp(t)
+	if err := ensureCronStateTable(app); err != nil {
+		t.Fatal(err)
+	}
+	newer := time.Date(2026, 11, 9, 12, 15, 0, 0, time.UTC)
+	persistCronFire(app, "digest", newer)
+	persistCronFire(app, "digest", newer.Add(-10*time.Minute))
+	var got string
+	if err := app.DB.QueryRow("SELECT last_fire FROM _benmore_cron_state WHERE job_id = 'digest'").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != newer.Format(time.RFC3339) {
+		t.Fatalf("last_fire = %s, want %s", got, newer.Format(time.RFC3339))
+	}
+}

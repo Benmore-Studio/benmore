@@ -1,0 +1,6 @@
+[
+  "Password policy: 8-128 characters with at least one uppercase letter (A-Z) and one special character (ASCII punctuation such as !@#$%^&*). Lowercase letters and digits are not required. A JSON request gets 400 {ok:false, error} naming the rule; a form post is redirected back with ?error=.",
+  "Brute-force protection: 5 failed login attempts → 15 min lockout per email",
+  "Session cookie is HttpOnly - JS cannot read it. Don't try.",
+  "For non-browser clients, exchange creds for a Bearer token at POST /api/_auth/token. Bearer auth doesn't need CSRF. An account with an active MFA factor also sends `mfa_code` (api({at:'mfa'}) endpoints)."
+]

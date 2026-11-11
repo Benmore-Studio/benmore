@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestAutoRestoreFromBackup_RecoversCorrupt verifies the v2.7.8
@@ -23,7 +24,8 @@ func TestAutoRestoreFromBackup_RecoversCorrupt(t *testing.T) {
 	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		t.Fatalf("mkdir backups: %v", err)
 	}
-	healthyPath := filepath.Join(backupDir, "pre-migrate-20260101T000000Z.db")
+	// A recent snapshot: auto-recovery refuses ones older than autoRestoreMaxAge.
+	healthyPath := filepath.Join(backupDir, "pre-migrate-"+time.Now().UTC().Add(-time.Hour).Format("20060102T150405Z")+".db")
 	// Use the real OpenDB to write a healthy file with our schema.
 	{
 		// Temporarily route OpenDB to this backup path by using its
@@ -75,7 +77,7 @@ func TestAutoRestoreFromBackup_RecoversCorrupt(t *testing.T) {
 
 	// Verify the corrupt original was moved (not deleted) so a
 	// human can post-mortem it.
-	entries, _ := os.ReadDir(dir)
+	entries, _ := os.ReadDir(filepath.Join(dir, backupDirName)) // with the snapshots, not next to data.db
 	foundCorrupt := false
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "data.db.corrupt-") {

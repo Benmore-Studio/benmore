@@ -1,0 +1,6 @@
+[
+  "api({at:'frontend'}) - TSX stack, query_tags, gotmpl_queries, ssr_page_gates, ssr_mustache_escaping, partials",
+  "api({at:'csrf'})",
+  "api({at:'encryption'}) authored_page_queries - masking in page SQL",
+  "api({at:'pdf'}) - GET /pdf/<page> renders a page the same way"
+]

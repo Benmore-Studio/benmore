@@ -1,0 +1,98 @@
+# No mcp.yaml: static/ is served from the directory. This pins what such an
+# app answers for the path forms its reviewed twin
+# (testdata/static-paths-reviewed) must also answer.
+#
+# `benmore test` serves the app in development mode, where a file read from
+# the directory carries no cache headers at all (a compiled bundle does). The
+# headers a served app sends (public, no-cache; immutable for the page's ?v=)
+# are pinned by the Go test TestOrdinaryAppStaticServingIsUnchanged.
+
+root_relative_files_are_served_from_static:
+  anon: true
+  steps:
+    - get: "/assets/x.js"
+      expect:
+        status: 200
+        contains: "root-relative script"
+        headers:
+          Cache-Control: ""
+          CDN-Cache-Control: ""
+    - get: "/assets/x.css"
+      expect:
+        status: 200
+        contains: "root-relative stylesheet"
+        headers:
+          Cache-Control: ""
+    - get: "/styles.css"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+    - get: "/static/assets/x.js"
+      expect:
+        status: 200
+        contains: "root-relative script"
+        headers:
+          Cache-Control: ""
+    - get: "/assets/missing.js"
+      expect:
+        status: 404
+    - get: "/static/app.tsx"
+      expect:
+        status: 404
+
+page_versions_name_the_served_bytes:
+  anon: true
+  steps:
+    - get: "/"
+      expect:
+        status: 200
+        contains:
+          - "static paths home"
+          - "shared head partial"
+          - "/static/styles.css?v=031c63c03f66"
+          - "/static/app.js?v="
+        not_contains: "<include"
+        headers:
+          Cache-Control: "no-store"
+    - get: "/guide/"
+      expect:
+        status: 200
+        contains:
+          - "static paths guide"
+          - "shared head partial"
+          - "/static/styles.css?v=031c63c03f66"
+        not_contains: "<include"
+    - get: "/static/styles.css?v=031c63c03f66"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+        headers:
+          Cache-Control: ""
+          CDN-Cache-Control: ""
+    - get: "/static/styles.css"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+        headers:
+          Cache-Control: ""
+    - get: "/static/styles.css?v=000000000000"
+      expect:
+        status: 200
+        headers:
+          Cache-Control: ""
+    # The script version covers the whole static/ tree and the framework
+    # release, so it cannot be written down here (the Go tests follow it from
+    # the page). Other spellings revalidate.
+    - get: "/static/app.js"
+      expect:
+        status: 200
+        contains: "static paths bundle"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/static/app.js?v=000000000000"
+      expect:
+        status: 200
+        contains: "static paths bundle"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"

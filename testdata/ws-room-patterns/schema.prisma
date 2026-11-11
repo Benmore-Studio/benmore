@@ -1,0 +1,7 @@
+model RoomMember {
+  id       Int @id @default(autoincrement())
+  roomId   Int @map("room_id")
+  memberId Int @map("member_id")
+
+  @@map("room_members")
+}

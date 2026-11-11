@@ -1,0 +1,1 @@
+GET /api/notes?page=2&per_page=20  → {data: [...rows], page: 2, per_page: 20, total: 32}; total counts the rows the same filters and scope match. The envelope comes with `page`: `per_page` alone, `limit`/`offset` and a plain list answer a bare row array.

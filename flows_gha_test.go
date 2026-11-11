@@ -261,6 +261,9 @@ jobs:
 	if flows[0].Trigger.Cron != "*/5 * * * *" {
 		t.Errorf("cron expression = %q", flows[0].Trigger.Cron)
 	}
+	if flows[0].Transaction {
+		t.Error("schedule transaction should default to false")
+	}
 }
 
 func TestLoadFlowsGHA_EventTrigger(t *testing.T) {
@@ -506,7 +509,7 @@ func TestTranslateGHAExpr_FirstAlias(t *testing.T) {
 // TestLoadFlowsGHA_APIJSONNestedArrays asserts that the GHA loader preserves
 // nested arrays/objects in a `run: api` step's `with.json` block instead of
 // flattening them to a map[string]string. This is the regression test for
-// benmore-go #94 (Modern Treasury routing_details / account_details arrays).
+// (Modern Treasury routing_details / account_details arrays).
 func TestLoadFlowsGHA_APIJSONNestedArrays(t *testing.T) {
 	dir := t.TempDir()
 	yamlBody := `
@@ -621,7 +624,7 @@ jobs:
 }
 
 // TestLoadFlowsGHA_APITimeout pins the two parser gaps from issue #221
-// (blitz-meter flows/messages.yaml): (1) `timeout:` under `with:` on a
+// (a hosted app's flows/messages.yaml): (1) `timeout:` under `with:` on a
 // `run: api` step was never mapped into FlowStep.Timeout, so execStepAPI
 // silently kept its 30s default in both directions (570s didn't extend
 // it, 3s didn't cut it); (2) a step carrying an `if:` gate was wrapped
@@ -639,7 +642,7 @@ on:
 jobs:
   messages:
     steps:
-      # if-gated api step with with.timeout (the blitz-meter shape)
+      # if-gated api step with with.timeout (that app's shape)
       - id: call
         if: ${{ params.xbeta }} == ''
         run: api

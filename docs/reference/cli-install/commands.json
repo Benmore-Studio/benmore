@@ -1,0 +1,4 @@
+[
+  "brew install Benmore-Studio/benmore/benmore-cli",
+  "curl -fsSL https://benmore.ai/install-cli.sh | sh"
+]

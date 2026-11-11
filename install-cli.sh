@@ -77,10 +77,18 @@ elif [ -z "$bundle_url" ]; then
   say "warning: release $tag has no Sigstore bundle; skipped signature verification"
 else
   curl -fsSL -o "$tmp/checksums.txt.sigstore.json" "$bundle_url" || die "download failed: $bundle_url"
-  cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity-regexp '^https://github\.com/ric897/benmore-go/\.github/workflows/release-cli\.yml@refs/tags/cli-v' \
-    "$tmp/checksums.txt" >/dev/null 2>&1 || die "signature verification of checksums.txt failed"
+  # Releases signed by cosign 3 write the protobuf bundle format, which cosign
+  # 2.4-2.x reads only with --new-bundle-format (cosign 3 reads both and has no
+  # such flag). The second attempt only changes how the bundle is parsed; a bad
+  # signature fails both.
+  verify_bundle() {
+    cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" "$@" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp '^https://github\.com/ric897/benmore-go/\.github/workflows/release-cli\.yml@refs/tags/cli-v' \
+      "$tmp/checksums.txt" >/dev/null 2>&1
+  }
+  verify_bundle || verify_bundle --new-bundle-format ||
+    die "signature verification of checksums.txt failed (cosign older than 2.4 cannot read this release's bundle; upgrade cosign)"
   say "verified Sigstore signature of checksums.txt"
 fi
 expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$tmp/checksums.txt")

@@ -1,0 +1,9 @@
+# hooks.yaml - text on a data event. `when:` is usually
+# load-bearing: without it every insert texts someone, and every send
+# costs money.
+on_insert:
+  messages:
+    - sms:
+        to: "{{recipient}}"
+        body: "{{sms_body}}"
+      when: "channel = 'sms'"

@@ -35,30 +35,20 @@ import (
 
 var errTenantDBRedirected = errors.New("database path leads to another file (symlink); refusing to open it")
 
-// foreignAppDirs is set in a process that loads apps from directories owned
-// by other accounts: the hosted router, which checks, backs up and queries
-// every tenant's app. There an app's database is the data.db in its own
-// directory and nothing else. The app's environment does not get to name
-// another file (DATABASE_URL is for a process that runs one app as itself),
-// and the file is opened as openTenantDB opens it.
+// foreignAppDirs is set in a process that works on app directories owned by
+// other accounts: the hosted router, the tenant file helper (which runs as
+// the app's user but keeps these conservative paths) and the tenant-data
+// lock canary. Such a process reads an app's files only through checked
+// opens, and it never loads an app or opens its database for a load
+// (errForeignAppLoad): the app's own process does that, and the router asks
+// it over the data channel.
 var foreignAppDirs atomic.Bool
 
-// openForeignAppDB is openDBWithPolicyLock for such a process. Repairing or
-// restoring a damaged database is left to the app's own process, which does
-// it at boot with the same code and owns the files.
-func openForeignAppDB(dir string, appEnv map[string]string) (*sql.DB, error) {
-	cfg := buildDBOpenConfigWithEnv(dir, "", appEnv)
-	db, err := openTenantDB(cfg.DriverName, filepath.Join(dir, "data.db"), cfg.DSN)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
-	}
-	applyAppDBPoolLimits(db, currentAppDBPoolLimits())
-	return db, nil
-}
+// errForeignAppLoad refuses an app load (and the database open and
+// pre-migrate snapshot that come with it) in a foreignAppDirs process. The
+// router's last such load, check_app's validation load, now runs in the
+// app's own process (data channel op check_live).
+var errForeignAppLoad = errors.New("this process does not own the app's directory, so it does not load the app or open its database for it; the app's own process does (the router asks it over the data channel)")
 
 // tenantDBConnector opens connections with a registered SQLite driver and
 // accepts each one only if the file it opened is want.
@@ -99,8 +89,12 @@ func canonicalTenantDBPath(dbPath string) (string, error) {
 
 // openTenantDB is sql.Open for a database inside a tenant's directory: dsn is
 // the data source name for dbPath. Every connection of the returned pool is
-// checked (tenantDBConnector).
+// checked (tenantDBConnector). With the router tenant-data lock on, the
+// hosted router refuses before touching the file (refuseRouterTenantData).
 func openTenantDB(driverName, dbPath, dsn string) (*sql.DB, error) {
+	if err := refuseRouterTenantData(dbPath); err != nil {
+		return nil, err
+	}
 	want, err := canonicalTenantDBPath(dbPath)
 	if err != nil {
 		return nil, err
@@ -114,13 +108,35 @@ func openTenantDB(driverName, dbPath, dsn string) (*sql.DB, error) {
 	return sql.OpenDB(&tenantDBConnector{drv: drv, dsn: dsn, want: want}), nil
 }
 
-// foreignDirBackupDatabase is backupDatabase for a process that does not own
-// the directory (the router's pre-deploy snapshot and its check load): it
-// snapshots an instance's data.db into that instance's .benmore/backups. The
-// source is opened as openTenantDB opens it, and the snapshot reaches the
-// backup directory through directory handles (treeDir), so neither a linked
-// data.db nor a linked .benmore or backups directory can make the router read
-// or write another app's files.
+// openForeignBackupDir opens an instance's existing .benmore/backups through
+// directory handles (treeDir): every component must be a real directory of
+// the one above it, never a link. Used where a foreignAppDirs process lists
+// or prunes snapshots, so a tenant cannot point its backups at another app's.
+func openForeignBackupDir(dir string) (*treeDir, error) {
+	cur, err := openTreeDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, part := range strings.Split(backupDirName, "/") {
+		next, err := cur.openDir(part)
+		cur.Close()
+		if err != nil {
+			return nil, err
+		}
+		cur = next
+	}
+	return cur, nil
+}
+
+// foreignDirBackupDatabase snapshots an instance's data.db into that
+// instance's .benmore/backups for the tenant file helper's backup-local (the
+// pre-deploy snapshot), its only caller: the helper runs as the app's user
+// but keeps the foreignAppDirs paths. The source is opened as openTenantDB
+// opens it, and the snapshot reaches the backup directory through directory
+// handles (treeDir), so neither a linked data.db nor a linked .benmore or
+// backups directory can make it read or write another app's files. The
+// router never snapshots an app itself (backupDatabase refuses in a
+// foreignAppDirs process).
 func foreignDirBackupDatabase(dir string) (string, error) {
 	path, err := foreignDirBackup(dir)
 	if err != nil || path == "" {
@@ -167,11 +183,24 @@ func foreignDirBackup(dir string) (string, error) {
 		return "", err
 	}
 	defer top.Close()
+	// Under the tenant-data lock (tenant_data_lock_marker.go) the snapshot and
+	// a backups directory made here are the app account's alone; .benmore
+	// itself keeps the group mode (the router reads its env and secret).
+	locked := tenantDataLockedFor(dir)
+	fileMode := os.FileMode(backupPermission)
+	if locked {
+		fileMode = 0o600
+	}
 	backups := top
-	for _, part := range strings.Split(backupDirName, "/") {
+	parts := strings.Split(backupDirName, "/")
+	for i, part := range parts {
+		dirMode := backupDirMode
+		if locked && i == len(parts)-1 {
+			dirMode = 0o700
+		}
 		created := false
 		if _, err := backups.lstat(part); errors.Is(err, fs.ErrNotExist) {
-			if err := backups.root.Mkdir(part, backupDirMode.Perm()); err != nil && !errors.Is(err, fs.ErrExist) {
+			if err := backups.root.Mkdir(part, dirMode.Perm()); err != nil && !errors.Is(err, fs.ErrExist) {
 				return "", fmt.Errorf("create backup dir: %w", err)
 			}
 			created = true
@@ -188,7 +217,7 @@ func foreignDirBackup(dir string) (string, error) {
 			// The app's own process must be able to write here too; set the
 			// mode on the directory just opened, not on its name.
 			if handle, err := backups.root.Open("."); err == nil {
-				err = handle.Chmod(backupDirMode)
+				err = handle.Chmod(dirMode)
 				handle.Close()
 				if err != nil {
 					backups.Close()
@@ -207,13 +236,13 @@ func foreignDirBackup(dir string) (string, error) {
 		if n > 0 {
 			final = fmt.Sprintf("%s-%d-%d.db", name, os.Getpid(), n)
 		}
-		out, err = backups.root.OpenFile(final, os.O_WRONLY|os.O_CREATE|os.O_EXCL, backupPermission)
+		out, err = backups.root.OpenFile(final, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileMode)
 		if err != nil && (!errors.Is(err, fs.ErrExist) || n > 100) {
 			return "", fmt.Errorf("create backup: %w", err)
 		}
 	}
 	_, err = io.Copy(out, in)
-	if err = errors.Join(err, out.Chmod(backupPermission), out.Close()); err != nil {
+	if err = errors.Join(err, out.Chmod(fileMode), out.Close()); err != nil {
 		_ = backups.root.Remove(final)
 		return "", fmt.Errorf("write backup: %w", err)
 	}

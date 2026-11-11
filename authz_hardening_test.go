@@ -21,6 +21,7 @@ func authzApp(t *testing.T) *App {
 	app, cleanup := newTestApp(t)
 	t.Cleanup(cleanup)
 	EnsureSessionsTable(app.DB)
+	EnsureAuditLogTable(app.DB)
 	if err := EnsureUsersTable(app.DB); err != nil {
 		t.Fatalf("EnsureUsersTable: %v", err)
 	}
@@ -324,7 +325,7 @@ func TestIncludeChildrenCappedAndAudited(t *testing.T) {
 
 	rows := []map[string]any{{"id": int64(1)}, {"id": int64(2)}}
 	session := &Session{UserID: 7, Email: "v@example.com"}
-	ResolveIncludes(app, "projects", rows, "tasks", session)
+	ResolveIncludes(app, nil, "projects", rows, "tasks", session)
 
 	big, _ := rows[0]["tasks"].([]map[string]any)
 	if len(big) != maxIncludeChildrenPerParent {

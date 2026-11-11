@@ -37,14 +37,16 @@ func TestScopeOwnerHoldsAcrossOr(t *testing.T) {
 	}
 }
 
-// Shapes the rewrite can't scope with certainty are refused, not guessed at.
+// Shapes the rewrite can't scope with certainty are refused, not guessed at:
+// the render fails (the page answers 500), it never shows the rows.
 func TestScopeOwnerRefusesCompoundQueries(t *testing.T) {
 	app := ssrTestApp(t)
 	crudScopeMustExec(t, app.DB, `INSERT INTO notes (user_id, title, body) VALUES (2, 'b', 'bob-b')`)
 	page := &Page{Route: "/u", Scope: "owner", RawHTML: `<query sql="SELECT body FROM notes WHERE user_id = 1 UNION SELECT body FROM notes" as="rows">{{#rows}}<li>{{body}}</li>{{/rows}}</query>`}
-	out := ownerScopeRows(t, app, page, &Session{UserID: 1})
-	if strings.Contains(out, "bob-b") || !strings.Contains(out, "benmore-error") {
-		t.Fatalf("compound query under scope=owner must render an error, got: %s", out)
+	ctx := &RenderContext{Data: map[string]any{}, User: &Session{UserID: 1}, App: app, Page: page}
+	out, err := RenderTemplate(app, page, ctx)
+	if err == nil || !strings.Contains(err.Error(), "compound") || strings.Contains(out, "bob-b") {
+		t.Fatalf("compound query under scope=owner must fail the render, got %q, %v", out, err)
 	}
 }
 

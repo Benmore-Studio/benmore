@@ -77,7 +77,7 @@ func RegisterI18nRoutes(mux appRouteRegistrar, app *App) {
 				return
 			}
 		}
-		httpJSON(w, http.StatusNotFound, map[string]string{"error": "language_not_found"})
+		httpJSON(w, http.StatusNotFound, withRefusalDocs(map[string]any{"error": "language_not_found"}, "language_not_found"))
 	})
 }
 

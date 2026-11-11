@@ -1,0 +1,5 @@
+[
+  "GET    /api/_auth/act_as                                       → { role, group_id, acting_as_group, effective_group, bypass }",
+  "POST   /api/_auth/act_as  { group_id: \"7\", password: \"<admin>\" } → admin-only. REQUIRES the admin's password as re-auth (same shape as /impersonate) so a stolen cookie alone can't start step-in. Validates the tenant exists, persists on the session row, audit-logs `act_as_start`, answers { status: 'acting_as', acting_as_group }.",
+  "DELETE /api/_auth/act_as                                       → any signed-in session that holds a step-in (not admin-only, so an account that lost admin can still step out); CSRF, no re-auth (exiting only RESTORES the admin's bypass, which a cookie-thief already has). Clears, audit-logs `act_as_end`, answers { status: 'cleared' }; { status: 'already_cleared' } when there is nothing to clear."
+]
