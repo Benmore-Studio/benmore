@@ -1,0 +1,8 @@
+[
+  "User POSTs password to /api/_auth/token (or /login). Role is in auth.require_mfa_for_roles.",
+  "Response is 200 { mfa_setup_required: true, setup_token, user_id, email, role, message } - NO session token yet.",
+  "SPA posts to /api/_auth/mfa/setup with header `X-MFA-Setup-Token: <setup_token>` - returns secret/otpauth_uri/backup_codes.",
+  "User scans QR, types code, SPA posts to /api/_auth/mfa/verify with the same header - returns { token, user_id, email, status: 'mfa_enabled' } AND sets the session cookie. From now on the user is fully signed in; future logins use the regular MFA-challenge path.",
+  "Browser variant (POST /login, and POST /signup for a new account whose role is listed): the framework sets a short-lived `_benmore_mfa_setup` HMAC cookie (named `__Host-_benmore_mfa_setup` over HTTPS, like the OTP, MFA-step and OAuth-state cookies, so a sibling subdomain cannot plant one) and sends the person to auth.mfa_setup_redirect (default /mfa-setup): a 303 for a form post, 200 {ok: true, mfa_setup_required: true, redirect} for a JSON request (no setup_token in the body). The setup page calls the same /setup + /verify endpoints - the cookie is the auth proof, no header or password needed (bm.mfa.enroll() then bm.mfa.verify(code)).",
+  "With auth.otp: true the emailed code comes first: /login routes to the OTP page, and only a correct POST to the OTP verify path sets `_benmore_mfa_setup` and redirects to auth.mfa_setup_redirect (no session yet). /api/_auth/token refuses OTP apps, so the API variant is unavailable there."
+]

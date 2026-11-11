@@ -112,7 +112,8 @@ func TestEditorGeneratedMutationAndHistoryTypes(t *testing.T) {
 		"versions(id: number | string): Promise<VersionHistory>;",
 		"revertTo(id: number | string, version: number): Promise<RevertReceipt>;",
 		"_version: number;", "_valid_from: string;", "_valid_to: string | null;", "_changed_by: number | null;", "_change_type: string;",
-		"versions: VersionMetadata[];", "reverted_to_version: string;", "owned_fields_kept: string[] | null;",
+		"versions: VersionMetadata[];", "reverted_to_version: string;", "owned_fields_kept: string[] | null;", "kept: RevertKeptColumn[];",
+		"reason: 'command_owned' | 'workflow_state' | 'protected' | 'hidden' | 'not_in_version';",
 	} {
 		if !strings.Contains(output, contract) {
 			t.Errorf("generated declaration missing actual wire contract: %s", contract)

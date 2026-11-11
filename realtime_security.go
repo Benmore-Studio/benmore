@@ -136,8 +136,15 @@ func (p realtimePrincipal) revalidate() (*Session, bool) {
 }
 
 func (p realtimePrincipal) canRead(table string, userID int64) bool {
+	return p.canReadWithPolicy(realtimePolicySnapshot(p.app), table, userID)
+}
+
+// canReadWithPolicy authorizes against the immutable policy generation captured
+// for one fan-out. Credential revalidation continues against the live app so
+// revocation, expiry, role changes and tenant switches remain current.
+func (p realtimePrincipal) canReadWithPolicy(policyView *App, table string, userID int64) bool {
 	session, valid := p.current()
-	if !valid || p.app == nil {
+	if !valid || p.app == nil || policyView == nil {
 		return false
 	}
 	if table == notificationsTable {
@@ -148,6 +155,6 @@ func (p realtimePrincipal) canRead(table string, userID int64) bool {
 	if table == presenceTable {
 		return session != nil
 	}
-	return SessionCanAccessTable(p.app, table, OpRead, session) &&
+	return SessionCanAccessTable(policyView, table, OpRead, session) &&
 		(session == nil || checkScope(session, table, "read") == nil)
 }

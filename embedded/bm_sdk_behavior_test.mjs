@@ -7,6 +7,7 @@
 // fetch dedupe, stale-time hit/miss, optimistic mutate rollback, and
 // invalidate / invalidateTable targeting.
 
+import fs from 'node:fs';
 import bm from './bm.js';
 
 let failures = 0;
@@ -342,6 +343,190 @@ await section('sdk: an id encoded as one segment still cannot be a dot segment',
     Object.assign(bm.api, real);
     globalThis.fetch = realFetch;
     if (!hadDocument) delete globalThis.document;
+  }
+});
+
+// Fixture fetch: answers each path from `routes` (a function of the request,
+// or a [status, body] pair) and records every non-registry request.
+function mockFetch(routes) {
+  const seen = [];
+  const realFetch = globalThis.fetch;
+  const hadDocument = 'document' in globalThis;
+  const previousDocument = globalThis.document;
+  if (!hadDocument) globalThis.document = { querySelector: () => null };
+  globalThis.fetch = async (p, init = {}) => {
+    const path = String(p);
+    if (path !== '/_internal/flows.json') seen.push(`${init.method || 'GET'} ${path}`);
+    const route = routes[path.split('?')[0]];
+    const [status, data] = typeof route === 'function' ? route(path, init) : (route || [404, { error: 'not found' }]);
+    const body = JSON.stringify(data);
+    return { ok: status < 300, status, headers: { get: () => 'application/json' }, text: async () => body, json: async () => JSON.parse(body) };
+  };
+  return {
+    seen,
+    restore() {
+      globalThis.fetch = realFetch;
+      if (!hadDocument) delete globalThis.document;
+      else globalThis.document = previousDocument;
+    },
+  };
+}
+
+await section('flows: camelCase, kebab and snake spellings reach a kebab-named flow file', async () => {
+  // flows/save-quote.yaml registers as saveQuote (bm_types.go flowSDKName).
+  const registry = { saveQuote: { path: '/api/quote', method: 'POST', inputs: { hours: { type: 'number' } } } };
+  const m = mockFetch({ '/_internal/flows.json': [200, registry], '/api/quote': [200, { total: 120 }] });
+  try {
+    for (const name of ['saveQuote', 'save-quote', 'save_quote']) {
+      m.seen.length = 0;
+      const res = await bm.flows[name]({}, { hours: 2 });
+      ok(res && res.total === 120 && m.seen.join() === 'POST /api/quote', `bm.flows.${name} sent ${m.seen.join(' ')}`);
+    }
+    let msg = '';
+    try { await bm.flows.saveQuotes({}); } catch (e) { msg = e.message; }
+    ok(msg.includes('bm.flows.saveQuote()'), 'unknown flow error should list the callable spelling: ' + msg);
+    let threw = false;
+    try { await bm.flows.constructor({}); } catch (_) { threw = true; }
+    ok(threw, 'a prototype key resolved as a flow');
+
+    // FlowForm (sdui) resolves the same spellings.
+    const src = fs.readFileSync(new URL('./sdui.js', import.meta.url), 'utf8')
+      .replace("import bm from 'bm';", `import bm from ${JSON.stringify(new URL('./bm.js', import.meta.url).href)};`);
+    const hadDocument = 'document' in globalThis, prev = globalThis.document;
+    delete globalThis.document; // ensureStyles is a no-op without a DOM
+    try {
+      const { FlowForm } = await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'));
+      for (const flow of ['save-quote', 'saveQuote']) {
+        const form = { addEventListener() {}, querySelectorAll: () => [] };
+        const target = { innerHTML: '', querySelector: (s) => (s === 'form' ? form : null) };
+        let err = null;
+        try { await FlowForm(target, { flow }); } catch (e) { err = e; }
+        ok(!err && target.innerHTML.includes('name="hours"'), `FlowForm({flow:'${flow}'}) did not render the flow's inputs: ${err && err.message}`);
+      }
+    } finally {
+      if (hadDocument) globalThis.document = prev;
+    }
+  } finally {
+    m.restore();
+  }
+});
+
+await section('errors: a JSON error explains itself through message and keeps its code', async () => {
+  const registry = { saveQuote: { path: '/api/quote', method: 'POST', inputs: {} } };
+  const m = mockFetch({
+    '/_internal/flows.json': [200, registry],
+    '/api/notes': [403, { error: 'forbidden', message: 'You can read notes but not create them.' }],
+    '/api/quote': [500, { error: 'flow_no_response', message: '2 of 2 steps ran and none responded' }],
+    '/api/plain': [400, { error: 'No fields to update' }],
+  });
+  try {
+    let e = null;
+    try { await bm.api.post('/api/notes', { title: 'x' }); } catch (x) { e = x; }
+    ok(e && e.message === 'You can read notes but not create them.' && e.code === 'forbidden' && e.status === 403,
+      `refused write: message=${e && e.message} code=${e && e.code} status=${e && e.status}`);
+    e = null;
+    try { await bm.flows.saveQuote({}); } catch (x) { e = x; }
+    ok(e && e.message === '2 of 2 steps ran and none responded' && e.code === 'flow_no_response',
+      `failed flow: message=${e && e.message} code=${e && e.code}`);
+    e = null;
+    try { await bm.api.patch('/api/plain', {}); } catch (x) { e = x; }
+    ok(e && e.message === 'No fields to update' && e.code === 'No fields to update', `error-only body: ${e && e.message}`);
+    e = null;
+    try { await bm.api.get('/api/missing'); } catch (x) { e = x; }
+    ok(e && e.message === 'not found' && e.status === 404, `404: ${e && e.message}`);
+  } finally {
+    m.restore();
+  }
+});
+
+await section('errors: a failed answer that is not JSON never becomes a page-long message', async () => {
+  const realFetch = globalThis.fetch;
+  const page = '<!DOCTYPE html><html><head><title>Not Found</title></head><body><h1>Not Found</h1>' + 'x'.repeat(500) + '</body></html>';
+  const answers = {
+    '/verify-mfa': [404, 'text/html; charset=utf-8', page],
+    '/login': [404, 'text/html', page],
+    '/api/plain': [429, 'text/plain; charset=utf-8', 'rate limited\n'],
+    '/api/long': [500, 'text/plain', 'y'.repeat(300)],
+    '/api/badjson': [502, 'application/json', '<html>Bad gateway</html>'],
+  };
+  const hadDocument = 'document' in globalThis;
+  if (!hadDocument) globalThis.document = { querySelector: () => null };
+  globalThis.fetch = async (path) => {
+    const [status, type, text] = answers[path];
+    return { ok: false, status, headers: { get: () => type }, text: async () => text };
+  };
+  try {
+    let e = null;
+    try { await bm.api.get('/verify-mfa'); } catch (x) { e = x; }
+    ok(e && e.message === 'Request failed (HTTP 404)' && e.status === 404 && e.body && e.body.body === page,
+      `HTML 404: message=${e && String(e.message).slice(0, 80)} body kept=${!!(e && e.body && e.body.body === page)}`);
+    const raw = await bm.api.raw.get('/verify-mfa');
+    ok(raw.data && raw.data.error === 'Request failed (HTTP 404)' && raw.data.body === page, 'raw result carries the HTML as data.error');
+    e = null;
+    try { await bm.auth.signIn('a@b.test', 'pw'); } catch (x) { e = x; }
+    ok(e && e.message === 'Request failed (HTTP 404)', `signIn shows the page: ${e && String(e.message).slice(0, 80)}`);
+    e = null;
+    try { await bm.api.get('/api/plain'); } catch (x) { e = x; }
+    ok(e && e.message === 'rate limited' && e.body.body === 'rate limited\n', `short plain text: ${e && e.message}`);
+    e = null;
+    try { await bm.api.get('/api/long'); } catch (x) { e = x; }
+    ok(e && e.message === 'Request failed (HTTP 500)', `long plain text: ${e && String(e.message).slice(0, 40)}`);
+    e = null;
+    try { await bm.api.get('/api/badjson'); } catch (x) { e = x; }
+    ok(e && e.message === 'Request failed (HTTP 502)' && e.body.body === '<html>Bad gateway</html>', `unparseable JSON error: ${e && e.message}`);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (!hadDocument) delete globalThis.document;
+  }
+});
+
+await section('table.list: REST options are sent under their REST names; unknown keys warn', async () => {
+  const m = mockFetch({ '/api/bookings': [200, { data: [{ id: 1 }], total: 1, page: 2, per_page: 10 }] });
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(' '));
+  try {
+    const rows = await bm.table('bookings').list({
+      orderBy: 'starts_at:asc', include: ['client', 'service'], fields: 'id,starts_at', page: 2, per_page: 10, where: { status: 'open' },
+    });
+    ok(Array.isArray(rows) && rows.length === 1, 'page envelope rows were not unwrapped');
+    const q = new URL(m.seen[0].split(' ')[1], 'https://fixture.example').searchParams;
+    for (const [k, v] of [['orderBy', 'starts_at:asc'], ['include', 'client,service'], ['fields', 'id,starts_at'], ['page', '2'], ['per_page', '10'], ['status', 'open']]) {
+      ok(q.get(k) === v, `list() sent ${k}=${q.get(k)}, want ${v} (${m.seen[0]})`);
+    }
+    ok(warnings.length === 0, 'known options warned: ' + warnings.join(' | '));
+    // A filter written at the top level never reaches the server: say so, once.
+    m.seen.length = 0;
+    await bm.table('bookings').list({ status: 'open' });
+    await bm.table('bookings').list({ status: 'open' });
+    ok(!m.seen[0].includes('status='), 'top-level filter was sent anyway');
+    ok(warnings.length === 1 && warnings[0].includes('"status"') && warnings[0].includes('where'), 'unknown option did not warn once: ' + warnings.join(' | '));
+  } finally {
+    console.warn = realWarn;
+    m.restore();
+  }
+});
+
+await section('workflow: current() reads the workflow field; available()/transitionTo() pass the wire shapes', async () => {
+  const m = mockFetch({
+    // A workflow on a field named neither state nor status.
+    '/api/orders/7/transitions': [200, { current: 'packed', transitions: [{ to: 'shipped', role: 'staff' }] }],
+    '/api/orders/7': [200, { id: 7, stage: 'packed' }],
+    '/api/orders/7/transition': [200, { status: 'transitioned', from: 'packed', to: 'shipped', id: '7' }],
+    // Anonymous reader: /transitions needs a session, the row is public.
+    '/api/orders/8/transitions': [401, { error: 'authentication required' }],
+    '/api/orders/8': [200, { id: 8, status: 'open' }],
+  });
+  try {
+    const wf = bm.workflow('orders', 7);
+    ok(await wf.current() === 'packed', 'current() missed a workflow field not named state/status');
+    const avail = await wf.available();
+    ok(avail.current === 'packed' && avail.transitions[0].to === 'shipped', 'available() shape changed: ' + JSON.stringify(avail));
+    const moved = await wf.transitionTo('shipped');
+    ok(moved.status === 'transitioned' && moved.to === 'shipped' && moved.id === '7', 'transitionTo() shape changed: ' + JSON.stringify(moved));
+    ok(await bm.workflow('orders', 8).current() === 'open', 'anonymous current() lost the row fallback');
+  } finally {
+    m.restore();
   }
 });
 

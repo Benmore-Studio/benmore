@@ -50,7 +50,7 @@ func AlterColumnType(db *sql.DB, table, column, newType string) error {
 // tables require an explicit migration: DROP TABLE can execute ON DELETE
 // actions even inside a transaction, so refuse before any DDL or copying.
 func rebuildTable(db *sql.DB, table string, transform func(Column) *Column) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "table rebuild "+table), nil)
 	if err != nil {
 		return err
 	}
@@ -426,16 +426,13 @@ func runMigrationDataCtx(ctx context.Context, db *sql.DB, data []byte, name, rec
 	// Legacy migration files without a `-- DOWN --` marker still run
 	// in full via extractMigrationSection's fallback (returns the
 	// whole body as UP).
-	upSQL, _ := extractMigrationSection(string(data))
-
-	statements := splitStatements(upSQL)
 	// Apply every statement in the file inside ONE transaction so a mid-file
 	// failure rolls the whole file back instead of committing a partial prefix.
 	// Without this, a file that failed on statement N left 1..N-1 committed but
 	// unrecorded, so the next boot re-ran from the top and the already-applied
 	// prefix errored ("duplicate column") forever - a wedged, half-migrated
 	// schema. Rolling back on failure means a retry always starts clean.
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(withLongWriteTx(ctx, "user migration "+name), nil)
 	if err != nil {
 		return fmt.Errorf("begin migration tx: %w", err)
 	}
@@ -445,7 +442,37 @@ func runMigrationDataCtx(ctx context.Context, db *sql.DB, data []byte, name, rec
 			_ = tx.Rollback()
 		}
 	}()
-	for _, stmt := range statements {
+	if err := runMigrationStatementsTx(ctx, tx, data); err != nil {
+		return err
+	}
+	// Record inside the SAME tx: apply + record are atomic, so a crash between
+	// them can no longer leave an applied-but-unrecorded file that re-runs.
+	if _, err := tx.ExecContext(ctx, recordSQL, name); err != nil {
+		return fmt.Errorf("record migration %s: %w", name, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// migrationStatementError is a failed migration statement: its text reads as
+// err's, and Statement carries the whole statement for whoever reports it.
+type migrationStatementError struct {
+	Statement string
+	err       error
+}
+
+func (e *migrationStatementError) Error() string { return e.err.Error() }
+func (e *migrationStatementError) Unwrap() error { return e.err }
+
+// runMigrationStatementsTx runs a migration file's UP section in tx. The
+// runner and the write-time dry run (migration_dry_run.go) share it, so they
+// agree on which statements run and which failures are tolerated.
+func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) error {
+	upSQL, _ := extractMigrationSection(string(data))
+	for _, stmt := range splitStatements(upSQL) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
@@ -453,8 +480,11 @@ func runMigrationDataCtx(ctx context.Context, db *sql.DB, data []byte, name, rec
 		// SQLite itself checks UNIQUE in this transaction. A separate GROUP BY
 		// preflight treats NULL as duplicate, misses partial/collated semantics,
 		// and cannot see a dedupe performed by preceding migration statements.
+		if err := refuseAuditTableStatement(tx, stmt); err != nil { // audit_append_only.go
+			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
+		}
 		if err := dropFrameworkIndexesForStatement(tx, stmt); err != nil { // scoping_indexes.go
-			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)
+			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
 		}
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			// Idempotency: if the desired change is ALREADY present (the column /
@@ -480,18 +510,9 @@ func runMigrationDataCtx(ctx context.Context, db *sql.DB, data []byte, name, rec
 				log.Printf("  migration: skipping already-applied rename (%v)", err)
 				continue
 			}
-			return fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)
+			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
 		}
 	}
-	// Record inside the SAME tx: apply + record are atomic, so a crash between
-	// them can no longer leave an applied-but-unrecorded file that re-runs.
-	if _, err := tx.ExecContext(ctx, recordSQL, name); err != nil {
-		return fmt.Errorf("record migration %s: %w", name, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migration: %w", err)
-	}
-	committed = true
 	return nil
 }
 
@@ -556,6 +577,11 @@ func runMigrationsCtxFromSources(ctx context.Context, db *sql.DB, dir string, be
 
 		data, err := readMigrationSource(dir, n, captured)
 		if err == nil {
+			// A file that drops data gets the line a destructive generated
+			// migration prints, so the log says what the reload deleted.
+			if drops, dropErr := migrationDataDrops(db, string(data)); dropErr == nil && len(drops) > 0 {
+				log.Printf("DESTRUCTIVE MIGRATION %s: %s", n, strings.Join(drops, ", "))
+			}
 			err = runMigrationDataCtx(ctx, db, data, n, recordSQL)
 		}
 		if err != nil {
@@ -612,7 +638,8 @@ func runUserMigrationsFromSources(ctx context.Context, db *sql.DB, dir string, c
 		if checkOnly && recentPreMigrateBackup(dir, checkBackupMinInterval) {
 			return nil
 		}
-		_, err := preparePreMigrationBackup(dir, true)
+		path, err := preparePreMigrationBackup(dir, true)
+		noteLoadSnapshot(ctx, path) // the loader restores it if the load's integrity_check fails
 		return err
 	}, captured)
 }

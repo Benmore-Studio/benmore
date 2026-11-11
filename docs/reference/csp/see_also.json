@@ -1,0 +1,4 @@
+[
+  "api({at:'frontend'}) - the static/TSX stack and what's loaded from /_internal by default",
+  "Extensions land at csp = <defaults> + <your additions>."
+]

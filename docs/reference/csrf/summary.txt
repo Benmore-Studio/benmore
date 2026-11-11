@@ -1,0 +1,1 @@
+Same-origin CSRF for cookie sessions. HMAC-derived, stateless, 24h validity. Bearer-auth requests are exempt. The runtime auto-injects BOTH the meta tag AND a hidden _csrf input into every POST form - vanilla-HTML apps work with zero JS.

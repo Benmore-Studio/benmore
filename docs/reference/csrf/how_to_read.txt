@@ -1,0 +1,1 @@
+Read the auto-injected <meta name='csrf-token' content='X'> tag, or GET /api/_csrf for a fresh token. For native HTML forms (no JS), the framework also auto-injects <input type='hidden' name='_csrf' value='…'> into every <form method='POST'> in served static HTML - you don't have to add it yourself.

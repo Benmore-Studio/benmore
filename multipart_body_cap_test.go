@@ -15,7 +15,7 @@ import (
 func TestMultipartCreateBodyHasTotalCap(t *testing.T) {
 	app, mux := auditApp(t)
 	sid := createCrudScopeSession(t, app, "writer@example.com", "user", "", "")
-	handler := serverBodyLimitMiddleware(mux, app)
+	handler := serverBodyLimitMiddleware(mux, app, nil)
 
 	post := func(parts int, size int) *httptest.ResponseRecorder {
 		var body bytes.Buffer

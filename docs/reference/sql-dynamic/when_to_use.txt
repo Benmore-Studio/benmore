@@ -1,0 +1,1 @@
+ONLY when the SQL is assembled by a trusted internal caller - typically your own AI agent flow, or admin tooling that constructs queries from a controlled grammar. NEVER point sql_dynamic at user-typed input.

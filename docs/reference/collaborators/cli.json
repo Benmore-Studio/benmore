@@ -1,0 +1,9 @@
+[
+  "benmore collaborators <app>                  # the owner and the collaborators: email, role, status (pending or active), invited_by, invited_at",
+  "benmore collaborators <app> add <email>      # owner: invite as editor (a viewer invite: invite_collaborator with role 'viewer', or the dashboard)",
+  "benmore collaborators <app> remove <email>   # owner: withdraw the invite or the access",
+  "benmore transfer-ownership <app> <email>     # owner: start an ownership transfer to that account. A transfer moves the whole app, dev and prod together: --env is accepted and changes nothing",
+  "benmore transfers                            # transfers waiting for the signed-in account: subdomain, name, from_email, created_at, expires_at",
+  "benmore transfer-ownership [app] --accept    # recipient: accept; the app may be left out when exactly one transfer is waiting",
+  "benmore transfer-ownership <app> --cancel    # owner or recipient: cancel the pending transfer (the app is required)"
+]

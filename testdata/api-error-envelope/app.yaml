@@ -1,0 +1,3 @@
+site_name: "api-error-envelope"
+auth:
+  identifier: email

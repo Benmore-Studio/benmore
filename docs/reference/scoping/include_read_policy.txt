@@ -1,0 +1,1 @@
+Relationship includes apply the target table's normal read access and scope policy. Anonymous reads can include related rows only when that target explicitly allows anonymous reads; signed-in/public distinctions match direct CRUD reads.

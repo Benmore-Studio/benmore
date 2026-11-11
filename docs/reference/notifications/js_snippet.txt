@@ -1,0 +1,11 @@
+async function refreshInbox() {
+  const { unread } = await fetch('/api/_notifications/count',
+    { credentials: 'same-origin' }).then(r => r.json());
+  document.getElementById('badge').textContent = unread || '';
+}
+
+// SSE invalidation - framework events are NAMED 'change' (onmessage misses them).
+new EventSource('/sse/events').addEventListener('change', ev => {
+  const msg = JSON.parse(ev.data);
+  if (msg.table === '_benmore_notifications') refreshInbox();
+});

@@ -1,0 +1,1 @@
+`bytes` and `sha256` on the create request both describe the bytes the CLIENT UPLOADS - for a gzipped file, the COMPRESSED bytes, never the decompressed stream. A client that hashes the decompressed data only finds out it guessed wrong after every row has already loaded into an open transaction, which then rolls back.

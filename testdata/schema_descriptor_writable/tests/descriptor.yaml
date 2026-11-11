@@ -1,0 +1,84 @@
+# /api/_schema and the OpenAPI request schemas describe what a create or a
+# PATCH really stores (round 2026-11-09 data F5). Run: benmore test <dir> --app
+
+computed_columns_are_not_writable:
+  as_user: "computed@test.com"
+  steps:
+    # The write path drops a computed column and says so.
+    - api: "POST /api/orders"
+      json: {title: "two at 2.50", qty: 2, unit_price: 2.5, line_total: 999}
+      save: {oid: "id"}
+      expect:
+        status: 200
+        headers: {X-Stripped-Fields: "line_total"}
+        contains: '"line_total":5'
+    - api: "POST /api/orders"
+      json: {title: "aggregate", item_count: 77}
+      expect:
+        status: 200
+        headers: {X-Stripped-Fields: "item_count"}
+        contains: '"item_count":0'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {line_total: 999}
+      expect:
+        status: 400
+        contains: "No fields to update"
+    # So the descriptor must not offer them to a form.
+    - get: "/api/_schema"
+      expect:
+        status: 200
+        contains:
+          - '"name":"line_total","required":false,"type":"REAL","writable":false'
+          - '"name":"item_count","required":false,"type":"INTEGER","writable":false'
+          - '"name":"title","required":true,"type":"TEXT","writable":true'
+          - '"name":"qty","required":false,"type":"INTEGER","writable":true'
+
+workflow_state_is_not_writable:
+  as_user: "state@test.com"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "starts as a draft", status: "approved"}
+      save: {oid: "id"}
+      expect:
+        status: 200
+        headers: {X-Stripped-Fields: "status"}
+        contains: '"status":"draft"'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {status: "approved"}
+      expect:
+        status: 400
+        contains: "No fields to update"
+    - get: "/api/_schema"
+      expect:
+        status: 200
+        contains: '"name":"status","required":false,"type":"TEXT","writable":false'
+
+custom_field_is_writable_and_listed:
+  as_user: "custom@test.com"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/_schema/orders/fields"
+      json: {name: "cf_ref", type: "TEXT"}
+      bearer: true
+      expect: {status_in: [201, 409]}
+    - api: "POST /api/orders"
+      json: {title: "with a custom field", cf_ref: "R-1"}
+      save: {oid: "id"}
+      expect: {status: 200, contains: '"cf_ref":"R-1"'}
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {cf_ref: "R-2"}
+      expect: {status: 200}
+    - get: "/api/orders/{{oid}}"
+      expect: {status: 200, contains: '"cf_ref":"R-2"'}
+    - get: "/api/_schema"
+      expect:
+        status: 200
+        contains: '"name":"cf_ref","required":false,"type":"TEXT","writable":true'
+    # The create schema refuses unknown properties: it lists the custom field
+    # and the plain columns, and none of line_total, item_count, status,
+    # user_id or the timestamps.
+    - get: "/api/_openapi"
+      bearer: true
+      expect:
+        status: 200
+        contains: '"CreateOrder":{"additionalProperties":false,"properties":{"cf_ref":{"type":["string","null"]},"note":{"type":["string","null"]},"qty":{"type":"integer"},"tax_id":{"type":["string","null"]},"title":{"type":"string"},"unit_price":{"type":"number"}},"required":["title"],"type":"object"}'

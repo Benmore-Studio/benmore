@@ -1,0 +1,16 @@
+{
+  "keys": [
+    "summary",
+    "when",
+    "files",
+    "page_settings",
+    "page_values",
+    "appearance",
+    "mustache",
+    "query_tags",
+    "gotmpl",
+    "forms",
+    "pipes",
+    "see_also"
+  ]
+}

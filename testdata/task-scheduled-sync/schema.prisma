@@ -1,0 +1,17 @@
+model Product {
+  id         Int    @id @default(autoincrement())
+  externalId String @unique @map("external_id")    // the supplier's id: the upsert key
+  name       String
+  priceCents Int    @default(0) @map("price_cents")
+  syncedAt   String @default("") @map("synced_at")  // the run that last saw it
+  @@map("products")
+}
+
+model SyncRun {
+  id      Int    @id @default(autoincrement())
+  firedAt String @map("fired_at")
+  pages   Int
+  items   Int
+  stored  Int
+  @@map("sync_runs")
+}

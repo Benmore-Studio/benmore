@@ -1,0 +1,3 @@
+site_name: "workflow-same-table-refused"
+auth:
+  identifier: email

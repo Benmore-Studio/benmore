@@ -1,0 +1,1 @@
+GET /api/_query/views, POST /api/_query/views {name, spec}, DELETE /api/_query/views/{id} - persist specs per user (the SavedViews component). The writes need the CSRF token from a cookie session and none from a Bearer-only request.

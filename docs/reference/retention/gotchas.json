@@ -1,0 +1,4 @@
+[
+  "Deletion is permanent and there is no dry run. Before adding a policy to a table that already holds old rows, count what the first sweep takes: `SELECT COUNT(*) FROM events WHERE julianday(created_at) < julianday('now', '-90 days')`.",
+  "Prove a policy in a YAML test: seed an old row in `setup:`, run one sweep with the step `flush: retention`, and assert the row is gone (api({at:'verification'}) flush_steps). A policy whose `table` or `column` names nothing in the schema is refused when the file is written and deletes nothing."
+]

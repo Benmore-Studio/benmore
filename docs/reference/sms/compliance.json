@@ -1,0 +1,5 @@
+[
+  "COLLECT CONSENT: a phone-auth app must show consent language at the point of number entry - e.g. 'I agree to receive one-time passcodes and account notification texts. Msg&data rates may apply. Reply STOP to unsubscribe, HELP for help.' The platform's carrier registration depends on hosted apps doing this.",
+  "STOP/HELP keywords are handled automatically at the carrier level; opted-out recipients are refused.",
+  "Transactional content ONLY from the shared number - no marketing/promotional SMS."
+]

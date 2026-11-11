@@ -1,0 +1,32 @@
+# #915 B-F11: the confirmation link is spent only in the transaction that
+# applies the change. A failed update (here a trigger standing in for a
+# concurrent sign-up taking the address) must leave the link usable.
+failed_update_keeps_the_link:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TABLE IF NOT EXISTS _benmore_email_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, new_email TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at DATETIME NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    - sql: "INSERT INTO _benmore_email_changes (user_id, new_email, token_hash, expires_at) VALUES ({{user_id}}, 'taken@test.com', '4414d4223bea23845042aaa81c1d1da2164c0b3b0a28b244539b0cdd90fea0df', '2999-01-01T00:00:00Z')"
+    - sql: "CREATE TRIGGER IF NOT EXISTS email_change_fails BEFORE UPDATE OF email ON _benmore_users WHEN NEW.email = 'taken@test.com' BEGIN SELECT RAISE(ABORT, 'UNIQUE constraint failed: _benmore_users.email'); END"
+  steps:
+    - api: "POST /settings/confirm-email"
+      data:
+        token: "tok-f11-confirm"
+    - sql: "SELECT id FROM _benmore_email_changes WHERE token_hash = '4414d4223bea23845042aaa81c1d1da2164c0b3b0a28b244539b0cdd90fea0df'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_users WHERE email = 'owner@test.com'"
+      expect: {rows: 1}
+    - sql: "DROP TRIGGER email_change_fails"
+
+successful_update_spends_the_link:
+  as_user: "owner2@test.com"
+  setup:
+    - sql: "CREATE TABLE IF NOT EXISTS _benmore_email_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, new_email TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at DATETIME NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    - sql: "INSERT INTO _benmore_email_changes (user_id, new_email, token_hash, expires_at) VALUES ({{user_id}}, 'moved@test.com', '37a171ab378492453a4c4afe73ee8b954db0e63b85de81ff72d32d35e3cd9d41', '2999-01-01T00:00:00Z')"
+  steps:
+    - api: "POST /settings/confirm-email"
+      data:
+        token: "tok-f11-ok"
+    - sql: "SELECT id FROM _benmore_email_changes WHERE token_hash = '37a171ab378492453a4c4afe73ee8b954db0e63b85de81ff72d32d35e3cd9d41'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_users WHERE email = 'moved@test.com'"
+      expect: {rows: 1}

@@ -2,7 +2,8 @@
 
 This public repository contains the app runtime, not the hosted fleet or cloud
 client. Read README.md and CONTRIBUTING.md. Build with `sqlite_fts5`; use the Go
-version in go.mod. Run `go vet ./...` and `go test -tags sqlite_fts5 ./...`.
+version in go.mod. Run `go vet -tags sqlite_fts5 ./...` and
+`go test -tags sqlite_fts5 ./...`.
 
 Keep the flat package main and app-agnostic runtime. Inspect actual schemas,
 config parsers and responses before changing contracts. Preserve the CRUD mutation

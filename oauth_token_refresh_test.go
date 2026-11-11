@@ -17,9 +17,11 @@ func oauthTokenStoreFixture(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	oldKey := appEncryptionKey
-	appEncryptionKey = []byte("0123456789abcdef0123456789abcdef")
-	t.Cleanup(func() { appEncryptionKey = oldKey })
+	// A configured (durable) key: an earlier test's app load may have left a
+	// generated one marked ephemeral, which durableSealKey refuses.
+	oldKey, oldEphemeral := appEncryptionKey, appEncryptionKeyEphemeral
+	appEncryptionKey, appEncryptionKeyEphemeral = []byte("0123456789abcdef0123456789abcdef"), false
+	t.Cleanup(func() { appEncryptionKey, appEncryptionKeyEphemeral = oldKey, oldEphemeral })
 	if err := EnsureUsersTable(db); err != nil {
 		t.Fatal(err)
 	}

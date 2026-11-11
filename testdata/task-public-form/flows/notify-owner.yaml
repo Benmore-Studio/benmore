@@ -1,0 +1,21 @@
+# flows/notify-owner.yaml - queued by contact.yaml: email the owner about one message
+on:
+  request:
+    method: POST
+    path: /api/contact/notify
+    role: admin                     # the queue runs it; only an admin may call it directly
+jobs:
+  notify:
+    steps:
+      - id: m
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT name, email, body FROM messages WHERE id = :message_id AND notified_at = ''" }
+      - run: email
+        with:
+          to: "${{ env.OWNER_EMAIL }}"
+          reply_to: "${{ steps.m.outputs.email }}"
+          subject: "New message from ${{ steps.m.outputs.name }}"
+          text: "${{ steps.m.outputs.body }}"
+      - run: sql
+        with: { query: "UPDATE messages SET notified_at = datetime('now') WHERE id = :message_id" }

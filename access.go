@@ -40,7 +40,8 @@ package main
 //       all: member-of:room_members(room_id, member_id)
 //
 // Modes: anon · everyone · self · group · admin · role:<name> ·
-// perm:<resource>.<action> · member-of:<table>(<join>,<user>) · off
+// owner_or_role:<roles> · perm:<resource>.<action> ·
+// member-of:<table>(<join>,<user>) · off
 //
 // Defaults - when no access: config exists at all:
 //   - Table has `user_id` column           → self everywhere
@@ -52,17 +53,16 @@ package main
 // All defaults are conservative - when ambiguous, fail closed.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // AccessOp identifies a CRUD operation for the access map.
@@ -726,18 +726,34 @@ func memberOfPredicate(app *App, table string, rule *memberOfRule, session *Sess
 		return "0", nil // misdeclared: no row is in scope
 	}
 	aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
-	// Only live membership rows count (groups_membership.go).
-	qualifiedMembership := "main." + quoteIdent(rule.Table)
+	// Only live membership rows count (groups_membership.go). The membership
+	// table is aliased: when it is also the protected table (a roster scoped
+	// by its own membership), an unaliased inner name would shadow the outer
+	// row and any membership anywhere would admit every row. App tables
+	// can't be named _benmore_*, so the alias never collides with the outer.
+	const membership = "_benmore_membership"
 	qualifiedTable := "main." + quoteIdent(table)
-	pred := fmt.Sprintf("(EXISTS (SELECT 1 FROM %s WHERE %s.%s = %s.%s AND %s.%s = ?%s) OR %s)",
-		qualifiedMembership, qualifiedMembership, quoteIdent(rule.JoinCol), qualifiedTable, quoteIdent(local), qualifiedMembership, quoteIdent(rule.UserCol),
-		membershipLiveConds(app.Group, rule.Table, rule.Table, appColumnChecker(app, rule.Table)), aclSQL)
+	pred := fmt.Sprintf("(EXISTS (SELECT 1 FROM main.%s AS %s WHERE %s.%s = %s.%s AND %s.%s = ?%s) OR %s)",
+		quoteIdent(rule.Table), membership, membership, quoteIdent(rule.JoinCol), qualifiedTable, quoteIdent(local), membership, quoteIdent(rule.UserCol),
+		membershipLiveConds(app.Group, rule.Table, membership, appColumnChecker(app, rule.Table)), aclSQL)
 	args := append([]any{rule.userValue(session)}, aclArgs...)
-	if app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key) && session.EffectiveHasGroup() {
+	if memberOfTenantKeyed(app, table) {
+		if !session.EffectiveHasGroup() {
+			// A caller with no tenant (removed from their company, or never
+			// in one) gains nothing on a tenant-keyed table from membership
+			// rows, as with group scoping: only an explicit share counts.
+			return aclSQL, aclArgs
+		}
 		pred = fmt.Sprintf("(%s = ? AND %s)", quoteIdent(app.Group.Key), pred)
 		args = append([]any{session.EffectiveGroupID()}, args...)
 	}
 	return pred, args
+}
+
+// memberOfTenantKeyed reports whether table carries the groups: tenant key,
+// so membership on it counts only inside the caller's own tenant.
+func memberOfTenantKeyed(app *App, table string) bool {
+	return app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
 }
 
 // memberOfHas reports whether the session is a member of the specific
@@ -756,7 +772,9 @@ func memberOfHasWith(db mutationQuerier, app *App, rule *memberOfRule, joinVal a
 
 // memberOfDenial is the outcome of a pre-write membership check.
 // status is the HTTP status to return; msg is the JSON error detail
-// (empty → plain 404 body, so parent existence doesn't leak).
+// (empty → the JSON 404 a read of a missing row gets, one body for a
+// missing, non-member or other-tenant parent, so parent existence doesn't
+// leak).
 type memberOfDenial struct {
 	status int
 	msg    string
@@ -796,6 +814,9 @@ func memberOfCreateDenialWith(db mutationQuerier, app *App, table string, sessio
 			msg:    fmt.Sprintf("%s is required: %s is membership-scoped (member-of:%s)", local, table, rule.Table),
 		}
 	}
+	if memberOfTenantKeyed(app, table) && !session.EffectiveHasGroup() {
+		return &memberOfDenial{status: http.StatusNotFound}
+	}
 	if !memberOfHasWith(db, app, rule, joinVal, session) {
 		return &memberOfDenial{status: http.StatusNotFound}
 	}
@@ -826,16 +847,22 @@ func memberOfRepointDenialWith(db mutationQuerier, app *App, table string, sessi
 	if v == "" {
 		return nil
 	}
+	if memberOfTenantKeyed(app, table) && !session.EffectiveHasGroup() {
+		return &memberOfDenial{status: http.StatusNotFound}
+	}
 	if !memberOfHasWith(db, app, rule, v, session) {
 		return &memberOfDenial{status: http.StatusNotFound}
 	}
 	return nil
 }
 
-// writeMemberOfDenial renders a denial onto an HTTP response.
+// writeMemberOfDenial renders a denial onto an HTTP response. A refusal
+// without detail is the JSON {"error":"Not found"} every other 404 on the
+// table answers; Go's text/plain "404 page not found" broke a client's
+// res.json() on this one refusal.
 func writeMemberOfDenial(w http.ResponseWriter, r *http.Request, d *memberOfDenial) {
 	if d.msg == "" {
-		http.NotFound(w, r)
+		httpError(w, "Not found", http.StatusNotFound)
 		return
 	}
 	httpJSON(w, d.status, map[string]any{"error": d.msg})
@@ -847,35 +874,126 @@ func writeMemberOfDenial(w http.ResponseWriter, r *http.Request, d *memberOfDeni
 //	ws_rooms:
 //	  "room-:id": room_members(room_id, member_id)
 //
-// The pattern holds exactly one `:param` placeholder; its matched
+// The pattern holds at most one `:param` placeholder; its matched
 // value is the join value checked against the membership table. A
 // pattern with no placeholder protects one literal room name.
+// parseWSRoomPattern is the one reader of a pattern.
 type WSRoomRule struct {
 	Pattern string
 	Rule    *memberOfRule
 }
 
-// matchWSRoomPattern extracts the placeholder value when `room`
-// matches `pattern`. ok=false when it doesn't match. Literal patterns
-// (no placeholder) return ("", true) on an exact match.
-func matchWSRoomPattern(pattern, room string) (val string, ok bool) {
+// wsRoomPattern is a ws_rooms pattern as parseWSRoomPattern read it: the
+// literal text before and after the placeholder (prefix alone for a literal
+// room name).
+type wsRoomPattern struct {
+	prefix, suffix string
+	param          bool
+}
+
+// parseWSRoomPattern reads a ws_rooms pattern. The forms are:
+//
+//	lobby             one literal room name
+//	room-:id          one `:name` placeholder: rooms room-<value>
+//	project-:id-chat  text after the placeholder: rooms project-<value>-chat
+//	chat::id          a literal ':' directly before the placeholder: rooms chat:<value>
+//
+// problem is non-empty for a pattern that can't mean what its author wrote:
+// `*` is not a wildcard, and one placeholder is all a pattern has. Such a
+// pattern used to be matched anyway, with the first ':' as the placeholder
+// and everything after its name as literal text ("chat::id" matched only
+// chat<value>:id, "chat:*" only chat<value>*), so it matched none of the
+// rooms it was written for and left them open to every signed-in user. The
+// write gate refuses it (wsRoomPatternRefusal) and a loaded one closes its
+// rooms (wsRoomClosedLead). A pattern with one ':' and no '*' reads exactly
+// as it always did, unnamed placeholder ("room-:") included.
+func parseWSRoomPattern(pattern string) (p wsRoomPattern, problem string) {
+	if pattern == "" {
+		return p, "the pattern is empty"
+	}
+	if strings.Contains(pattern, "*") {
+		return p, "`*` is not a wildcard"
+	}
 	i := strings.IndexByte(pattern, ':')
 	if i < 0 {
-		return "", pattern == room
+		return wsRoomPattern{prefix: pattern}, ""
 	}
-	j := i + 1
+	start := i
+	if i+1 < len(pattern) && pattern[i+1] == ':' {
+		start = i + 1 // "::name": the first ':' is part of the room name
+	}
+	j := start + 1
 	for j < len(pattern) && (pattern[j] == '_' ||
 		(pattern[j] >= 'a' && pattern[j] <= 'z') ||
 		(pattern[j] >= 'A' && pattern[j] <= 'Z') ||
 		(pattern[j] >= '0' && pattern[j] <= '9')) {
 		j++
 	}
-	prefix, suffix := pattern[:i], pattern[j:]
-	if len(room) <= len(prefix)+len(suffix) ||
-		!strings.HasPrefix(room, prefix) || !strings.HasSuffix(room, suffix) {
+	if strings.Contains(pattern[j:], ":") {
+		return p, "a pattern has one `:name` placeholder"
+	}
+	return wsRoomPattern{prefix: pattern[:start], suffix: pattern[j:], param: true}, ""
+}
+
+// matchWSRoomPattern extracts the placeholder value when `room`
+// matches `pattern`. ok=false when it doesn't match. Literal patterns
+// (no placeholder) return ("", true) on an exact match. An unusable
+// pattern matches nothing.
+func matchWSRoomPattern(pattern, room string) (val string, ok bool) {
+	p, problem := parseWSRoomPattern(pattern)
+	if problem != "" {
 		return "", false
 	}
-	return room[len(prefix) : len(room)-len(suffix)], true
+	if !p.param {
+		return "", p.prefix == room
+	}
+	if len(room) <= len(p.prefix)+len(p.suffix) ||
+		!strings.HasPrefix(room, p.prefix) || !strings.HasSuffix(room, p.suffix) {
+		return "", false
+	}
+	return room[len(p.prefix) : len(room)-len(p.suffix)], true
+}
+
+// wsRoomClosedLead reports the rooms an unusable pattern closes: every room
+// whose name starts with lead, the pattern's text before its first ':' or
+// '*'. That text is literal under every reading of the pattern, so the rooms
+// the author meant are among them, whichever ':' was meant as the
+// placeholder. closed is false for a usable pattern and for an empty one
+// (which names no room).
+func wsRoomClosedLead(pattern string) (lead string, closed bool) {
+	if _, problem := parseWSRoomPattern(pattern); problem == "" || pattern == "" {
+		return "", false
+	}
+	if i := strings.IndexAny(pattern, ":*"); i >= 0 {
+		return pattern[:i], true
+	}
+	return pattern, true
+}
+
+// wsRoomPatternRefusal is the write gate's message for an unusable ws_rooms
+// pattern ("" for a usable one). It names what is wrong and, when the
+// pattern becomes usable by writing its `*` as a placeholder, that pattern
+// and a room it restricts.
+func wsRoomPatternRefusal(pattern string) string {
+	_, problem := parseWSRoomPattern(pattern)
+	if problem == "" {
+		return ""
+	}
+	msg := fmt.Sprintf("ws_rooms pattern %q does not restrict the rooms it is written for: %s.", pattern, problem)
+	if pattern == "" {
+		return msg + " Name the rooms, e.g. \"room-:id\" for rooms named like room-42."
+	}
+	if lead, closed := wsRoomClosedLead(pattern); closed && lead != "" {
+		msg += fmt.Sprintf(" While app.yaml holds it, rooms whose name starts with %q and match no other pattern are closed to everyone but admins.", lead)
+	} else if closed {
+		msg += " While app.yaml holds it, every room that matches no other pattern is closed to everyone but admins."
+	}
+	if fixed := strings.Replace(pattern, "*", ":id", 1); fixed != pattern {
+		if p, bad := parseWSRoomPattern(fixed); bad == "" && p.prefix+p.suffix != "" {
+			return msg + fmt.Sprintf(" Write %q to restrict rooms named like %s42%s: the placeholder's value is the membership join value.", fixed, p.prefix, p.suffix)
+		}
+	}
+	return msg + " A pattern is a literal room name or holds one `:name` placeholder, whose value is the membership join value: \"room-:id\" restricts rooms named like room-42. A literal `:` may come only directly before the placeholder: \"chat::id\" restricts rooms named like chat:42. Use `-`, `.` or `_` for any other separator in the room name."
 }
 
 // errMemberOfUnverified: an email-keyed membership can't be founded for an
@@ -894,8 +1012,9 @@ func memberOfAutoJoins(app *App, table string, rule *memberOfRule) bool {
 // common membership-table shapes: the join + user columns always, plus
 // the app's group key and a user_id column when present - covering the
 // `room_members(room_id, member_id, company_id)` shapes multi-tenant
-// apps actually declare. Membership tables with additional NOT NULL
-// columns lacking defaults will error; the caller logs + surfaces it.
+// apps actually declare - and the initial state of a workflow on the
+// membership table. Membership tables with other NOT NULL columns
+// lacking defaults will error; the caller logs + surfaces it.
 func memberOfAutoJoin(app *App, rule *memberOfRule, rowID any, session *Session) error {
 	return memberOfAutoJoinWith(app.DB, app, rule, rowID, session)
 }
@@ -914,6 +1033,11 @@ func memberOfAutoJoinWith(db sqlExecutor, app *App, rule *memberOfRule, rowID an
 		cols = append(cols, "user_id")
 		vals = append(vals, session.UserID)
 	}
+	// A workflow on the membership table: the founder's row starts in its
+	// initial state, like a membership row created through the API.
+	stateCols, stateVals := workflowInitialColumns(app, rule.Table, appColumnChecker(app, rule.Table), cols)
+	cols = append(cols, stateCols...)
+	vals = append(vals, stateVals...)
 	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", ")
 	_, err := db.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING",
 		quoteIdent(rule.Table), strings.Join(quoteIdents(cols), ", "), placeholders), vals...)
@@ -983,8 +1107,7 @@ func LoadAccess(dir string) *AccessConfig {
 }
 
 func loadAccessChecked(dir string) (*AccessConfig, error) {
-	path := filepath.Join(dir, "app.yaml")
-	data, err := os.ReadFile(path)
+	data, err := readAppConfigFile(dir, "app.yaml")
 	if err != nil {
 		return nil, err
 	}
@@ -1057,7 +1180,11 @@ func parseAccessConfig(data []byte) (*AccessConfig, error) {
 // per-row filter applied later by handleList's WHERE builder.
 //
 // 404 (not 403) on access denial matches the framework's posture:
-// don't leak existence of resources the caller can't reach.
+// don't leak existence of resources the caller can't reach. The one
+// exception is a create, update or delete refused on a table the caller
+// may read: GET already shows that table exists, so the refusal answers
+// 403 and says it is an access rule (writeCRUDOpDenied) instead of the
+// unmatched-route 404 that sent developers hunting for a typo.
 func EnforceCRUDAccess(w http.ResponseWriter, r *http.Request, app *App, table string, op AccessOp, targetUserID int64) bool {
 	if actor, private := appMCPPrivateSession(app, r); private {
 		identity, _ := r.Context().Value(appMCPPrivateKey{}).(*appMCPPrivateRead)
@@ -1067,14 +1194,16 @@ func EnforceCRUDAccess(w http.ResponseWriter, r *http.Request, app *App, table s
 		}
 	}
 	if app == nil {
-		http.NotFound(w, r)
+		writeUnmatchedAPINotFound(w)
 		return false
 	}
 	hasUID := hasColumn(app, table, "user_id")
 	hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
 	mode := app.Access.ModeFor(table, op, hasUID, hasGroupKey)
 	if mode == "off" {
-		http.NotFound(w, r)
+		// `off` disables the route itself (route discovery lists it under
+		// crud_access_off), so it keeps the unmatched-route answer.
+		writeUnmatchedAPINotFound(w)
 		return false
 	}
 	var session *Session
@@ -1092,10 +1221,7 @@ func EnforceCRUDAccess(w http.ResponseWriter, r *http.Request, app *App, table s
 			// the right pattern at the moment the 401 fires. Filtered
 			// to read-of-owner-default so we don't suggest "make this
 			// public" on, say, _benmore_users or admin-only tables.
-			body := `{"error":"authentication required"}`
-			if op == OpRead && hasUID && !app.Access.HasExplicitRule(table, op) {
-				body = `{"error":"authentication required","hint":"This table is owner-scoped (visitors see 401). For a public feed, declare ` + "`access:\\n  " + table + ":\\n    read: anon`" + ` in app.yaml. Run benmore docs for the full access-mode catalogue."}`
-			}
+			body := unauthenticatedAPIBody(app, r, table, op, hasUID)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(body))
@@ -1120,10 +1246,88 @@ func EnforceCRUDAccess(w http.ResponseWriter, r *http.Request, app *App, table s
 		if op == OpRead && mode == "group" && targetUserID == 0 && session != nil && !session.EffectiveHasGroup() && !session.IsAdminBypass() && (hasUID || hasGroupKey) {
 			return true
 		}
-		http.NotFound(w, r)
+		if op != OpRead && crudReadGatePasses(app, table, session, hasUID, hasGroupKey) {
+			writeCRUDOpDenied(w, app, table, op, mode, session, hasGroupKey)
+			return false
+		}
+		writeUnmatchedAPINotFound(w)
 		return false
 	}
 	return true
+}
+
+// crudReadGatePasses reports whether EnforceCRUDAccess would let session list
+// table: the read mode is not off, an anonymous caller only on an anon table,
+// and the mode admits the caller (including the empty list a tenant-less
+// caller gets on a group table). When it passes, GET /api/<table> already
+// answers this caller with something other than the unmatched-route 404, so
+// naming a refused write as an access refusal reveals nothing new.
+func crudReadGatePasses(app *App, table string, session *Session, hasUID, hasGroupKey bool) bool {
+	if app == nil {
+		return false
+	}
+	mode := app.Access.ModeFor(table, OpRead, hasUID, hasGroupKey)
+	switch {
+	case mode == "off":
+		return false
+	case mode != "anon" && session == nil:
+		return false
+	case tableModeAllowed(app, table, OpRead, mode, session, 0):
+		return true
+	}
+	return mode == "group" && session != nil && !session.EffectiveHasGroup() && !session.IsAdminBypass() && (hasUID || hasGroupKey)
+}
+
+// tableReadGateFor is crudReadGatePasses for a table name that has not been
+// checked yet: false for a name that is not a served schema table. Side
+// routes (/api/_transaction, share/permissions, revert) use it to answer a
+// table the caller may not list exactly like an unmatched /api path before
+// any per-row or scope message, so they are no oracle for which tables exist
+// (security.md 14f); a refusal on a table that passes keeps its 403.
+// It is consulted only once a request is being refused: a write-only table
+// (`read: admin`, `write: everyone`) must keep accepting the writes its
+// rules allow.
+func tableReadGateFor(app *App, table string, session *Session) bool {
+	if app == nil || !safeIdent(table) || !appHasTable(app, table) {
+		return false
+	}
+	hasUID := hasColumn(app, table, "user_id")
+	hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
+	return crudReadGatePasses(app, table, session, hasUID, hasGroupKey)
+}
+
+// writeTableRefusal answers a refused side-route request: the unmatched-route
+// 404 when the caller may not read the table (14f), otherwise status + body.
+func writeTableRefusal(w http.ResponseWriter, app *App, table string, session *Session, status int, body map[string]any) {
+	if !tableReadGateFor(app, table, session) {
+		writeUnmatchedAPINotFound(w)
+		return
+	}
+	httpJSON(w, status, body)
+}
+
+// writeCRUDOpDenied answers a create, update or delete the access rules refuse
+// on a table the caller may read (crudReadGatePasses): 403 with what was
+// refused, never which rule or role would allow it. When the op's mode is `group`
+// and the caller has no tenant, that is the cause, and the answer says so.
+func writeCRUDOpDenied(w http.ResponseWriter, app *App, table string, op AccessOp, mode string, session *Session, hasGroupKey bool) {
+	action := map[AccessOp]string{OpWrite: "create rows in", OpUpdate: "change rows in", OpDelete: "delete rows from"}[op]
+	if action == "" {
+		action = string(op) + " rows in"
+	}
+	body := map[string]any{
+		"error":   "forbidden",
+		"message": fmt.Sprintf("the app's access rules do not let you %s %s (its `%s` rule under access: in app.yaml)", action, table, op),
+	}
+	if mode == "group" && hasGroupKey && app.Group != nil && session != nil && !session.EffectiveHasGroup() && !session.IsAdminBypass() {
+		hint := fmt.Sprintf("%s rows belong to a tenant (%s) and your session has none yet: join a tenant as a member", table, app.Group.Key)
+		if app.Group.Bootstrap != nil {
+			hint += " or create one with POST /api/_groups/create"
+		}
+		body["hint"] = hint + ", then retry"
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	httpJSON(w, http.StatusForbidden, withRefusalDocs(body, "forbidden"))
 }
 
 // ReadAllowsBroaderRows returns true when the read mode permits
@@ -1363,4 +1567,32 @@ func (a *AccessConfig) String() string {
 		}
 	}
 	return b.String()
+}
+
+// unauthenticatedAPIBody is the 401 body for an auto-CRUD request without a
+// valid session. The public-feed hint is for an anonymous read of an
+// owner-scoped table with no explicit access rule. A request that did present
+// a credential (a session cookie or an Authorization header) that no longer
+// resolves - an expired, revoked or restored-away token or session - is told
+// that instead: suggesting `read: anon` to it pointed at the wrong fix. One
+// refused only because auth.require_verified wants its account's email
+// verified gets email_verification_required: signing in again would not help.
+func unauthenticatedAPIBody(app *App, r *http.Request, table string, op AccessOp, hasUID bool) string {
+	presented := r.Header.Get("Authorization") != ""
+	if c, err := requestSessionCookie(r); err == nil && c.Value != "" {
+		presented = true
+	}
+	// Where the rule is documented (refusal_docs.go), closing each body.
+	docs := `,"docs":"` + refusalDocsAt(refusalAuthRequired, "") + `"}`
+	if presented {
+		if presentedCredentialAwaitsVerification(app, r) {
+			body, _ := json.Marshal(unverifiedCredentialBody(app))
+			return string(body)
+		}
+		return `{"error":"authentication required","hint":"The session or token this request sent is not valid (expired, revoked or signed out). Sign in again or use a current token."` + docs
+	}
+	if op == OpRead && hasUID && !app.Access.HasExplicitRule(table, op) {
+		return `{"error":"authentication required","hint":"This table is owner-scoped (visitors see 401). For a public feed, declare ` + "`access:\\n  " + table + ":\\n    read: anon`" + ` in app.yaml; that makes EVERY row of the table readable without sign-in, drafts and other owners' rows included (scopes.public_read_when does not narrow it), so to publish only some rows keep the table private and serve them from a public flow. The access modes are listed in api(at:'access') (CLI: benmore api <app> access)."` + docs
+	}
+	return `{"error":"authentication required"` + docs
 }

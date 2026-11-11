@@ -64,6 +64,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -278,11 +279,11 @@ func runSQLRestore(app *App, sess *importSession) error {
 			if isStorageFullError(err) {
 				reason = storageFullMessage(app) + " (" + reason + "; the restore was rolled back)"
 			}
-			changed, serr := saveImportStateIf(app.DB, sess.ID, "running", "failed", 0, reason)
+			changed, serr := saveImportStateIf(app.DB, sess.ID, importStateRunning, importStateFailed, 0, reason)
 			if serr != nil {
 				log.Printf("IMPORT %s: failed to persist failed state: %v", sess.ID, serr)
 			}
-			if !changed {
+			if !changed && !replaceLapsedFailure(app.DB, sess.ID, reason) {
 				return
 			}
 			// See the matching comment in runImport (import_run.go): a
@@ -369,7 +370,7 @@ func runSQLRestoreInner(app *App, sess *importSession) (int64, error) {
 		src = &boundedReader{r: gz, limit: gzipExpansionBound(sess)}
 	}
 
-	tx, err := app.DB.Begin()
+	tx, err := app.DB.BeginTx(withLongWriteTx(context.Background(), "SQL restore import"), nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin: %w", err)
 	}

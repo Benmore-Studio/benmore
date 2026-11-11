@@ -264,7 +264,7 @@ const storageFullStatus = http.StatusInsufficientStorage
 // storage limit. It keeps the pre-flight check's `error` value so clients
 // that already handle "storage cap reached" handle this too.
 func storageFullBody(app *App) map[string]any {
-	body := map[string]any{"error": "storage cap reached", "code": "storage_limit"}
+	body := withRefusalDocs(map[string]any{"error": "storage cap reached", "code": "storage_limit"}, "storage_limit")
 	limit := int64(0)
 	if app != nil && app.Dir != "" {
 		limit = effectiveDBStorageLimit(canonicalDBPath(filepath.Join(app.Dir, "data.db")))

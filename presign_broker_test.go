@@ -111,7 +111,7 @@ func TestPresignS3PutURL_NoCreds(t *testing.T) {
 func TestPresignBrokerDerivesObjectMetaFromPath(t *testing.T) {
 	s3 := &S3Storage{Bucket: "b", Region: "us-east-1", Key: "AKIDEXAMPLE", Secret: "secret"}
 	put := func(p, ct, disp string) (*presignResp, error) {
-		return executePresignBrokerRequest(presignReq{Path: p, ContentType: ct, Disposition: disp}, "tenant", false, s3)
+		return executePresignBrokerRequest(presignReq{Path: p, ContentType: ct, Disposition: disp}, presignScope{write: "tenant", read: []string{"tenant"}}, s3)
 	}
 	resp, err := put("uploads/files/abc.png", "text/html", "inline")
 	if err != nil {

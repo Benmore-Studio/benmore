@@ -1,0 +1,5 @@
+[
+  "After changing computed.yaml, write a row through the API and read the column back. An entry that would calculate nothing is refused when the file is written (declare). A column that does not move in an app deployed with such an entry is named in the app's log as `COMPUTED NOT RUNNING`.",
+  "computed.yaml is applied before migrations/ run, so its tables and columns come from schema.prisma, not from a hand-written migration (api({at:'schema'}) config_references).",
+  "A table or column named with an SQL reserved word is quoted inside `expr:` and `sql:` (api({at:'schema'}) reserved_word_names)."
+]

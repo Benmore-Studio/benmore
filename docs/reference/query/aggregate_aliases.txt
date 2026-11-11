@@ -1,0 +1,1 @@
+Aggregate as names are validated identifiers and may be SQL keywords. Names must be unique against group keys and other aggregates under SQLite's ASCII case folding, or the query returns 400. order_by resolves a selected aggregate alias before an identically named source column.

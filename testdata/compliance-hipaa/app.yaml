@@ -1,0 +1,6 @@
+site_name: "Compliance hipaa fixture"
+compliance: hipaa
+auth:
+  identifier: email
+frontend:
+  stack: html

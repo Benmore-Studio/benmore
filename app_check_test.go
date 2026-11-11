@@ -218,7 +218,7 @@ func TestAgentDocs_TopicsList(t *testing.T) {
 	// The public framework export ships build and harness; the private monorepo also
 	// carries the cloud-only `deploy` guide. A new topic is a deliberate act.
 	topics := AgentDocsTopics()
-	want := []string{"build", "connector"}
+	want := []string{"build", "changes", "connector"}
 	if _, err := os.Stat("docs/agent/deploy.md"); err == nil {
 		want = append(want, "deploy")
 	} else if !os.IsNotExist(err) {

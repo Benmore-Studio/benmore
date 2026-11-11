@@ -248,6 +248,7 @@ func designFromAppYAML(raw map[string]any) *DesignConfig {
 		PWA:        make(map[string]string),
 		Recording:  make(map[string]string),
 	}
+	config.Compliance, _ = raw["compliance"].(string)
 
 	if v, ok := raw["theme"].(string); ok {
 		config.Colors["_theme"] = v
@@ -455,8 +456,7 @@ func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 
 // LoadGroupConfig reads the org: section from app.yaml for group-level data scoping.
 func LoadGroupConfig(dir string) *GroupConfig {
-	path := filepath.Join(dir, "app.yaml")
-	data, err := os.ReadFile(path)
+	data, err := readAppConfigFile(dir, "app.yaml")
 	if err != nil {
 		return nil
 	}
@@ -528,8 +528,11 @@ func parseGroupConfig(data []byte) *GroupConfig {
 
 // LoadWSRooms reads the `ws_rooms:` section from app.yaml (v2.7.164):
 // room-name patterns bound to membership-table checks, enforced at WS
-// join time. Malformed rules are dropped with a startup warning so a
-// typo can't silently leave a room open.
+// join time. A malformed membership rule never gets here (the config loader
+// refuses the file, parseAppConfigDocument). A rule whose PATTERN is
+// unusable is kept: it matches no room, and roomMembershipAllowed closes the
+// rooms it was written for, so a typo can't leave a room open. The loader
+// logs each one (logUnusableWSRoomPatterns).
 func LoadWSRooms(dir string) []WSRoomRule {
 	path := filepath.Join(dir, "app.yaml")
 	data, err := os.ReadFile(path)
@@ -859,8 +862,10 @@ type WorkflowYAML struct {
 
 // TransitionYAML is the raw YAML for a single transition rule.
 type TransitionYAML struct {
-	Role string `yaml:"role"`
-	When string `yaml:"when"`
+	// Role is one role or an any-of list: "owner, manager" or [owner, manager]
+	// (workflow_roles.go).
+	Role workflowRoleYAML `yaml:"role"`
+	When string           `yaml:"when"`
 }
 
 // TimeoutYAML is the raw YAML for a timeout auto-transition.
@@ -913,6 +918,13 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 			if err := configIdentError(fmt.Sprintf("workflows.yaml: %s.table", name), t); err != nil {
 				return nil, err
 			}
+			// A workflow takes the app's own tables only. One on a framework
+			// table is not loaded, for every consumer: no transition route, no
+			// timeout sweep (config_framework_tables.go; the write gate refuses
+			// it and warnWorkflowShape logs it).
+			if frameworkOwnedTableName(t) {
+				continue
+			}
 		}
 		if f := strings.TrimSpace(wy.Field); f != "" {
 			if err := configIdentError(fmt.Sprintf("workflows.yaml: %s.field", name), f); err != nil {
@@ -921,8 +933,8 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 		}
 		wf := &Workflow{
 			Name:         name,
-			Table:        wy.Table,
-			Field:        wy.Field,
+			Table:        strings.TrimSpace(wy.Table),
+			Field:        strings.TrimSpace(wy.Field),
 			Initial:      wy.Initial,
 			Transitions:  make(map[string]map[string]Transition),
 			OnTransition: make(map[string][]Hook),
@@ -952,7 +964,7 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 			for to, rule := range targets {
 				addDerived(to)
 				wf.Transitions[from][to] = Transition{
-					Role: rule.Role,
+					Role: canonicalWorkflowRole(string(rule.Role)),
 					When: rule.When,
 				}
 			}
@@ -976,6 +988,9 @@ func parseWorkflowsYAML(data []byte) (*WorkflowConfig, error) {
 		}
 
 		config.Workflows[name] = wf
+	}
+	if err := workflowSameTableError(raw); err != nil {
+		return nil, err
 	}
 
 	return config, nil
@@ -1035,20 +1050,26 @@ func LoadComputedFieldsYAML(dir string) *ComputedFieldConfig {
 	return parseComputedFieldsYAML(data)
 }
 
+// parseComputedFieldsYAML is computed.yaml as every consumer reads it: the
+// fields on the app's own tables, each with the triggers that name the app's
+// own tables. A field declared on a framework table, and a trigger that names
+// one, are dropped here, so no trigger is installed on a framework table
+// (config_framework_tables.go; the write gate refuses them and the load logs
+// them).
 func parseComputedFieldsYAML(data []byte) *ComputedFieldConfig {
+	return withoutComputedFrameworkTables(readComputedFieldsYAML(data))
+}
+
+// readComputedFieldsYAML is computed.yaml as written, framework tables
+// included. Only the checks that name those entries read it.
+func readComputedFieldsYAML(data []byte) *ComputedFieldConfig {
 	config := &ComputedFieldConfig{
 		Fields: make(map[string]map[string]*ComputedField),
 	}
 
 	// Try flat-list format first (most common in client apps)
 	var listWrapper struct {
-		Fields []struct {
-			Table    string                   `yaml:"table"`
-			Column   string                   `yaml:"column"`
-			Expr     string                   `yaml:"expr"`
-			SQL      string                   `yaml:"sql"`
-			Triggers []ComputedTriggerDefYAML `yaml:"triggers"`
-		} `yaml:"fields"`
+		Fields []computedListFieldYAML `yaml:"fields"`
 	}
 	if err := yamlUnmarshal(data, &listWrapper); err == nil && len(listWrapper.Fields) > 0 {
 		for _, f := range listWrapper.Fields {
@@ -1117,8 +1138,7 @@ func parseComputedFieldsYAML(data []byte) *ComputedFieldConfig {
 // LoadRolesConfig reads the roles: section from app.yaml.
 // Roles define default scopes for each developer-defined role.
 func LoadRolesConfig(dir string) *RolesConfig {
-	path := filepath.Join(dir, "app.yaml")
-	data, err := os.ReadFile(path)
+	data, err := readAppConfigFile(dir, "app.yaml")
 	if err != nil {
 		return nil
 	}
@@ -1317,27 +1337,64 @@ func (rc *RolesConfig) ScopesForRole(role string) string {
 // On-demand consumers share the published source generation. Ordinary apps
 // retain their existing disk loader behavior.
 func (app *App) versionedConfig() *VersionedConfig {
-	data, err := app.readSourceFile("app.yaml")
+	data, err := app.readConfigSource("app.yaml")
 	if err != nil {
 		return nil
 	}
 	return parseVersionedConfig(data)
 }
 func (app *App) aggregateConfig() []AggregateConfig {
-	data, err := app.readSourceFile("app.yaml")
+	data, err := app.readConfigSource("app.yaml")
 	if err != nil {
 		return nil
 	}
 	return parseAggregateConfig(data)
 }
+
+// readConfigSource is readSourceFile for a file that is parsed as
+// configuration rather than rendered: a reviewed app's captured bytes, else
+// the plain disk read the loader itself makes of that file. readSourceFile
+// reads disk through the app root, which refuses a link leading outside the
+// app; taking app.yaml that way would let a section parsed on demand
+// (versioned:, aggregates:) silently go missing from a file the loader read.
+func (app *App) readConfigSource(name string) ([]byte, error) {
+	app.mu.RLock()
+	reviewed := app.MCP != nil
+	app.mu.RUnlock()
+	if reviewed {
+		return app.readSourceFile(name)
+	}
+	return readFileFromDir(app.Dir, name)
+}
 func (app *App) retentionConfig() []RetentionPolicy {
+	retentionData, _ := app.retentionSources()
+	return parseRetentionConfig(retentionData)
+}
+
+// retentionSources returns the bytes retention is read from: retention.yaml,
+// and app.yaml (only to report a retired inline `retention:` section). A
+// reviewed app's captured bytes, else the files on disk.
+func (app *App) retentionSources() (retentionData, appData []byte) {
 	app.mu.RLock()
 	reviewed, sources := app.MCP != nil, app.sourceFiles
 	app.mu.RUnlock()
-	if !reviewed {
-		return LoadRetentionConfig(app.Dir)
+	if reviewed {
+		return sources["retention.yaml"], sources["app.yaml"]
 	}
-	return parseRetentionConfig(sources["retention.yaml"], sources["app.yaml"])
+	retentionData, _ = os.ReadFile(app.Dir + "/retention.yaml")
+	appData, _ = os.ReadFile(app.Dir + "/app.yaml")
+	return retentionData, appData
+}
+
+// logUnusableWSRoomPatterns says, once per load, which ws_rooms patterns
+// match no room and which rooms are closed because of them. The write gate
+// refuses such a pattern; this is for an app.yaml that already holds one.
+func logUnusableWSRoomPatterns(rules []WSRoomRule) {
+	for _, wr := range rules {
+		if _, closed := wsRoomClosedLead(wr.Pattern); closed {
+			log.Printf("SECURITY: app.yaml: %s", wsRoomPatternRefusal(wr.Pattern))
+		}
+	}
 }
 
 // Published feature objects are immutable; readers take their pointer under the
@@ -1367,4 +1424,27 @@ func (app *App) i18nConfig() *I18n {
 	app.mu.RLock()
 	defer app.mu.RUnlock()
 	return app.I18n
+}
+
+// sessionRoleScopes is ResolveScopesForRoles for the roles session s holds,
+// plus the built-in admin role. `user` and `admin` always exist (grants and
+// /_admin/set-role accept both without a roles: entry), and a global admin
+// (IsAdmin: the users.role column or a global grant) of an app whose roles:
+// block does not declare admin holds every scope, as it does in an app
+// without roles:. The undeclared role used to resolve to nothing, and the
+// deny sentinel then refused the app's own admin on every auto-CRUD table
+// (admin-mode and self tables included), every perm: mode and every flow
+// permissions: gate. Declaring admin under roles: sets its scopes
+// explicitly. Callers intersect the credential's own scopes afterwards, so an
+// admin's scoped API token or Bearer session stays narrowed; a tenant
+// membership role or group-scoped grant named admin is not IsAdmin, and a
+// delegated connector identity never gains it.
+func (rc *RolesConfig) sessionRoleScopes(s *Session, held []string) string {
+	if rc == nil {
+		return ""
+	}
+	if _, declared := rc.Roles["admin"]; !declared && s != nil && s.IsAdmin() && !s.connectorGrant {
+		return "*"
+	}
+	return rc.ResolveScopesForRoles(held)
 }

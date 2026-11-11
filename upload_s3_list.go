@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,7 +21,13 @@ const (
 	s3ListMaxObjects    = 1000000
 	s3ListMetadataBytes = 64 << 20
 	s3ListTimeout       = 10 * time.Minute
+	s3ListMaxPrefixes   = 100000
 )
+
+// errS3ListBudget: a complete listing would exceed its resource budget (too
+// many objects or too much metadata). Retention treats it per prefix, so one
+// prefix that grew past it cannot stop the others.
+var errS3ListBudget = errors.New("S3 list exceeds complete-inventory resource budget")
 
 // List returns a complete recursive inventory or an error, never a successful
 // partial inventory. Retention must not delete from an incomplete listing.
@@ -39,8 +46,71 @@ func (s3 *S3Storage) ListFlatContext(ctx context.Context, prefix string) ([]S3Ob
 }
 
 func (s3 *S3Storage) listContext(ctx context.Context, prefix, delimiter string) ([]S3Object, error) {
+	var out []S3Object
+	metadataBytes := 0
+	err := s3.listPages(ctx, prefix, delimiter, func(page *s3ListPage) error {
+		for _, object := range page.Contents {
+			metadataBytes += len(object.Key) + len(object.LastModified)
+			if len(out) >= s3ListMaxObjects || metadataBytes > s3ListMetadataBytes {
+				return errS3ListBudget
+			}
+			out = append(out, object)
+		}
+		metadataBytes += len(page.NextContinuationToken)
+		if metadataBytes > s3ListMetadataBytes {
+			return errS3ListBudget
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListPrefixes returns the direct child "directories" of prefix (its common
+// prefixes with delimiter "/"), each ending in "/": for "" the bucket's
+// top-level instance prefixes.
+func (s3 *S3Storage) ListPrefixes(prefix string) ([]string, error) {
+	var out []string
+	err := s3.listPages(context.Background(), prefix, "/", func(page *s3ListPage) error {
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == prefix+"/" {
+				// Keys starting "<prefix>/" (an empty path segment): nothing
+				// retention or a backup view can name. Reported, not fatal,
+				// so one stray key cannot stop the sweep of every prefix.
+				log.Printf("S3 list: skipped the empty common prefix %q under %q (keys with an empty path segment)", cp.Prefix, prefix)
+				continue
+			}
+			if !strings.HasPrefix(cp.Prefix, prefix) || !strings.HasSuffix(cp.Prefix, "/") {
+				return errors.New("S3 list returned an invalid common prefix")
+			}
+			if len(out) >= s3ListMaxPrefixes {
+				return errS3ListBudget
+			}
+			out = append(out, cp.Prefix)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListPages streams a recursive listing of prefix one page at a time,
+// without the complete-inventory budget: for work that is safe page by page
+// (retention's cleanup of a prefix too large to list whole).
+func (s3 *S3Storage) ListPages(prefix string, fn func([]S3Object) error) error {
+	return s3.listPages(context.Background(), prefix, "", func(page *s3ListPage) error { return fn(page.Contents) })
+}
+
+// listPages walks every page of a listing, checking each object and the
+// continuation tokens, and hands each page to fn (which may stop the walk
+// with an error).
+func (s3 *S3Storage) listPages(ctx context.Context, prefix, delimiter string, fn func(*s3ListPage) error) error {
 	if ctx == nil {
-		return nil, errors.New("S3 listing requires a context")
+		return errors.New("S3 listing requires a context")
 	}
 	ctx, cancel := context.WithTimeout(ctx, s3ListTimeout)
 	defer cancel()
@@ -58,49 +128,44 @@ func (s3 *S3Storage) listContext(ctx context.Context, prefix, delimiter string) 
 	if delimiter != "" {
 		values.Set("delimiter", delimiter)
 	}
-	var out []S3Object
-	metadataBytes := 0
 	seen := map[string]bool{}
 	for page := 0; page < s3ListMaxPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("S3 list canceled: %w", err)
+			return fmt.Errorf("S3 list canceled: %w", err)
 		}
 		result, err := s3.listPage(ctx, client, values)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, object := range result.Contents {
 			if object.Key == "" || !strings.HasPrefix(object.Key, prefix) || object.Size < 0 {
-				return nil, errors.New("S3 list returned an invalid object or foreign prefix")
+				return errors.New("S3 list returned an invalid object or foreign prefix")
 			}
-			metadataBytes += len(object.Key) + len(object.LastModified)
-			if len(out) >= s3ListMaxObjects || metadataBytes > s3ListMetadataBytes {
-				return nil, errors.New("S3 list exceeds complete-inventory resource budget")
-			}
-			out = append(out, object)
+		}
+		if err := fn(result); err != nil {
+			return err
 		}
 		if !*result.IsTruncated {
-			return out, nil
+			return nil
 		}
 		next := result.NextContinuationToken
 		if next == "" || len(next) > 16<<10 || seen[next] {
-			return nil, errors.New("S3 list has a missing, repeated or oversized continuation token")
-		}
-		metadataBytes += len(next)
-		if metadataBytes > s3ListMetadataBytes {
-			return nil, errors.New("S3 list exceeds complete-inventory resource budget")
+			return errors.New("S3 list has a missing, repeated or oversized continuation token")
 		}
 		seen[next] = true
 		values.Set("continuation-token", next)
 	}
-	return nil, errors.New("S3 list exceeds complete-inventory page budget")
+	return errors.New("S3 list exceeds complete-inventory page budget")
 }
 
 type s3ListPage struct {
-	XMLName               xml.Name   `xml:"ListBucketResult"`
-	Contents              []S3Object `xml:"Contents"`
-	IsTruncated           *bool      `xml:"IsTruncated"`
-	NextContinuationToken string     `xml:"NextContinuationToken"`
+	XMLName        xml.Name   `xml:"ListBucketResult"`
+	Contents       []S3Object `xml:"Contents"`
+	CommonPrefixes []struct {
+		Prefix string `xml:"Prefix"`
+	} `xml:"CommonPrefixes"`
+	IsTruncated           *bool  `xml:"IsTruncated"`
+	NextContinuationToken string `xml:"NextContinuationToken"`
 }
 
 func (s3 *S3Storage) listPage(ctx context.Context, client *http.Client, values url.Values) (*s3ListPage, error) {
@@ -124,6 +189,9 @@ func (s3 *S3Storage) listPage(ctx context.Context, client *http.Client, values u
 			}
 			signAWSv4(req, nil, key, secret, s3.Region, "s3")
 		} else {
+			if token != "" {
+				req.Header.Set("X-Amz-Security-Token", token)
+			}
 			req.SetBasicAuth(key, secret)
 		}
 	}
@@ -147,7 +215,7 @@ func (s3 *S3Storage) listPage(ctx context.Context, client *http.Client, values u
 	if err := xml.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("S3 list parse: %w", err)
 	}
-	if result.IsTruncated == nil || len(result.Contents) > 1000 {
+	if result.IsTruncated == nil || len(result.Contents)+len(result.CommonPrefixes) > 1000 {
 		return nil, errors.New("S3 list page lacks completion metadata or exceeds requested size")
 	}
 	return &result, nil

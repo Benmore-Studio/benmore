@@ -1,0 +1,1 @@
+On the hosted platform each app's backups are reachable only with credentials scoped to that app's own backup prefix: no operation on one app's backups can read or write another app's. A dashboard backup download is a redirect to a five-minute URL signed for exactly that object, and /health reports `checks.pitr` (ok, degraded or starting) to admins of an app with PITR.

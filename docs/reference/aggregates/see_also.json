@@ -1,0 +1,5 @@
+[
+  "api({at:'computed'}) - per-row values the database keeps current on every write",
+  "api({at:'query'}) - aggregates computed per request, as the caller",
+  "api({at:'ssr'}) - values a server-rendered page can print"
+]

@@ -14,28 +14,50 @@ import (
 
 // App holds the entire application state.
 type App struct {
-	Dir      string
-	DB       *sql.DB
-	Pages    map[string]*Page
-	Tables   []Table
-	Design   *DesignConfig
-	Partials map[string]string
-	Sessions *SessionStore
-	Hooks    *HookConfig
-	Flows    []Flow
-	MCP      *AppMCPManifest
+	errorReporterMu         sync.Mutex
+	errorReporter           *errorReporterGeneration
+	errorGroupWrites        atomic.Int64
+	errorMonitorsConfigured map[string][32]byte // guarded by errorReporterMu; retained across reporter generations
+	errorCompiles           errorCompileSet
+	errorSourceMaps         errorSourceMapCache
+	errorScrubber           errorEnvScrubber
+	// errorDeliveryOff keeps a `benmore test` run's reports local: the copy
+	// keeps env.yaml, so SENTRY_DSN and ERROR_SLACK_WEBHOOK are live in it.
+	errorDeliveryOff atomic.Bool
+	// jobsInProcess counts processNextJob calls in progress: the worker's
+	// and a test flush's. FlushJobs waits for it to reach zero, so a job the
+	// worker claimed first has finished when the flush returns.
+	jobsInProcess atomic.Int32
+	Dir           string
+	DB            *sql.DB
+	Pages         map[string]*Page
+	Tables        []Table
+	Design        *DesignConfig
+	Partials      map[string]string
+	Hooks         *HookConfig
+	Flows         []Flow
+	MCP           *AppMCPManifest
 	// mcpWithheld says why a present mcp.yaml's connector is off for this
 	// generation (its review does not bind the current source); "" otherwise.
 	mcpWithheld string
+	// mcpWritesOffByReload is when (unix nanoseconds) a hot reload of this
+	// process last turned approved writes or auto-approve off; 0 when none
+	// has since the start or the owner's last switch change. Status explains
+	// it, because a reload also forgets the approval binding the other
+	// reasons are read from.
+	mcpWritesOffByReload atomic.Int64
 	// mcpGeneration is published with the configuration fields used by private
 	// connector reads. Each successful reload installs a fresh identity.
-	mcpGeneration     *appMCPRuntimeGeneration
-	mcpRevisionPins   atomic.Int64      // pooled connections held by connector read revision pins
-	auditOwner        *App              // policy views route reads to the live owner's audit sink
-	sourceFiles       map[string][]byte // immutable reviewed generation; nil for ordinary apps
-	environment       map[string]string // runtime generation; values guarded by appEnvStore.mu
-	templateEnvSource []byte            // immutable private env.yaml; never part of the public source inventory
-	routeEnv          map[string]string // candidate-only environment snapshot; never published
+	mcpGeneration *appMCPRuntimeGeneration
+	// realtimePolicyView is the immutable policy snapshot read during inline
+	// event delivery, which can run while the caller already holds app.mu.
+	realtimePolicyView atomic.Pointer[App]
+	mcpRevisionPins    atomic.Int64      // pooled connections held by connector read revision pins
+	auditOwner         *App              // policy views route reads to the live owner's audit sink
+	sourceFiles        map[string][]byte // immutable reviewed generation; nil for ordinary apps
+	environment        map[string]string // runtime generation; values guarded by appEnvStore.mu
+	templateEnvSource  []byte            // immutable private env.yaml; never part of the public source inventory
+	routeEnv           map[string]string // candidate-only environment snapshot; never published
 	// Scopes lets app.yaml declare per-table override SQL fragments
 	// for the auto-CRUD's read filter. Keyed by table name. The most
 	// common use is `public_read_when: "status = 'published'"` so a
@@ -69,6 +91,11 @@ type App struct {
 	AppID           string        // auto-generated UUID for this app (persisted in .benmore/app_id)
 	ExternalID      string        // optional external system ID from app.yaml (e.g., project tracker ID)
 	DevMode         bool
+	// managedOAuth, when set, is where this app's managed social sign-in is
+	// brokered and the key that verifies the broker's handoff (oauth_managed.go).
+	// nil reads both from the router-written environment, as every hosted app
+	// does; only the router's own dashboard sign-in app sets it.
+	managedOAuth *managedOAuthSettings
 	// MCPLocal is `benmore serve --mcp-local`: the connector resource is
 	// http://localhost:<port>/api/_mcp (mcp_local_serve.go).
 	MCPLocal, MCPLocalWrites bool
@@ -104,6 +131,12 @@ type App struct {
 	// It is diagnostic capture progress, not TRUNCATE permission. The shipper
 	// owns SQLite-coordinated generation rotation; maintenance uses PASSIVE.
 	walShippedOffset atomic.Int64
+	// walCoverage is the WAL shipper's last report on PITR coverage, shown
+	// to admins by /health (setWALCoverage, db.go).
+	walCoverage atomic.Pointer[walCoverageReport]
+	// healthReadiness caches /health's database probe and memory reading
+	// (health_probe.go).
+	healthReadiness healthReadinessCache
 	// walCheckpointMu serializes the two in-process checkpointers - the WAL
 	// maintenance loop (db.go) and the WAL shipper's base snapshot
 	// (wal_shipper.go) - so a maintenance checkpoint can't write data.db while
@@ -116,6 +149,12 @@ type App struct {
 	workerWG        sync.WaitGroup
 	shuttingDown    bool
 	shutdownOnce    sync.Once
+	// scheduledBackupMu serializes scheduled backups across worker generations
+	// (a reload does not wait for the old one); scheduledBackupSince is the
+	// first backup-worker start in this process, the schedule's anchor until a
+	// scheduled-* backup exists (StartBackupWorker, migrate.go).
+	scheduledBackupMu    sync.Mutex
+	scheduledBackupSince atomic.Pointer[time.Time]
 	// jobWG tracks the workers that run app code of unbounded length (the
 	// job worker, the scheduled-task sweeper). Shutdown waits for them only
 	// up to jobDrainTimeout, which the single-app `serve` process sets: a
@@ -125,8 +164,34 @@ type App struct {
 	// long job.
 	jobWG           sync.WaitGroup
 	jobDrainTimeout time.Duration
+	// dbVerifiedAt is when this app's database last passed a full structural
+	// check (startup quick_check, carried by a clean-shutdown marker, or the
+	// post-migration integrity_check). markCleanOnClose makes closing the pool
+	// leave a clean-shutdown marker that vouches for it (db_clean_shutdown.go):
+	// set for the start-up load of a served process and serve's boot check.
+	dbVerifiedAt     time.Time
+	markCleanOnClose bool
+	// dbLocalSQLite is set when DB is the app directory's own data.db.
+	dbLocalSQLite bool
+	// dbOpened is the device and inode of the data.db the pool opened; a
+	// clean-shutdown marker may only vouch for that file (zero: unknown).
+	dbOpened dbFileIdentity
+	// dbFileWatch checks that data.db is still the opened file
+	// (db_file_watch.go); set only by `benmore serve`.
+	dbFileWatch *dbFileWatcher
+	// jobDrainTimedOut records that Shutdown closed the database under a job
+	// still running: that connection's writes are unaccounted for, so no
+	// clean-shutdown marker is written.
+	jobDrainTimedOut bool
 	// Advances only after a successful handler swap, never on a rejected reload.
 	reloadGeneration atomic.Uint64
+	// flowRoutesLogged: the per-route "flow:" lines were printed once; later
+	// registrations (every hot reload) log a one-line count instead. A large
+	// app printed ~430 lines per reload.
+	flowRoutesLogged atomic.Bool
+	// aggregates: which app.yaml aggregates the served mux publishes and
+	// which last failed to refresh (aggregates_served.go).
+	aggregates aggregateServing
 }
 
 // Shutdown signals background workers to stop and closes the DB.
@@ -172,6 +237,7 @@ func (app *App) Shutdown() {
 			select {
 			case <-drained:
 			case <-time.After(app.jobDrainTimeout):
+				app.jobDrainTimedOut = true
 				log.Printf("shutdown: a background job was still running after %s; closing the database under it (lease recovery handles the row)", app.jobDrainTimeout)
 			}
 		}
@@ -183,8 +249,10 @@ func (app *App) Shutdown() {
 			if _, err := app.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 				log.Printf("shutdown: wal_checkpoint: %v", err)
 			}
-			app.DB.Close()
+			app.leaveCleanShutdownMarker(app.DB.Close(), true)
 		}
+		// Its descriptor of data.db is closed only now that the pool is.
+		app.stopDBFileWatch()
 	})
 }
 
@@ -390,19 +458,23 @@ type WorkflowConfig struct {
 
 // Workflow defines a state machine for a single entity table.
 type Workflow struct {
-	Name         string
-	Table        string
-	Field        string
-	Initial      string
-	States       []string
-	Transitions  map[string]map[string]Transition // from_state → to_state → rule
-	OnTransition map[string][]Hook                // state_entered → hooks to fire
-	Timeouts     map[string]WorkflowTimeout       // state → auto-transition
+	Name  string
+	Table string
+	// ConfiguredTable is the table spelling workflows.yaml used when it differs
+	// from the schema's (Table is then the schema's); its transition routes
+	// stay registered so a deployed client keeps working.
+	ConfiguredTable string
+	Field           string
+	Initial         string
+	States          []string
+	Transitions     map[string]map[string]Transition // from_state → to_state → rule
+	OnTransition    map[string][]Hook                // state_entered → hooks to fire
+	Timeouts        map[string]WorkflowTimeout       // state → auto-transition
 }
 
 // Transition defines a single allowed state change.
 type Transition struct {
-	Role string // required role (empty = anyone)
+	Role string // required role, or an any-of list "owner,manager" (empty = anyone)
 	When string // optional condition
 }
 
@@ -440,6 +512,9 @@ type Table struct {
 	// SQLite FTS5 virtual table (<Name>_fts) + sync triggers, and
 	// /api/<Name>?q=... routes through it.
 	FullText [][]string
+	// Relations are the Prisma model's relation fields (none for a
+	// schema.sql app); `?include=<field>` resolves through them.
+	Relations []PrismaRelation
 }
 
 // Column represents a table column.
@@ -475,7 +550,7 @@ type QueryTag struct {
 // All features default to enabled (true) for backwards compatibility.
 type FeaturesConfig struct {
 	Admin   *bool `yaml:"admin"`   // /admin panel (default: true)
-	Uploads *bool `yaml:"uploads"` // generic file-upload endpoints (default: true)
+	Uploads *bool `yaml:"uploads"` // file uploads on every path: /api/_upload, /api/_files, multipart creates, connector pulls (default: true; uploadsAllowed)
 	Exports *bool `yaml:"exports"` // HTTP PDF and user-data exports (default: true)
 	// Search removed - opinionated feature, not a framework concern
 	SSE             *bool `yaml:"sse"`              // /sse/events endpoint (default: true)
@@ -599,14 +674,9 @@ type DesignConfig struct {
 	Auth            map[string]string               // domain, otp, redirect
 	PWA             map[string]string               // name, short_name, icon, theme_color, offline
 	Recording       map[string]string               // enabled, production, mask_inputs
+	Compliance      string                          // app.yaml `compliance:` ("" or complianceHIPAA)
 	Features        *FeaturesConfig                 // opt-in/opt-out for admin, search, sse, docs
 	AutoMemberships map[string]AutoMembershipConfig `yaml:"auto_memberships"`
-}
-
-// SessionStore manages user sessions.
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
 }
 
 // Session represents an authenticated user session.
@@ -647,7 +717,7 @@ type Session struct {
 	EmailGrandfathered bool
 
 	// CredentialScopes is the scope list the credential itself carries (the
-	// session row, API token or edge grant), before role grants narrow
+	// session row or API token), before role grants narrow
 	// Scopes. "" or "*" means an unscoped credential; anything else is a
 	// delegated token that must not manage the account (see
 	// accountManagementSession).
@@ -686,6 +756,12 @@ type Session struct {
 	// impersonated user so the trail shows who really acted.
 	ImpersonatorUserID int64
 	ImpersonatorEmail  string
+
+	// mfaEnrollmentPending marks a credential whose account must enroll the
+	// TOTP factor auth.require_mfa_for_roles demands before it may act
+	// (mfa_enrollment_gate.go). getSession never returns such a session; only
+	// the enrollment endpoints and the navigation gate see it.
+	mfaEnrollmentPending bool
 }
 
 // HasGroup reports whether the session has a non-empty tenant key.

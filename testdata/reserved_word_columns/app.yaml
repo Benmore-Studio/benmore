@@ -1,0 +1,6 @@
+site_name: "reserved-word-columns"
+auth:
+  identifier: email
+
+# The history table of a versioned table carries the same columns.
+versioned: [steps, order]

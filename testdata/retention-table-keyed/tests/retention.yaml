@@ -1,0 +1,28 @@
+# The table-keyed retention.yaml runs no policy. Run: benmore test <dir> --app
+
+table_keyed_file_deletes_nothing:
+  as_user: "owner@table-keyed.test"
+  setup:
+    - sql: "DELETE FROM messages"
+    - sql: "INSERT INTO messages (subject, user_id, created_at) VALUES ('four years old', {{user_id}}, datetime('now', '-1500 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT id FROM messages WHERE subject = 'four years old'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action IN ('ttl_delete', 'ttl_purge')"
+      expect:
+        rows: 0
+
+# An admin sees it in the health report.
+health_report_says_no_policy_is_running:
+  as_user: "admin@table-keyed.test"
+  as_role: "admin"
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+        contains:
+          - '"status":"healthy"'
+          - '"note":"retention.yaml: no policy is running"'
+          - '"policies_running":0'

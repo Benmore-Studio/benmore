@@ -1,0 +1,6 @@
+[
+  "POST /api/<table>/<id>/share        body: { email, permission: 'edit' }",
+  "GET /api/<table>/<id>/permissions",
+  "DELETE /api/<table>/<id>/permissions/<url-encoded-email> (browser SDK revoke)",
+  "DELETE /api/<table>/<id>/share/<permissionId> (revoke one grant)"
+]

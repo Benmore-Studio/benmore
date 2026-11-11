@@ -1,0 +1,29 @@
+[
+  "Owner-only records with an elevated reader, and a private file per record: each signed-in user files expense claims and sees only their own, a user whose role is `manager` sees and edits every claim, and a claim's receipt is a private upload that only someone who may read that claim can open. No flow is needed.",
+  {
+    "file": "app.yaml",
+    "content": "# Owner-only records: each user sees and changes only their own expense\n# claims, a manager sees and changes every claim, and a claim's receipt is a\n# private file that only someone who may read the claim can open.\nsite_name: \"Expense claims\"\nauth:\n  identifier: email\naccess:\n  claims:\n    read: owner_or_role:manager     # own rows; every row for a manager\n    write: everyone                 # any signed-in user files a claim\n    update: owner_or_role:manager\n    delete: owner_or_role:manager"
+  },
+  {
+    "file": "schema.prisma",
+    "content": "model Claim {\n  id          Int      @id @default(autoincrement())\n  title       String\n  amountCents Int      @map(\"amount_cents\")\n  receiptUrl  String   @default(\"\") @map(\"receipt_url\")   // what POST /api/_upload returned\n  userId      Int      @map(\"user_id\")                    // the owner, set by the framework\n  createdAt   DateTime @default(now()) @map(\"created_at\")\n  @@map(\"claims\")\n}"
+  },
+  {
+    "check": "POST /api/_upload (multipart: `file`, `kind=private`) answers {path, url, filename, size}; store `path` in receipt_url when creating the claim. GET on that path answers 403. GET /api/_signed_url?path=<path>&record_table=claims&record_id=<id> answers {path, url, expires_in} for the owner and for a manager, and the signed path returns the bytes; any other user gets 404 on the claim and 403 on the signature, also after copying the reference into a claim of their own (`this record does not own the file`). In page code: `bm.signedUrl(claim.receipt_url, { record: { table: 'claims', id: claim.id } })`.",
+    "notes": [
+      "`manager` here is the account's own role (`_benmore_users.role`): set it when creating the user (`benmore users <app> create <email> --password-stdin --role manager`) or in the admin panel. A role held only inside a tenant does not widen `owner_or_role:` on a table without the tenant key (`access.how`).",
+      "`role:manager` instead of `owner_or_role:manager` would leave a manager with only their own rows (`access.role_mode_rows`).",
+      "The owner can edit every column of their own claim. To keep one column out of their hands (an approval state), move it with a workflow: `tasks.status_workflow`.",
+      "Store and sign the reference exactly as the upload returned it; on the hosted media CDN it is a full URL (`uploads.gotchas`).",
+      "On the hosted platform an upload that would take the account past its media storage allowance answers 507 with code `media_storage_limit` and stores nothing (`uploads.storage_allowance`)."
+    ],
+    "read_next": [
+      "access.owner_or_elevated_pattern",
+      "access.role_mode_rows",
+      "uploads.public_vs_private",
+      "uploads.private_ownership",
+      "uploads.storage_allowance",
+      "signed-urls.authorization"
+    ]
+  }
+]

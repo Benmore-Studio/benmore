@@ -5,8 +5,6 @@ package main
 // Record creation and loading newly inserted rows.
 
 import (
-	"crypto/hmac"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +20,27 @@ func requiresUserIDInsert(cols []Column) bool {
 		if identIs(c.Name, "user_id") && c.NotNull {
 			return true
 		}
+	}
+	return false
+}
+
+// ownerOrTenantReplaced reports a submitted user_id or tenant key that the
+// create replaces with the caller's own. Sending your own id is common and
+// harmless; a different one (adding another member, assigning a row to a
+// colleague) was swapped without a word, so the row landed under the caller.
+func ownerOrTenantReplaced(session *Session, field, value string, groupKey bool) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	switch {
+	case identIs(field, "user_id"):
+		return session == nil || value != fmt.Sprint(session.UserID)
+	case groupKey:
+		if session != nil && session.IsAdminBypass() {
+			return false // an admin's explicit tenant is honored
+		}
+		return session == nil || !session.EffectiveHasGroup() || value != session.EffectiveGroupID()
 	}
 	return false
 }
@@ -64,7 +83,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
-				httpJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large (set MAX_UPLOAD_BODY_BYTES to accept several large files at once)"})
+				httpJSON(w, http.StatusRequestEntityTooLarge, withRefusalDocs(map[string]any{"error": "request body too large (set MAX_UPLOAD_BODY_BYTES to accept several large files at once)"}, refusalUploadTooLarge))
 				return
 			}
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "malformed multipart body"})
@@ -76,7 +95,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		decoder := json.NewDecoder(r.Body)
 		decoder.UseNumber()
 		if err := decoder.Decode(&body); err != nil || body == nil {
-			httpJSON(w, 400, map[string]any{"error": "expected a JSON object"})
+			if !answerIfRequestBodyTooLarge(w, err) {
+				httpJSON(w, 400, map[string]any{"error": "expected a JSON object"})
+			}
 			return
 		} else {
 			jsonBody = body
@@ -85,12 +106,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 				r.Form.Set(k, jsonToFormValue(v))
 			}
 		}
-	} else {
-		r.ParseForm()
+	} else if err := parseFormBody(r); answerIfRequestBodyTooLarge(w, err) {
+		// An oversized form used to parse as no fields and create an
+		// empty row (or fail validation for "missing" fields).
+		return
 	}
 
 	// Validate CSRF
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
@@ -120,7 +143,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// Scope enforcement
 	if session != nil {
 		if err := checkScope(session, table, "write"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 	}
@@ -128,6 +151,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	// The groups membership table takes a tenant admin unless the app
 	// declared its own rule (groups_membership_manage.go).
 	if writeMembershipManageDenial(w, membershipCreateDenial(app.DB, app, table, session)) {
+		return
+	}
+	submittedForm := make(map[string]any, len(r.Form))
+	for k, v := range r.Form {
+		submittedForm[k] = v
+	}
+	if err := membershipCreateIdentityDenial(app, table, session, submittedForm); err != nil {
+		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}
 
@@ -147,13 +178,39 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		httpJSON(w, 401, map[string]any{"error": "idempotency requires authentication"})
 		return
 	}
+	// features.uploads: false turns file uploads off here as it does on
+	// /api/_upload and /api/_files: a create that carries a file part is
+	// refused before anything is stored (no object, ownership row, table row
+	// or audit row). A multipart body with fields only is an ordinary create.
+	if field := uploadFilePart(r.MultipartForm); field != "" && uploadsAllowed(app) != nil {
+		writeUploadsDisabled(w, field)
+		return
+	}
 	// Handle file uploads - check for file inputs and save them
+	// Stored bytes and ownership rows are removed unless the row commits:
+	// the gates below (NOT NULL, member-of, FK, validators, before-hooks,
+	// idempotency, constraints) can all still refuse the create.
+	var storedUploads []string
+	created := false
+	defer func() {
+		if !created {
+			for _, p := range storedUploads {
+				discardStoredUpload(app, p)
+			}
+		}
+	}()
 	if r.MultipartForm != nil {
 		for fieldName, fileHeaders := range r.MultipartForm.File {
 			if len(fileHeaders) > 0 {
 				// Save the uploaded file
-				path, err := HandleFileUpload(app, r, fieldName, table, 0, nil)
+				path, dest, err := handleFileUploadAt(app, r, fieldName, table, 0, nil)
+				if dest != "" {
+					storedUploads = append(storedUploads, dest)
+				}
 				if err != nil {
+					if respondMediaAllowance(w, err) {
+						return
+					}
 					httpError(w, err.Error(), http.StatusBadRequest)
 					return
 				}
@@ -212,11 +269,18 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 			stripped = append(stripped, k)
 		} else if workflowCreateStateRefused(app, table, k, r.FormValue(k)) {
 			stripped = append(stripped, k)
+		} else if ownerOrTenantReplaced(session, k, r.FormValue(k), isGroupKey(k)) {
+			stripped = append(stripped, k)
 		}
 	}
 	if len(stripped) > 0 {
 		w.Header().Set("X-Stripped-Fields", strings.Join(stripped, ","))
 	}
+	formFields := make([]string, 0, len(r.Form))
+	for k := range r.Form {
+		formFields = append(formFields, k)
+	}
+	setIgnoredFieldsHeader(w, r, formFields, cols)
 
 	// submitted: the columns written from the request itself, for the
 	// before-hooks' {{_submitted}} (not the framework-filled user_id and
@@ -277,6 +341,15 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 
 		// Skip protected fields
 		if protected.has(col.Name) {
+			continue
+		}
+
+		// A workflow's state column always starts in its initial state, sent,
+		// null or left out (never the column default, never "").
+		if initial, ok := workflowCreateInitial(app, table, col.Name); ok {
+			fields = append(fields, col.Name)
+			placeholders = append(placeholders, "?")
+			values = append(values, initial)
 			continue
 		}
 
@@ -353,28 +426,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	var idempKey, fingerprint string
 	if idempotencyKey != "" {
 		idempKey, fingerprint = createIdempotencyIdentity(r, table, session, idempotencyKey)
-		if _, err := tx.Exec("DELETE FROM _benmore_idempotency WHERE key=? AND user_id=? AND created_at < datetime('now', '-1 day')", idempKey, session.UserID); err != nil {
+		answered, err := answerIdempotentReplay(w, tx, idempKey, fingerprint, session.UserID, isHTMX(r))
+		if err != nil {
 			serverErrorJSON(w, r, app, table+" create", err, "idempotency unavailable")
 			return
 		}
-		var cached, previous string
-		var status int
-		err := tx.QueryRow("SELECT response, status_code, fingerprint FROM _benmore_idempotency WHERE key=? AND user_id=?", idempKey, session.UserID).Scan(&cached, &status, &previous)
-		if err == nil {
-			if !hmac.Equal([]byte(previous), []byte(fingerprint)) {
-				httpJSON(w, 409, map[string]any{"error": "idempotency key already used with different input or authorization"})
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if isHTMX(r) {
-				w.Header().Set("HX-Refresh", "true")
-			}
-			w.WriteHeader(status)
-			w.Write([]byte(cached))
-			return
-		}
-		if err != sql.ErrNoRows {
-			serverErrorJSON(w, r, app, table+" create", err, "idempotency unavailable")
+		if answered {
 			return
 		}
 		var legacy bool
@@ -418,8 +475,8 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 	markSubmittedFields(beforeRow, submitted)
 	injectSessionContext(beforeRow, session)
 	// Cross-field validators (declarative rules from validators.yaml)
-	if err := ValidateCrossField(app.validatorConfig(), table, beforeRow); err != nil {
-		httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+	if err := ValidateCrossField(app.validatorConfig(), table, beforeRow, cols); err != nil {
+		httpJSON(w, http.StatusUnprocessableEntity, withRefusalDocs(map[string]any{"error": err.Error()}, refusalValidatorRule))
 		return
 	}
 	if err := fireBeforeHooksWith(tx, app, "insert", table, beforeRow); err != nil {
@@ -452,10 +509,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		// levers instead of the raw SQLite error.
 		if app.Group != nil && app.Group.Key != "" &&
 			strings.Contains(err.Error(), fmt.Sprintf("NOT NULL constraint failed: %s.%s", table, app.Group.Key)) {
-			httpJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			httpJSON(w, http.StatusUnprocessableEntity, withRefusalDocs(map[string]any{
 				"error": fmt.Sprintf("Insert failed: %s is the tenant key - it cannot be set by clients and is auto-injected from the session's group, but this user has no group membership yet.", app.Group.Key),
 				"hint":  fmt.Sprintf("Bootstrap the tenant first: declare `groups.bootstrap: {org_table: <orgs>}` in app.yaml and POST /api/_groups/create (creates the org + this user's founding membership atomically), or insert a row into %s for this user server-side. See api(at:\"scoping\").", app.Group.Table),
-			})
+			}, refusalTenantRequired))
 			return
 		}
 		if respondStorageFull(w, app, err) || respondDatabaseBusy(w, err) {
@@ -529,7 +586,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		body = nil
 	}
 	if idempotencyKey != "" {
-		if _, err := tx.Exec("INSERT INTO _benmore_idempotency (key,user_id,response,status_code,fingerprint) VALUES (?,?,?,?,?)", idempKey, session.UserID, string(body), http.StatusOK, fingerprint); err != nil {
+		// The response holds the creator's decrypted view of encrypted
+		// fields: it is stored sealed (crud_idempotency.go).
+		stored, err := sealIdempotentResponse(tx, app, table, idempKey, session.UserID, body)
+		if err != nil {
+			serverErrorJSON(w, r, app, table+" create", err, "idempotency save failed")
+			return
+		}
+		if _, err := tx.Exec("INSERT INTO _benmore_idempotency (key,user_id,response,status_code,fingerprint) VALUES (?,?,?,?,?)", idempKey, session.UserID, stored, http.StatusOK, fingerprint); err != nil {
 			if respondStorageFull(w, app, err) {
 				return
 			}
@@ -542,6 +606,18 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		row[f] = values[i]
 	}
 	row["id"] = id
+	// Insert events (hooks, event flows, webhook subscriptions) carry the
+	// row as stored, like update events and batch and /api/_transaction
+	// creates: typed values, defaulted columns (status, created_at, ...)
+	// and decrypted encrypted fields. They used to carry the submitted
+	// fields as text ("amount_cents":"2500") without the defaults. Read in
+	// the insert's transaction; a failed read keeps the submitted row.
+	event := row
+	if stored, err := queryNativeRowsWith(tx, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id); err == nil && len(stored) == 1 {
+		event = stored[0]
+	} else {
+		log.Printf("create %s id=%v: events carry the submitted fields; the stored row could not be read: %v", table, id, err)
+	}
 	// The audit row commits (or rolls back) with the insert, on the same
 	// write lock, instead of a second write after commit that could be lost.
 	if err := LogAuditTx(tx, app, "insert", table, idStr, session, nil, row); err != nil {
@@ -551,6 +627,18 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		serverErrorJSON(w, r, app, table+" create", err, "audit write failed")
 		return
 	}
+	// Hook jobs and webhook deliveries commit with the row. Subscriptions
+	// deliver the row as stored, taken before the session context
+	// overwrites same-named columns.
+	stored := copyRow(event)
+	injectSessionContext(event, session)
+	if err := enqueueRowEffectsTx(tx, app, "insert", table, event, stored, session); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverErrorJSON(w, r, app, table+" create", err, "effect queue write failed")
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		if respondStorageFull(w, app, err) {
 			return
@@ -558,11 +646,8 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		serverErrorJSON(w, r, app, table+" create", err, "commit failed")
 		return
 	}
-	// Fire insert hooks
-	injectSessionContext(row, session)
-	FireHooks(app, "insert", table, row)
-	FireFlowsForEvent(app, "on_insert", table, row)
-	FireWebhookSubscriptions(app, "insert", table, row, session)
+	created = true
+	FireFlowsForEvent(app, "on_insert", table, event)
 	Broadcast(app, table, "insert", session)
 	appendHXTrigger(w, "benmore:changed")
 

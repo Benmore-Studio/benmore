@@ -1,0 +1,11 @@
+{
+  "keys": [
+    "summary",
+    "endpoint",
+    "dictionary_delivery",
+    "browser_bootstrap",
+    "literal_substitution",
+    "yaml_example",
+    "js_snippet"
+  ]
+}

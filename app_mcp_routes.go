@@ -188,17 +188,6 @@ func appMCPRouteProbe(path, target string) string {
 	return strings.Join(parts, "/")
 }
 
-func validateAppMCPDatabaseBindings(dir string, m *AppMCPManifest, flows []Flow, db *sql.DB) error {
-	if m == nil {
-		return nil
-	}
-	tables, err := appMCPCandidateTables(dir, db)
-	if err != nil {
-		return err
-	}
-	return validateAppMCPRouteBindings(m, flows, tables)
-}
-
 func appMCPCandidateTables(dir string, db *sql.DB) (map[string]bool, error) {
 	return appMCPCandidateTablesWithSchema(dir, db, func(name string) ([]byte, error) { return readOptionalConfig(dir, name) }, nil)
 }
@@ -216,21 +205,12 @@ func appMCPCandidateTablesWithSchema(dir string, db *sql.DB, readSource func(str
 	if err != nil {
 		return nil, err
 	} else if prisma != nil {
-		var ledger int
-		if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND lower(name)='_benmore_migrations'").Scan(&ledger); err != nil {
-			return nil, fmt.Errorf("mcp.yaml: cannot inspect Prisma migration ledger")
+		dropped, unparseable, err := appMCPPrismaTransitionDrops(db, prisma)
+		if err != nil {
+			return nil, err
 		}
-		if ledger > 0 {
-			var previous string
-			err := db.QueryRow("SELECT source FROM _benmore_migrations ORDER BY id DESC LIMIT 1").Scan(&previous)
-			if err != nil && err != sql.ErrNoRows {
-				return nil, fmt.Errorf("mcp.yaml: cannot inspect Prisma migration source")
-			}
-			oldModels, oldErr := ParsePrismaSchema(previous)
-			newModels, newErr := ParsePrismaSchema(string(prisma))
-			if oldErr != nil || newErr != nil || len(DiffSchemas(oldModels, newModels).TablesDropped) > 0 {
-				return nil, fmt.Errorf("mcp.yaml: destructive Prisma schema transition is unsupported")
-			}
+		if unparseable || len(dropped) > 0 {
+			return nil, appMCPDestructiveSchemaError(dropped)
 		}
 	}
 	existing, err := readCRUDTableDefinitions(db)
@@ -323,6 +303,7 @@ func validateAppMCPCandidateRoutes(dir string, config *runtimeConfig, db *sql.DB
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	canonicalizeWorkflowTableNames(config.workflows, names)
 	candidate := &App{Dir: dir, DB: db, Pages: pages, Paths: DiscoverAuthPaths(pages), Design: config.design,
 		Flows: config.flows, Workflows: config.workflows, Hooks: config.hooks, MCP: config.mcp, sourceFiles: config.sourceFiles,
 		Group: config.group, Access: config.access, routeEnv: environment}

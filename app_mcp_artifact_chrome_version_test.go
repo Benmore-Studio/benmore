@@ -20,7 +20,8 @@ func artifactChromeVersionFixture(t *testing.T, body string) string {
 	path := filepath.Join(t.TempDir(), "chrome-version")
 	// exec replaces the shell so cancelling the probe cannot leave a sleeping
 	// child holding the output pipe open after the parent process is killed.
-	script := "#!/bin/sh\nif [ \"$#\" -ne 1 ] || [ \"$1\" != \"--version\" ]; then exit 7; fi\n" + body + "\n"
+	// The probe passes --version first, then the keychain-free flags.
+	script := "#!/bin/sh\nif [ \"$1\" != \"--version\" ]; then exit 7; fi\nshift\nfor arg in \"$@\"; do case \"$arg\" in --password-store=basic|--use-mock-keychain) ;; *) exit 7;; esac; done\n" + body + "\n"
 	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,1 @@
+A WebSocket to another host needs `csp.connect_src: "wss://<host>"` in app.yaml; the default connect-src allows only the app's own origin. See api(at:"csp") (websockets).

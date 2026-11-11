@@ -26,6 +26,7 @@ func TestGroupBootstrapAppliesCreateWriteGates(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	app := &App{Dir: dir, DB: db}
 	EnsureSessionsTable(db)
+	EnsureAuditLogTable(db)
 	if err := EnsureUsersTable(db); err != nil {
 		t.Fatal(err)
 	}

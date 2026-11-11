@@ -1,0 +1,134 @@
+# Who an approval is assigned to. A request addressed by email belongs to the
+# account that has proven that address (verified, or grandfathered), in any
+# letter case; a request that names its approver by id alone is that
+# account's. Test users are created verified; a setup UPDATE makes one
+# unproven. Rows are found by row_id (no fixed ids: requests made through the
+# API take the next id, in whatever order the tests run).
+
+request_in_other_letter_case_binds_the_approver:
+  users:
+    - "casey@test.com"
+  as_user: "asker1@test.com"
+  steps:
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "case-1", approver_email: " Casey@Test.COM ", title: "Case"}
+      expect: {status: 200, json: {status: "pending"}}
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "case-1", approver_email: "CASEY@test.com", title: "Case"}
+      expect: {status: 200, json: {status: "pending"}}
+    # One row for both submits, stored normalized and bound to casey.
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'case-1'"
+      expect: {rows: 1}
+    - sql: "SELECT a.id FROM _benmore_approvals a JOIN _benmore_users u ON u.id = a.approver_id WHERE a.row_id = 'case-1' AND a.approver_email = 'casey@test.com' AND u.email = 'casey@test.com'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_notifications WHERE title = 'Approval requested' AND user_id = (SELECT id FROM _benmore_users WHERE email = 'casey@test.com')"
+      expect: {rows: 1}
+
+approver_decides_request_stored_in_other_letter_case:
+  as_user: "bob6@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_email, title) VALUES ('label', 'case-2', 999, 'someone@test.com', 'Bob6@Test.com', 'Stored as typed')"
+  steps:
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'case-2'"
+      save: {approval: "id"}
+      expect: {rows: 1}
+    - get: "/api/_approvals?mine=1"
+      expect: {status: 200, contains: "Stored as typed"}
+    - api: "POST /api/_approvals/{{approval}}/decide"
+      json: {decision: "approved"}
+      expect: {status: 200, json: {status: "approved"}}
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'case-2' AND status = 'approved'"
+      expect: {rows: 1}
+
+request_is_not_bound_to_an_unproven_account:
+  as_user: "asker2@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_users (username, email, password_hash, role, verified, email_grandfathered) VALUES ('squatter-cfo1', 'cfo1@test.com', 'x', 'user', 0, 0)"
+  steps:
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "wire-1", approver_email: "cfo1@test.com", title: "Wire"}
+      expect: {status: 200, json: {status: "pending"}}
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-1' AND approver_email = 'cfo1@test.com' AND approver_id IS NULL AND status = 'pending'"
+      expect: {rows: 1}
+    - sql: "SELECT 1 AS quiet WHERE NOT EXISTS (SELECT 1 FROM _benmore_notifications WHERE user_id = (SELECT id FROM _benmore_users WHERE email = 'cfo1@test.com'))"
+      expect: {rows: 1}
+
+unproven_account_cannot_read_or_decide_a_request_for_its_address:
+  as_user: "cfo2@test.com"
+  setup:
+    - sql: "UPDATE _benmore_users SET verified = 0, email_grandfathered = 0 WHERE id = {{user_id}}"
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES ('label', 'wire-2', 999, 'someone@test.com', {{user_id}}, 'cfo2@test.com', 'Legacy wire')"
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_email, title) VALUES ('label', 'wire-3', 999, 'someone@test.com', 'cfo2@test.com', 'Unbound wire')"
+  steps:
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-2'"
+      save: {legacy: "id"}
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-3'"
+      save: {unbound: "id"}
+      expect: {rows: 1}
+    - get: "/api/_approvals?mine=1"
+      expect:
+        status: 200
+        not_contains:
+          - "Legacy wire"
+          - "Unbound wire"
+    - get: "/api/_approvals"
+      expect:
+        status: 200
+        not_contains:
+          - "Legacy wire"
+          - "Unbound wire"
+    - api: "POST /api/_approvals/{{legacy}}/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+    - api: "POST /api/_approvals/{{unbound}}/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id IN ('wire-2', 'wire-3') AND status = 'pending'"
+      expect: {rows: 2}
+
+grandfathered_account_keeps_a_request_for_its_address:
+  as_user: "veteran1@test.com"
+  setup:
+    - sql: "UPDATE _benmore_users SET verified = 0, email_grandfathered = 1 WHERE id = {{user_id}}"
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES ('label', 'wire-4', 999, 'someone@test.com', {{user_id}}, 'veteran1@test.com', 'Grandfathered wire')"
+  steps:
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-4'"
+      save: {approval: "id"}
+      expect: {rows: 1}
+    - get: "/api/_approvals?mine=1"
+      expect: {status: 200, contains: "Grandfathered wire"}
+    - api: "POST /api/_approvals/{{approval}}/decide"
+      json: {decision: "approved"}
+      expect: {status: 200, json: {status: "approved"}}
+
+approver_named_by_id_needs_no_address:
+  as_user: "temp1@test.com"
+  setup:
+    - sql: "UPDATE _benmore_users SET verified = 0, email_grandfathered = 0 WHERE id = {{user_id}}"
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES ('label', 'wire-5', 999, 'someone@test.com', {{user_id}}, '', 'Named by id')"
+  steps:
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-5'"
+      save: {approval: "id"}
+      expect: {rows: 1}
+    - get: "/api/_approvals?mine=1"
+      expect: {status: 200, contains: "Named by id"}
+    - api: "POST /api/_approvals/{{approval}}/decide"
+      json: {decision: "rejected"}
+      expect: {status: 200, json: {status: "rejected"}}
+
+stored_approver_id_does_not_outlive_the_address:
+  as_user: "eve1@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES ('label', 'wire-6', 999, 'someone@test.com', {{user_id}}, 'cfo4@test.com', 'Addressed elsewhere')"
+  steps:
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-6'"
+      save: {approval: "id"}
+      expect: {rows: 1}
+    - get: "/api/_approvals?mine=1"
+      expect: {status: 200, not_contains: "Addressed elsewhere"}
+    - api: "POST /api/_approvals/{{approval}}/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+    - sql: "SELECT id FROM _benmore_approvals WHERE row_id = 'wire-6' AND status = 'pending'"
+      expect: {rows: 1}

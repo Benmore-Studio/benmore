@@ -91,15 +91,13 @@ func TestJobRunningGateWaitsForLeaseRecoveryTransition(t *testing.T) {
 	if processNextJob(app) {
 		t.Fatal("expired lease bypassed a still-running predecessor before recovery")
 	}
+	// The test drain starts with the worker's recovery sweep: B runs only
+	// after A was failed closed, never around a running A.
 	FlushJobs(app)
-	if jobStatus(t, app.DB, b) != "pending" {
-		t.Fatal("test drain bypassed a still-running predecessor")
-	}
-	jobsRecoverOrphanedJobs(app)
 	if jobStatus(t, app.DB, a) != "failed" {
 		t.Fatal("non-idempotent predecessor was not failed closed")
 	}
-	if !processNextJob(app) {
+	if jobStatus(t, app.DB, b) == "pending" {
 		t.Fatal("terminal predecessor did not unblock B")
 	}
 }

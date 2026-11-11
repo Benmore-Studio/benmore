@@ -125,7 +125,7 @@ func registerBillingRoutes(mux appRouteRegistrar, app *App) {
 		json.NewEncoder(w).Encode(sub)
 	})
 	mux.HandleFunc("POST /api/_billing/portal", func(w http.ResponseWriter, r *http.Request) {
-		if !validateCSRF(r) && !isBearerAuth(r) {
+		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpError(w, "CSRF validation failed", http.StatusForbidden)
 			return
 		}
@@ -159,7 +159,7 @@ func registerBillingRoutes(mux appRouteRegistrar, app *App) {
 		if err != nil {
 			// Stripe's error body names the account (dashboard log URLs, a
 			// masked key); it goes to the log, not to the app's end user.
-			serverErrorStatus(w, r, app, http.StatusBadGateway, "billing portal", err, "portal session failed")
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "billing portal", err, "portal session failed")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

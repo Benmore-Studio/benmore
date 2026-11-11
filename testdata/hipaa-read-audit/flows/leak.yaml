@@ -1,0 +1,12 @@
+on:
+  request: { method: POST, path: /api/patient-leak, auth: required, transaction: true }
+jobs:
+  leak:
+    steps:
+      - run: sql
+        id: rows
+        with: { query: "SELECT name FROM patients" }
+      - run: sql
+        with: { query: "INSERT INTO patients (name, user_id) VALUES (NULL, :user_id)" }
+      - run: respond
+        with: { json: { ok: true } }

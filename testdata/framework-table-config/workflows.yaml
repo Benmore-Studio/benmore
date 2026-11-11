@@ -1,0 +1,16 @@
+note_status:
+  table: notes
+  field: status
+  initial: draft
+  transitions:
+    draft:
+      done: {}
+
+# Not loaded: a workflow takes only the app's own tables.
+promote:
+  table: _benmore_users
+  field: role
+  initial: user
+  transitions:
+    user:
+      admin: {}

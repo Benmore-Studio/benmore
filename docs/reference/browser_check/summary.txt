@@ -1,0 +1,1 @@
+Drive rendered UI in headless Chrome, then inspect it with script. Actions are preflight-validated before any action runs; an invalid field, selector, target type, or select option reports an error and drives nothing.

@@ -60,7 +60,7 @@ func TestFlowConditionsThatCanHoldAreAccepted(t *testing.T) {
 		"${{ steps.a.outputs.rows[0].id == params.id }}",
 		"${{ params.a == 'a!=b' }}",
 	} {
-		step := "      - id: a\n        run: sql\n        with: { query: \"SELECT 1 AS ok, 1 AS n\" }\n      - if: \"" + cond + "\"\n        steps:\n          - run: respond\n            with: { status: 403, body: { error: no } }\n"
+		step := "      - id: a\n        run: sql\n        with: { query: \"SELECT 1 AS ok, 1 AS n, 1 AS id\" }\n      - if: \"" + cond + "\"\n        steps:\n          - run: respond\n            with: { status: 403, body: { error: no } }\n"
 		if msg := ValidateOnWrite("flows/x.yaml", deadConditionFlow(step)); msg != "" {
 			t.Errorf("%s: refused: %s", cond, msg)
 		}

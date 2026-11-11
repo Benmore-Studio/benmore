@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "disabled_reason",
+    "hipaa",
+    "git_diagnostics",
+    "history_safety",
+    "write_receipts",
+    "summary",
+    "tools",
+    "cli",
+    "gotchas"
+  ]
+}

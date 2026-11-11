@@ -14,7 +14,7 @@ package main
 //     symbol. The implementations are kept byte-identical on purpose.
 //
 //  2. No-op / nil stubs for genuinely platform-only features (the platform
-//     DB handle, dashboard user sync, the edge-auth bridge). Every framework
+//     DB handle, dashboard user sync). Every framework
 //     call site already guards on the zero value these return ("platform
 //     absent"), so the framework degrades cleanly to single-app behavior.
 
@@ -25,7 +25,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"strings"
 )
 
 // ---- generic helpers (mirrors of the platform-build originals) ----
@@ -122,44 +121,6 @@ func hashAPIToken(plaintext string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// extractTableFromStmt returns the target table of an INSERT/UPDATE/DELETE
-// statement, or "". (Mirror of mcp_tools_composers.go.)
-func extractTableFromStmt(stmt string) string {
-	trimmed := strings.TrimSpace(stmt)
-	upper := strings.ToUpper(trimmed)
-	upperNorm := strings.Join(strings.Fields(upper), " ")
-	var prefix string
-	switch {
-	case strings.HasPrefix(upperNorm, "INSERT INTO "):
-		prefix = "INSERT INTO "
-	case strings.HasPrefix(upperNorm, "UPDATE "):
-		prefix = "UPDATE "
-	case strings.HasPrefix(upperNorm, "DELETE FROM "):
-		prefix = "DELETE FROM "
-	default:
-		return ""
-	}
-	fields := strings.Fields(trimmed)
-	prefixWords := len(strings.Fields(prefix))
-	if len(fields) <= prefixWords {
-		return ""
-	}
-	candidate := fields[prefixWords]
-	end := 0
-	for end < len(candidate) {
-		c := candidate[end]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
-			end++
-			continue
-		}
-		break
-	}
-	if end == 0 {
-		return ""
-	}
-	return candidate[:end]
-}
-
 // ---- platform-only feature stubs (no-op / nil = "platform absent") ----
 
 // platformDB is the hosted control-plane database handle. It is always nil in
@@ -205,16 +166,15 @@ func platformPasswordChanged(app *App, email, passwordHash string, emailProved b
 // account. No platform → no-op.
 func platformAccountDeleted(app *App, email string) {}
 
-// edgeBridgeUserID resolves a trusted edge-proxy user header. Edges are a
-// platform feature, so there is never such a header here → 0 (no bridge).
-func edgeBridgeUserID(r *http.Request) int64 { return 0 }
+// handlePlatformAccountDeletion is the hosted dashboard's Delete account.
+// Unreachable here: platformDashboardApp is false for every app.
+func handlePlatformAccountDeletion(w http.ResponseWriter, r *http.Request, app *App) {
+	http.NotFound(w, r)
+}
 
-// sessionForEdgeBridge mints a session for the edge bridge. No edges → nil.
-func sessionForEdgeBridge(app *App, userID int64) *Session { return nil }
-
-// RegisterEdgeAuthOnApp mounts the edge consent routes on an app. No edges →
-// nothing to mount.
-func RegisterEdgeAuthOnApp(mux appRouteRegistrar, app *App) {}
+// registerPlatformAccountDeletionRoutes mounts the hosted dashboard's
+// account-deletion routes. No platform → nothing to mount.
+func registerPlatformAccountDeletionRoutes(mux appRouteRegistrar, app *App) {}
 
 // loadAppBuildState hydrates build-time accounting from the platform DB. No
 // platform → no-op (App.BuildSeconds stays zero).
@@ -229,13 +189,13 @@ func StartWALShipper(app *App) {}
 // this is a no-op (never blocked).
 func checkStorageCap(app *App, projectedBytes int64) (string, bool) { return "", false }
 
+// refuseRouterTenantData is the hosted router's tenant-data lock
+// (router_tenant_data_lock.go). Framework and cloud builds have no router.
+func refuseRouterTenantData(path string) error { return nil }
+
 // storageLimitRemedy follows a storage refusal. Without plan limits the only
 // way to reach one is a full disk.
 func storageLimitRemedy() string { return "Delete data or free disk space, then retry." }
-
-// revokeEdgeGrantsForUser revokes a user's edge grants. Edges are a platform
-// feature, so there are none to revoke here.
-func revokeEdgeGrantsForUser(app *App, userID int64) error { return nil }
 
 // oauthMintCLIToken issues a hosted-platform CLI api_token after OAuth. There
 // is no platform here, so it never issues a token - OAuth just creates the
@@ -246,3 +206,16 @@ func oauthMintCLIToken(w http.ResponseWriter, r *http.Request, app *App, email, 
 
 // registerCLIDeviceRoutes serves CLI device login in the platform build only.
 func registerCLIDeviceRoutes(mux appRouteRegistrar, app *App) {}
+
+// dashboardIdentityFromRouter resolves the benmore.ai dashboard's caller from
+// the platform router once the router owns its sign-in. No platform → the
+// app resolves its own sessions.
+func dashboardIdentityFromRouter(app *App, r *http.Request) (*Session, bool) { return nil, false }
+
+// dashboardUsesRouterIdentity reports whether app is the dashboard with its
+// sign-in owned by the platform router. No platform → never.
+func dashboardUsesRouterIdentity(app *App) bool { return false }
+
+// dashboardFlowWriteRefusal refuses a dashboard flow's write to credential
+// tables the platform router owns. No platform → nothing is refused.
+func dashboardFlowWriteRefusal(app *App, query string) error { return nil }

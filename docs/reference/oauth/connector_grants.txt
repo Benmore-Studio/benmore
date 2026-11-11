@@ -1,0 +1,1 @@
+The MCP connector contract (OAuth grants, tools, commands, approvals, execution states, files, artifacts, resources, external connections, owner controls, limits and security) is documented in api(at:"connector"): start at its `connector_grants` key, which names the key that holds each subject.

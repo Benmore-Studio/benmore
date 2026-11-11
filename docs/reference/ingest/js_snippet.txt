@@ -1,0 +1,7 @@
+const rows = [{ title: 'A' }, { title: 'B' }, /* … */];
+const ndjson = rows.map(r => JSON.stringify(r)).join('\n');
+await fetch('/api/notes/ingest', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/x-ndjson', 'X-CSRF-Token': csrf },
+  body: ndjson,
+});

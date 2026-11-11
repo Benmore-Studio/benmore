@@ -1,0 +1,126 @@
+# api(at:"computed"): computed.yaml columns are kept by the database on every
+# write and are never taken from a client. Run: benmore test <dir> --app
+
+same_row_expression_follows_the_row:
+  as_user: "owner@computed.test"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "three at 2.50", quantity: 3, unit_price: 2.5}
+      save: {oid: "id"}
+      expect:
+        status: 200
+        contains: '"line_total":7.5'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {quantity: 10}
+      expect:
+        status: 200
+    - get: "/api/orders/{{oid}}"
+      expect:
+        status: 200
+        contains: '"line_total":25'
+    # Lists filter by it like any column.
+    - get: "/api/orders?line_total__gte=25&fields=title,line_total"
+      expect:
+        status: 200
+        contains: '"title":"three at 2.50"'
+    - get: "/api/orders?line_total__gt=25&fields=title,line_total"
+      expect:
+        status: 200
+        not_contains: '"title":"three at 2.50"'
+
+# A create or PATCH that sends a computed column succeeds without it and says so.
+client_values_for_computed_columns_are_left_out:
+  as_user: "sender@computed.test"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "one at 2", quantity: 1, unit_price: 2, line_total: 999, item_count: 42}
+      save: {oid: "id"}
+      expect:
+        status: 200
+        contains:
+          - '"line_total":2'
+          - '"item_count":0'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {title: "renamed", line_total: 999}
+      expect:
+        status: 200
+        headers: {X-Stripped-Fields: "line_total"}
+        contains: '"stripped_fields":["line_total"]'
+    - api: "PATCH /api/orders/{{oid}}"
+      json: {line_total: 999}
+      expect:
+        status: 400
+        contains: "No fields to update"
+    - get: "/api/orders/{{oid}}"
+      expect:
+        status: 200
+        contains:
+          - '"title":"renamed"'
+          - '"line_total":2'
+
+# The sql: field counts the order's items: it follows inserts, a soft delete
+# (an update that sets deleted_at) and a child that moves to another order.
+aggregate_field_follows_its_child_rows:
+  as_user: "counter@computed.test"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "first"}
+      save: {first: "id"}
+      expect:
+        status: 200
+        contains: '"item_count":0'
+    - api: "POST /api/orders"
+      json: {title: "second"}
+      save: {second: "id"}
+      expect:
+        status: 200
+    - api: "POST /api/items"
+      json: {order_id: "{{first}}", name: "a"}
+      save: {a: "id"}
+      expect:
+        status: 200
+    - api: "POST /api/items"
+      json: {order_id: "{{first}}", name: "b"}
+      save: {b: "id"}
+      expect:
+        status: 200
+    - get: "/api/orders/{{first}}"
+      expect:
+        status: 200
+        contains: '"item_count":2'
+    - api: "DELETE /api/items/{{a}}"
+      json: {}
+      expect:
+        status: 200
+    - get: "/api/orders/{{first}}"
+      expect:
+        status: 200
+        contains: '"item_count":1'
+    - api: "PATCH /api/items/{{b}}"
+      json: {order_id: "{{second}}"}
+      expect:
+        status: 200
+    - get: "/api/orders/{{first}}"
+      expect:
+        status: 200
+        contains: '"item_count":0'
+    - get: "/api/orders/{{second}}"
+      expect:
+        status: 200
+        contains: '"item_count":1'
+
+# The count runs in the database, not as a caller, so a child may only name a
+# parent its writer can read: order 9001 belongs to another user.
+child_cannot_point_at_a_parent_its_writer_cannot_read:
+  as_user: "intruder@computed.test"
+  setup:
+    - sql: "INSERT OR IGNORE INTO orders (id, title, user_id) VALUES (9001, 'someone else''s order', 99999)"
+  steps:
+    - api: "POST /api/items"
+      json: {order_id: 9001, name: "not mine"}
+      expect:
+        status: 422
+        contains: "does not exist or is not accessible"
+    - sql: "SELECT id FROM orders WHERE id = 9001 AND item_count = 0"
+      expect:
+        rows: 1

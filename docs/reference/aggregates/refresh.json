@@ -1,0 +1,7 @@
+[
+  "Every aggregate is computed when the app starts or reloads, then on its own timer every `refresh`. In between, the cached value does not follow writes: it can be up to one `refresh` old.",
+  "POST /api/_aggregates/refresh (an admin, with the CSRF token) recomputes all of them at once and answers `{refreshed: [names], failed: [names]}`.",
+  "A refresh whose SQL fails keeps the last value. GET /api/_aggregates then lists the aggregate with `stale: true`, `stale_since` (the first failure since the last success) and `error`, and `updated_at` stays the time of the last successful run. One that has never succeeded is listed with `value: null`.",
+  "The query runs as often as `refresh` says, with a 30 second limit: one that takes longer fails that refresh and keeps its last value (`stale: true`). Write one an index can answer, and give a heavy one a long `refresh`.",
+  "Removing an entry from app.yaml stops serving it and deletes its cached value at the next load."
+]

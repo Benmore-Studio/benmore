@@ -1,0 +1,113 @@
+the_requester_withdraws_but_cannot_approve:
+  as_user: "ann@requests.test"
+  steps:
+    # A create starts in the initial state whatever it sends.
+    - api: "POST /api/requests"
+      json: { title: "Monitor", amount_cents: 30000, status: "approved" }
+      save: { id: "id" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM requests WHERE id = {{id}} AND status = 'submitted' AND user_id = {{user_id}}"
+      expect: { rows: 1 }
+    - get: "/api/requests/{{id}}/transitions"
+      expect:
+        status: 200
+        json: { current: submitted }
+        contains: '"to":"withdrawn"'
+        not_contains: "approved"
+    - api: "POST /api/requests/{{id}}/transition"
+      json: { to: "approved" }
+      expect:
+        status: 403
+        contains: "role 'manager' required for this transition"
+    # PATCH edits the row and cannot move the state.
+    - api: "PATCH /api/requests/{{id}}"
+      json: { status: "approved", title: "Monitor 27in" }
+      expect:
+        status: 200
+        headers: { X-Stripped-Fields: "status" }
+    - sql: "SELECT id FROM requests WHERE id = {{id}} AND status = 'submitted' AND title = 'Monitor 27in'"
+      expect: { rows: 1 }
+    - api: "POST /api/requests/{{id}}/transition"
+      json: { to: "withdrawn" }
+      expect:
+        status: 200
+        json: { from: submitted, to: withdrawn }
+    # The history: one version per change, each naming who made it.
+    - get: "/api/requests/{{id}}/versions"
+      expect:
+        status: 200
+        contains:
+          - '"_version":2'
+          - '"_changed_by":'
+    - sql: "SELECT _version FROM requests_history WHERE id = {{id}} AND _changed_by = {{user_id}}"
+      expect: { rows: 2 }
+    - get: "/api/requests/{{id}}/versions/2"
+      expect: { status: 200, contains: '"status":"submitted"' }
+    - api: "POST /api/requests/{{id}}/transition"
+      json: { to: "approved" }
+      expect:
+        status: 409
+        json: { error: "no transitions from current state" }
+
+a_manager_decides_and_a_condition_guards_the_order:
+  as_user: "max@requests.test"
+  as_role: "manager"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (6001, 'Server rack', 900000, 99999)"
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (6002, 'Keyboard', 8000, 99999)"
+  steps:
+    - get: "/api/requests"
+      expect:
+        status: 200
+        contains:
+          - "Server rack"
+          - "Keyboard"
+    - api: "POST /api/requests/6001/transition"
+      json: { to: "approved" }
+      expect: { status: 200 }
+    - api: "POST /api/requests/6001/transition"
+      json: { to: "ordered" }
+      expect: { status: 422, contains: "condition not met" }
+    - api: "POST /api/requests/6002/transition"
+      json: { to: "approved" }
+      expect: { status: 200 }
+    - api: "POST /api/requests/6002/transition"
+      json: { to: "ordered" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM requests WHERE (id = 6001 AND status = 'approved') OR (id = 6002 AND status = 'ordered')"
+      expect: { rows: 2 }
+    - get: "/api/requests/6002/versions"
+      expect:
+        status: 200
+        contains:
+          - '"_version":2'
+          - '"_changed_by":'
+    - sql: "SELECT _version FROM requests_history WHERE id = 6002 AND _changed_by = {{user_id}}"
+      expect: { rows: 2 }
+    # The same moves in the admin's audit log.
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'requests' AND action = 'transition' AND row_id IN ('6001', '6002') AND user_id = {{user_id}}"
+      expect: { rows: 3 }
+
+another_member_sees_neither_the_request_nor_its_history:
+  as_user: "bob@requests.test"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (6003, 'Not bobs', 5000, 99999)"
+  steps:
+    - get: "/api/requests/6003"
+      expect: { status: 404 }
+    - get: "/api/requests/6003/versions"
+      expect: { status: 404 }
+    - api: "POST /api/requests/6003/transition"
+      json: { to: "withdrawn" }
+      expect: { status: 404 }
+    - sql: "SELECT id FROM requests WHERE id = 6003 AND status = 'submitted'"
+      expect: { rows: 1 }
+
+signed_out_callers_get_nothing:
+  anon: true
+  steps:
+    - get: "/api/requests"
+      expect: { status: 401 }
+    - api: "POST /api/requests/6003/transition"
+      json: { to: "withdrawn" }
+      expect: { status: 401 }

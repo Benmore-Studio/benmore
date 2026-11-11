@@ -1,0 +1,1 @@
+Optimistic locking via `_expected_updated_at`. Send the timestamp you read; PATCH fails with 409 if the row has changed since.

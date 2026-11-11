@@ -33,7 +33,35 @@ func chownToDirOwner(path, dir string) {
 	if !ok {
 		return
 	}
-	_ = os.Chown(path, int(sys.Uid), int(sys.Gid))
+	// Lchown: a link planted at path is re-owned itself, never its target.
+	_ = os.Lchown(path, int(sys.Uid), int(sys.Gid))
+}
+
+// openNoFollow is os.OpenFile that refuses a symbolic link at path (ELOOP)
+// and never blocks on a FIFO swapped in there.
+func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
+}
+
+// chmodNoFollow changes the mode of path when it is a regular file or a
+// directory, never through a link: the change goes through a descriptor
+// opened without following one, so a link swapped in after a check is not
+// followed either. An app process uses it on files in its own tree, where a
+// link to data.db would otherwise have the database widened.
+func chmodNoFollow(path string, mode os.FileMode) error {
+	f, err := openNoFollow(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return errors.New(path + ": not a regular file or directory")
+	}
+	return f.Chmod(mode)
 }
 
 // writableByOwningUser reports whether `path` (or its nearest existing
@@ -74,6 +102,15 @@ func fileOwnerUID(info os.FileInfo) (uint32, bool) {
 func fileOwnedByProcess(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(stat.Uid) == os.Geteuid()
+}
+
+// fileLinkCount returns the number of hard links recorded in info.
+func fileLinkCount(info os.FileInfo) (uint64, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(stat.Nlink), true
 }
 
 var errAuthorityLockBusy = errors.New("connector authority lock is busy")

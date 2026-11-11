@@ -1,0 +1,14 @@
+{
+  "keys": [
+    "model_maps",
+    "route_composition",
+    "payload_integrity",
+    "summary",
+    "commands",
+    "mcp_tools",
+    "catalog",
+    "safety",
+    "gotchas",
+    "see_also"
+  ]
+}

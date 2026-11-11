@@ -1,0 +1,5 @@
+// Trigger a download
+window.open('/pdf/invoice?id=' + invoiceId);   // invoice.html reads {{param_id}}
+
+// Or fetch the blob
+const blob = await fetch('/pdf/invoice?id=' + invoiceId).then(r => r.blob());

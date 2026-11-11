@@ -1,0 +1,5 @@
+[
+  "A tiered 'owner-OR-elevated' read (employee sees only their own rows, manager sees the whole tenant, platform admin sees all) is ONE declaration: `access: { payslips: { read: owner_or_role:manager } }` - see `how` → owner_or_role. `self` alone has no middle tier and `group` lets every member see every tenant row, so don't reach for either here.",
+  "A secure-read flow is only for a shape owner_or_role and member-of cannot express: identity matched through a column other than user_id (e.g. an employee_id mapped to the signed-in user), or a middle tier narrower than the tenant (a manager sees only their own department). Set `access.<table>.read: off` and expose a flow whose `run: sql` scopes the WHERE itself from server-bound values (`user.*`, `:_group_id`), never from request input; AND any optional `?eid=` with that scope so a coworker's id returns nothing. Flow SQL bypasses the access layer.",
+  "`read: off` closes every generic read surface: list, single-row GET, ?include=, /versions and point-in-time reads all pass the same read gate and row scope."
+]

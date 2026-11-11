@@ -1,0 +1,9 @@
+orders:
+  line_total:
+    expr: "qty * unit_price"
+  item_count:
+    sql: "SELECT COUNT(*) FROM order_items WHERE order_id = ?"
+    triggers:
+      - table: order_items
+        on: [insert, update, delete]
+        fk: order_id

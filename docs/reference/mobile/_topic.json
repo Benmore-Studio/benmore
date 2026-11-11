@@ -1,0 +1,14 @@
+{
+  "keys": [
+    "summary",
+    "endpoint",
+    "alternative",
+    "pwa",
+    "output",
+    "workflow",
+    "native_plugins",
+    "gotchas",
+    "pwa_service_worker",
+    "see_also"
+  ]
+}

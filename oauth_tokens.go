@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,10 +46,12 @@ func StoreOAuthToken(db *sql.DB, userID int64, provider, accessToken, refreshTok
 		tokenType = "Bearer"
 	}
 
-	// Encrypt tokens at rest if ENCRYPTION_KEY is configured
+	// Tokens are sealed at rest under a key that survives a restart (an app
+	// without a configured ENCRYPTION_KEY saves its generated one first);
+	// when there is none they are not stored at all (fieldEncryptForDB).
 	encAccess, encErr := fieldEncryptForDB(db, accessToken)
 	if encErr != nil {
-		log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+		log.Printf("OAUTH TOKEN: not stored for user %d: %v", userID, encErr)
 		return
 	}
 	// No refresh token in this response (providers send one on the first
@@ -59,7 +62,7 @@ func StoreOAuthToken(db *sql.DB, userID int64, provider, accessToken, refreshTok
 	if refreshToken != "" {
 		enc, encErr := fieldEncryptForDB(db, refreshToken)
 		if encErr != nil {
-			log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+			log.Printf("OAUTH TOKEN: not stored for user %d: %v", userID, encErr)
 			return
 		}
 		encRefresh = enc
@@ -90,9 +93,15 @@ func GetOAuthToken(db *sql.DB, appDir string, userID int64, provider string) str
 		return ""
 	}
 	storedAccess := accessToken // as stored: what a refresh replaces
-	// Decrypt if encrypted
-	accessToken, _ = fieldDecryptForDB(db, accessToken)
-	refreshToken, _ = fieldDecryptForDB(db, refreshToken)
+	// Decrypt if encrypted. A token sealed under a key the app no longer has
+	// (one generated for an earlier process) opens to nothing: say so, since
+	// the flow that wanted it only sees an empty value.
+	var accessErr, refreshErr error
+	accessToken, accessErr = fieldDecryptForDB(db, accessToken)
+	refreshToken, refreshErr = fieldDecryptForDB(db, refreshToken)
+	if accessErr != nil || refreshErr != nil {
+		logOAuthTokenUnreadable(provider, userID)
+	}
 
 	// Check if expired
 	if expiresAt.Valid && expiresAt.String != "" {
@@ -117,6 +126,19 @@ func GetOAuthToken(db *sql.DB, appDir string, userID int64, provider string) str
 	return accessToken
 }
 
+// oauthTokenUnreadableLastLog throttles logOAuthTokenUnreadable (unix seconds):
+// every flow run that reads the token would otherwise log again.
+var oauthTokenUnreadableLastLog atomic.Int64
+
+func logOAuthTokenUnreadable(provider string, userID int64) {
+	now := time.Now().Unix()
+	last := oauthTokenUnreadableLastLog.Load()
+	if now-last < 30 || !oauthTokenUnreadableLastLog.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("OAUTH TOKEN: the stored %q token for user %d cannot be decrypted with this app's ENCRYPTION_KEY (sealed under a key the app no longer has); flows read it as empty until the user signs in with that provider again (throttled: at most one line per 30s)", provider, userID)
+}
+
 // storeRefreshedOAuthToken keeps what a refresh returned: the new access
 // token and its expiry, and the new refresh token when the provider rotated
 // it. Without it the row stayed expired, so every call refreshed again, and a
@@ -128,14 +150,14 @@ func GetOAuthToken(db *sql.DB, appDir string, userID int64, provider string) str
 func storeRefreshedOAuthToken(db *sql.DB, userID int64, provider, storedAccess string, refreshed oauthRefreshResult) {
 	encAccess, err := fieldEncryptForDB(db, refreshed.AccessToken)
 	if err != nil {
-		log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+		log.Printf("OAUTH TOKEN: refreshed token not stored for user %d: %v", userID, err)
 		return
 	}
 	var encRefresh any
 	if refreshed.RefreshToken != "" {
 		enc, err := fieldEncryptForDB(db, refreshed.RefreshToken)
 		if err != nil {
-			log.Printf("OAUTH TOKEN: encryption failed for user %d", userID)
+			log.Printf("OAUTH TOKEN: refreshed token not stored for user %d: %v", userID, err)
 			return
 		}
 		encRefresh = enc

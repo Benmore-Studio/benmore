@@ -60,6 +60,13 @@ var respondHeaderNames = map[string]bool{
 // respondHeadersAllowedText lists the allowlist for messages and docs.
 const respondHeadersAllowedText = "Content-Type (or `content_type:`), Content-Disposition, Cache-Control, Content-Language, ETag, Last-Modified, Expires, Vary, Link, and X- headers the framework does not use"
 
+// flowRespondHeadersRuleReference is the `rule` of api(at:"flows.respond_headers"):
+// the reference states the allowlist from the constant the validator's
+// message uses (referenceGenerators, reference_generated.go).
+func flowRespondHeadersRuleReference() string {
+	return "A `run: respond` step may set: " + respondHeadersAllowedText + ". Anything else is refused when the file is written, and a deployed file loads without it (the app log has a `WARNING`): Set-Cookie, Content-Security-Policy, Access-Control-*, Location and Refresh (use `run: redirect`), Strict-Transport-Security, the framing headers (Content-Length, Transfer-Encoding, Connection, Content-Encoding, ...), X-Frame-Options, X-Content-Type-Options, X-Request-Id, X-Real-IP, X-Forwarded-*, X-Benmore-*, X-Accel-* and the other headers the framework or the hosted platform sets or reads."
+}
+
 // respondReservedXHeaders are X- headers the framework or the router sets or
 // reads, the legacy names of security headers, and the ones a proxy or web
 // server in front of an app acts on.
@@ -215,7 +222,7 @@ func respondHeaderScalar(v any) (string, bool) {
 	case string:
 		return t, true
 	case int, int64, uint64, float64, bool:
-		return fmt.Sprint(t), true
+		return valueText(t), true
 	}
 	return "", false
 }
@@ -366,7 +373,7 @@ func respondTextValue(v any, contentType string) ([]byte, error) {
 	case []byte:
 		return t, nil
 	case bool, int, int64, int32, uint64, float64, float32:
-		return []byte(fmt.Sprint(t)), nil
+		return []byte(valueText(t)), nil
 	}
 	if respondContentTypeIsJSON(contentType) {
 		return marshalRespondJSON(v)
@@ -385,16 +392,21 @@ func marshalRespondJSON(v any) ([]byte, error) {
 }
 
 // dropSharedCacheControl removes a Cache-Control that lets a shared cache
-// store the response from the respond steps of a flow
+// store the response from the respond and proxy steps of a flow
 // only signed-in callers reach: one caller's data must not be served to the
-// next. The write gate refuses it (flowStepValueProblems); a deployed file
-// loads without it.
+// next. The write gate refuses it (flowStepValueProblems,
+// ghaProxyViolation); a deployed file loads without it.
 func dropSharedCacheControl(steps []FlowStep) {
 	for i := range steps {
 		if r := steps[i].Respond; r != nil {
 			r.Headers = slices.DeleteFunc(r.Headers, func(h FlowRespondHeader) bool {
 				return h.Name == "Cache-Control" && respondCacheControlShared(h.Value)
 			})
+		}
+		if p := steps[i].Proxy; p != nil && p.CacheControl != "" {
+			if _, shared, err := parseProxyCacheControl(p.CacheControl); err != nil || shared {
+				p.CacheControl = ""
+			}
 		}
 		dropSharedCacheControl(steps[i].Steps)
 		dropSharedCacheControl(steps[i].ElseSteps)

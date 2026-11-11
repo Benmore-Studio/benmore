@@ -1,0 +1,25 @@
+model Organization {
+  id        Int      @id @default(autoincrement())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("organizations")
+}
+
+model OrgMember {
+  id         Int      @id @default(autoincrement())
+  orgId      Int      @map("org_id")
+  userId     Int      @map("user_id")
+  memberRole String   @default("member") @map("member_role")
+  createdAt  DateTime @default(now()) @map("created_at")
+  @@unique([orgId, userId])
+  @@map("org_members")
+}
+
+model Project {
+  id        Int      @id @default(autoincrement())
+  orgId     Int      @map("org_id")
+  name      String
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("projects")
+}

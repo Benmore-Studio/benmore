@@ -218,7 +218,19 @@ func appOAuthPRMetadata(w http.ResponseWriter, r *http.Request, app *App, resour
 // ===== Dynamic client registration (RFC 7591) =====
 
 func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if !oauthRegisterAllowed(w, r, app.Dir) {
+		return
+	}
+	appOAuthRegisterGrants(w, r, app, []string{"authorization_code"})
+}
+
+// appOAuthRegisterGrants registers a client and answers the grant types the
+// token endpoint will accept from it (RFC 7591 section 3.2.1: the response
+// carries the registered metadata, which may differ from what was asked for).
+// The legacy app endpoint issues no refresh tokens; the MCP connector endpoint
+// does, for every client.
+func appOAuthRegisterGrants(w http.ResponseWriter, r *http.Request, app *App, grantTypes []string) {
+	r.Body = http.MaxBytesReader(w, r.Body, oauthRegisterMaxBody)
 	var req struct {
 		ClientName   string   `json:"client_name"`
 		RedirectURIs []string `json:"redirect_uris"`
@@ -232,6 +244,13 @@ func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{
 			"error":             "invalid_request",
 			"error_description": "client_name and redirect_uris are required",
+		})
+		return
+	}
+	if !oauthRegisterMetadataOK(req.ClientName, req.RedirectURIs, req.Scope) {
+		httpJSON(w, http.StatusBadRequest, map[string]any{
+			"error":             "invalid_client_metadata",
+			"error_description": "client_name (at most 256 bytes), redirect_uris (at most 16, each at most 8192 bytes) or scope is too long",
 		})
 		return
 	}
@@ -266,7 +285,7 @@ func appOAuthRegister(w http.ResponseWriter, r *http.Request, app *App) {
 		"client_id_issued_at":        time.Now().Unix(),
 		"client_name":                req.ClientName,
 		"redirect_uris":              req.RedirectURIs,
-		"grant_types":                []string{"authorization_code"},
+		"grant_types":                grantTypes,
 		"response_types":             []string{"code"},
 		"token_endpoint_auth_method": "none",
 		"scope":                      scopes,

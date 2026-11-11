@@ -1,0 +1,20 @@
+# Hosted app: count the rows of a column still stored in plaintext.
+# --dry-run changes nothing; it needs an admin of the app and targets the
+# environment pinned with benmore use.
+benmore encrypt-backfill <app> support_messages.body --as <admin-email> --dry-run
+# "No plaintext rows found - nothing to backfill." means every stored value
+# of that column is encrypted. Otherwise it prints
+# "Found N plaintext rows in support_messages.body" (N stops at 1000, the SQL
+# read limit; empty strings are not counted). A compliance: hipaa app refuses
+# the command: its SQL reads need a stated reason, which it does not send.
+
+# Self-hosted: confirm a column is encrypted on disk after a write
+# (this reads the database file, so it needs a shell where the app runs).
+sqlite3 <app dir>/data.db \
+  "SELECT id, substr(body, 1, 40) FROM support_messages ORDER BY id DESC LIMIT 3;"
+
+# Healthy output looks like (enc:v2: + hex of table and column; rows written
+# by old runtimes may still start enc:v1:):
+#   12|enc:v2:737570706f72745f6d657373616765730
+# Unhealthy (plaintext on disk):
+#   12|hello world  ← row predates encrypted.yaml (backfill it) or the trigger is missing

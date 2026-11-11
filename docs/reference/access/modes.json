@@ -1,0 +1,14 @@
+[
+  "anon",
+  "everyone",
+  "self",
+  "group",
+  "admin",
+  "role:<name>",
+  "role:<a>,<b>,<c>",
+  "owner_or_role:<r1,r2>",
+  "perm:<resource>.<action>",
+  "member-of:<table>(<join_col>,<user_col>)",
+  "member-of:<table>(<join_col>=id,<user_col>)",
+  "off"
+]

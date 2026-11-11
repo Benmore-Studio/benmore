@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPReadFlowCancellationAfterSQLStarts(t *testing.T) {
@@ -54,7 +52,7 @@ func TestAppMCPReadFlowCancellationAfterSQLStarts(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := conn.Raw(func(raw any) error {
-				return raw.(*sqlite3.SQLiteConn).RegisterFunc("length", func(value string) int64 {
+				return mustSQLiteConn(raw).RegisterFunc("length", func(value string) int64 {
 					select {
 					case started <- struct{}{}:
 					default:
@@ -102,7 +100,7 @@ func TestAppMCPReadFlowCancellationAfterSQLStarts(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := fresh.Raw(func(raw any) error {
-				if !raw.(*sqlite3.SQLiteConn).AutoCommit() {
+				if !mustSQLiteConn(raw).AutoCommit() {
 					return fmt.Errorf("canceled read left a transaction open")
 				}
 				return nil

@@ -39,10 +39,13 @@ func resolveJSONValue(v any, ctx *FlowContext) any {
 		trimmed := strings.TrimSpace(val)
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") && strings.Count(trimmed, "{{") == 1 {
 			key := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			// A string the caller sent stays a string; it is never
+			// decoded into an object or array (flows_request_text.go).
+			requestText := ctx.exprReadsRequestText(key, flatDataForCtx(ctx))
 			// Raw ctx.Data covers top-level step values (`{{r}}`,
 			// `{{r.outputs}}`).
 			if ctxVal, ok := flowDataValue(ctx, key); ok {
-				return maybeDecodeJSONString(ctxVal)
+				return keepRequestTextString(ctxVal, requestText)
 			}
 			// NESTED whole-refs (`{{r.years}}`, `{{r.obj}}`) only exist in
 			// the FLATTENED view - ctx.Data has the parent map, not the
@@ -53,8 +56,39 @@ func resolveJSONValue(v any, ctx *FlowContext) any {
 			// or operators won't match either map and correctly fall
 			// through to interpolateCtx below, which applies the pipe.)
 			if ctxVal, ok := flowLookup(flatDataForCtx(ctx), key); ok {
-				return maybeDecodeJSONString(ctxVal)
+				return keepRequestTextString(ctxVal, requestText)
 			}
+			// A whole-value expression (`${{ params.n > 3 }}`,
+			// `${{ a && b || 'none' }}`) is emitted as its native result
+			// too: a comparison is a JSON boolean, `&&`/`||` the operand's
+			// own value.
+			if flowValueExprUsesOperators(key) {
+				if val, ok := resolveBindExpr(key, flatDataForCtx(ctx)); ok {
+					return keepRequestTextString(val, requestText)
+				}
+			}
+			// A ref whose last pipe yields a whole number (`| length`,
+			// `| count`, `| cents`) is a JSON number, like a bare numeric
+			// ref: every pipe returns text, so `n: ${{ rows | length }}`
+			// answered "20". interpolateCtx still renders it, so missing
+			// refs and secret tracking behave as for any other value.
+			if wholeValuePipeYieldsInteger(key) {
+				rendered := interpolateCtx(val, ctx)
+				if n, err := strconv.ParseInt(strings.TrimSpace(rendered), 10, 64); err == nil {
+					return n
+				}
+				return maybeDecodeJSONString(rendered)
+			}
+		}
+		// A template that substitutes request text is decoded only when the
+		// author wrote it as a JSON document, and then each value is written
+		// whole (interpolateCtxJSON), so a value can't add keys or elements.
+		// Any other such template stays the string it renders to.
+		if ctx.readsRequestText(val, flatDataForCtx(ctx)) {
+			if rendered, isJSON := interpolateCtxJSONDocument(val, ctx); isJSON {
+				return maybeDecodeJSONString(rendered)
+			}
+			return interpolateCtx(val, ctx)
 		}
 		// Otherwise interpolate as string, then check if the rendered
 		// result looks like JSON.
@@ -71,6 +105,30 @@ func resolveJSONValue(v any, ctx *FlowContext) any {
 	default:
 		return v
 	}
+}
+
+// wholeValuePipeYieldsInteger reports whether the text of a whole-value
+// `{{ ref | ... }}` ends in a pipe whose result is a whole number. The other
+// pipes return text on purpose (`number` and `currency` add separators and
+// symbols, `digits` keeps leading zeros, `default:` passes its argument
+// through), and a `||` fallback may pick text, so those stay strings.
+func wholeValuePipeYieldsInteger(expr string) bool {
+	if indexOutsideQuotes(expr, "||") >= 0 {
+		return false
+	}
+	parts := splitOutsideQuotes(expr, "|")
+	if len(parts) < 2 {
+		return false
+	}
+	name, _, hasArg := splitPipeNameArg(parts[len(parts)-1])
+	if hasArg {
+		return false
+	}
+	switch name {
+	case "length", "count", "cents":
+		return true
+	}
+	return false
 }
 
 // maybeDecodeJSONString inlines a stringified JSON value (the typical
@@ -98,7 +156,19 @@ func maybeDecodeJSONString(v any) any {
 	return decoded
 }
 
-// resolveBindExpr splits a `{{ key | pipe1 | pipe2:arg }}` expression,
+// resolveBindExpr resolves the text of one `{{ ... }}` value template: a
+// ref with pipes and `||` fallbacks (resolveBindRef), or an expression in
+// the `if:` grammar - `&&`, `||`, `!`, comparisons and parentheses
+// (resolveValueExpression). expr is always the author's template text, never
+// a resolved value.
+func resolveBindExpr(expr string, flatData map[string]any) (any, bool) {
+	if flowValueExprUsesOperators(expr) {
+		return resolveValueExpression(expr, flatData)
+	}
+	return resolveBindRef(expr, flatData)
+}
+
+// resolveBindRef splits a `{{ key | pipe1 | pipe2:arg }}` expression,
 // looks up the base key in flatData, applies pipes left-to-right, and
 // returns the final value + ok. The base key is whatever appears before
 // the first pipe (or the whole expression if there are no pipes).
@@ -112,20 +182,23 @@ func maybeDecodeJSONString(v any) any {
 // outputs.rows | length }}` bind an integer-shaped string into a SQL
 // `?` placeholder instead of trying to bind a slice (which the agent
 // would otherwise hit as `sql: unrecognized token: "{"`).
-func resolveBindExpr(expr string, flatData map[string]any) (any, bool) {
+func resolveBindRef(expr string, flatData map[string]any) (any, bool) {
 	// JS/GHA-style `a || fallback`: try the left operand; if it's missing
 	// OR empty, use the right (a quoted literal or another ref). Agents
 	// reach for `||` intuitively (the `| default:` pipe also works). Handle
 	// `||` BEFORE the single-pipe split so it isn't mistaken for two pipes.
-	if i := strings.Index(expr, "||"); i >= 0 {
+	// A `||` inside a quoted pipe argument is text: the expression parser
+	// keeps it in the ref (condLexer.pipeSegment), so taint analysis never
+	// sees a ref behind it, and the runtime must not read one either.
+	if i := indexOutsideQuotes(expr, "||"); i >= 0 {
 		left := strings.TrimSpace(expr[:i])
 		right := strings.TrimSpace(expr[i+2:])
-		if v, ok := resolveBindExpr(left, flatData); ok && !isEmptyish(v) {
+		if v, ok := resolveBindRef(left, flatData); ok && !isEmptyish(v) {
 			return v, true
 		}
 		return resolveFallbackOperand(right, flatData)
 	}
-	parts := strings.Split(expr, "|")
+	parts := splitOutsideQuotes(expr, "|")
 	base := strings.TrimSpace(parts[0])
 	val, ok := flowLookup(flatData, base)
 	if !ok {
@@ -163,6 +236,41 @@ func resolveBindExpr(expr string, flatData map[string]any) (any, bool) {
 	return cur, true
 }
 
+// indexOutsideQuotes is strings.Index(s, sub) that skips '...' and "..."
+// text, quoted the way the expression parser quotes (no escapes,
+// condLexer.pipeSegment). Text after an unterminated quote counts as quoted.
+func indexOutsideQuotes(s, sub string) int {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '\'' || c == '"' {
+			end := strings.IndexByte(s[i+1:], c)
+			if end < 0 {
+				return -1
+			}
+			i += end + 1
+			continue
+		}
+		if strings.HasPrefix(s[i:], sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+// splitOutsideQuotes is strings.Split(s, sep) that never splits inside quoted
+// text (indexOutsideQuotes), so a pipe argument like `default:"a|b"` stays
+// whole, as the expression parser reads it.
+func splitOutsideQuotes(s, sep string) []string {
+	var out []string
+	for {
+		i := indexOutsideQuotes(s, sep)
+		if i < 0 {
+			return append(out, s)
+		}
+		out = append(out, s[:i])
+		s = s[i+len(sep):]
+	}
+}
+
 // isEmptyish reports whether a resolved value should trigger an `||`
 // fallback - nil, blank string, or an empty collection.
 func isEmptyish(v any) bool {
@@ -189,7 +297,7 @@ func resolveFallbackOperand(s string, flatData map[string]any) (any, bool) {
 	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
 		return s[1 : len(s)-1], true
 	}
-	if v, ok := resolveBindExpr(s, flatData); ok {
+	if v, ok := resolveBindRef(s, flatData); ok {
 		return v, true
 	}
 	return s, true
@@ -337,7 +445,7 @@ func interpolateCtxSafe(template string, ctx *FlowContext) (string, []any) {
 				expr := strings.TrimSpace(result[i+3 : i+3+end])
 				if val, ok := resolveBindExpr(expr, flatData); ok {
 					// Inline the value inside quotes (escape single quotes to prevent injection)
-					s := fmt.Sprintf("%v", val)
+					s := valueText(val)
 					s = strings.ReplaceAll(s, "'", "''")
 					output.WriteByte('\'')
 					output.WriteString(s)
@@ -362,7 +470,7 @@ func interpolateCtxSafe(template string, ctx *FlowContext) (string, []any) {
 			end := strings.Index(result[i+2:], "}}")
 			if end >= 0 {
 				expr := strings.TrimSpace(result[i+2 : i+2+end])
-				if val, ok := resolveBindExpr(expr, flatData); ok {
+				if val, ok := resolveSQLBindExpr(expr, flatData); ok {
 					output.WriteByte('?')
 					// Pipe results stringify by design (resolveBindExpr), so
 					// `{{ rows | length }}` arrives here as "3" - give it the
@@ -370,6 +478,8 @@ func interpolateCtxSafe(template string, ctx *FlowContext) (string, []any) {
 					// compares numerically too.
 					if s, isStr := val.(string); isStr {
 						val = sqlBindValue(s)
+					} else {
+						val = sqlNativeBindValue(val)
 					}
 					args = append(args, val)
 					i = i + 2 + end + 2
@@ -424,7 +534,7 @@ func interpolateCtx(template string, ctx *FlowContext) string {
 						i = i + 2 + end + 2
 						continue
 					}
-					output.WriteString(fmt.Sprintf("%v", val))
+					output.WriteString(valueText(val))
 					i = i + 2 + end + 2
 					continue
 				}
@@ -503,6 +613,8 @@ func buildFlatDataForCtx(ctx *FlowContext, env map[string]string) map[string]any
 		data = ctx.Data
 	}
 	flat := flattenData(data)
+	overlayIdentityStepOutputs(flat)
+	overlayRequestOnlyParams(flat, ctx)
 	// env.* names the app's environment only. A request body key `env`
 	// (or a form key `env.X`) flattens to the same paths and would
 	// otherwise stand in for any variable the app hasn't set.
@@ -669,13 +781,24 @@ func colonParamAt(template string, i int, params map[string]string) (int, string
 // request value. Request input can never set this key.
 const flowStepNamedParamsKey = "__benmore_step_named_params"
 
+// flowRequestOnlyParamsFlatKey marks, in a flattened view only (never in
+// ctx.Data), the names `${{ params.<name> }}` must not read from the top
+// level because a step writes there (overlayRequestOnlyParams).
+const flowRequestOnlyParamsFlatKey = "__benmore_request_only_params"
+
 // flowLookup resolves a translated ref in a flattened view. `params.X`
 // reads the request field X: from the step-named store when X is also a
-// step id, otherwise from the top level as before.
+// step id, set key or loop variable, otherwise from the top level as before.
+// When X is named like one of those and the request did not send it, it is
+// missing: the top level holds what the step wrote, not a request field.
 func flowLookup(flat map[string]any, key string) (any, bool) {
 	if rest, ok := strings.CutPrefix(key, "params."); ok {
 		if v, ok := flat[flowStepNamedParamsKey+"."+rest]; ok {
 			return v, true
+		}
+		head, _, _ := strings.Cut(rest, ".")
+		if flat[flowRequestOnlyParamsFlatKey+"."+rest] == true || flat[flowRequestOnlyParamsFlatKey+"."+head] == true {
+			return nil, false
 		}
 		key = rest
 	}
@@ -691,8 +814,41 @@ func flowDataValue(ctx *FlowContext, key string) (any, bool) {
 				return v, true
 			}
 		}
+		if ctx.paramIsRequestOnly(rest) {
+			return nil, false
+		}
 		key = rest
 	}
 	v, ok := ctx.Data[key]
 	return v, ok
+}
+
+// paramIsRequestOnly reports whether a `params.` name reads like one of the
+// flow's step ids, set keys or loop variables, with the same rule that
+// shadows request fields (flowRequestKeyNamed).
+func (ctx *FlowContext) paramIsRequestOnly(name string) bool {
+	if ctx == nil || len(ctx.requestOnlyParams) == 0 {
+		return false
+	}
+	return flowRequestKeyNamed(name, ctx.requestOnlyParams, flowNamePrefixes(ctx.requestOnlyParams))
+}
+
+// overlayRequestOnlyParams marks the flow's step ids, set keys and loop
+// variables (and their dotted prefixes) in a flattened view for flowLookup,
+// after dropping any data key that claims the marker's name.
+func overlayRequestOnlyParams(flat map[string]any, ctx *FlowContext) {
+	for k := range flat {
+		if k == flowRequestOnlyParamsFlatKey || strings.HasPrefix(k, flowRequestOnlyParamsFlatKey+".") {
+			delete(flat, k)
+		}
+	}
+	if ctx == nil {
+		return
+	}
+	for name := range ctx.requestOnlyParams {
+		flat[flowRequestOnlyParamsFlatKey+"."+name] = true
+	}
+	for prefix := range flowNamePrefixes(ctx.requestOnlyParams) {
+		flat[flowRequestOnlyParamsFlatKey+"."+prefix] = true
+	}
 }

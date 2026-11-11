@@ -33,8 +33,10 @@ package main
 // is rejected (would lock the user out instantly).
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -89,7 +91,7 @@ func EnsureUserRolesTable(db *sql.DB) error {
 	var hasGroupID int
 	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('_benmore_user_roles') WHERE name='group_id'").Scan(&hasGroupID)
 	if hasGroupID == 0 {
-		tx, err := db.Begin()
+		tx, err := db.BeginTx(withLongWriteTx(context.Background(), "user roles migration"), nil)
 		if err != nil {
 			return fmt.Errorf("user_roles migration: begin: %w", err)
 		}
@@ -521,7 +523,12 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// in every group context, identical to the v2.7.54 default.
 	mux.HandleFunc("POST /api/_auth/users/{id}/roles", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+		// IsAdminConsole (rule 15b): an admin on an unscoped credential, so
+		// a token scoped to, say, contacts:read held by an admin can never
+		// widen its own or anyone else's access. The credential's scopes
+		// decide, not the role-derived session scopes (a roles: block that
+		// declares admin with narrow scopes narrows those).
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
@@ -549,13 +556,9 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		// Verify role exists in config (or is the special-cased "admin"/"user").
-		if app.Roles != nil && role != "admin" && role != "user" {
-			if _, ok := app.Roles.Roles[role]; !ok {
-				httpJSON(w, http.StatusBadRequest, map[string]any{
-					"error": fmt.Sprintf("role %q is not defined in app.yaml under roles:", role),
-				})
-				return
-			}
+		if err := undeclaredRoleError(app, role); err != nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
 		}
 		// Verify the target user exists.
 		var exists int
@@ -586,12 +589,40 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 		var groupID any
 		groupStr := strings.TrimSpace(body.GroupID)
 		if groupStr != "" {
+			// A session only ever has a group when app.yaml declares
+			// groups:, so here the grant could never apply while the roles
+			// endpoint went on listing its permissions.
+			if app.Group == nil {
+				httpJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "group_id needs groups: in app.yaml (table, key, user_field): this app has no tenants, so a group-scoped grant could never apply. Omit group_id for a global grant.",
+				})
+				return
+			}
 			groupID = groupStr
 		}
 		// Upsert keyed by the new (user_id, role, IFNULL(group_id, ''))
 		// uniqueness - re-granting an existing (role, group) tuple
-		// refreshes granted_by/expires_at/granted_at.
-		_, err = app.DB.Exec(`
+		// refreshes granted_by/expires_at/granted_at. Re-granting the
+		// global admin grant WITH an expiry puts it on a timer, so it
+		// passes the lockout guard first (last_admin_guard.go): the app's
+		// last durable admin cannot be made a temporary one.
+		tx, err := app.DB.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErrorJSON(w, r, app, "roles grant", err, "grant failed")
+			return
+		}
+		defer tx.Rollback()
+		if role == "admin" && groupID == nil && expiresAt != nil {
+			if err := refuseLastDurableAdmin(app, tx, uid, dropsGlobalAdminGrant); err != nil {
+				if errors.Is(err, errLastDurableAdmin) {
+					httpJSON(w, http.StatusBadRequest, map[string]any{"error": lastAdminRefusal})
+				} else {
+					serverErrorJSON(w, r, app, "roles grant", err, "grant failed")
+				}
+				return
+			}
+		}
+		_, err = tx.Exec(`
 			INSERT INTO _benmore_user_roles (user_id, role, group_id, granted_by, expires_at)
 			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT(user_id, role, IFNULL(group_id, '')) DO UPDATE SET
@@ -599,6 +630,9 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				expires_at = excluded.expires_at,
 				granted_at = CURRENT_TIMESTAMP`,
 			uid, role, groupID, session.UserID, expiresAt)
+		if err == nil {
+			err = tx.Commit()
+		}
 		if err != nil {
 			serverErrorJSON(w, r, app, "roles grant", fmt.Errorf("grant user_id=%d role=%s: %w", uid, role, err), "grant failed")
 			return
@@ -626,7 +660,7 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// param targets the GLOBAL grant (group_id IS NULL).
 	mux.HandleFunc("PATCH /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
@@ -657,14 +691,32 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 			}
 			expiresAt = t.UTC().Format("2006-01-02 15:04:05")
 		}
+		// An expiry on the global admin grant (even one already past, which
+		// ends it now) passes the lockout guard first (last_admin_guard.go).
+		tx, err := app.DB.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErrorJSON(w, r, app, "roles update", err, "update failed")
+			return
+		}
+		defer tx.Rollback()
+		if role == "admin" && groupID == "" && expiresAt != nil {
+			if err := refuseLastDurableAdmin(app, tx, uid, dropsGlobalAdminGrant); err != nil {
+				if errors.Is(err, errLastDurableAdmin) {
+					httpJSON(w, http.StatusBadRequest, map[string]any{"error": lastAdminRefusal})
+				} else {
+					serverErrorJSON(w, r, app, "roles update", err, "update failed")
+				}
+				return
+			}
+		}
 		var res sql.Result
 		if groupID == "" {
-			res, err = app.DB.Exec(`
+			res, err = tx.Exec(`
 				UPDATE _benmore_user_roles SET expires_at = ?
 				WHERE user_id = ? AND role = ? AND group_id IS NULL`,
 				expiresAt, uid, role)
 		} else {
-			res, err = app.DB.Exec(`
+			res, err = tx.Exec(`
 				UPDATE _benmore_user_roles SET expires_at = ?
 				WHERE user_id = ? AND role = ? AND group_id = ?`,
 				expiresAt, uid, role, groupID)
@@ -675,6 +727,10 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "grant not found"})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			serverErrorJSON(w, r, app, "roles update", err, "update failed")
 			return
 		}
 		LogAudit(app, "role_expiry_updated", "_benmore_user_roles", strconv.FormatInt(uid, 10),
@@ -697,16 +753,16 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	//                               user - convenience for full removal
 	//
 	// Refuses to revoke the user's primary role (the column on
-	// _benmore_users) - that's a settings.go operation. Also refuses
-	// self-revoke of the last GLOBAL admin (lockout protection); the
-	// guard counts BOTH primary-column admins AND globally-scoped
-	// join-table admin grants (group_id IS NULL) other than this one.
-	// Group-scoped admin grants don't count toward "the last admin"
-	// because they don't grant cross-tenant authority - removing them
-	// can't lock the system out of admin.
+	// _benmore_users) - that's a settings.go operation. Also refuses to
+	// take the global admin grant from the app's last usable durable
+	// admin (lockout protection, last_admin_guard.go): only active
+	// accounts that hold admin by the role column or by a global grant
+	// with no expiry count. Group-scoped admin grants don't count toward
+	// "the last admin" because they don't grant cross-tenant authority -
+	// removing them can't lock the system out of admin.
 	mux.HandleFunc("DELETE /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
-		if session == nil || !session.IsAdmin() || !sessionHasFullAccess(session) {
+		if !session.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
 			return
 		}
@@ -722,38 +778,37 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 		role := r.PathValue("role")
 		groupID := strings.TrimSpace(r.URL.Query().Get("group_id"))
 		revokeAll := groupID == "all"
-		// Lockout guard: only applies when revoking the GLOBAL admin
-		// grant (group_id query param absent OR explicitly empty).
-		// A self-revoke of a group-scoped admin doesn't risk
-		// locking the system out - the user retains every other
-		// grant they hold, and primary admins are unaffected.
-		if uid == session.UserID && role == "admin" && groupID == "" {
-			var others int
-			_ = app.DB.QueryRow(`
-				SELECT (
-					(SELECT COUNT(*) FROM _benmore_users
-						WHERE role = 'admin' AND id != ? AND (deactivated_at IS NULL OR deactivated_at = ''))
-					+
-					(SELECT COUNT(*) FROM _benmore_user_roles
-						WHERE role = 'admin' AND user_id != ? AND group_id IS NULL
-						  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')))
-				)`,
-				session.UserID, session.UserID).Scan(&others)
-			if others == 0 {
-				httpJSON(w, http.StatusBadRequest, map[string]any{
-					"error": "cannot revoke admin from the last active admin",
-				})
+		// Lockout guard (last_admin_guard.go), in the transaction that
+		// deletes the grant: revoking the global admin grant (no group_id,
+		// or group_id=all, which removes it too) from the app's last usable
+		// durable admin is refused, whoever asks. Admins holding only a
+		// time-bounded grant, deactivated admins and admins held at a
+		// temporary password do not count. Group-scoped admin grants never
+		// confer app-wide admin, so revoking one is never guarded.
+		tx, err := app.DB.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
+			return
+		}
+		defer tx.Rollback()
+		if role == "admin" && (groupID == "" || revokeAll) {
+			if err := refuseLastDurableAdmin(app, tx, uid, dropsGlobalAdminGrant); err != nil {
+				if errors.Is(err, errLastDurableAdmin) {
+					httpJSON(w, http.StatusBadRequest, map[string]any{"error": lastAdminRefusal})
+				} else {
+					serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
+				}
 				return
 			}
 		}
 		var res sql.Result
 		switch {
 		case revokeAll:
-			res, err = app.DB.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ?", uid, role)
+			res, err = tx.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ?", uid, role)
 		case groupID == "":
-			res, err = app.DB.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ? AND group_id IS NULL", uid, role)
+			res, err = tx.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ? AND group_id IS NULL", uid, role)
 		default:
-			res, err = app.DB.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ? AND group_id = ?", uid, role, groupID)
+			res, err = tx.Exec("DELETE FROM _benmore_user_roles WHERE user_id = ? AND role = ? AND group_id = ?", uid, role, groupID)
 		}
 		if err != nil {
 			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
@@ -761,6 +816,10 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "grant not found"})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
 			return
 		}
 		auditScope := groupID

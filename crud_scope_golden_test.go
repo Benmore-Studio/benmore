@@ -69,7 +69,7 @@ func TestCrudScopeSQLGolden(t *testing.T) {
 			table:     "rooms",
 			session:   groupUser,
 			action:    "view",
-			predicate: "(EXISTS (SELECT 1 FROM main.\"room_members\" WHERE main.\"room_members\".\"room_id\" = main.\"rooms\".\"id\" AND main.\"room_members\".\"member_id\" = ?) OR id IN (SELECT resource_id FROM main._benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
+			predicate: "(EXISTS (SELECT 1 FROM main.\"room_members\" AS _benmore_membership WHERE _benmore_membership.\"room_id\" = main.\"rooms\".\"id\" AND _benmore_membership.\"member_id\" = ?) OR id IN (SELECT resource_id FROM main._benmore_permissions WHERE resource_type = ? AND grant_type = 'user' AND grantee_id = ? AND permission IN ('view','edit','delete','admin') AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))))",
 			args:      []any{int64(10), "rooms", "g@example.com"},
 		},
 	}

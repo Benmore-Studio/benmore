@@ -1,0 +1,3 @@
+site_name: "uploads-switch-on fixture"
+auth:
+  identifier: email

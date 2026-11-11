@@ -1,0 +1,8 @@
+orders:
+  table: Orders
+  field: Status
+  initial: draft
+  states: [draft, approved]
+  transitions:
+    draft:
+      approved: { role: admin }

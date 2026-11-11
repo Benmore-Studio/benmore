@@ -1,0 +1,13 @@
+// Stable key per logical operation
+const idempotencyKey = crypto.randomUUID();
+await fetch('/api/orders', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-CSRF-Token': csrf,
+    'X-Idempotency-Key': idempotencyKey,
+  },
+  credentials: 'same-origin',
+  body: JSON.stringify({ amount: 100 }),
+});
+// Retry-safe: a network blip + retry produces ONE order, not two.

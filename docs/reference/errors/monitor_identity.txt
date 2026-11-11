@@ -1,0 +1,1 @@
+Cron monitor slugs end in a digest of the complete app/job identity, so punctuation, case and truncated prefixes cannot merge distinct jobs. Masked names use stable opaque components; original masked values remain private. Slugs stay lowercase/hyphen and at most 50 characters.

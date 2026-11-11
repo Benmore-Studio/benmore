@@ -1,0 +1,8 @@
+order:
+  table: orders
+  field: status
+  initial: draft
+  states: [draft, approved]
+  transitions:
+    draft:
+      approved: {}

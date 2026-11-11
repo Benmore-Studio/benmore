@@ -152,5 +152,44 @@ await section('live subscribers rebind and queued old events are ignored', async
   ok(connections.at(-1) !== current && !connections.at(-1).closed, 'new public subscription could not reconnect after logout'); anonymousStop();
 });
 
+await section('in a page, a sign-in that still needs the emailed code goes to the code page', async () => {
+  const went = [];
+  globalThis.location = { origin: 'https://app.example.test', search: '?next=%2Fprojects%2F7', assign: (u) => went.push(u) };
+  try {
+    for (const [path, call] of [
+      ['/api/_auth/passkeys/login', () => bm.auth.passkey.signIn()],
+      ['/login', () => bm.auth.signIn('other', 'proof')],
+      ['/signup', () => bm.auth.signUp({ email: 'other', password: 'proof' })],
+    ]) {
+      const k = key(); bm.query.set(k, 'current'); went.length = 0;
+      handler = p => p === '/api/_auth/passkeys/login/options' ? response({ challenge: 'AA' }) : p === path ? response({ ok: true, otp_required: true, redirect: '/verify-otp' }) : undefined;
+      let settled = false;
+      call().then(() => { settled = true; }, () => { settled = true; });
+      for (let i = 0; i < 20 && !went.length; i++) await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 5));
+      ok(went.length === 1 && went[0] === '/verify-otp?next=%2Fprojects%2F7', path + ' did not go to the code page with next: ' + JSON.stringify(went));
+      ok(!settled, path + ' resolved, so the caller would redirect away from the code page');
+      ok(bm.query.get(k) === 'current', path + ' code step evicted the current session');
+    }
+    // An MFA sign-in answers {mfa_required} or, for a role that must enroll,
+    // {mfa_setup_required}; both go to their page, never resolve, keep the session.
+    for (const [step, page] of [['mfa_required', '/verify-mfa'], ['mfa_setup_required', '/mfa-setup']]) {
+      const k = key(); bm.query.set(k, 'current'); went.length = 0;
+      handler = p => p === '/login' ? response({ ok: true, [step]: true, redirect: page }) : undefined;
+      let settled = false;
+      bm.auth.signIn('other', 'proof').then(() => { settled = true; }, () => { settled = true; });
+      for (let i = 0; i < 20 && !went.length; i++) await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 5));
+      ok(went.length === 1 && went[0] === page + '?next=%2Fprojects%2F7', step + ' did not go to ' + page + ': ' + JSON.stringify(went));
+      ok(!settled && bm.query.get(k) === 'current', step + ' resolved or evicted the current session');
+    }
+    handler = p => p === '/login' ? response({ ok: true, user: { id: 2 } }) : undefined; went.length = 0;
+    const user = await bm.auth.signIn('other', 'proof');
+    ok(user && user.id === 2 && went.length === 0, 'a completed sign-in navigated or lost its user');
+    handler = p => p === '/login' ? response({ ok: true, otp_required: true, redirect: '//evil.example/x' }) : undefined; went.length = 0;
+    ok(await bm.auth.signIn('other', 'proof') === null && went.length === 0, 'a cross-origin step was followed');
+  } finally { delete globalThis.location; handler = null; }
+});
+
 if (failures) { console.error(failures + ' auth cache failures'); process.exit(1); }
 console.log('all bm auth cache assertions passed');

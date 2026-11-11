@@ -59,7 +59,7 @@ func registerLockTables(mux appRouteRegistrar, app *App, tables []string) {
 				key = fmt.Sprintf("user:%d", session.UserID)
 			}
 			if !lockLimiter().Allow(key) {
-				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				httpRefusal(w, "rate limit exceeded", http.StatusTooManyRequests, refusalLockRateLimit)
 				return
 			}
 			handleLockAcquire(w, r, app, t)
@@ -97,7 +97,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 	}
 
 	// CSRF check (skip for Bearer auth)
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 		return
 	}
@@ -110,7 +110,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 
 	// Scope check: user must have write access to this table
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -125,8 +125,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 	// the owner out of their own record.
 	// A row the caller cannot READ answers 404 exactly like a missing one, so
 	// the lock endpoints are no oracle for which ids exist in other tenants.
-	if !lockRowReadable(app, table, id, session) {
-		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+	if !lockRowReadable(w, app, table, id, session) {
 		return
 	}
 	if !SessionCanAccessTable(app, table, OpUpdate, session) || !canAccessRowScoped(app, table, id, session, "edit") || membershipRowControlDenied(app, table, id, session) {
@@ -134,7 +133,12 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 		return
 	}
 
-	expiresAt := time.Now().Add(lockTTL).UTC().Format("2006-01-02 15:04:05")
+	// Stored as SQLite UTC text (the expiry sweeps compare it with
+	// datetime('now')); answered as RFC3339, the form the status endpoint and
+	// the 409 already give for the same column, so a client parses one shape.
+	expires := time.Now().Add(lockTTL).UTC().Truncate(time.Second)
+	expiresAt := expires.Format("2006-01-02 15:04:05")
+	expiresAtRFC3339 := expires.Format(time.RFC3339)
 
 	// Try to acquire the lock. If already locked by someone else and not expired, reject.
 	// First, delete any expired lock on this row.
@@ -161,16 +165,16 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 			httpJSON(w, http.StatusOK, map[string]any{
 				"status":     "locked",
 				"locked_by":  session.Email,
-				"expires_at": expiresAt,
+				"expires_at": expiresAtRFC3339,
 			})
 			return
 		}
 		// Different user holds the lock
-		httpJSON(w, http.StatusConflict, map[string]any{
+		httpJSON(w, http.StatusConflict, withRefusalDocs(map[string]any{
 			"error":      "record is locked by another user",
 			"locked_by":  existingEmail,
 			"expires_at": existingExpires,
-		})
+		}, refusalRecordLocked))
 		return
 	}
 
@@ -192,7 +196,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 		isUnique := errors.As(err, &sqliteErr) &&
 			sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique
 		if isUnique || strings.Contains(err.Error(), "UNIQUE constraint") {
-			httpJSON(w, http.StatusConflict, map[string]any{"error": "record is locked by another user"})
+			httpJSON(w, http.StatusConflict, withRefusalDocs(map[string]any{"error": "record is locked by another user"}, refusalRecordLocked))
 			return
 		}
 		serverErrorJSON(w, r, app, table+" lock", err, "failed to acquire lock")
@@ -202,7 +206,7 @@ func handleLockAcquire(w http.ResponseWriter, r *http.Request, app *App, table s
 	httpJSON(w, http.StatusOK, map[string]any{
 		"status":     "locked",
 		"locked_by":  session.Email,
-		"expires_at": expiresAt,
+		"expires_at": expiresAtRFC3339,
 	})
 }
 
@@ -215,7 +219,7 @@ func handleLockRelease(w http.ResponseWriter, r *http.Request, app *App, table s
 	}
 
 	// CSRF check (skip for Bearer auth)
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 		return
 	}
@@ -230,8 +234,7 @@ func handleLockRelease(w http.ResponseWriter, r *http.Request, app *App, table s
 	// ANY row id - telling a caller in another tenant which of its rows are
 	// being edited right now. The row's read gate runs first, and a row the
 	// caller cannot read gets the same 404 whether or not it is locked.
-	if !lockRowReadable(app, table, id, session) {
-		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+	if !lockRowReadable(w, app, table, id, session) {
 		return
 	}
 
@@ -247,8 +250,11 @@ func handleLockRelease(w http.ResponseWriter, r *http.Request, app *App, table s
 		return
 	}
 
-	// Only the lock owner or admin can release
-	if lockUserID != session.UserID && !session.IsAdmin() {
+	// Only the lock owner or admin can release. Releasing someone else's
+	// lock is an admin-management action, so it needs the admin's unscoped
+	// credential (IsAdminConsole), not a scoped token an admin minted for an
+	// integration.
+	if lockUserID != session.UserID && !session.IsAdminConsole() {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "only the lock owner can release this lock"})
 		return
 	}
@@ -271,20 +277,27 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 	// row scope. Without this any signed-in caller could learn, for any row in
 	// any tenant (or on an admin-only table), that it is being edited and by
 	// whom. 404 on denial so the row's existence doesn't leak either.
+	//
+	// It also needs a session: on a `read: anon` table the read gate admits
+	// everyone, and the status answered locked_by (an editor's email) to any
+	// anonymous visitor, while the CRUD 409 hides the holder outside dev mode
+	// (lockErrorResponse). Only a caller who may edit the row itself - the
+	// one who needs to know whom to ask - is told who holds it.
 	session := getSession(app, r)
-	if !lockRowReadable(app, table, id, session) {
-		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+	if session == nil {
+		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return
+	}
+	if !lockRowReadable(w, app, table, id, session) {
 		return
 	}
 
-	// Clean expired locks first
-	app.DB.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
-		table, id)
-
+	// Expired rows are filtered here instead of deleted: a status read must
+	// not take the database write lock (cleanupExpiredLocks sweeps them).
 	var userEmail string
 	var lockedAt, expiresAt string
 	err := app.DB.QueryRow(
-		`SELECT user_email, locked_at, expires_at FROM _benmore_locks WHERE table_name = ? AND row_id = ?`,
+		`SELECT user_email, locked_at, expires_at FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) >= datetime('now')`,
 		table, id,
 	).Scan(&userEmail, &lockedAt, &expiresAt)
 
@@ -293,32 +306,49 @@ func handleLockStatus(w http.ResponseWriter, r *http.Request, app *App, table st
 		return
 	}
 
-	httpJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"locked":     true,
-		"locked_by":  userEmail,
 		"locked_at":  lockedAt,
 		"expires_at": expiresAt,
-	})
+	}
+	if SessionCanAccessTable(app, table, OpUpdate, session) && canAccessRowScoped(app, table, id, session, "edit") {
+		resp["locked_by"] = userEmail
+	}
+	httpJSON(w, http.StatusOK, resp)
 }
 
 // lockRowReadable is the read gate every lock endpoint applies first: the
 // table's read mode + token scope, then the canonical row scope
-// (rowScopeClause via canAccessRowScoped). Callers answer 404 when it fails.
-func lockRowReadable(app *App, table, id string, session *Session) bool {
-	return SessionCanAccessTable(app, table, OpRead, session) && canAccessRowScoped(app, table, id, session, "view")
+// (rowScopeClause via canAccessRowScoped). It writes the refusal itself: a
+// table the caller may not read answers exactly like an unmatched /api path
+// (security.md 14f), so the lock routes are no oracle for which tables exist;
+// an unreadable row on a readable table answers 404 like a missing row.
+func lockRowReadable(w http.ResponseWriter, app *App, table, id string, session *Session) bool {
+	if !SessionCanAccessTable(app, table, OpRead, session) {
+		writeUnmatchedAPINotFound(w)
+		return false
+	}
+	if !canAccessRowScoped(app, table, id, session, "view") {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return false
+	}
+	return true
 }
 
 // CheckLock checks if a record is locked by another user.
 // Returns (true, lockedByEmail) if locked by someone else, (false, "") otherwise.
+//
+// It only reads. It used to DELETE the row's expired lock first, a separate
+// autocommit write that took SQLite's write lock on every PATCH, DELETE,
+// batch id and transaction op, ignored its error, and - when that DELETE was
+// refused as busy - left the SELECT (which did not check expiry) to answer a
+// stale 409. Expiry is now part of the SELECT; expired rows are swept by
+// cleanupExpiredLocks and replaced on acquire.
 func CheckLock(db *sql.DB, table, rowID string, userID int64) (bool, string) {
-	// Clean expired lock for this specific row
-	db.Exec(`DELETE FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) < datetime('now')`,
-		table, rowID)
-
 	var lockUserID int64
 	var lockEmail string
 	err := db.QueryRow(
-		`SELECT user_id, user_email FROM _benmore_locks WHERE table_name = ? AND row_id = ?`,
+		`SELECT user_id, user_email FROM _benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) >= datetime('now')`,
 		table, rowID,
 	).Scan(&lockUserID, &lockEmail)
 
@@ -387,5 +417,5 @@ func lockErrorResponse(devMode bool, lockedBy string) map[string]any {
 	if devMode {
 		resp["locked_by"] = lockedBy
 	}
-	return resp
+	return withRefusalDocs(resp, refusalRecordLocked)
 }

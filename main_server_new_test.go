@@ -67,8 +67,13 @@ func TestServerNewReportsResolvedDirectoryAndEditionWorkflow(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(wantDir, "mcp.yaml")); err != nil {
 			t.Fatalf("self-hosted starter lost its reviewed connector: %v", err)
 		}
-		if !strings.Contains(text, "benmore serve") || !strings.Contains(text, "http://localhost:8080") {
+		if !strings.Contains(text, "benmore serve") || !strings.Contains(text, "--port 8080") {
 			t.Fatalf("framework next steps omitted self-hosted serve:\n%s", text)
+		}
+		// serve is the self-hosted runtime, not a development mode: the next
+		// steps name the command and its port, never a localhost address.
+		if strings.Contains(text, "localhost") {
+			t.Fatalf("framework next steps name a localhost address:\n%s", text)
 		}
 		return
 	}

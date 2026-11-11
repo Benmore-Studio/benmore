@@ -1,0 +1,1 @@
+app.yaml shorthand for 'every active user is auto-enrolled in every row of <parent>'. Synthesized at load time as on_insert hooks against the parent table; the agent doesn't have to write the bulk-INSERT pattern by hand. (v2.7.35+)

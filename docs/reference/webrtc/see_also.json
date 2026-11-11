@@ -1,0 +1,5 @@
+[
+  "api({at:'mobile'}) - wrapping a Benmore app as a native iOS/Android app via Capacitor",
+  "api({at:'websocket'}) - bm.room signaling for ≤4-person mesh calls",
+  "api({at:'sse'}) - the live-chat companion pattern"
+]

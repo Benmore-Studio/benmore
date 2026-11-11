@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -71,7 +72,10 @@ func ValidFeedbackStatus(s string) bool { return feedbackStatuses[s] }
 // visitors' emails, so reads are admin-only - a regular end-user must not be
 // able to GET other people's feedback. Anonymous is never allowed (callers
 // return an empty list rather than 401 so the widget's own history panel
-// doesn't spam console errors).
+// doesn't spam console errors). The inbox is an admin-management surface no
+// scope names, so the admin needs an unscoped credential (IsAdminConsole,
+// as registerDemoRoutes asks): a scoped token an admin minted for an
+// integration reads it no more than an ordinary user does.
 func feedbackReadAllowed(app *App, session *Session) bool {
 	if session == nil {
 		return false
@@ -79,7 +83,7 @@ func feedbackReadAllowed(app *App, session *Session) bool {
 	if app.FeatureEnabled("testing") {
 		return true
 	}
-	return session.IsAdmin()
+	return session.IsAdminConsole()
 }
 
 // feedbackSubmitCSRF gates POST /api/_feedback. Submission is open to
@@ -387,8 +391,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 	RegisterDemoLoginRoute(mux, app, password)
 
 	// Webhook config
-	webhookURL := GetAppEnv(app.Dir, "TESTING_WEBHOOK_URL")
-	webhookToken := GetAppEnv(app.Dir, "TESTING_WEBHOOK_TOKEN")
+	webhookURL := appRouteEnv(app, "TESTING_WEBHOOK_URL")
+	webhookToken := appRouteEnv(app, "TESTING_WEBHOOK_TOKEN")
 	intake := newFeedbackIntake(app)
 
 	// POST /api/_feedback - submit feedback (anyone with demo session)
@@ -501,7 +505,12 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 		log.Printf("  testing: webhook → %s", webhookURL)
 	}
 
-	// Test data reset (admin only, testing mode only)
+	// Test data reset (admin only, testing mode only). The clear and reseed
+	// is the shared privileged reset (resetAppDataLocked, app_reset.go): one
+	// transaction, with seeds.sql held to app-data DML. This handler used to
+	// run each `;`-separated piece of seeds.sql on the pool and drop every
+	// error, so a seed could drop an audit trigger or a framework table and
+	// a failed seed still answered success.
 	mux.HandleFunc("POST /api/_testing/reset", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil || !session.IsAdminConsole() {
@@ -512,29 +521,27 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF"})
 			return
 		}
-		// Get all app tables (not _benmore_ tables)
-		tables, _ := GetTableNames(app.DB)
-		for _, t := range tables {
-			if !strings.HasPrefix(t, "_benmore_") {
-				app.DB.Exec("DELETE FROM " + quoteIdent(t))
-			}
-		}
-		// Re-run seeds
-		seedPath := app.Dir + "/seeds.sql"
-		seedData, err := readFileFromDir(app.Dir, "seeds.sql")
-		if err != nil {
-			httpJSON(w, http.StatusOK, map[string]any{"status": "cleared", "seeds": false, "note": "no seeds.sql found"})
+		reset, err := resetAppDataLocked(r.Context(), app.DB, app.Dir)
+		var seedsErr *appResetSeedsError
+		if errors.As(err, &seedsErr) {
+			// The caller is the app's admin and seeds.sql the app's own
+			// file: name the statement (by number, never its text).
+			log.Printf("testing reset refused, nothing changed: %v", err)
+			httpJSON(w, http.StatusUnprocessableEntity, map[string]any{"status": "failed", "seeds": false, "error": err.Error()})
 			return
 		}
-		_ = seedPath
-		statements := strings.Split(string(seedData), ";")
-		for _, stmt := range statements {
-			stmt = strings.TrimSpace(stmt)
-			if stmt != "" {
-				app.DB.Exec(stmt)
-			}
+		if err != nil {
+			serverError(w, r, app, "testing reset", err, "the reset could not run")
+			return
 		}
-		httpJSON(w, http.StatusOK, map[string]any{"status": "reset", "seeds": true, "tables_cleared": len(tables)})
+		values, _ := json.Marshal(map[string]any{"surface": "testing_reset", "tables_cleared": reset.Deletions, "seeds_run": reset.SeedsRun})
+		insertAuditRow(app.DB, "data_reset_seed", "", "", session, "", string(values))
+		answer := map[string]any{"status": "reset", "seeds": true, "tables_cleared": len(reset.Deletions), "seeds_run": reset.SeedsRun}
+		if reset.SeedsRun == 0 {
+			answer["status"], answer["seeds"] = "cleared", false
+			answer["note"] = "no seed statements: seeds.sql is missing or empty"
+		}
+		httpJSON(w, http.StatusOK, answer)
 	})
 
 	log.Printf("  testing mode: password-gated, feedback widget, test reset")
@@ -552,8 +559,8 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 // people's feedback. Anonymous reads always return an empty list (not 401) so
 // the widget's own history panel on /login doesn't spam console errors.
 func RegisterFeedbackAPI(mux appRouteRegistrar, app *App) {
-	webhookURL := GetAppEnv(app.Dir, "TESTING_WEBHOOK_URL")
-	webhookToken := GetAppEnv(app.Dir, "TESTING_WEBHOOK_TOKEN")
+	webhookURL := appRouteEnv(app, "TESTING_WEBHOOK_URL")
+	webhookToken := appRouteEnv(app, "TESTING_WEBHOOK_TOKEN")
 	intake := newFeedbackIntake(app)
 
 	// POST /api/_feedback - submit. Open to anonymous visitors so people
@@ -624,7 +631,7 @@ func RegisterFeedbackAPI(mux appRouteRegistrar, app *App) {
 		httpJSON(w, http.StatusOK, result)
 	})
 
-	log.Printf("  feedback: API registered at /api/_feedback")
+	routeInfof(mux, "  feedback: API registered at /api/_feedback")
 }
 
 func serveDemoGate(w http.ResponseWriter, r *http.Request, errMsg string) {
@@ -682,9 +689,9 @@ func BuiltWithBadgeHTML(app *App) string {
 }
 
 // BuiltWithBenmorePill is the standardized "Built with Benmore" attribution
-// chip used IDENTICALLY by deployed apps and edges: a fixed bottom-right rounded
-// pill with the Benmore logo that links STRAIGHT to benmore.ai - no popover, no
-// "experimental" interstitial. ref tags the inbound link (app subdomain, or "edge").
+// chip used by deployed apps: a fixed bottom-right rounded pill with the
+// Benmore logo that links STRAIGHT to benmore.ai - no popover, no
+// "experimental" interstitial. ref tags the inbound link (the app subdomain).
 func BuiltWithBenmorePill(ref string) string {
 	return fmt.Sprintf(`<a href="https://benmore.ai/?ref=%s" target="_blank" rel="noopener" aria-label="Built with Benmore" style="position:fixed;bottom:16px;right:16px;z-index:99996;display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 6px;border-radius:9999px;background:#fff;border:1px solid #e4e4e7;box-shadow:0 2px 8px rgba(0,0,0,0.10);text-decoration:none;color:#18181b;font-family:system-ui,-apple-system,sans-serif;font-size:12px;font-weight:500;line-height:1;white-space:nowrap;"><img src="%s" alt="" width="20" height="20" style="display:block;width:20px;height:20px;max-width:none;min-width:0;margin:0;padding:0;border:0;border-radius:5px;flex-shrink:0;"/><span style="color:#52525b;font:500 12px/1 system-ui,-apple-system,sans-serif;">Built with Benmore</span></a>`, ref, benmoreLogoDataURI)
 }
@@ -1090,6 +1097,8 @@ func FeedbackWidgetHTML(testing bool) string {
 
   // Screenshot file/drop handlers - (re)bound per fresh node in wire().
   function readSSImg(blob){
+    // The server keeps only an image data URL (feedbackScreenshotRe).
+    if(!blob||!/^image\/[a-z0-9.+-]+$/i.test(blob.type||''))return;
     var r=new FileReader();r.onload=function(e){
       pendingScreenshot=e.target.result;
       var pv=$('bm-fb-ss-preview');if(pv){pv.src=pendingScreenshot;pv.style.display='block';}

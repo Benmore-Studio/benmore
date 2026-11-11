@@ -225,13 +225,24 @@ func TestParseScope_Invalid(t *testing.T) {
 }
 
 func TestCheckScope_Denied(t *testing.T) {
-	s := &Session{Scopes: "contacts:read"}
+	// A credential whose own scopes leave the permission out is the token.
+	s := &Session{ID: "apitoken:0123456789abcdef", Scopes: "contacts:read", CredentialScopes: "contacts:read"}
 	err := checkScope(s, "contacts", "write")
 	if err == nil {
-		t.Error("should deny write when only read is scoped")
+		t.Fatal("should deny write when only read is scoped")
 	}
 	if err.Error() != "scope denied: token does not have contacts:write permission" {
 		t.Errorf("unexpected error message: %s", err)
+	}
+	// A sign-in session narrowed by its roles is a session, not a token.
+	cookie := &Session{ID: "sha256:abc", Scopes: "contacts:read"}
+	if err := checkScope(cookie, "contacts", "write"); err == nil || err.Error() != "scope denied: session does not have contacts:write permission: no role the account holds grants it under roles: in app.yaml" {
+		t.Errorf("role-narrowed session: %v", err)
+	}
+	// A token whose own scopes allow it but whose account's roles do not.
+	full := &Session{ID: "apitoken:0123456789abcdef", Scopes: "contacts:read", CredentialScopes: "*"}
+	if err := checkScope(full, "contacts", "write"); err == nil || err.Error() != "scope denied: token does not have contacts:write permission: no role the account holds grants it under roles: in app.yaml" {
+		t.Errorf("role-narrowed token: %v", err)
 	}
 }
 

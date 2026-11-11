@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -28,7 +28,24 @@ const maxNotificationsPerUser = 1000
 
 // EnsureNotificationsTable creates the notifications table if it doesn't exist.
 func EnsureNotificationsTable(db *sql.DB) {
-	db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_notifications (
+	if err := EnsureNotificationsTableChecked(db); err != nil {
+		log.Printf("notifications: initialize table: %v", err)
+	}
+}
+
+// EnsureNotificationsTableChecked creates the notifications table and index,
+// returning DDL errors to startup and reload callers that must fail closed.
+func EnsureNotificationsTableChecked(db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("notifications database unavailable")
+	}
+	return ensureNotificationsTableWith(db)
+}
+
+// ensureNotificationsTableWith is EnsureNotificationsTableChecked on db or in
+// a transaction (the dry run of a start, dryRunStartSetup).
+func ensureNotificationsTableWith(db sqlExecutor) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_notifications (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
 		title TEXT NOT NULL,
@@ -37,21 +54,51 @@ func EnsureNotificationsTable(db *sql.DB) {
 		read INTEGER DEFAULT 0,
 		link TEXT DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`)
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_notifications_user ON _benmore_notifications(user_id, read, created_at DESC)")
+	)`); err != nil {
+		return fmt.Errorf("create notifications table: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_notifications_user ON _benmore_notifications(user_id, read, created_at DESC)"); err != nil {
+		return fmt.Errorf("create notifications index: %w", err)
+	}
+	return nil
 }
+
+// errNotificationRecipientMissing is CreateNotification's answer when no
+// account has the target user id: nothing is stored.
+var errNotificationRecipientMissing = errors.New("no account has this user id")
 
 // CreateNotification inserts a notification for a user and broadcasts via SSE.
 // notifType: "info", "success", "warning", "error"
 func CreateNotification(db *sql.DB, userID int64, title, body, notifType, link string) (int64, error) {
-	if notifType == "" {
-		notifType = "info"
+	id, notifType, err := insertNotification(context.Background(), db, userID, title, body, notifType, link)
+	if err != nil {
+		return 0, err
 	}
-	// Validate type
+	announceNotification(db, userID, notifType, title)
+	return id, nil
+}
+
+// validNotificationType reports one of the four stored notification types.
+func validNotificationType(notifType string) bool {
 	switch notifType {
 	case "info", "success", "warning", "error":
-		// valid
-	default:
+		return true
+	}
+	return false
+}
+
+// notificationExec is the app pool or a flow's transaction.
+type notificationExec interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertNotification stores one notification through exec and applies the
+// per-user retention. It returns the stored type (anything but the four
+// types is stored as info). A hook `notify:` (CreateNotification) and a flow
+// `run: notify` (execStepNotify) both store through it; the caller announces
+// the row with announceNotification once it is durable.
+func insertNotification(ctx context.Context, exec notificationExec, userID int64, title, body, notifType, link string) (int64, string, error) {
+	if !validNotificationType(notifType) {
 		notifType = "info"
 	}
 
@@ -63,32 +110,46 @@ func CreateNotification(db *sql.DB, userID int64, title, body, notifType, link s
 		link = ""
 	}
 
-	result, err := db.Exec(
+	// Only for an account that exists. A hook's notify: takes its user id
+	// from row data, and a row naming no account (assignee_id 999) stored an
+	// orphan that the account later given that id would have read: another
+	// tenant's task title, say. One statement, so a concurrent account
+	// delete cannot slip between the check and the insert.
+	result, err := exec.ExecContext(ctx,
 		`INSERT INTO _benmore_notifications (user_id, title, body, type, link)
-		 VALUES (?, ?, ?, ?, ?)`,
-		userID, title, body, notifType, link,
+		 SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM _benmore_users WHERE id = ?)`,
+		userID, title, body, notifType, link, userID,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("create notification: %w", err)
+		return 0, notifType, fmt.Errorf("create notification: %w", err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return 0, notifType, fmt.Errorf("create notification: %w", err)
+	} else if n == 0 {
+		return 0, notifType, errNotificationRecipientMissing
 	}
 
 	id, _ := result.LastInsertId()
 
 	// Auto-cleanup: keep only the most recent maxNotificationsPerUser per user
-	db.Exec(
+	exec.ExecContext(ctx,
 		`DELETE FROM _benmore_notifications WHERE user_id = ? AND id NOT IN (
 			SELECT id FROM _benmore_notifications WHERE user_id = ?
 			ORDER BY created_at DESC, id DESC LIMIT ?
 		)`,
 		userID, userID, maxNotificationsPerUser,
 	)
+	return id, notifType, nil
+}
 
+// announceNotification sends the recipient's live streams the insert event
+// for _benmore_notifications. Only the recipient hears it
+// (realtimePrincipal.canRead), whoever caused it.
+func announceNotification(db *sql.DB, userID int64, notifType, title string) {
 	// Broadcast via SSE to the target user only
 	BroadcastChangeScoped(&App{DB: db}, notificationsTable, "insert", "", userID)
 
 	log.Printf("NOTIFICATION [%s] user=%d title=%q", notifType, userID, truncateNotif(title, 60))
-
-	return id, nil
 }
 
 // GetUnreadNotificationCount returns the number of unread notifications for a user.
@@ -328,7 +389,7 @@ func registerNotificationRoutes(mux appRouteRegistrar, app *App) {
 		httpJSON(w, http.StatusOK, map[string]any{"status": "done", "updated": affected})
 	})
 
-	log.Printf("  notifications: /api/_notifications (auth required)")
+	routeInfof(mux, "  notifications: /api/_notifications (auth required)")
 }
 
 // notificationScopeResource is the scope resource a delegated credential
@@ -340,20 +401,15 @@ const notificationScopeResource = "_notifications"
 // own scopes, not the
 // role-derived Scopes: a role's scope list names app tables and never
 // listed notifications, so gating on it would cut every member of a
-// roles: app off their own inbox. A scoped API token, Bearer session or
-// edge identity (say notes:read) is delegated access and must not read
-// or dismiss the owner's notifications unless it was minted for them.
+// roles: app off their own inbox. A scoped API token or Bearer session
+// (say notes:read) is delegated access and must not read or dismiss the
+// owner's notifications unless it was minted for them.
 func notificationScopeError(session *Session, action string) error {
 	if session == nil {
 		return errors.New("authentication required")
 	}
-	scopes := session.CredentialScopes
-	if strings.HasPrefix(session.ID, "edge:") && scopes == "" {
-		// A verified edge bridge always carries a requested scope. Never
-		// interpret a missing delegation as an unrestricted login.
-		scopes = "_none_:read"
-	}
-	return checkScope(&Session{Scopes: scopes}, notificationScopeResource, action)
+	cred := session.CredentialScopes
+	return checkScope(&Session{Scopes: cred, CredentialScopes: cred}, notificationScopeResource, action)
 }
 
 func requireNotificationScope(w http.ResponseWriter, session *Session, action string) bool {
@@ -410,6 +466,12 @@ func executeNotifyHook(db *sql.DB, notify *NotifyHook, row map[string]any, appDi
 	link := interpolateRow(notify.Link, row, appDir)
 
 	if _, err := CreateNotification(db, userID, title, body, notifType, link); err != nil {
+		if errors.Is(err, errNotificationRecipientMissing) {
+			// Skipped like an sms hook with no recipient: logged once, and
+			// the hook job keeps the reason (executeHookJob).
+			log.Printf("HOOK [notify] skipped: no account has user_id %d (resolved from %q)", userID, notify.UserID)
+			return fmt.Errorf("hook notify skipped: no account has user_id %d", userID)
+		}
 		log.Printf("HOOK ERROR [notify] user=%d title=%q: %s", userID, title, err)
 		return errors.New("hook notification was not created")
 	}
@@ -436,11 +498,11 @@ func unmarshalNotifyHook(data map[string]any) *NotifyHook {
 		return nil
 	}
 	return &NotifyHook{
-		UserID: fmt.Sprintf("%v", data["user_id"]),
-		Title:  fmt.Sprintf("%v", data["title"]),
-		Body:   fmt.Sprintf("%v", data["body"]),
-		Type:   fmt.Sprintf("%v", data["type"]),
-		Link:   fmt.Sprintf("%v", data["link"]),
+		UserID: valueText(data["user_id"]),
+		Title:  valueText(data["title"]),
+		Body:   valueText(data["body"]),
+		Type:   valueText(data["type"]),
+		Link:   valueText(data["link"]),
 	}
 }
 

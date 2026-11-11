@@ -1,0 +1,65 @@
+# Each of app.yaml (versioned:), encrypted.yaml, workflows.yaml and
+# computed.yaml in this fixture names a framework table next to an entry on
+# the app's own notes table. Run: benmore test <dir> --app
+
+# The entries on framework tables do nothing.
+entries_on_framework_tables_do_nothing:
+  as_user: "first@framework-tables.test"
+  steps:
+    # workflows.yaml: the user table has no transition routes.
+    - api: "POST /api/_benmore_users/{{user_id}}/transition"
+      json:
+        to: "admin"
+      expect:
+        status: 404
+    - get: "/api/_benmore_users/{{user_id}}/transitions"
+      expect:
+        status: 404
+    # computed.yaml: no account was made an admin.
+    - sql: "SELECT id FROM _benmore_users WHERE role = 'admin'"
+      expect:
+        rows: 0
+    # encrypted.yaml: the address is stored as it was written.
+    - sql: "SELECT id FROM _benmore_users WHERE email = 'first@framework-tables.test'"
+      expect:
+        rows: 1
+    # app.yaml versioned: no history of the user table and no versions route.
+    - get: "/api/_benmore_users/{{user_id}}/versions"
+      expect:
+        status: 404
+    - sql: "SELECT name FROM sqlite_master WHERE name = '_benmore_users_history'"
+      expect:
+        rows: 0
+    # No history, encryption or computed trigger sits on a framework table.
+    - sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND substr(tbl_name, 1, 9) = '_benmore_' AND (substr(name, 1, 13) IN ('_benmore_ver_', '_benmore_enc_') OR substr(name, 1, 12) = '_benmore_cf_')"
+      expect:
+        rows: 0
+
+# The entries on the app's own table, in the same files, are in force.
+entries_on_the_apps_own_table_work:
+  as_user: "writer@framework-tables.test"
+  steps:
+    - api: "POST /api/notes"
+      json:
+        title: "hello"
+      save:
+        note_id: "id"
+      expect:
+        status: 200
+    # computed.yaml
+    - get: "/api/notes/{{note_id}}"
+      expect:
+        status: 200
+        contains: '"title_len":5'
+    # workflows.yaml
+    - api: "POST /api/notes/{{note_id}}/transition"
+      json:
+        to: "done"
+      expect:
+        status: 200
+        contains: '"to":"done"'
+    # app.yaml versioned
+    - get: "/api/notes/{{note_id}}/versions"
+      expect:
+        status: 200
+        contains: '"_change_type":"update"'

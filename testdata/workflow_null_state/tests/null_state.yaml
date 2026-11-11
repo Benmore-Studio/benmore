@@ -1,0 +1,44 @@
+# An explicit JSON null for the state column must not store NULL (a state with
+# no outgoing transitions): it is dropped like any non-initial value, so the
+# column default applies.
+null_state_takes_the_default:
+  as_user: "u@test.com"
+  steps:
+    - api: "POST /api/orders"
+      json: {title: "single", status: null}
+      expect: {status: 200}
+    - api: "POST /api/orders/batch"
+      json_array:
+        - {title: "batch", status: null}
+      expect: {status: 200}
+    - sql: "SELECT id FROM orders WHERE status = 'draft'"
+      expect:
+        rows: 2
+
+# A NOT NULL state column with no column default: omitted, null or a guarded
+# value all start in `initial` (never "" and never the generic NOT NULL error).
+not_null_state_starts_in_initial:
+  as_user: "u@test.com"
+  steps:
+    - api: "POST /api/tickets"
+      json: {title: "omitted"}
+      expect: {status: 200}
+    - api: "POST /api/tickets"
+      json: {title: "null", status: null}
+      expect: {status: 200}
+    - api: "POST /api/tickets"
+      json: {title: "guarded", status: "closed"}
+      expect: {status: 200}
+    - api: "POST /api/tickets/batch"
+      json_array:
+        - {title: "batch-omitted"}
+        - {title: "batch-null", status: null}
+      expect: {status: 200}
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {action: "insert", table: "tickets", data: {title: "tx-omitted"}}
+      expect: {status: 200}
+    - sql: "SELECT id FROM tickets WHERE status = 'new'"
+      expect:
+        rows: 6

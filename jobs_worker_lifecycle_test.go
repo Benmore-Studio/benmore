@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -203,5 +204,79 @@ func TestAppShutdownJobDrainIsBounded(t *testing.T) {
 				t.Fatalf("Shutdown returned after %s, before the %s drain window", elapsed, c.timeout)
 			}
 		})
+	}
+}
+
+// A finished job whose closing status write finds the database busy is not
+// left running for recovery to fail (or re-deliver): the write is retried,
+// under the live lease, until it lands, and the body runs once. A write
+// refused for any other reason is not retried: it would hold the single
+// worker for a lease window and still fail.
+func TestJobTerminalWriteRetriedUntilItLands(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	EnsureJobsTable(db)
+	app := &App{DB: db, Dir: t.TempDir(), Stop: make(chan struct{})}
+	runs := 0
+	var holder *sql.Conn
+	testJobExecutors["test_finish_retry"] = func(*App, string, map[string]any) error {
+		runs++
+		if holder != nil {
+			// Another connection takes the write lock before the closing write.
+			if _, err := holder.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+				t.Error(err)
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { delete(testJobExecutors, "test_finish_retry") })
+
+	other, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	holder, err = other.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := enqueueTypedJob(db, "test_finish_retry", "", "x", map[string]any{}, nil, jobEnqueueOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan bool)
+	go func() { done <- processNextJob(app) }()
+	time.Sleep(400 * time.Millisecond) // a few busy writes
+	if _, err := holder.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker never finished the job")
+	}
+	if got := jobStatus(t, db, id); got != "completed" || runs != 1 {
+		t.Fatalf("status = %q after %d run(s), want completed after one", got, runs)
+	}
+
+	// A permanent refusal (a trigger) gives up at once.
+	holder = nil
+	mustExecArgs(t, db, `CREATE TRIGGER refuse_finish_trg BEFORE UPDATE OF status ON _benmore_jobs
+		WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'refused (test)'); END`)
+	id, _, err = enqueueTypedJob(db, "test_finish_retry", "", "y", map[string]any{}, nil, jobEnqueueOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	processNextJob(app)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("a permanently refused status write held the worker for %s", took)
+	}
+	if got := jobStatus(t, db, id); got != "running" {
+		t.Fatalf("status = %q, want running (left to lease recovery)", got)
 	}
 }

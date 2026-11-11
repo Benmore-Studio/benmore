@@ -1,0 +1,18 @@
+on:
+  request:
+    method: POST
+    path: /api/hook/:eventId
+    auth: none
+    rate_limit: "1000/m per ip"
+    verify: github_sha256
+    # A literal fixture secret: env.yaml is gitignored, and an unset env secret
+    # would make every request 401 for the wrong reason.
+    secret: fixture-only-hook-secret
+jobs:
+  hook:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          json:
+            eventId: ${{ eventId }}

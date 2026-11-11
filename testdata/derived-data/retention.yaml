@@ -1,0 +1,7 @@
+# The retention.yaml example of api(at:"retention"), verbatim.
+policies:
+  - table: events
+    ttl: "90d"
+  - table: drafts
+    ttl: "7d"
+    column: expires_at

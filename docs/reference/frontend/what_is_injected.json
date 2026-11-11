@@ -1,0 +1,7 @@
+[
+  "<meta name='csrf-token' content='...'> before </head>",
+  "<input type='hidden' name='_csrf' value='...'> inside every POST form and every HTMX hx-post/put/patch/delete form. Never inside a GET form (method=\"get\", no method, hx-get), so a search or filter form's URL never carries the token.",
+  "<script type=\"importmap\"> mapping bm → /_internal/bm.js and sdui → /_internal/sdui.js, each with a ?v= content hash: a map the page authors (the scaffold ships one) gets the ?v= on its bm URL and the sdui entry; a page with a <script type=\"module\"> and no import map gets the whole map injected before its first module script; a page with no module script gets none",
+  "Cache-Control: no-store on HTML (the token rotates)",
+  "<include src=\"partials/x.html\" /> expanded server-side - see `partials` below"
+]

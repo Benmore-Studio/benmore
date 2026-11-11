@@ -5,32 +5,80 @@ package main
 // Step values the runtime cannot honor as written.
 //
 // flowStepKeyProblems decides which keys a step type reads; this decides
-// whether the values of five of them can be sent: a webhook's JSON body
+// whether the values of some of them can be sent: a webhook's JSON body
 // (`payload:`, or `body:` as a map or list), a respond step's `status`,
-// `content_type` and `headers`, an api step's `body:` written as a map or
-// list, and an email's `unsubscribe_url`. The write gate and `benmore check`
-// refuse each problem; the loader logs the same line for a deployed file,
-// which keeps loading and drops what it cannot send (a refused header, a
-// second body) or fails the step when it runs (a status that is not one, an
-// unsubscribe URL that is not https).
+// `content_type` and `headers`, an api step's `json:` (a map, a list or one
+// `${{ }}` reference) and `body:` written as a map or list, an email's
+// `unsubscribe_url`, and the `source` a parse step reads. The write gate and
+// `benmore check` refuse each problem; the loader logs the same line for a
+// deployed file, which keeps loading and drops what it cannot send (a
+// refused header, a second body) or fails the step when it runs (a status
+// that is not one, an unsubscribe URL that is not https); a parse step with
+// such a source produces no outputs. A send inside a `transaction: true` flow
+// is the exception: deployed files carry it, so it is a warning
+// (flowTransactionalSendProblems). The values the runtime used to ignore
+// without a word (a negative `retry`, a `retry_delay` it cannot read, a
+// `paginate` block, a reserved loop variable, a malformed `attachments`) are
+// checked from here too: validators_flow_ignored_values.go.
 
 import (
 	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 )
 
 // flowStepValueProblems lists the step values of a flow file that would not
 // be sent as written, jobs in name order and steps in file order at every
-// nesting depth.
+// nesting depth. The write gate and `benmore check` refuse each.
 func flowStepValueProblems(file FlowFileGHA) []string {
+	problems, _ := flowStepValueFindings(file)
+	return problems
+}
+
+// flowTransactionalSendProblems lists the fire-and-forget sends inside a
+// `transaction: true` flow (transactionalSendProblem), in the same order.
+// Deployed flow files carry them (six files in four apps on 2026-11-10), so
+// the write gate and `benmore check` warn (flowTransactionalSendWarnings)
+// and the loader logs each; nothing is refused until no deployed file has one.
+func flowTransactionalSendProblems(file FlowFileGHA) []string {
+	_, sends := flowStepValueFindings(file)
+	return sends
+}
+
+// flowTransactionalSendWarnings reports flowTransactionalSendProblems for the
+// flow file just written, or for every flow file on a full check.
+func flowTransactionalSendWarnings(dir, writtenPath string) []CheckFinding {
+	var findings []CheckFinding
+	for _, rel := range flowFilesFor(dir, writtenPath) {
+		data, err := readFileInRoot(dir, rel)
+		if err != nil {
+			continue
+		}
+		var file FlowFileGHA
+		if decodeConfigYAML(data, &file) != nil || file.Jobs == nil {
+			continue
+		}
+		name := filepath.ToSlash(rel)
+		for _, problem := range flowTransactionalSendProblems(file) {
+			findings = append(findings, CheckFinding{Severity: "warning", Source: "flows", File: name,
+				Message: strings.Replace(problem, "flows.yaml: ", name+": ", 1)})
+		}
+	}
+	return findings
+}
+
+// flowStepValueFindings walks a flow file once. problems are refused when the
+// file is written; sends are the transactional sends, which are warned about.
+func flowStepValueFindings(file FlowFileGHA) (problems, sends []string) {
 	signedIn := flowRequestSignedIn(file.On.Request)
-	var problems []string
-	var walk func(job, path string, steps []FlowStepGHA)
-	walk = func(job, path string, steps []FlowStepGHA) {
+	inTx := (file.On.Request != nil && file.On.Request.Transaction) || (file.On.Schedule != nil && file.On.Schedule.Transaction)
+	background := flowRunsInBackground(file.On)
+	var walk func(job, path string, steps []FlowStepGHA, transactional bool)
+	walk = func(job, path string, steps []FlowStepGHA, transactional bool) {
 		for i, s := range steps {
 			here := fmt.Sprintf("%s[%d]", path, i)
 			where := fmt.Sprintf("flows.yaml: job %q step %s", job, here)
@@ -40,24 +88,112 @@ func flowStepValueProblems(file FlowFileGHA) []string {
 			for _, problem := range flowStepValueProblemsOf(ghaStepRunType(s), s.With, signedIn) {
 				problems = append(problems, where+": "+problem)
 			}
-			walk(job, here+".steps", s.Steps)
-			walk(job, here+".else", s.Else)
-			walk(job, here+".on_error", s.OnError)
+			// Values the runtime would ignore or read as something else
+			// (validators_flow_ignored_values.go).
+			for _, problem := range flowStepRetryProblems(s) {
+				problems = append(problems, where+": "+problem)
+			}
+			if ghaStepRunType(s) == "for_each" {
+				if problem := flowLoopNameProblem(s.As); problem != "" {
+					problems = append(problems, where+": "+problem)
+				}
+			}
+			if transactional {
+				if problem := transactionalSendProblem(ghaStepRunType(s)); problem != "" {
+					sends = append(sends, where+": "+problem)
+				}
+			}
+			if file.On.Request != nil && !background && ghaStepRunType(s) == "extract_text" {
+				problems = append(problems, where+": "+syncExtractTextProblem)
+			}
+			if transactional && ghaStepRunType(s) == "extract_text" {
+				problems = append(problems, where+": "+extractTextTransactionMessage)
+			}
+			if background && ghaStepRunType(s) == "parse" && s.With["source"] == "headers" {
+				problems = append(problems, where+": "+backgroundParseHeadersProblem)
+			}
+			if file.On.Request != nil && ghaStepRunType(s) == "api" {
+				if problem := apiRequestHostProblem(s.With); problem != "" {
+					problems = append(problems, where+": "+problem)
+				}
+			}
+			// A signed-in caller's profile values are request input
+			// (flows_user_taint.go); the runtime refuses them in
+			// sql_dynamic text. A deployed file still loads (the loader
+			// logs this) and the step fails when it runs.
+			if file.On.Request != nil && ghaStepRunType(s) == "sql_dynamic" {
+				withQuery, _ := s.With["query"].(string)
+				for _, query := range []string{s.Query, withQuery} {
+					if problem := sqlDynamicUserProfileProblem(query); problem != "" {
+						problems = append(problems, where+": "+problem)
+						break
+					}
+				}
+			}
+			if ghaStepRunType(s) == "sql" {
+				query := s.Query
+				if q, ok := s.With["query"].(string); ok {
+					query = q
+				}
+				if problem := sqlQuotedRefProblem(query); problem != "" {
+					problems = append(problems, where+": "+problem)
+				}
+			}
+			walk(job, here+".steps", s.Steps, transactional)
+			walk(job, here+".else", s.Else, transactional)
+			// The handler runs after the transaction was rolled back
+			// (flows_steps.go), so a send there is outside it.
+			walk(job, here+".on_error", s.OnError, false)
 		}
 	}
 	for _, job := range slices.Sorted(maps.Keys(file.Jobs)) {
-		walk(job, "steps", file.Jobs[job].Steps)
+		walk(job, "steps", file.Jobs[job].Steps, inTx)
 	}
-	return problems
+	return problems, sends
 }
+
+// transactionalSendProblem names a fire-and-forget send inside a
+// `transaction: true` flow. It runs at once, so a later failing step rolls the
+// rows back after the email, SMS or webhook has already gone. `run: api` is
+// left alone: later steps read its outputs (live flows POST to a payment API
+// and store the result), which `run: enqueue` cannot give them. It is a
+// warning when the file is written and in `benmore check`, and a log line
+// when the file loads (flowTransactionalSendProblems).
+func transactionalSendProblem(runType string) string {
+	switch runType {
+	case "email", "sms", "webhook":
+		return fmt.Sprintf("`run: %s` can't run in a `transaction: true` flow: it sends at once, so a later failing step rolls the database back after the message has already gone. Queue it with `run: enqueue` (`with: { flow: <flow that sends>, with: { ... } }`): the job is written inside the transaction and runs only after COMMIT. Or send from a separate flow.", runType)
+	}
+	return ""
+}
+
+// flowRunsInBackground reports a flow that runs in the job worker or the
+// scheduler rather than inside the HTTP request: `mode: async`, a schedule or
+// a data event.
+func flowRunsInBackground(on FlowTriggerGHA) bool {
+	if on.Request != nil {
+		return strings.EqualFold(strings.TrimSpace(on.Request.Mode), "async")
+	}
+	return on.Schedule != nil || on.Event != nil
+}
+
+// backgroundParseHeadersProblem refuses `run: parse` with `source: headers`
+// in a background flow. There is no request when it runs, so the headers
+// would have to travel in the job, and request headers carry credentials
+// (Authorization, Cookie, signature and API-key headers) that would then sit
+// in `_benmore_jobs.payload`. The step reads nothing today, so refusing it
+// also stops it passing as a check that never fires.
+const backgroundParseHeadersProblem = "`run: parse` with `source: headers` can't run in an async, scheduled or data-event flow. The flow runs in the background with no request, and carrying request headers into it would write credentials (Authorization, Cookie, API keys) into job payloads. Read the header in an inline flow and queue only the value you need: `run: enqueue` with `with: { flow: <background flow>, with: { name: \"${{ steps.<parse id>.outputs.<Header> | json }}\" } }` (a header is a list of values; the queued flow reads it as `${{ params.name }}`)."
 
 // flowRequestSignedIn reports a request flow only signed-in callers reach.
 func flowRequestSignedIn(req *FlowRequestTrigger) bool {
 	if req == nil {
 		return false
 	}
-	auth, _ := canonicalAuthValue(req.Auth)
-	return auth == "required" || strings.TrimSpace(req.Role) != "" || len(req.Permissions) > 0
+	// An optional flow answers signed-in callers too, so a shared cache
+	// must not store its responses either.
+	auth := normalizeFlowAuth(req.Auth, "")
+	return auth == "required" || auth == "optional" || strings.TrimSpace(req.Role) != "" || len(req.Permissions) > 0
 }
 
 // flowStepValueProblemsOf checks one step's `with:` values.
@@ -68,13 +204,61 @@ func flowStepValueProblemsOf(runType string, with map[string]any, signedIn bool)
 	case "webhook":
 		return webhookValueProblems(with)
 	case "api":
-		return apiBodyValueProblems(with)
+		return append(apiBodyValueProblems(with), paginateValueProblems(with)...)
 	case "respond":
 		return respondValueProblems(with, signedIn)
 	case "email":
-		return emailValueProblems(with)
+		return append(emailValueProblems(with), emailAttachmentProblems(with)...)
+	case "serve_file":
+		return append(serveFileValueProblems(with), uploadRecordValueProblems(with)...)
+	case "delete_upload":
+		return uploadRecordValueProblems(with)
+	case "extract_text":
+		return append(extractTextValueProblems(with), uploadRecordValueProblems(with)...)
+	case "parse":
+		return parseSourceValueProblems(with)
 	}
 	return nil
+}
+
+// syncExtractTextProblem refuses `run: extract_text` in a synchronous request
+// flow: extraction can take minutes, a synchronous flow is cut off at 30 s.
+const syncExtractTextProblem = "`run: extract_text` can take minutes and cannot run in a synchronous request flow (30 s limit). Add `mode: async` under `on: request:`, or put the step in an async or scheduled flow and `run: enqueue` that flow (api(at:\"pdf\") -> extract_text)."
+
+// extractTextValueProblems refuses the values `run: extract_text` cannot honor.
+func extractTextValueProblems(with map[string]any) []string {
+	var problems []string
+	if p, ok := with["source_path"].(string); !ok || strings.TrimSpace(p) == "" {
+		problems = append(problems, "`run: extract_text` needs `with.source_path`: the private upload reference, taken from a row.")
+	}
+	// Without a record the uploader rule is only advisory (flows_upload_owner.go),
+	// so a schedule reading user-editable reference columns would extract
+	// files their row owners never uploaded.
+	if _, ok := with["record"]; !ok {
+		problems = append(problems, "`run: extract_text` needs `with.record: { table: <table>, id: \"${{ steps.<id>.outputs.first.id }}\" }` naming the row that stores `source_path`: the file must have been uploaded by that row's owner or tenant.")
+	}
+	if ocr, set := with["ocr"]; set {
+		if _, ok := ocr.(bool); !ok {
+			problems = append(problems, fmt.Sprintf("`with.ocr: %v` must be true or false (default true).", ocr))
+		}
+	}
+	return problems
+}
+
+// parseSourceValueProblems refuses a `run: parse` source the step cannot
+// read. execStepParse reads `body` and `headers` only, so any other text (an
+// unsupported source such as `query`, a `${{ }}` reference to another step's
+// output) made the step a silent no-op with no outputs, and a value that is
+// not text was read as `body`.
+func parseSourceValueProblems(with map[string]any) []string {
+	raw, set := with["source"]
+	if !set {
+		return nil
+	}
+	if source, ok := raw.(string); ok && (source == "body" || source == "headers") {
+		return nil
+	}
+	return []string{fmt.Sprintf("`with.source: %v` is not a source `run: parse` reads, so the step would produce no outputs. It reads `body` (the default) or `headers`; query parameters already bind as `:name` / `${{ params.<key> }}`, and another step's output needs no parse step.", raw)}
 }
 
 // isJSONBodyShape reports a value written as a JSON body: a map or a list.
@@ -103,6 +287,15 @@ func webhookValueProblems(with map[string]any) []string {
 }
 
 func apiBodyValueProblems(with map[string]any) []string {
+	if raw, set := with["json"]; set && !isJSONBodyShape(raw) {
+		text, isText := raw.(string)
+		if _, sole := soleFlowExpr(normalizeGHARefs(text)); !isText || !sole {
+			return []string{"`with.json` must be a map, a list, or one `${{ }}` reference to the value to send (for example `json: ${{ steps.build.outputs }}`); it is not sent. For a text body use `with.body`."}
+		}
+		if _, text := with["body"].(string); text {
+			return []string{"`with.json` and `with.body` are both set, and the step sends one body: only the `json` one is sent. Keep one."}
+		}
+	}
 	if !isJSONBodyShape(with["body"]) {
 		return nil
 	}
@@ -313,6 +506,12 @@ func enqueueValueProblems(with map[string]any) []string {
 			problems = append(problems, "`with.with` must be a map of text bindings.")
 		} else {
 			for _, key := range slices.Sorted(maps.Keys(payload)) {
+				// The queued flow would read the key as who it runs for; the
+				// step never queues it (execStepEnqueue).
+				if flowJobIdentityKey(key) {
+					problems = append(problems, flowJobIdentityKeyProblem("with.with."+key))
+					continue
+				}
 				if _, ok := payload[key].(string); !ok {
 					problems = append(problems, "`with.with."+key+"` must be text; quote scalars or use the json filter.")
 				}
@@ -337,6 +536,28 @@ func emailOneClickURLProblem(v string) string {
 	}
 	if strings.Contains(v, "#") {
 		return "must not contain a fragment"
+	}
+	return ""
+}
+
+// sqlQuotedRefProblem refuses a `${{ }}` reference inside a larger quoted SQL
+// string ('n=${{ x }}'). References bind as parameters, and SQLite does not
+// read a parameter inside a string literal, so the step failed only when it
+// ran ("not enough args"), in an event flow as nothing but a log line. A
+// literal that is exactly one reference ('${{ x }}') is inlined as an escaped
+// string and stays accepted.
+func sqlQuotedRefProblem(query string) string {
+	if !strings.Contains(query, "{{") {
+		return ""
+	}
+	for _, tok := range sqlTokenize(normalizeGHARefs(query)) {
+		if tok.kind != sqlTokLiteral || !strings.Contains(tok.text, "{{") {
+			continue
+		}
+		if _, sole := soleFlowExpr(tok.text); sole && strings.TrimSpace(tok.text) == tok.text {
+			continue
+		}
+		return fmt.Sprintf("the query has a `${{ }}` reference inside the quoted string '%s'. A reference is bound as a parameter, and a parameter inside a SQL string is not read, so the step fails when it runs. Bind the value outside the quotes and concatenate ('n=' || :n), or make the whole string one reference ('${{ x }}').", truncate(tok.text, 80))
 	}
 	return ""
 }

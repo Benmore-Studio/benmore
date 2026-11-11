@@ -67,7 +67,7 @@ func TestSessionIDsAreStoredHashed(t *testing.T) {
 		t.Helper()
 		for _, tok := range tokens {
 			var n int
-			app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=? OR impersonator_session_id=?", tok, tok).Scan(&n)
+			app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id=? OR impersonator_session_id=? OR started_by_session_id=?", tok, tok, tok).Scan(&n)
 			var audit int
 			app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log WHERE row_id=?", tok).Scan(&audit)
 			if n != 0 || audit != 0 {
@@ -163,8 +163,9 @@ func TestSessionIDsAreStoredHashed(t *testing.T) {
 	}
 	var restored string
 	for _, c := range w.Result().Cookies() {
-		// A plain-HTTP request gets the unprefixed development name.
-		if c.Name == sessionCookieNameFor(false) {
+		// The cookie sign-in sets for this app's mode, whatever the
+		// request's scheme (the other name is expired alongside it).
+		if c.Name == sessionCookieNameFor(!app.DevMode) && c.Value != "" {
 			restored = c.Value
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -204,6 +205,13 @@ func appMCPAddTransferPreview(cap *appMCPCommandCapability, intent, preview map[
 	transfer := cap.tool.Transfer
 	view := map[string]any{"kind": transfer.Kind, "connection": transfer.Connection, "operation_id": transfer.OperationID}
 	if transfer.Kind == "pull" {
+		// A pull stores the source's file as a private upload. With
+		// features.uploads: false it is refused here, before review,
+		// approval or any request to the source.
+		if err := uploadsAllowed(cap.app); err != nil {
+			log.Printf("mcp %s: pull refused: %v", cap.tool.Name, err)
+			return appMCPResultFailure("denied")
+		}
 		id, ok := appMCPTransferValue(intent, transfer.SelectorIntentPath)
 		recordID, recordOK := appMCPTransferValue(intent, transfer.RecordIDIntentPath)
 		if !ok || !recordOK || len(id) > 512 || len(recordID) > 256 {
@@ -492,6 +500,13 @@ func appMCPDeliverExternalTransfer(app *App, jobID int64, data map[string]any) e
 	connection := appMCPTransferConnection(generation.manifest, job.Connection)
 	if connection == nil {
 		return appMCPBlockedEffect("transfer connection is unavailable")
+	}
+	// A pull approved while uploads were on does not download or store once
+	// the app turns them off.
+	if job.Kind == "pull" {
+		if err := uploadsAllowed(app); err != nil {
+			return appMCPBlockedEffect(err.Error())
+		}
 	}
 	credential := ""
 	if connection.Auth.Kind != "none" {
@@ -900,6 +915,11 @@ func appMCPStorePulledFile(app *App, actor Session, path string, content []byte,
 	}
 	if app == nil {
 		return errors.New("upload ownership database unavailable")
+	}
+	// The store step itself refuses while uploads are off, before the
+	// ownership row or any bytes exist.
+	if err := uploadsAllowed(app); err != nil {
+		return err
 	}
 	if err := EnsureUploadOwnersTable(app.DB); err != nil {
 		return err

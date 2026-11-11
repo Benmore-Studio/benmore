@@ -100,3 +100,52 @@ func TestRunCronJobNonTransactionalFlowDoesNotRollBack(t *testing.T) {
 		t.Fatalf("non-transactional cron flow rolled back an autocommit write (%d rows, want 1)", count)
 	}
 }
+
+func TestGHAScheduledTransactionReachesCronRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		transaction string
+		lateStep    string
+		wantError   bool
+		wantRows    int
+	}{
+		{name: "commit", transaction: "true", wantRows: 1},
+		{name: "rollback", transaction: "true", lateStep: "\n      - run: sql\n        query: INSERT INTO missing_table VALUES (1)", wantError: true},
+		{name: "autocommit", transaction: "false", lateStep: "\n      - run: sql\n        query: INSERT INTO missing_table VALUES (1)", wantError: true, wantRows: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newJobsTestApp(t)
+			if _, err := app.DB.Exec("CREATE TABLE applied (id INTEGER PRIMARY KEY)"); err != nil {
+				t.Fatalf("create table: %v", err)
+			}
+			source := `on:
+  schedule:
+    cron: "@daily"
+    transaction: ` + tc.transaction + `
+jobs:
+  run:
+    steps:
+      - run: sql
+        query: INSERT INTO applied VALUES (1)` + tc.lateStep + "\n"
+			flows, err := parseGHAFlowFile("flows/scheduled.yaml", []byte(source))
+			if err != nil {
+				t.Fatalf("parse scheduled flow: %v", err)
+			}
+			app.Flows = flows
+			mergeFlowCronsIntoConfig(app)
+			if len(app.Cron.Jobs) != 1 || app.Cron.Jobs[0].Flow != flows[0].Name {
+				t.Fatalf("scheduled flow was not registered: %+v", app.Cron)
+			}
+			if err := executeCronJob(app, app.Cron.Jobs[0].ID, map[string]any{}); (err != nil) != tc.wantError {
+				t.Fatalf("executeCronJob error = %v, want error %t", err, tc.wantError)
+			}
+			var count int
+			if err := app.DB.QueryRow("SELECT COUNT(*) FROM applied").Scan(&count); err != nil {
+				t.Fatalf("count applied: %v", err)
+			}
+			if count != tc.wantRows {
+				t.Fatalf("scheduled flow left %d committed rows, want %d", count, tc.wantRows)
+			}
+		})
+	}
+}

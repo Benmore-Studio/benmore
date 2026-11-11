@@ -18,7 +18,7 @@ import (
 // stringifyForPipe converts a pipe-input value to its string form for
 // pipes that operate on strings (upper, lower, default, hmac, etc.).
 //
-// For scalars it's fmt.Sprintf("%v", ...) like before. For SLICES and
+// For scalars it's valueText (numbers written in full). For SLICES and
 // MAPS it's JSON encoding - pre-2.7.35 we used Go's default reflect
 // shape ("[map[id:1]]"), which is NOT valid JSON. Agents writing the
 // canonical
@@ -48,7 +48,7 @@ func stringifyForPipe(value any) string {
 	case bool, int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64,
 		float32, float64, json.Number:
-		return fmt.Sprintf("%v", v)
+		return valueText(v)
 	}
 	// Complex shapes (slice, map, struct) - JSON encode so the pipe
 	// chain composes correctly with downstream SQL/JSON consumers.
@@ -112,6 +112,10 @@ func ApplyPipe(value any, pipe string) string {
 		return fmt.Sprintf("$%s", formatNumber(f))
 
 	case "cents":
+		// Dollars to whole cents for a payment API (25.5 -> "2550"), not
+		// a money formatter: a cents column shown through it is 100x too
+		// big. Show cents as money with SQL `price_cents / 100.0` and the
+		// currency pipe. Flows rely on this shape (wholeValuePipeYieldsInteger).
 		f := toFloat(value)
 		return fmt.Sprintf("%.0f", f*100)
 
@@ -208,14 +212,7 @@ func ApplyPipe(value any, pipe string) string {
 		return s
 
 	case "pluralize":
-		f := toFloat(value)
-		if f == 1 {
-			return s
-		}
-		if param != "" {
-			return param
-		}
-		return s + "s"
+		return pluralizePipe(toFloat(value), param)
 
 	case "json":
 		// Already a string representation
@@ -279,6 +276,32 @@ func ApplyPipe(value any, pipe string) string {
 	}
 
 	return s
+}
+
+// pluralizePipe is the pluralize pipe. The piped value is a count and the
+// argument names the word: `{{n | pluralize:event}}` is "event" when n is 1
+// and "events" otherwise; `{{n | pluralize:person,people}}` gives the plural
+// form for irregular words. Without an argument it returns only the suffix,
+// "" when n is 1 and "s" otherwise, for `{{n}} item{{n | pluralize}}`. A value
+// that isn't a number counts as 0, so it takes the plural.
+//
+// It used to return the count itself when it was 1, the argument unchanged
+// for any other count, and the value plus "s" with no argument, so
+// `{{n | pluralize:event}}` rendered "event" for 3 and "1" for 1.
+func pluralizePipe(n float64, param string) string {
+	singular, plural, hasPlural := strings.Cut(param, ",")
+	singular = strings.TrimSpace(singular)
+	plural = strings.TrimSpace(plural)
+	if n == 1 {
+		return singular
+	}
+	if hasPlural {
+		return plural
+	}
+	if singular == "" {
+		return "s"
+	}
+	return singular + "s"
 }
 
 // isRawHTMLPipe reports whether a pipe returns HTML that is already sanitized

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const commandFixture = `command:
@@ -590,7 +590,7 @@ func TestValidateOnWriteInCompilesCommandAtTrueAppRelativePath(t *testing.T) {
 	if msg := ValidateOnWriteIn("", "flows/complete_item.yaml", commandFixture); msg == "" {
 		t.Fatal("command write without appDir accepted")
 	}
-	ordinaryFlow := "on: {request: {method: POST, path: /api/ordinary, auth: required}}\njobs:\n  first: {steps: [{run: respond, with: {status: 200, body: ok}}]}\n  second: {steps: [{run: respond, with: {status: 200, body: ok}}]}\n"
+	ordinaryFlow := "on: {request: {method: POST, path: /api/ordinary, auth: required}}\njobs:\n  first: {steps: [{run: respond, with: {status: 200, body: ok}}]}\n"
 	if msg := ValidateOnWriteIn(dir, "flows/ordinary.yaml", ordinaryFlow); msg != "" {
 		t.Fatalf("ordinary flow write changed by command dispatch: %s", msg)
 	}

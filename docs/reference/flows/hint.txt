@@ -1,0 +1,1 @@
+Run describe_flows(app) to see resolved step lists. probe_route(app, path) to live-fire a flow. Related topics: 'sign' (outbound auth), 'verify' (inbound webhooks), 'async-flows' (long-running fan-outs), 'sql-dynamic' (LLM-written queries), 'hooks' (CRUD side effects), 'components' (FlowForm renders inputs:).

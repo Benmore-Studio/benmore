@@ -72,7 +72,8 @@ func flowHasPurgeCurrentUser(steps []FlowStep) bool {
 }
 
 // flowValidateTransactionalResponse rejects steps that stream bytes directly
-// from a file, which cannot be safely held until a transaction commits.
+// from a file or an outside service (serve_file, proxy), which cannot be
+// safely held until a transaction commits.
 func flowValidateTransactionalResponse(flow *Flow) error {
 	if flow == nil || !flow.Transaction || flow.Trigger.Type != "http" {
 		return nil
@@ -80,8 +81,8 @@ func flowValidateTransactionalResponse(flow *Flow) error {
 	var walk func([]FlowStep) error
 	walk = func(steps []FlowStep) error {
 		for _, step := range steps {
-			if step.Type == "serve_file" {
-				return fmt.Errorf("flow %q: serve_file cannot be used in a transactional HTTP flow because responses are buffered until commit", flow.Name)
+			if step.Type == "serve_file" || step.Type == "proxy" {
+				return fmt.Errorf("flow %q: %s cannot be used in a transactional HTTP flow because responses are buffered until commit", flow.Name, step.Type)
 			}
 			for _, nested := range [][]FlowStep{step.Steps, step.ElseSteps, step.OnError} {
 				if err := walk(nested); err != nil {

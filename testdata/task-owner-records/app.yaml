@@ -1,0 +1,12 @@
+# Owner-only records: each user sees and changes only their own expense
+# claims, a manager sees and changes every claim, and a claim's receipt is a
+# private file that only someone who may read the claim can open.
+site_name: "Expense claims"
+auth:
+  identifier: email
+access:
+  claims:
+    read: owner_or_role:manager     # own rows; every row for a manager
+    write: everyone                 # any signed-in user files a claim
+    update: owner_or_role:manager
+    delete: owner_or_role:manager

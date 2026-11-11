@@ -1,0 +1,9 @@
+site_name: Contract smoke
+features:
+  docs: true
+  analytics: false
+  testing: true
+auth:
+  identifier: email
+access:
+  notes: {read: everyone, write: off, update: off, delete: off}

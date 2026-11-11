@@ -10,8 +10,13 @@ import (
 // Generated tests must not revive arbitrary app data or assume app-specific
 // update hooks permit restoration. Exercise the native action's invalid-ID
 // guard; the successful transaction and rollback paths have isolated Go tests.
+// handleRestore checks the table's update and read access before the ID, so a
+// plain user the access rules refuse gets that refusal (a 403 on a table it
+// may read, the unmatched-route 404 otherwise) instead of the invalid-ID 404.
+// Its scope checks come after the ID check, so they never answer this probe.
 func generateRestoreTests(app *App) AppTestFile {
 	tests := make(map[string]AppTestCase)
+	session := plainGeneratedSession(app)
 	for _, table := range userTables(app) {
 		if !hasColumn(app, table, "deleted_at") || restoreRouteOwnedByFlow(app, table) {
 			continue
@@ -27,9 +32,16 @@ func generateRestoreTests(app *App) AppTestFile {
 		if !integerID || rowIDCanonical(app, table, "01") {
 			continue
 		}
+		expect := AppTestExpect{Status: http.StatusNotFound}
+		for _, op := range []AccessOp{OpUpdate, OpRead} {
+			if d := generatedCRUDDenial(app, table, op, session); d == generatedOpDenial || d == generatedRouteDenial {
+				expect = d.expect()
+				break
+			}
+		}
 		tests["restore_invalid_id_"+table] = AppTestCase{
 			AsUser: frameworkTestUser,
-			Steps:  []AppTestStep{{API: "POST /api/" + table + "/01/restore", Expect: AppTestExpect{Status: http.StatusNotFound}}},
+			Steps:  []AppTestStep{{API: "POST /api/" + table + "/01/restore", Expect: expect}},
 		}
 	}
 	return AppTestFile{Name: "_framework_restore", Tests: tests}

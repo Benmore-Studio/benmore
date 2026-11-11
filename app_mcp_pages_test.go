@@ -184,7 +184,7 @@ func TestAppMCPReviewPageRendersHumanFields(t *testing.T) {
 	// the review text elsewhere, this page only shows them.
 	review := &appMCPReview{Tool: "complete_item", Description: "model-facing words", Preview: "{\n  \"id\": 1\n}", State: "prepared",
 		ExpiresAt: time.Now().Add(14*time.Minute + 30*time.Second).Unix(), Title: "Mark task done", Summary: "Closes <b>one</b> task.", AutoApprove: "it edits a record",
-		Changes: []appMCPReviewChange{{Label: "Status", Before: "open", After: "done", Changed: true}, {Label: "Owner", Before: "me", After: "me"}}}
+		Changes: []appMCPReviewChange{{Label: "Status", Before: "open", After: "done", Changed: true, HasBefore: true}, {Label: "Owner", Before: "me", After: "me", HasBefore: true}}}
 	view := newAppMCPReviewView(review, id, time.Now())
 	view.Approvable, view.CSRF, view.Action = true, "tok", "/x"
 	rec := httptest.NewRecorder()

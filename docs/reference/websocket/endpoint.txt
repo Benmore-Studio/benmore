@@ -1,0 +1,1 @@
+GET /ws  (use wss:// in production)

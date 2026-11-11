@@ -17,6 +17,7 @@ package main
 //     the trace.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -80,11 +81,12 @@ func PrunePrismaDrift(db *sql.DB, dir string) (PruneResult, error) {
 
 	// Build the SQL statements + emit a migration file for the trace.
 	var stmts []string
+	// A reserved-word name is quoted, any other is written bare (ddlIdent).
 	for _, cc := range dropColumns {
-		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", cc[0], cc[1]))
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", ddlIdent(cc[0]), ddlIdent(cc[1])))
 	}
 	for _, t := range dropTables {
-		stmts = append(stmts, fmt.Sprintf("DROP TABLE IF EXISTS %s;", t))
+		stmts = append(stmts, fmt.Sprintf("DROP TABLE IF EXISTS %s;", ddlIdent(t)))
 	}
 
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -112,7 +114,7 @@ func PrunePrismaDrift(db *sql.DB, dir string) (PruneResult, error) {
 	}
 
 	// Apply in a single transaction.
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "prisma drift prune"), nil)
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("begin tx: %w", err)
 	}

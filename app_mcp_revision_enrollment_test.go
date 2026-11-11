@@ -707,14 +707,34 @@ func TestAppMCPRevisionEnrollmentRefusesComputedSecondaryWriteBeforePending(t *t
 	if _, err := f.app.DB.Exec(`CREATE TABLE unmanaged (value TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, f.app.Dir, "computed.yaml", `fields:
+	const reviewed = `fields:
   - table: notes
     column: normalized
-    expr: "0) WHERE rowid=NEW.rowid; UPDATE unmanaged SET value='extra'; UPDATE notes SET normalized=(0"
-`)
+    expr: "0"
+`
+	writeTestFile(t, f.app.Dir, "computed.yaml", reviewed)
 	reviewAppMCPFixture(t, f.app.Dir)
 	if err := reloadAppConfig(f.app); err != nil {
 		t.Fatalf("install captured computed trigger fixture: %v", err)
+	}
+	// The expression appears twice in the generated trigger (the value and
+	// its IS NOT guard); this fragment is valid SQL at both sites. A computed
+	// expression must be one SQL expression now, so the load refuses it
+	// (computedFieldTextError), but a database an earlier runtime served can
+	// still hold the trigger that runtime installed. Put the fragment where it
+	// left it: in the published field and in the installed triggers.
+	const fragment = "0); UPDATE unmanaged SET value='extra'; UPDATE notes SET normalized=(0"
+	writeTestFile(t, f.app.Dir, "computed.yaml", "fields:\n  - table: notes\n    column: normalized\n    expr: \""+fragment+"\"\n")
+	if err := reloadAppConfig(f.app); err == nil || !strings.Contains(err.Error(), "one SQL expression") {
+		t.Fatalf("the load must refuse a computed fragment that carries statements, got %v", err)
+	}
+	writeTestFile(t, f.app.Dir, "computed.yaml", reviewed)
+	legacy := snapshotAppMCPGeneration(f.app).computed.Fields["notes"]["normalized"]
+	legacy.Expr = fragment
+	for _, event := range []string{"insert", "update"} {
+		name, ddl := computedExprTriggerSQL(legacy, event)
+		mustExec(t, f.app.DB, "DROP TRIGGER IF EXISTS "+quoteIdent(name))
+		mustExec(t, f.app.DB, ddl)
 	}
 	beforeOwner, err := currentAppMCPEpoch(f.app.Dir)
 	if err != nil {
@@ -745,6 +765,8 @@ func TestAppMCPRevisionEnrollmentRefusesComputedSecondaryWriteBeforePending(t *t
 	beforeData := canonicalEffectsSnapshot(t, f.app)
 	if _, err := repairAppMCPRevisionEnrollment(context.Background(), f.app, snapshotAppMCPGeneration(f.app)); err == nil {
 		t.Fatal("computed fragment with a secondary write entered revision enrollment")
+	} else if !strings.Contains(err.Error(), "not one admitted expression") {
+		t.Fatalf("enrollment must refuse the fragment for its secondary statement, got %v", err)
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != string(beforeRecord) {
 		t.Fatalf("unsupported computed fragment changed enrollment record: %v", err)

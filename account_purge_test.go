@@ -96,7 +96,6 @@ func TestPurgeCurrentUserRejectsNonSessionAndImpersonation(t *testing.T) {
 	}{
 		{name: "nil session"},
 		{name: "persistent api token", session: &Session{ID: "apitoken:1", UserID: 1, Email: "owner@example.com"}},
-		{name: "edge bridge", session: &Session{ID: "edge:1", UserID: 1, Email: "owner@example.com"}},
 		{name: "not live", session: &Session{ID: "missing", UserID: 1, Email: "owner@example.com"}},
 		{name: "impersonation", session: &Session{ID: sessionID, UserID: 1, Email: "owner@example.com"}, prepare: func() {
 			mustExec(t, app.DB, "UPDATE _benmore_sessions SET is_impersonation=1 WHERE id='"+sessionID+"'")
@@ -125,6 +124,9 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	defer cleanup()
 	insertPurgeUser(t, app, 1, "owner@example.com")
 	insertPurgeUser(t, app, 2, "victim@example.com")
+	// Both admins, so the tombstone's role reset is visible and user 1 is
+	// not the app's last admin.
+	mustExec(t, app.DB, `UPDATE _benmore_users SET role='admin' WHERE id IN (1,2)`)
 	if err := ensureAppMCPGrantTables(app.DB); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +147,7 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	EnsureJobsTable(app.DB)
 	mustExec(t, app.DB, `INSERT INTO _benmore_jobs(flow_name,payload,status) VALUES('mine-pending','{"user_id":1,"email":"owner@example.com"}','pending'),('mine-complete','{"user_id":"1","email":"owner@example.com"}','complete'),('theirs','{"user_id":2,"email":"victim@example.com"}','pending')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_audit_log(action,table_name,row_id,user_id,user_email,old_values,new_values) VALUES('update','_benmore_users','1',1,'owner@example.com','{"email":"owner@example.com"}','{"email":"new@example.com"}')`)
-	mustExec(t, app.DB, `INSERT INTO _benmore_read_audit(table_name,query_type,user_id,user_email) VALUES('docs','read',1,'owner@example.com')`)
+	mustExec(t, app.DB, `INSERT INTO _benmore_read_audit(table_name,query_type,user_id,user_email,client_ip) VALUES('docs','read',1,'owner@example.com','203.0.113.9')`)
 	mustExec(t, app.DB, `INSERT INTO _benmore_subscriptions(user_id,status) VALUES(1,'active')`)
 
 	flow := &Flow{
@@ -209,7 +211,7 @@ func TestPurgeCurrentUserUsesImmutableSessionAndScrubsFrameworkIdentity(t *testi
 	}
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_audit_log WHERE action='update' AND user_id=1 AND user_email='' AND old_values IS NULL AND new_values IS NULL", 1)
 	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_audit_log WHERE action='account_purge' AND row_id='1'", 1)
-	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_read_audit WHERE user_id=1 AND user_email=''", 1)
+	assertCount(t, app, "SELECT COUNT(*) FROM _benmore_read_audit WHERE user_id=1 AND user_email='' AND client_ip IS NULL", 1)
 
 	// The released identifier may create a genuinely new account, but it must
 	// never reconnect that identity to the retained tombstone/history.
@@ -284,9 +286,10 @@ func TestPurgeCurrentUserConcurrentRequestsHaveOneWinner(t *testing.T) {
 	for code := range codes {
 		if code == http.StatusOK {
 			ok++
-		} else if code == http.StatusUnauthorized || code >= http.StatusInternalServerError {
+		} else if code == http.StatusUnauthorized || code == http.StatusForbidden || code >= http.StatusInternalServerError {
 			// The losing request can reach auth after the winner has revoked
-			// both sessions. It is then rejected before entering the flow.
+			// both sessions. It is then rejected before entering the flow,
+			// or (403) by the purge step's in-transaction session check.
 			failed++
 		} else {
 			t.Fatalf("unexpected concurrent purge status %d", code)
@@ -422,8 +425,10 @@ func newPurgeTestApp(t *testing.T) (*App, func()) {
 
 func insertPurgeUser(t *testing.T, app *App, id int64, email string) {
 	t.Helper()
+	// A plain user: the app's last admin cannot purge itself
+	// (last_admin_guard.go), so tests that purge an admin add a second one.
 	_, err := app.DB.Exec(`INSERT INTO _benmore_users(id,username,email,phone,password_hash,first_name,last_name,avatar_url,role,verified) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		id, "user-"+email, email, "+1555000000"+strconv.FormatInt(id, 10), "hash", "Owner", "Person", "/avatar.png", "admin", 1)
+		id, "user-"+email, email, "+1555000000"+strconv.FormatInt(id, 10), "hash", "Owner", "Person", "/avatar.png", "user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

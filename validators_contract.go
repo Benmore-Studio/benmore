@@ -90,6 +90,17 @@ var flowKeyHints = map[string]string{
 	"catch":          "use `on_error:`",
 }
 
+// flowRequestKeyHints are the hints for `on.request` keys: the step hints,
+// except that a retry count there means the queued job's max_attempts
+// (a step's `retry:` re-runs one step; max_attempts re-runs the flow).
+var flowRequestKeyHints = func() map[string]string {
+	hints := maps.Clone(flowKeyHints)
+	for _, key := range []string{"retries", "retry", "max_retries", "attempts", "maxattempts", "max-attempts"} {
+		hints[key] = "use `max_attempts:` (how many runs a queued job of this flow may take in all, counting the first; see api(at:\"async-flows\") → retries)"
+	}
+	return hints
+}()
+
 // flowVerifyKeyHints are the hints for `on.request.verify` map keys
 // (flowVerifyKeys).
 var flowVerifyKeyHints = map[string]string{
@@ -122,7 +133,7 @@ func flowUnknownKeyViolation(content string) string {
 			return msg
 		}
 		if req, ok := on["request"].(map[string]any); ok {
-			if msg := unknownKeyIn(req, flowRequestKeys, "`on.request`"); msg != "" {
+			if msg := unknownKeyInHints(req, flowRequestKeys, "`on.request`", flowRequestKeyHints); msg != "" {
 				return msg
 			}
 			// A verify map is read key by key (parseVerifyMap): a misspelled
@@ -216,16 +227,22 @@ func unknownKeyInHints(m map[string]any, known map[string]bool, where string, hi
 // runtime cannot honor as written.
 func flowTriggerValueViolation(file FlowFileGHA) string {
 	if req := file.On.Request; req != nil {
-		if _, known := canonicalAuthValue(req.Auth); !known {
+		if _, known := canonicalAuthValue(req.Auth); !known && normalizeFlowAuth(req.Auth, "") != "optional" {
 			return fmt.Sprintf(
 				"flows.yaml: on.request.auth %q is not a recognized value.\n\n"+
-					"Use `auth: required` (a signed-in session is required; `${{ user.* }}` binds from it) or `auth: none` (public; omitting auth: is the same). `true`/`yes`/`on` mean required and `false`/`no`/`off`/`public` mean none. An unrecognized value is treated as `required` at runtime, so say which one you mean.",
+					"Use `auth: required` (a signed-in session is required; `${{ user.* }}` binds from it), `auth: optional` (anyone may call; a signed-in caller's `${{ user.* }}` binds, an anonymous caller's identity is null) or `auth: none` (public; omitting auth: is the same). `true`/`yes`/`on` mean required and `false`/`no`/`off`/`public` mean none. An unrecognized value is treated as `required` at runtime, so say which one you mean.",
 				req.Auth)
 		}
 		switch strings.ToLower(strings.TrimSpace(req.Mode)) {
 		case "", "sync", "async":
 		default:
 			return fmt.Sprintf("flows.yaml: on.request.mode %q is not a recognized value. Use `mode: async` (enqueue and return {job_id, status_url}) or omit it (runs inline). Any other value runs inline.", req.Mode)
+		}
+		if msg := flowRequestTimeoutViolation(req); msg != "" {
+			return msg
+		}
+		if msg := flowMaxAttemptsViolation(req); msg != "" {
+			return msg
 		}
 	}
 	if ev := file.On.Event; ev != nil {
@@ -463,15 +480,33 @@ func hooksSubKeyViolation(content string) string {
 	return ""
 }
 
-// contractCrossFileWarnings names access: rules and encryption declarations
-// whose table (or encrypted column) is not in the schema. Such a declaration
-// binds nothing: the real table keeps its implicit access default, and a
-// misspelled encrypted column fails its trigger (logged only) while the real
-// column is stored in plaintext. Warnings, not errors: the schema may be
-// written after the config, and a table can come from migrations/.
+// contractCrossFileWarnings names access: rules whose table nothing in the
+// app's source creates: not a schema model, not a table a migrations/ file
+// creates or renames into place, not a framework table. Such a rule is most
+// likely a misspelling, and the table that was meant keeps its implicit
+// access default. A rule on a migration-created table is in force (the
+// runtime looks rules up by table name, AccessConfig.ModeFor, and serves
+// auto-CRUD for every table in the database), so it is not named here; it
+// used to be, as a rule that "applies to nothing". A warning, not an error:
+// the app loads with it and the schema may be written after the config.
+// Encrypted, versioned and computed references the load refuses are errors on
+// the file that holds them (validators_load_refs.go), not warnings here.
 func contractCrossFileWarnings(appDir string, tables map[string]bool) []string {
 	var out []string
-	known := func(t string) bool { return tables[t] || frameworkTables[t] }
+	// The tables the load will find, as the load-reference checks read them
+	// (schema, migrations/, framework). Read only for a rule the schema does
+	// not explain: this runs on every write.
+	var found *loadRefSchema
+	var foundRead bool
+	known := func(t string) bool {
+		if tables[t] || frameworkTables[t] {
+			return true
+		}
+		if !foundRead {
+			found, foundRead = readLoadRefSchema(loadRefSource{dir: appDir}), true
+		}
+		return found != nil && found.hasTable(t)
+	}
 	if data := readAppFileOrNil(appDir, "app.yaml"); data != nil {
 		var raw map[string]any
 		if yamlUnmarshal(data, &raw) == nil {
@@ -481,27 +516,7 @@ func contractCrossFileWarnings(appDir string, tables map[string]bool) []string {
 				if t == "default" || known(t) {
 					continue
 				}
-				out = append(out, fmt.Sprintf("app.yaml: access.%s names a table that is not in schema.prisma, so the rule applies to nothing (known tables: %s). A misspelled table keeps its implicit default (self/group/admin).", table, crossFileSortedKeys(tables)))
-			}
-		}
-	}
-	enc := LoadEncryptedFieldsConfig(appDir)
-	if enc == nil {
-		return out
-	}
-	columns := loadSchemaColumns(appDir)
-	for _, table := range slices.Sorted(maps.Keys(enc.Fields)) {
-		if !known(table) {
-			out = append(out, fmt.Sprintf("encryption: table %q is not in schema.prisma, so nothing is encrypted for it (known tables: %s).", table, crossFileSortedKeys(tables)))
-			continue
-		}
-		cols := columns[table]
-		if cols == nil {
-			continue
-		}
-		for _, def := range enc.Fields[table] {
-			if !cols[def.Column] {
-				out = append(out, fmt.Sprintf("encryption: %s.%s is not a column of %s, so its encryption trigger fails and nothing is encrypted under that name - check the spelling; a misspelled entry leaves the real column in plaintext.", table, def.Column, table))
+				out = append(out, fmt.Sprintf("app.yaml: access.%s names a table that is not in schema.prisma and that no migrations/ file creates (known tables: %s). The rule takes effect only once a table of that name exists; if the name is misspelled, the table you meant keeps its implicit default (self/group/admin).", table, crossFileSortedKeys(tables)))
 			}
 		}
 	}

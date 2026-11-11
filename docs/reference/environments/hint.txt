@@ -1,0 +1,1 @@
+create_app returns `environment: "dev"` + the dev URL when dev/prod is on - build there, then `benmore promote <app>` (or the dashboard's Promote button) publishes to prod. The _platform dashboard shows a Dev|Prod switcher + Promote button for apps that have a dev instance.

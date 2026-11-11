@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v3"
 )
 
 func appMCPManifestFixture() string {
@@ -181,6 +183,90 @@ func TestAppMCPManifestCheckedRuntimeAndWrite(t *testing.T) {
 	if !found {
 		t.Fatal("check omitted manifest")
 	}
+}
+
+func writeComputeCommandManifestFixture(t *testing.T, dir, module, description string) string {
+	t.Helper()
+	writeTestFile(t, dir, "schema.sql", "CREATE TABLE work_items (id INTEGER PRIMARY KEY);\n")
+	writeTestFile(t, dir, "static/"+module+".ts", "export function validate() { return true; }\n")
+	flow := strings.Replace(commandFixtureForManifest,
+		"prepare: {steps: [{run: respond,",
+		"prepare: {steps: [{run: compute, with: {module: "+module+", function: validate, args: {}}}, {run: respond,", 1)
+	if flow == commandFixtureForManifest {
+		t.Fatal("compute command fixture insertion point changed")
+	}
+	writeTestFile(t, dir, "flows/complete_item.yaml", flow)
+	manifest := commandManifest()
+	manifest.Tools[0].Description = description
+	data, err := yaml.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, dir, "mcp.yaml", string(data))
+	return reviewAppMCPFixture(t, dir)
+}
+
+func TestAppMCPManifestWriteValidatorUsesFreshCapturedComputeSources(t *testing.T) {
+	t.Run("accepts sealed compute module", func(t *testing.T) {
+		dir := t.TempDir()
+		manifest := writeComputeCommandManifestFixture(t, dir, "forecast-baseline", "Complete one item")
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", manifest); msg != "" {
+			t.Fatalf("sealed compute module was rejected: %s", msg)
+		}
+	})
+
+	t.Run("rejects missing module even after resealing", func(t *testing.T) {
+		dir := t.TempDir()
+		_ = writeComputeCommandManifestFixture(t, dir, "forecast-baseline", "Complete one item")
+		if err := os.Remove(filepath.Join(dir, "static/forecast-baseline.ts")); err != nil {
+			t.Fatal(err)
+		}
+		manifest := reviewAppMCPFixture(t, dir)
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", manifest); !strings.Contains(msg, "absent from captured source") {
+			t.Fatalf("missing compute module was not refused specifically: %s", msg)
+		}
+	})
+
+	t.Run("rejects stale digest", func(t *testing.T) {
+		dir := t.TempDir()
+		manifest := writeComputeCommandManifestFixture(t, dir, "forecast-baseline", "Complete one item")
+		parsed, err := parseAppMCPManifest([]byte(manifest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed.ExecutionDigest = strings.Repeat("f", 64)
+		stale, err := yaml.Marshal(parsed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", string(stale)); !strings.Contains(msg, "digest mismatch") {
+			t.Fatalf("stale execution digest was not refused: %s", msg)
+		}
+	})
+
+	t.Run("rejects changed module bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		manifest := writeComputeCommandManifestFixture(t, dir, "forecast-baseline", "Complete one item")
+		writeTestFile(t, dir, "static/forecast-baseline.ts", "export function validate() { return false; }\n")
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", manifest); !strings.Contains(msg, "digest mismatch") {
+			t.Fatalf("changed compute module was not refused: %s", msg)
+		}
+	})
+
+	t.Run("stages each new manifest from the current directory snapshot", func(t *testing.T) {
+		dir := t.TempDir()
+		first := writeComputeCommandManifestFixture(t, dir, "forecast-baseline", "Complete one item")
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", first); msg != "" {
+			t.Fatalf("first sealed manifest was rejected: %s", msg)
+		}
+		second := writeComputeCommandManifestFixture(t, dir, "forecast-baseline-v2", "Complete the updated item")
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", first); !strings.Contains(msg, "digest mismatch") {
+			t.Fatalf("old manifest was not rejected against new source: %s", msg)
+		}
+		if msg := ValidateOnWriteIn(dir, "mcp.yaml", second); msg != "" {
+			t.Fatalf("new sealed manifest reused stale source snapshot: %s", msg)
+		}
+	})
 }
 
 func TestAppMCPManifestRejectsCommentedAndReservedTables(t *testing.T) {

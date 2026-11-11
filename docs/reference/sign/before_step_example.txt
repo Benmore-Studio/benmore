@@ -1,0 +1,22 @@
+# OAuth-style flows that need a token-exchange BEFORE the real call.
+# before: { cache_key, request, extract } runs first; extracted bindings
+# (notably 'access_token' and 'ttl') feed the compute/headers below.
+# Cache deduplicates concurrent flow runs needing the same token.
+- run: api
+  with:
+    url: https://api.example.com/v1/users
+    sign:
+      before:
+        cache_key: "ex:{{env.EX_CLIENT_ID}}"
+        request:
+          method: POST
+          url: https://auth.example.com/token
+          form:
+            grant_type: client_credentials
+            client_id: "{{ env.EX_CLIENT_ID | required }}"
+            client_secret: "{{ env.EX_CLIENT_SECRET | required }}"
+        extract:
+          access_token: "$.access_token"
+          ttl:          "$.expires_in"
+      headers:
+        Authorization: "Bearer {{access_token}}"

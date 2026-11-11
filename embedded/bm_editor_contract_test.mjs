@@ -29,7 +29,7 @@ await check('SDK preserves update receipt, history metadata and revert receipt',
  const revision=history.versions.find(v=>v._version===1);
  assert.ok(revision && revision._valid_from && Object.hasOwn(revision,'_changed_by'));
  const receipt=await notes.revertTo(1,revision._version);
- assert.equal(receipt.status,'reverted'); assert.equal(receipt.reverted_to_version,'1');
+ assert.equal(receipt.status,'reverted'); assert.equal(receipt.reverted_to_version,'1'); assert.ok(Array.isArray(receipt.kept));
  assert.equal((await notes.get(1)).title,original.title);
 });
 await check('SDK list retains bare-array and rows-envelope compatibility',async()=>{

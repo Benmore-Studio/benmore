@@ -173,6 +173,82 @@ func TestScheduledBackupPermissionsAllowRouterVerification(t *testing.T) {
 	}
 }
 
+// Review finding (router tenant-data lock): switching the lock off, or a
+// rollback cut short, leaves an instance's .benmore/backups at 0700 with no
+// marker. The unlocked path then insisted on 02770, which a unit with
+// RestrictSUIDSGID=yes refuses, so the next release's pre-migrate snapshot
+// failed and the app crash-looped. 0770 without a set-id bit is accepted, and
+// a refused 02770 falls back to it.
+func TestUnlockedBackupWorksWhenSetIDChmodIsRefused(t *testing.T) {
+	if tenantDataLockOn() {
+		t.Skip("this host carries the router tenant-data lock marker")
+	}
+	dir := t.TempDir()
+	db := openMigrationTestDB(t, dir)
+	execMigrationTestSQL(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY)`)
+	db.Close()
+	backupDir := filepath.Join(dir, backupDirName)
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(backupDir, "pre-migrate-20260101T000000Z.db")
+	if err := os.WriteFile(locked, []byte("snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	was := backupChmod
+	var chmods []string
+	backupChmod = func(path string, mode os.FileMode) error {
+		chmods = append(chmods, filepath.Base(path)+" "+mode.String())
+		if mode&(os.ModeSetgid|os.ModeSetuid) != 0 {
+			return &os.PathError{Op: "chmod", Path: path, Err: os.ErrPermission}
+		}
+		return os.Chmod(path, mode)
+	}
+	t.Cleanup(func() { backupChmod = was })
+
+	snap, err := backupDatabase(dir)
+	if err != nil {
+		t.Fatalf("pre-migrate snapshot from a 0700 backups dir with set-id chmods refused: %v (chmods %v)", err, chmods)
+	}
+	sched, err := scheduledBackup(dir)
+	if err != nil {
+		t.Fatalf("scheduled snapshot with set-id chmods refused: %v (chmods %v)", err, chmods)
+	}
+	info, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o770 || info.Mode()&(os.ModeSetgid|os.ModeSetuid) != 0 {
+		t.Fatalf("backups dir mode %v, want drwxrwx--- without a set-id bit", info.Mode())
+	}
+	for _, p := range []string{snap, sched, locked} {
+		if got := mustFileMode(t, p); got != backupPermission {
+			t.Errorf("%s mode %o, want %o", filepath.Base(p), got, backupPermission)
+		}
+	}
+
+	// 0770 without setgid is right as it is: the next snapshot asks for no
+	// directory chmod at all (a set-id one would be refused again).
+	chmods = nil
+	if _, err := backupDatabase(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chmods {
+		if strings.HasPrefix(c, filepath.Base(backupDir)+" ") {
+			t.Fatalf("a 0770 backups dir was chmodded again: %v", chmods)
+		}
+	}
+}
+
+func mustFileMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
+}
+
 func TestBackupFilePermissionRepairDecision(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -276,7 +352,7 @@ func TestPostMigrationMissingColumnServesWithoutRestore(t *testing.T) {
 	}
 
 	// data.db must be untouched: no corrupt-aside file, original row intact.
-	if matches, _ := filepath.Glob(filepath.Join(dir, "data.db.corrupt-*")); len(matches) != 0 {
+	if matches, _ := corruptCopies(dir); len(matches) != 0 {
 		t.Fatalf("missing-column drift must NOT move data.db aside; found %v", matches)
 	}
 	verify := openMigrationTestDB(t, dir)
@@ -304,4 +380,18 @@ func TestExpandContractGuidanceDetectsRenameShapedDiff(t *testing.T) {
 			t.Fatalf("guidance %q missing %q", got, want)
 		}
 	}
+}
+
+// corruptCopies lists auto-recovery's moved-aside originals, wherever they
+// are: .benmore/backups (now), or next to data.db (before).
+func corruptCopies(dir string) ([]string, error) {
+	var out []string
+	for _, d := range []string{dir, filepath.Join(dir, backupDirName)} {
+		m, err := filepath.Glob(filepath.Join(d, "data.db.corrupt-*"))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m...)
+	}
+	return out, nil
 }

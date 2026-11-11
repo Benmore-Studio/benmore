@@ -1,0 +1,932 @@
+{
+ "about": "A database created by the framework binary built from main at 7e9bbc7c (2.7.317 in main.go), the commit before reserved-word names were quoted in generated DDL: `benmore serve` was started once with the first schema recorded in the ledger below, rows were added to projects and memberships with sqlite3, and it was started again with app/schema.prisma. app/migrations/ holds the two files that binary wrote. objects is its sqlite_master in creation order; ledger is _benmore_migrations. TestExistingDatabaseSeesNoSchemaChange restores it and loads it with the current code.",
+ "sqlite_version": "3.35.5 (reader); written by the framework's bundled SQLite",
+ "objects": [
+  {
+   "type": "table",
+   "name": "_benmore_migrations",
+   "table": "_benmore_migrations",
+   "sql": "CREATE TABLE _benmore_migrations (\n\t\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\t\tname TEXT NOT NULL,\n\t\t\tapplied_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\t\tsource TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL\n\t\t)"
+  },
+  {
+   "type": "table",
+   "name": "sqlite_sequence",
+   "table": "sqlite_sequence",
+   "sql": "CREATE TABLE sqlite_sequence(name,seq)"
+  },
+  {
+   "type": "table",
+   "name": "projects",
+   "table": "projects",
+   "sql": "CREATE TABLE projects (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    user_id INTEGER NOT NULL,\n    name TEXT NOT NULL,\n    key TEXT NOT NULL UNIQUE,\n    desc TEXT,\n    action TEXT NOT NULL DEFAULT 'none',\n    offset INTEGER NOT NULL DEFAULT 0,\n    total INTEGER NOT NULL DEFAULT 0,\n    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\n, priority INTEGER NOT NULL DEFAULT 0, slug TEXT)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_projects_1",
+   "table": "projects",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "tasks",
+   "table": "tasks",
+   "sql": "CREATE TABLE tasks (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    user_id INTEGER NOT NULL,\n    project_id INTEGER NOT NULL,\n    title TEXT NOT NULL,\n    first TEXT,\n    last TEXT,\n    end DATETIME,\n    plan TEXT,\n    query TEXT,\n    view INTEGER NOT NULL DEFAULT 0,\n    cast TEXT,\n    raise REAL,\n    quantity INTEGER NOT NULL DEFAULT 1,\n    price REAL NOT NULL DEFAULT 0,\n    amount REAL NOT NULL DEFAULT 0,\n    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    deleted_at DATETIME, range INTEGER NOT NULL DEFAULT 0, due_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    FOREIGN KEY (project_id) REFERENCES projects(id)\n)"
+  },
+  {
+   "type": "index",
+   "name": "idx_projects_user_id_created_at",
+   "table": "projects",
+   "sql": "CREATE INDEX idx_projects_user_id_created_at ON projects(user_id, created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "idx_tasks_project_id",
+   "table": "tasks",
+   "sql": "CREATE INDEX idx_tasks_project_id ON tasks(project_id)"
+  },
+  {
+   "type": "index",
+   "name": "uniq_tasks_project_id_title",
+   "table": "tasks",
+   "sql": "CREATE UNIQUE INDEX uniq_tasks_project_id_title ON tasks(project_id, title)"
+  },
+  {
+   "type": "trigger",
+   "name": "trg_projects_updated_at_updated",
+   "table": "projects",
+   "sql": "CREATE TRIGGER trg_projects_updated_at_updated\nAFTER UPDATE ON projects\nFOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at AND (NEW.updated_at IS NULL OR julianday(NEW.updated_at) < julianday(CURRENT_TIMESTAMP)) BEGIN\n  UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE rowid = NEW.rowid;\nEND"
+  },
+  {
+   "type": "trigger",
+   "name": "trg_tasks_updated_at_updated",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER trg_tasks_updated_at_updated\nAFTER UPDATE ON tasks\nFOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at AND (NEW.updated_at IS NULL OR julianday(NEW.updated_at) < julianday(CURRENT_TIMESTAMP)) BEGIN\n  UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE rowid = NEW.rowid;\nEND"
+  },
+  {
+   "type": "table",
+   "name": "tasks_history",
+   "table": "tasks_history",
+   "sql": "CREATE TABLE \"tasks_history\" (\"id\" INTEGER, \"user_id\" INTEGER, \"project_id\" INTEGER, \"title\" TEXT, \"first\" TEXT, \"last\" TEXT, \"end\" DATETIME, \"plan\" TEXT, \"query\" TEXT, \"view\" INTEGER, \"cast\" TEXT, \"raise\" REAL, \"quantity\" INTEGER, \"price\" REAL, \"amount\" REAL, \"created_at\" DATETIME, \"updated_at\" DATETIME, \"deleted_at\" DATETIME, _version INTEGER NOT NULL, _valid_from DATETIME NOT NULL, _valid_to DATETIME NOT NULL DEFAULT (datetime('now')), _changed_by INTEGER, _change_type TEXT NOT NULL, \"range\" INTEGER, \"due_at\" DATETIME)"
+  },
+  {
+   "type": "index",
+   "name": "idx_tasks_history_id_version",
+   "table": "tasks_history",
+   "sql": "CREATE INDEX \"idx_tasks_history_id_version\" ON \"tasks_history\" (id, _version)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_notifications",
+   "table": "_benmore_notifications",
+   "sql": "CREATE TABLE _benmore_notifications (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\ttitle TEXT NOT NULL,\n\t\tbody TEXT DEFAULT '',\n\t\ttype TEXT DEFAULT 'info',\n\t\tread INTEGER DEFAULT 0,\n\t\tlink TEXT DEFAULT '',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_notifications_user",
+   "table": "_benmore_notifications",
+   "sql": "CREATE INDEX idx_notifications_user ON _benmore_notifications(user_id, read, created_at DESC)"
+  },
+  {
+   "type": "table",
+   "name": "tasks_fts",
+   "table": "tasks_fts",
+   "sql": "CREATE VIRTUAL TABLE tasks_fts USING fts5(title, plan, content='tasks', content_rowid='id', tokenize='trigram')"
+  },
+  {
+   "type": "table",
+   "name": "tasks_fts_data",
+   "table": "tasks_fts_data",
+   "sql": "CREATE TABLE 'tasks_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+  },
+  {
+   "type": "table",
+   "name": "tasks_fts_idx",
+   "table": "tasks_fts_idx",
+   "sql": "CREATE TABLE 'tasks_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+  },
+  {
+   "type": "table",
+   "name": "tasks_fts_docsize",
+   "table": "tasks_fts_docsize",
+   "sql": "CREATE TABLE 'tasks_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+  },
+  {
+   "type": "table",
+   "name": "tasks_fts_config",
+   "table": "tasks_fts_config",
+   "sql": "CREATE TABLE 'tasks_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+  },
+  {
+   "type": "trigger",
+   "name": "tasks_fts_ai",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER tasks_fts_ai AFTER INSERT ON tasks BEGIN INSERT INTO tasks_fts(rowid, title, plan) VALUES (new.id, new.title, new.plan); END"
+  },
+  {
+   "type": "trigger",
+   "name": "tasks_fts_ad",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER tasks_fts_ad AFTER DELETE ON tasks BEGIN INSERT INTO tasks_fts(tasks_fts, rowid, title, plan) VALUES('delete', old.id, old.title, old.plan); END"
+  },
+  {
+   "type": "trigger",
+   "name": "tasks_fts_au",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER tasks_fts_au AFTER UPDATE ON tasks WHEN old.id IS NOT new.id OR old.title IS NOT new.title OR old.plan IS NOT new.plan BEGIN INSERT INTO tasks_fts(tasks_fts, rowid, title, plan) VALUES('delete', old.id, old.title, old.plan); INSERT INTO tasks_fts(rowid, title, plan) VALUES (new.id, new.title, new.plan); END"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_audit_log",
+   "table": "_benmore_audit_log",
+   "sql": "CREATE TABLE _benmore_audit_log (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\taction TEXT NOT NULL,\n\t\ttable_name TEXT NOT NULL,\n\t\trow_id TEXT,\n\t\tuser_id INTEGER,\n\t\tuser_email TEXT,\n\t\told_values TEXT,\n\t\tnew_values TEXT,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, impersonator_user_id INTEGER DEFAULT 0, impersonator_email TEXT DEFAULT '')"
+  },
+  {
+   "type": "index",
+   "name": "idx_audit_log_row",
+   "table": "_benmore_audit_log",
+   "sql": "CREATE INDEX idx_audit_log_row ON _benmore_audit_log(table_name, row_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_audit_log_user",
+   "table": "_benmore_audit_log",
+   "sql": "CREATE INDEX idx_audit_log_user ON _benmore_audit_log(user_id, id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_audit_log_time",
+   "table": "_benmore_audit_log",
+   "sql": "CREATE INDEX idx_audit_log_time ON _benmore_audit_log(created_at)"
+  },
+  {
+   "type": "index",
+   "name": "idx_bm_tasks_user_id",
+   "table": "tasks",
+   "sql": "CREATE INDEX \"idx_bm_tasks_user_id\" ON \"tasks\"(\"user_id\")"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_upload_owners",
+   "table": "_benmore_upload_owners",
+   "sql": "CREATE TABLE _benmore_upload_owners (\n\t\tpath TEXT PRIMARY KEY,\n\t\tuser_id INTEGER NOT NULL DEFAULT 0,\n\t\tgroup_id TEXT NOT NULL DEFAULT '',\n\t\tuploader_admin INTEGER NOT NULL DEFAULT 0,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_upload_owners_1",
+   "table": "_benmore_upload_owners",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_idempotency",
+   "table": "_benmore_idempotency",
+   "sql": "CREATE TABLE _benmore_idempotency (\n\t\tkey TEXT NOT NULL,\n\t\tuser_id INTEGER NOT NULL DEFAULT 0,\n\t\tresponse TEXT NOT NULL,\n\t\tstatus_code INTEGER NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP, fingerprint TEXT NOT NULL DEFAULT '',\n\t\tPRIMARY KEY (key, user_id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_idempotency_1",
+   "table": "_benmore_idempotency",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_locks",
+   "table": "_benmore_locks",
+   "sql": "CREATE TABLE _benmore_locks (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\ttable_name TEXT NOT NULL,\n\t\trow_id TEXT NOT NULL,\n\t\tuser_id INTEGER NOT NULL,\n\t\tuser_email TEXT NOT NULL,\n\t\tlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\texpires_at DATETIME NOT NULL,\n\t\tUNIQUE(table_name, row_id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_locks_1",
+   "table": "_benmore_locks",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_context_nodes",
+   "table": "_benmore_context_nodes",
+   "sql": "CREATE TABLE _benmore_context_nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tnode_type TEXT NOT NULL,\n\t\tref TEXT NOT NULL,\n\t\tlabel TEXT DEFAULT '',\n\t\tmetadata TEXT DEFAULT '{}',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tupdated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tUNIQUE (node_type, ref)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_context_nodes_1",
+   "table": "_benmore_context_nodes",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_context_nodes_type",
+   "table": "_benmore_context_nodes",
+   "sql": "CREATE INDEX idx_benmore_context_nodes_type ON _benmore_context_nodes(node_type)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_context_edges",
+   "table": "_benmore_context_edges",
+   "sql": "CREATE TABLE _benmore_context_edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tfrom_node INTEGER NOT NULL,\n\t\tto_node INTEGER NOT NULL,\n\t\tedge_type TEXT NOT NULL,\n\t\tmetadata TEXT DEFAULT '{}',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tFOREIGN KEY (from_node) REFERENCES _benmore_context_nodes(id) ON DELETE CASCADE,\n\t\tFOREIGN KEY (to_node) REFERENCES _benmore_context_nodes(id) ON DELETE CASCADE\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_context_edges_from",
+   "table": "_benmore_context_edges",
+   "sql": "CREATE INDEX idx_benmore_context_edges_from ON _benmore_context_edges(from_node)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_context_edges_to",
+   "table": "_benmore_context_edges",
+   "sql": "CREATE INDEX idx_benmore_context_edges_to ON _benmore_context_edges(to_node)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_context_edges_type",
+   "table": "_benmore_context_edges",
+   "sql": "CREATE INDEX idx_benmore_context_edges_type ON _benmore_context_edges(edge_type)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_request_log",
+   "table": "_benmore_request_log",
+   "sql": "CREATE TABLE _benmore_request_log (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tmethod TEXT NOT NULL,\n\t\tpath TEXT NOT NULL,\n\t\tstatus INTEGER NOT NULL,\n\t\tduration_ms INTEGER NOT NULL,\n\t\tip TEXT DEFAULT '',\n\t\tuser_id TEXT DEFAULT '',\n\t\tuser_agent TEXT DEFAULT '',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, error TEXT DEFAULT '', request_id TEXT DEFAULT '')"
+  },
+  {
+   "type": "index",
+   "name": "idx_request_log_time",
+   "table": "_benmore_request_log",
+   "sql": "CREATE INDEX idx_request_log_time ON _benmore_request_log(created_at DESC)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_imports",
+   "table": "_benmore_imports",
+   "sql": "CREATE TABLE _benmore_imports (\n\t\tid TEXT PRIMARY KEY,\n\t\ttable_name TEXT NOT NULL,\n\t\tformat TEXT NOT NULL,\n\t\tgzip INTEGER NOT NULL DEFAULT 0,\n\t\tbytes_total INTEGER NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tnull_as TEXT NOT NULL DEFAULT '',\n\t\tstate TEXT NOT NULL DEFAULT 'staging',\n\t\trows_loaded INTEGER NOT NULL DEFAULT 0,\n\t\terror TEXT NOT NULL DEFAULT '',\n\t\tcreated_by INTEGER NOT NULL DEFAULT 0,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tstarted_at DATETIME,\n\t\tcompleted_at DATETIME\n\t, uncompressed_bytes INTEGER NOT NULL DEFAULT 0, created_by_subject TEXT NOT NULL DEFAULT '', owner_user_id INTEGER NOT NULL DEFAULT 0, owner_email TEXT NOT NULL DEFAULT '')"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_imports_1",
+   "table": "_benmore_imports",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_analytics",
+   "table": "_benmore_analytics",
+   "sql": "CREATE TABLE _benmore_analytics (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tvisitor_id TEXT NOT NULL,\n\t\tsession_id TEXT NOT NULL,\n\t\tpath TEXT NOT NULL,\n\t\treferrer TEXT DEFAULT '',\n\t\treferrer_domain TEXT DEFAULT '',\n\t\tutm_source TEXT DEFAULT '',\n\t\tutm_medium TEXT DEFAULT '',\n\t\tutm_campaign TEXT DEFAULT '',\n\t\tscreen_w INTEGER DEFAULT 0,\n\t\tscreen_h INTEGER DEFAULT 0,\n\t\tdevice_type TEXT DEFAULT 'desktop',\n\t\tbrowser TEXT DEFAULT '',\n\t\tos TEXT DEFAULT '',\n\t\tcountry TEXT DEFAULT '',\n\t\tduration_ms INTEGER DEFAULT 0,\n\t\tis_bounce INTEGER DEFAULT 1,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, is_entry INTEGER DEFAULT 0, is_exit INTEGER DEFAULT 0)"
+  },
+  {
+   "type": "index",
+   "name": "idx_analytics_time",
+   "table": "_benmore_analytics",
+   "sql": "CREATE INDEX idx_analytics_time ON _benmore_analytics(created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "idx_analytics_visitor",
+   "table": "_benmore_analytics",
+   "sql": "CREATE INDEX idx_analytics_visitor ON _benmore_analytics(visitor_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_analytics_session",
+   "table": "_benmore_analytics",
+   "sql": "CREATE INDEX idx_analytics_session ON _benmore_analytics(session_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_analytics_path",
+   "table": "_benmore_analytics",
+   "sql": "CREATE INDEX idx_analytics_path ON _benmore_analytics(path)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_funnels",
+   "table": "_benmore_funnels",
+   "sql": "CREATE TABLE _benmore_funnels (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname TEXT NOT NULL,\n\t\tsteps TEXT NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_visitors",
+   "table": "_benmore_visitors",
+   "sql": "CREATE TABLE _benmore_visitors (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tvisitor_id TEXT UNIQUE NOT NULL,\n\t\tuser_id INTEGER DEFAULT 0,\n\t\tfirst_seen DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tlast_seen DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tsession_count INTEGER DEFAULT 1,\n\t\tpageview_count INTEGER DEFAULT 0\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_visitors_1",
+   "table": "_benmore_visitors",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_visitors_last_seen",
+   "table": "_benmore_visitors",
+   "sql": "CREATE INDEX idx_visitors_last_seen ON _benmore_visitors(last_seen, pageview_count)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_read_audit",
+   "table": "_benmore_read_audit",
+   "sql": "CREATE TABLE _benmore_read_audit (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\ttable_name TEXT NOT NULL,\n\t\trow_id TEXT,\n\t\tquery_type TEXT NOT NULL,\n\t\tuser_id INTEGER NOT NULL,\n\t\tuser_email TEXT NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_read_audit_table",
+   "table": "_benmore_read_audit",
+   "sql": "CREATE INDEX idx_read_audit_table ON _benmore_read_audit(table_name, created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "idx_read_audit_user",
+   "table": "_benmore_read_audit",
+   "sql": "CREATE INDEX idx_read_audit_user ON _benmore_read_audit(user_id, created_at DESC)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_devices",
+   "table": "_benmore_devices",
+   "sql": "CREATE TABLE _benmore_devices (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\ttoken TEXT NOT NULL,\n\t\tplatform TEXT NOT NULL,\n\t\tapp_version TEXT,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tupdated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tUNIQUE(user_id, token)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_devices_1",
+   "table": "_benmore_devices",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_custom_fields",
+   "table": "_benmore_custom_fields",
+   "sql": "CREATE TABLE _benmore_custom_fields (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\ttable_name TEXT NOT NULL,\n\t\tcolumn_name TEXT NOT NULL,\n\t\tcolumn_type TEXT NOT NULL,\n\t\tdescription TEXT DEFAULT '',\n\t\tadded_by INTEGER,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tUNIQUE(table_name, column_name)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_custom_fields_1",
+   "table": "_benmore_custom_fields",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_saved_views",
+   "table": "_benmore_saved_views",
+   "sql": "CREATE TABLE _benmore_saved_views (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tspec TEXT NOT NULL DEFAULT '{}',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_scheduled_tasks",
+   "table": "_benmore_scheduled_tasks",
+   "sql": "CREATE TABLE _benmore_scheduled_tasks (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tkind TEXT NOT NULL DEFAULT 'reminder',   -- reminder | flow\n\t\ttitle TEXT NOT NULL DEFAULT 'Reminder',\n\t\tmessage TEXT DEFAULT '',\n\t\tflow TEXT DEFAULT '',\n\t\tbody TEXT DEFAULT '',                     -- JSON args for kind=flow\n\t\ttable_name TEXT DEFAULT '',\n\t\trow_id TEXT DEFAULT '',\n\t\trun_at DATETIME NOT NULL,\n\t\tstatus TEXT NOT NULL DEFAULT 'pending',   -- pending | done | cancelled | failed\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tfired_at DATETIME\n\t, claimed_at DATETIME, authorization TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', recoveries INTEGER NOT NULL DEFAULT 0)"
+  },
+  {
+   "type": "index",
+   "name": "idx_sched_due",
+   "table": "_benmore_scheduled_tasks",
+   "sql": "CREATE INDEX idx_sched_due ON _benmore_scheduled_tasks(status, run_at)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_approvals",
+   "table": "_benmore_approvals",
+   "sql": "CREATE TABLE _benmore_approvals (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\ttable_name TEXT NOT NULL,\n\t\trow_id TEXT NOT NULL,\n\t\trequested_by INTEGER NOT NULL,\n\t\trequested_email TEXT DEFAULT '',\n\t\tapprover_id INTEGER,\n\t\tapprover_email TEXT DEFAULT '',\n\t\ttitle TEXT DEFAULT '',\n\t\tstatus TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected\n\t\tnote TEXT DEFAULT '',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tdecided_at DATETIME\n\t)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_users",
+   "table": "_benmore_users",
+   "sql": "CREATE TABLE _benmore_users (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tusername TEXT UNIQUE NOT NULL,\n\t\temail TEXT UNIQUE,\n\t\tphone TEXT UNIQUE,\n\t\tpassword_hash TEXT,\n\t\tpassword_change_required INTEGER NOT NULL DEFAULT 0,\n\t\tfirst_name TEXT DEFAULT '',\n\t\tlast_name TEXT DEFAULT '',\n\t\tavatar_url TEXT DEFAULT '',\n\t\trole TEXT DEFAULT 'user',\n\t\tverified INTEGER DEFAULT 0,\n\t\tdeactivated_at DATETIME,\n\t\tlast_login_at DATETIME,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, mfa_setup_nonce TEXT NOT NULL DEFAULT '', email_grandfathered INTEGER NOT NULL DEFAULT 0, totp_secret TEXT, backup_codes TEXT, mfa_last_totp TEXT, mfa_last_totp_at DATETIME)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_users_1",
+   "table": "_benmore_users",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_users_2",
+   "table": "_benmore_users",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_users_3",
+   "table": "_benmore_users",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_signin_challenges",
+   "table": "_benmore_signin_challenges",
+   "sql": "CREATE TABLE _benmore_signin_challenges (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, purpose TEXT NOT NULL, email TEXT NOT NULL, otp_key TEXT NOT NULL, credential_binding TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_signin_challenges_1",
+   "table": "_benmore_signin_challenges",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_signin_challenges_user",
+   "table": "_benmore_signin_challenges",
+   "sql": "CREATE INDEX idx_benmore_signin_challenges_user ON _benmore_signin_challenges(user_id,expires_at)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_signin_challenges_expiry",
+   "table": "_benmore_signin_challenges",
+   "sql": "CREATE INDEX idx_benmore_signin_challenges_expiry ON _benmore_signin_challenges(expires_at)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_users_email_nocase",
+   "table": "_benmore_users",
+   "sql": "CREATE UNIQUE INDEX idx_benmore_users_email_nocase ON _benmore_users(email COLLATE NOCASE) WHERE email IS NOT NULL AND email != ''"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_sessions",
+   "table": "_benmore_sessions",
+   "sql": "CREATE TABLE _benmore_sessions (\n\t\tid TEXT PRIMARY KEY,\n\t\tuser_id INTEGER NOT NULL,\n\t\temail TEXT NOT NULL,\n\t\texpires_at DATETIME NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, group_id INTEGER DEFAULT 0, scopes TEXT DEFAULT '', is_impersonation INTEGER DEFAULT 0, impersonator_session_id TEXT DEFAULT '', impersonator_user_id INTEGER DEFAULT 0, impersonator_email TEXT DEFAULT '', ip TEXT DEFAULT '', user_agent TEXT DEFAULT '', acting_as_group TEXT DEFAULT '', login_at INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER NOT NULL DEFAULT 0)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_sessions_1",
+   "table": "_benmore_sessions",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_sessions_user",
+   "table": "_benmore_sessions",
+   "sql": "CREATE INDEX idx_benmore_sessions_user ON _benmore_sessions(user_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_sessions_expiry",
+   "table": "_benmore_sessions",
+   "sql": "CREATE INDEX idx_benmore_sessions_expiry ON _benmore_sessions(datetime(expires_at))"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_login_attempts",
+   "table": "_benmore_login_attempts",
+   "sql": "CREATE TABLE _benmore_login_attempts (\n\t\temail TEXT NOT NULL,\n\t\tattempted_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tsuccess BOOLEAN DEFAULT 0\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_login_attempts_email",
+   "table": "_benmore_login_attempts",
+   "sql": "CREATE INDEX idx_login_attempts_email ON _benmore_login_attempts(email, attempted_at)"
+  },
+  {
+   "type": "index",
+   "name": "idx_login_attempts_time",
+   "table": "_benmore_login_attempts",
+   "sql": "CREATE INDEX idx_login_attempts_time ON _benmore_login_attempts(attempted_at)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_user_roles",
+   "table": "_benmore_user_roles",
+   "sql": "CREATE TABLE _benmore_user_roles (\n\t\t\tuser_id    INTEGER NOT NULL,\n\t\t\trole       TEXT    NOT NULL,\n\t\t\tgroup_id   TEXT,\n\t\t\tgranted_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\t\tgranted_by INTEGER,\n\t\t\texpires_at DATETIME\n\t\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_user_roles_uniq",
+   "table": "_benmore_user_roles",
+   "sql": "CREATE UNIQUE INDEX idx_user_roles_uniq ON _benmore_user_roles(user_id, role, IFNULL(group_id, ''))"
+  },
+  {
+   "type": "index",
+   "name": "idx_user_roles_expiry",
+   "table": "_benmore_user_roles",
+   "sql": "CREATE INDEX idx_user_roles_expiry ON _benmore_user_roles(expires_at) WHERE expires_at IS NOT NULL"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_password_resets",
+   "table": "_benmore_password_resets",
+   "sql": "CREATE TABLE _benmore_password_resets (\n\t\ttoken TEXT PRIMARY KEY,\n\t\temail TEXT NOT NULL,\n\t\texpires_at DATETIME NOT NULL,\n\t\tused INTEGER DEFAULT 0,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, type TEXT DEFAULT 'reset')"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_password_resets_1",
+   "table": "_benmore_password_resets",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_api_tokens",
+   "table": "_benmore_api_tokens",
+   "sql": "CREATE TABLE _benmore_api_tokens (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\ttoken_hash TEXT UNIQUE NOT NULL,\n\t\tscopes TEXT NOT NULL,\n\t\tlast_used_at DATETIME,\n\t\texpires_at DATETIME,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tFOREIGN KEY (user_id) REFERENCES _benmore_users(id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_api_tokens_1",
+   "table": "_benmore_api_tokens",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_api_tokens_hash",
+   "table": "_benmore_api_tokens",
+   "sql": "CREATE INDEX idx_api_tokens_hash ON _benmore_api_tokens(token_hash)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_passkeys",
+   "table": "_benmore_passkeys",
+   "sql": "CREATE TABLE _benmore_passkeys (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tcredential_id TEXT NOT NULL UNIQUE,\n\t\tpublic_key BLOB NOT NULL,\n\t\talg INTEGER NOT NULL,\n\t\tsign_count INTEGER NOT NULL DEFAULT 0,\n\t\tname TEXT NOT NULL DEFAULT '',\n\t\tcreated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\t\tlast_used_at DATETIME\n\t, user_handle TEXT)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_passkeys_1",
+   "table": "_benmore_passkeys",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_passkeys_user",
+   "table": "_benmore_passkeys",
+   "sql": "CREATE INDEX idx_benmore_passkeys_user ON _benmore_passkeys(user_id)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_passkey_challenges",
+   "table": "_benmore_passkey_challenges",
+   "sql": "CREATE TABLE _benmore_passkey_challenges (\n\t\t\tchallenge_hash TEXT PRIMARY KEY,\n\t\t\tpurpose TEXT NOT NULL CHECK(purpose IN ('register','login')),\n\t\t\tuser_id INTEGER NOT NULL,\n\t\t\trp_id TEXT NOT NULL,\n\t\t\torigin TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\texpires_at INTEGER NOT NULL\n\t\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_passkey_challenges_1",
+   "table": "_benmore_passkey_challenges",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_passkey_challenges_source",
+   "table": "_benmore_passkey_challenges",
+   "sql": "CREATE INDEX idx_benmore_passkey_challenges_source ON _benmore_passkey_challenges(source_hash,rp_id,expires_at)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_oauth_tokens",
+   "table": "_benmore_oauth_tokens",
+   "sql": "CREATE TABLE _benmore_oauth_tokens (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tprovider TEXT NOT NULL,\n\t\taccess_token TEXT NOT NULL,\n\t\trefresh_token TEXT,\n\t\ttoken_type TEXT DEFAULT 'Bearer',\n\t\texpires_at DATETIME,\n\t\tscopes TEXT,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tupdated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tUNIQUE(user_id, provider),\n\t\tFOREIGN KEY (user_id) REFERENCES _benmore_users(id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_oauth_tokens_1",
+   "table": "_benmore_oauth_tokens",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_oauth_clients",
+   "table": "_benmore_oauth_clients",
+   "sql": "CREATE TABLE _benmore_oauth_clients (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tclient_id TEXT UNIQUE NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tredirect_uris TEXT NOT NULL,\n\t\tscopes TEXT NOT NULL DEFAULT '*',\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_oauth_clients_1",
+   "table": "_benmore_oauth_clients",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_oauth_codes",
+   "table": "_benmore_oauth_codes",
+   "sql": "CREATE TABLE _benmore_oauth_codes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tclient_id TEXT NOT NULL,\n\t\tuser_id INTEGER NOT NULL,\n\t\tcode TEXT UNIQUE NOT NULL,\n\t\tcode_challenge TEXT NOT NULL,\n\t\tcode_challenge_method TEXT NOT NULL,\n\t\tredirect_uri TEXT NOT NULL,\n\t\tresource TEXT NOT NULL DEFAULT '',\n\t\tscopes TEXT NOT NULL DEFAULT '*',\n\t\texpires_at DATETIME NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_oauth_codes_1",
+   "table": "_benmore_oauth_codes",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_oauth_codes_code",
+   "table": "_benmore_oauth_codes",
+   "sql": "CREATE INDEX idx_oauth_codes_code ON _benmore_oauth_codes(code)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_email_changes",
+   "table": "_benmore_email_changes",
+   "sql": "CREATE TABLE _benmore_email_changes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\tnew_email TEXT NOT NULL,\n\t\ttoken_hash TEXT NOT NULL UNIQUE,\n\t\texpires_at DATETIME NOT NULL,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_email_changes_1",
+   "table": "_benmore_email_changes",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_email_changes_user",
+   "table": "_benmore_email_changes",
+   "sql": "CREATE INDEX idx_email_changes_user ON _benmore_email_changes(user_id)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_permissions",
+   "table": "_benmore_permissions",
+   "sql": "CREATE TABLE _benmore_permissions (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tresource_type TEXT NOT NULL,\n\t\tresource_id TEXT NOT NULL,\n\t\tgrant_type TEXT NOT NULL,\n\t\tgrantee_id TEXT NOT NULL,\n\t\tpermission TEXT NOT NULL,\n\t\tgranted_by INTEGER,\n\t\tgranted_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\texpires_at DATETIME,\n\t\tUNIQUE(resource_type, resource_id, grant_type, grantee_id),\n\t\tFOREIGN KEY (granted_by) REFERENCES _benmore_users(id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_permissions_1",
+   "table": "_benmore_permissions",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_perm_resource",
+   "table": "_benmore_permissions",
+   "sql": "CREATE INDEX idx_benmore_perm_resource ON _benmore_permissions(resource_type, resource_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_perm_grantee",
+   "table": "_benmore_permissions",
+   "sql": "CREATE INDEX idx_benmore_perm_grantee ON _benmore_permissions(resource_type, grantee_id)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_webhooks",
+   "table": "_benmore_webhooks",
+   "sql": "CREATE TABLE _benmore_webhooks (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tuser_id INTEGER NOT NULL,\n\t\turl TEXT NOT NULL,\n\t\tsecret TEXT NOT NULL,\n\t\ttables TEXT NOT NULL DEFAULT '',\n\t\tevents TEXT NOT NULL DEFAULT '',\n\t\tactive INTEGER NOT NULL DEFAULT 1,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_webhooks_user",
+   "table": "_benmore_webhooks",
+   "sql": "CREATE INDEX idx_webhooks_user ON _benmore_webhooks(user_id)"
+  },
+  {
+   "type": "index",
+   "name": "idx_webhooks_active",
+   "table": "_benmore_webhooks",
+   "sql": "CREATE INDEX idx_webhooks_active ON _benmore_webhooks(active)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_jobs",
+   "table": "_benmore_jobs",
+   "sql": "CREATE TABLE _benmore_jobs (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tjob_type TEXT NOT NULL DEFAULT 'flow',\n\t\tflow_name TEXT NOT NULL DEFAULT '',\n\t\tpayload TEXT,\n\t\tstatus TEXT DEFAULT 'pending',\n\t\tattempts INTEGER DEFAULT 0,\n\t\tmax_attempts INTEGER DEFAULT 3,\n\t\terror TEXT,\n\t\trun_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n\t\tnot_before DATETIME,\n\t\tstarted_at DATETIME,\n\t\tcompleted_at DATETIME,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t, status_token TEXT, lease_expires_at DATETIME, unique_key TEXT)"
+  },
+  {
+   "type": "index",
+   "name": "idx_jobs_status",
+   "table": "_benmore_jobs",
+   "sql": "CREATE INDEX idx_jobs_status ON _benmore_jobs(status, run_at)"
+  },
+  {
+   "type": "index",
+   "name": "idx_jobs_unique_active",
+   "table": "_benmore_jobs",
+   "sql": "CREATE UNIQUE INDEX idx_jobs_unique_active ON _benmore_jobs(unique_key) WHERE unique_key IS NOT NULL AND unique_key != '' AND status IN ('pending', 'running')"
+  },
+  {
+   "type": "index",
+   "name": "idx_jobs_backoff",
+   "table": "_benmore_jobs",
+   "sql": "CREATE INDEX idx_jobs_backoff ON _benmore_jobs(run_at) WHERE status = 'pending' AND not_before IS NOT NULL"
+  },
+  {
+   "type": "index",
+   "name": "idx_jobs_backoff_project",
+   "table": "_benmore_jobs",
+   "sql": "CREATE INDEX idx_jobs_backoff_project ON _benmore_jobs((CASE WHEN json_valid(payload) THEN json_extract(payload, '$.project_id') END), run_at) WHERE status = 'pending' AND not_before IS NOT NULL"
+  },
+  {
+   "type": "index",
+   "name": "idx_jobs_running_project",
+   "table": "_benmore_jobs",
+   "sql": "CREATE INDEX idx_jobs_running_project ON _benmore_jobs((CASE WHEN json_valid(payload) THEN json_extract(payload, '$.project_id') END)) WHERE status = 'running'"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_presence",
+   "table": "_benmore_presence",
+   "sql": "CREATE TABLE _benmore_presence (\n\t\tslug TEXT NOT NULL,\n\t\tuser_id INTEGER NOT NULL,\n\t\tjoined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\t\tlast_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\t\tPRIMARY KEY (slug, user_id)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_presence_1",
+   "table": "_benmore_presence",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_benmore_presence_last_seen",
+   "table": "_benmore_presence",
+   "sql": "CREATE INDEX idx_benmore_presence_last_seen ON _benmore_presence(last_seen_at)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_usage",
+   "table": "_benmore_usage",
+   "sql": "CREATE TABLE _benmore_usage (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tscope TEXT NOT NULL,\n\t\tmetric TEXT NOT NULL,\n\t\tcount INTEGER DEFAULT 0,\n\t\tperiod TEXT NOT NULL,\n\t\tUNIQUE(scope, metric, period)\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_usage_1",
+   "table": "_benmore_usage",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_usage_lookup",
+   "table": "_benmore_usage",
+   "sql": "CREATE INDEX idx_usage_lookup ON _benmore_usage(scope, period)"
+  },
+  {
+   "type": "table",
+   "name": "_benmore_broadcasts",
+   "table": "_benmore_broadcasts",
+   "sql": "CREATE TABLE _benmore_broadcasts (\n\t\tslug TEXT PRIMARY KEY,\n\t\tpublisher_session_id TEXT NOT NULL,\n\t\tpublisher_user_id INTEGER,\n\t\tpublisher_group_id TEXT,\n\t\tviewer_count INTEGER DEFAULT 0,\n\t\tcreated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n\t\tlast_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex__benmore_broadcasts_1",
+   "table": "_benmore_broadcasts",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "_benmore_client_errors",
+   "table": "_benmore_client_errors",
+   "sql": "CREATE TABLE _benmore_client_errors (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tkind TEXT, message TEXT, stack TEXT, source TEXT,\n\t\tline INTEGER, col INTEGER, status INTEGER, url TEXT,\n\t\tua TEXT, user_id INTEGER, ip TEXT,\n\t\tcreated_at DATETIME DEFAULT CURRENT_TIMESTAMP\n\t)"
+  },
+  {
+   "type": "index",
+   "name": "idx_client_err_created",
+   "table": "_benmore_client_errors",
+   "sql": "CREATE INDEX idx_client_err_created ON _benmore_client_errors(created_at)"
+  },
+  {
+   "type": "table",
+   "name": "notes",
+   "table": "notes",
+   "sql": "CREATE TABLE notes (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    user_id INTEGER NOT NULL,\n    body TEXT NOT NULL,\n    filter TEXT,\n    window TEXT,\n    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\n)"
+  },
+  {
+   "type": "index",
+   "name": "uniq_projects_slug",
+   "table": "projects",
+   "sql": "CREATE UNIQUE INDEX uniq_projects_slug ON projects(slug)"
+  },
+  {
+   "type": "index",
+   "name": "idx_projects_priority",
+   "table": "projects",
+   "sql": "CREATE INDEX idx_projects_priority ON projects(priority)"
+  },
+  {
+   "type": "table",
+   "name": "memberships",
+   "table": "memberships",
+   "sql": "CREATE TABLE \"memberships\" (project_id INTEGER NOT NULL, user_id INTEGER NOT NULL, level TEXT NOT NULL DEFAULT 'member', joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (project_id, user_id))"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_memberships_1",
+   "table": "memberships",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_bm_memberships_user_id",
+   "table": "memberships",
+   "sql": "CREATE INDEX \"idx_bm_memberships_user_id\" ON \"memberships\"(\"user_id\")"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_tasks_amount_insert",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_tasks_amount_insert AFTER INSERT ON tasks FOR EACH ROW BEGIN UPDATE tasks SET amount = (quantity * price) WHERE rowid = NEW.rowid AND amount IS NOT (quantity * price); END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_tasks_amount_update",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_tasks_amount_update AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET amount = (quantity * price) WHERE rowid = NEW.rowid AND amount IS NOT (quantity * price); END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_projects_total_tasks_insert",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_projects_total_tasks_insert AFTER INSERT ON tasks FOR EACH ROW WHEN NEW.project_id IS NOT NULL BEGIN UPDATE projects SET total = (SELECT COUNT(*) FROM tasks WHERE project_id = NEW.project_id AND deleted_at IS NULL) WHERE id = NEW.project_id; END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_projects_total_tasks_update",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_projects_total_tasks_update AFTER UPDATE ON tasks FOR EACH ROW WHEN NEW.project_id IS NOT NULL BEGIN UPDATE projects SET total = (SELECT COUNT(*) FROM tasks WHERE project_id = NEW.project_id AND deleted_at IS NULL) WHERE id = NEW.project_id; END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_projects_total_tasks_update_old",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_projects_total_tasks_update_old AFTER UPDATE ON tasks FOR EACH ROW WHEN OLD.project_id IS NOT NULL AND OLD.project_id IS NOT NEW.project_id BEGIN UPDATE projects SET total = (SELECT COUNT(*) FROM tasks WHERE project_id = OLD.project_id AND deleted_at IS NULL) WHERE id = OLD.project_id; END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_cf_projects_total_tasks_delete",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER _benmore_cf_projects_total_tasks_delete AFTER DELETE ON tasks FOR EACH ROW WHEN OLD.project_id IS NOT NULL BEGIN UPDATE projects SET total = (SELECT COUNT(*) FROM tasks WHERE project_id = OLD.project_id AND deleted_at IS NULL) WHERE id = OLD.project_id; END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_ver_tasks_update",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER \"_benmore_ver_tasks_update\" BEFORE UPDATE ON \"tasks\" FOR EACH ROW WHEN NOT (((OLD.\"id\" IS NEW.\"id\") AND (OLD.\"user_id\" IS NEW.\"user_id\") AND (OLD.\"project_id\" IS NEW.\"project_id\") AND (OLD.\"title\" IS NEW.\"title\") AND (OLD.\"first\" IS NEW.\"first\") AND (OLD.\"last\" IS NEW.\"last\") AND (OLD.\"end\" IS NEW.\"end\") AND (OLD.\"plan\" IS NEW.\"plan\") AND (OLD.\"query\" IS NEW.\"query\") AND (OLD.\"view\" IS NEW.\"view\") AND (OLD.\"cast\" IS NEW.\"cast\") AND (OLD.\"raise\" IS NEW.\"raise\") AND (OLD.\"quantity\" IS NEW.\"quantity\") AND (OLD.\"price\" IS NEW.\"price\") AND (OLD.\"created_at\" IS NEW.\"created_at\") AND (OLD.\"deleted_at\" IS NEW.\"deleted_at\") AND (OLD.\"range\" IS NEW.\"range\") AND (OLD.\"due_at\" IS NEW.\"due_at\")) AND (OLD.\"updated_at\" IS NEW.\"updated_at\" OR benmore_history_covers((SELECT _valid_to FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), NEW.\"updated_at\")) AND ((OLD.\"amount\" IS NOT NEW.\"amount\") OR benmore_history_covers((SELECT _valid_to FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), NEW.\"updated_at\"))) BEGIN INSERT INTO \"tasks_history\" (\"id\", \"user_id\", \"project_id\", \"title\", \"first\", \"last\", \"end\", \"plan\", \"query\", \"view\", \"cast\", \"raise\", \"quantity\", \"price\", \"amount\", \"created_at\", \"updated_at\", \"deleted_at\", \"range\", \"due_at\", _version, _valid_from, _valid_to, _change_type) SELECT OLD.\"id\", OLD.\"user_id\", OLD.\"project_id\", OLD.\"title\", OLD.\"first\", OLD.\"last\", OLD.\"end\", OLD.\"plan\", OLD.\"query\", OLD.\"view\", OLD.\"cast\", OLD.\"raise\", OLD.\"quantity\", OLD.\"price\", OLD.\"amount\", OLD.\"created_at\", OLD.\"updated_at\", OLD.\"deleted_at\", OLD.\"range\", OLD.\"due_at\", (SELECT COALESCE(MAX(_version), 0) + 1 FROM \"tasks_history\" WHERE id = OLD.id), boundary.start, benmore_history_end(boundary.start, NEW.\"updated_at\"), 'update' FROM (WITH captured AS MATERIALIZED (SELECT benmore_history_start((SELECT _valid_from FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), (SELECT _valid_to FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), OLD.\"updated_at\", OLD.\"created_at\") AS start) SELECT start FROM captured) AS boundary; END"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_ver_tasks_delete",
+   "table": "tasks",
+   "sql": "CREATE TRIGGER \"_benmore_ver_tasks_delete\" BEFORE DELETE ON \"tasks\" FOR EACH ROW BEGIN INSERT INTO \"tasks_history\" (\"id\", \"user_id\", \"project_id\", \"title\", \"first\", \"last\", \"end\", \"plan\", \"query\", \"view\", \"cast\", \"raise\", \"quantity\", \"price\", \"amount\", \"created_at\", \"updated_at\", \"deleted_at\", \"range\", \"due_at\", _version, _valid_from, _valid_to, _change_type) SELECT OLD.\"id\", OLD.\"user_id\", OLD.\"project_id\", OLD.\"title\", OLD.\"first\", OLD.\"last\", OLD.\"end\", OLD.\"plan\", OLD.\"query\", OLD.\"view\", OLD.\"cast\", OLD.\"raise\", OLD.\"quantity\", OLD.\"price\", OLD.\"amount\", OLD.\"created_at\", OLD.\"updated_at\", OLD.\"deleted_at\", OLD.\"range\", OLD.\"due_at\", (SELECT COALESCE(MAX(_version), 0) + 1 FROM \"tasks_history\" WHERE id = OLD.id), boundary.start, benmore_history_end(boundary.start, NULL), 'delete' FROM (WITH captured AS MATERIALIZED (SELECT benmore_history_start((SELECT _valid_from FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), (SELECT _valid_to FROM \"tasks_history\" WHERE id=OLD.id ORDER BY _version DESC LIMIT 1), OLD.\"updated_at\", OLD.\"created_at\") AS start) SELECT start FROM captured) AS boundary; END"
+  },
+  {
+   "type": "index",
+   "name": "idx_bm_notes_user_id",
+   "table": "notes",
+   "sql": "CREATE INDEX \"idx_bm_notes_user_id\" ON \"notes\"(\"user_id\")"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_mfa_setup_nonce_insert",
+   "table": "_benmore_users",
+   "sql": "CREATE TRIGGER _benmore_mfa_setup_nonce_insert AFTER INSERT ON _benmore_users BEGIN\n\t\t\tUPDATE _benmore_users SET mfa_setup_nonce=lower(hex(randomblob(16))) WHERE id=NEW.id;\n\t\tEND"
+  },
+  {
+   "type": "trigger",
+   "name": "_benmore_mfa_setup_nonce_reset",
+   "table": "_benmore_users",
+   "sql": "CREATE TRIGGER _benmore_mfa_setup_nonce_reset AFTER UPDATE OF password_hash,password_change_required ON _benmore_users BEGIN\n\t\t\tUPDATE _benmore_users SET mfa_setup_nonce=lower(hex(randomblob(16))) WHERE id=NEW.id;\n\t\tEND"
+  }
+ ],
+ "ledger": [
+  {
+   "id": 1,
+   "name": "0001_20261109T210602Z_add_3_tables.sql",
+   "applied_at": "2026-11-09 21:06:02",
+   "source": "// An app as it exists today: ordinary names, and names that are SQL\n// keywords SQLite accepts bare (key, desc, action, offset, first, last, end,\n// plan, query, view, cast, raise).\n\nmodel Project {\n  id        Int      @id @default(autoincrement())\n  userId    Int      @map(\"user_id\")\n  name      String\n  key       String   @unique\n  desc      String?\n  action    String   @default(\"none\")\n  offset    Int      @default(0)\n  total     Int      @default(0)\n  createdAt DateTime @default(now()) @map(\"created_at\")\n  updatedAt DateTime @default(now()) @updatedAt @map(\"updated_at\")\n  tasks     Task[]\n\n  @@index([userId, createdAt(sort: Desc)])\n  @@map(\"projects\")\n}\n\nmodel Task {\n  id        Int       @id @default(autoincrement())\n  userId    Int       @map(\"user_id\")\n  projectId Int       @map(\"project_id\")\n  project   Project   @relation(fields: [projectId], references: [id])\n  title     String\n  first     String?\n  last      String?\n  end       DateTime?\n  plan      String?\n  query     String?\n  view      Int       @default(0)\n  cast      String?\n  raise     Float?\n  quantity  Int       @default(1)\n  price     Float     @default(0)\n  amount    Float     @default(0)\n  createdAt DateTime  @default(now()) @map(\"created_at\")\n  updatedAt DateTime  @default(now()) @updatedAt @map(\"updated_at\")\n  deletedAt DateTime? @map(\"deleted_at\")\n\n  @@index([projectId])\n  @@unique([projectId, title])\n  @@fulltext([title, plan])\n  @@map(\"tasks\")\n}\n\nmodel Membership {\n  projectId Int    @map(\"project_id\")\n  userId    Int    @map(\"user_id\")\n  level     String @default(\"member\")\n\n  @@id([projectId, userId])\n  @@map(\"memberships\")\n}\n",
+   "source_hash": "762569f63ac00a43cbab85a59077d67770714a0feceffd9019327836347cc0ef"
+  },
+  {
+   "id": 2,
+   "name": "0002_20261109T210704Z_add_1_tables_add_5_cols.sql",
+   "applied_at": "2026-11-09 21:07:04",
+   "source": "// An app as it exists today: ordinary names, and names that are SQL\n// keywords SQLite accepts bare (key, desc, action, offset, first, last, end,\n// plan, query, view, cast, raise).\n\nmodel Project {\n  id        Int      @id @default(autoincrement())\n  userId    Int      @map(\"user_id\")\n  name      String\n  key       String   @unique\n  desc      String?\n  action    String   @default(\"none\")\n  offset    Int      @default(0)\n  total     Int      @default(0)\n  priority  Int      @default(0)\n  slug      String?  @unique\n  createdAt DateTime @default(now()) @map(\"created_at\")\n  updatedAt DateTime @default(now()) @updatedAt @map(\"updated_at\")\n  tasks     Task[]\n\n  @@index([userId, createdAt(sort: Desc)])\n  @@index([priority])\n  @@map(\"projects\")\n}\n\nmodel Task {\n  id        Int       @id @default(autoincrement())\n  userId    Int       @map(\"user_id\")\n  projectId Int       @map(\"project_id\")\n  project   Project   @relation(fields: [projectId], references: [id])\n  title     String\n  first     String?\n  last      String?\n  end       DateTime?\n  plan      String?\n  query     String?\n  view      Int       @default(0)\n  cast      String?\n  raise     Float?\n  quantity  Int       @default(1)\n  price     Float     @default(0)\n  amount    Float     @default(0)\n  range     Int       @default(0)\n  dueAt     DateTime  @default(now()) @map(\"due_at\")\n  createdAt DateTime  @default(now()) @map(\"created_at\")\n  updatedAt DateTime  @default(now()) @updatedAt @map(\"updated_at\")\n  deletedAt DateTime? @map(\"deleted_at\")\n\n  @@index([projectId])\n  @@unique([projectId, title])\n  @@fulltext([title, plan])\n  @@map(\"tasks\")\n}\n\nmodel Membership {\n  projectId Int    @map(\"project_id\")\n  userId    Int    @map(\"user_id\")\n  level     String @default(\"member\")\n  joinedAt  DateTime @default(now()) @map(\"joined_at\")\n\n  @@id([projectId, userId])\n  @@map(\"memberships\")\n}\n\nmodel Note {\n  id        Int      @id @default(autoincrement())\n  userId    Int      @map(\"user_id\")\n  body      String\n  filter    String?\n  window    String?\n  createdAt DateTime @default(now()) @map(\"created_at\")\n\n  @@map(\"notes\")\n}\n",
+   "source_hash": "6b8462e5f21296455f697524181919aaf3eca82b7b938980ffeb1bc3e6b3d133"
+  }
+ ],
+ "rows": {
+  "projects": [
+   {
+    "id": 1,
+    "user_id": 1,
+    "name": "Alpha",
+    "key": "alpha",
+    "desc": "first project",
+    "action": "build",
+    "offset": 3,
+    "total": 0,
+    "created_at": "2026-11-09 21:06:15",
+    "updated_at": "2026-11-09 21:06:15",
+    "priority": 0,
+    "slug": null
+   },
+   {
+    "id": 2,
+    "user_id": 1,
+    "name": "Beta",
+    "key": "beta",
+    "desc": null,
+    "action": "none",
+    "offset": 0,
+    "total": 0,
+    "created_at": "2026-11-09 21:06:15",
+    "updated_at": "2026-11-09 21:06:15",
+    "priority": 0,
+    "slug": null
+   }
+  ],
+  "memberships": [
+   {
+    "project_id": 1,
+    "user_id": 1,
+    "level": "owner",
+    "joined_at": "2026-11-09 21:07:04"
+   },
+   {
+    "project_id": 2,
+    "user_id": 1,
+    "level": "member",
+    "joined_at": "2026-11-09 21:07:04"
+   }
+  ]
+ }
+}

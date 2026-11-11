@@ -1,0 +1,23 @@
+# flows/complete-tasks.yaml - mark several of the caller's tasks done, all or none
+on:
+  request:
+    method: POST
+    path: /api/tasks/complete
+    auth: required
+    transaction: true                 # a failed iteration undoes the earlier ones
+jobs:
+  complete:
+    steps:
+      - for_each: ${{ params.ids }}   # a JSON array in the body: {"ids": [3, 5, 8]}
+        as: task_id                   # the loop variable; "item" when left out
+        steps:
+          - run: sql
+            expect_rows: "=1"         # an id that is not the caller's open task stops the loop
+            with:
+              query: "UPDATE tasks SET status = 'done' WHERE id = :task_id AND user_id = :user_id AND status = 'open'"
+              params: { task_id: "${{ task_id }}" }
+        on_error:                     # sees the item that failed
+          - run: respond
+            with: { status: 409, json: { error: not_an_open_task, id: "${{ task_id }}" } }
+      - run: respond
+        with: { status: 200, json: { completed: "${{ params.ids | length }}" } }

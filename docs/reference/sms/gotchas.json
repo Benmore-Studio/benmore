@@ -1,0 +1,7 @@
+[
+  "**SMS costs real money** (~$0.01/segment US) - quotas are deliberately tight. Bulk/marketing SMS is not what this service is for.",
+  "**Self-hosted / OSS builds** have no platform service - configure SMS_ACCOUNT_SID/SMS_AUTH_TOKEN (Twilio) or SMS_WEBHOOK_URL.",
+  "**Segments**: messages over 160 GSM chars split into multiple billed segments; keep OTP messages short.",
+  "**Hook keys are allowlisted at write time.** An unrecognized key (`sms_body:`, `text:` at entry root, `send_email:`) is DROPPED silently by the YAML parser - the hook would fire and do nothing. `benmore check` and write_file reject it instead; a hook that parses to no action at all also logs a loud warning at boot.",
+  "**The shared number must clear carrier registration before ANY send works.** `benmore sms <app>` shows the state. Until then sends fail loudly rather than queueing forever."
+]

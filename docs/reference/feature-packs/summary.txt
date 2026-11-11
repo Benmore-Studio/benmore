@@ -1,0 +1,1 @@
+Reusable feature packs are versioned `feature.yaml` tarballs containing selected source files, Prisma model additions, flows/hooks/routes/static assets, env-var references by name, and install requirements. Existing app exports and curated starters use the same format.

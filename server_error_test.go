@@ -4,9 +4,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,6 +31,17 @@ func newServerErrorFixture(t *testing.T, dev bool) *serverErrorFixture {
 	app := newGateApp(t,
 		"CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT)",
 		"CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, body TEXT)")
+	// The middleware now writes diagnostics concurrently with handlers. Use the
+	// app's real WAL/immediate-transaction settings: the bare test connection's
+	// deferred read-to-write upgrade can fail even with a busy timeout.
+	if err := app.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", sqliteAppDSN(filepath.Join(app.Dir, "data.db"), app.Dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.DB = db
 	app.DevMode = dev
 	EnsureJobsTable(app.DB)
 	EnsureWebhooksTable(app.DB)
@@ -110,22 +123,23 @@ func TestServerErrorsAreRecordedAndProductionAnswersAreGeneric(t *testing.T) {
 				handler                  func(http.ResponseWriter, *http.Request)
 				status                   int
 				json                     bool   // the answer is a JSON error object
+				key                      string // the JSON key holding the text (default "error")
 				public                   string // generic text a production caller gets
 				detail                   string // what only the server side (and dev mode) may hold
 				where                    string // the label of the request log row and journal line
 			}
 			calls := []call{
-				{name: "list", method: "GET", path: "/api/widgets", status: 500, public: "list failed", detail: "no such table: widgets", where: "[widgets list]",
+				{name: "list", method: "GET", path: "/api/widgets", status: 500, json: true, public: "list failed", detail: "no such table: widgets", where: "[widgets list]",
 					handler: func(w http.ResponseWriter, r *http.Request) { handleList(w, r, f.app, "widgets") }},
-				{name: "count", method: "GET", path: "/api/widgets?count=true", status: 500, public: "count failed", detail: "no such table: widgets", where: "[widgets count]",
+				{name: "count", method: "GET", path: "/api/widgets?count=true", status: 500, json: true, public: "count failed", detail: "no such table: widgets", where: "[widgets count]",
 					handler: func(w http.ResponseWriter, r *http.Request) { handleList(w, r, f.app, "widgets") }},
-				{name: "batch create", method: "POST", path: "/api/notes/batch", body: `[{"body":"a"}]`, status: 500,
+				{name: "batch create", method: "POST", path: "/api/notes/batch", body: `[{"body":"a"}]`, status: 500, json: true,
 					public: "Batch insert failed: audit write failed", detail: "audit trigger refused the row", where: "[notes batch create]",
 					handler: func(w http.ResponseWriter, r *http.Request) { handleBatchCreate(w, r, f.app, "notes") }},
 				{name: "transaction", method: "POST", path: "/api/_transaction", body: `{"operations":[{"table":"notes","action":"insert","data":{"body":"tx"}}]}`, status: 500, json: true,
 					public: "audit write failed", detail: "audit trigger refused the row", where: "[_transaction insert notes]",
 					handler: func(w http.ResponseWriter, r *http.Request) { handleTransaction(w, r, f.app) }},
-				{name: "flow", method: "POST", path: "/api/broken-flow", status: 500,
+				{name: "flow", method: "POST", path: "/api/broken-flow", status: 500, json: true, key: "message",
 					public: "Internal error", detail: "no such table: missing_flow_table", where: "[flow broken-flow]",
 					handler: func(w http.ResponseWriter, r *http.Request) { executeFlowHTTP(f.app, flow, w, r) }},
 			}
@@ -149,9 +163,16 @@ func TestServerErrorsAreRecordedAndProductionAnswersAreGeneric(t *testing.T) {
 					if got["request_id"] != id {
 						t.Fatalf("%s: request_id %v, want %s", c.name, got["request_id"], id)
 					}
-					msg, _ := got["error"].(string)
+					key := c.key
+					if key == "" {
+						key = "error"
+					}
+					msg, _ := got[key].(string)
 					if !strings.HasPrefix(msg, c.public) {
-						t.Fatalf("%s: error key %q lost the route's text %q", c.name, msg, c.public)
+						t.Fatalf("%s: %s key %q lost the route's text %q", c.name, key, msg, c.public)
+					}
+					if !dev && key == "message" && msg != c.public+" (request id: "+id+")" {
+						t.Fatalf("%s: production message %q lacks the generic text and request id", c.name, msg)
 					}
 				}
 				if dev {
@@ -206,7 +227,8 @@ func TestReadQueryFailureIsRecordedAndStill404(t *testing.T) {
 	f := newServerErrorFixture(t, false)
 	f.breakStorage()
 	w, journal := f.call(func(w http.ResponseWriter, r *http.Request) { handleRead(w, r, f.app, "widgets") }, "GET", "/api/widgets/1", "")
-	if w.Code != http.StatusNotFound || strings.TrimSpace(w.Body.String()) != "Not found" {
+	var answer map[string]any
+	if w.Code != http.StatusNotFound || json.Unmarshal(w.Body.Bytes(), &answer) != nil || answer["error"] != "Not found" {
 		t.Fatalf("read answer changed: %d %q", w.Code, w.Body.String())
 	}
 	id := w.Header().Get(requestIDHeader)

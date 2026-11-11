@@ -1,0 +1,1 @@
+Clients send masked, unfragmented UTF-8 text frames; extensions are not negotiated. Invalid flags, unsupported opcodes and oversized control frames close the connection.

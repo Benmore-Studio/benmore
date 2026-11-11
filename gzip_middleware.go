@@ -26,8 +26,8 @@ package main
 // (compressed when the response is eligible) and flushes the connection.
 // Hijack and Unwrap are still NOT exposed, as before: hijacking (or reaching
 // the raw writer through http.ResponseController) underneath a gzip stream
-// would interleave raw bytes with compressed ones. Upgrade/SSE requests skip
-// the wrapper entirely.
+// would interleave raw bytes with compressed ones. Read and write deadlines
+// are passed through. Upgrade/SSE requests skip the wrapper entirely.
 
 import (
 	"compress/gzip"
@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // gzipMinSize is the body size below which compression is skipped. Gzip adds
@@ -121,6 +122,21 @@ func (w *gzipResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// SetReadDeadline and SetWriteDeadline reach the connection's deadlines for
+// http.ResponseController, which stops at a writer with neither these methods
+// nor Unwrap. Unlike Unwrap they expose no raw writer: a deadline cannot
+// interleave bytes with the compressed stream. Bulk-body handlers
+// (bulk_body_deadline.go) and a synchronous flow's answer deadline
+// (flows_time_limit.go) rely on them; without them a gzip-accepting client
+// (Go's http.Client asks by default) kept the server's deadlines.
+func (w *gzipResponseWriter) SetReadDeadline(deadline time.Time) error {
+	return http.NewResponseController(w.ResponseWriter).SetReadDeadline(deadline)
+}
+
+func (w *gzipResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
 }
 
 // decide fixes the encoding, writes the real header and drains the buffer.

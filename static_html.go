@@ -65,6 +65,14 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 	// Strip the leading slash for joining.
 	rel := strings.TrimPrefix(clean, "/")
 
+	// /<rel> is another name for /static/<rel>, so it refuses what that form
+	// refuses, with the same answer, before any candidate or fallback below
+	// is tried: /app.tsx and /server/key.ts answered 200 here with the source
+	// /static/ withholds (static_server_sources.go).
+	if refuseStaticServerSource(w, r, app, rel) {
+		return true
+	}
+
 	// Reject any traversal attempts up front - filepath.Clean shouldn't
 	// produce ".." for absolute paths, but defense-in-depth.
 	if strings.Contains(rel, "..") {
@@ -87,14 +95,28 @@ func serveStaticHTML(w http.ResponseWriter, r *http.Request, app *App) bool {
 	}
 	for _, candidate := range candidates {
 		if reviewed {
-			if strings.HasSuffix(strings.ToLower(candidate), ".html") && tryServeHTMLFile(w, r, app, candidate) {
+			if strings.HasSuffix(strings.ToLower(candidate), ".html") {
+				if tryServeHTMLFile(w, r, app, candidate) {
+					return true
+				}
+				continue
+			}
+			// The file itself (/assets/app.js for static/assets/app.js), from
+			// the captured generation: what /static/<rel> answers with.
+			if serveCapturedRootFile(w, r, app, rel) {
 				return true
 			}
 			continue
 		}
 		// Open the contained file once; reads must not reopen a pathname that
 		// could be replaced after the containment check.
-		file, ok := openServableFile(staticRoot, candidate)
+		file, refused, ok := openStaticAsset(app, candidate)
+		if refused {
+			// The candidate is source under another name (a link inside
+			// static/): the answer /static/ gives it.
+			writeStaticSourceRefusal(w, r)
+			return true
+		}
 		if !ok {
 			// A candidate that exists on disk (even as a symlink) but is
 			// rejected by the resolver is a containment block, not a plain
@@ -160,7 +182,7 @@ func tryServeHTMLFile(w http.ResponseWriter, r *http.Request, app *App, path str
 		}
 		data, err = app.readSourceFile(filepath.Join("static", rel))
 	} else if app != nil {
-		file, ok := openServableFile(filepath.Join(app.Dir, "static"), path)
+		file, _, ok := openStaticAsset(app, path)
 		if !ok {
 			return false
 		}
@@ -230,6 +252,9 @@ func serveHTMLBytes(w http.ResponseWriter, r *http.Request, app *App, data []byt
 		if devReloadClientEnabled(app) {
 			injected = injectDevReloadClient(injected)
 		}
+		// Manifest link, theme color and worker registration for apps with
+		// a pwa: section; before versioning so a /static/ icon gets its ?v=.
+		injected = injectPWATags(injected, app)
 	}
 	injected = versionStaticAssets(injected, app)
 	// Guarantee the bm import map exists BEFORE versioning/sdui run (they only
@@ -352,6 +377,21 @@ func injectFeedbackWidget(html []byte, testing bool) []byte {
 	return append(html, chunk...)
 }
 
+// cookieBannerOptOutRe matches `<meta name="bm-cookie-banner" content="off">`
+// (either attribute order, any quoting case).
+var cookieBannerOptOutRe = regexp.MustCompile(`(?is)<meta\s[^>]*name\s*=\s*["']bm-cookie-banner["'][^>]*content\s*=\s*["']off["']|<meta\s[^>]*content\s*=\s*["']off["'][^>]*name\s*=\s*["']bm-cookie-banner["']`)
+
+// pageOptsOutOfCookieBanner reports a page that declares
+// `<meta name="bm-cookie-banner" content="off">`: an embed shown inside
+// another product (a video player unfurled in Slack) where the banner covers
+// the content. The only switch used to be turning analytics off for the whole
+// app, so authors hid the banner with CSS. Without the banner nobody can
+// accept the visitor cookie there; the beacon still counts the view without
+// one.
+func pageOptsOutOfCookieBanner(html []byte) bool {
+	return cookieBannerOptOutRe.Match(html)
+}
+
 // injectCookieBanner inserts the consent banner before </body>. The
 // banner gates the analytics beacon's _bm_vid cookie - without an
 // explicit "Accept" click, the server-side handler at
@@ -360,7 +400,7 @@ func injectFeedbackWidget(html []byte, testing bool) []byte {
 //
 // Idempotency: bails when the bm-cookie id is already in the document.
 func injectCookieBanner(html []byte, app *App) []byte {
-	if bytes.Contains(html, []byte(`id="bm-cookie"`)) {
+	if bytes.Contains(html, []byte(`id="bm-cookie"`)) || pageOptsOutOfCookieBanner(html) {
 		return html
 	}
 	chunk := []byte("\n" + AnalyticsCookieNotice(app) + "\n")
@@ -375,62 +415,56 @@ func injectCookieBanner(html []byte, app *App) []byte {
 	return append(html, chunk...)
 }
 
-// staticAssetRefRe matches `href="/static/foo.css"` and
-// `src="/static/foo.js"` patterns, optionally followed by a `?v=<digits>`
-// query string that the framework manages itself. We accept and discard
-// the existing `?v=N` so subsequent passes re-version with the current
-// mtime - pre-2.7.31 the regex required the closing quote to follow the
-// extension immediately, so any URL the agent had bumped by hand (or that
-// we'd written ourselves on a prior render) became a permanent dead zone
-// and never picked up a fresh mtime. An earlier app build manually
-// walked `?v=2→3→5→6→7` across nine HTML files for this exact reason.
-//
-// Other query strings (`?hash=abc`, `?ver=foo`, `?v=abc`) are author
-// intent and left untouched. Only the numeric `?v=` shape is claimed
-// by the framework.
+// staticAssetRefRe matches `href="/static/foo.css"`, `src="/static/foo.js"`,
+// `poster="/static/intro.jpg"` and `content="/static/og.png"` (an og:image or
+// twitter:image meta tag), optionally followed by a `?v=<alnum>` the
+// framework manages itself. We accept and discard the existing `?v=` so later
+// passes re-version with the current content - pre-2.7.31 the regex required
+// the closing quote to follow the extension immediately, so any URL the agent
+// had bumped by hand (or that we'd written ourselves on a prior render) became
+// a permanent dead zone. Other query strings (`?hash=abc`, `?ver=foo`) are
+// author intent and left untouched.
 //
 // Capture groups (used by versionStaticAssets):
 //
-//	$1 = attribute name (href | src)
+//	$1 = attribute name (href | src | poster | content)
 //	$2 = opening quote
 //	$3 = URL path without query string (e.g. /static/app.js)
-//	$4 = optional framework-owned `?v=<digits>` - discarded
+//	$4 = optional framework-owned `?v=<alnum>` - discarded
 //	$5 = closing quote
 //
-// Supported extensions are the cacheable static-asset shapes the
-// framework serves with `immutable` cache-control. The set extends
-// well beyond CSS/JS because EVERY file the static handler serves
-// with `max-age=31536000, immutable` is unbustable from the client
-// side once cached. Pre-v2.7.63 this regex only covered .css|.js;
-// agents replacing a logo/png/font would push the new bytes, but
-// browsers + Cloudflare would still serve the old cached copy
-// (sometimes for the full year). The fix is to extend the same
-// `?v=<mtime>` rewrite to every cacheable shape.
+// The extensions are the asset shapes pages link to: stylesheets and scripts,
+// images and icons, fonts, audio/video, PDFs and JSON/web manifests. Only a
+// URL carrying the current `?v=` is cached for a year (staticAssetCacheHeaders);
+// an unversioned one revalidates on every use, so versioning here is what lets
+// browsers and CDNs keep a page's assets without asking again.
 //
-// Covered now:
-//
-//	css   js   mjs   cjs           - stylesheets + scripts
-//	png   jpg  jpeg  gif  webp     - raster images
-//	svg   avif ico                 - vector / modern raster / favicons
-//	woff  woff2 ttf  otf  eot      - web fonts
-//
-// Not covered (deliberate): URLs in CSS `background-image: url(...)`
-// or `<source srcset="...">`. Those don't appear in href/src so the
-// regex doesn't see them. Agents who hit cache-staleness on CSS
-// `url()` references should bump the *.css file itself - its
-// versioned link picks up the same `?v=<mtime>` and triggers a CF
-// revalidate; the inner url() is fetched as part of that.
+// URLs inside a CSS file (`url(...)`, `@import`) are not rewritten: they
+// revalidate, and a changed stylesheet gets a new ?v= of its own.
+// `srcset`/`imagesrcset` candidate lists are versioned by staticSrcsetRe.
 var staticAssetRefRe = regexp.MustCompile(
-	`(?i)(href|src)=("|')(/static/[^"'?]+?\.(?:css|js|mjs|cjs|png|jpg|jpeg|gif|webp|svg|avif|ico|woff2|woff|ttf|otf|eot))(\?v=[0-9a-zA-Z]+)?("|')`)
+	`(?i)(href|src|poster|content)=("|')(/static/[^"'?#]+?\.(?:` + staticVersionedExts + `))(\?v=[0-9a-zA-Z]+)?("|')`)
 
-// versionStaticAssets rewrites `href="/static/foo.css"` and
-// `src="/static/foo.js"` references in served HTML to include a
-// `?v=<content-hash>` query string. This invalidates Cloudflare's immutable
-// cache (which the static handler sets to max-age=1y) the moment a file's
-// CONTENT changes - no agent has to remember to bump a version in their HTML,
-// and no `?v=N`-thrash debugging loops. A content hash (not the bare mtime)
-// means a `git revert` that restores older bytes serves the matching cached
-// version instead of a stale one keyed on a reused mtime.
+// staticVersionedExts are the /static/ file types served HTML references get
+// a ?v= for.
+const staticVersionedExts = `css|js|mjs|cjs|png|jpg|jpeg|gif|webp|svg|avif|ico|woff2|woff|ttf|otf|eot|mp4|webm|ogg|mp3|wav|m4a|pdf|json|webmanifest`
+
+// staticSrcsetRe matches a srcset/imagesrcset attribute; each /static/
+// candidate in its list is versioned like an href.
+var staticSrcsetRe = regexp.MustCompile(`(?i)(srcset|imagesrcset)=("|')([^"']*)("|')`)
+
+// staticSrcsetURLRe is one srcset candidate URL that versionStaticAssets
+// rewrites: a /static/ path of a versioned type, with at most a framework ?v=.
+var staticSrcsetURLRe = regexp.MustCompile(`(?i)^(/static/[^"'?#,\s]+?\.(?:` + staticVersionedExts + `))(\?v=[0-9a-zA-Z]+)?$`)
+
+// versionStaticAssets rewrites /static/ references in served HTML (href,
+// src, poster, an og:image `content`, and srcset candidates) to carry
+// `?v=<content-hash>`. The static handler caches exactly that URL for a year
+// and revalidates every other spelling, so a page picks up a changed file the
+// moment its CONTENT changes - no agent has to remember to bump a version in
+// their HTML. A content hash (not the bare mtime) means a `git revert` that
+// restores older bytes serves the matching cached version instead of a stale
+// one keyed on a reused mtime.
 //
 // Idempotent + framework-owned: a prior `?v=<hash>` we emitted is replaced
 // with the current one (the regex matches `?v=<alnum>`); a non-`v` query
@@ -448,25 +482,33 @@ func versionStaticAssets(html []byte, app *App) []byte {
 	// per render (and at most once per staticTreeVersionTTL across renders).
 	var treeVer string
 	var treeOK, treeDone bool
-	return staticAssetRefRe.ReplaceAllFunc(html, func(match []byte) []byte {
-		groups := staticAssetRefRe.FindSubmatch(match)
-		if len(groups) < 6 {
-			return match
-		}
-		// groups[4] is the optional existing `?v=<digits>` - discarded.
-		attr, quote, urlPath, closeQuote := groups[1], groups[2], groups[3], groups[5]
-		rel := strings.TrimPrefix(string(urlPath), "/static/")
-		var ver string
-		var ok bool
+	versionOf := func(urlPath string) (string, bool) {
+		rel := strings.TrimPrefix(urlPath, "/static/")
 		if strings.HasSuffix(rel, ".js") {
 			if !treeDone {
 				treeVer, treeOK = cachedStaticTreeVersion(staticRoot)
 				treeDone = true
 			}
-			ver, ok = treeVer, treeOK
-		} else {
-			ver, ok = assetContentVersion(staticRoot, rel)
+			return treeVer, treeOK
 		}
+		return assetContentVersion(staticRoot, rel)
+	}
+	if manifest, sources := capturedStaticSnapshot(app); manifest != nil {
+		// A reviewed app serves its captured generation, so its pages name
+		// that generation's bytes: a version taken from the directory would
+		// name bytes the static handler is not serving.
+		versionOf = func(urlPath string) (string, bool) {
+			return capturedStaticVersion(manifest, sources, strings.TrimPrefix(urlPath, "/static/"))
+		}
+	}
+	html = staticAssetRefRe.ReplaceAllFunc(html, func(match []byte) []byte {
+		groups := staticAssetRefRe.FindSubmatch(match)
+		if len(groups) < 6 {
+			return match
+		}
+		// groups[4] is the optional existing `?v=<alnum>` - discarded.
+		attr, quote, urlPath, closeQuote := groups[1], groups[2], groups[3], groups[5]
+		ver, ok := versionOf(string(urlPath))
 		if !ok {
 			return match
 		}
@@ -478,6 +520,42 @@ func versionStaticAssets(html []byte, app *App) []byte {
 		out = append(out, '?', 'v', '=')
 		out = append(out, ver...)
 		out = append(out, closeQuote...)
+		return out
+	})
+	return staticSrcsetRe.ReplaceAllFunc(html, func(match []byte) []byte {
+		groups := staticSrcsetRe.FindSubmatch(match)
+		if len(groups) < 5 || !bytes.Equal(groups[2], groups[4]) {
+			return match
+		}
+		candidates := strings.Split(string(groups[3]), ",")
+		changed := false
+		for i, candidate := range candidates {
+			fields := strings.Fields(candidate)
+			if len(fields) == 0 {
+				continue
+			}
+			m := staticSrcsetURLRe.FindStringSubmatch(fields[0])
+			if m == nil {
+				continue
+			}
+			ver, ok := versionOf(m[1])
+			if !ok {
+				continue
+			}
+			lead := candidate[:strings.Index(candidate, fields[0])]
+			rest := candidate[strings.Index(candidate, fields[0])+len(fields[0]):]
+			candidates[i] = lead + m[1] + "?v=" + ver + rest
+			changed = true
+		}
+		if !changed {
+			return match
+		}
+		out := make([]byte, 0, len(match)+32)
+		out = append(out, groups[1]...)
+		out = append(out, '=')
+		out = append(out, groups[2]...)
+		out = append(out, strings.Join(candidates, ",")...)
+		out = append(out, groups[4]...)
 		return out
 	})
 }
@@ -624,23 +702,111 @@ func assetContentVersion(staticRoot, rel string) (string, bool) {
 	if strings.HasSuffix(rel, ".js") {
 		return staticSourceTreeVersion(staticRoot)
 	}
-	full := filepath.Join(staticRoot, rel)
-	st, err := os.Stat(full)
-	if err != nil {
+	// Read through the same contained handle the static handler serves
+	// from: a link out of static/ is not served, so it gets no version
+	// (and its target's hash never reaches a page).
+	file, ok := openServableFile(staticRoot, filepath.Join(staticRoot, rel))
+	if !ok {
 		return "", false
 	}
-	probe := strconv.FormatInt(st.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(st.Size(), 10)
-	if v, ok := cachedAssetVer(rel, probe); ok {
+	defer file.Close()
+	return staticFileContentVersion(staticRoot, rel, file)
+}
+
+// staticFileContentVersion is the ?v= of one opened static file: the first
+// 12 hex digits of its SHA-256, memoized per file by (mtime, size). Pages and
+// the static handler share it, so the handler can tell whether a request's
+// ?v= names the bytes it is about to send (staticAssetCacheHeaders).
+func staticFileContentVersion(staticRoot, rel string, file *servableFile) (string, bool) {
+	stable := filepath.Join(staticRoot, filepath.FromSlash(rel))
+	probe := strconv.FormatInt(file.info.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(file.info.Size(), 10)
+	if v, ok := cachedAssetVer(stable, probe); ok {
 		return v, true
 	}
-	data, err := os.ReadFile(full)
-	if err != nil {
+	h := sha256.New()
+	if file.info.Size() > staticFileContentHashMax {
+		// A large file (a video) counts by size and mtime, so a page render
+		// or a range request never reads it whole; any write changes both
+		// or the mtime.
+		h.Write([]byte("size-mtime|" + probe))
+	} else if _, err := io.Copy(h, io.NewSectionReader(file.File, 0, file.info.Size())); err != nil {
 		return "", false
 	}
-	sum := sha256.Sum256(data)
-	v := hex.EncodeToString(sum[:])[:12]
-	storeAssetVer(rel, probe, v)
+	v := hex.EncodeToString(h.Sum(nil))[:12]
+	storeAssetVer(stable, probe, v)
 	return v, true
+}
+
+// staticFileContentHashMax is the largest static/ file versioned by its
+// content; larger ones are versioned by size and mtime.
+const staticFileContentHashMax = 16 << 20
+
+// staticAssetVersionFor is the version the framework writes for /static/<rel>
+// into pages (versionStaticAssets): the file's content hash, or for a .js
+// file the hash of the whole static/ tree it may bundle. file is the handle
+// being served; nil means open it.
+func staticAssetVersionFor(staticRoot, rel string, file *servableFile) (string, bool) {
+	if strings.HasSuffix(rel, ".js") {
+		return staticSourceTreeVersion(staticRoot)
+	}
+	if file == nil {
+		return assetContentVersion(staticRoot, rel)
+	}
+	return staticFileContentVersion(staticRoot, rel, file)
+}
+
+// staticAssetCacheHeaders returns the Cache-Control and ETag for a static/
+// file. Only a URL whose query is exactly the framework's current version of
+// the bytes being served (`?v=<hash>`, what served HTML carries) is cached
+// for a year. Anything else - no query, a stale or hand-written `?v=`,
+// another query - revalidates against the ETag (a 304 while unchanged), so a
+// direct link, a CSS url() or an <img> in a .tsx view shows a replaced file on
+// the next use. A one-year response is what a CDN that honours origin headers
+// would otherwise keep serving after a push or promote.
+func staticAssetCacheHeaders(r *http.Request, staticRoot, rel string, file *servableFile) (cacheControl, etag string) {
+	cacheControl = "public, no-cache"
+	if own, ok := staticFileContentVersion(staticRoot, rel, file); ok {
+		etag = `"` + own + `"`
+	}
+	if want, ok := strings.CutPrefix(r.URL.RawQuery, "v="); ok && want != "" {
+		// A .js reference carries the version of the whole tree it may
+		// bundle; anything else its own content hash. The tree version is
+		// first compared with the one served pages emit (cachedStaticTreeVersion):
+		// only a request naming that version pays for the uncached walk that
+		// confirms it, so a stale or invented ?v= on an anonymous request no
+		// longer walks all of static/ every time.
+		if strings.HasSuffix(rel, ".js") {
+			if current, ok := cachedStaticTreeVersion(staticRoot); !ok || current != want {
+				return cacheControl, etag
+			}
+		}
+		if ver, ok := staticAssetVersionFor(staticRoot, rel, file); ok && want == ver {
+			cacheControl = "public, max-age=31536000, immutable"
+		}
+	}
+	return cacheControl, etag
+}
+
+// versionedStaticURL adds the framework's ?v= to an app-relative /static/
+// URL that has no query and names an existing file, for references the
+// framework writes outside served HTML (the PWA manifest's icons). Any other
+// value is returned unchanged.
+func versionedStaticURL(app *App, u string) string {
+	if app == nil || app.Dir == "" || !strings.HasPrefix(u, "/static/") || strings.ContainsAny(u, "?#") {
+		return u
+	}
+	rel := strings.TrimPrefix(u, "/static/")
+	var ver string
+	var ok bool
+	if manifest, sources := capturedStaticSnapshot(app); manifest != nil {
+		ver, ok = capturedStaticVersion(manifest, sources, rel)
+	} else {
+		ver, ok = staticAssetVersionFor(filepath.Join(app.Dir, "static"), rel, nil)
+	}
+	if !ok {
+		return u
+	}
+	return u + "?v=" + ver
 }
 
 // staticSourceTreeVersion is the ?v= of every /static/*.js reference: one
@@ -809,13 +975,17 @@ func injectCSRFMeta(html []byte) []byte {
 		return html
 	}
 	token := generateCSRFToken()
-	meta := []byte("<meta name=\"csrf-token\" content=\"" + token + "\">\n")
+	return insertInHead(html, []byte("<meta name=\"csrf-token\" content=\""+token+"\">\n"))
+}
 
+// insertInHead inserts chunk at the end of the document's head: before
+// `</head>`, else after the `<head ...>` tag, else at the top.
+func insertInHead(html, chunk []byte) []byte {
 	// Try </head> (case-insensitive).
 	if idx := indexFoldBytes(html, []byte("</head>")); idx >= 0 {
-		out := make([]byte, 0, len(html)+len(meta))
+		out := make([]byte, 0, len(html)+len(chunk))
 		out = append(out, html[:idx]...)
-		out = append(out, meta...)
+		out = append(out, chunk...)
 		out = append(out, html[idx:]...)
 		return out
 	}
@@ -826,18 +996,18 @@ func injectCSRFMeta(html []byte) []byte {
 		closeIdx := bytes.IndexByte(html[idx:], '>')
 		if closeIdx >= 0 {
 			insertAt := idx + closeIdx + 1
-			out := make([]byte, 0, len(html)+len(meta))
+			out := make([]byte, 0, len(html)+len(chunk)+1)
 			out = append(out, html[:insertAt]...)
 			out = append(out, '\n')
-			out = append(out, meta...)
+			out = append(out, chunk...)
 			out = append(out, html[insertAt:]...)
 			return out
 		}
 	}
 
 	// No head section at all - prepend.
-	out := make([]byte, 0, len(html)+len(meta))
-	out = append(out, meta...)
+	out := make([]byte, 0, len(html)+len(chunk))
+	out = append(out, chunk...)
 	out = append(out, html...)
 	return out
 }
@@ -858,7 +1028,8 @@ func injectCSRFMeta(html []byte) []byte {
 // overwrote app.js they lost it. This injector closes that gap.
 //
 // Idempotent: forms that already declare `name="_csrf"` are skipped.
-// GET forms are skipped. The token re-used per page-render so the
+// Forms that don't send a body (GET, no method, hx-get) are skipped
+// (formSubmitsBody). The token re-used per page-render so the
 // meta tag and form field carry the same value.
 func injectCSRFFormFields(html []byte, token string) []byte {
 	if len(html) == 0 {
@@ -902,10 +1073,10 @@ func injectCSRFFormFields(html []byte, token string) []byte {
 		// Copy everything up to and including the opening tag.
 		out = append(out, html[cursor:tagEnd+1]...)
 
-		// Only inject when this is a POST form and doesn't already have _csrf.
-		isPost := bytes.Contains(bytes.ToLower(openingTag), []byte(`method="post"`)) ||
-			bytes.Contains(bytes.ToLower(openingTag), []byte(`method='post'`)) ||
-			bytes.Contains(bytes.ToLower(openingTag), []byte(`method=post`))
+		// Only inject when the form sends a body (POST or HTMX
+		// post/put/patch/delete, the rule InjectCSRF uses) and doesn't
+		// already have _csrf. A GET form never gets the token.
+		isPost := formSubmitsBody(string(openingTag[len("<form") : len(openingTag)-1]))
 		alreadyHas := indexFoldBytes(html[tagEnd+1:bodyAbsEnd], []byte(`name="_csrf"`)) >= 0 ||
 			indexFoldBytes(html[tagEnd+1:bodyAbsEnd], []byte(`name='_csrf'`)) >= 0
 		if isPost && !alreadyHas {

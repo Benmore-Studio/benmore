@@ -17,8 +17,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPPolicyLifecycleReloadKeepsSynthesizedHooksAndOldGeneration(t *testing.T) {
@@ -228,7 +226,7 @@ func installCanonicalSQLBarrier(t *testing.T, f appMCPCanonicalUpdateFixture) (<
 		t.Fatal(err)
 	}
 	err = conn.Raw(func(raw any) error {
-		sqliteConn := raw.(*sqlite3.SQLiteConn)
+		sqliteConn := mustSQLiteConn(raw)
 		sqliteConn.RegisterCommitHook(func() int {
 			startedOnce.Do(func() { close(started) })
 			<-release

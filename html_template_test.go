@@ -117,6 +117,9 @@ func TestNotificationLinkDropsScriptSchemes(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	EnsureNotificationsTable(app.DB)
+	// A notification is stored only for an account that exists.
+	mustExec(t, app.DB, "CREATE TABLE IF NOT EXISTS _benmore_users (id INTEGER PRIMARY KEY, email TEXT)")
+	mustExec(t, app.DB, "INSERT OR IGNORE INTO _benmore_users (id, email) VALUES (7, 'owner@example.com')")
 	hook := &NotifyHook{UserID: "{{owner}}", Title: "New {{name}}", Body: "b", Link: "{{url}}"}
 	for url, want := range map[string]string{
 		"javascript:alert(document.cookie)": "",

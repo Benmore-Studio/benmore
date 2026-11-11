@@ -11,8 +11,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 const updateConstraintTable = "private_catalog"
@@ -126,7 +124,7 @@ func TestUpdateInternalDatabaseFaultRemainsServerError(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = conn.Raw(func(raw any) error {
-				return raw.(*sqlite3.SQLiteConn).RegisterFunc("broken_catalog_storage", func() (int, error) { return 0, errors.New("UNIQUE constraint failed: private_internal_failure") }, false)
+				return mustSQLiteConn(raw).RegisterFunc("broken_catalog_storage", func() (int, error) { return 0, errors.New("UNIQUE constraint failed: private_internal_failure") }, false)
 			})
 			if closeErr := conn.Close(); err != nil || closeErr != nil {
 				t.Fatalf("register fault: %v close:%v", err, closeErr)

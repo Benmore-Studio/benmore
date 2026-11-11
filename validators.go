@@ -65,8 +65,10 @@ func parseValidatorsYAML(data []byte) *ValidatorConfig {
 }
 
 // ValidateCrossField checks all cross-field rules for a table against the given data.
-// Returns nil if all rules pass, or the first error message.
-func ValidateCrossField(config *ValidatorConfig, table string, data map[string]any) error {
+// Returns nil if all rules pass, or the first error message. columns are the
+// table's columns: an operand naming one that data leaves out (an omitted
+// nullable column with no default) is NULL, like one data holds as nil.
+func ValidateCrossField(config *ValidatorConfig, table string, data map[string]any, columns []Column) error {
 	if config == nil {
 		return nil
 	}
@@ -74,9 +76,16 @@ func ValidateCrossField(config *ValidatorConfig, table string, data map[string]a
 	if !ok {
 		return nil
 	}
+	var names map[string]bool
+	if len(columns) > 0 {
+		names = make(map[string]bool, len(columns))
+		for _, c := range columns {
+			names[c.Name] = true
+		}
+	}
 
 	for _, rule := range rules {
-		if !evaluateCrossFieldExpr(rule.Rule, data) {
+		if !evaluateCrossFieldExpr(rule.Rule, data, names) {
 			errMsg := rule.Error
 			if errMsg == "" {
 				errMsg = "Validation failed: " + rule.Rule
@@ -91,7 +100,13 @@ func ValidateCrossField(config *ValidatorConfig, table string, data map[string]a
 // "end_date > start_date" resolves both end_date and start_date from data.
 // "value >= 0" resolves value from data and treats 0 as a literal.
 // The write gate mirrors how it finds the comparison (splitCrossFieldRule).
-func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
+//
+// A column operand that is NULL (nil in data, or a column of the table data
+// leaves out) makes the rule pass, as a SQL CHECK constraint does: the rule
+// has nothing to compare. It used to be compared as its own column NAME, so
+// `end_date >= start_date` passed a row with only start_date and refused one
+// with only end_date. columns may be nil; only data keys are columns then.
+func evaluateCrossFieldExpr(expr string, data map[string]any, columns map[string]bool) bool {
 	for _, op := range []string{"!=", ">=", "<=", "=", ">", "<"} {
 		idx := strings.Index(expr, " "+op+" ")
 		if idx < 0 {
@@ -101,6 +116,9 @@ func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
 		right := strings.TrimSpace(expr[idx+len(op)+2:])
 
 		// Resolve both sides - try as field name first, fall back to literal
+		if crossFieldOperandNull(left, data, columns) || crossFieldOperandNull(right, data, columns) {
+			return true
+		}
 		leftVal := resolveFieldOrLiteral(left, data)
 		rightVal := resolveFieldOrLiteral(right, data)
 
@@ -127,9 +145,41 @@ func evaluateCrossFieldExpr(expr string, data map[string]any) bool {
 		}
 	}
 
-	// No operator found - treat as truthy check
+	// No operator found - treat as truthy check. A NULL column passes, as
+	// above (it read as its own name before, which is truthy too).
+	if crossFieldOperandNull(expr, data, columns) {
+		return true
+	}
 	val := resolveFieldOrLiteral(expr, data)
 	return val != "" && val != "0" && val != "<nil>"
+}
+
+// appTableColumns returns the loaded columns of one of the app's tables, or
+// nil when the app has no such table.
+func appTableColumns(app *App, table string) []Column {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	for _, t := range app.Tables {
+		if t.Name == table {
+			return t.Columns
+		}
+	}
+	return nil
+}
+
+// crossFieldOperandNull reports whether a rule operand is a column with no
+// value: present in data as nil, or a column of the table that data leaves
+// out. A quoted string, a number or a bare word that names no column is a
+// literal (the write gate accepts `status = active`), never NULL.
+func crossFieldOperandNull(s string, data map[string]any, columns map[string]bool) bool {
+	s = strings.TrimSpace(s)
+	if val, ok := data[s]; ok {
+		return val == nil
+	}
+	return columns[s] && crossFieldIdentRe.MatchString(s)
 }
 
 // crossFieldDateLayouts are the ISO-8601 date and date-time shapes an

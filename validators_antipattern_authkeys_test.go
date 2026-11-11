@@ -13,7 +13,7 @@ func TestValidateAppYAMLRecognizesOAuthOnlyAndAllowEmails(t *testing.T) {
 auth:
   identifier: email
   oauth_only: true
-  allow_emails: "richard@benmore.tech"
+  allow_emails: "dana@example.org"
   redirect: "/newsroom"
 `
 	if msg := validateAppYAML(good); msg != "" {

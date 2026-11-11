@@ -1,0 +1,181 @@
+# A refused write saves nothing: no row, no audit row, no queued job, no
+# effect. Accepted writes leave exactly one audit row and their hook jobs.
+create_refused_by_before_hook:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "refuse"}
+      expect: {status: 422, contains: "refused by hook"}
+    - sql: "SELECT id FROM docs WHERE title = 'refuse'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND new_values LIKE '%refuse%'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%refuse%'"
+      expect: {rows: 0}
+
+create_accepted_leaves_audit_and_hook_job:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "ok-create"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'insert' AND new_values LIKE '%ok-create%'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%ok-create%'"
+      expect: {rows: 1}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'insert' AND ref = 'ok-create'"
+      expect: {rows: 1}
+
+update_refused_by_before_hook:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "u-before"}
+      save: {doc_id: "id"}
+      expect: {status: 200}
+    - api: "PATCH /api/docs/{{doc_id}}"
+      json: {title: "refuse"}
+      expect: {status: 422, contains: "refused by hook"}
+    - sql: "SELECT id FROM docs WHERE id = {{doc_id}} AND title = 'u-before'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'update' AND row_id = '{{doc_id}}'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%refuse%'"
+      expect: {rows: 0}
+
+update_accepted_leaves_audit_and_effect:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "u-old"}
+      save: {doc_id: "id"}
+      expect: {status: 200}
+    - api: "PATCH /api/docs/{{doc_id}}"
+      json: {title: "u-new"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'update' AND row_id = '{{doc_id}}' AND old_values LIKE '%u-old%' AND new_values LIKE '%u-new%'"
+      expect: {rows: 1}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'update' AND ref = 'u-new'"
+      expect: {rows: 1}
+
+batch_create_is_all_or_nothing:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs/batch"
+      json_array:
+        - {title: "b-ok"}
+        - {title: "refuse"}
+      expect: {status: 422, contains: "refused by hook"}
+    - sql: "SELECT id FROM docs WHERE title IN ('b-ok', 'refuse')"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND (new_values LIKE '%b-ok%' OR new_values LIKE '%refuse%')"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%b-ok%' OR payload LIKE '%refuse%'"
+      expect: {rows: 0}
+
+batch_create_accepted_one_job_per_row:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs/batch"
+      json_array:
+        - {title: "b-one"}
+        - {title: "b-two"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'insert' AND (new_values LIKE '%b-one%' OR new_values LIKE '%b-two%')"
+      expect: {rows: 2}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'insert' AND ref IN ('b-one', 'b-two')"
+      expect: {rows: 2}
+
+transaction_is_all_or_nothing:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {table: "docs", action: "insert", data: {title: "t-ok"}}
+          - {table: "docs", action: "insert", data: {title: "refuse"}}
+      expect: {status: 422, contains: "refused by hook"}
+    - sql: "SELECT id FROM docs WHERE title IN ('t-ok', 'refuse')"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND (new_values LIKE '%t-ok%' OR new_values LIKE '%refuse%')"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%t-ok%' OR payload LIKE '%refuse%'"
+      expect: {rows: 0}
+
+transaction_accepted_leaves_effects:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {table: "docs", action: "insert", data: {title: "t-one"}}
+      expect: {status: 200}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'insert' AND new_values LIKE '%t-one%'"
+      expect: {rows: 1}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'insert' AND ref = 't-one'"
+      expect: {rows: 1}
+
+ingest_does_not_fire_hooks:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs/ingest"
+      ndjson:
+        - {title: "i-one"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM docs WHERE title = 'i-one'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'insert' AND new_values LIKE '%i-one%'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_jobs WHERE payload LIKE '%i-one%'"
+      expect: {rows: 0}
+
+delete_refused_by_before_hook:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "keep"}
+      save: {doc_id: "id"}
+      expect: {status: 200}
+    - api: "DELETE /api/docs/{{doc_id}}"
+      json: {}
+      expect: {status: 422, contains: "refused by hook"}
+    - sql: "SELECT id FROM docs WHERE id = {{doc_id}}"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'delete' AND row_id = '{{doc_id}}'"
+      expect: {rows: 0}
+
+delete_accepted_leaves_audit_and_effect:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "d-gone"}
+      save: {doc_id: "id"}
+      expect: {status: 200}
+    - api: "DELETE /api/docs/{{doc_id}}"
+      json: {}
+      expect: {status: 200}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'delete' AND row_id = '{{doc_id}}'"
+      expect: {rows: 1}
+    - flush: "jobs"
+    - sql: "SELECT id FROM effects WHERE kind = 'delete' AND ref = 'd-gone'"
+      expect: {rows: 1}
+
+foreign_key_to_unreadable_parent_refused:
+  users:
+    - "alice@test.com"
+    - "bob@test.com"
+  as_user: "bob@test.com"
+  setup:
+    - sql: "INSERT INTO docs (id, title, user_id) VALUES (9001, 'alice-doc', 99999)"
+  steps:
+    - api: "POST /api/notes"
+      json: {body: "n-fk", doc_id: 9001}
+      expect: {status: 422}
+    - sql: "SELECT id FROM notes WHERE body = 'n-fk'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'notes'"
+      expect: {rows: 0}

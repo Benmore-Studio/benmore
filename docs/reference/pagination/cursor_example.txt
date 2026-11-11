@@ -1,0 +1,1 @@
+GET /api/notes?cursor=0&limit=20&where[status]=open

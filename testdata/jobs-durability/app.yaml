@@ -1,0 +1,5 @@
+site_name: "Jobs durability"
+auth:
+  identifier: email
+frontend:
+  stack: html

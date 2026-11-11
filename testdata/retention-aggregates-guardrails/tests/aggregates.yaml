@@ -1,0 +1,40 @@
+# app.yaml in this fixture declares one aggregate that reads and one whose SQL
+# is an INSERT ... RETURNING. An aggregate is read-only: the second is refused
+# at every refresh and writes nothing. Run: benmore test <dir> --app
+
+aggregate_that_would_write_is_refused_and_writes_nothing:
+  as_user: "admin@guardrails.test"
+  as_role: "admin"
+  steps:
+    # The app has started, which refreshes every aggregate once.
+    - sql: "SELECT id FROM notes WHERE title = 'written by an aggregate'"
+      expect:
+        rows: 0
+    - api: "POST /api/_aggregates/refresh"
+      expect:
+        status: 200
+        contains:
+          - '"failed":["writes_a_row"]'
+          - '"refreshed":["event_count"]'
+    - api: "POST /api/_aggregates/refresh"
+      expect:
+        status: 200
+        contains: '"failed":["writes_a_row"]'
+    - sql: "SELECT id FROM notes WHERE title = 'written by an aggregate'"
+      expect:
+        rows: 0
+    # Listed as failing, with the reason, and never given a value.
+    - get: "/api/_aggregates"
+      expect:
+        status: 200
+        contains:
+          - '"name":"writes_a_row"'
+          - '"stale":true'
+          - "an aggregate is one read-only SELECT"
+          - '"name":"event_count"'
+    - sql: "SELECT name FROM _benmore_aggregates WHERE name = 'writes_a_row'"
+      expect:
+        rows: 0
+    - sql: "SELECT name FROM _benmore_aggregates WHERE name = 'event_count' AND value IS NOT NULL"
+      expect:
+        rows: 1

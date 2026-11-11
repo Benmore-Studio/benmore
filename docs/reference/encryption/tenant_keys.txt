@@ -1,0 +1,1 @@
+Query decryption, encrypted searches, OAuth storage, webhook signing and audit encryption select only the owning database key. Ciphertext from another app is masked; loading another app never authorizes its decryption.

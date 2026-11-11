@@ -1,0 +1,3 @@
+BENMORE_TOKEN=${BENMORE_TOKEN:?set CI secret} benmore deploy .
+# Or bootstrap a fresh runner without a browser:
+BENMORE_TOKEN=$BENMORE_TOKEN benmore bootstrap --quiet

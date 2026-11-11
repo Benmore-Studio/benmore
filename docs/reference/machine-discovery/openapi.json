@@ -1,0 +1,5 @@
+[
+  "GET /api/_openapi (canonical)",
+  "GET /openapi.json (alias; identical auth, body, and cache headers)",
+  "GET /api/openapi.json (alias; identical auth, body, and cache headers)"
+]

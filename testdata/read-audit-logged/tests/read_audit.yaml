@@ -1,0 +1,46 @@
+# Outside compliance: hipaa a failed read-audit write keeps the old behavior
+# (the read answers) but is logged instead of discarded; reads are still
+# recorded with the client address.
+audited_read_records_ip:
+  as_user: "reader@test.com"
+  steps:
+    - get: "/api/patients"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'patients' AND query_type = 'list' AND user_email = 'reader@test.com' AND client_ip <> '' LIMIT 1"
+      expect:
+        rows: 1
+
+failed_audit_write_still_answers:
+  as_user: "reader@test.com"
+  steps:
+    - sql: "CREATE TRIGGER audit_down BEFORE INSERT ON _benmore_read_audit BEGIN SELECT RAISE(ABORT, 'audit down'); END"
+    - get: "/api/patients"
+      expect:
+        status: 200
+    - sql: "DROP TRIGGER audit_down"
+
+# Outside hipaa anonymous reads are not recorded (as before), even of a
+# table read_audit lists; a signed-in read of it is.
+anonymous_read_is_not_audited:
+  anon: true
+  setup:
+    - sql: "INSERT INTO notices (title) VALUES ('open hours')"
+  steps:
+    - get: "/api/notices"
+      expect:
+        status: 200
+    # Absence asserted as one row (NOT EXISTS).
+    - sql: "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM _benmore_read_audit WHERE table_name = 'notices' AND user_id = 0)"
+      expect:
+        rows: 1
+
+signed_in_read_of_listed_public_table_is_audited:
+  as_user: "reader2@test.com"
+  steps:
+    - get: "/api/notices"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_read_audit WHERE table_name = 'notices' AND user_email = 'reader2@test.com'"
+      expect:
+        rows: 1

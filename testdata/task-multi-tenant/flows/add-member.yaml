@@ -1,0 +1,38 @@
+# flows/add-member.yaml - an organisation admin adds an existing account to
+# their organisation. Generic CRUD cannot write another user's membership.
+on:
+  request:
+    method: POST
+    path: /api/org/members
+    auth: required
+    transaction: true
+    inputs:
+      email: { type: email, required: true }
+      role:  { type: enum, values: [member, manager], default: member }
+jobs:
+  add:
+    steps:
+      - id: me
+        run: sql
+        with:
+          query: "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'org_admin'"
+          params: { org: "${{ user.group_id }}" }
+      - if: ${{ !steps.me.outputs.rows }}
+        run: respond
+        with: { status: 403, json: { error: not_org_admin } }
+      - id: account
+        run: sql
+        with: { query: "SELECT id FROM _benmore_users WHERE email = :email" }
+      - if: ${{ !steps.account.outputs.rows }}
+        run: respond
+        with: { status: 404, json: { error: no_such_account } }
+      - id: added
+        run: sql
+        with:
+          query: "INSERT INTO org_members (org_id, user_id, member_role) VALUES (:org, :member, :role) ON CONFLICT (org_id, user_id) DO NOTHING RETURNING id"
+          params: { org: "${{ user.group_id }}", member: "${{ steps.account.outputs.id }}" }
+      - if: ${{ !steps.added.outputs.rows }}
+        run: respond
+        with: { status: 409, json: { error: already_a_member } }
+      - run: respond
+        with: { status: 201, json: { id: "${{ steps.added.outputs.id }}", role: "${{ params.role }}" } }

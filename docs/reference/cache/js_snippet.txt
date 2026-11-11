@@ -1,0 +1,16 @@
+import bm from 'bm';
+
+// Per-tab - survives navigation, dies on tab close.
+const shell = bm.cache.namespaced('shell', staticAssetVersion);
+const cached = shell.get();           // the cached string, or undefined on a miss
+if (cached) listEl.innerHTML = cached;   // instant pre-paint
+
+// Then fetch the real data + write back.
+const html = renderList(await bm.table('posts').list({ limit: 50 }));
+listEl.innerHTML = html;
+shell.set(html);
+
+shell.purgeOld();                     // drops all versions of 'shell' except current
+
+// Cross-tab cache - same shape, localStorage backing.
+const userPrefs = bm.cache.persistent('prefs', 'v3');

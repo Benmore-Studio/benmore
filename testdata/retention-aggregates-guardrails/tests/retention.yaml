@@ -1,0 +1,107 @@
+# retention.yaml in this fixture names framework tables, a policy with an
+# unknown key and one on a column its table lacks, next to one good policy.
+# `flush: retention` runs one sweep. Run: benmore test <dir> --app
+
+# The policy on the app's own table deletes that table's expired rows and
+# nothing else.
+app_table_policy_deletes_only_its_expired_rows:
+  as_user: "owner@guardrails.test"
+  setup:
+    - sql: "DELETE FROM events"
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('expired', {{user_id}}, datetime('now', '-31 days'))"
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('recent', {{user_id}}, datetime('now', '-29 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT id FROM events WHERE title = 'expired'"
+      expect:
+        rows: 0
+    - sql: "SELECT id FROM events WHERE title = 'recent'"
+      expect:
+        rows: 1
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'ttl_delete' AND table_name = 'events' AND user_email = 'system:retention' LIMIT 1"
+      expect:
+        rows: 1
+
+# events is versioned: every earlier state of a row is kept in events_history,
+# and deleting a row records its final state there. The sweep removes the
+# stored versions of the rows it deletes; a row that stays keeps its versions.
+swept_rows_leave_no_copy_in_the_version_history:
+  as_user: "historian@guardrails.test"
+  setup:
+    - sql: "DELETE FROM events"
+    - sql: "DELETE FROM events_history"
+    - sql: "INSERT INTO events (id, title, user_id, created_at) VALUES (9101, 'expired v1', {{user_id}}, datetime('now', '-31 days'))"
+    - sql: "INSERT INTO events (id, title, user_id, created_at) VALUES (9102, 'recent v1', {{user_id}}, datetime('now', '-1 days'))"
+    - sql: "UPDATE events SET title = 'expired v2' WHERE id = 9101"
+    - sql: "UPDATE events SET title = 'recent v2' WHERE id = 9102"
+  steps:
+    - sql: "SELECT id FROM events_history WHERE id = 9101 AND title = 'expired v1'"
+      expect:
+        rows: 1
+    - flush: "retention"
+    - sql: "SELECT id FROM events WHERE id = 9101"
+      expect:
+        rows: 0
+    - sql: "SELECT id FROM events_history WHERE id = 9101"
+      expect:
+        rows: 0
+    - sql: "SELECT id FROM events WHERE id = 9102 AND title = 'recent v2'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM events_history WHERE id = 9102 AND title = 'recent v1'"
+      expect:
+        rows: 1
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'ttl_delete' AND table_name = 'events' AND new_values LIKE '%\"history_rows_deleted\":1%' LIMIT 1"
+      expect:
+        rows: 1
+
+# Whatever retention.yaml says, a sweep deletes no account, no session and no
+# audit row.
+framework_tables_are_never_swept:
+  as_user: "keeper@guardrails.test"
+  setup:
+    - sql: "INSERT OR IGNORE INTO _benmore_users (username, email, password_hash, created_at) VALUES ('aged-account', 'aged-account@guardrails.test', 'x', datetime('now', '-400 days'))"
+    - sql: "INSERT OR IGNORE INTO _benmore_sessions (id, user_id, email, created_at, expires_at) VALUES ('sha256:guardrails-aged-session', {{user_id}}, 'keeper@guardrails.test', datetime('now', '-3 days'), datetime('now', '+30 days'))"
+    - sql: "INSERT INTO _benmore_audit_log (action, table_name, row_id, user_email, created_at) VALUES ('update', 'events', '1', 'aged-audit@guardrails.test', datetime('now', '-400 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT id FROM _benmore_users WHERE email = 'aged-account@guardrails.test'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM _benmore_sessions WHERE id = 'sha256:guardrails-aged-session'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM _benmore_audit_log WHERE user_email = 'aged-audit@guardrails.test'"
+      expect:
+        rows: 1
+    # No sweep recorded a deletion from a framework table.
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action IN ('ttl_delete', 'ttl_purge') AND table_name LIKE '\\_benmore\\_%' ESCAPE '\\'"
+      expect:
+        rows: 0
+
+# `col: updated_at` is not `column: updated_at`. The policy does not run: the
+# draft created three days ago is not deleted by created_at.
+unknown_key_never_falls_back_to_created_at:
+  as_user: "drafter@guardrails.test"
+  setup:
+    - sql: "DELETE FROM drafts"
+    - sql: "INSERT INTO drafts (title, user_id, created_at, updated_at) VALUES ('old but touched today', {{user_id}}, datetime('now', '-3 days'), datetime('now'))"
+    - sql: "INSERT INTO drafts (title, user_id, created_at, updated_at) VALUES ('old and untouched', {{user_id}}, datetime('now', '-3 days'), datetime('now', '-3 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT id FROM drafts"
+      expect:
+        rows: 2
+
+# A policy on a column the table lacks does not run at all: the note trashed
+# three days ago is not purged.
+missing_column_policy_purges_nothing:
+  as_user: "noter@guardrails.test"
+  setup:
+    - sql: "DELETE FROM notes"
+    - sql: "INSERT INTO notes (title, user_id, created_at, deleted_at) VALUES ('trashed three days ago', {{user_id}}, datetime('now', '-9 days'), datetime('now', '-3 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT id FROM notes WHERE title = 'trashed three days ago'"
+      expect:
+        rows: 1

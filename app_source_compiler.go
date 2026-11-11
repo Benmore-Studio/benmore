@@ -3,33 +3,20 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
-	"time"
 
 	esbuild "github.com/benmore-studio/benmore/third_party/esbuild/pkg/api"
 )
 
-// serveCapturedStaticAsset serves a reviewed generation's static file with a
-// strong content validator instead of no-store: the browser keeps the bytes
-// but revalidates on every use (setRevalidateCacheHeaders, CDNs never store
-// it), so a page view costs a 304 rather than a download, and a new
-// generation's different bytes are seen on the very next load.
-func serveCapturedStaticAsset(w http.ResponseWriter, r *http.Request, name string, data []byte) {
-	w.Header().Set("ETag", capturedAssetETag(data))
-	setRevalidateCacheHeaders(w)
-	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
-}
-
-// capturedAssetETags memoizes validators by the captured slice itself: a
+// capturedAssetETags memoizes the validators of a reviewed generation's static
+// files (serveCapturedStatic, static_captured.go) by the captured slice itself: a
 // generation's bytes never change in place, so its backing array identifies
 // the content and the hash is computed once per generation, not per request.
 var capturedAssetETags = struct {

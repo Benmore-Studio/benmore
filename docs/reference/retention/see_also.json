@@ -1,0 +1,6 @@
+[
+  "api({at:'audit'}) - the audit log and its own retention",
+  "api({at:'versioning'}) - retention, what a sweep does to stored versions",
+  "api({at:'scoping'}) - soft_delete_restore",
+  "api({at:'auth'}) - account_erasure, for deleting one user's data on request"
+]

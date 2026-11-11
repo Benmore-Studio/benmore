@@ -27,11 +27,21 @@ package main
 // sessionlessWriteScope instead: to the tenant or owner its trusted trigger
 // data names, otherwise to admins (tenant tables) or a generic refresh (owner
 // tables), so one tenant's writes never name a table to another tenant.
+//
+// A cron job has no trigger tenant, so its writes to a tenant table used to
+// reach admins only and every member's live view went stale. A write in a run
+// with no request at all (cron, and jobs and events that carry no request
+// field) that RETURNs the table's tenant column is announced to each tenant
+// its rows name (flowReturnedTenants): `UPDATE bookings SET stale = 1 WHERE
+// ... RETURNING studio_id`. Those values are the written rows' own, never
+// request input. A write that returns no tenant still reaches admins only.
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,9 +53,31 @@ type flowWriteLog struct {
 	mu    sync.Mutex
 	order []flowWriteEntry
 	seen  map[flowWriteEntry]bool
+	// tenants holds, per entry, the tenants the rows of its RETURNING writes
+	// named (flowReturnedTenants); untenanted marks an entry with at least one
+	// write whose rows' tenants are unknown.
+	tenants    map[flowWriteEntry]map[string]bool
+	untenanted map[flowWriteEntry]bool
 	// committed runs once the run's transaction commits (announceFlowWrites);
 	// a rollback drops it.
 	committed []func()
+	// reads are read-audit events of the run's transactional SQL, written
+	// once the transaction has ended, committed or not (flushFlowTxReadAudit).
+	reads []readAuditEntry
+}
+
+func (l *flowWriteLog) addReads(entries []readAuditEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reads = append(l.reads, entries...)
+}
+
+func (l *flowWriteLog) takeReads() []readAuditEntry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	reads := l.reads
+	l.reads = nil
+	return reads
 }
 
 // onCommit queues fn for after the run's transaction commits.
@@ -77,7 +109,9 @@ func newFlowWriteLog() *flowWriteLog {
 	return &flowWriteLog{seen: map[flowWriteEntry]bool{}}
 }
 
-func (l *flowWriteLog) add(writes []sqlWrite, inTx bool) {
+// add records writes. tenants is the tenant set the statement's returned
+// rows named (only for a single-table write); nil means unknown.
+func (l *flowWriteLog) add(writes []sqlWrite, inTx bool, tenants []string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, w := range writes {
@@ -86,22 +120,65 @@ func (l *flowWriteLog) add(writes []sqlWrite, inTx bool) {
 			l.seen[e] = true
 			l.order = append(l.order, e)
 		}
+		if tenants == nil {
+			l.markUntenanted(e)
+			continue
+		}
+		if l.tenants == nil {
+			l.tenants = map[flowWriteEntry]map[string]bool{}
+		}
+		set := l.tenants[e]
+		if set == nil {
+			set = map[string]bool{}
+			l.tenants[e] = set
+		}
+		for _, g := range tenants {
+			if len(set) >= flowReturnedTenantCap && !set[g] {
+				// Past the cap the remaining tenants are not named; admins
+				// still hear about the write.
+				if !l.untenanted[e] {
+					log.Printf("flows: a write to %s returned more than %d tenants; the others get no live refresh for it", w.Table, flowReturnedTenantCap)
+				}
+				l.markUntenanted(e)
+				break
+			}
+			set[g] = true
+		}
 	}
+}
+
+func (l *flowWriteLog) markUntenanted(e flowWriteEntry) {
+	if l.untenanted == nil {
+		l.untenanted = map[flowWriteEntry]bool{}
+	}
+	l.untenanted[e] = true
+}
+
+// flowReturnedTenantCap bounds the per-tenant events one run sends for one
+// table and action.
+const flowReturnedTenantCap = 256
+
+// flowDurableWrite is one durable (table, action) and the tenants to tell.
+type flowDurableWrite struct {
+	sqlWrite
+	tenants    map[string]bool
+	untenanted bool
 }
 
 // take returns the durable writes (all non-transactional ones, plus the
 // transactional ones when committed) and empties the log, so a second call
 // announces nothing.
-func (l *flowWriteLog) take(committed bool) []sqlWrite {
+func (l *flowWriteLog) take(committed bool) []flowDurableWrite {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	var out []sqlWrite
+	var out []flowDurableWrite
 	for _, e := range l.order {
 		if !e.inTx || committed {
-			out = append(out, sqlWrite{Table: e.table, Action: e.action})
+			out = append(out, flowDurableWrite{sqlWrite: sqlWrite{Table: e.table, Action: e.action}, tenants: l.tenants[e], untenanted: l.untenanted[e]})
 		}
 	}
 	l.order, l.seen = nil, map[flowWriteEntry]bool{}
+	l.tenants, l.untenanted = nil, nil
 	return out
 }
 
@@ -109,6 +186,12 @@ func (l *flowWriteLog) take(committed bool) []sqlWrite {
 // query is the text that ran; affected is the driver's RowsAffected, or -1
 // when unknown. A single statement that changed no rows is not a write.
 func recordFlowSQLWrites(ctx *FlowContext, query string, affected int64) {
+	recordFlowSQLWriteRows(ctx, query, affected, nil)
+}
+
+// recordFlowSQLWriteRows is recordFlowSQLWrites for a statement that returned
+// rows (a write with RETURNING), whose rows may name their tenants.
+func recordFlowSQLWriteRows(ctx *FlowContext, query string, affected int64, rows []map[string]any) {
 	if ctx == nil || ctx.Writes == nil || !sqlMayWrite(query) {
 		return
 	}
@@ -116,7 +199,60 @@ func recordFlowSQLWrites(ctx *FlowContext, query string, affected int64) {
 	if len(writes) == 0 || (statements == 1 && affected == 0) {
 		return
 	}
-	ctx.Writes.add(writes, ctx.Tx != nil)
+	var tenants []string
+	if statements == 1 && len(writes) == 1 {
+		tenants = flowReturnedTenants(ctx, writes[0].Table, rows)
+	}
+	ctx.Writes.add(writes, ctx.Tx != nil, tenants)
+}
+
+// flowReturnedTenants returns the tenants named by the rows a single-table
+// write RETURNed, or nil when they can't be used: the run has a session (its
+// own tenant scopes the event) or any request input at all - an HTTP
+// request, or request fields carried by a job or event - so no returned
+// value can be a caller's choice; the app or table is not tenant-keyed; or a
+// row lacks the tenant column. Rows with an empty or 0 tenant name none.
+func flowReturnedTenants(ctx *FlowContext, table string, rows []map[string]any) []string {
+	if ctx == nil || ctx.App == nil || ctx.Session != nil || ctx.Request != nil || len(rows) == 0 {
+		return nil
+	}
+	ctx.DataMu.Lock()
+	requestInput := len(ctx.RequestKeys) > 0
+	ctx.DataMu.Unlock()
+	app := ctx.App
+	if requestInput || app.Group == nil || app.Group.Key == "" {
+		return nil
+	}
+	name, ok := flowAnnounceableTables(app)[strings.ToLower(table)]
+	if !ok || !hasColumn(app, name, app.Group.Key) {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, row := range rows {
+		found := false
+		for col, v := range row {
+			if !strings.EqualFold(col, app.Group.Key) {
+				continue
+			}
+			found = true
+			if v == nil {
+				break
+			}
+			if g := valueText(v); g != "" && g != "0" && !seen[g] {
+				seen[g] = true
+				out = append(out, g)
+			}
+			break
+		}
+		if !found {
+			return nil
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // sqlMayWrite is a cheap prefilter so read-only steps skip tokenizing.
@@ -129,11 +265,13 @@ func sqlMayWrite(query string) bool {
 // announceFlowWrites broadcasts one table event per distinct (table, action)
 // the run durably wrote. committed reports whether the run's transaction (if
 // it had one) committed. Only app schema tables are announced - never
-// _benmore_*, sqlite_* or full-text shadow tables.
+// _benmore_*, sqlite_* or full-text shadow tables. It first writes the run's
+// deferred read-audit events, whether or not the transaction committed.
 func announceFlowWrites(ctx *FlowContext, committed bool) {
 	if ctx == nil || ctx.App == nil || ctx.Writes == nil {
 		return
 	}
+	flushFlowTxReadAudit(ctx)
 	for _, fn := range ctx.Writes.takeCommitted(committed) {
 		fn()
 	}
@@ -142,26 +280,48 @@ func announceFlowWrites(ctx *FlowContext, committed bool) {
 		return
 	}
 	tables := flowAnnounceableTables(ctx.App)
-	sent := map[sqlWrite]bool{}
+	// One announcement per (table, action), merging a table's transactional
+	// and non-transactional writes and the tenants their rows returned.
+	var order []sqlWrite
+	merged := map[sqlWrite]*flowDurableWrite{}
 	for _, w := range writes {
 		name, ok := tables[strings.ToLower(w.Table)]
 		if !ok {
 			continue
 		}
 		key := sqlWrite{Table: name, Action: w.Action}
-		if sent[key] {
-			continue
+		m := merged[key]
+		if m == nil {
+			m = &flowDurableWrite{sqlWrite: key, tenants: map[string]bool{}}
+			merged[key] = m
+			order = append(order, key)
 		}
-		sent[key] = true
+		for g := range w.tenants {
+			m.tenants[g] = true
+		}
+		m.untenanted = m.untenanted || w.untenanted
+	}
+	for _, key := range order {
+		name, action := key.Table, key.Action
 		if ctx.Session != nil {
-			Broadcast(ctx.App, name, w.Action, ctx.Session)
+			Broadcast(ctx.App, name, action, ctx.Session)
 			continue
 		}
-		if groupID, userID, public := sessionlessWriteScope(ctx, name); public {
-			BroadcastUnscoped(ctx.App, name, w.Action)
-		} else {
-			BroadcastScopedDirect(ctx.App, name, w.Action, groupID, userID)
+		groupID, userID, public := sessionlessWriteScope(ctx, name)
+		if public {
+			BroadcastUnscoped(ctx.App, name, action)
+			continue
 		}
+		if m := merged[key]; groupID == realtimeNoTenant && len(m.tenants) > 0 {
+			// The written rows' own tenants (flowReturnedTenants).
+			for _, g := range slices.Sorted(maps.Keys(m.tenants)) {
+				BroadcastScopedDirect(ctx.App, name, action, g, 0)
+			}
+			if !m.untenanted {
+				continue
+			}
+		}
+		BroadcastScopedDirect(ctx.App, name, action, groupID, userID)
 	}
 }
 
@@ -181,13 +341,6 @@ const (
 // data event's row - never from request input (ctx.RequestKeys).
 func sessionlessWriteScope(ctx *FlowContext, table string) (groupID string, userID int64, public bool) {
 	app := ctx.App
-	hasUID := hasColumn(app, table, "user_id")
-	grouped := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-	if app.Access != nil {
-		if mode := app.Access.ModeFor(table, "read", hasUID, grouped); mode == "anon" || mode == "everyone" {
-			return "", 0, true
-		}
-	}
 	trusted := func(key string) string {
 		ctx.DataMu.Lock()
 		defer ctx.DataMu.Unlock()
@@ -200,19 +353,44 @@ func sessionlessWriteScope(ctx *FlowContext, table string) (groupID string, user
 		case nil:
 			return ""
 		default:
-			return fmt.Sprint(v)
+			return valueText(v)
+		}
+	}
+	tenant := ""
+	if app.Group != nil && app.Group.Key != "" {
+		for _, key := range []string{"_group_id", app.Group.Key} {
+			if g := trusted(key); g != "" && g != "0" {
+				tenant = g
+				break
+			}
+		}
+	}
+	return triggeredWriteScope(app, table, tenant, trusted("user_id"))
+}
+
+// triggeredWriteScope is the audience of a write to table made without a
+// session, from the tenant and owner its trusted trigger data names (a flow's
+// trigger, or the row of the CRUD write that queued a hook job). A publicly
+// readable table is unscoped; a tenant-keyed table reaches that tenant, else
+// only admins; an owner-keyed table reaches its owner in full and other
+// readers as the generic refresh. Any other table is unscoped, and its read
+// mode decides the rest (realtimeAudienceFor).
+func triggeredWriteScope(app *App, table, tenant, owner string) (groupID string, userID int64, public bool) {
+	hasUID := hasColumn(app, table, "user_id")
+	grouped := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
+	if app.Access != nil {
+		if mode := app.Access.ModeFor(table, "read", hasUID, grouped); mode == "anon" || mode == "everyone" {
+			return "", 0, true
 		}
 	}
 	if grouped {
-		for _, key := range []string{"_group_id", app.Group.Key} {
-			if g := trusted(key); g != "" && g != "0" {
-				return g, 0, false
-			}
+		if tenant != "" && tenant != "0" {
+			return tenant, 0, false
 		}
 		return realtimeNoTenant, 0, false
 	}
 	if hasUID {
-		if id, err := strconv.ParseInt(trusted("user_id"), 10, 64); err == nil && id > 0 {
+		if id, err := strconv.ParseInt(owner, 10, 64); err == nil && id > 0 {
 			return "", id, false
 		}
 		return "", realtimeNoOwner, false

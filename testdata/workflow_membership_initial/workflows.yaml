@@ -1,0 +1,16 @@
+team_membership:
+  table: team_members
+  field: standing
+  initial: active
+  states: [active, suspended]
+  transitions:
+    active:
+      suspended: { role: admin }
+room_membership:
+  table: room_members
+  field: standing
+  initial: active
+  states: [active, muted]
+  transitions:
+    active:
+      muted: { role: admin }

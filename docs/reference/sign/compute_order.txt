@@ -1,0 +1,1 @@
+Inline sign.compute bindings run in their declared source order, including `sign:` under a step's `with:`, nested steps and YAML anchors/merges. A later binding may reference an earlier binding, as in ts followed by sig over ts.body. Named built-in recipes run in their own fixed order.

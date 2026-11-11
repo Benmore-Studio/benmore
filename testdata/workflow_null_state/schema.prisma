@@ -1,0 +1,21 @@
+model Order {
+  id        Int      @id @default(autoincrement())
+  title     String   @default("")
+  status    String?  @default("draft")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("orders")
+}
+
+model Ticket {
+  id        Int      @id @default(autoincrement())
+  title     String   @default("")
+  status    String
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("tickets")
+}

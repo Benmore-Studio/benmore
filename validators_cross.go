@@ -26,10 +26,12 @@ import (
 
 // frameworkTables enumerates the internal tables the runtime creates
 // on its own. They aren't declared in schema.prisma but are valid
-// targets for hooks.yaml / workflows.yaml / SQL in flows. Without
+// targets for hooks.yaml, access: rules and SQL in flows. Without
 // this allowlist, hooks on the auth table (`on_insert: _benmore_users`
 // → fire a welcome email on signup) trigger false "table doesn't
-// exist" warnings.
+// exist" warnings. Config that would change a framework table
+// (versioned:, encrypted fields, workflows.yaml, computed.yaml) is
+// refused by name instead (config_framework_tables.go).
 var frameworkTables = map[string]bool{
 	"_benmore_users":          true,
 	"_benmore_sessions":       true,
@@ -170,6 +172,9 @@ func CrossFileWarnings(appDir, writtenPath string) []string {
 			}
 		}
 	}
+
+	// hooks.yaml references to columns the hooked table does not have.
+	warnings = append(warnings, hookColumnRefWarnings(appDir)...)
 
 	// workflows.yaml: each top-level workflow has a `table:` field.
 	if refs := scanWorkflowRefs(appDir); len(refs) > 0 {

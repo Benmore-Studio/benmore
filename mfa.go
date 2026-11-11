@@ -15,6 +15,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -23,19 +24,20 @@ import (
 )
 
 // roleRequiresMFAEnrollment reports whether `role` appears in the
-// `auth.require_mfa_for_roles` list in app.yaml (comma-separated).
+// `auth.require_mfa_for_roles` list in app.yaml (comma-separated; `*` = every role).
 // When the role is listed, password authentication alone does not grant
 // a session - the user must enroll in MFA before one is issued.
 func roleRequiresMFAEnrollment(app *App, role string) bool {
-	if app == nil || app.Design == nil || role == "" {
+	if app == nil || app.Design == nil {
 		return false
 	}
-	raw := strings.TrimSpace(app.Design.Auth["require_mfa_for_roles"])
+	raw := mfaRequiredRoles(app)
 	if raw == "" {
 		return false
 	}
 	for _, r := range strings.Split(raw, ",") {
-		if strings.EqualFold(strings.TrimSpace(r), role) {
+		// "*" lists every account, whatever its role (compliance: hipaa).
+		if r = strings.TrimSpace(r); r == "*" || (role != "" && strings.EqualFold(r, role)) {
 			return true
 		}
 	}
@@ -47,6 +49,9 @@ func roleRequiresMFAEnrollment(app *App, role string) bool {
 // in _benmore_user_roles, the same set IsAdmin and the access gates honour.
 // Grants scoped to one tenant are not consulted: no tenant is chosen yet.
 func userRequiresMFAEnrollment(app *App, userID int64) bool {
+	if roleRequiresMFAEnrollment(app, "") { // "*" lists every account, even one with no role
+		return true
+	}
 	var role string
 	app.DB.QueryRow("SELECT COALESCE(role, '') FROM _benmore_users WHERE id = ?", userID).Scan(&role)
 	for _, held := range LoadSessionRoles(app.DB, userID, role, "") {
@@ -60,7 +65,7 @@ func userRequiresMFAEnrollment(app *App, userID int64) bool {
 // needsMFAEnrollmentWith makes the final enrollment decision under the same
 // writer transaction that exchanges the OTP proof for its next credential.
 func needsMFAEnrollmentWith(app *App, q mutationQuerier, userID int64) (bool, error) {
-	if app.Design == nil || strings.TrimSpace(app.Design.Auth["require_mfa_for_roles"]) == "" {
+	if mfaRequiredRoles(app) == "" {
 		return false, nil
 	}
 	var secret, role string
@@ -111,13 +116,21 @@ func redirectToMFAEnrollment(w http.ResponseWriter, r *http.Request, app *App, u
 		return
 	}
 	setFlowCookie(w, flowCookieMFASetup, token, !app.DevMode, int(mfaSetupTokenTTL.Seconds()))
-	redirect := "/mfa-setup"
-	if app.Design != nil {
-		if v := strings.TrimSpace(app.Design.Auth["mfa_setup_redirect"]); v != "" {
-			redirect = v
-		}
+	sendMFASetupStep(w, r, app)
+}
+
+// sendMFASetupStep routes a caller whose role must enroll an authenticator
+// to the enrollment page (auth.mfa_setup_redirect, default /mfa-setup) once
+// the setup cookie is set: a JSON client gets {mfa_setup_required, redirect},
+// a form post or a navigation a 303. The page completes with
+// POST /api/_auth/mfa/setup and /verify; the cookie is its proof.
+func sendMFASetupStep(w http.ResponseWriter, r *http.Request, app *App) {
+	target := authStepTarget(mfaSetupPagePath(app), r)
+	if wantsJSON(r) {
+		httpJSON(w, http.StatusOK, map[string]any{"ok": true, "mfa_setup_required": true, "redirect": target})
+		return
 	}
-	http.Redirect(w, r, redirect, http.StatusSeeOther)
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 // mfaSetupTokenTTL is the lifetime of an MFA-setup token. Long enough
@@ -129,7 +142,9 @@ const mfaSetupTokenTTL = 15 * time.Minute
 // real session; falls back to an MFA-setup token from the
 // X-MFA-Setup-Token header or _benmore_mfa_setup cookie. Returns
 // fromSetupToken=true when the latter was used, so /verify knows to
-// mint a real session on success.
+// mint a real session on success. Last comes a login session held until its
+// account enrolls (mfa_enrollment_gate.go): it enrolls like any signed-in
+// caller, with the current password and CSRF.
 func mfaCallerIdentity(app *App, r *http.Request) (userID int64, email string, fromSetupToken bool, err error) {
 	if s := getSession(app, r); s != nil {
 		if !credentialManagementSession(app, s) || !accountManagementSession(s) {
@@ -138,7 +153,16 @@ func mfaCallerIdentity(app *App, r *http.Request) (userID int64, email string, f
 		return s.UserID, s.Email, false, nil
 	}
 	uid, current, err := mfaSetupTokenIdentity(app, app.DB, r)
-	return uid, current, err == nil, err
+	if err == nil {
+		return uid, current, true, nil
+	}
+	if s := mfaEnrollmentSession(app, r); s != nil {
+		if !credentialManagementSession(app, s) || !accountManagementSession(s) {
+			return 0, "", false, fmt.Errorf("MFA enrollment requires a full-access login session outside act-as mode")
+		}
+		return s.UserID, s.Email, false, nil
+	}
+	return 0, "", false, err
 }
 
 // mfaSetupSameSite reports whether an enrollment call authenticated by the
@@ -258,6 +282,9 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 			hashedCodes[i] = string(h)
 		}
 		codesJSON, _ := json.Marshal(hashedCodes)
+		// An app on a generated per-process key saves it first, so the
+		// enrollment is sealed under a key the next start still has.
+		prepareTOTPSealKey(app.DB)
 		sealed, err := sealTOTPSecret(app.DB, secretB32)
 		if err != nil {
 			serverErrorJSON(w, r, app, "mfa setup", err, "MFA setup could not be saved")
@@ -301,12 +328,9 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 				issuer = sn
 			}
 		}
-		otpauthURI := fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s&digits=6&period=30",
-			issuer, email, secretB32, issuer)
-
 		httpJSON(w, http.StatusOK, map[string]any{
 			"secret":       secretB32,
-			"otpauth_uri":  otpauthURI,
+			"otpauth_uri":  totpKeyURI(issuer, email, secretB32),
 			"backup_codes": backupCodes, // shown ONCE, never again
 		})
 	})
@@ -367,6 +391,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		// its ciphertext; one started before sealing is sealed now.
 		active := strings.TrimPrefix(secretRaw, totpPendingPrefix)
 		if !totpSecretSealed(active) {
+			prepareTOTPSealKey(app.DB)
 			if active, err = sealTOTPSecret(app.DB, secretB32); err != nil {
 				serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
 				return
@@ -434,6 +459,8 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		log.Printf("MFA: enabled for user %d", userID)
+		// A session held for enrollment acts again from now on.
+		invalidateRequestSession(r)
 		if fromSetup {
 			AttachSessionContext(app.DB, token, r)
 			http.SetCookie(w, sessionCookie(token, app.DevMode, app.SessionDuration))
@@ -546,8 +573,10 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 }
 
 // RegisterMFALoginRoute registers the POST handler for web MFA verification during login.
-// After password success, if MFA is enabled, the user is redirected to the MFA page.
-// The MFA page's form POSTs here with the TOTP code.
+// After password success, if MFA is enabled, the user is sent to the MFA page
+// (a 303, or {mfa_required, redirect} for JSON). The app serves that page
+// (the scaffold's static/verify-mfa.html); its form POSTs here with the TOTP
+// or backup code as mfa_code (or code) and the page's ?next=.
 func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc(fmt.Sprintf("POST %s", app.Paths.VerifyMFA), func(w http.ResponseWriter, r *http.Request) {
 		mergeJSONBodyIntoForm(r)
@@ -556,11 +585,14 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 			code = strings.TrimSpace(r.FormValue("code"))
 		}
 
+		// Bounces back to the code page keep the post-sign-in destination.
+		mfaPath := authStepTarget(app.Paths.VerifyMFA, r)
+
 		// As on the emailed-code step: no CSRF token (the code is the
 		// secret), but another site must not drive this step through a
 		// visitor's browser and lock their second factor (csrfOriginReason).
 		if _, ok := csrfOriginReason(r); !ok {
-			authRedirect(w, r, app.Paths.VerifyMFA, "This form expired. Reload the page and try again.")
+			authRedirect(w, r, mfaPath, "This form expired. Reload the page and try again.")
 			return
 		}
 
@@ -579,7 +611,7 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 		passwordSignIn := otpKey != ""
 
 		if code == "" {
-			authRedirect(w, r, app.Paths.VerifyMFA, "MFA code is required")
+			authRedirect(w, r, mfaPath, "MFA code is required")
 			return
 		}
 
@@ -589,7 +621,7 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 		mfaKey := mfaLockKey(userID)
 		defer lockAttempt(mfaKey)() // serialize this account's check→verify→record (lockout race)
 		if isAccountLocked(app.DB, mfaKey) {
-			authRedirect(w, r, app.Paths.VerifyMFA, "Too many MFA attempts. Try again in 15 minutes.")
+			authRedirect(w, r, mfaPath, "Too many MFA attempts. Try again in 15 minutes.")
 			return
 		}
 
@@ -608,7 +640,7 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 		if !validateMFACodeWith(tx, userID, code) {
 			tx.Rollback()
 			recordLoginAttempt(app.DB, mfaKey, false)
-			authRedirect(w, r, app.Paths.VerifyMFA, "Invalid MFA code")
+			authRedirect(w, r, mfaPath, "Invalid MFA code")
 			return
 		}
 		var sessionID, otpCode, otpToken string
@@ -647,11 +679,19 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 			}
 		}
 
+		// A JSON caller gets the user, as from /login; a form post goes on
+		// to the page it came for (?next=) or the app's sign-in landing page.
+		if authSuccessJSON(w, r, app, userID) {
+			return
+		}
 		redirectTo := "/"
 		if app.Design != nil {
 			if rd := app.Design.Auth["redirect"]; rd != "" {
 				redirectTo = rd
 			}
+		}
+		if next := r.FormValue("next"); isSafeNext(next) {
+			redirectTo = next
 		}
 		http.Redirect(w, r, redirectTo, http.StatusSeeOther)
 	})
@@ -778,6 +818,28 @@ func consumeMFATOTPWith(db mutationTx, userID int64, code string) bool {
 }
 
 // ===== TOTP Implementation (RFC 6238) =====
+
+// totpKeyURI builds the otpauth:// URI an authenticator app scans, in the Key
+// URI Format: otpauth://totp/<issuer>:<account>?secret=…&issuer=…. Every part
+// is percent-encoded, so an app name with `&`, `?`, `#` or `%` (site_name is
+// free text) can no longer end the label or the issuer parameter early and push
+// the secret out of the query. The format forbids a colon inside either label
+// part (it separates them), so colons are dropped from the label only; the
+// issuer parameter, which authenticators show, keeps the exact name.
+func totpKeyURI(issuer, account, secretB32 string) string {
+	labelPart := func(s string) string {
+		return totpURIEscape(strings.TrimSpace(strings.ReplaceAll(s, ":", "")))
+	}
+	return "otpauth://totp/" + labelPart(issuer) + ":" + labelPart(account) +
+		"?secret=" + totpURIEscape(secretB32) + "&issuer=" + totpURIEscape(issuer) + "&digits=6&period=30"
+}
+
+// totpURIEscape percent-encodes s for any part of an otpauth URI. Spaces are
+// %20, not "+": the label is a path, and some authenticators show a "+" in the
+// issuer parameter literally.
+func totpURIEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
 
 // GenerateTOTP computes a 6-digit TOTP code for the current time window.
 func GenerateTOTP(secretB32 string) string {

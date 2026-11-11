@@ -98,9 +98,11 @@ func sqliteAppDSNWithEnv(dbPath, dir string, appEnv map[string]string) string {
 		// with SetMaxOpenConns(25) contending for SQLite's single writer it turns
 		// into a storm that blocks every HTTP goroutine (the [locks] cleanup worker
 		// in locks.go is a visible victim). IMMEDIATE makes writers queue cleanly on
-		// _busy_timeout instead of deadlocking. Safe here: every per-app *sql.DB txn
-		// site (crud/flows/jobs/cron/admin/groups_bootstrap) is a WRITE; read paths
-		// use plain Query (WAL, no txn). Read-only opens (mode=ro) must NOT set this.
+		// _busy_timeout instead of deadlocking. A BeginTx with ReadOnly set is the
+		// exception: the framework driver runs it as a deferred snapshot with
+		// query_only on (db_write_lock.go), which also names write-lock holders and
+		// limits how long a write transaction may hold the lock. Read-only opens
+		// (mode=ro) must NOT set this.
 		"&_txlock=immediate" +
 		"&_synchronous=" + synchronous +
 		// Per-connection page cache; 16 MB in hosted tenants, 64 MB

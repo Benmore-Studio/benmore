@@ -70,17 +70,24 @@ func TestImpersonationRefusesAdminsAndAuditsRealActor(t *testing.T) {
 	if tok == "" {
 		t.Fatal("no impersonation token")
 	}
-	// The admin logs out; the trail must still name them.
-	DeleteSessionFromDB(app.DB, adminSID)
-	body := strings.NewReader(`{"title":"written while impersonating"}`)
-	r := httptest.NewRequest(http.MethodPost, "/api/notes", body)
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("X-CSRF-Token", authMintCSRFToken(tok))
-	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tok})
-	cw := httptest.NewRecorder()
-	crud.ServeHTTP(cw, r)
-	if cw.Code != http.StatusOK && cw.Code != http.StatusCreated {
+	// The trail names the admin from the support session's own row.
+	createNote := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"title":"written while impersonating"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-CSRF-Token", authMintCSRFToken(tok))
+		r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tok})
+		cw := httptest.NewRecorder()
+		crud.ServeHTTP(cw, r)
+		return cw
+	}
+	if cw := createNote(); cw.Code != http.StatusOK && cw.Code != http.StatusCreated {
 		t.Fatalf("create as impersonated member: %d %s", cw.Code, cw.Body.String())
+	}
+	// The admin's own sign-in ends (logout, revoke): the support session it
+	// started ends with it, so nothing more is written as the member.
+	DeleteSessionFromDB(app.DB, adminSID)
+	if cw := createNote(); cw.Code != http.StatusUnauthorized {
+		t.Fatalf("create through a support session whose admin sign-in ended: %d %s", cw.Code, cw.Body.String())
 	}
 	var userID, actorID int64
 	var actorEmail string

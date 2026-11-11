@@ -1,0 +1,8 @@
+# `contain:` is not a key `expect:` takes (`contains:` is), so the text would
+# never be looked for.
+health_names_a_missing_text:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        contain: "this text is not in the answer"

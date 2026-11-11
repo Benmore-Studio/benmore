@@ -51,8 +51,10 @@ func TestWriteBareScaffoldFilesInfraOnly(t *testing.T) {
 	if !strings.Contains(string(appYAML), `site_name: "Email Test"`) {
 		t.Errorf("bare app.yaml missing site_name, got:\n%s", appYAML)
 	}
-	if !strings.Contains(string(appYAML), "stack: html") {
-		t.Errorf("bare app.yaml missing frontend.stack, got:\n%s", appYAML)
+	// Nothing reads `frontend.stack`; the scaffold no longer writes the label
+	// (TestScaffoldWritesNoAppYAMLKeyWithoutEffect holds every such key).
+	if strings.Contains(string(appYAML), "frontend") {
+		t.Errorf("bare app.yaml writes the unread frontend label, got:\n%s", appYAML)
 	}
 }
 

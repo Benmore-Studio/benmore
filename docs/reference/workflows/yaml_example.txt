@@ -1,0 +1,20 @@
+# workflows.yaml
+orders:
+  table: orders
+  field: status
+  initial: pending
+  transitions:
+    pending:
+      processing:  { role: admin }
+      cancelled:   {}
+    processing:
+      shipped:     { role: [admin, manager], when: "tracking_number IS NOT NULL" }   # any listed role
+    shipped:
+      delivered:   {}
+  timeout:
+    shipped: { after: 14d, to: delivered }
+  on_transition:
+    shipped:
+      - webhook: "{{env.SHIPPING_WEBHOOK}}"
+      - notify: "{{old_user_id}}"   # the order's owner; {{user_id}} is whoever shipped it
+        notify_title: "Your order shipped"

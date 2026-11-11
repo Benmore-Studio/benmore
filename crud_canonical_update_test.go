@@ -44,11 +44,20 @@ func canonicalUpdateFixture(t *testing.T) (*App, string, int64) {
 
 func refreshTableColumns(t *testing.T, app *App, names ...string) {
 	t.Helper()
-	for _, name := range names {
+	columns := make([][]Column, len(names))
+	for i, name := range names {
 		cols, err := GetTableColumns(app.DB, name)
 		if err != nil {
 			t.Fatal(err)
 		}
+		columns[i] = cols
+	}
+	// Background readers (the realtime dispatcher) read app.Tables under
+	// app.mu, so the tables change under the lock.
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	for n, name := range names {
+		cols := columns[n]
 		found := false
 		for i := range app.Tables {
 			if app.Tables[i].Name == name {
@@ -121,10 +130,19 @@ func TestCanonicalUpdateNativeHandlerGatesAndCas(t *testing.T) {
 func TestCanonicalUpdateNativeHandlerForeignViewerAndMemberRepoint(t *testing.T) {
 	t.Run("foreign tenant row", func(t *testing.T) {
 		app, _, _ := canonicalUpdateFixture(t)
+		// A real tenant-a member, so the request passes the table gate and
+		// the row scope is what refuses tenant-b's row. Without the
+		// membership the session has no tenant and the table gate refuses
+		// it (403 since Round 2 B15: the caller may list orgdocs).
+		mustExec(t, app.DB, `INSERT INTO members (id, org_id, email) VALUES (90, 'tenant-a', 'foreign@example.com')`)
 		sid := createCrudScopeSession(t, app, "foreign@example.com", "user", "tenant-a", "")
 		w := canonicalPatch(app, sid, "orgdocs", "2", "application/json", `{"title":"crossed"}`)
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("foreign tenant patch: %d %s", w.Code, w.Body.String())
+		}
+		// The same answer as for a row that does not exist: no existence oracle.
+		if missing := canonicalPatch(app, sid, "orgdocs", "999", "application/json", `{"title":"crossed"}`); missing.Code != w.Code || missing.Body.String() != w.Body.String() {
+			t.Fatalf("foreign row %d %q differs from missing row %d %q", w.Code, w.Body.String(), missing.Code, missing.Body.String())
 		}
 		var title string
 		if err := app.DB.QueryRow(`SELECT title FROM orgdocs WHERE id=2`).Scan(&title); err != nil || title != "private-b" {
@@ -136,7 +154,8 @@ func TestCanonicalUpdateNativeHandlerForeignViewerAndMemberRepoint(t *testing.T)
 		app, sid, _ := canonicalUpdateFixture(t)
 		app.Access.rules["notes"] = map[AccessOp]string{"read": "self", "update": "admin"}
 		w := canonicalPatch(app, sid, "notes", "1", "application/json", `{"title":"viewer-write"}`)
-		if w.Code != http.StatusNotFound || canonicalTitle(t, app) != "before" {
+		// The caller may read notes, so the refused update says so (403).
+		if w.Code != http.StatusForbidden || canonicalTitle(t, app) != "before" {
 			t.Fatalf("viewer updated row: status=%d body=%s title=%q", w.Code, w.Body.String(), canonicalTitle(t, app))
 		}
 	})

@@ -223,7 +223,6 @@ func (exec *appMCPCommandExecution) revokeUserSessions(ctx *FlowContext, step *F
 	if err != nil {
 		return err
 	}
-	cap.revokedUsers = append(cap.revokedUsers, target)
 	return nil
 }
 
@@ -282,13 +281,4 @@ func authorizeCommandRevoke(action int, arg1, arg2, database string) int {
 		}
 	}
 	return sqlite3.SQLITE_DENY
-}
-
-// appMCPAfterCommitRevocations ends the platform-side edge grants of each
-// revoked user once the command has committed (they live outside the app
-// database). A failure is logged by the helper, never undoing the commit.
-func appMCPAfterCommitRevocations(app *App, users []int64) {
-	for _, id := range users {
-		revokeEdgeGrantsAfterCredentialChange(app, id)
-	}
 }

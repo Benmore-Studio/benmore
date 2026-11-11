@@ -52,9 +52,16 @@ func tempCookieAudience(app *App) string {
 // (passkey user handles stored in authenticators, challenge source keys)
 // and for the transition in verifyTempCookieFor.
 func tempCookieMAC(app *App, payload string) string {
-	mac := hmac.New(sha256.New, []byte(serverSecret))
+	return tempCookieMACWith(serverSecret, tempCookieAudience(app), payload)
+}
+
+// tempCookieMACWith is tempCookieMAC under an explicit secret and audience,
+// for code that recomputes the passkey user handles another process derived
+// (passkeyUserHandleWith) when it moves passkeys into its own store.
+func tempCookieMACWith(secret, audience, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(tempCookieDomain))
-	mac.Write([]byte(tempCookieAudience(app)))
+	mac.Write([]byte(audience))
 	mac.Write([]byte{0})
 	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))

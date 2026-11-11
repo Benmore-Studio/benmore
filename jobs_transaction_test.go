@@ -260,7 +260,11 @@ func newJobsTestApp(t *testing.T) *App {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	EnsureJobsTable(db)
-	return &App{DB: db, Dir: t.TempDir(), Stop: make(chan struct{})}
+	app := &App{DB: db, Dir: t.TempDir(), Stop: make(chan struct{})}
+	// Failures can start tracked reporters; drain them before SQLite and the
+	// temporary directories are removed, just as the runtime shutdown does.
+	t.Cleanup(app.Shutdown)
+	return app
 }
 
 func countJobs(t *testing.T, db *sql.DB) int {

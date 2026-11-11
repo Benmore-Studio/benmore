@@ -1,0 +1,1 @@
+The audit log keeps every row by default. `BENMORE_AUDIT_RETENTION` (per-app env, at least 1d) deletes rows older than that TTL; with the audit shipper configured it deletes only rows already shipped.

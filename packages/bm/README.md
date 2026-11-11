@@ -14,7 +14,7 @@ Native Benmore apps keep using `import bm from "bm"`; their generated
 This package's `index.js` is staged byte-for-byte from the framework's canonical
 `embedded/bm.js`; it has no separate runtime implementation or build step.
 
-App-building agents use the [harness guide](../../docs/agent/harness.md) and
+App-building agents use the [harness guide](https://github.com/Benmore-Studio/benmore/blob/main/docs/agent/harness.md) and
 canonical `sdk` / `existing-frontends` API recipes. The SDK is separate from the
 native hosted CLI and does not install agent skills or deploy an app. Inspect
 live tables and authorization before replacing `contacts` in the example.

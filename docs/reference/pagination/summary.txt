@@ -1,0 +1,1 @@
+Two modes. Offset (page+per_page) is simple but unstable on append-heavy tables. Cursor (cursor+limit) is stable and recommended for feeds.

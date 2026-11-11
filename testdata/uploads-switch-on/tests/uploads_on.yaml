@@ -1,0 +1,33 @@
+# The control for the fixture uploads-switch-off: with features.uploads at
+# its default (on), the same multipart create stores its file part, records
+# the path on the row and serves the bytes back.
+
+multipart_create_with_a_file_stores_it:
+  as_user: "member@test.com"
+  steps:
+    - api: "POST /api/notes"
+      data: {title: "scan"}
+      files:
+        attachment: {name: "scan.txt", content: "hello upload"}
+      save: {file_path: "attachment"}
+      expect:
+        status: 200
+        json: {status: "created", title: "scan"}
+        contains: "/uploads/notes/"
+    - get: "{{file_path}}"
+      expect:
+        status: 200
+        contains: "hello upload"
+    - sql: "SELECT id FROM notes WHERE title = 'scan' AND attachment LIKE '/uploads/notes/%.txt'"
+      expect: {rows: 1}
+
+upload_route_stores_a_file:
+  as_user: "member@test.com"
+  steps:
+    - api: "POST /api/_upload"
+      data: {kind: "files"}
+      files:
+        file: {name: "scan.txt", content: "hello upload"}
+      expect:
+        status: 200
+        contains: "/uploads/files/"

@@ -1,0 +1,13 @@
+# The flows of this app are the examples of api(at:"flows"), api(at:"uploads")
+# and api(at:"pdf"), file for file (TestFlowExampleFilesAreTheDocumentedExamples).
+site_name: "Flow examples"
+auth:
+  identifier: email
+  session_duration: "30d"
+frontend:
+  stack: html
+access:
+  task_events: { read: self, write: admin, update: admin, delete: admin }
+  flow_failures: { all: admin }
+  maintenance_runs: { all: admin }
+  contacts: { all: admin }

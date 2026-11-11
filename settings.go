@@ -144,8 +144,8 @@ func accountSettingsMFASetupDisabled(w http.ResponseWriter, r *http.Request, app
 	if app.FeatureEnabled("account_settings") {
 		return false
 	}
-	if _, _, fromSetup, err := mfaCallerIdentity(app, r); err == nil && fromSetup {
-		return false // only login's setup-token identity may enroll while self-service is off
+	if _, _, fromSetup, err := mfaCallerIdentity(app, r); err == nil && (fromSetup || mfaEnrollmentSession(app, r) != nil) {
+		return false // only required enrollment (a setup token or a held session) proceeds while self-service is off
 	}
 	return accountSettingsDisabled(w, r, app)
 }
@@ -157,6 +157,10 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_auth/profile", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
+			if presentedCredentialAwaitsVerification(app, r) {
+				httpJSON(w, http.StatusUnauthorized, unverifiedCredentialBody(app))
+				return
+			}
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
@@ -177,6 +181,18 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			userMap["permissions"] = session.Permissions
 		} else {
 			userMap["permissions"] = []string{}
+		}
+		// The caller's current tenant (groups.key value) for a multi-tenant
+		// app, null without one - so a page can tell "which workspace am I
+		// in / do I still need onboarding" without guessing from roles. The
+		// EFFECTIVE group: an admin stepped into a tenant (act-as) sees that
+		// tenant, as every scoped read does. Only the caller's own tenant id.
+		if app.Group != nil {
+			if session.EffectiveHasGroup() {
+				userMap["group_id"] = session.EffectiveGroupID()
+			} else {
+				userMap["group_id"] = nil
+			}
 		}
 		httpJSON(w, http.StatusOK, userMap)
 	})
@@ -216,6 +232,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		mode := userDirectoryMode(app)
 		if mode == "off" {
 			http.NotFound(w, r)
+			return
+		}
+		if !requireUserDirectoryScope(w, session) {
 			return
 		}
 		// Soft pagination - large user tables shouldn't dump everything.
@@ -271,6 +290,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		mode := userDirectoryMode(app)
 		if mode == "off" {
 			http.NotFound(w, r)
+			return
+		}
+		if !requireUserDirectoryScope(w, session) {
 			return
 		}
 		idStr := r.PathValue("id")
@@ -388,7 +410,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		pendingEmail := ""
 		if changingEmail && newEmail != session.Email {
 			if err := requestEmailChange(app, r, session.UserID, strings.TrimSpace(newEmail)); err != nil {
-				status := http.StatusBadGateway
+				status := http.StatusServiceUnavailable
 				if errors.Is(err, errEmailInUse) {
 					status = http.StatusConflict
 				} else if errors.Is(err, errEmailChangeUnsupported) {
@@ -458,7 +480,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			}
 			if len(droppedUnknown) > 0 {
 				resp["dropped_unknown"] = droppedUnknown
-				resp["hint"] = "fields not present on _benmore_users - add them to your schema.prisma model User block and push. The framework refuses to silently auto-extend the user table to keep the schema authoritative."
+				resp["hint"] = "fields not present on _benmore_users - list them in app.yaml auth.signup_fields and push: the framework adds a column for each listed field when the app loads. It never adds a user column from a request."
 			}
 			httpJSON(w, http.StatusBadRequest, resp)
 			return
@@ -493,7 +515,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			}
 			if len(droppedUnknown) > 0 {
 				meta["dropped_unknown"] = droppedUnknown
-				meta["hint"] = "some fields aren't present on _benmore_users - add them to your schema.prisma model User block and push. The framework keeps the schema authoritative on purpose."
+				meta["hint"] = "some fields aren't present on _benmore_users - list them in app.yaml auth.signup_fields and push: the framework adds a column for each listed field when the app loads. It never adds a user column from a request."
 			}
 			if userMap == nil {
 				userMap = map[string]any{}
@@ -517,7 +539,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			httpError(w, "Sign in directly to change your password", http.StatusForbidden)
 			return
 		}
-		r.ParseForm()
+		parseSettingsForm(w, r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return
@@ -598,7 +620,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			httpError(w, "Sign in directly to change your email", http.StatusForbidden)
 			return
 		}
-		r.ParseForm()
+		parseSettingsForm(w, r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return
@@ -646,6 +668,14 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 
 	// Delete account
 	mux.HandleFunc("POST /settings/delete-account", func(w http.ResponseWriter, r *http.Request) {
+		// A hosted dashboard account is also a platform account (apps,
+		// billing, CLI token): its own handler refuses while those block the
+		// deletion and deletes the platform half too. No-op without the
+		// platform engine.
+		if platformDashboardApp(app) {
+			handlePlatformAccountDeletion(w, r, app)
+			return
+		}
 		if accountSettingsDisabled(w, r, app) {
 			return
 		}
@@ -654,7 +684,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
 			return
 		}
-		r.ParseForm()
+		parseSettingsForm(w, r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return
@@ -675,6 +705,10 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		// Every framework credential and identifier goes, atomically; the
 		// row is left as a non-login tombstone (deleteOwnAccount).
 		if err := deleteOwnAccount(app, session); err != nil {
+			if errors.Is(err, errLastDurableAdmin) {
+				settingsRedirect(w, r, app, "You are this app's last admin. Make another account an admin first, then delete this one.")
+				return
+			}
 			log.Printf("settings: account deletion for user %d: %v", session.UserID, err)
 			settingsRedirect(w, r, app, "Unable to delete the account")
 			return
@@ -697,6 +731,25 @@ func directoryUserRow(session *Session, userID int64, row map[string]any) map[st
 		delete(row, "password_change_required")
 	}
 	return row
+}
+
+// userDirectoryScopeResource is the scope a scoped credential must carry to
+// read /api/_auth/users and /{id}: the directory's own access: key, so
+// `_benmore_users:read` (or `*:read`).
+const userDirectoryScopeResource = "_benmore_users"
+
+// requireUserDirectoryScope applies checkScope's narrowing to the user
+// directory, which lists people (email, name, role) and has no app table for
+// auto-CRUD to narrow. Like notifications it checks the CREDENTIAL's own
+// scopes: role scope lists name app tables, never the directory, whose role
+// gate is its access: rule (buildUserListQuery, canSeeUser). Unscoped
+// credentials and ordinary sign-ins pass unchanged.
+func requireUserDirectoryScope(w http.ResponseWriter, session *Session) bool {
+	if !scopedCredential(session) || checkScope(&Session{Scopes: session.CredentialScopes}, userDirectoryScopeResource, "read") == nil {
+		return true
+	}
+	httpJSON(w, http.StatusForbidden, map[string]any{"error": "scope denied: this credential does not have " + userDirectoryScopeResource + ":read permission, which the user directory requires of a scoped API token or session"})
+	return false
 }
 
 // userDirectoryMode returns the effective access mode for the
@@ -880,7 +933,37 @@ func canSeeUser(app *App, session *Session, mode string, targetID int64) bool {
 
 // settingsRedirect redirects to the settings page with an error or success message.
 // Messages prefixed with "success:" are passed as ?success=, others as ?error=.
+// parseSettingsForm reads a settings form in either encoding a browser sends:
+// URL-encoded (an HTML form) or multipart (fetch with a FormData body).
+// r.ParseForm alone leaves a multipart body unread, so every field came back
+// empty and the dashboard's password form answered "All password fields are
+// required". Settings forms carry no files; the body is capped at 1 MiB.
+func parseSettingsForm(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		_ = r.ParseMultipartForm(1 << 20)
+		return
+	}
+	_ = r.ParseForm()
+}
+
 func settingsRedirect(w http.ResponseWriter, r *http.Request, app *App, msg string) {
+	// A page that submits with fetch and asks for JSON gets the result
+	// itself: following the redirect landed it on the app's settings path,
+	// which an app with its own account page (the dashboard's /profile) may
+	// not serve, so the form showed a 404 page as its error.
+	if wantsJSON(r) {
+		if text, ok := strings.CutPrefix(msg, "success:"); ok {
+			httpJSON(w, http.StatusOK, map[string]any{"ok": true, "message": text})
+			return
+		}
+		status := http.StatusBadRequest
+		if strings.HasPrefix(msg, "Too many") {
+			status = http.StatusTooManyRequests
+		}
+		httpJSON(w, status, map[string]any{"ok": false, "error": msg})
+		return
+	}
 	settingsPath := app.Paths.Settings
 	if strings.HasPrefix(msg, "success:") {
 		http.Redirect(w, r, settingsPath+"?success="+url.QueryEscape(strings.TrimPrefix(msg, "success:")), http.StatusSeeOther)

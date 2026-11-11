@@ -1,0 +1,37 @@
+[
+  "Inbound webhook: a payment provider posts {id, type, order_id} to POST /api/webhooks/payments. The delivery is refused unless its body is signed with the shared secret, each event id is recorded once, and a background job marks the order paid, so a redelivery does nothing twice. Customers read their own orders and cannot change them.",
+  {
+    "file": "app.yaml",
+    "content": "# Inbound webhook: a payment provider calls the app. The delivery is verified,\n# recorded once, and the order is marked paid by a background job.\nsite_name: \"Orders\"\nauth:\n  identifier: email\naccess:\n  orders: { read: self, write: admin, update: admin, delete: admin }   # customers read their own; only the job marks one paid\n  webhook_events: { all: admin }     # written only by the webhook flow"
+  },
+  {
+    "file": "schema.prisma",
+    "content": "model Order {\n  id        Int      @id @default(autoincrement())\n  item      String\n  status    String   @default(\"pending\")\n  paidAt    String   @default(\"\") @map(\"paid_at\")\n  userId    Int      @map(\"user_id\")\n  createdAt DateTime @default(now()) @map(\"created_at\")\n  @@map(\"orders\")\n}\n\nmodel WebhookEvent {\n  id         Int      @id @default(autoincrement())\n  eventId    String   @unique @map(\"event_id\")     // the provider's id: one row per event\n  kind       String\n  receivedAt DateTime @default(now()) @map(\"received_at\")\n  @@map(\"webhook_events\")\n}"
+  },
+  {
+    "file": "flows/payment-webhook.yaml",
+    "content": "# flows/payment-webhook.yaml - receive {id, type, order_id}: verify, record once, queue the work\non:\n  request:\n    method: POST\n    path: /api/webhooks/payments\n    auth: none\n    verify:                         # 401 before any step unless the body is signed\n      recipe: hmac_sha256_body\n      header: X-Signature-256\n      prefix: \"sha256=\"\n      secret: \"${{ env.PAYMENTS_WEBHOOK_SECRET }}\"\n    transaction: true               # the event row and the queued job commit together\njobs:\n  receive:\n    steps:\n      - id: event\n        run: sql\n        with: { query: \"INSERT INTO webhook_events (event_id, kind) VALUES (:id, :type) ON CONFLICT (event_id) DO NOTHING RETURNING id\" }\n      - if: ${{ !steps.event.outputs.rows }}      # a redelivery: answer 200, do nothing twice\n        run: respond\n        with: { status: 200, json: { received: true, duplicate: true } }\n      - run: enqueue\n        with:\n          flow: mark-order-paid\n          unique_key: \"payment-${{ params.id }}\"\n          with: { order_id: \"${{ params.order_id }}\" }\n      - run: respond\n        with: { status: 200, json: { received: true } }"
+  },
+  {
+    "file": "flows/mark-order-paid.yaml",
+    "content": "# flows/mark-order-paid.yaml - queued by payment-webhook.yaml; safe to run twice\non:\n  request:\n    method: POST\n    path: /api/orders/mark-paid\n    role: admin                     # the queue runs it; only an admin may call it directly\njobs:\n  mark:\n    steps:\n      - run: sql\n        expect_rows: \"=1\"           # an order id that names nothing fails the job\n        with: { query: \"UPDATE orders SET status = 'paid', paid_at = CASE WHEN paid_at = '' THEN datetime('now') ELSE paid_at END WHERE id = :order_id\" }\n      - run: respond\n        with: { status: 200, json: { paid: true } }"
+  },
+  {
+    "check": "A delivery with header `X-Signature-256: sha256=<hex HMAC-SHA256 of the raw body>` answers 200 {received:true}, stores one `webhook_events` row and queues one job; the job sets the order to `paid`. The same delivery again answers 200 {received:true, duplicate:true} and queues nothing. No signature, a signature from another secret, one over a different body or one without the `sha256=` prefix answers 401 `Invalid signature` and changes nothing. A signed-in customer's PATCH or POST on orders answers 403, and POST /api/orders/mark-paid answers 403 for anyone but an admin.",
+    "notes": [
+      "Set the secret once: `benmore env <app> set PAYMENTS_WEBHOOK_SECRET=<secret>`. While it is unset every delivery answers 401.",
+      "For Stripe, GitHub, Shopify, Slack or another Benmore app, write `verify: stripe` (or the provider's name) with a sibling `secret:`; a sender that signs a timestamp takes the `hmac_timestamp_dot_body` recipe (`verify.built_in_recipes`, `webhooks.inbound_verify`).",
+      "A verified flow reads nothing from the URL query: send every value in the signed body (`verify.signed_input`).",
+      "The job's UPDATE is safe to repeat, and `expect_rows` fails it for an order id that names no order: the failed job is listed in GET /api/_jobs for an admin.",
+      "Orders are created and changed by an admin or by your own flows; a customer who could write the row could mark it paid."
+    ],
+    "read_next": [
+      "verify.built_in_recipes",
+      "verify.failure_behavior",
+      "verify.signed_input",
+      "webhooks.inbound_verify",
+      "flows.enqueue",
+      "async-flows.retries"
+    ]
+  }
+]

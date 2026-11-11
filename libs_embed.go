@@ -3,7 +3,9 @@
 package main
 
 // Embedded JS libraries served at /_internal/* paths. Zero external CDN
-// dependencies - everything ships in the binary. The HTML stack is
+// dependencies - everything ships in the binary. Version, source and sha256
+// of every third-party file are recorded in embedded/THIRD_PARTY.json
+// (TestEmbeddedThirdPartyManifest), which also holds the update procedure. The HTML stack is
 // vanilla-first but agents who want a small library (Chart.js for
 // graphs, Alpine.js for reactive sprinkles, HTMX for declarative HTTP,
 // Lucide for icons) can pull them from /_internal/ instead of taking a
@@ -51,10 +53,10 @@ var lucideJS []byte
 // UMD standalone build - it bundles vis-data, so the page needs one script
 // tag and no import map. Exposes the `vis` global (vis.Network, vis.DataSet).
 //
-// Embedded rather than CDN-linked for the reason at the top of this file:
-// the default CSP does allowlist unpkg, so a CDN tag would work - but an
-// external runtime dependency means a page that renders only while unpkg is
-// reachable, and a third-party origin that sees every viewer's request.
+// Embedded rather than CDN-linked for the reason at the top of this file: an
+// external runtime dependency means a page that renders only while the CDN is
+// reachable, a third-party origin that sees every viewer's request, and a CDN
+// origin in the app's page CSP (csp_cdn_sources.go).
 //
 //go:embed embedded/vis-network.min.js
 var visNetworkJS []byte

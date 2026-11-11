@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+func TestEmbeddedBMErrorCapture(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "embedded/bm_error_capture_test.mjs").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "all bm error capture assertions passed") {
+		t.Fatalf("bm error capture: %v\n%s", err, out)
+	}
+}
+
 // TestEmbeddedBMSDKBehavior exercises the real runtime behavior of the
 // bm.createStore + bm.query primitives (no-op suppression, persistence
 // round-trip, concurrent-fetch dedupe, stale-time gating, optimistic mutate

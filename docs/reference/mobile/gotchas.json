@@ -1,0 +1,7 @@
+[
+  "Bundle ID auto-derives as `ai.benmore.<slug>` from the app's subdomain. Edit `capacitor.config.ts` if you want your own reverse-DNS (e.g., `com.mycompany.myapp`).",
+  "iOS Info.plist usage strings are NOT added automatically - if you install @capacitor/camera you MUST add NSCameraUsageDescription before App Store submission or Apple rejects.",
+  "Push notifications require Apple Push Notification Service (APNS) certs + Firebase Cloud Messaging (FCM) project. The framework can't automate those - they're per-app developer work. The Capacitor bridge code is one `npm install @capacitor/push-notifications` away once you have the credentials.",
+  "App Store ($99/yr Apple Developer) + Play Store ($25 one-time) accounts required for distribution.",
+  "TestFlight (Apple) gives over-the-air install to anyone after the first Xcode build - convenient way to share preview builds without re-uploading on every JS change."
+]

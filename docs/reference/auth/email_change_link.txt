@@ -1,0 +1,1 @@
+An email-change confirmation link is spent in the same transaction that changes the address. If the change fails (for example a concurrent sign-up took the address), the link stays usable until it expires; an expired link or one for an address the app now refuses is spent at once.

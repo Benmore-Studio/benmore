@@ -151,12 +151,12 @@ func mapKeys[V any](m map[string]V) []string {
 
 // writeOwnedFieldRefusal answers 403 with the documented JSON error.
 func writeOwnedFieldRefusal(w http.ResponseWriter, v *ownedFieldError) {
-	httpJSON(w, http.StatusForbidden, map[string]any{
+	httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
 		"error":   "field_owned_by_command",
 		"field":   v.Field,
 		"command": v.Command,
 		"message": "this field can only be changed by its command",
-	})
+	}, "field_owned_by_command"))
 }
 
 // respondOwnedField writes the refusal when err carries one.

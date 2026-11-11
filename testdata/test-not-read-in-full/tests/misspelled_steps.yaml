@@ -1,0 +1,7 @@
+# `step:` is not a key a test takes (`steps:` is), so the test has no steps.
+health_is_down:
+  anon: true
+  step:
+    - get: "/health"
+      expect:
+        status: 500

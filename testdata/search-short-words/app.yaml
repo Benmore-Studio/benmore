@@ -1,0 +1,3 @@
+site_name: "search-short-words"
+auth:
+  identifier: email

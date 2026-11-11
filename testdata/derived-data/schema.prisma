@@ -1,0 +1,47 @@
+// One small app for the derived-data topics: computed columns (orders, items),
+// a materialized aggregate over them, a custom field added at run time, and
+// retention (events, drafts).
+
+model Order {
+  id        Int      @id @default(autoincrement())
+  title     String
+  quantity  Int      @default(1)
+  unitPrice Float    @default(0) @map("unit_price")
+  lineTotal Float    @default(0) @map("line_total")
+  itemCount Int      @default(0) @map("item_count")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+}
+
+model Item {
+  id        Int       @id @default(autoincrement())
+  orderId   Int?      @map("order_id")
+  name      String
+  userId    Int       @map("user_id")
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+}
+
+model Event {
+  id        Int      @id @default(autoincrement())
+  title     String
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+}
+
+model Draft {
+  id        Int       @id @default(autoincrement())
+  title     String
+  userId    Int       @map("user_id")
+  expiresAt DateTime? @map("expires_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+}
+
+// Written by the on_delete hook below, so a test can show the hook did not run.
+model DeletedEvent {
+  id        Int      @id @default(autoincrement())
+  title     String
+  createdAt DateTime @default(now()) @map("created_at")
+}

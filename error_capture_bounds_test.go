@@ -22,7 +22,7 @@ func TestErrorCaptureIsBoundedAndSlackSafe(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	app := &App{Dir: t.TempDir(), DB: db, Stop: make(chan struct{})}
-	t.Cleanup(func() { close(app.Stop) })
+	t.Cleanup(func() { stopReportingTest(app) })
 	mux := http.NewServeMux()
 	RegisterErrorCaptureRoute(mux, app)
 

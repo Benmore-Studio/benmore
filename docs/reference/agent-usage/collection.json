@@ -1,0 +1,8 @@
+[
+  "The CLI incrementally scans standard Claude and Codex JSONL stores, ignores unknown record shapes, and discards any record over 1 MiB through its newline before continuing with later records.",
+  "Normal CLI startup is throttled before any telemetry request or source scan. An unknown or rotated token resolves once to the platform's stable account ID; later startups inside the account's throttle window do neither. Explicit usage sync and the Claude Stop/SessionEnd hook still perform the incremental scan. Edit-hook push commands skip telemetry work.",
+  "Uploads are monotonic and idempotent. Run detail is retained for 30 days, then rolled into monthly numeric aggregates.",
+  "Uploads send only the tail: runs that ended after the last fully-successful sync, plus a 48h overlap for clock skew and sessions still open at sync time. The high-water mark advances only when no app errored, so a failed upload stays in the next window. benmore usage sync always resends everything as the repair path.",
+  "A run is identified by (run key, provider, model) and the run key hashes the agent session only, so one session whose working directory crossed app markers is coalesced into a single run before upload: counters sum and attribution goes to the app holding the most tokens. Runs with all-zero counters are not uploaded.",
+  "An app the account no longer has - a deleted app, or a throwaway worktree app whose .benmore/app marker survived - is skipped with a named warning on stderr rather than failing the sync. Live apps in the same sync still upload."
+]

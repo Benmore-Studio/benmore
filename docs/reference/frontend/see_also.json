@@ -1,0 +1,16 @@
+[
+  "api({at:'ssr'}) - server-rendered pages: frontmatter, mustache vs gotmpl, <query>, layouts, forms, pipes",
+  "api({at:'csrf'})",
+  "api({at:'access'})",
+  "api({at:'webrtc'}) - bm.broadcast / bm.webrtc surfaces in detail",
+  "api({at:'mobile'}) - wrapping the app in a Capacitor native shell",
+  "api({at:'count'}) - bm.table().count() + ?count=true",
+  "api({at:'presence'}) - bm.presence(slug)",
+  "api({at:'cache'}) - bm.cache.namespaced / .persistent",
+  "api({at:'optimistic'}) - bm.api.optimistic()",
+  "api({at:'live-scoped'}) - bm.live.scoped()",
+  "api({at:'markdown'}) - bm.markdown(text)",
+  "api({at:'success_when'}) - reject 200-with-error-envelope upstream",
+  "api({at:'auto_memberships'}) - app.yaml shorthand for auto-enrol hooks",
+  "api({at:'recovery'}) - integrity-check / restore / delete-file"
+]

@@ -90,9 +90,24 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 		return FeaturePack{}, nil, err
 	}
 	files := map[string][]byte{}
+	// The pack's limits are enforced while reading, not after: an export
+	// runs in the router (viewer-level feature_export) and used to read every
+	// selected file whole before FeaturePackTarGzBytes refused an oversized
+	// pack. Paths are read in order so a refusal names the same file each
+	// time.
+	order := make([]string, 0, len(selected))
 	for p := range selected {
+		order = append(order, p)
+	}
+	sort.Strings(order)
+	var total int64
+	for _, p := range order {
 		if p == "" || featurePackPathProtected(p) {
 			continue
+		}
+		// feature.yaml is the pack's other entry.
+		if featurePackLimits.MaxFiles > 0 && len(files)+2 > featurePackLimits.MaxFiles {
+			return FeaturePack{}, nil, fmt.Errorf("feature pack has too many files: max %d", featurePackLimits.MaxFiles)
 		}
 		abs, err := safeFeatureJoin(dir, p)
 		if err != nil {
@@ -102,13 +117,14 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 		if err != nil {
 			return FeaturePack{}, nil, err
 		}
-		b, err := readFeaturePackSource(root, rel)
+		b, err := readFeaturePackSourceLimited(root, rel, featurePackReadLimit(total))
 		if err != nil {
 			if !explicitSelected[p] && (os.IsNotExist(err) || errors.Is(err, errTreeNotRegular) || errors.Is(err, errTreeNotDir)) {
 				continue
 			}
 			return FeaturePack{}, nil, fmt.Errorf("read selected path %s: %w", p, err)
 		}
+		total += int64(len(b))
 		files[p] = b
 		pack.Files = append(pack.Files, FeaturePackFile{Path: p, SHA256: hashBytesSHA256(b), Size: int64(len(b))})
 		if strings.HasPrefix(p, "static/") {
@@ -148,7 +164,39 @@ func ExportFeaturePackFromDir(dir string, pack FeaturePack, paths, models, flows
 // or its parent directory just before the file is opened.
 var featurePackBeforeRead = func(path string) {}
 
+// errFeaturePackTooLarge: a selected file, or the pack so far, is over the
+// pack's size limits.
+var errFeaturePackTooLarge = errors.New("feature pack size limit")
+
+// featurePackReadLimit is how many bytes the next file may have: one entry's
+// limit, or what is left of the pack's uncompressed budget if less (-1: no
+// limit configured).
+func featurePackReadLimit(total int64) int64 {
+	limit := int64(-1)
+	if entry := featurePackLimits.MaxEntryBytes; entry > 0 {
+		limit = entry
+	}
+	if max := featurePackLimits.MaxUncompressedBytes; max > 0 {
+		left := max - total
+		if left < 0 {
+			left = 0
+		}
+		if limit < 0 || left < limit {
+			limit = left
+		}
+	}
+	return limit
+}
+
 func readFeaturePackSource(top *treeDir, rel string) ([]byte, error) {
+	return readFeaturePackSourceLimited(top, rel, featurePackReadLimit(0))
+}
+
+// readFeaturePackSourceLimited reads one source file of at most limit bytes
+// (-1: unlimited). The size is judged on the opened handle before anything is
+// read and the read itself is capped, so a file that grows meanwhile cannot
+// push the reader past it either.
+func readFeaturePackSourceLimited(top *treeDir, rel string, limit int64) ([]byte, error) {
 	rel = filepath.Clean(filepath.FromSlash(rel))
 	if rel == "." || !filepath.IsLocal(rel) {
 		return nil, fmt.Errorf("invalid feature source path")
@@ -174,7 +222,24 @@ func readFeaturePackSource(top *treeDir, rel string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return io.ReadAll(f)
+	if limit < 0 {
+		return io.ReadAll(f)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > limit {
+		return nil, fmt.Errorf("%w: %s is %d bytes, %d allowed (max %d per file, %d per pack)", errFeaturePackTooLarge, filepath.ToSlash(rel), st.Size(), limit, featurePackLimits.MaxEntryBytes, featurePackLimits.MaxUncompressedBytes)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: %s grew past %d bytes while it was read", errFeaturePackTooLarge, filepath.ToSlash(rel), limit)
+	}
+	return b, nil
 }
 
 func extractPrismaModels(src string, names []string) ([]FeaturePackModel, error) {

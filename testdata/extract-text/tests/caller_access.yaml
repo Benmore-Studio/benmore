@@ -1,0 +1,122 @@
+# A request-chosen reference needs a caller who could read the `record:` row
+# through auto-CRUD: the table's read mode, the credential's read scope and
+# the per-row scope. The per-row scope alone is empty on a table with no owner
+# or tenant column (contracts, briefs), so every signed-in caller used to pass
+# there. uploads/ is not copied into the test workspace: a caller who passes
+# stops at the private read (`extract_text: unsupported_file`), and no parser
+# runs.
+
+extract_text_refuses_an_admin_only_table_for_an_ordinary_user:
+  as_user: "intruder@test.com"
+  setup:
+    - sql: "INSERT INTO contracts (id, file_url) VALUES (1, 'uploads/private/sample.pdf')"
+  steps:
+    - get: "/api/contracts/1"
+      expect:
+        status: 404
+    - api: "POST /api/contracts/1/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM contracts WHERE id = 1 AND extract_error = 'extract_text refused: the signed-in caller cannot read the `record:` row'"
+      expect:
+        rows: 1
+
+extract_text_passes_an_admin_on_an_admin_only_table:
+  as_user: "admin@test.com"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO contracts (id, file_url) VALUES (2, 'uploads/private/sample.pdf')"
+  steps:
+    - api: "POST /api/contracts/2/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM contracts WHERE id = 2 AND extract_error = 'extract_text: unsupported_file'"
+      expect:
+        rows: 1
+
+extract_text_refuses_a_role_gated_table_without_the_role:
+  as_user: "intruder@test.com"
+  setup:
+    - sql: "INSERT INTO briefs (id, file_url) VALUES (1, 'uploads/private/sample.pdf')"
+  steps:
+    - get: "/api/briefs/1"
+      expect:
+        status: 404
+    - api: "POST /api/briefs/1/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM briefs WHERE id = 1 AND extract_error = 'extract_text refused: the signed-in caller cannot read the `record:` row'"
+      expect:
+        rows: 1
+
+extract_text_passes_a_role_holder_on_a_role_gated_table:
+  as_user: "counsel@test.com"
+  as_role: "legal"
+  setup:
+    - sql: "INSERT INTO briefs (id, file_url) VALUES (2, 'uploads/private/sample.pdf')"
+  steps:
+    - get: "/api/briefs/2"
+      expect:
+        status: 200
+    - api: "POST /api/briefs/2/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM briefs WHERE id = 2 AND extract_error = 'extract_text: unsupported_file'"
+      expect:
+        rows: 1
+
+# The owner's own row, through an API token that has no read scope on
+# documents: a direct GET is refused, and so is the step.
+extract_text_refuses_a_token_without_read_scope_on_the_table:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO documents (id, file_url, user_id) VALUES (4, 'uploads/private/sample.pdf', {{user_id}})"
+  steps:
+    - api: "POST /api/_auth/api-tokens"
+      json:
+        name: "contracts only"
+        scopes: "contracts:read"
+      save:
+        scoped_token: "token"
+      expect:
+        status: 200
+    - set_auth: "{{scoped_token}}"
+    - get: "/api/documents/4"
+      expect:
+        status: 403
+    - api: "POST /api/documents/4/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM documents WHERE id = 4 AND extract_error = 'extract_text refused: the signed-in caller cannot read the `record:` row'"
+      expect:
+        rows: 1
+
+extract_text_passes_a_token_with_read_scope_on_the_table:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO documents (id, file_url, user_id) VALUES (5, 'uploads/private/sample.pdf', {{user_id}})"
+  steps:
+    - api: "POST /api/_auth/api-tokens"
+      json:
+        name: "documents reader"
+        scopes: "documents:read"
+      save:
+        scoped_token: "token"
+      expect:
+        status: 200
+    - set_auth: "{{scoped_token}}"
+    - get: "/api/documents/5"
+      expect:
+        status: 200
+    - api: "POST /api/documents/5/extract"
+      expect:
+        status: 202
+    - flush: "jobs"
+    - sql: "SELECT id FROM documents WHERE id = 5 AND extract_error = 'extract_text: unsupported_file'"
+      expect:
+        rows: 1

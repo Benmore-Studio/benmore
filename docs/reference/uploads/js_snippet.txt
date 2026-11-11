@@ -1,0 +1,17 @@
+async function upload(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('_csrf', csrf);
+  const { path } = await fetch('/api/_upload', {
+    method: 'POST',
+    body: fd,
+    credentials: 'same-origin',
+  }).then(r => r.json());
+  return path;  // '/uploads/files/<id>.png' locally, or an https URL on the media CDN
+}
+
+// Wire to a file input
+fileInput.onchange = async () => {
+  const path = await upload(fileInput.files[0]);
+  preview.src = path;
+};

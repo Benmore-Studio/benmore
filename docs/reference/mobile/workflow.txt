@@ -1,0 +1,15 @@
+# 1. Scaffold the wrapper
+benmore mobile my-app --platform both
+
+# 2. Install + add platforms (one time)
+cd ~/Benmore/my-app-mobile
+npm install
+npx cap add ios && npx cap add android
+npx cap sync
+
+# 3. Open in Xcode / Android Studio
+npx cap open ios      # Product → Run → simulator boots, loads live URL
+npx cap open android
+
+# 4. After editing capacitor.config.ts:
+npx cap sync

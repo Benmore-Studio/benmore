@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-// Incident, 2026-10-14 (fixed in benmore-go#464): the MCP
+// Incident, 2026-10-14 (since fixed): the MCP
 // connector's single and batch review pages sent `Referrer-Policy:
 // no-referrer`. A real browser then posts the approve form with
 // `Origin: null`, and appMCPBoundCSRF refused it: no person could approve any
@@ -48,16 +48,6 @@ var noReferrerFormAllowlist = map[string]string{
 	// Origin against this host, and no-referrer keeps the one-time token page's
 	// URL out of the loopback request. It posts nothing to this origin.
 	"oauth_cli_token.go:writeCLITokenHandoffPage": "cross-origin form to the CLI's loopback listener, by design",
-
-	// ServeEdgeSubdomain sets no-referrer on the served edge page (user-authored
-	// HTML on its own isolated origin, 37a). The scan links it to the password
-	// gate's `<form method="POST" action="/_paste/unlock">` only because both
-	// are reachable from the same handler: renderEdgeLockGate is a separate
-	// early-return response that sets no Referrer-Policy at all, so that form
-	// posts under the server default (strict-origin-when-cross-origin) and
-	// names its origin. The unlock POST has no CSRF origin gate either. If the
-	// gate ever starts sending no-referrer itself, this entry is wrong.
-	"edge_router.go:ServeEdgeSubdomain": "no-referrer is on the served edge page; the lock-gate form is a separate response without the header",
 }
 
 var (

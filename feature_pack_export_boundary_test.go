@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,5 +120,41 @@ func TestFeatureExportNeverReadsSwappedProtectedAliases(t *testing.T) {
 				t.Fatalf("export accepted swapped %s symlink", kind)
 			}
 		})
+	}
+}
+
+// The pack's size and file-count limits are enforced while the export reads,
+// not only when the archive is built: the router used to read every selected
+// file whole first.
+func TestFeatureExportEnforcesLimitsBeforeReading(t *testing.T) {
+	old := featurePackLimits
+	t.Cleanup(func() { featurePackLimits = old })
+	featurePackLimits.MaxEntryBytes = 64
+	featurePackLimits.MaxUncompressedBytes = 100
+	featurePackLimits.MaxFiles = 4
+
+	dir := t.TempDir()
+	writeTestFile(t, dir, "static/big.js", strings.Repeat("x", 65))
+	writeTestFile(t, dir, "static/a.js", strings.Repeat("a", 60))
+	writeTestFile(t, dir, "static/b.js", strings.Repeat("b", 60))
+	writeTestFile(t, dir, "static/c.js", "c")
+	writeTestFile(t, dir, "static/d.js", "d")
+	writeTestFile(t, dir, "static/e.js", "e")
+
+	if _, _, err := ExportFeaturePackFromDir(dir, FeaturePack{Name: "Big"}, []string{"static/big.js"}, nil, nil); !errors.Is(err, errFeaturePackTooLarge) {
+		t.Fatalf("file over the entry limit: err = %v", err)
+	}
+	if _, _, err := ExportFeaturePackFromDir(dir, FeaturePack{Name: "Total"}, []string{"static/a.js,static/b.js"}, nil, nil); !errors.Is(err, errFeaturePackTooLarge) {
+		t.Fatalf("pack over the total limit: err = %v", err)
+	}
+	if _, _, err := ExportFeaturePackFromDir(dir, FeaturePack{Name: "Many"}, []string{"static/c.js,static/d.js,static/e.js,static/a.js"}, nil, nil); err == nil || !strings.Contains(err.Error(), "too many files") {
+		t.Fatalf("pack over the file limit: err = %v", err)
+	}
+	pack, files, err := ExportFeaturePackFromDir(dir, FeaturePack{Name: "Ok"}, []string{"static/a.js,static/c.js"}, nil, nil)
+	if err != nil || len(files) != 2 || len(pack.Files) != 2 {
+		t.Fatalf("pack within limits: files=%d err=%v", len(files), err)
+	}
+	if _, err := FeaturePackTarGzBytes(pack, files); err != nil {
+		t.Fatalf("pack within limits does not archive: %v", err)
 	}
 }

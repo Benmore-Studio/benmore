@@ -1,0 +1,14 @@
+# flows/welcome-email.yaml - send an email from a flow
+on:
+  request: { path: /api/welcome, method: POST, auth: required }
+jobs:
+  welcome_email:
+    steps:
+      - id: send
+        run: email
+        with:
+          to: "${{ user.email }}"
+          subject: "Welcome!"
+          template: welcome        # resolves emails/welcome.html
+      - run: respond
+        with: { json: { ok: true } }

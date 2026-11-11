@@ -56,7 +56,7 @@ func extractID(path, table string) string {
 	return ""
 }
 
-func getUpdateFields(r *http.Request, app *App, table string) map[string]any {
+func getUpdateFields(r *http.Request, app *App, table string) (map[string]any, error) {
 	columns := prismaWriteColumns(app, table)
 	fields := make(map[string]any)
 
@@ -65,7 +65,8 @@ func getUpdateFields(r *http.Request, app *App, table string) map[string]any {
 		var body map[string]any
 		decoder := json.NewDecoder(r.Body)
 		decoder.UseNumber()
-		if err := decoder.Decode(&body); err == nil {
+		err := decoder.Decode(&body)
+		if err == nil {
 			for k, v := range body {
 				if _, declared := columns[k]; declared {
 					fields[k] = v
@@ -73,7 +74,13 @@ func getUpdateFields(r *http.Request, app *App, table string) map[string]any {
 					fields[k] = jsonToUpdateValue(v)
 				}
 			}
-			return fields
+			return fields, nil
+		}
+		// A body over the cap is not an empty update (the caller answers
+		// 413); a JSON body that does not decode still falls back to the
+		// form and query values, as it always has.
+		if _, tooLarge := requestBodyTooLarge(err); tooLarge {
+			return nil, err
 		}
 	}
 
@@ -106,7 +113,7 @@ func getUpdateFields(r *http.Request, app *App, table string) map[string]any {
 		}
 	}
 
-	return fields
+	return fields, nil
 }
 
 // jsonToUpdateValue retains an explicit JSON null as SQL NULL. Non-null
@@ -190,6 +197,31 @@ func queryInt(r *http.Request, key string, defaultVal int) int {
 	return n
 }
 
+// httpError answers a refusal as a JSON {"error": msg} body. It wrote Go's
+// text/plain http.Error body, so the auto-CRUD routes (and the other API
+// routes that use it) answered some refusals as JSON and others - a
+// single-row 404, a CSRF refusal, a missing id - as text, and a client's
+// res.json() failed on those (Round 2 B15).
+//
+// A sentence that means the same on every route (a CSRF refusal, a scope
+// denial) also carries `docs`, the address of the reference key that states
+// its rule (refusalTextDocs, refusal_docs.go).
 func httpError(w http.ResponseWriter, msg string, code int) {
-	http.Error(w, msg, code)
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Set("X-Content-Type-Options", "nosniff")
+	body := map[string]any{"error": msg}
+	if at := refusalTextDocs(msg); at != "" {
+		body["docs"] = at
+	}
+	httpJSON(w, code, body)
+}
+
+// httpRefusal is httpError for a refusal whose rule the route knows: the
+// body carries `docs`, the address refusal_docs.go lists under name.
+func httpRefusal(w http.ResponseWriter, msg string, code int, name string) {
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Set("X-Content-Type-Options", "nosniff")
+	httpJSON(w, code, withRefusalDocs(map[string]any{"error": msg}, name))
 }

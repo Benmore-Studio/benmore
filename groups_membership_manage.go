@@ -145,7 +145,7 @@ func membershipOwnRow(q rowQuerier, app *App, session *Session, id any) bool {
 func membershipRowTenant(app *App, row map[string]any) string {
 	for col, v := range row {
 		if identIs(col, app.Group.Key) && v != nil {
-			return fmt.Sprint(v)
+			return valueText(v)
 		}
 	}
 	return ""
@@ -162,6 +162,61 @@ func membershipCreateDenial(q rowQuerier, app *App, table string, session *Sessi
 		return nil
 	}
 	return &membershipManageError{table: table}
+}
+
+// membershipIdentityError refuses a create that names someone else through a
+// groups.user_field the create never reads from the request.
+type membershipIdentityError struct{ table, field string }
+
+func (e *membershipIdentityError) Error() string {
+	return fmt.Sprintf("%s.%s names the member, and this create can only add the caller, so nothing was created. Add other members with an invitation or a flow that checks who is asking: see api(at:\"scoping\"), membership_management", e.table, e.field)
+}
+
+// membershipNamedIdentityDenial is the one rule for every create path. When
+// groups.user_field is protected (user_id), a create fills it from the caller,
+// so a request naming someone else would answer success with a membership row
+// for the caller while the app believes that person joined. member is the
+// value the row would get; submitted is the request's fields (a form's values
+// as []string). Empty values name nobody. A writable user_field (an email
+// column, which is how an invite row names someone) is not affected.
+func membershipNamedIdentityDenial(app *App, table string, member any, hasMember bool, submitted map[string]any) error {
+	if app == nil || app.Group == nil {
+		return nil
+	}
+	g := app.Group
+	if g.Table == "" || g.UserField == "" || !identIs(table, g.Table) || !protectedCreateFields(app, table).has(g.UserField) {
+		return nil
+	}
+	own := ""
+	if hasMember {
+		own = valueText(member)
+	}
+	for key, value := range submitted {
+		if !identIs(key, g.UserField) || value == nil {
+			continue
+		}
+		values, isForm := value.([]string)
+		if !isForm {
+			values = []string{valueText(value)}
+		}
+		for _, text := range values {
+			if text = strings.TrimSpace(text); text != "" && text != own {
+				return &membershipIdentityError{table: table, field: g.UserField}
+			}
+		}
+	}
+	return nil
+}
+
+// membershipCreateIdentityDenial applies the rule to a session's create. An
+// anonymous caller has no identity to name, so any value names someone else.
+func membershipCreateIdentityDenial(app *App, table string, session *Session, submitted map[string]any) error {
+	var member any
+	hasMember := false
+	if app != nil && app.Group != nil && session != nil {
+		member, hasMember = groupMemberValue(app.Group, session)
+	}
+	return membershipNamedIdentityDenial(app, table, member, hasMember, submitted)
 }
 
 // membershipUpdateDenial gates a generic CRUD update of membership row `row`
@@ -218,7 +273,7 @@ func membershipRowControlDenied(app *App, table, id string, session *Session) bo
 		if b, ok := tenant.([]byte); ok {
 			rowTenant = string(b)
 		} else {
-			rowTenant = fmt.Sprint(tenant)
+			rowTenant = valueText(tenant)
 		}
 	}
 	return !membershipTenantAdmin(app.DB, app, session, rowTenant)
@@ -230,7 +285,7 @@ func membershipInactiveValue(v any) bool {
 	if v == nil {
 		return true
 	}
-	switch strings.ToLower(fmt.Sprint(v)) {
+	switch strings.ToLower(valueText(v)) {
 	case "", "0", "false", "no", "off":
 		return true
 	}

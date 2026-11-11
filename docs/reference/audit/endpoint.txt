@@ -1,0 +1,1 @@
+GET /api/_audit?table=&user_id=&row_id=&action=  (admin only)

@@ -15,19 +15,25 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
+
+// readAppConfigFile reads an app's configuration file: plainly in the app's
+// own process, and through checked opens (readForeignAppFile, which refuses a
+// link) in a process that does not own dir. The router's source view read
+// app.yaml's groups, roles and access sections with os.ReadFile, so an
+// app.yaml linked to another app's handed it that app's rules.
+func readAppConfigFile(dir, name string) ([]byte, error) {
+	if foreignAppDirs.Load() {
+		return readForeignAppFile(dir, name)
+	}
+	return os.ReadFile(filepath.Join(dir, name))
+}
 
 // Missing optional files disable a feature. Unreadable files and malformed
 // replacements must never be mistaken for intentional removal.
 func readOptionalConfig(dir, name string) ([]byte, error) {
-	var data []byte
-	var err error
-	if foreignAppDirs.Load() {
-		data, err = readForeignAppFile(dir, name)
-	} else {
-		data, err = os.ReadFile(filepath.Join(dir, name))
-	}
+	data, err := readAppConfigFile(dir, name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -308,12 +314,18 @@ type runtimeConfig struct {
 	paths             *AuthPaths
 	mcp               *AppMCPManifest
 	mcpWithheld       string // why mcp.yaml's connector is off for this generation; "" when loaded or absent
-	design            *DesignConfig
-	backup            *BackupConfig
-	hooks             *HookConfig
-	flows             []Flow
-	workflows         *WorkflowConfig
-	cron              *CronConfig
+	mcpUnbound        string // command flows loaded unexposed because no mcp.yaml binds them; "" otherwise
+	// mcpToolProblems names each file tool whose groups or schema requirement
+	// the reviewed source does not meet. A strict load refuses the first
+	// (reviewRefusal); a served load keeps the connector, logs them, and the
+	// tool answers denied when called.
+	mcpToolProblems []string
+	design          *DesignConfig
+	backup          *BackupConfig
+	hooks           *HookConfig
+	flows           []Flow
+	workflows       *WorkflowConfig
+	cron            *CronConfig
 }
 
 // appMCPReviewStaleError: mcp.yaml's review does not bind the current source
@@ -340,10 +352,13 @@ func loadRuntimeConfig(dir string) (*runtimeConfig, error) {
 // mcp.yaml review withholds only the connector: the app loads from disk like
 // an app without mcp.yaml, its command flows stay loaded (they run only
 // through the connector, and still guard the fields they own), and the
-// connector stays off until the source is reviewed again. Any other mcp.yaml
-// error, including a source set that can't be fingerprinted, still refuses
-// the load. Returned values, including deliberate nils,
-// are the ones published.
+// connector stays off until the source is reviewed again. Command flows with
+// no mcp.yaml at all (a first connector before its manifest is written, or
+// one whose mcp.yaml was removed) load the same way, unexposed: refusing them
+// refused the reload that has to migrate the schema before that manifest can
+// be written, and the restart after it. Any other mcp.yaml error, including a
+// source set that can't be fingerprinted, still refuses the load. Returned
+// values, including deliberate nils, are the ones published.
 func loadServedRuntimeConfig(dir string) (*runtimeConfig, error) {
 	data, err := readOptionalConfig(dir, "mcp.yaml")
 	if err != nil {
@@ -351,24 +366,94 @@ func loadServedRuntimeConfig(dir string) (*runtimeConfig, error) {
 	}
 	c, err := stageRuntimeConfig(dir, data, false)
 	var stale *appMCPReviewStaleError
-	if !errors.As(err, &stale) {
-		return c, err
+	var unbound *appMCPUnboundCommandError
+	switch {
+	case errors.As(err, &stale):
+		c, err = stageRuntimeConfig(dir, nil, true)
+		if err != nil {
+			return nil, err
+		}
+		c.mcpWithheld = stale.Error()
+		return c, nil
+	case data == nil && errors.As(err, &unbound):
+		c, err = stageRuntimeConfig(dir, nil, true)
+		if err != nil {
+			return nil, err
+		}
+		c.mcpUnbound = appMCPUnboundCommandsNotice(c.flows)
+		return c, nil
 	}
-	c, err = stageRuntimeConfig(dir, nil, true)
-	if err != nil {
-		return nil, err
+	return c, err
+}
+
+// appMCPUnboundCommandError: a command flow is declared and no mcp.yaml binds
+// it. The strict loaders (review, inspect, archive checks) refuse it; a served
+// load keeps the command unexposed (loadServedRuntimeConfig).
+type appMCPUnboundCommandError struct{ name string }
+
+func (e *appMCPUnboundCommandError) Error() string {
+	return fmt.Sprintf("flows: command %q requires an mcp.yaml binding", e.name)
+}
+
+// appMCPUnboundCommandsNotice names the command flows a load keeps without a
+// connector, for the load log and the upgrade check.
+func appMCPUnboundCommandsNotice(flows []Flow) string {
+	var names []string
+	for _, flow := range flows {
+		if flow.Command != nil || flow.Trigger.Type == "command" {
+			names = append(names, flow.Name)
+		}
 	}
-	c.mcpWithheld = stale.Error()
-	return c, nil
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("command flow(s) %s loaded without an mcp.yaml binding: no connector serves them, so they cannot run until a reviewed mcp.yaml binds them (`benmore mcp review <appdir> --reviewed`, then push mcp.yaml)", strings.Join(names, ", "))
 }
 
 // Stage a reviewed replacement without publishing it or opening app data.
+// Strict, like loadRuntimeConfig: review, check, inspect, the mcp.yaml write
+// gate and archive checks all come through here.
 func loadRuntimeConfigWithManifest(dir string, data []byte) (*runtimeConfig, error) {
-	return stageRuntimeConfig(dir, data, false)
+	c, err := stageRuntimeConfig(dir, data, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.reviewRefusal(dir); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// reviewRefusal is what a strict load refuses on top of a served one: a
+// manifest whose tools the reviewed source cannot run. A served load keeps
+// such a manifest so an app that was reviewed before a check existed keeps
+// its connector and its other tools (the affected tool refuses when called):
+//
+//   - a file tool whose groups or schema requirement is unmet
+//     (mcpToolProblems; the tool answers denied);
+//   - command SQL that calls a function the command authorizer refuses
+//     (app_mcp_command_sql_functions.go; the statement fails with the final
+//     code invalid_declaration).
+func (c *runtimeConfig) reviewRefusal(dir string) error {
+	if c == nil || c.mcp == nil {
+		return nil
+	}
+	if len(c.mcpToolProblems) > 0 {
+		return errors.New(c.mcpToolProblems[0])
+	}
+	return appMCPCheckCommandSQLFunctions(func(name string) ([]byte, error) { return c.schemaSource(dir, name) }, c.flows, c.mcp)
+}
+
+// appMCPToolProblemsNotice is the load-log and upgrade-check line for the
+// tools a served load keeps although review would refuse them.
+func appMCPToolProblemsNotice(problem string) string {
+	return problem + " (the connector stays on and this tool refuses every call; fix the source, then run `benmore mcp review <appdir> --reviewed` and push mcp.yaml)"
 }
 
 // stageRuntimeConfig stages configuration with data as the mcp.yaml bytes.
-// withheld loads an app whose present mcp.yaml was set aside (data is nil).
+// withheld loads an app with no connector (data is nil) whose command flows
+// stay loaded but unexposed: its present mcp.yaml was set aside, or it has
+// none to bind them.
 func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig, error) {
 	c := &runtimeConfig{}
 	var err error
@@ -387,6 +472,7 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 			return nil, &appMCPReviewStaleError{fmt.Errorf("mcp.yaml: reviewed contract or execution digest mismatch (source changed since its last review; review it and run `benmore mcp review <appdir> --reviewed`, or delete mcp.yaml if the app serves no connector)")}
 		}
 		c.mcp.sourceHashes = sources
+		c.mcp.sourceVersion = capturedSourceVersion(sources)
 		c.sourceFiles = captured
 	}
 	readConfig := func(name string) ([]byte, error) {
@@ -407,6 +493,12 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 	raw, backup, err := parseAppConfigDocument(appData)
 	if err != nil {
 		return nil, err
+	}
+	if msg := complianceAppYAMLProblem(raw); msg != "" {
+		return nil, errors.New(msg)
+	}
+	if msg := idleTimeoutAppYAMLProblem(raw); msg != "" {
+		return nil, errors.New(msg)
 	}
 	if raw != nil {
 		c.design = designFromAppYAML(raw)
@@ -432,7 +524,7 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 	if c.mcp == nil && !withheld {
 		for _, flow := range c.flows {
 			if flow.Command != nil || flow.Trigger.Type == "command" {
-				return nil, fmt.Errorf("flows: command %q requires an mcp.yaml binding", flow.Name)
+				return nil, &appMCPUnboundCommandError{flow.Name}
 			}
 		}
 	}
@@ -522,13 +614,10 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 		if err != nil {
 			return nil, err
 		}
-		if err := validateAppMCPFileColumnBindings(c.mcp, definitions); err != nil {
-			return nil, err
-		}
-		if err := validateAppMCPBindingsForTables(c.mcp, c.flows, eligibleCRUDTables(definitions), parseRolesConfig(appData)); err != nil {
-			return nil, err
-		}
-		if err := validateAppMCPDeclaredSources(dir, c.mcp); err != nil {
+		// Groups and encrypted fields come from the captured sources, like
+		// everything else a reviewed connector is checked against.
+		c.mcpToolProblems, err = validateAppMCPSourceBindings(dir, c.mcp, c.flows, definitions, parseRolesConfig(appData), parseGroupConfig(appData), parseEncryptedFieldsConfig(encData, appData))
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -540,6 +629,7 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 		return nil, fmt.Errorf("app.yaml: %w", err)
 	}
 	c.wsRooms = parseWSRooms(appData)
+	logUnusableWSRoomPatterns(c.wsRooms)
 	data, err = readConfig("validators.yaml")
 	if err != nil {
 		return nil, err
@@ -562,60 +652,24 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 	if err != nil {
 		return nil, err
 	}
-	var computedDocument map[string]any
-	if err := decodeConfigYAML(data, &computedDocument); err != nil {
-		return nil, fmt.Errorf("computed.yaml: %w", err)
-	}
-	emptyComputedList := false
-	if fields, present := computedDocument["fields"]; present {
-		entries, ok := fields.([]any)
-		if fields != nil && !ok {
-			if _, nested := fields.(map[string]any); !nested {
-				return nil, fmt.Errorf("computed.yaml: fields must be a list or nested mapping")
-			}
-		}
-		emptyComputedList = (fields == nil || ok) && len(entries) == 0
-		for _, entry := range entries {
-			field, ok := entry.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("computed.yaml: field must be a mapping")
-			}
-			for _, key := range []string{"table", "column"} {
-				value, ok := field[key].(string)
-				if !ok || strings.TrimSpace(value) == "" {
-					return nil, fmt.Errorf("computed.yaml: field requires %s", key)
-				}
-			}
-		}
-	}
-	if !emptyComputedList {
-		c.computed = parseComputedFieldsYAML(data)
-		if len(computedDocument) != 0 && c.computed == nil {
-			return nil, fmt.Errorf("computed.yaml: invalid computed fields")
-		}
+	// The file's shape, as the write gate checks it too (computed_document.go).
+	c.computed, err = checkComputedDocument(data)
+	if err != nil {
+		return nil, err
 	}
 	data, err = readConfig("retention.yaml")
 	if err != nil {
 		return nil, err
 	}
-	var retentionDocument retentionFileConfig
-	if err := decodeConfigYAML(data, &retentionDocument); err != nil {
+	// One reader for the load, the sweep and the write gate
+	// (retention_document.go). The load refuses what it always has; a policy
+	// with any other problem does not run and is logged (logRetentionProblems).
+	retentionDocument, err := parseRetentionDocument(data)
+	if err != nil {
 		return nil, fmt.Errorf("retention.yaml: %w", err)
 	}
-	for _, policy := range retentionDocument.Policies {
-		if strings.TrimSpace(policy.Table) == "" || parseTTLDuration(policy.TTL) <= 0 {
-			return nil, fmt.Errorf("retention.yaml: policy requires table and positive ttl")
-		}
-		// table and (when set) column are spliced into the DELETE the
-		// retention worker runs; a plain identifier only.
-		if err := configIdentError("retention.yaml: policy table", strings.TrimSpace(policy.Table)); err != nil {
-			return nil, err
-		}
-		if col := strings.TrimSpace(policy.Column); col != "" {
-			if err := configIdentError("retention.yaml: policy column", col); err != nil {
-				return nil, err
-			}
-		}
+	if err := retentionDocument.loadError(); err != nil {
+		return nil, err
 	}
 	c.encrypted = parseEncryptedFieldsConfig(encData, appData)
 	return c, nil
@@ -636,8 +690,8 @@ func (c *runtimeConfig) schemaSource(dir, name string) ([]byte, error) {
 	}
 	return data, nil
 }
-func (c *runtimeConfig) loadSchema(db *sql.DB, dir string) ([]Table, []string, error) {
-	return loadSchemaWithReader(db, dir, func(name string) ([]byte, error) { return c.schemaSource(dir, name) }, c.mcp != nil)
+func (c *runtimeConfig) loadSchema(ctx context.Context, db *sql.DB, dir string, checkOnly bool) ([]Table, []string, error) {
+	return loadSchemaWithReaderCtx(ctx, db, dir, func(name string) ([]byte, error) { return c.schemaSource(dir, name) }, c.mcp != nil, checkOnly)
 }
 func (c *runtimeConfig) annotateFullText(dir string, tables []Table) {
 	data, err := c.schemaSource(dir, "schema.prisma")

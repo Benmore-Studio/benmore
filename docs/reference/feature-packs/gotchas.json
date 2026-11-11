@@ -1,0 +1,8 @@
+[
+  "Feature packs install code and schema shape, not seed data. Add test/demo rows separately through normal app APIs.",
+  "An installed pack's flows are new HTTP routes with the pack's own auth/role gates; review them in the dry-run like any source change. The curated notify-hub `POST /api/notify-hub/broadcast` requires `role: admin` because it writes into every verified user's inbox.",
+  "Env refs in `feature.yaml` are names only. Set values with `benmore env set`, scoped to shared/dev/prod as needed.",
+  "`benmore clone` and `benmore feature clone` read a source app from the instance `--source-env` names and install into the instance `--target-env` names (each dev or prod); `--env` sets both, and one that is not given follows the `benmore use` pin, else the app's default instance. `benmore feature install` uses the target one. `--name NAME` names the pack built from a source app or directory (default: `<source> Clone`); it has no effect on a pack file or a curated pack.",
+  "Use `--route-prefix` and `--model-prefix` for broad namespace moves; use `--route-map` and `--model-map` for specific route/model collisions in mature apps.",
+  "Installed `static/*.tsx` files are feature modules. Import/link them from the target app shell or add a host `static/*.html` page when you want a clean navigable route; install does not rewrite an existing app's nav automatically."
+]

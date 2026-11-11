@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-sms
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - run: sms
+        with: { to: "+15555550100", body: hi }
+      - run: respond
+        with: { json: { ok: true } }

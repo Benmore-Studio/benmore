@@ -1,0 +1,3 @@
+# A test with no steps checks nothing.
+nothing_to_run:
+  as_user: "owner@test.com"

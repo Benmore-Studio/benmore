@@ -7,4 +7,4 @@ This package intentionally contains no CLI and no dependencies.
 
 Run `benmore bootstrap` after native installation. The shared Codex/Claude skill
 is installed by the CLI, not this npm package. See the
-[harness guide](../../docs/agent/harness.md) for discovery and explicit pushes.
+[harness guide](https://github.com/Benmore-Studio/benmore/blob/main/docs/agent/harness.md) for discovery and explicit pushes.

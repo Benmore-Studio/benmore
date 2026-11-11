@@ -1,0 +1,6 @@
+{
+  "0": "local deployable source matches the deployed manifest",
+  "1": "non-conflicting drift exists (local-only, remote-only, local_changed, remote_changed, or deletes)",
+  "2": "conflicts exist; push/delete/deploy should block by default",
+  "3": "setup/auth/remote error"
+}

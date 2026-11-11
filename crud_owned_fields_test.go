@@ -264,8 +264,8 @@ func TestCommandOwnedFieldsImportModeARefusesOwnedColumns(t *testing.T) {
 	}
 	// NDJSON ignores unknown keys, but an owned key must fail the load, in the
 	// first object and mid-stream.
-	check := func(keys []string) error {
-		if v := ownedFieldViolation(app, "products", keys...); v != nil {
+	check := func(obj map[string]any) error {
+		if v := ownedFieldViolation(app, "products", mapKeys(obj)...); v != nil {
 			return v
 		}
 		return nil
@@ -274,14 +274,14 @@ func TestCommandOwnedFieldsImportModeARefusesOwnedColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := nd.(*ndjsonSource).refuseKeys(check); err == nil {
+	if err := nd.(*ndjsonSource).refuseObjects(check); err == nil {
 		t.Fatal("NDJSON first object with an owned key was accepted")
 	}
 	nd, _, err = newNDJSONSource(strings.NewReader(`{"sku":"a"}`+"\n"+`{"sku":"b","qty":2}`+"\n"), cols)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := nd.(*ndjsonSource).refuseKeys(check); err != nil {
+	if err := nd.(*ndjsonSource).refuseObjects(check); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := nd.Next(); err != nil {

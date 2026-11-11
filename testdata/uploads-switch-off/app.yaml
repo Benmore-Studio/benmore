@@ -1,0 +1,5 @@
+site_name: "uploads-switch-off fixture"
+auth:
+  identifier: email
+features:
+  uploads: false

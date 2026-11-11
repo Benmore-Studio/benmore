@@ -14,13 +14,14 @@ func newWorkflowTimeoutApp(t *testing.T) (*App, *Workflow) {
 	app.Stop = make(chan struct{})
 	EnsureJobsTable(app.DB)
 	EnsureAuditLogTable(app.DB)
+	EnsureWebhooksTable(app.DB)
 	mustExec(t, app.DB, "CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT, updated_at DATETIME)")
 	app.Tables = []Table{{Name: "orders", Columns: []Column{{Name: "id"}, {Name: "status"}, {Name: "updated_at"}}}}
 	wf := &Workflow{
 		Name: "orders", Table: "orders", Field: "status", Initial: "shipped",
 		States:       []string{"shipped", "delivered"},
 		Transitions:  map[string]map[string]Transition{"shipped": {"delivered": {}}},
-		OnTransition: map[string][]Hook{"delivered": {{SQL: "SELECT 1"}}},
+		OnTransition: map[string][]Hook{"delivered": {{Webhook: "https://example.com/hook"}}},
 		Timeouts:     map[string]WorkflowTimeout{"shipped": {After: time.Second, To: "delivered"}},
 	}
 	app.Workflows = &WorkflowConfig{Workflows: map[string]*Workflow{"orders": wf}}
@@ -98,5 +99,53 @@ func TestCheckWorkflowTimeoutsFiresHooksOnce(t *testing.T) {
 	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_jobs WHERE job_type = 'hook'").Scan(&hooks)
 	if hooks != 1 {
 		t.Fatalf("on_transition hook enqueued %d times, want 1", hooks)
+	}
+}
+
+// A row edited after the sweep selected it has a fresh updated_at: the
+// timeout's own transaction re-checks the deadline and leaves it alone.
+func TestWorkflowTimeoutRechecksDeadlineInTransaction(t *testing.T) {
+	app, wf := newWorkflowTimeoutApp(t)
+	mustExec(t, app.DB, "INSERT INTO orders (status, updated_at) VALUES ('shipped', datetime('now'))")
+	applied, err := applyWorkflowTimeoutDue(app, wf, "1", "shipped", "delivered", 3600)
+	if err != nil || applied {
+		t.Fatalf("apply on a row edited within the deadline = %v, %v; want not applied", applied, err)
+	}
+	mustExec(t, app.DB, "UPDATE orders SET updated_at = datetime('now', '-2 hours') WHERE id = 1")
+	applied, err = applyWorkflowTimeoutDue(app, wf, "1", "shipped", "delivered", 3600)
+	if err != nil || !applied {
+		t.Fatalf("apply past the deadline = %v, %v; want applied", applied, err)
+	}
+}
+
+// A failing timeout is retried with a doubling wait (capped), not every sweep.
+func TestWorkflowTimeoutFailureBacksOff(t *testing.T) {
+	b := &workflowTimeoutBackoffMap{m: map[workflowTimeoutKey]workflowTimeoutRetry{}}
+	k := workflowTimeoutKey{dir: "d", workflow: "w", id: "1"}
+	now := time.Unix(1_000_000, 0)
+	if b.skip(k, now) {
+		t.Fatal("an unknown row was skipped")
+	}
+	if w := b.fail(k, now); w != time.Minute {
+		t.Fatalf("first wait = %s, want 1m", w)
+	}
+	if !b.skip(k, now.Add(30*time.Second)) || b.skip(k, now.Add(61*time.Second)) {
+		t.Fatal("the row was not skipped for exactly its wait")
+	}
+	var w time.Duration
+	for i := 0; i < 10; i++ {
+		w = b.fail(k, now)
+	}
+	if w != workflowTimeoutMaxBackoff {
+		t.Fatalf("wait after many failures = %s, want the cap", w)
+	}
+	b.clear(k)
+	if b.skip(k, now) {
+		t.Fatal("a cleared row is still skipped")
+	}
+	b.fail(k, now)
+	b.prune(now.Add(4 * time.Hour))
+	if len(b.m) != 0 {
+		t.Fatal("prune kept a long-stale entry")
 	}
 }

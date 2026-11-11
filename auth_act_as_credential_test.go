@@ -47,10 +47,10 @@ func actAsCredentialApp(t *testing.T) (*App, *http.ServeMux) {
 	return app, mux
 }
 
-// Step-in is stored on the session row. An API token (or an edge identity)
-// has no row, so the UPDATE matched nothing, yet the endpoint answered
-// "acting_as": a tool that stepped in to work as one tenant kept the
-// cross-tenant bypass and read or wrote every tenant's rows.
+// Step-in is stored on the session row. An API token has no row, so the
+// UPDATE matched nothing, yet the endpoint answered "acting_as": a tool that
+// stepped in to work as one tenant kept the cross-tenant bypass and read or
+// wrote every tenant's rows.
 func TestActAsRefusesCredentialsWithoutASessionRow(t *testing.T) {
 	app, mux := actAsCredentialApp(t)
 	hash, err := generateBcryptHash([]byte("Admin!Pass1"))

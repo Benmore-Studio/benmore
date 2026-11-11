@@ -37,7 +37,7 @@ func TestConfirmationPagesRefuseFraming(t *testing.T) {
 	app.Design = &DesignConfig{Auth: map[string]string{}, SEO: map[string]string{}, CSP: map[string]string{"frame_ancestors": "*"}}
 	serve := func(h http.HandlerFunc, r *http.Request) http.Header {
 		w := httptest.NewRecorder()
-		applySecurityHeaders(w, false, app) // what the app-wide middleware sets first
+		applySecurityHeaders(w, nil, false, app) // what the app-wide middleware sets first
 		h(w, r)
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s: status %d", r.URL.Path, w.Code)
@@ -70,7 +70,7 @@ func TestConfirmationPagesRefuseFraming(t *testing.T) {
 
 	// Control: an ordinary response of the same app keeps the app's policy.
 	w := httptest.NewRecorder()
-	applySecurityHeaders(w, false, app)
+	applySecurityHeaders(w, nil, false, app)
 	if framingDenied(w.Header()) {
 		t.Fatal("control: the app-wide policy already denies framing, so this test proves nothing")
 	}

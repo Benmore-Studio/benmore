@@ -1,0 +1,1 @@
+A write-gate or `benmore check` refusal of a flow file names the file written (`flows/v1ping.yaml: path "/api/_ping" collides with the framework's reserved prefix "/api/_"`).

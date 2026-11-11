@@ -1,0 +1,31 @@
+version: 1
+execution_sources: runtime
+connector: {id: static-paths-fixture, name: Static paths fixture, version: '1'}
+contract_digest: 844b4b7efc18ab96346eb6bbbc6ea83682f3520886e4baefec8deb614a966fc8
+execution_digest: de05a1c5fca4af68a35a71e566ab2f29afec6afcb1949d41ffd21774df56c695
+tools:
+  - name: list_notes
+    description: Read your notes
+    handler: {kind: native, operation: table.list, table: notes}
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        page: {type: integer, minimum: 1}
+        per_page: {type: integer, minimum: 1, maximum: 500}
+    output_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        id: {type: integer}
+        title: {type: string}
+        body: {type: string}
+    permissions: [notes:read]
+    effect: read
+    approval: none
+    idempotency: none
+    reconciliation: none
+    output: {include: [id, title, body]}
+    component: none
+resources: []
+connections: []

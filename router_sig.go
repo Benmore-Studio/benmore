@@ -16,9 +16,10 @@ package main
 // The target app is bound implicitly: every instance (each tenant, prod and
 // dev separately) has its own secret, which the router writes and hands to
 // that instance alone, so a request the router signed for tenant A never
-// verifies at tenant B and replaying it there gains nothing. _platform shares
-// the router's own secret, which no tenant holds. Signing the subdomain too
-// would add no protection.
+// verifies at tenant B and replaying it there gains nothing. The _platform
+// dashboard signs with its own secret too once it has one (Phase 2,
+// platform_dashboard_account.go); before that it shares the router's own,
+// which no tenant holds. Signing the subdomain too would add no protection.
 //
 // Signatures are REQUIRED by default (the router has signed since before this
 // default changed, and router and apps ship the same binary). An operator

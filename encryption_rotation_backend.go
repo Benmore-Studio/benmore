@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func captureLocalRotationBackend(ctx context.Context, lease *appMCPAuthorityLease, oldSource, newSource string) (*appRotationBackendSnapshot, error) {

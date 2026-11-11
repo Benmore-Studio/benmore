@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "summary",
+    "endpoints",
+    "sdk_methods",
+    "livestream_js_snippet",
+    "peer_mesh_js_snippet",
+    "auth",
+    "gotchas",
+    "app_yaml_example",
+    "see_also"
+  ]
+}

@@ -163,33 +163,57 @@ func (s *pdfSandbox) tunnel(w http.ResponseWriter, r *http.Request) {
 // pdfChromeArgs is the headless Chrome command line for one sandboxed
 // render.
 func pdfChromeArgs(proxyAddr, docURL, pdfPath, profileDir string) []string {
-	return []string{
+	return append(append([]string{}, chromeKeychainFreeArgs...),
 		"--headless=new",
 		"--disable-gpu",
+		// Current Chrome already refuses SwiftShader without
+		// --enable-unsafe-swiftshader; older releases fell back to it under
+		// --disable-gpu, and its shader JIT cannot run under the units'
+		// MemoryDenyWriteExecute. The GPU process then only composites in
+		// software, which is all printing needs.
+		"--disable-software-rasterizer",
 		"--no-sandbox",
+		// Without this, every renderer, GPU and utility process is forked
+		// by Chrome's zygote, which drops capabilities in each child with
+		// capset(2) and aborts when that fails (credentials.cc,
+		// ForkAndDropCapabilitiesInChild). The hosted units deny capset
+		// (SystemCallFilter=~@privileged, EPERM), so every child died and
+		// Chrome exited with "GPU process isn't usable". With --no-zygote
+		// (allowed only with --no-sandbox) the browser starts each child
+		// with a plain fork and exec and needs no call the units refuse.
+		// The children hold no capabilities to drop: the units' bounding
+		// set is empty.
+		"--no-zygote",
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-extensions",
 		"--disable-sync",
 		"--disable-background-networking",
 		"--disable-component-update",
-		// This disposable profile needs no OS password store. Match the
-		// browser allocator defaults so a private HOME cannot prompt for a
+		// Hosted app units run with MemoryDenyWriteExecute=true, which
+		// refuses every mapping that becomes executable at run time, and
+		// V8's JIT needs exactly that. Without JIT V8 interprets: page
+		// script still runs (slower), WebAssembly does not, and the render
+		// gains no executable memory a page could aim an exploit at.
+		"--js-flags=--jitless",
+		// Shared memory files go to the private /tmp, not to /dev/shm,
+		// which a service with PrivateDevices= shares with the host.
+		"--disable-dev-shm-usage",
+		// chromeKeychainFreeArgs come first: this disposable profile needs
+		// no OS password store, and a private HOME must not prompt for a
 		// user's macOS Keychain while rendering a server-owned document.
-		"--password-store=basic",
-		"--use-mock-keychain",
-		"--user-data-dir=" + profileDir,
+		"--user-data-dir="+profileDir,
 		// Everything through the sandbox proxy, loopback included.
-		"--proxy-server=http://" + proxyAddr,
+		"--proxy-server=http://"+proxyAddr,
 		"--proxy-bypass-list=<-loopback>",
 		// Chrome itself resolves nothing; only the proxy dials out.
 		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
 		// WebRTC UDP would bypass the proxy.
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
-		"--print-to-pdf=" + pdfPath,
+		"--print-to-pdf="+pdfPath,
 		docURL,
-	}
+	)
 }
 
 // pdfPolicy builds the render CSP from the same host allowlists page

@@ -1,0 +1,5 @@
+[
+  "A compute step with `id: gate` lands its return value under BOTH `${{ gate.<field> }}` and `${{ steps.gate.outputs.<field> }}` - both resolve; nested fields too (`${{ gate.result.irr }}`). `${{ gate.outputs }}` / `${{ gate }}` give the whole object.",
+  "You can ONLY reference a field the function actually RETURNED. If gate() returns `{ ok: true, roomId: 5 }` on success, `${{ gate.error }}` is unresolved (no error key) and halts the flow. Fix: have the function ALWAYS return every field it might be read by - e.g. `return { ok:false, error:'bad token', roomId:0 }` AND `return { ok:true, error:'', roomId:5 }`. Don't omit keys per branch.",
+  "To gate on a boolean result: `if: ${{ gate.ok }}` (bare boolean, truthy) or `if: ${{ gate.ok }} == false`. Use `if:`, never `when:`: a flow step has no `when:` key, and a file that uses one is refused when it is written and when the app loads its flows."
+]

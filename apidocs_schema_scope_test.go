@@ -66,3 +66,40 @@ func TestRichSchemaHonorsScopes(t *testing.T) {
 		t.Errorf("a * scope lost tables: %v", all)
 	}
 }
+
+// A field's relation named its target table even when the caller could not
+// see that table (the descriptor left the table itself out), so a notes:read
+// caller learned that payroll exists.
+func TestRichSchemaRelationNamesOnlyVisibleTables(t *testing.T) {
+	app := authzApp(t)
+	authzTable(t, app, "payroll", "CREATE TABLE payroll (id INTEGER PRIMARY KEY, user_id INTEGER, salary INTEGER)")
+	authzTable(t, app, "notes", "CREATE TABLE notes (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, payroll_id INTEGER REFERENCES payroll(id))")
+	app.Access = accessFromYAML(t, "access:\n  notes: self\n  payroll: self\n")
+	relationOf := func(s *Session) map[string]string {
+		raw, _ := json.Marshal(generateRichSchema(app, s))
+		var out struct {
+			Tables map[string]struct {
+				Fields []struct {
+					Name     string            `json:"name"`
+					Relation map[string]string `json:"relation"`
+				} `json:"fields"`
+			} `json:"tables"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range out.Tables["notes"].Fields {
+			if f.Name == "payroll_id" {
+				return f.Relation
+			}
+		}
+		t.Fatal("notes.payroll_id missing from the descriptor")
+		return nil
+	}
+	if rel := relationOf(&Session{UserID: 2, Role: "viewer", Scopes: "notes:read"}); rel != nil {
+		t.Errorf("a notes:read caller is told payroll_id points at %v", rel)
+	}
+	if rel := relationOf(&Session{UserID: 2, Role: "user"}); rel["table"] != "payroll" || rel["column"] != "id" {
+		t.Errorf("a caller who can see payroll lost the relation: %v", rel)
+	}
+}

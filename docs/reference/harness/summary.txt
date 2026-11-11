@@ -1,0 +1,1 @@
+The operating contract for Codex, Claude Code, and other agents: identify the edition, account, app and environment; inspect live contracts; push explicitly where hooks do not apply; verify effects and source synchronization.

@@ -73,7 +73,7 @@ func TestRequestSessionCache(t *testing.T) {
 
 		// An entry older than the TTL is not used.
 		holder := requestSessionHolderFor(r)
-		cred, _ := requestSessionCredential(r)
+		cred := requestSessionCredential(r)
 		holder.put(app, cred, &Session{ID: "stale", UserID: 99}, time.Now().Add(-2*requestSessionCacheTTL))
 		if s := getSession(app, r); s != nil {
 			t.Fatalf("an expired entry answered: %+v", s)
@@ -172,6 +172,7 @@ func TestAuthTablesHaveSweepIndexes(t *testing.T) {
 	for q, index := range map[string]string{
 		"DELETE FROM _benmore_sessions WHERE datetime(expires_at) < datetime('now')":          "idx_benmore_sessions_expiry",
 		"DELETE FROM _benmore_sessions WHERE user_id = 1":                                     "idx_benmore_sessions_user",
+		"DELETE FROM _benmore_sessions WHERE is_impersonation=1 AND impersonator_user_id=1":   "idx_benmore_sessions_impersonator",
 		"DELETE FROM _benmore_login_attempts WHERE attempted_at < datetime('now', '-1 hour')": "idx_login_attempts_time",
 	} {
 		if p := plan(q); !strings.Contains(p, index) {

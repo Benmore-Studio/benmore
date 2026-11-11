@@ -9,14 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
-	"time"
 )
 
 func execStepRedirect(ctx *FlowContext, step *FlowStep) error {
@@ -98,13 +100,26 @@ func flowRedirectSameOrigin(target string, r *http.Request) bool {
 		return false
 	}
 	if u.Scheme == "" && u.Host == "" && u.Opaque == "" {
-		return true
+		// http.Redirect joins a relative target onto the request path and
+		// runs path.Clean, which treats `\` as text: "/./\evil.com" or
+		// "../\evil.com" cleaned to "/\evil.com", which browsers follow as
+		// "//evil.com". No backslash in the path, and Clean cannot make a
+		// protocol-relative prefix (it folds repeated slashes).
+		return !strings.Contains(u.Path, `\`) && !strings.Contains(target[:pathEnd(target)], `\`)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if (scheme != "http" && scheme != "https") || u.Host == "" || r == nil {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSuffix(u.Hostname(), "."), flowRequestHostname(r))
+}
+
+// pathEnd is the length of target's path part: up to the first ? or #.
+func pathEnd(target string) int {
+	if i := strings.IndexAny(target, "?#"); i >= 0 {
+		return i
+	}
+	return len(target)
 }
 
 // flowRequestHostname is the request Host without its port.
@@ -163,10 +178,13 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 	if step.ServeFile == nil || step.ServeFile.Path == "" {
 		return fmt.Errorf("serve_file step missing `path:` - point at an uploaded file, e.g. path: ${{ steps.item.outputs.file_url }}")
 	}
-	raw := strings.TrimSpace(interpolateCtx(step.ServeFile.Path, ctx))
+	// The untrimmed value is what a private reference must match: a stored
+	// reference never carries surrounding space.
+	untrimmed := interpolateCtx(step.ServeFile.Path, ctx)
+	raw := strings.TrimSpace(untrimmed)
 	// Connector artifacts are served only by GET /api/_mcp/artifacts/{id}.
 	if raw == "" || appMCPArtifactStorageReference(raw) {
-		http.Error(ctx.Writer, "Not found", http.StatusNotFound)
+		httpError(ctx.Writer, "Not found", http.StatusNotFound)
 		ctx.Stopped = true
 		return nil
 	}
@@ -189,6 +207,44 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 		}
 	}
 	isCDNURL := cfg != nil && strings.HasPrefix(raw, "https://"+cfg.CDNDomain+"/")
+	// The disposition may be a template (`${{ params.dl == '1' &&
+	// 'attachment' || 'inline' }}`); anything but "attachment" serves inline.
+	// The filename may be one too (`${{ steps.doc.outputs.name }}`).
+	attachment := strings.EqualFold(strings.TrimSpace(flowValueTemplate(step.ServeFile.Disposition, ctx)), "attachment")
+	filename := strings.TrimSpace(flowValueTemplate(step.ServeFile.Filename, ctx))
+	recordID := ""
+	if step.UploadRecord != nil {
+		recordID = strings.TrimSpace(interpolateCtx(step.UploadRecord.ID, ctx))
+	}
+	if ctx.hasMissingRefs() {
+		// Write nothing: the step dispatcher answers the unresolved
+		// reference (template_unresolved) once the step returns.
+		return nil
+	}
+
+	// A private upload is served only from the reference its upload stored
+	// (the delete_upload rule: a query, fragment, space or other spelling
+	// names no stored file, and on the CDN would sign a URL the CDN
+	// refuses), and only when the caller or the step's `record:` vouches
+	// for the uploader, as /api/_signed_url requires (flows_upload_owner.go).
+	vouchedLogical := ""
+	if serveFileNamesPrivateUpload(ctx.App, raw, cfg) {
+		backend := serveFileStorage(ctx.App, cfg)
+		logical, err := privateUploadReadPath(ctx.App, backend, untrimmed)
+		if err != nil {
+			log.Printf("serve_file [%s]: refused a private upload reference that is not in its stored form: %v", filepath.Base(ctx.App.Dir), err)
+			httpError(ctx.Writer, "Not found", http.StatusNotFound)
+			ctx.Stopped = true
+			return nil
+		}
+		if why := flowPrivateUploadOwnerRefusal(ctx, step.UploadRecord, recordID, backend, logical); why != "" {
+			log.Printf("serve_file [%s]: refused %s: %s", filepath.Base(ctx.App.Dir), logical, why)
+			httpError(ctx.Writer, "serve_file: "+why, http.StatusForbidden)
+			ctx.Stopped = true
+			return nil
+		}
+		vouchedLogical = logical
+	}
 
 	// CDN backend: serve via a CloudFront redirect - SIGNED + short-TTL for
 	// private files (the flow has already authorized this request), plain
@@ -198,9 +254,24 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 	// or a logical path whose local file is absent (migrated / new upload).
 	if cfg != nil && (isCDNURL || !localExists) {
 		if url, isPrivate, ok := cdnURLForServe(ctx.App, raw, cfg); ok {
+			// A redirect cannot name the download: the CDN answers with the
+			// headers stored on the object, and a signed CloudFront URL
+			// carries response-content-disposition to the bucket only if the
+			// distribution forwards that query string, which the framework
+			// cannot check. A download is streamed through the app instead,
+			// from a short-lived signed URL that never leaves this process.
+			if attachment {
+				streamCDNDownload(ctx, cfg, url, isPrivate, filename)
+				ctx.Stopped = true
+				return nil
+			}
 			target := url
 			if isPrivate {
-				signed, err := signPrivateMediaURL(ctx.App, cfg, url, 120*time.Second)
+				// Short by default; audio/video lasts long enough to play to
+				// the end, because the player keeps range-requesting the URL it
+				// was redirected to (signedLinkTTL).
+				ttl := signedLinkTTL(url, step.ServeFile.ExpiresIn, serveFileSignTTL)
+				signed, err := signPrivateMediaURL(ctx.App, cfg, url, ttl)
 				if err != nil {
 					serverError(ctx.Writer, ctx.Request, ctx.App, "serve_file", err, "media signing unavailable")
 					ctx.Stopped = true
@@ -216,7 +287,16 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 
 	// Local-disk serve (file present on disk, or CDN not configured).
 	if !inUploads || !localExists {
-		http.Error(ctx.Writer, "Not found", http.StatusNotFound)
+		httpError(ctx.Writer, "Not found", http.StatusNotFound)
+		ctx.Stopped = true
+		return nil
+	}
+	// The bytes come from the symlink-resolved file. One that resolves into
+	// a private folder must be the private reference vouched for above, not
+	// an alias reaching it from a public path (the /uploads/ route re-checks
+	// the resolved path the same way).
+	if resolved := "uploads/" + filepath.ToSlash(localFile.relative); isPrivateUploadPath(strings.ToLower(resolved)) && resolved != vouchedLogical {
+		httpError(ctx.Writer, "Not found", http.StatusNotFound)
 		ctx.Stopped = true
 		return nil
 	}
@@ -224,26 +304,55 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 	// active content like .html/.svg even when inline is requested).
 	applyUploadFileDispositionHeaders(ctx.Writer, fullPath, localFile)
 	// Explicit attachment override (the "Download" affordance) wins. The
-	// disposition may be a template (`${{ params.dl == '1' && 'attachment'
-	// || 'inline' }}`); anything but "attachment" serves inline.
-	disposition := strings.TrimSpace(flowValueTemplate(step.ServeFile.Disposition, ctx))
-	if strings.EqualFold(disposition, "attachment") {
-		name := step.ServeFile.Filename
-		if name == "" {
-			name = filepath.Base(fullPath)
-		}
-		ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, name))
-	} else if step.ServeFile.Filename != "" {
+	// name's extension follows the stored file's (serveFileDownloadName).
+	if attachment {
+		ctx.Writer.Header().Set("Content-Disposition", serveFileContentDisposition("attachment", serveFileDownloadName(filename, filepath.Base(fullPath))))
+	} else if filename != "" {
 		// Inline with a suggested filename (only set if the safety helper
 		// left it inline - i.e. it didn't force an attachment).
 		if ctx.Writer.Header().Get("Content-Disposition") == "" {
-			ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, step.ServeFile.Filename))
+			ctx.Writer.Header().Set("Content-Disposition", serveFileContentDisposition("inline", serveFileDownloadName(filename, filepath.Base(fullPath))))
 		}
 	}
 	// Serve from the validated handle, retaining Range and cache support.
 	localFile.serveHTTP(ctx.Writer, ctx.Request)
 	ctx.Stopped = true
 	return nil
+}
+
+// serveFileDownloadName is the download name a serve_file response offers:
+// the step's `filename:` (else the stored name) cut to a safe name whose
+// extension is one of the stored file's type, run: proxy's rule
+// (proxyDownloadName). A name a user wrote into a row cannot present a CSV
+// as `page.html` or carry its own Content-Disposition parameters. "" sends
+// no name.
+func serveFileDownloadName(name, storedName string) string {
+	ext := strings.ToLower(filepath.Ext(storedName))
+	if !proxyExtensionRe.MatchString(ext) {
+		return ""
+	}
+	exts := []string{ext}
+	if mediaType, _, err := mime.ParseMediaType(mime.TypeByExtension(ext)); err == nil {
+		if known := proxyTypeExtensions[mediaType]; slices.Contains(known, ext) {
+			exts = known
+		}
+	}
+	if out := downloadNameWithExtension(proxySafeFilename(name), exts); out != "" {
+		return out
+	}
+	return downloadNameWithExtension(proxySafeFilename(storedName), exts)
+}
+
+// serveFileContentDisposition formats a Content-Disposition (RFC 6266, as
+// run: proxy sends it) with an optional download name.
+func serveFileContentDisposition(disposition, name string) string {
+	if name == "" {
+		return disposition
+	}
+	if v := mime.FormatMediaType(disposition, map[string]string{"filename": name}); v != "" {
+		return v
+	}
+	return disposition
 }
 
 func execStepDeleteUpload(ctx *FlowContext, step *FlowStep) error {
@@ -256,7 +365,23 @@ func execStepDeleteUpload(ctx *FlowContext, step *FlowStep) error {
 	if appMCPArtifactStorageReference(target) {
 		return fmt.Errorf("delete_upload cannot remove connector artifact storage")
 	}
-	return deletePrivateUpload(ctx.App, target)
+	recordID := ""
+	if step.UploadRecord != nil {
+		recordID = strings.TrimSpace(interpolateCtx(step.UploadRecord.ID, ctx))
+	}
+	if ctx.hasMissingRefs() {
+		// Delete nothing: the step dispatcher reports the unresolved
+		// reference once the step returns.
+		return nil
+	}
+	// The reference must also be the caller's (or the record's) to delete,
+	// as for serve_file (flows_upload_owner.go).
+	return deletePrivateUploadAuthorized(ctx.App, target, func(backend StorageBackend, logical string) error {
+		if why := flowPrivateUploadOwnerRefusal(ctx, step.UploadRecord, recordID, backend, logical); why != "" {
+			return fmt.Errorf("delete_upload refused: %s", why)
+		}
+		return nil
+	})
 }
 
 func execStepRespond(ctx *FlowContext, step *FlowStep) error {
@@ -330,6 +455,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 			// Try the flattened path map first so dotted/indexed
 			// accesses like `stories.0`, `user.email` resolve.
 			flat := flattenData(ctx.Data)
+			overlayRequestOnlyParams(flat, ctx)
 			ctxVal, ok := flowLookup(flat, key)
 			if !ok {
 				ctxVal, ok = flowDataValue(ctx, key)
@@ -360,6 +486,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 				"unresolved_key": key,
 				"hint":           "the body template referenced {{" + key + "}} but no step produced that key. Check (a) the step that should produce it has `id: <name>` set, (b) the path matches (steps.<id>.outputs / steps.<id>.outputs.rows / steps.<id>.outputs[0]), (c) the step actually ran (no prior step errored). Run describe_flows to see the resolved step list.",
 				"request_id":     recordRespondUnresolved(ctx, []string{key}),
+				"docs":           refusalDocsAt("template_unresolved", ""),
 			}
 			if keys := flowDiagnosticKeys(ctx); keys != nil {
 				envelope["available_keys"] = keys
@@ -474,6 +601,7 @@ func writeRespondUnresolved(ctx *FlowContext, missing []string) {
 		"unresolved_refs": missing,
 		"hint":            "the respond step's body referenced template variables that didn't resolve. Most common: (a) the step you reference has no `id:` set, (b) you used `${{ steps.<id>.outputs.<col> }}` but the upstream SQL was INSERT/UPDATE without RETURNING - add RETURNING <col> so the value is captured, (c) you referenced `${{ user.<field> }}` on a route without `auth: required`. Pre-v2.7.5 the literal placeholder text would have been baked into the response - now it's surfaced explicitly here.",
 		"request_id":      recordRespondUnresolved(ctx, missing),
+		"docs":            refusalDocsAt("template_unresolved", ""),
 	}
 	if keys := flowDiagnosticKeys(ctx); keys != nil {
 		envelope["available_keys"] = keys
@@ -495,7 +623,7 @@ func recordRespondUnresolved(ctx *FlowContext, missing []string) string {
 
 // flowDiagnosticKeys lists the run's top-level data keys for a
 // template_unresolved response, sorted - but only for a development app
-// (`serve --dev`, or a hosted `<sub>-dev` instance). The names include
+// (a hosted `<sub>-dev` instance, or App.DevMode in tests). The names include
 // request fields and internal step ids, which a production caller has no
 // need to see; there the server log and describe_flows remain.
 func flowDiagnosticKeys(ctx *FlowContext) []string {

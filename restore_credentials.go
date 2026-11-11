@@ -41,9 +41,17 @@ package main
 // the snapshot has them; MCP grants are marked revoked and their credentials
 // and authorizations deleted. The summary says which mode ran.
 //
+// refresh-dev's copy of production gets that last mode before it leaves the
+// helper's private directory (revokeCopiedCredentials): dev is a different
+// instance, so nothing on dev vouches for a production credential and none
+// may stay usable there.
+//
 // A new credential-bearing framework table must join restoreGrantTables (a
 // snapshot row survives only when still live), restoreLiveStateTables (live
 // rows replace the snapshot's) or restoreMCPTables (connector stores).
+//
+// The same transaction settles the work the snapshot has queued, so a restore
+// does not run jobs and scheduled tasks a second time (restore_queue.go).
 
 import (
 	"context"
@@ -64,6 +72,9 @@ const (
 	restoreCredentialsCarried    = "carried_forward"
 	restoreCredentialsUnreadable = "live_unreadable_revoked_all"
 	restoreCredentialsNoLive     = "no_live_database_revoked_all"
+	// restoreCredentialsCopyRevoked: a copy of another instance's database
+	// (refresh-dev), every credential in it revoked (revokeCopiedCredentials).
+	restoreCredentialsCopyRevoked = "copy_revoked_all"
 )
 
 // restoreCredentialSummary reports what a restore did to credential state.
@@ -80,6 +91,10 @@ type restoreCredentialSummary struct {
 	MCPGrantsRevoked int            `json:"mcp_grants_revoked,omitempty"`
 	Kept             map[string]int `json:"kept"`
 	Removed          map[string]int `json:"removed"`
+	// Queue reports what happened to the jobs and scheduled tasks the
+	// snapshot had queued (restore_queue.go). nil for a refresh-dev copy,
+	// whose whole queue is held instead (holdRefreshedQueue).
+	Queue *restoreQueueSummary `json:"queue,omitempty"`
 }
 
 // restoreUserIdentityColumns are login identifiers: whoever holds one live
@@ -127,7 +142,10 @@ var restoreGrantTables = []restoreGrantTable{
 }
 
 // restoreLiveStateTables are replaced wholesale by their live rows.
-var restoreLiveStateTables = []string{"_benmore_login_attempts"}
+// _benmore_cron_state is when each cron schedule last ran: an interval
+// schedule (`every 24h`) counts from it, and with the snapshot's older time it
+// fired again as soon as the restored app started.
+var restoreLiveStateTables = []string{"_benmore_login_attempts", "_benmore_cron_state"}
 
 // credTable is one table: every column it has, and rows holding the selected
 // columns in their stored form.
@@ -165,11 +183,34 @@ func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath
 		summary.Mode, summary.LiveError, live = restoreCredentialsUnreadable, err.Error(), nil
 		log.Printf("restore: live database unreadable (%v); revoking every restored session, token and grant", err)
 	}
+	return rewriteCandidateCredentials(ctx, live, livePath, candidatePath, "restore_credentials", actor, summary)
+}
 
+// revokeCopiedCredentials revokes every credential in candidatePath, a copy
+// of another instance's database (refresh-dev's copy of production): every
+// session, API token, passkey, OAuth token, code and client, sign-in
+// challenge, email-change, reset/verification and one-time-code grant is
+// deleted, connector grants are marked revoked and their credentials,
+// pending authorizations and sealed upstream credentials deleted. Accounts
+// keep the password hashes and MFA state they had. It is the no-live-database
+// mode of a restore on purpose: the instance the copy lands on is a
+// different instance, so none of its own credentials can vouch for a
+// credential in the copy (its accounts are different accounts, matched only
+// by id or email), and none of the copy's credentials may stay usable there.
+// One refresh_credentials audit row in the copy records the counts.
+func revokeCopiedCredentials(ctx context.Context, candidatePath, actor string) (*restoreCredentialSummary, error) {
+	summary := &restoreCredentialSummary{Mode: restoreCredentialsCopyRevoked, Kept: map[string]int{}, Removed: map[string]int{}}
+	return rewriteCandidateCredentials(ctx, nil, "", candidatePath, "refresh_credentials", actor, summary)
+}
+
+// rewriteCandidateCredentials applies live (nil: nothing is live) to the
+// candidate's credential state in one transaction, with one audit row named
+// action.
+func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable, livePath, candidatePath, action, actor string, summary *restoreCredentialSummary) (*restoreCredentialSummary, error) {
 	// The maintenance driver: app triggers still compile, the storage
 	// ceiling does not apply, and DELETE journaling keeps every change in
 	// the one file that gets installed.
-	db, err := sql.Open(sqliteMaintenanceDriver, sqliteRestoreURI(candidatePath, "rw")+"&_journal_mode=DELETE&_txlock=immediate")
+	db, err := openRestoreDB(sqliteMaintenanceDriver, candidatePath, "rw", "&_journal_mode=DELETE&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -212,11 +253,17 @@ func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath
 	if err := carryForwardMCPArtifacts(ctx, tx, live, pairs, summary); err != nil {
 		return nil, fmt.Errorf("connector artifacts: %w", err)
 	}
+	// refresh-dev's copy has had its whole queue held (holdRefreshedQueue).
+	if summary.Mode != restoreCredentialsCopyRevoked {
+		if summary.Queue, err = carryForwardRestoreQueue(ctx, tx, livePath, live != nil); err != nil {
+			return nil, fmt.Errorf("queued work: %w", err)
+		}
+	}
 	values, err := json.Marshal(summary)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES ('restore_credentials', '_benmore_users', '', 0, ?, NULL, ?)`, actor, string(values)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, old_values, new_values) VALUES (?, '_benmore_users', '', 0, ?, NULL, ?)`, action, actor, string(values)); err != nil {
 		return nil, fmt.Errorf("audit: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -232,8 +279,11 @@ func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath
 	if err := errors.Join(f.Sync(), f.Close()); err != nil {
 		return nil, err
 	}
-	log.Printf("restore: credentials %s: %d accounts matched (%d updated), %d snapshot-only; kept %v; removed %v",
-		summary.Mode, summary.UsersMatched, summary.UsersUpdated, summary.UsersSnapshotOnly, summary.Kept, summary.Removed)
+	log.Printf("%s: %s: %d accounts matched (%d updated), %d snapshot-only; kept %v; removed %v",
+		action, summary.Mode, summary.UsersMatched, summary.UsersUpdated, summary.UsersSnapshotOnly, summary.Kept, summary.Removed)
+	if q := summary.Queue; q != nil {
+		log.Printf("%s: queued work in the snapshot: %v already finished live and kept finished, %v held (not run again), %v left to run", action, q.Finished, q.Held, q.Waiting)
+	}
 	return summary, nil
 }
 
@@ -247,7 +297,7 @@ func readLiveCredentialState(ctx context.Context, livePath string) (map[string]*
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("live database is not a regular file")
 	}
-	db, err := sql.Open("sqlite3", sqliteRestoreURI(livePath, "ro"))
+	db, err := openRestoreDB("sqlite3", livePath, "ro", "")
 	if err != nil {
 		return nil, err
 	}

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // stepKeyBase is the smallest step of a type: only what makes it that type.
@@ -51,13 +51,16 @@ var stepKeyRootProbes = map[string]any{
 }
 
 // stepKeyWithProbes are tried one by one under each `with:` key: text, a
-// number, a map, and the list shapes a key may want. A key is read when any
-// of them changes the loaded step. A respond step keeps only a media type as
-// its content type and only an allowed header (flows_respond_headers.go).
+// number, a boolean, a map, and the list shapes a key may want. A key is read
+// when any of them changes the loaded step. A respond step keeps only a media
+// type as its content type and only an allowed header
+// (flows_respond_headers.go); a proxy step's `path_slashes` takes only a
+// boolean.
 var stepKeyWithProbes = []any{
 	"probe",
 	"text/csv",
 	404,
+	true,
 	map[string]any{"probe_key": "probe_value"},
 	map[string]any{"X-Probe": "probe"},
 	[]any{404},

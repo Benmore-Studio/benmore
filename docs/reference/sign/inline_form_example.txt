@@ -1,0 +1,22 @@
+# When no built-in fits: write the recipe inline.
+# Engine: ordered compute: bindings -> headers: with template substitution.
+# Pipes available: hmac_sha256, hmac_sha512, hmac_sha1, sha256, sha512, sha1, md5,
+# hex, base64, base64url, fmt:layout, unix, unix_milli, prepend, append, lower,
+# upper, default, if_unset, or_env, urlencode, pct_encode, json_path, sort_query,
+# required, length. or_env:NAME returns input if non-empty, else the app's env var
+# NAME (the same lookup as env.NAME; never the server process environment) - used
+# by builtin recipes for caller-overrides-with-env-fallback. default:'x' replaces
+# an empty value; if_unset:'x' replaces only a params.<key> the sign
+# block did not pass, so an explicit empty binding stays empty.
+- run: api
+  with:
+    url: https://example.com/webhook
+    method: POST
+    sign:
+      compute:
+        ts:  "{{ now | unix }}"
+        sig: "{{ env.MY_SECRET | hmac_sha256:'{{ts}}.{{body}}' | hex }}"
+      headers:
+        X-Timestamp: "{{ts}}"
+        X-Signature: "{{sig}}"
+    json: { hello: world }

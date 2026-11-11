@@ -1,0 +1,5 @@
+site_name: "Flow resource binding"
+frontend:
+  stack: html
+access:
+  probe_writes: {read: off, write: off, update: off, delete: off}

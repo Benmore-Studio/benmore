@@ -1,0 +1,21 @@
+on:
+  request:
+    method: GET
+    path: /api/sign
+jobs:
+  sign:
+    steps:
+      - id: s
+        run: compute
+        with:
+          module: server/sign
+          function: sign
+      - id: p
+        run: compute
+        with:
+          module: server/plain
+          function: run
+      - run: respond
+        with:
+          status: 200
+          body: '${{ steps.s.outputs }}'

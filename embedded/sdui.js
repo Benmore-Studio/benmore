@@ -91,25 +91,35 @@ function labelField(desc) {
 }
 
 // <option> list for an FK field - rows of the related table, labelled.
+// A current value the list doesn't hold (past the first 200 rows, or a row
+// this caller can't read) stays selected as "#id"; it used to read as
+// "- none -", so the picker showed the record as unlinked.
 async function relationOptions(relTable, selected) {
+  let rows = [], lf = 'id';
   try {
     const s = await schema();
-    const lf = labelField(s[relTable]);
-    const rows = await bm.table(relTable).list({ limit: 200 });
-    return rows.map((r) =>
-      `<option value="${esc(r.id)}" ${String(selected) === String(r.id) ? 'selected' : ''}>${esc(r[lf] ?? r.id)}</option>`
-    ).join('');
-  } catch (_) { return ''; } // no read access → empty picker, server still enforces
+    lf = labelField(s[relTable]);
+    const r = await bm.table(relTable).list({ limit: 200 });
+    rows = Array.isArray(r) ? r : (r && r.rows) || [];
+  } catch (_) { /* no read access → only the current value; the server still enforces */ }
+  let html = rows.map((r) =>
+    `<option value="${esc(r.id)}" ${String(selected) === String(r.id) ? 'selected' : ''}>${esc(r[lf] ?? r.id)}</option>`
+  ).join('');
+  if (selected != null && selected !== '' && !rows.some((r) => String(r.id) === String(selected))) {
+    html += `<option value="${esc(selected)}" selected>#${esc(selected)}</option>`;
+  }
+  return html;
 }
 
 // Build a CRUD list querystring (sort/order beyond what bm.table.list
 // passes) and normalize the array-or-{rows} response. Keeps DataTable/
 // Cards/Board on one read path that honors server-side sort + paging.
-async function listRows(table, { limit, offset, q, where, sort, order } = {}) {
+async function listRows(table, { limit, offset, q, where, sort, order, include } = {}) {
   const qs = new URLSearchParams();
   if (limit != null)  qs.set('limit', String(limit));
   if (offset)         qs.set('offset', String(offset));
   if (q)              qs.set('q', String(q));
+  if (include)        qs.set('include', String(include));
   if (sort)         { qs.set('sort', String(sort)); qs.set('order', order === 'desc' ? 'desc' : 'asc'); }
   if (where) for (const [k, v] of Object.entries(where)) qs.set(k, String(v));
   const r = await bm.api.get(`/api/${table}` + (qs.toString() ? '?' + qs : ''));
@@ -214,23 +224,104 @@ function wireUploadFields(scope) {
   });
 }
 
+// ─── date/time values ────────────────────────────────────────────────
+// A DATETIME (control 'datetime') is an instant. The API answers RFC 3339 in
+// UTC; a zone-less value (SQLite's CURRENT_TIMESTAMP text, '2026-12-01
+// 18:00:00') is UTC too, and the server reads a zone-less value it is sent
+// as UTC. A datetime-local control holds wall time in the viewer's zone, so
+// the form converts both ways: the control's own text, sent as is, would
+// shift the instant by the viewer's offset.
+const pad2 = (n) => String(n).padStart(2, '0');
+function parseInstant(v) {
+  if (v == null || v === '') return null;
+  let s = String(v).trim();
+  const m = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2})(?::(\d{2})(?:\.(\d+))?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i.exec(s);
+  if (m) {
+    let zone = (m[5] || 'Z').toUpperCase();
+    if (zone !== 'Z' && zone.indexOf(':') < 0) zone = zone.slice(0, 3) + ':' + zone.slice(3);
+    s = `${m[1]}T${m[2] || '00:00'}:${m[3] || '00'}${m[4] ? '.' + (m[4] + '00').slice(0, 3) : ''}${zone}`;
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+// The datetime-local value (viewer's zone, to the minute) of a stored
+// instant; '' when there is none.
+function localDateTimeValue(v) {
+  const d = parseInstant(v);
+  return d ? `${String(d.getFullYear()).padStart(4, '0')}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}` : '';
+}
+// A datetime-local value back to the instant it names, as RFC 3339 UTC.
+function instantFromLocal(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(s);
+  if (!m) return s;
+  const d = new Date(2000, 0, 1);
+  d.setFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  d.setHours(Number(m[4]), Number(m[5]), Number(m[6] || 0), Number(((m[7] || '') + '000').slice(0, 3)));
+  return isNaN(d.getTime()) ? s : d.toISOString().replace('.000Z', 'Z');
+}
+// A date has no zone: its first 10 characters, never converted.
+const dateValue = (v) => { const m = /^\d{4}-\d{2}-\d{2}/.exec(String(v ?? '')); return m ? m[0] : ''; };
+const timeValue = (v) => { const m = /^\d{2}:\d{2}/.exec(String(v ?? '')); return m ? m[0] : ''; };
+const isOn = (v) => v === true || v === 1 || (typeof v === 'string' && /^(1|true)$/i.test(v.trim()));
+const isBoolColumn = (f) => /BOOL/i.test(String(f.type || ''));
+
+// controlHTML renders a field's control holding value: the row's value on an
+// edit, the column default (already a value, not SQL) on a create.
 function controlHTML(f, value, relOptions) {
   // FK column with a relation → a picker of the related table's rows.
   if (f.relation && relOptions != null) {
     return `<select name="${esc(f.name)}" ${f.required ? 'required' : ''} data-bm-control="relation" class="${inputCls}"><option value="">- none -</option>${relOptions}</select>`;
   }
-  const v = value ?? f.default ?? '';
+  const v = value ?? '';
   switch (f.control) {
     case 'image': case 'file': return uploadFieldHTML(f, v, f.control === 'image');
     case 'textarea': return skin.textarea({ name: f.name, value: v, required: f.required });
-    case 'checkbox': return skin.checkbox({ name: f.name, checked: !!Number(v) });
+    case 'checkbox': return skin.checkbox({ name: f.name, checked: isOn(v) });
     case 'number':   return skin.input({ name: f.name, type: 'number', value: v, required: f.required, control: 'number' });
     case 'email':    return skin.input({ name: f.name, type: 'email', value: v, required: f.required, control: 'email' });
     case 'tel':      return skin.input({ name: f.name, type: 'tel', value: v, required: f.required, control: 'tel' });
     case 'url':      return skin.input({ name: f.name, type: 'url', value: v, required: f.required, control: 'url' });
-    case 'date':     return skin.input({ name: f.name, type: 'date', value: String(v).slice(0, 10), required: f.required, control: 'date' });
+    case 'datetime': return skin.input({ name: f.name, type: 'datetime-local', value: localDateTimeValue(v), required: f.required, control: 'datetime' });
+    case 'date':     return skin.input({ name: f.name, type: 'date', value: dateValue(v), required: f.required, control: 'date' });
+    case 'time':     return skin.input({ name: f.name, type: 'time', value: timeValue(v), required: f.required, control: 'time' });
     default:         return skin.input({ name: f.name, type: 'text', value: v, required: f.required, control: 'text' });
   }
+}
+
+// encodeFieldValue turns a control's FormData value into what the API takes
+// for the column: a checkbox is true/false on a BOOLEAN column (1/0 on an
+// INTEGER flag), a number a number, a datetime the UTC instant. An empty
+// number, date, time or relation is null (no value; a relation's
+// "- none -" used to send '' and the PATCH failed: must be an integer).
+// undefined: the form has no such control, send nothing.
+function encodeFieldValue(f, raw) {
+  if (f.control === 'checkbox') return isBoolColumn(f) ? raw != null : (raw != null ? 1 : 0);
+  if (raw == null) return undefined;
+  if (raw === '' && (f.relation || f.control === 'number' || f.control === 'datetime' || f.control === 'date' || f.control === 'time')) return null;
+  if (f.control === 'number') return Number(raw);
+  if (f.control === 'datetime') return instantFromLocal(raw);
+  return raw;
+}
+// formSnapshot reads the form's values the way a submit will. An edit form
+// takes one right after rendering, so a submit can tell what was changed.
+function formSnapshot(form) { try { return new FormData(form); } catch (_) { return null; } }
+// formPayload builds the create/update body. An edit sends only the fields
+// whose control the person changed, so an untouched field keeps its stored
+// value exactly: a datetime is never rewritten (the date control used to cut
+// it to midnight), a relation the picker could not list is never cleared.
+// A null value (empty) is sent on an edit and left out on a create, where the
+// column's default applies.
+function formPayload(fields, form, before, editing) {
+  const fd = new FormData(form);
+  const payload = {};
+  for (const f of fields) {
+    const raw = fd.get(f.name);
+    if (before && raw === before.get(f.name)) continue;
+    const v = encodeFieldValue(f, raw);
+    if (v === undefined || (v === null && !editing)) continue;
+    payload[f.name] = v;
+  }
+  return payload;
 }
 
 // ─── control → table cell (mirror of the form mapping) ───────────────
@@ -266,8 +357,14 @@ function cellHTML(f, value) {
     case 'email': return `<a href="mailto:${esc(value)}" class="bm-accent-text hover:underline">${esc(value)}</a>`;
     case 'url':   return `<a href="${esc(safeUrl(value))}" target="_blank" rel="noopener" class="bm-accent-text hover:underline">${esc(value)}</a>`;
     case 'date': {
-      const d = new Date(String(value));
-      return isNaN(d.getTime()) ? esc(value) : `<span class="text-zinc-500">${d.toLocaleDateString()}</span>`;
+      // A calendar day, shown as that day in every zone.
+      const day = dateValue(value);
+      const d = day ? new Date(day + 'T00:00:00Z') : null;
+      return d && !isNaN(d.getTime()) ? `<span class="text-zinc-500">${esc(d.toLocaleDateString(undefined, { timeZone: 'UTC' }))}</span>` : esc(value);
+    }
+    case 'datetime': {
+      const d = parseInstant(value);
+      return d ? `<span class="text-zinc-500">${esc(d.toLocaleString())}</span>` : esc(value);
     }
     case 'number': return `<span class="tabular-nums">${formatNumber(f, value)}</span>`;
     default:       return esc(value);
@@ -295,6 +392,26 @@ export async function DataTable(target, opts) {
     const want = opts.columns.split(',').map((c) => c.trim());
     cols = want.map((n) => desc.fields.find((f) => f.name === n)).filter(Boolean);
   }
+  // A relation column shows the related row's label (the field relation
+  // pickers label options by). The list asks the API to embed each related
+  // row (?include=<column without _id>, which applies that table's own access
+  // rules); a row the caller can't read keeps showing the id. Skipped when the
+  // table has a column of the include's name, which the embedded row would
+  // replace.
+  const relLabels = {};
+  for (const c of cols) {
+    if (!c.relation || !/_id$/.test(c.name) || !s[c.relation.table]) continue;
+    const key = c.name.slice(0, -3);
+    if (desc.fields.some((f) => f.name === key)) continue;
+    relLabels[c.name] = { key, label: labelField(s[c.relation.table]) };
+  }
+  const include = Object.values(relLabels).map((r) => r.key).join(',') || undefined;
+  const cellFor = (c, row) => {
+    const r = relLabels[c.name];
+    const rel = r && row[r.key];
+    if (rel && typeof rel === 'object' && rel[r.label] != null && rel[r.label] !== '') return esc(rel[r.label]);
+    return cellHTML(c, row[c.name]);
+  };
   const perPage   = opts.perPage || opts.limit || 25;
   const sortable  = opts.sortable !== false;
   const paginate  = opts.paginate !== false;
@@ -315,7 +432,7 @@ export async function DataTable(target, opts) {
     if (!rows.length) { bodyEl.innerHTML = skin.emptyState(q ? 'No matches.' : 'Nothing here yet.'); return; }
     const head = skin.tr({ cells: cols.map((c) => skin.th(c.label)).join(''), clickable: false });
     const body = rows.map((row) => {
-      const cells = cols.map((c) => skin.cell(cellHTML(c, row[c.name]))).join('');
+      const cells = cols.map((c) => skin.cell(cellFor(c, row))).join('');
       return skin.tr({ cells, clickable: !!opts.onRowClick }).replace('<tr ', `<tr data-bm-id="${esc(row.id)}" `);
     }).join('');
     bodyEl.innerHTML = skin.table({ head, body });
@@ -361,14 +478,14 @@ export async function DataTable(target, opts) {
     // Search: client-side substring across visible columns so it works on
     // ANY table (the server ?q= only filters tables with @@fulltext).
     if (q) {
-      const all = await listRows(opts.table, { limit: 1000, where, sort: sortField, order: sortOrder });
+      const all = await listRows(opts.table, { limit: 1000, where, sort: sortField, order: sortOrder, include });
       const needle = q.toLowerCase();
       const matches = all.filter((r) => cols.some((c) => String(r[c.name] ?? '').toLowerCase().includes(needle)));
       render(matches.slice(0, 200));
       if (pagerEl) pagerEl.innerHTML = `<span>${matches.length} match${matches.length === 1 ? '' : 'es'} for “${esc(q)}”</span>`;
       return;
     }
-    const rows = await listRows(opts.table, { limit: perPage, offset: paginate ? offset : undefined, where, sort: sortField, order: sortOrder });
+    const rows = await listRows(opts.table, { limit: perPage, offset: paginate ? offset : undefined, where, sort: sortField, order: sortOrder, include });
     render(rows);
     if (paginate) {
       try { total = await bm.table(opts.table).count({ where }); } catch (_) { total = null; }
@@ -486,15 +603,19 @@ export async function RecordForm(target, opts) {
   const s = await schema();
   const desc = tableDesc(s, opts.table);
   const fields = editable(desc);
-  const existing = opts.id != null ? await bm.table(opts.table).get(opts.id) : {};
+  const editing = opts.id != null;
+  const existing = editing ? await bm.table(opts.table).get(opts.id) : {};
+  // An edit starts from the row (a NULL stays empty), a create from the
+  // column defaults.
+  const start = (f) => (editing ? existing[f.name] : f.default);
 
   // Pre-fetch <option> lists for any FK fields (relation pickers).
   const relOpts = {};
   for (const f of fields) {
-    if (f.relation) relOpts[f.name] = await relationOptions(f.relation.table, existing[f.name]);
+    if (f.relation) relOpts[f.name] = await relationOptions(f.relation.table, start(f));
   }
 
-  const fieldHtml = (f) => skin.field({ label: f.label, required: f.required, inner: controlHTML(f, existing[f.name], relOpts[f.name]), inline: f.control === 'checkbox' });
+  const fieldHtml = (f) => skin.field({ label: f.label, required: f.required, inner: controlHTML(f, start(f), relOpts[f.name]), inline: f.control === 'checkbox' });
   // sections: [{title, fields:'a,b'}] groups fields under titled headings
   // (all visible - unlike WizardForm's one-at-a-time steps). Unlisted
   // fields fall into a trailing untitled group so none are dropped.
@@ -516,23 +637,18 @@ export async function RecordForm(target, opts) {
 
   const form = el.querySelector('form');
   wireUploadFields(form); // image/file controls → upload pickers
+  let before = editing ? formSnapshot(form) : null;
   const errEl = el.querySelector('[data-bm-error]');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (errEl) errEl.hidden = true;
-    const fd = new FormData(form);
-    const payload = {};
-    for (const f of fields) {
-      if (f.control === 'checkbox') { payload[f.name] = fd.get(f.name) ? 1 : 0; continue; }
-      const val = fd.get(f.name);
-      if (val === null) continue;
-      payload[f.name] = f.control === 'number' && val !== '' ? Number(val) : val;
-    }
+    const payload = formPayload(fields, form, before, editing);
     try {
-      const saved = opts.id != null
-        ? await bm.table(opts.table).update(opts.id, payload)
-        : await bm.table(opts.table).create(payload);
-      if (opts.id == null) form.reset();
+      // An edit that changed nothing has nothing to send.
+      const saved = !editing ? await bm.table(opts.table).create(payload)
+        : before && !Object.keys(payload).length ? existing
+        : await bm.table(opts.table).update(opts.id, payload);
+      if (!editing) form.reset(); else before = formSnapshot(form);
       if (opts.onSaved) opts.onSaved(saved);
     } catch (ex) {
       if (errEl) { errEl.textContent = ex?.message || 'Save failed'; errEl.hidden = false; }
@@ -553,7 +669,9 @@ export async function WizardForm(target, opts) {
   const desc = tableDesc(s, opts.table);
   const all = editable(desc);
   const byName = Object.fromEntries(all.map((f) => [f.name, f]));
-  const existing = opts.id != null ? await bm.table(opts.table).get(opts.id) : {};
+  const editing = opts.id != null;
+  const existing = editing ? await bm.table(opts.table).get(opts.id) : {};
+  const start = (f) => (editing ? existing[f.name] : f.default);
 
   const groups = (opts.steps && opts.steps.length)
     ? opts.steps.map((st) => ({ title: st.title || '', fields: String(st.fields).split(',').map((n) => byName[n.trim()]).filter(Boolean) }))
@@ -561,12 +679,12 @@ export async function WizardForm(target, opts) {
   const flat = groups.flatMap((g) => g.fields);
 
   const relOpts = {};
-  for (const f of flat) if (f.relation) relOpts[f.name] = await relationOptions(f.relation.table, existing[f.name]);
+  for (const f of flat) if (f.relation) relOpts[f.name] = await relationOptions(f.relation.table, start(f));
 
   const stepHTML = groups.map((g, i) =>
     `<div data-bm-step="${i}" ${i === 0 ? '' : 'hidden'}>` +
     (g.title ? `<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;opacity:.55;margin-bottom:12px">${esc(g.title)}</div>` : '') +
-    g.fields.map((f) => skin.field({ label: f.label, required: f.required, inner: controlHTML(f, existing[f.name], relOpts[f.name]), inline: f.control === 'checkbox' })).join('') +
+    g.fields.map((f) => skin.field({ label: f.label, required: f.required, inner: controlHTML(f, start(f), relOpts[f.name]), inline: f.control === 'checkbox' })).join('') +
     `</div>`).join('');
 
   el.innerHTML = `<form data-bm-wizard class="space-y-4">${skin.error('')}
@@ -576,6 +694,7 @@ export async function WizardForm(target, opts) {
 
   const form = el.querySelector('form');
   wireUploadFields(form); // image/file controls → upload pickers
+  let before = editing ? formSnapshot(form) : null;
   const errEl = el.querySelector('[data-bm-error]');
   const nav = form.querySelector('[data-bm-nav]');
   const progress = form.querySelector('[data-bm-progress]');
@@ -603,19 +722,12 @@ export async function WizardForm(target, opts) {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (errEl) errEl.hidden = true;
-    const fd = new FormData(form);
-    const payload = {};
-    for (const f of flat) {
-      if (f.control === 'checkbox') { payload[f.name] = fd.get(f.name) ? 1 : 0; continue; }
-      const val = fd.get(f.name);
-      if (val === null) continue;
-      payload[f.name] = f.control === 'number' && val !== '' ? Number(val) : val;
-    }
+    const payload = formPayload(flat, form, before, editing);
     try {
-      const saved = opts.id != null
-        ? await bm.table(opts.table).update(opts.id, payload)
-        : await bm.table(opts.table).create(payload);
-      if (opts.id == null) { cur = 0; draw(); form.reset(); }
+      const saved = !editing ? await bm.table(opts.table).create(payload)
+        : before && !Object.keys(payload).length ? existing
+        : await bm.table(opts.table).update(opts.id, payload);
+      if (!editing) { cur = 0; draw(); form.reset(); } else before = formSnapshot(form);
       if (opts.onSaved) opts.onSaved(saved);
     } catch (ex) {
       if (errEl) { errEl.textContent = ex?.message || 'Save failed'; errEl.hidden = false; }
@@ -663,6 +775,16 @@ async function flowsRegistry() {
   const res = await fetch('/_internal/flows.json', { credentials: 'same-origin', cache: 'no-store' });
   _flows = res.ok ? await res.json() : {};
   return _flows;
+}
+
+// Registry keys are camelCase (save-quote / save_quote → saveQuote), the
+// rule bm.flows applies (bm.js camelizeFlowName, bm_types.go flowSDKName),
+// so FlowForm accepts the same spellings bm.flows does.
+function flowRegistryDef(reg, name) {
+  const own = (k) => (Object.prototype.hasOwnProperty.call(reg, k) ? reg[k] : undefined);
+  const parts = String(name).split(/[-_]+/).filter(Boolean);
+  const camel = parts.map((p, i) => (i === 0 ? p.charAt(0).toLowerCase() : p.charAt(0).toUpperCase()) + p.slice(1)).join('');
+  return own(name) || (camel ? own(camel) : undefined);
 }
 
 let _me;
@@ -730,13 +852,13 @@ function flowControlHTML(name, inp) {
 export async function FlowForm(target, opts) {
   const el = resolveEl(target);
   let reg = await flowsRegistry();
-  let def = reg[opts.flow];
+  let def = flowRegistryDef(reg, opts.flow);
   if (!def) {
     // flows.json lists only the caller's callable flows; refetch once in case
     // it was loaded before sign-in.
     _flows = null;
     reg = await flowsRegistry();
-    def = reg[opts.flow];
+    def = flowRegistryDef(reg, opts.flow);
   }
   if (!def) throw new Error(`sdui: flow "${opts.flow}" not in /_internal/flows.json (or not callable by this user)`);
   const inputs = def.inputs || {};
@@ -1230,9 +1352,10 @@ export async function MfaSetup(target, opts = {}) {
   const render = async () => {
     const me = await bm.auth.me();
     if (me && me.mfa_enabled) {
-      el.innerHTML = `<div data-bm-mfa class="space-y-3"><div class="text-sm">Two-factor auth is <b class="text-green-600">enabled</b>.</div><form data-bm-form class="space-y-3">${skin.error('')}${skinField('password', 'Confirm password to disable', { type: 'password', required: true })}<button type="submit" class="px-3 py-1.5 rounded border border-red-300 text-red-600 text-sm">Disable 2FA</button></form></div>`;
+      el.innerHTML = `<div data-bm-mfa class="space-y-3"><div class="text-sm">Two-factor auth is <b class="text-green-600">enabled</b>.</div><form data-bm-form class="space-y-3">${skin.error('')}${skinField('code', 'Enter a code from your authenticator app to disable', { required: true })}<button type="submit" class="px-3 py-1.5 rounded border border-red-300 text-red-600 text-sm">Disable 2FA</button></form></div>`;
       const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
-      form.addEventListener('submit', async (e) => { e.preventDefault(); try { await bm.mfa.disable(new FormData(form).get('password')); bm.auth.refreshMe && bm.auth.refreshMe(); render(); } catch (ex) { errEl.textContent = ex?.message; errEl.hidden = false; } });
+      // The server turns the factor off for a current authenticator code, not the password.
+      form.addEventListener('submit', async (e) => { e.preventDefault(); try { await bm.mfa.disable(String(new FormData(form).get('code') || '').trim()); bm.auth.refreshMe && bm.auth.refreshMe(); render(); } catch (ex) { errEl.textContent = ex?.message; errEl.hidden = false; } });
       return;
     }
     // Enrolling from a signed-in session needs the current password (the
@@ -1381,7 +1504,7 @@ export async function AuditLog(target, opts = {}) {
     try { rows = await bm.audit.list({ table: opts.table, row_id: opts.row_id, user_id: opts.user_id, action: opts.action, limit: opts.limit || 50 }); } catch (ex) { el.innerHTML = skin.emptyState(ex?.message || 'No audit access.'); return; }
     if (!rows.length) { el.innerHTML = skin.emptyState('No audit entries.'); return; }
     const head = skin.tr({ cells: ['When', 'Action', 'Table', 'Row', 'User'].map((h) => skin.th(h)).join(''), clickable: false });
-    const body = rows.map((r) => skin.tr({ cells: [relTime(r.created_at || r.timestamp), Badge(r.action || '', { variant: r.action === 'delete' ? 'error' : r.action === 'create' ? 'success' : 'neutral' }), esc(r.table_name || r.table || ''), esc(r.row_id ?? ''), esc(r.user_email || r.user_id || '')].map((c) => skin.cell(c)).join(''), clickable: false })).join('');
+    const body = rows.map((r) => skin.tr({ cells: [relTime(r.created_at || r.timestamp), Badge(r.action || '', { variant: r.action === 'delete' ? 'error' : (r.action === 'insert' || r.action === 'create') ? 'success' : 'neutral' }), esc(r.table_name || r.table || ''), esc(r.row_id ?? ''), esc(r.user_email || r.user_id || '')].map((c) => skin.cell(c)).join(''), clickable: false })).join('');
     el.innerHTML = skin.table({ head, body });
   };
   await render();
@@ -1435,18 +1558,29 @@ export async function ShareDialog(target, opts) {
   await render();
   return { refresh: render, destroy: () => { destroyed = true; generation++; el.innerHTML = ''; } };
 }
-// DownloadMyData(target, { label? }) - gather every readable table → JSON download
+// DownloadMyData(target, { label? }) - the signed-in user's own data → my-data.json.
+// It downloads the server's export, GET /api/_my-data: the user's profile
+// (credential columns removed), every row they own (user_id = them) in each
+// table they may read, and their latest 1,000 audit events. It used to list
+// every readable table itself, one capped page each, and wrote [] for a
+// table that failed, so the file was short or missing tables without a word
+// (and an admin's held every user's rows). A failed export downloads nothing
+// and says so.
 export async function DownloadMyData(target, opts = {}) {
   const el = resolveEl(target);
   el.innerHTML = `<button data-bm-dl class="px-4 py-2 rounded-md bm-accent-bg font-medium">${esc(opts.label || 'Download my data')}</button>`;
   el.querySelector('button').addEventListener('click', async () => {
     const btn = el.querySelector('button'); const txt = btn.textContent; btn.textContent = 'Gathering…'; btn.disabled = true;
     try {
-      const s = await schema(); const out = {};
-      for (const t of Object.keys(s)) { try { out[t] = await listRows(t, { limit: 1000 }); } catch (_) { out[t] = []; } }
+      const out = await bm.api.get('/api/_my-data');
+      if (!out || typeof out !== 'object' || !out.tables || typeof out.tables !== 'object') throw new Error('the export answered something other than an export');
       const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'my-data.json'; a.click(); URL.revokeObjectURL(a.href);
-    } catch (ex) { Toast(ex?.message || 'Export failed', { type: 'error' }); }
+    } catch (ex) {
+      // features.exports: false answers 404 before anything else.
+      const why = ex?.status === 404 ? 'data export is turned off for this app' : (ex?.message || 'the export failed');
+      Toast(`Your data was not downloaded: ${why}.`, { type: 'error', duration: 12000 });
+    }
     btn.textContent = txt; btn.disabled = false;
   });
   return { destroy: () => { el.innerHTML = ''; } };
@@ -1717,7 +1851,7 @@ export async function WebhookManager(target, opts = {}) {
   const list = document.createElement('div'); list.className = 'space-y-2 mt-4';
   const renderList = async () => {
     let rows = []; try { const r = await bm.api.get('/api/_webhooks'); rows = Array.isArray(r) ? r : (r.webhooks || []); } catch (_) {}
-    list.innerHTML = rows.length ? rows.map((w) => `<div class="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-2.5 text-sm"><div><div class="font-medium truncate" style="max-width:320px">${esc(w.url)}</div><div class="text-zinc-500">${esc((w.events || w.event || '').toString())}</div></div><div class="flex gap-3"><button data-test="${esc(w.id)}" class="bm-accent-text">Test</button><button data-del="${esc(w.id)}" class="text-red-600">Delete</button></div></div>`).join('') : skin.emptyState('No webhooks.');
+    list.innerHTML = rows.length ? rows.map((w) => `<div class="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-2.5 text-sm"><div><div class="font-medium truncate" style="max-width:320px">${esc(w.url)}</div><div class="text-zinc-500">${esc((w.events || w.event || '').toString())}</div>${w.status === 'secret_unreadable' ? '<div class="text-red-600">Signing secret unreadable: deliveries fail. Delete and re-create this webhook.</div>' : ''}</div><div class="flex gap-3"><button data-test="${esc(w.id)}" class="bm-accent-text">Test</button><button data-del="${esc(w.id)}" class="text-red-600">Delete</button></div></div>`).join('') : skin.emptyState('No webhooks.');
     list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete('/api/_webhooks/' + b.getAttribute('data-del')); renderList(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
     list.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.post('/api/_webhooks/' + b.getAttribute('data-test') + '/test'); Toast('Test delivery sent', { type: 'success' }); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
   };
@@ -1895,6 +2029,18 @@ function schedList(tasks) {
   if (!tasks.length) return '<p class="text-sm text-zinc-500">Nothing scheduled.</p>';
   return tasks.map((t) => `<div class="flex items-center justify-between text-sm px-1 py-1.5"><div><span class="font-medium">${esc(t.title || t.message || t.flow || 'Task')}</span> <span class="text-zinc-500">${relTime(t.run_at)} · ${esc(t.status)}</span></div>${t.status === 'pending' ? `<button data-cancel="${esc(t.id)}" class="text-red-600">Cancel</button>` : ''}</div>`).join('');
 }
+// schedCancel cancels one listed task. DELETE /api/_scheduled/{id} answers 404
+// (no such task of yours) or 409 { status } (running, done, failed or already
+// cancelled) when it cancelled nothing: the list on screen is stale, so the
+// answer is shown and the list re-read. An already cancelled task is what was
+// asked for and raises no error. A request that failed otherwise keeps the list.
+async function schedCancel(id, render) {
+  try { await bm.api.delete('/api/_scheduled/' + id); } catch (ex) {
+    if (!(ex?.status === 409 && ex?.body?.status === 'cancelled')) Toast(ex?.message || 'Failed', { type: 'error' });
+    if (ex?.status !== 404 && ex?.status !== 409) return;
+  }
+  await render();
+}
 // Reminder(target, { table?, rowId? }) - schedule an in-app reminder.
 export async function Reminder(target, opts = {}) {
   const el = resolveEl(target);
@@ -1907,7 +2053,7 @@ export async function Reminder(target, opts = {}) {
       ${skin.button({ label: 'Set reminder' })}</form><div data-list class="space-y-1">${schedList(tasks)}</div></div>`;
     const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
     form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); const when = fd.get('run_at'); try { await bm.api.post('/api/_scheduled', { kind: 'reminder', title: 'Reminder', message: fd.get('message'), run_at: new Date(when).toISOString(), table: opts.table, row_id: opts.rowId != null ? String(opts.rowId) : '' }); render(); } catch (ex) { errEl.textContent = ex?.message || 'Failed'; errEl.hidden = false; } });
-    el.querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete('/api/_scheduled/' + b.getAttribute('data-cancel')); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
+    el.querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', () => schedCancel(b.getAttribute('data-cancel'), render)));
   };
   await render();
   return { refresh: render, destroy: () => { el.innerHTML = ''; } };
@@ -1924,7 +2070,7 @@ export async function ScheduleAction(target, opts) {
       ${skin.button({ label: 'Schedule' })}</form><div data-list class="space-y-1">${schedList(tasks)}</div></div>`;
     const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
     form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const when = new FormData(form).get('run_at'); try { await bm.api.post('/api/_scheduled', { kind: 'flow', title: opts.label || opts.flow, flow: opts.flow, body: opts.body || {}, run_at: new Date(when).toISOString(), table: opts.table, row_id: opts.rowId != null ? String(opts.rowId) : '' }); render(); } catch (ex) { errEl.textContent = ex?.message || 'Failed'; errEl.hidden = false; } });
-    el.querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete('/api/_scheduled/' + b.getAttribute('data-cancel')); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
+    el.querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', () => schedCancel(b.getAttribute('data-cancel'), render)));
   };
   await render();
   return { refresh: render, destroy: () => { el.innerHTML = ''; } };
@@ -1939,9 +2085,11 @@ export async function Approval(target, opts) {
     const open = rows.find((a) => a.status === 'pending');
     let inner;
     if (open) {
-      const amApprover = me && (open.approver_email === me.email);
+      const mine = me && open.requested_by == me.id; // nobody decides their own request
+      // One address in any letter case, as the server compares it (it also checks the address is verified).
+      const amApprover = me && !mine && !!open.approver_email && String(open.approver_email).toLowerCase() === String(me.email || '').toLowerCase();
       inner = `<div class="flex items-center gap-3 text-sm">${Badge('Pending approval', { variant: 'warning' })}<span class="text-zinc-500">${esc(open.title || '')} · ${esc(open.approver_email || 'unassigned')}</span></div>` +
-        (amApprover || (me && me.role === 'admin') ? `<div class="flex gap-2 mt-2"><button data-decide="approved" class="px-3 py-1.5 rounded-md bg-green-600 text-white text-sm">Approve</button><button data-decide="rejected" class="px-3 py-1.5 rounded-md border border-red-300 text-red-600 text-sm">Reject</button></div>` : '');
+        (amApprover || (me && !mine && me.role === 'admin') ? `<div class="flex gap-2 mt-2"><button data-decide="approved" class="px-3 py-1.5 rounded-md bg-green-600 text-white text-sm">Approve</button><button data-decide="rejected" class="px-3 py-1.5 rounded-md border border-red-300 text-red-600 text-sm">Reject</button></div>` : '');
     } else {
       const last = rows[0];
       inner = (last ? `<div class="text-sm mb-3">Last decision: ${Badge(last.status, { variant: last.status === 'approved' ? 'success' : 'error' })} ${esc(last.note || '')}</div>` : '') +
@@ -2435,13 +2583,22 @@ export function SplitLayout(target, opts = {}) {
 }
 
 // Map(target, { lat, lng, zoom?, markers?, height?, label? }) - Leaflet + OSM tiles.
-// Needs the app CSP to allow unpkg.com (script/style) + *.tile.openstreetmap.org (img).
+// Leaflet 1.9.4 loads from unpkg with Subresource Integrity, so a changed file is
+// refused. The framework's page CSP allows exactly these files (and Leaflet's
+// marker images) for an app that imports sdui; the OSM tiles need
+// `csp: img_src: "https://*.tile.openstreetmap.org"` in app.yaml.
+// The URLs and hashes must stay in sync with csp_cdn_sources.go
+// (TestSDUILeafletURLsMatchCSP).
+const LEAFLET_JS = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+const LEAFLET_JS_SRI = 'sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH';
+const LEAFLET_CSS = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+const LEAFLET_CSS_SRI = 'sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H';
 let _leafletLoading = null;
 function loadLeaflet() {
   if (typeof window !== 'undefined' && window.L) return Promise.resolve(window.L);
   if (!_leafletLoading) _leafletLoading = new Promise((res, rej) => {
-    const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'; document.head.appendChild(css);
-    const sc = document.createElement('script'); sc.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'; sc.onload = () => res(window.L); sc.onerror = () => rej(new Error('failed to load Leaflet (CSP must allow unpkg.com)')); document.head.appendChild(sc);
+    const css = document.createElement('link'); css.rel = 'stylesheet'; css.integrity = LEAFLET_CSS_SRI; css.crossOrigin = 'anonymous'; css.href = LEAFLET_CSS; document.head.appendChild(css);
+    const sc = document.createElement('script'); sc.integrity = LEAFLET_JS_SRI; sc.crossOrigin = 'anonymous'; sc.src = LEAFLET_JS; sc.onload = () => res(window.L); sc.onerror = () => rej(new Error('failed to load Leaflet (blocked by CSP or integrity check)')); document.head.appendChild(sc);
   });
   return _leafletLoading;
 }
@@ -2949,17 +3106,76 @@ function csvCell(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-// ExportButton(target, { table, columns?, where?, filename?, label? }) - rows → CSV download.
+// EXPORT_PAGE is the list API's page cap (listPageMax in production.go): a
+// larger limit is clamped to it. The export used to ask for limit=5000 once
+// and got 500 rows of a 28k-row table with no sign that rows were missing.
+// EXPORT_MAX_ROWS bounds one export at 100 page requests (inside the default
+// 300-requests-per-minute budget); opts.maxRows changes it.
+const EXPORT_PAGE = 500;
+const EXPORT_MAX_ROWS = 50000;
+
+function exportQuery({ where, q }) {
+  const qs = new URLSearchParams();
+  if (where) for (const [k, v] of Object.entries(where)) qs.set(k, String(v));
+  if (q) qs.set('q', String(q));
+  return qs;
+}
+
+// exportRows reads the rows of table the caller may read with the list API's
+// keyset pages (?cursor=, id order), which stay consistent while rows are
+// added or removed during the export. The list's filters (where, q) and
+// access rules apply to every page. It stops at max rows; truncated is true
+// when rows beyond max exist.
+async function exportRows(table, filter, max) {
+  const base = exportQuery(filter);
+  base.set('limit', String(EXPORT_PAGE));
+  const rows = [];
+  let cursor = 0;
+  for (;;) {
+    const qs = new URLSearchParams(base);
+    qs.set('cursor', String(cursor));
+    const r = await bm.api.get(`/api/${table}?${qs}`);
+    const page = Array.isArray(r) ? r : (r?.data || r?.rows || []);
+    for (const row of page) {
+      if (rows.length >= max) return { rows, truncated: true };
+      rows.push(row);
+    }
+    if (r?.next_cursor == null || page.length === 0) return { rows, truncated: false };
+    cursor = r.next_cursor;
+  }
+}
+
+// exportTotal counts the rows the export would cover (null if it can't).
+async function exportTotal(table, filter) {
+  const qs = exportQuery(filter);
+  qs.set('count', 'true');
+  try {
+    const r = await bm.api.get(`/api/${table}?${qs}`);
+    return typeof r?.count === 'number' ? r.count : null;
+  } catch (_) { return null; }
+}
+
+// ExportButton(target, { table, columns?, where?, q?, filename?, label?, maxRows? }) - rows → CSV download.
+// Exports every row the caller can read (in id order), up to maxRows
+// (default 50,000; `limit` is accepted as an older name). An export cut at
+// that bound says so in a warning toast instead of handing over a short file.
 export function ExportButton(target, opts) {
   const el = resolveEl(target);
   el.innerHTML = `<button data-bm-export class="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 text-sm font-medium">${lucide('download', 16)} ${esc(opts.label || 'Export CSV')}</button>`;
   el.querySelector('button').addEventListener('click', async () => {
     const btn = el.querySelector('button'); const txt = btn.textContent; btn.textContent = 'Exporting…'; btn.disabled = true;
     try {
-      const rows = await listRows(opts.table, { limit: opts.limit || 5000, where: opts.where });
+      const max = Math.max(1, Math.floor(Number(opts.maxRows ?? opts.limit) || EXPORT_MAX_ROWS));
+      const filter = { where: opts.where, q: opts.q };
+      const { rows, truncated } = await exportRows(opts.table, filter, max);
       const cols = opts.columns ? opts.columns.split(',').map((c) => c.trim()) : (rows.length ? Object.keys(rows[0]) : []);
       const csv = [cols.map(csvCell).join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n');
       const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = opts.filename || (opts.table + '.csv'); a.click(); URL.revokeObjectURL(a.href);
+      if (truncated) {
+        const total = await exportTotal(opts.table, filter);
+        const of = total != null ? ` of ${total.toLocaleString()}` : '';
+        Toast(`Exported the first ${max.toLocaleString()}${of} rows: one export holds at most ${max.toLocaleString()}. Filter the export to get the rest.`, { type: 'warning', duration: 12000 });
+      }
     } catch (ex) { Toast(ex?.message || 'Export failed', { type: 'error' }); }
     btn.textContent = txt; btn.disabled = false;
   });
@@ -3034,7 +3250,7 @@ export async function BulkChangeWizard(target, opts) {
       el.innerHTML = `<div data-bm-bulk class="space-y-3"><div style="font-size:13px;opacity:.6">3 · Set the new values for ${affected.length} record(s)</div><form data-set class="space-y-3">${skin.error('')}${setable.map((f) => skin.field({ label: f.label, inner: controlHTML(f, '', null), required: false })).join('')}<div style="display:flex;justify-content:space-between"><button type="button" data-back style="padding:8px 16px;border-radius:8px;border:1px solid rgba(128,128,128,.3);background:none;cursor:pointer">← Back</button><button type="submit" style="padding:8px 16px;border-radius:8px;background:#dc2626;color:#fff;border:none;cursor:pointer">Apply to ${affected.length}</button></div></form></div>`;
       const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
       el.querySelector('[data-back]').addEventListener('click', () => render(2));
-      form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); const fields = {}; setable.forEach((f) => { const v = fd.get(f.name); if (v != null && v !== '') fields[f.name] = f.control === 'number' ? Number(v) : v; }); if (!Object.keys(fields).length) { errEl.textContent = 'Set at least one field.'; errEl.hidden = false; return; } try { await bm.api.patch(`/api/${opts.table}/batch`, { ids: affected.map((r) => r.id), fields }); Toast(`Updated ${affected.length} record(s) ✓`, { type: 'success' }); if (opts.onDone) opts.onDone(affected.length); render(1); } catch (ex) { errEl.textContent = ex?.message || 'Apply failed'; errEl.hidden = false; } });
+      form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); const fields = {}; setable.forEach((f) => { const v = fd.get(f.name); if (v != null && v !== '') fields[f.name] = encodeFieldValue(f, v); }); if (!Object.keys(fields).length) { errEl.textContent = 'Set at least one field.'; errEl.hidden = false; return; } try { await bm.api.patch(`/api/${opts.table}/batch`, { ids: affected.map((r) => r.id), fields }); Toast(`Updated ${affected.length} record(s) ✓`, { type: 'success' }); if (opts.onDone) opts.onDone(affected.length); render(1); } catch (ex) { errEl.textContent = ex?.message || 'Apply failed'; errEl.hidden = false; } });
     }
   };
   render(1);

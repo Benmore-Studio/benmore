@@ -1,0 +1,22 @@
+# flows.yaml - GitHub Actions-style envelope
+on:
+  request:
+    method: POST
+    path: /api/posts/:id/publish
+    # mode: async              # opt-in: enqueue + return job_id immediately
+    # max_attempts: 3          # async/enqueued jobs: re-run the flow after a transient failure (topic async-flows → retries)
+    # verify: { … }            # opt-in: HMAC-verify inbound webhook (see topic 'verify')
+
+jobs:
+  publish:
+    steps:
+      - id: post
+        run: sql
+        with:
+          query: "SELECT * FROM posts WHERE id = :id"
+      - run: respond
+        with:
+          status: 200
+          json:
+            id: ${{ steps.post.outputs.rows[0].id }}
+            status: published

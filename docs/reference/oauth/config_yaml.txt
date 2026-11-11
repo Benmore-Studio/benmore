@@ -1,0 +1,17 @@
+# Provider credentials are per-app environment values, never source.
+# Hosted app:   benmore env <app> set GOOGLE_CLIENT_ID=<provider client ID>
+#               benmore env <app> set GOOGLE_CLIENT_SECRET=<provider client secret>
+#               (MCP: set_env; add --env dev|prod to give dev and prod different clients;
+#               env.yaml is not accepted by push/deploy)
+# Self-hosted:  env.yaml next to app.yaml (never commit it):
+GOOGLE_CLIENT_ID: "<provider client ID>"
+GOOGLE_CLIENT_SECRET: "<provider client secret>"
+# Custom provider metadata belongs under top-level oauth in app.yaml:
+# oauth:
+#   custom:
+#     auth_url: https://identity.example.com/authorize
+#     token_url: https://identity.example.com/token
+#     userinfo_url: https://identity.example.com/userinfo
+#     scopes: "openid email profile"
+#     trust_email: true   # only if the provider verifies every address it returns
+# A custom provider's credentials are CUSTOM_CLIENT_ID and CUSTOM_CLIENT_SECRET, set the same way.

@@ -26,6 +26,7 @@ package main
 // Trade-off: verifying on a second device now needs the password once.
 
 import (
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -76,15 +77,37 @@ func lookupVerifyEmailAccount(app *App, email string) (verifyEmailAccount, bool)
 	return a, true
 }
 
+// restoreVerifyEmailToken makes a spent link usable again. The link is spent
+// before the account is marked, so when the mark is not stored it is put
+// back: it is the only link a sign-up gets, and under auth.require_verified
+// the account cannot sign in to ask for another.
+func restoreVerifyEmailToken(app *App, token string) {
+	if _, err := app.DB.Exec("UPDATE _benmore_password_resets SET used = 0 WHERE token = ? AND used = 1 AND type = 'verify'", hashResetToken(token)); err != nil {
+		log.Printf("auth: a verification link spent on a failed verification could not be restored: %v", err)
+	}
+}
+
+// failEmailVerification answers a link whose account could not be marked
+// verified: a server error, never the redirect a completed verification
+// gets, with the link usable again.
+func failEmailVerification(w http.ResponseWriter, r *http.Request, app *App, token string, err error) {
+	restoreVerifyEmailToken(app, token)
+	invalidateRequestSession(r)
+	serverError(w, r, app, "verify email", err, "Your email could not be verified. Open the link again.")
+}
+
 // completeEmailVerification marks the account verified (attaching invites
 // waiting on the address) and ends every session and token other than keep,
-// and every edge grant, as the other credential changes do.
-func completeEmailVerification(app *App, userID int64, email, keep string) {
-	markEmailVerified(app, userID, email)
+// as the other credential changes do. On an error the account is not
+// verified and nothing was revoked.
+func completeEmailVerification(app *App, userID int64, email, keep string) error {
+	if err := markEmailVerified(app, userID, email); err != nil {
+		return err
+	}
 	if err := revokeOtherCredentials(app.DB, userID, keep); err != nil {
 		log.Printf("auth: revoking credentials after email verification failed (user %d): %v", userID, err)
 	}
-	revokeEdgeGrantsAfterCredentialChange(app, userID)
+	return nil
 }
 
 func handleVerifyEmail(w http.ResponseWriter, r *http.Request, app *App) {
@@ -104,25 +127,47 @@ func handleVerifyEmail(w http.ResponseWriter, r *http.Request, app *App) {
 			return
 		}
 		if found {
-			markEmailVerified(app, account.userID, email)
+			if err := markEmailVerified(app, account.userID, email); err != nil {
+				failEmailVerification(w, r, app, token, err)
+				return
+			}
 		}
 	case verifyEmailSessionOwner(app, r, account.userID) != "":
 		if !consumeVerifyEmailToken(app, token) {
 			http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
 			return
 		}
-		completeEmailVerification(app, account.userID, email, verifyEmailSessionOwner(app, r, account.userID))
+		if err := completeEmailVerification(app, account.userID, email, verifyEmailSessionOwner(app, r, account.userID)); err != nil {
+			failEmailVerification(w, r, app, token, err)
+			return
+		}
 	case !account.hasPassword:
 		if !consumeVerifyEmailToken(app, token) {
 			http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
 			return
 		}
 		if err := claimUnverifiedAccountAs(app, account.userID, email, "email_claim_unverified"); err != nil {
-			log.Printf("auth: claiming unverified account %d at email verification failed: %v", account.userID, err)
-			http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
+			// The claim rolled back and nothing is verified: same answer
+			// as a mark that was not stored (it used to be the redirect a
+			// completed verification gets, with the link spent).
+			failEmailVerification(w, r, app, token, fmt.Errorf("claiming unverified account %d: %w", account.userID, err))
 			return
 		}
-		completeEmailVerification(app, account.userID, email, "")
+		err := completeEmailVerification(app, account.userID, email, "")
+		if err != nil {
+			// A busy database is the likely cause; the claim is already in,
+			// so one more try is cheap and spares the reset below.
+			err = completeEmailVerification(app, account.userID, email, "")
+		}
+		if err != nil {
+			// The claim committed: the account now has a password nobody
+			// knows, so a restored link would only lead to a password form
+			// that cannot be answered. Leave it spent and point at the reset,
+			// which proves the same mailbox.
+			invalidateRequestSession(r)
+			serverError(w, r, app, "verify email", err, "Your email could not be verified. Use \"Forgot password\" with this address to finish setting up your account.")
+			return
+		}
 	default:
 		// Not signed in as the account: prove its password first. The
 		// token stays unspent so the form can carry it.
@@ -143,7 +188,7 @@ func verifyEmailSessionOwner(app *App, r *http.Request, userID int64) string {
 	if err != nil || c.Value == "" {
 		return ""
 	}
-	if s := GetSessionFromDB(app.DB, c.Value); s != nil && s.UserID == userID {
+	if s := getAppSession(app, r, c.Value); s != nil && s.UserID == userID {
 		return s.ID
 	}
 	return ""
@@ -183,7 +228,10 @@ func handleVerifyEmailConfirm(w http.ResponseWriter, r *http.Request, app *App) 
 		http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
 		return
 	}
-	completeEmailVerification(app, account.userID, email, "")
+	if err := completeEmailVerification(app, account.userID, email, ""); err != nil {
+		failEmailVerification(w, r, app, token, err)
+		return
+	}
 	invalidateRequestSession(r)
 	platformEmailProved(app, email, false)
 	http.Redirect(w, r, app.Paths.Login+"?success="+url.QueryEscape("Email verified. Sign in to continue."), http.StatusSeeOther)

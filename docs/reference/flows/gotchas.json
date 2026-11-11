@@ -1,0 +1,9 @@
+[
+  "The flow rules that most often surprise, split by subject. Each line below names a key of this topic and what it holds; read the one that matches the question.",
+  "`gotchas_file_shape`: where `on:` and `jobs:` go, the `query:` shorthand and its `params:`, keys a step type does not read, and steps that do nothing where they are written.",
+  "`gotchas_sql_steps`: reading a step's rows, RETURNING, how params bind, the tenant key in flow SQL, `expect_rows` and `rows_affected`, and numbers written as text.",
+  "`gotchas_conditions`: `if:` and `success_when:` conditions: operators, truthiness, fallbacks for a missing value, and what a skipped branch does.",
+  "`gotchas_request_input`: what a value sent by the caller can and cannot change in a flow, how request fields and step names shadow each other, request taint, and rate limiting a public route.",
+  "`gotchas_outbound_calls`: `run: api` and `run: webhook`: how URL values are encoded and who may choose the host, redirects, 4xx handling, timeouts and what a failed call stops.",
+  "`gotchas_bodies`: JSON bodies and payloads, `respond:` text and JSON bodies, status and header values, and `run: email` html."
+]

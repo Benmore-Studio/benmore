@@ -1,0 +1,10 @@
+# `sqll:` is not a key a setup entry takes (`sql:` is), so the insert the
+# steps rely on would not run.
+setup_is_misspelled:
+  as_user: "owner@test.com"
+  setup:
+    - sqll: "INSERT INTO notes (title, user_id) VALUES ('seeded', {{user_id}})"
+  steps:
+    - get: "/health"
+      expect:
+        status: 200

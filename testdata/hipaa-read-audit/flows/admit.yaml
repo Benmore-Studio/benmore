@@ -1,0 +1,12 @@
+on:
+  request: { method: POST, path: /api/patient-admit, auth: required, transaction: true }
+jobs:
+  admit:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO patients (name, user_id) VALUES ('admitted', :user_id)" }
+      - run: sql
+        id: n
+        with: { query: "SELECT COUNT(*) AS n FROM patients WHERE user_id = :user_id" }
+      - run: respond
+        with: { json: { n: "${{ steps.n.outputs.n }}" } }

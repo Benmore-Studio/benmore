@@ -1,0 +1,5 @@
+// Private file (e.g. a document row with a file_url column):
+const url = await bm.signedUrl(doc.file_url, { record: { table: 'documents', id: doc.id } });
+img.src = url;                       // valid 5 min (SDK default ttlSeconds: 300; audio/video default 4h so playback outlives it), authorized against doc's access policy
+// Custom TTL: bm.signedUrl(path, { ttlSeconds: 120, record: { table, id } })  (a bare number is the TTL)
+// Public file: const u = await bm.signedUrl(publicUrl);   // no record needed

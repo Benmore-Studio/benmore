@@ -1,0 +1,3 @@
+site_name: "workflow-null-state"
+auth:
+  identifier: email

@@ -1,0 +1,23 @@
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+// --- Room broadcast (chat / signaling) ---
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'join', room: 'chat-lobby' }));
+  // Send a message to everyone in the room.
+  ws.send(JSON.stringify({ type: 'broadcast', room: 'chat-lobby', payload: { kind: 'chat', text: 'hello' } }));
+  // Table event subscription (CRUD invalidation) on the SAME connection; both shapes coexist.
+  ws.send(JSON.stringify({ type: 'subscribe', tables: ['notes'] }));
+};
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'message') {
+    // Room broadcasts arrive as type 'message'. msg.payload is whatever the
+    // sender broadcast; msg.from is its user id, or 'server' (run: broadcast).
+    console.log('from', msg.from, msg.payload);
+  } else if (msg.type === 'presence') {
+    // Someone joined/left the room.
+  } else if (msg.type === 'change') {
+    // Table CRUD event (if you also subscribed to tables).
+  }
+};

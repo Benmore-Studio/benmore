@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func appMCPUploadTenantFixture(t *testing.T) (*App, *appMCPTokenPair, *appMCPRuntimeGeneration) {
@@ -270,23 +270,22 @@ func TestAppMCPUploadTenantManifestContractAndInspection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	strictTool := appMCPFileTool(validManifest, "ingest_file")
-	strictManifest := &AppMCPManifest{Tools: []AppMCPTool{*strictTool}}
+	strictTool := *appMCPFileTool(validManifest, "ingest_file")
 	group := &GroupConfig{Table: "members", Key: "org_id", UserField: "email"}
 	definitions := []crudTableDefinition{
 		{name: "notes", columns: map[string]bool{"file_path": true, "org_id": true}},
 		{name: "members", columns: map[string]bool{"org_id": true, "email": true}},
 	}
-	if err := validateAppMCPFileUploadTenantBindings(strictManifest, nil, definitions); err == nil {
+	if err := validateAppMCPFileUploadTenantBinding(strictTool, nil, definitions); err == nil {
 		t.Fatal("upload tenant accepted missing configured groups")
 	}
-	if err := validateAppMCPFileUploadTenantBindings(strictManifest, group, []crudTableDefinition{
+	if err := validateAppMCPFileUploadTenantBinding(strictTool, group, []crudTableDefinition{
 		{name: "notes", columns: map[string]bool{"file_path": true}},
 		{name: "members", columns: map[string]bool{"org_id": true, "email": true}},
 	}); err == nil {
 		t.Fatal("upload tenant accepted a source table without the configured tenant key")
 	}
-	if err := validateAppMCPFileUploadTenantBindings(strictManifest, group, definitions); err != nil {
+	if err := validateAppMCPFileUploadTenantBinding(strictTool, group, definitions); err != nil {
 		t.Fatalf("valid canonical tenant bindings rejected: %v", err)
 	}
 }

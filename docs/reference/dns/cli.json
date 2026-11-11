@@ -1,0 +1,6 @@
+[
+  "benmore dns <app>                   # zones + delegation status",
+  "benmore dns <app> add <domain>      # create the zone (prints the 4 nameservers)",
+  "benmore dns <app> records <domain>  # list records (prints every zone of the app with its records)",
+  "benmore dns <app> remove <domain>   # delete the zone + records"
+]

@@ -65,11 +65,7 @@ func requireAPIAuthForOp(w http.ResponseWriter, r *http.Request, app *App, table
 		// explicit access: rule, point the agent at access.read: anon.
 		// An earlier app build built a custom /api/feed flow before
 		// discovering this was the right lever.
-		body := `{"error":"authentication required"}`
-		hasUID := hasColumn(app, table, "user_id")
-		if op == OpRead && hasUID && !app.Access.HasExplicitRule(table, op) {
-			body = `{"error":"authentication required","hint":"This table is owner-scoped (visitors see 401). For a public feed, declare ` + "`access:\\n  " + table + ":\\n    read: anon`" + ` in app.yaml. Run benmore docs for the full access-mode catalogue."}`
-		}
+		body := unauthenticatedAPIBody(app, r, table, op, hasColumn(app, table, "user_id"))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(body))

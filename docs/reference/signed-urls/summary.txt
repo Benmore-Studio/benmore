@@ -1,0 +1,1 @@
+Time-limited signed URLs for private files. SDK primitive: `bm.signedUrl(path, opts)` (GET /api/_signed_url). For files on the platform media CDN it mints a CloudFront signature; for local-disk files an HMAC URL. NO custom flow needed.

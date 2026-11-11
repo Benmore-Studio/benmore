@@ -1,0 +1,9 @@
+# One step, two actions: only the SQL would run and the request with its
+# status 500 would be dropped.
+request_and_sql_in_one_step:
+  anon: true
+  steps:
+    - sql: "SELECT 1"
+      get: "/health"
+      expect:
+        status: 500

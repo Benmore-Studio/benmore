@@ -1,0 +1,1 @@
+A hard-coded sessionStorage shell cache never invalidates, so the UI shows data from yesterday. A version in the cache key makes invalidation automatic.

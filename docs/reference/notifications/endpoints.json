@@ -1,0 +1,7 @@
+[
+  "GET /api/_notifications?page=&per_page=   → { notifications, total, unread, page, per_page, latest_id } (unread first, newest first; per_page max 100). Also accepts limit= / offset= (what bm.notifications.list({limit, offset, unread}) sends) and unread=1 to list unread only; bm.notifications.onNew(cb) calls cb with each new notification (it fetches them, since live events carry no row)",
+  "GET /api/_notifications/count             → { unread }",
+  "PATCH /api/_notifications/{id}/read",
+  "DELETE /api/_notifications/{id}",
+  "POST /api/_notifications/read-all"
+]

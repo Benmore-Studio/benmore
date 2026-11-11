@@ -1,0 +1,21 @@
+# The step's own on_error handler answers, so the caller never saw the late
+# failure; the row was written all the same.
+on:
+  request:
+    method: POST
+    path: /api/sql-handled
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: ins
+        run: sql
+        with:
+          query: "INSERT INTO notes (title, body) VALUES ('handled', :b)"
+          params:
+            b: "${{ params.b }}"
+        on_error:
+          - run: respond
+            with: { status: 422, json: { error: "b is required" } }
+      - run: respond
+        with: { status: 200, json: { ok: true } }

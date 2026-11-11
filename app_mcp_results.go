@@ -27,7 +27,7 @@ const appMCPResultLimit = 4 << 20
 var appMCPErrorCodes = []string{
 	"denied", "invalid_input", "conflict", "expired_intent", "approval_required",
 	"operation_limit", "hook_refused", "unavailable_provider", "incomplete_result",
-	"unknown_execution", "in_progress",
+	"unknown_execution", "in_progress", appMCPConstraintFailedCode, appMCPInvalidDeclarationCode,
 }
 
 type appMCPResultError struct{ Code, Message string }
@@ -35,6 +35,37 @@ type appMCPResultError struct{ Code, Message string }
 func (e *appMCPResultError) Error() string { return e.Message }
 func appMCPResultFailure(code string) error {
 	return &appMCPResultError{code, "Connector operation could not produce an authorized, validated result."}
+}
+
+// appMCPJSONText is the JSON text a connector result carries beside its
+// structured content. It keeps & < > as written: json.Marshal turns them into
+// & < > for embedding in HTML, so a model read "R&D" for
+// "R&D" (r1104). The text never goes into HTML unescaped; a page that shows
+// JSON (the review page's exact data) renders it through html/template.
+func appMCPJSONText(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+// appMCPInvalidInputFailure is invalid_input naming where the input broke the
+// tool's input schema (r1104): the JSON path and rule from
+// appMCPSchemaValueError, never the rejected value, which can be anything the
+// caller typed. Any other error keeps the generic text.
+func appMCPInvalidInputFailure(err error) error {
+	var named *appMCPSchemaValueError
+	if !errors.As(err, &named) {
+		return appMCPResultFailure("invalid_input")
+	}
+	where := "the input"
+	if named.Path != "" {
+		where = named.Path
+	}
+	return &appMCPResultError{Code: "invalid_input", Message: "The input does not match the tool's input_schema at " + where + ": " + named.Rule + "."}
 }
 
 type appMCPReadResult struct {
@@ -105,8 +136,8 @@ func runAppMCPNativeReadGeneration(ctx context.Context, origin *App, generation 
 	if err != nil || tool == nil || !appMCPGenerationCurrent(origin, generation) || !scopesWithin(actor.Scopes, strings.Join(tool.Permissions, " ")) {
 		return nil, appMCPResultFailure("denied")
 	}
-	if validateAppMCPSchemaValue(tool.InputSchema, input) != nil {
-		return nil, appMCPResultFailure("invalid_input")
+	if err := validateAppMCPSchemaValue(tool.InputSchema, input); err != nil {
+		return nil, appMCPInvalidInputFailure(err)
 	}
 	payload, err := json.Marshal(input)
 	if err != nil || len(payload) > appMCPInputLimit {
@@ -342,7 +373,9 @@ func appMCPNativeReadInput(app *App, tool *AppMCPTool, args map[string]any, colu
 		case "q":
 			search, ok := value.(string)
 			fts, cols := FTSTableFor(app.Tables, tool.Handler.Table)
-			if !ok || strings.TrimSpace(search) == "" || fts == "" || len(cols) == 0 {
+			// A search with no words (blank, or only control characters,
+			// which separate words) would list the table unfiltered.
+			if !ok || planFTSQuery(search).empty() || fts == "" || len(cols) == 0 {
 				return "", nil, denied
 			}
 			query.Set("q", search)

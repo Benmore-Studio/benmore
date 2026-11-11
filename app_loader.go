@@ -13,14 +13,18 @@ import (
 
 // appLoadOptions tune loadApp for callers that are not booting the app.
 type appLoadOptions struct {
-	// checkOnly marks a validation load (the router's per-edit RunCompleteCheck).
-	// It must not copy the tenant's whole database on every call: at most one
+	// checkOnly marks a validation load (tryLoadApp: serve's boot check and
+	// `benmore check` in an app directory; never the router, which loads no
+	// app). It must not copy the database on every call: at most one
 	// pre-migrate snapshot per checkBackupMinInterval.
 	checkOnly bool
 	// startup marks the one load that begins a served process: connector
 	// writes are suspended with their approval binding kept, so the caller can
 	// resume them (resumeAppMCPApprovedWrites) once the app has loaded.
 	startup bool
+	// noErrorDelivery keeps every error report local (`benmore test`), set
+	// before anything in the load can report.
+	noErrorDelivery bool
 }
 
 // loadApp initializes the full app from a directory.
@@ -29,6 +33,11 @@ func loadApp(dir string) (app *App, err error) {
 }
 
 func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
+	if foreignAppDirs.Load() {
+		// Refused before anything is read, leased or written (the database
+		// open refuses too, errForeignAppLoad).
+		return nil, errForeignAppLoad
+	}
 	trace := newAppLoadTrace(dir)
 	defer func() { trace.finish(err) }()
 	trace.phase("config")
@@ -39,14 +48,21 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	if config.mcpWithheld != "" {
 		log.Printf("  MCP connector withheld: %s", config.mcpWithheld)
 	}
+	if config.mcpUnbound != "" {
+		log.Printf("  WARNING: MCP %s", config.mcpUnbound)
+	}
+	for _, problem := range config.mcpToolProblems {
+		log.Printf("  WARNING: MCP %s", appMCPToolProblemsNotice(problem))
+	}
 	nextEnv, err := config.stageEnvironment(dir)
 	if err != nil {
 		return nil, fmt.Errorf("environment: %w", err)
 	}
-	// Validation may run as the hosted router, not the app's owning user.
-	// Generating a key here can leave an unreadable owner-only env.yaml and
-	// install live database triggers under a key the serving process lacks.
-	// Refuse before opening/migrating the database; startup owns initialization.
+	// A validation load is not the serving process's start (it may be the
+	// boot check, or `benmore check` run by another account). Generating a key
+	// here can leave an unreadable owner-only env.yaml and install live
+	// database triggers under a key the serving process lacks. Refuse before
+	// opening/migrating the database; startup owns initialization.
 	if opts.checkOnly && nextEnv["ENCRYPTION_KEY"] == "" && config.encrypted != nil {
 		for _, fields := range config.encrypted.Fields {
 			if len(fields) > 0 {
@@ -59,9 +75,9 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 		sourceFiles:       config.sourceFiles,
 		templateEnvSource: config.templateEnvSource,
 		environment:       nextEnv,
-		Sessions:          NewSessionStore(),
 		Stop:              make(chan struct{}),
 	}
+	app.errorDeliveryOff.Store(opts.noErrorDelivery)
 
 	// Cache the owner's plan + accumulated build time onto the App struct
 	// so the "Built with Benmore in X minutes" badge can render without
@@ -88,19 +104,36 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	}
 	defer policyRelease()
 
+	// A restore or refresh-dev that never finished (a router restart, a
+	// cancelled request) leaves its database copies behind; nothing else
+	// removes them between restores.
+	if !opts.checkOnly {
+		sweepRestoreStages(dir, "", restoreStageLeftoverAge)
+	}
+
 	// Open database
 	trace.phase("database_open")
-	db, err := openDBWithPolicyLease(dir, nextEnv, policyLease)
+	db, dbCheck, err := openDBWithPolicyLease(dir, nextEnv, policyLease)
 	if err != nil {
 		return nil, fmt.Errorf("database: %w", err)
 	}
 	app.DB = db
-	// Every error return below abandons this pool. In the ROUTER process that
-	// is a permanent leak: MCP write_file/edit_file runs RunCompleteCheck ->
-	// tryLoadApp -> loadApp on every edit, and the app DSN carries
-	// _cache_size=-64000 (64MB page cache per connection) + a 256MB mmap
-	// window, so a repeatedly-failing load grew the router by hundreds of MB
-	// and fed the 2026-08-01 MemoryHigh throttling outage.
+	app.dbVerifiedAt, app.dbLocalSQLite = dbCheck.verifiedAt, dbCheck.local
+	if dbCheck.openedKnown {
+		app.dbOpened = dbFileIdentity{Dev: dbCheck.openedDev, Ino: dbCheck.openedIno}
+	}
+	// The process that serves this database vouches for it when it closes the
+	// pool cleanly (db_clean_shutdown.go); so does serve's boot check, whose
+	// load runs just before the start-up load in the same process.
+	app.markCleanOnClose = opts.startup || (opts.checkOnly && serveBootCheckActive.Load())
+	// The schema cookie at open: any DDL this load runs bumps it, which is how
+	// the schema step below knows whether it changed anything.
+	schemaVersionAtOpen, schemaVersionErr := sqliteSchemaVersion(db)
+	// Every error return below abandons this pool, so close it. The app DSN
+	// carries _cache_size=-64000 (64MB page cache per connection) + a 256MB
+	// mmap window; when the router still loaded apps for checks, a
+	// repeatedly-failing load grew it by hundreds of MB and fed the 2026-08-01
+	// MemoryHigh throttling outage.
 	defer func() {
 		if err != nil {
 			db.Close()
@@ -139,7 +172,25 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	}
 	// Load schema
 	trace.phase("schema_load")
-	tables, deferredDDL, err := config.loadSchema(db, dir)
+	schemaCtx, cancelSchema := context.Background(), context.CancelFunc(func() {})
+	if opts.checkOnly {
+		schemaCtx, cancelSchema = context.WithTimeout(schemaCtx, checkMigrationTimeout)
+	}
+	loadSnaps := &loadSnapshots{}
+	if opts.startup {
+		// serve's boot check, just before this load, may already have copied the
+		// database before changing it: that copy is this start's pre-image too.
+		loadSnaps.first = takeServeBootCheckSnapshot(dir)
+	} else if opts.checkOnly && serveBootCheckActive.Load() {
+		defer func() {
+			if loadSnaps.first != "" {
+				handOffServeBootCheckSnapshot(dir, loadSnaps.first)
+			}
+		}()
+	}
+	schemaCtx = withLoadSnapshots(schemaCtx, loadSnaps)
+	tables, deferredDDL, err := config.loadSchema(schemaCtx, db, dir, opts.checkOnly)
+	cancelSchema()
 	if err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
@@ -150,15 +201,46 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	config.annotateFullText(dir, app.Tables)
 
 	// Run migrations (with pre-migration backup)
-	if len(tables) > 0 || len(deferredDDL) > 0 {
-		// Back up database before applying schema migrations
+	schemaManaged := len(tables) > 0 || len(deferredDDL) > 0
+	schemaStepApplied, migratedColumns := false, 0
+	if schemaManaged {
+		// Back up the database before a schema step that will change it. A
+		// snapshot is a whole-database copy; a restart that changes nothing
+		// has nothing to undo (schema_change_plan.go).
 		trace.phase("schema_backup")
-		backupPath := ""
-		if !(opts.checkOnly && recentPreMigrateBackup(dir, checkBackupMinInterval)) {
-			var err error
-			backupPath, err = preparePreMigrationBackup(dir, hadDBBeforeOpen)
+		schemaReason := schemaSnapshotReason(db, schemaVersionAtOpen, schemaVersionErr == nil, tables, deferredDDL)
+		// Later steps rewrite stored data when the runtime build or the storage
+		// configuration changed (db_boot_state.go): one snapshot covers those.
+		build := runtimeBuildID()
+		storage, digestErr := storageConfigDigest(app, config, nextEnv)
+		if digestErr != nil {
+			storage = ""
+		}
+		snapshotReason := schemaReason
+		if snapshotReason == "" {
+			snapshotReason = bootStateSnapshotReason(dir, build, storage)
+		}
+		switch {
+		case snapshotReason == "":
+			log.Printf("  backup: no pre-migrate snapshot needed, the schema step changes nothing")
+		case loadSnaps.first != "":
+			// The Prisma step copied the database before it changed anything.
+			log.Printf("  backup: using the snapshot the schema load took before migrating (%s)", snapshotReason)
+		case opts.checkOnly && recentPreMigrateBackup(dir, checkBackupMinInterval):
+			log.Printf("  backup: reusing a pre-migrate snapshot from the last %s (%s)", checkBackupMinInterval, snapshotReason)
+		default:
+			log.Printf("  backup: pre-migrate snapshot (%s)", snapshotReason)
+			backupPath, err := preparePreMigrationBackup(dir, hadDBBeforeOpen)
 			if err != nil {
 				return nil, err
+			}
+			loadSnaps.first = backupPath
+		}
+		// The snapshot (or a database too new to need one) covers this build and
+		// storage configuration, so a retried start does not copy it again.
+		if snapshotReason != "" && (loadSnaps.first != "" || !hadDBBeforeOpen) {
+			if err := recordBootState(dir, build, storage); err != nil && !foreignAppDirs.Load() {
+				log.Printf("  backup: snapshot taken but its build and configuration could not be recorded (%v); the next start snapshots again", err)
 			}
 		}
 
@@ -177,17 +259,22 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 		for _, blocked := range result.Blocked {
 			log.Printf("  warning: %s", blocked)
 		}
-		trace.phase("schema_verify")
-		// PRAGMA integrity_check reads the whole database. A validation load
-		// that changed nothing has nothing to verify; the app's own boot does.
-		if !(opts.checkOnly && len(result.Added) == 0) {
-			if err := verifyPostMigrationAndRestoreWithLease(dir, db, backupPath, policyLease); err != nil {
-				return nil, err
-			}
+		// What the load leaves in place is logged once per change, by a
+		// serving load (schema_notice_once.go), not on every start.
+		if !opts.checkOnly {
+			logSchemaNoticesOnce(dir, schemaNoticesToLog(db, result.Retained))
 		}
-
-		// Keep only the last 10 backups
-		cleanupOldBackups(dir, maxBackups)
+		// Did the schema step change the schema? A read error counts as yes.
+		migratedColumns = len(result.Added)
+		schemaStepApplied = migratedColumns > 0
+		if versionNow, verr := sqliteSchemaVersion(db); schemaVersionErr != nil || verr != nil || versionNow != schemaVersionAtOpen {
+			schemaStepApplied = true
+		}
+		if schemaStepApplied && schemaReason == "" {
+			log.Printf("  WARNING: the schema step changed the schema although its plan found nothing to apply; it is verified without a pre-migrate snapshot")
+		}
+		// The integrity_check runs after the load's last schema-writing step
+		// (schema_verify below), so one check covers what this load changed.
 	}
 	trace.phase("app_config")
 
@@ -252,14 +339,18 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	// stanza, no hooks.yaml dance needed.
 	synthesizeAutoMembershipHooks(app)
 
+	canonicalizeWorkflowColumns(config.workflows, app.Tables)
 	app.Flows, app.Workflows = config.flows, config.workflows
 	app.MCP, app.mcpWithheld = config.mcp, config.mcpWithheld
 
-	// Load computed fields and install SQLite triggers
+	// Load computed fields and install SQLite triggers (a computed column
+	// that is also encrypted is written sealed: computedSeal).
 	app.Computed = config.computed
-	if err := installComputedTriggersChecked(db, app.Computed); err != nil {
+	if err := installComputedTriggersSealed(db, app.Computed, config.encrypted); err != nil {
 		return nil, fmt.Errorf("computed triggers: %w", err)
 	}
+	// Declared fields that install no trigger are said out loud.
+	logComputedProblems(app.Computed)
 
 	// Initialize field-level encryption and install triggers
 	encConfig := config.encrypted
@@ -272,7 +363,7 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	}
 
 	// Initialize content versioning
-	versionConfig := app.versionedConfig()
+	versionConfig := withComputedVersionMaintenance(app.versionedConfig(), app.Computed)
 	if err := installVersioningBeforeMigrations(db, versionConfig, encConfig); err != nil {
 		return nil, fmt.Errorf("versioning: %w", err)
 	}
@@ -281,8 +372,11 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	app.I18n = config.i18n
 
 	// Run migration files (migrations/ directory), with a pre-migration backup.
+	if err := EnsureNotificationsTableChecked(db); err != nil {
+		return nil, fmt.Errorf("notifications: %w", err)
+	}
 	trace.phase("user_migrations")
-	if err := config.runUserMigrations(context.Background(), db, dir, opts.checkOnly); err != nil {
+	if err := config.runUserMigrations(withLoadSnapshots(context.Background(), loadSnaps), db, dir, opts.checkOnly); err != nil {
 		return nil, fmt.Errorf("user migration: %w", err)
 	}
 	if freshMCPDatabase {
@@ -300,6 +394,24 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	trace.phase("fulltext")
 	if err := EnsureFTSTables(db, app.Tables); err != nil {
 		return nil, err
+	}
+	// Prisma, deferred DDL, user migrations and full-text setup may have
+	// created triggers after an enrolled table's revision triggers, which must
+	// fire first (app_mcp_revision_order.go).
+	if err := reseatAppMCPRevisionTriggersDB(context.Background(), db); err != nil {
+		return nil, fmt.Errorf("revision trigger order: %w", err)
+	}
+
+	// Verify after the last step that writes schema (Prisma, Migrate, deferred
+	// DDL, triggers, history tables, user migrations, full-text tables), so one
+	// PRAGMA integrity_check covers everything this load changed; a failure
+	// restores the load's first snapshot (db_integrity_ledger.go).
+	if schemaManaged {
+		trace.phase("schema_verify")
+		if err := verifyLoadedSchema(app, opts.checkOnly, schemaStepApplied, migratedColumns, loadSnaps.first, policyLease); err != nil {
+			return nil, err
+		}
+		cleanupOldBackups(dir, maxBackups)
 	}
 
 	// Build join map for shorthand engine
@@ -326,7 +438,7 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("operation lifecycle finalization: %w", err)
 	}
-	app.mcpGeneration = newAppMCPRuntimeGeneration(app, app.MCP, app.Group, app.Roles, app.Access, app.Scopes, app.Design, app.Tables, app.UUIDTables, app.Encrypted, app.Flows, app.sourceFiles, app.environment, app.templateEnvSource, app.Hooks, app.Validators, app.Computed, app.Workflows, pages)
+	publishAppMCPRuntimeGeneration(app, newAppMCPRuntimeGeneration(app, app.MCP, app.Group, app.Roles, app.Access, app.Scopes, app.Design, app.Tables, app.UUIDTables, app.Encrypted, app.Flows, app.sourceFiles, app.environment, app.templateEnvSource, app.Hooks, app.Validators, app.Computed, app.Workflows, pages))
 	if !opts.checkOnly {
 		// Connections removed from mcp.yaml lose their stored credentials.
 		purgeUndeclaredAppMCPConnectionCredentials(db, app.MCP)

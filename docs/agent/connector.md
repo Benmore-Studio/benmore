@@ -4,15 +4,12 @@ The platform MCP at `/mcp` builds and manages apps. Each app's connector at
 `/api/_mcp` lets its users connect an MCP client to reviewed app tools. Platform
 credentials cannot substitute for an app user's consent and permissions.
 
-You need the installed **CLI 0.1.37 or newer**, your **app project files**, and a
-runtime with app connector support. You do not need the Benmore framework's Go
-source, Go, Node, or a compiler to author/review a native connector. CLI 0.1.35
-has inspect/check/generate and owner controls, but cannot review an unsealed
-manifest; upgrade before using this workflow. Run `benmore mcp --help` for the
-installed commands. The hosted reference is `benmore api <app> connector`.
-The source changes in this checkout target CLI 0.1.37 and runtime 2.7.259; this
-guide does not establish that those versions are released or deployed. Verify
-the versions actually installed before relying on review or hosted behavior.
+You need the installed CLI and your **app project files**. You do not need the
+Benmore framework's Go source, Go, Node, or a compiler to author/review a native
+connector. This guide ships inside the CLI that prints it: `benmore version`
+names that CLI, and a deployed app's `/health` (`version`) names its runtime.
+Run `benmore mcp --help` for the installed commands. The hosted reference is
+`benmore api <app> connector`.
 
 ## Start from the app's actual files
 
@@ -29,7 +26,9 @@ Pull downloads app source, not production databases, uploads or secrets. Inspect
 and role declarations; the example below is for the standard Notes scaffold.
 Server-created HTML apps and self-hosted framework starters include a reviewed
 Notes manifest. Replace its tool bindings when replacing the demo, then review
-the changed project again. Hosted CLI `benmore new` omits that manifest so its
+the changed project again. Removing the `Note` model is a destructive schema
+change: deploy it, and let the app migrate, before a new reviewed `mcp.yaml`
+(see Common setup errors). Hosted CLI `benmore new` omits that manifest so its
 documented first `benmore deploy` works. Deploy first, pull the complete remote
 source into a fresh directory, then author and review a connector there. The
 unlinked-app review guard still refuses an already reviewed `mcp.yaml` whose
@@ -112,12 +111,12 @@ not open app data, enable access or approve an operation. Check/inspect remain
 read-only and require a sealed manifest. Local success does not prove the
 physical database, host authority directory, current grant or a real client.
 
-The unreleased review serialization fix accepts omitted optional `tools`,
-`resources` and `connections` arrays and seals the representation written to
-YAML. Explicit `null` remains invalid. On older CLIs, write unused arrays as
-`[]`, as in the example above, before reviewing. Existing sealed manifests keep
-their original contract validation; only an explicit `review --reviewed`
-rewrites them. See the hosted `connector` recipe's `review_serialization` entry.
+Review edits only its own top-level keys (`contract_digest`,
+`execution_digest`, `execution_sources`) and keeps the rest of `mcp.yaml` as you
+wrote it: integers, quoting, comments and indentation. Reviewing a reviewed
+file again keeps its bytes and digests. Omitted optional `tools`, `resources`
+and `connections` arrays stay omitted; explicit `null` is invalid. See the
+hosted `connector` recipe's `review_serialization` entry.
 
 The generated `contract_digest` and `execution_digest` are **top-level keys**,
 next to `version`, `connector` and `tools`, never under `connector`, a tool or a
@@ -134,13 +133,12 @@ and each `connections[].openapi` document with the JSON/YAML files beside it
 `docs/`, root `*.md`, `src/`, `tests/` and hidden directories outside those
 trees (`.sdd/`, `docs/x/.verify/`) do not move it, so a hosted instance may hold
 files a checkout lacks. A manifest without the key was reviewed over the whole
-tree: it keeps validating that way (an upgrade never turns a reviewed connector
-off) until you run review again. Every runtime-source edit requires another
-review. Runtime and upload validation still
+tree and keeps validating that way until you run review again. Every
+runtime-source edit requires another review. Runtime and upload validation
 reject missing/incorrect digests.
 
 Deploy sends dependencies before `mcp.yaml` and requests a final reload. Pushes
-with multiple named files also send `mcp.yaml` last. Unreleased CLI: both put root
+with multiple named files also send `mcp.yaml` last. Both put root
 `schema.prisma`, `schema.sql` or `schema.yaml` first, then `app.yaml`, then the
 remaining dependencies in their existing order. This lets command flows refer
 to tables added in the same batch; every upload still passes source validation. If only the manifest changed
@@ -158,8 +156,7 @@ its reported failures, correct/review the intended source and rerun it.
 
 Enable requires the app owner and a loaded, valid manifest plus a configured
 instance authority directory. If status reports `authority_configured:false`,
-an operator must provision it according to the release runbook; a CLI flag
-cannot bypass this. Use an explicit `--env` when dev and prod both exist.
+an operator must provision it; a CLI flag cannot bypass this. Use an explicit `--env` when dev and prod both exist.
 Approved writes stay off until the owner enables `--writes` on an app declaring
 approved commands. Export and publication have separate opt-ins.
 
@@ -172,14 +169,85 @@ exposure is on and the revision enrollment is active for the current owner epoch
 and verifies against the database. Otherwise `benmore mcp status` shows
 `approved_writes_off_reason` and the owner runs `enable --writes` again. An owner
 `disable`, `--revoke`, a restore, a hot reload or an environment change forgets the
-approval, so a later restart never resumes it. Apps whose writes an older runtime
-enabled have no recorded digests: the first restart onto this runtime still turns
-their writes off once.
+approval, so a later restart never resumes it. A hot reload is any push or
+source write that reloads the app, so the edit that leaves `mcp.yaml`'s review
+stale and the push of the new review each turn approved writes and auto-approve
+off: a review restores the connector's reads, grants and exposure, not its
+write approval. `approved_writes_off_reason` says when a reload did this, until
+the owner changes a switch.
 
 Users connect their MCP client to `https://<app-host>/api/_mcp`, sign in as their
 own app user and consent to explicit scopes. A successful owner enable is not
 proof of a real-client connection. Test allowed and denied identities, revocation
 and the actual user workflow before calling the app fully accepted.
+
+### Test a hosted connector from a script
+
+A script can play both the MCP client and the approving person. It needs a
+dedicated test app user whose password stays out of the script and its logs
+(read it from the environment), and a cookie jar that does not follow
+redirects. `ORIGIN` is the instance, for example
+`https://<app>-dev.<platform domain>`; the resource is `ORIGIN + "/api/_mcp"`.
+
+1. Sign in: `GET /api/_csrf`, then `POST /login` with JSON
+   `{email, password}`, header `X-CSRF-Token: <token>` and
+   `Accept: application/json`. Keep the session cookie.
+2. Register a client: `POST /oauth/register` with JSON
+   `{client_name, redirect_uris: ["http://127.0.0.1:8765/cb"], grant_types:
+   ["authorization_code", "refresh_token"], response_types: ["code"],
+   token_endpoint_auth_method: "none", scope: "<tool permissions>"}`. A
+   loopback `http` redirect is accepted; nothing needs to listen on it. Scopes
+   the app does not offer are dropped, and the answer's `grant_types` names
+   both grants.
+3. Make a PKCE pair: a 43-128 character `verifier` and
+   `challenge = base64url(sha256(verifier))` without padding. With the cookie,
+   `GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&state=...&scope=...&code_challenge=...&code_challenge_method=S256&resource=<resource>`.
+   An account in several workspaces gets a picker first; repeat with
+   `&workspace=<id>`.
+4. The consent page holds one form that posts to `/oauth/authorize`. Send every
+   hidden input back unchanged (`response_type`, `client_id`, `redirect_uri`,
+   `state`, `scope`, `code_challenge`, `code_challenge_method`, `resource`,
+   `workspace`, `connector_nonce`, `consent`) plus `decision=approve`,
+   form-encoded, with `Origin: ORIGIN`. Add `auto_approve=1` only if the page
+   offers it and you want it. The `302` `Location` carries `code` and `state`.
+5. `POST /oauth/token` form-encoded with `grant_type=authorization_code`,
+   `code`, `redirect_uri`, `client_id`, `code_verifier` and `resource`. Refresh
+   later with `grant_type=refresh_token`, `refresh_token`, `client_id` and
+   `resource`.
+6. Call tools: `POST <resource>` with a JSON-RPC body,
+   `Authorization: Bearer <access_token>`,
+   `Accept: application/json, text/event-stream` and an
+   `MCP-Protocol-Version` header. An event-stream answer carries the JSON in its
+   last `data:` line. A command tool returns `operation_id` and `review_url`.
+7. Approve as the signed-in person: with the cookie, `GET review_url`, read the
+   hidden `_csrf` input (bound to that session and that operation) and `POST`
+   it form-encoded to the form's action (`<review_url>/approve`) with
+   `Origin: ORIGIN`. A `303` back to the review page means approved. The bearer
+   token can never approve.
+8. Call `_commit` with `{operation_id}`, then `_status`.
+
+```python
+import base64, hashlib, html, json, re, secrets, urllib.request
+
+def pkce():
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+def hidden_fields(page):
+    form = re.search(r'<form[^>]*method="post"[^>]*>(.*?)</form>', page, re.S | re.I).group(1)
+    fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', form))
+    return {name: html.unescape(value) for name, value in fields.items()}
+
+def rpc(origin, access_token, method, params):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    request = urllib.request.Request(origin + "/api/_mcp", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + access_token,
+        "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"})
+    text = urllib.request.urlopen(request).read().decode()
+    lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    return json.loads(lines[-1] if lines else text)
+```
 
 ## Point reads and read flows
 
@@ -219,8 +287,8 @@ inputs that match the app's real readable fields and indexes. `order` requires
 are refused. Read masks and current row access still apply.
 
 Use a flow when a read needs a business-specific projection or row predicate.
-This is the minimal Notes pattern used by the runtime tests; adapt its columns
-and ownership condition to the app's actual schema:
+This is a minimal Notes pattern; adapt its columns and ownership condition to
+the app's actual schema:
 
 ```yaml
 on:
@@ -246,7 +314,7 @@ an input schema requiring integer `id`, a closed output schema containing
 `output: {include: [id, title]}` and `component: none`. The flow must be uniquely
 registered, synchronous and effect-free. Route and tool permissions must agree;
 the flow's SQL must scope rows itself (`auth` and permission declarations do not
-add SQL predicates). Connector flow reads run with a read-only database authorizer.
+add SQL predicates). Connector flow reads run read-only.
 Mutating SQL, API/email/webhook/enqueue effects, async flows and parallel steps
 are rejected. Do not bind a command flow with `flow.call`.
 
@@ -289,9 +357,9 @@ completed_by)` and a `tasks:write` scope:
   component: none
 ```
 
-The matching `flows/complete_task.yaml` command declaration follows. This
-minimal fixture is source-tested; a real app must add its actual owner/group
-predicates and every consequence to the preview:
+The matching `flows/complete_task.yaml` command declaration follows. It is a
+minimal example; a real app must add its actual owner/group predicates and
+every consequence to the preview:
 
 ```yaml
 command:
@@ -355,6 +423,36 @@ jobs:
             status: '${{ steps.completed_task.outputs.first.status }}'
 ```
 
+As written, a task that does not exist or is already done leaves the prepare
+`respond` without a row to read, and the tool answers `unavailable_provider`.
+Count the row first and refuse with a message (see "Refuse in prepare with a
+message").
+
+Every command flow needs the three jobs `prepare`, `apply` and `readback` and 1
+to 64 `dependencies` (an insert-only command still names one, for example the
+row it must not duplicate); review refuses `missing "readback"`,
+`missing "dependencies"` and `dependencies must contain 1..64 entries`.
+
+Each `dependencies` query must return exactly one column named `id` (`t.id` and
+`id AS ID` qualify). Review, `mcp check`, the push write gate and
+`benmore check` prepare each query against an empty copy of the schema and refuse
+`dependency "<name>" must return exactly one id column`, naming the columns it
+returns. A query the schema files alone cannot prepare (a column a migration adds)
+is checked at run time instead, where prepare fails with `invalid_declaration`.
+
+Command SQL (dependency queries and the SQL of all three jobs) may call only the
+functions listed under "Triggers you wrote on a written table" below, without
+the three only triggers may call. Review, `mcp check`, the push write gate and `benmore check` compile
+each statement against the same empty copy of the schema and refuse any other
+call (`random`, `randomblob`, `iif`, a misspelled name) with
+`<statement> calls function "<name>", which approved commands cannot run` and
+the allowed list. A statement the schema files alone cannot compile is checked
+at run time instead, where it fails with `invalid_declaration` naming the
+function. Review does not judge column names, because the schema files do not
+list the columns a migration adds: SQL that names a column the database does
+not have fails at run time with `invalid_declaration` (the message does not
+name the column; the app's log does).
+
 A command permission is `<table>:read|write` for a declared table, or a
 capability scope `<capability>:<action>` (for example `billing:write`) when some
 role in `app.yaml` `roles:` grants that resource, directly or through `inherits:`;
@@ -395,22 +493,65 @@ enables writes separately:
 benmore mcp enable <app> --writes --env dev
 ```
 
+Commands need a durable `ENCRYPTION_KEY`: prepared operations, approvals and
+attempt history are sealed under it, and a load whose `mcp.yaml` binds a
+command refuses without one (`operation lifecycle requires configured
+ENCRYPTION_KEY`). On the hosted platform the push or deploy that adds commands
+to an instance without a key restarts the app instead of hot reloading it, and
+the restart pins a key in that instance's environment, as it does for encrypted
+fields; `benmore restart <app> --env dev` does the same. An
+existing key is never replaced. `benmore check` and `benmore mcp check` warn
+while the key is missing. Self-hosted or with `benmore serve --mcp-local`, set
+`ENCRYPTION_KEY` (`openssl rand -hex 32`) in `env.yaml` or the environment
+before the first start, and keep it: once commands have run, changing it needs
+the key-rotation workflow.
+
 The command call only prepares an operation and returns its ID, preview, expiry
 and first-party review URL. A person signs in to the app and approves that exact
 operation in the browser; `_commit` applies it once, and `_status` reads its
 durable state and receipt. There is no MCP approval tool. Connector bearer
-credentials, API tokens, impersonated sessions and edge identities cannot approve.
+credentials, API tokens and impersonated sessions cannot approve.
 Prepared approvals expire after 15 minutes. Treat `prepared`, `approved`,
-`running`, `succeeded`, `failed`, `conflict`, `unknown` and `expired` as distinct
-states. Retry only when status says retryable; an unknown result needs recovery,
-not a blind second mutation. Business commit and any external delivery are
-separate outcomes.
+`running`, `succeeded`, `failed`, `conflict`, `unknown`, `expired` and `denied` as
+distinct states. Retry only when status says retryable; an unknown result needs
+recovery, not a blind second mutation. Business commit and any external delivery
+are separate outcomes.
+
+Two failures are final. `constraint_failed` means the apply SQL hit a
+FOREIGN KEY, UNIQUE, NOT NULL or CHECK constraint (for example deleting a row other
+rows still reference); the change was rolled back, the message names only the
+constraint kind, `_status` says `retryable: false`, and `_commit` answers the same
+code again. `invalid_declaration` means the reviewed command cannot run against
+the database, such as a dependency query that does not return one `id` column,
+SQL that calls a function commands cannot run, or SQL that names a column the
+database does not have.
+Fix the data or the source and prepare a new operation. Genuine outages stay
+`unavailable_provider` and remain retryable.
+
+`denied` means the operation has not expired but cannot commit right now, and
+`_commit` gives its owner the same answer: `_status` carries `reason` and a failed
+`_commit` carries `_meta.reason`, one of `source_changed`, `actor_changed` or
+`approval_lapsed`. Prepare the operation again. Another caller gets a bare `denied`.
+The review page shows the same state and reason to its owner: an approval whose
+browser session has ended (for example, the person signed out) reads "The
+approval no longer holds", never "Approved", and an operation blocked by a role
+or source change is shown with its reason and cannot be approved. One operation
+takes one approval, so the person asks the assistant to prepare it again and
+stays signed in until the new one is applied. An `approval: grant` approval is
+described as coming from the connection's consent; only `_status` can say
+whether that consent still holds.
+
+A command input that does not match `input_schema` fails `invalid_input` naming
+the JSON path and the rule (`... at arguments.status: value is not in enum.`),
+never the value itself.
 
 A prepared result also carries `batch_review_url`
 (`/api/_mcp/operations/batch?grant=<id>`): one page listing every pending,
 unexpired change that connection prepared for the signed-in person, approved
 together in one POST. Nothing is ticked for the person; each selected change
-spends the approval rate limit as it is approved. It has the single-operation page's gates (cookie session
+spends the approval rate limit as it is approved. The person's unexpired changes
+that can no longer be applied are listed under "Can't be applied" with the
+reason, without a checkbox. It has the single-operation page's gates (cookie session
 only, direct login, rate limits, CSP), one CSRF token bound to the session and
 that grant, and still records one human approval per operation.
 
@@ -471,8 +612,7 @@ Rules, all enforced by the runtime:
   grant of the member this change names"). That is the only consent surface: an
   `approval: grant` command carrying the step applies without a browser trip
   like any other.
-- It writes one `mcp_command_revoke_sessions` audit row (user ids only) and
-  revokes the user's platform edge grants after the commit.
+- It writes one `mcp_command_revoke_sessions` audit row (user ids only).
 - Ordinary flows cannot use it; the write gate refuses the step there.
 
 ### Triggers you wrote on a written table (`app_triggers`)
@@ -517,14 +657,14 @@ refused. To change a trigger, `DROP TRIGGER`
 and `CREATE TRIGGER` again in a new migration (a second `CREATE` alone is
 skipped as already applied), then review and re-enroll. The WHEN clause and body
 may call only these functions: `abs`, `avg`, `char`, `coalesce`, `concat`,
-`concat_ws`, `count`, `date`, `datetime`, `glob`, `hex`, `ifnull`, `instr`,
+`concat_ws`, `count`, `date`, `datetime`, `benmore_today`, `glob`, `hex`, `ifnull`, `instr`,
 `length`, `like`, `lower`, `ltrim`, `max`, `min`, `nullif`, `printf`, `quote`,
-`replace`, `round`, `rtrim`, `sign`, `soundex`, `sqlite_version`, `substr`,
+`replace`, `round`, `rtrim`, `sign`, `sqlite_version`, `substr`,
 `substring`, `sum`, `time`, `total`, `trim`, `typeof`, `unicode`, `upper`,
 `zeroblob`, `julianday`, `strftime` and the `json`, `json_array`,
 `json_array_length`, `json_group_array`, `json_extract`,
 `json_insert`, `json_object`, `json_patch`, `json_remove`, `json_replace`,
-`json_type`, `json_valid`, `json_quote` family, plus `raise`, `current_timestamp`
+`json_set`, `json_type`, `json_valid`, `json_quote` family, plus `raise`, `current_timestamp`
 and `benmore_encrypt`, which only triggers may call. Any other call (`random`, `randomblob`, `iif`) and bare
 `current_date`/`current_time` make enrollment fail, so the trigger is refused when
 you enable writes, not on the first command.
@@ -599,9 +739,10 @@ approval, only when all three opt-ins hold:
    shrink, and reconnecting is the only way to change it. The consent is
    bound to the owner's auto-approve epoch at that moment and to the reviewed
    manifest (each tool as `name@<contract digest>`): an owner off/on cycle,
-   any write-epoch rotation or a change to `mcp.yaml` sends the connection
+   any write-epoch rotation (every hot reload rotates it) or a change to
+   `mcp.yaml` sends the connection
    back to per-write review until the user reconnects and ticks again.
-   Grants from before this binding never auto-approve.
+   A grant that does not carry this consent never auto-approves.
 
 The command call then returns the `_commit` result (`outcome`, `receipt` with
 `approval_basis: grant_consent:<grant id>`) instead of a review URL. Without
@@ -689,7 +830,12 @@ command:
     properties:
       email: {type: string, maxLength: 254}
   writes: [invites]
-  # dependencies: ...
+  dependencies:                 # at least one, even for an insert
+    - name: existing_invite
+      table: invites
+      query: SELECT id FROM invites WHERE email = :email
+      params: {email: '${{ params.email }}'}
+      max_rows: 1
 jobs:
   prepare:
     steps:
@@ -709,10 +855,15 @@ jobs:
           params: {email: '${{ params.email }}', token: '${{ params.generated.invite_token }}'}
       - run: respond
         with: {status: 200, json: {ok: true}}
+  readback:
+    steps:
+      - run: respond
+        with: {status: 200, json: {ok: true}}
 ```
 
 Each entry has a unique lowercase `name`, `kind: token` and `bytes` from 16 to 64
-(at most 16 entries). Prepare draws every value from `crypto/rand` once and seals
+(at most 16 entries). Prepare draws every value from the system's cryptographic
+random source once and seals
 it into the prepared arguments as `arguments.generated.<name>`, a fixed-length
 string (24 bytes is 32 base64url characters or 48 hex). The approval digest covers
 it, so approval, commit, a retried attempt and a replay all see the same value, and
@@ -742,21 +893,23 @@ columns refuse at runtime. The binding is reviewed contract content and requires
 resealing; the snapshot remains immutable, but a changed column no longer grants
 access to its old processing result. Without `file_column`, legacy tools retain
 their broader any-string-column reference check; do not use that mode to claim an
-exact document-version binding. This addition is unreleased; source review and
-fixture tests do not prove an installed or hosted runtime supports it.
+exact document-version binding.
 
 File handlers may also declare `membership_constraints: {kind: human, status: active}`.
 Each key must name a canonical, visible scalar column in the configured groups
 table; all declared equalities must match the actor's one live membership row
 and are checked alongside existing grants, table/row access, exact file-column
-binding and ownership. Omission preserves existing behavior. A file handler may
+binding and ownership. Review, `mcp check` and the push write gate refuse the
+manifest when the app has no `groups` table, key and user field configured or
+the groups table does not declare a constrained column. Omission preserves
+existing behavior. A file handler may
 declare a `status` operation with required `processing_id`, `record_id` and
 `file_ref` inputs. It returns bounded metadata for a known successful,
 snapshot-backed processing result only, after rechecking current row, file,
 membership and owner authority. The response contains no parsed blocks or
 snapshot payload. `complete` describes historical parser completion and does
 not attest to the current file bytes. Failure-only and legacy unbound records
-are not eligible. This source feature is unreleased.
+are not eligible.
 
 Apps that allow admins to attach uploads across workspace rows can opt a file
 handler into `upload_tenant: current`, alongside its exact `file_column`. The
@@ -766,9 +919,10 @@ key. The framework checks that provenance before file access and again during
 cache reuse, verification, status reads and snapshot publication. A strict tool
 cannot reuse a snapshot recorded under legacy policy. The configured groups
 table, key and user field, plus that key on the source table, must be declared in
-the reviewed schema. Omitting the field keeps the established admin/uploader/
+the reviewed schema; review, `mcp check` and the push write gate refuse the
+manifest otherwise. Omitting the field keeps the established admin/uploader/
 row-owner vouch rules. The setting is part of the reviewed manifest contract
-and appears in lowercase in source inspection. This source feature is unreleased.
+and appears in lowercase in source inspection.
 
 File tools do not accept arbitrary paths or URLs. `kind: file` supports
 `ingest`, `verify` and metadata-only `status`; permissions include both `files:read` and the row's
@@ -778,8 +932,19 @@ same immutable extraction. CSV/XLSX/XLSM and PDF limits and host prerequisites
 are in `api(at:"connector")`; OCR output is evidence for human review, not a
 guarantee of correctness.
 
+DOCX extraction emits bounded paragraph and table text. PPTX extraction follows
+the presentation's declared slide order and emits slide text, tables and notes.
+This parser does not reconstruct page geometry, evaluate fields, or interpret
+images, charts, SmartArt, inherited layout or animations. Tracked changes,
+alternate content and external text stories fail closed rather than selecting a
+possibly misleading partial result. `complete` means the declared supported
+text scope parsed successfully; it does not mean the rendered document was
+understood.
+
 `artifact.export` creates an immutable report from the caller's own successful
 reviewed-command receipt. It does not accept arbitrary rows or rerun the command.
+It returns `artifact_id`, `kind`, `sha256`, `size` and `download_url`, as
+`artifact.create` does.
 Retrieval requires the owner's interactive app session and rechecks current
 tenant, role and original scopes; a bearer token is insufficient. PDF export has
 host prerequisites and a shared per-user rendering budget.
@@ -836,11 +1001,17 @@ remain). The assistant then calls the built-in `artifact.create` with
 `{tool: "cashflow_forecast", format: "xlsx", arguments: {...}}`; `arguments` are
 only that tool's own inputs. The framework re-runs the read with the caller's
 grant, formats the validated result, stores it as an immutable artifact and
-returns `artifact_id`, `sha256`, `size` and `download_url`. The user opens the
+returns `artifact_id`, `kind`, `sha256`, `size`, `download_url` and
+`read_completeness`. The user opens the
 URL signed in to the app in their own browser; retrieval is as for
 `artifact.export`. The XLSX has typed cells and a frozen header row; the HTML
 is a printable branded report; the PDF prints that report with the same
-prerequisites as `artifact.export`. Limits: 20 artifacts an hour per user (PDFs
+prerequisites as `artifact.export`. A PDF renderer that is missing, fails or
+runs past its deadline returns `unavailable_provider` from both tools; any
+other failure after the request is authorized (formatting or storing the file)
+returns `incomplete_result` from both, and a refused receipt or tool returns
+`denied`. On hosted apps an HTML report is stored as a download-only
+`.html.bin` object and served only by the artifact download. Limits: 20 artifacts an hour per user (PDFs
 also share the PDF budget), 5000 rows per sheet, 100000 cells, and the newest
 25 read artifacts per user within 128 MiB are kept (when a new one is made,
 the first one that breaks the count, byte or 7-day limit and every older one are
@@ -877,6 +1048,11 @@ resources:
     deep_link: /notes/{id}
 ```
 
+A tool binds a component by setting its own `component:` to that resource's
+`uri` (for example `component: ui://notes/card`). The resource's `name` or its
+`component:` label is refused with `tool "<name>" has unresolved component
+resource`; `component: none` binds nothing.
+
 The entrypoint and bridge behavior must be tested in the intended MCP client.
 Declaring a resource alone does not make a working widget. Calls from the UI
 still use tool permissions and first-party write approval; upstream secrets are
@@ -888,18 +1064,22 @@ External reads use a named connection pinned to a local OpenAPI 3.0/3.1 file.
 does not make a deployable manifest. Review the real provider response, method,
 operation ID, parameter mapping and output schema before authoring a connection.
 Only local file references are supported. Private or unresolvable hosts and
-generic external write tools are refused. Connection credentials come from
-per-app environment settings, separate from inbound app-user MCP grants.
+generic external write tools are refused. Each user stores their own upstream
+credential per connection from a signed-in browser session
+(`PUT /api/_mcp/connections/<name>/credential`, body `{"secret": "..."}`),
+separate from inbound app-user MCP grants; a call without one answers `denied`
+naming that route. `auth.env` must still be declared for `bearer` and `header`
+(review refuses the connection without it), but its value is not read.
 Selected file pull and approved artifact push use the separate manifest-bound
 `transfer` declaration; continuous two-way sync is unsupported.
 
 ## Owner controls and client limits
 
 `benmore mcp status|enable|disable <app> --env dev|prod` controls exposure.
-`--writes`, `--export`, `--publication` and `--revoke` target separate controls;
-use the installed help for exact flags. A valid manifest does not itself enable
-any switch or create user grants. The publication flag currently has no
-publication consumer. Resource subscriptions, arbitrary SQL/shell/HTTP proxies,
+`--writes`, `--auto-approve`, `--export`, `--publication` and `--revoke` target
+separate controls; `benmore mcp status --help` prints the exact flags. A valid
+manifest does not itself enable any switch or create user grants. Nothing
+consumes the publication switch yet. Resource subscriptions, arbitrary SQL/shell/HTTP proxies,
 automatic exposure of ordinary app routes, and generic external writes are
 unsupported. Runtime and local tests do not prove hosted authority setup,
 provider qualification or a real client's behavior; measure those on the target
@@ -909,20 +1089,23 @@ instance before claiming app acceptance.
 
 | Error | Correct action |
 |---|---|
-| `Unknown ... review` on 0.1.35 | Upgrade the installed CLI; framework source is unnecessary. |
 | Missing/invalid lowercase SHA-256 | Review the app files and run `mcp review . --reviewed`; digests belong at top level. |
 | `field ... not found` | Use the complete example; the schema rejects unknown keys and misplaced digests. |
 | Unsupported handler kind/operation | Use `native` + `table.list`/`table.read`/`flow.call`; commands use `flow` + `command`. |
-| Reviewed digest mismatch, or a write answers `mcp_connector_withheld` / push warns "this app's MCP connector is off" | Source changed or differs from the server. The app keeps serving the change, but its connector stays off until you reconcile, review again and deploy all reviewed files; if the app serves no connector, delete `mcp.yaml` instead. |
+| Reviewed digest mismatch, or a write answers `mcp_connector_withheld` / push warns "this app's MCP connector is off" | Source changed or differs from the server. The app keeps serving the change, but its connector stays off until you reconcile, review again and deploy all reviewed files; if the app serves no connector, delete `mcp.yaml` instead. Deploy never deletes server files: a deploy of `mcp.yaml` that would leave a file you deleted locally, or a migration the server wrote, on the server is blocked and names the file (`benmore delete-file <path>` or `benmore pull`, then review again). |
+| Inserts into an enrolled table fail with `write rejected (insert <table>): revision ledger row missing` after a reload, or `mcp status` shows `revision_enrollment: out_of_order` | Another trigger on the table (an encrypted, computed or blind-index field) fires before the connector's revision triggers. Every load puts the revision triggers first again; run `benmore mcp enable <app> --writes` or reload to reorder them (nothing is re-approved). |
+| `revision enrollment universe changed; explicit repair is required`, or `mcp status` shows `revision_enrollment: changed` | The reviewed commands now read or write a different set of tables. Run `benmore mcp enable <app> --writes`: it re-enrolls for the new set. |
 | Review names an excluded path such as `static/.env`, `flows/.git/` or `static/data.db-wal` | Remove or rename the protected file or directory outside `static/` and `flows/`, then review again. Ordinary non-MCP pushes retain the CLI's existing write-time normalization. |
 | MCP push, `write_file` or `edit_file` says source needs normalization | Apply the suggested normalization, review the resulting source, then push or write again; MCP delivery and the write tools never change reviewed bytes. |
-| `Unknown flag` from `benmore mcp status|enable|disable` | Use only the documented action flags and spell each option exactly; unknown owner-switch flags fail before a request is sent. |
+| `unknown flag` from `benmore mcp status|enable|disable` | Use only the documented action flags and spell each option exactly; unknown owner-switch flags fail before a request is sent. |
 | No reviewed manifest loaded / authority unavailable | Check owner status on the correct instance; deployment or operator provisioning is still required. |
 | `pending route-changing migration DDL is unsupported` on an existing database | A pending ALTER/DROP/PRAGMA migration could change routes under the live manifest. Apply it in a separate reviewed step (remove the manifest, boot, restore it and review again). A fresh database applies its migrations first and then checks the manifest, so this only affects existing data (a retried first boot counts as fresh until one load completes). |
+| `operation lifecycle requires configured ENCRYPTION_KEY` | The app declares commands and its environment has no durable key. Hosted: the push or deploy that adds commands restarts the app and pins one; `benmore restart <app> --env <env>` does the same. Self-hosted: set `ENCRYPTION_KEY` before starting. |
+| `destructive Prisma schema transition is unsupported`, or `mcp.yaml not written: the server's schema.prisma removes the model of table ...` | A reviewed manifest blocks a migration that drops a table (for example the scaffold's `notes`). From `benmore deploy` (or a multi-file push) the refused `mcp.yaml` is the batch's last write, so the server reloads the files already written without it: the schema change applies and the CLI pulls the `migrations/` file it wrote. Then `benmore mcp review . --reviewed` and deploy again. Otherwise, in this order: keep the reviewed `mcp.yaml` off the server (a first connector has none there; one reviewed for the old schema is stale and already off; delete one reviewed for the new schema with `benmore delete-file mcp.yaml --app <app> --env <env>`); push `schema.prisma` and wait for the reload to migrate; `benmore pull` the `migrations/` file the server wrote; `benmore mcp review . --reviewed`; deploy again. Command flows can stay: while no `mcp.yaml` is loaded they load without being exposed. |
 | Read succeeds locally but connector request is denied | Recheck the current app user, role, tenant, scope, grant, audience and owner switches. |
 
-The connector implementation includes scoped OAuth, reads, approved commands,
-recovery, files/artifacts, reviewed MCP Apps resources and pinned external
-connections. These are implemented capabilities with configuration and host
-prerequisites, not automatic exposure of every HTTP route. Generic external
-write proxies and resource subscriptions are unsupported.
+The connector covers scoped OAuth, reads, approved commands, recovery,
+files/artifacts, reviewed MCP Apps resources and pinned external connections,
+each with configuration and host prerequisites; it never exposes an HTTP route
+automatically. Generic external write proxies and resource subscriptions are
+unsupported.

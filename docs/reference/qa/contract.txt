@@ -1,0 +1,19 @@
+# tests/journeys/employees.yaml (what qa_inventory drafts, tightened)
+name: employees
+tags: [smoke]
+user: hr_admin            # verify.yaml: users: {hr_admin: hr@example.com}
+path: /employees
+actions:
+  - {do: click, selector: "[data-testid=employee-add]"}
+  - {do: fill, selector: "[data-testid=employee-name]", text: "Ada Lovelace"}
+  - {do: click, selector: "[data-testid=employee-save]"}
+assertions:
+  - {visible: "[data-testid=employee-list]"}
+  - {text: {selector: "[data-testid=employee-list]", contains: "Ada Lovelace"}}
+  - {url: {contains: "/employees"}}
+  - {horizontal_overflow: false}
+
+# browser_batch call (what benmore verify sends)
+{"app":"hris","env":"dev","journeys":[{"name":"employees","path":"/employees","as":"hr@example.com",
+  "actions":[{"do":"click","selector":"[data-testid=employee-add]"}],"script":"<compiled assertions>"}]}
+# → {"results":[{"name":"employees","clean":true,"report":{...},"duration_ms":2140}],"pending":[],"summary":{"requested":1,"ran":1,"clean":1,"pending":0},"concurrency":2}

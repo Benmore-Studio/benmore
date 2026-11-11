@@ -1,0 +1,7 @@
+[
+  "1. Seed a known state on dev (refresh_dev or reset_and_seed) and create one test user per role (create_superuser / signup).",
+  "2. qa_inventory(app, as:<user>) once per role. Read `surface` (declared expectations: access mode per table/op, role-gated flows and transitions) and `pages` (rendered buttons/forms with selectors). `pending` lists pages not reached - call again with `paths` set to them.",
+  "3. Save each `draft_journey` under tests/journeys/<page>.yaml, uncomment the actions worth exercising, and turn declared expectations into assertions (a forbidden transition returns 403; an owner-scoped list shows only the caller's rows).",
+  "4. browser_batch(app, journeys) or `benmore verify .` to run everything. A journey passes only when `clean` (no uncaught error, failed request, console error or exhausted budget) AND its assertions return ok.",
+  "5. On failure read `report.errors` / `failed_requests` / `text_snapshot`; repair the app or the selector; rerun only the failed names."
+]

@@ -1,0 +1,6 @@
+[
+  "The sweep deletes with its own SQL: hooks.yaml hooks, webhook subscriptions and live `{table, action}` events do not fire for the rows it removes.",
+  "Each sweep that removes rows writes one audit entry per table: action `ttl_delete` with `{rows_deleted, ttl, cutoff}`, or `ttl_purge` with `{rows_purged, ttl}` for soft-deleted rows, as `system:retention`. `history_rows_deleted` is added when stored versions went with them and `rows_skipped` when referenced rows were kept. It records the counts, not the rows. An admin reads them with GET /api/_audit?action=ttl_delete (api({at:'audit'})).",
+  "On a versioned table (app.yaml `versioned:`) the stored versions of the rows a sweep deletes go with them, and those of rows deleted through the API age out by the same policy: api({at:'versioning'}) retention.",
+  "The audit log is not a retention.yaml table, and a policy never changes it. Its lifetime is the env value BENMORE_AUDIT_RETENTION (api({at:'recovery'}) audit_retention), and under `compliance: hipaa` audit rows are kept at least six years (api({at:'audit'}) append_only). `compliance: hipaa` changes nothing else here: policies on the app's own tables run the same way."
+]

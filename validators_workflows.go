@@ -78,6 +78,12 @@ func workflowShapeProblems(content string, column func(table, col string) (has, 
 			add("workflows.yaml: there is no `workflows:` wrapper - each top-level key IS a workflow (`orders: { table: orders, field: status, transitions: ... }`). Under the wrapper the parser reads one workflow named \"workflows\" with no table, so nothing is enforced.")
 			continue
 		}
+		// A workflow on a framework table is not loaded at all, so nothing
+		// else about it is worth saying (config_framework_tables.go).
+		if msg := workflowFrameworkTableProblem(name, wy.Table); msg != "" {
+			problems = append(problems, msg)
+			continue
+		}
 		for _, key := range sortedWhenKeys(raw) {
 			if !workflowKeys[key] {
 				problems = append(problems, workflowUnknownKey(name, key, workflowKeys))
@@ -94,6 +100,13 @@ func workflowShapeProblems(content string, column func(table, col string) (has, 
 			if !membershipIdentRe.MatchString(strings.TrimSpace(wy.Field)) {
 				add("workflows.yaml %s: `field:` %q is not a plain identifier (letters, digits and _ only, not starting with a digit).", name, wy.Field)
 			}
+			// A state column the table lacks guards nothing. Case alone is
+			// fine: the loader rewrites it to the schema's spelling.
+			if column != nil {
+				if has, known := column(strings.TrimSpace(wy.Table), strings.TrimSpace(wy.Field)); known && !has {
+					add("workflows.yaml %s: `field:` %q is not a column of table %q, so no state is enforced. Name the column that holds the state.", name, wy.Field, wy.Table)
+				}
+			}
 		}
 		if transitions, ok := raw["transitions"].(map[string]any); ok {
 			for _, from := range sortedWhenKeys(transitions) {
@@ -104,6 +117,10 @@ func workflowShapeProblems(content string, column func(table, col string) (has, 
 						if !workflowTransitionKeys[key] {
 							problems = append(problems, workflowUnknownKey(fmt.Sprintf("%s.transitions.%s -> %s", name, from, to), key, workflowTransitionKeys))
 						}
+					}
+					// The runtime keeps such a role as a gate only an admin passes.
+					if role := string(wy.Transitions[from][to].Role); role != "" && len(workflowRoleNames(role)) == 0 {
+						add("workflows.yaml %s.transitions.%s -> %s: `role: %q` names no role, so only an admin could make the transition. Name the role (`role: manager`) or several (`role: \"owner, manager\"` or `role: [owner, manager]`, any one passes), or drop the key to let anyone who may update the row make it.", name, from, to, role)
 					}
 				}
 			}
@@ -224,8 +241,13 @@ func workflowShapeProblems(content string, column func(table, col string) (has, 
 // validateWorkflowsShape is the write-time and `benmore check` form.
 func validateWorkflowsShape(appDir, content string) string {
 	var column func(table, col string) (bool, bool)
+	var columnsOf func(table string) []Column
 	if db := whenSchemaDB(appDir); db != nil {
 		defer db.Close()
+		columnsOf = func(table string) []Column {
+			cols, _ := tableColumnsWith(db, table)
+			return cols
+		}
 		column = func(table, col string) (bool, bool) {
 			cols, err := tableColumnsWith(db, table)
 			if err != nil || len(cols) == 0 {
@@ -240,6 +262,9 @@ func validateWorkflowsShape(appDir, content string) string {
 		}
 	}
 	problems := workflowShapeProblems(content, column)
+	problems = append(problems, workflowDefaultProblems(content, columnsOf, workflowSchemaFile(appDir))...)
+	problems = append(problems, workflowEncryptedStateProblems(content,
+		parseEncryptedFieldsConfig(readAppFileOrNil(appDir, "encrypted.yaml"), readAppFileOrNil(appDir, "app.yaml")))...)
 	if len(problems) == 0 {
 		return ""
 	}
@@ -264,7 +289,166 @@ func warnWorkflowShape(app *App) {
 		}
 		return false, false
 	}
-	for _, p := range workflowShapeProblems(string(data), column) {
+	problems := workflowShapeProblems(string(data), column)
+	problems = append(problems, workflowDefaultProblems(string(data), func(table string) []Column {
+		for _, t := range app.Tables {
+			if sqliteIdentifierFold(t.Name) == sqliteIdentifierFold(table) {
+				return t.Columns
+			}
+		}
+		return nil
+	}, workflowSchemaFile(app.Dir))...)
+	problems = append(problems, workflowEncryptedStateProblems(string(data), app.Encrypted)...)
+	for _, p := range problems {
 		log.Printf("WARNING: %s", p)
 	}
+}
+
+// workflowDefaultProblems names each workflow whose state column has a
+// column default other than `initial`. A create through the API starts in
+// `initial` regardless, but a flow, hook or SQL insert that leaves the column
+// out takes the default, a state the workflow does not start in. A column
+// with no default, or an explicit NULL one, stores NULL either way and is not
+// named. schemaFile (workflowSchemaFile) words the fix for the file the
+// default is declared in. The write gate, `benmore check` and the load
+// warning all call this one function.
+func workflowDefaultProblems(content string, columnsOf func(table string) []Column, schemaFile string) []string {
+	if columnsOf == nil {
+		return nil
+	}
+	var typed map[string]WorkflowYAML
+	if err := decodeConfigYAML([]byte(content), &typed); err != nil {
+		return nil
+	}
+	var problems []string
+	for _, name := range sortedWhenKeys(typed) {
+		wy := typed[name]
+		initial := strings.TrimSpace(wy.Initial)
+		if initial == "" {
+			continue
+		}
+		for _, c := range columnsOf(strings.TrimSpace(wy.Table)) {
+			if !strings.EqualFold(c.Name, strings.TrimSpace(wy.Field)) {
+				continue
+			}
+			state, shown, ok := workflowDefaultState(c.Default)
+			if !ok || state == initial {
+				continue
+			}
+			problems = append(problems, fmt.Sprintf("workflows.yaml %s: %s.%s has column default %s but `initial:` is %q. A row inserted by a flow, hook or SQL that leaves the column out would start in %s, not %q. %s",
+				name, wy.Table, c.Name, strings.TrimSpace(c.Default), initial, shown, initial, workflowDefaultFix(schemaFile, initial)))
+		}
+	}
+	return problems
+}
+
+// workflowDefaultState reads a column default, as the SQL text PRAGMA
+// table_info or the schema's DDL gives it, the way SQLite applies it. ok is
+// false for a column with no default or an explicit NULL one: both store
+// NULL. state is what a row left to the default holds and shown is how a
+// message names it. SQLite stores a default written as a name as that text,
+// so DEFAULT "draft", DEFAULT `draft` and DEFAULT [draft] are the string
+// 'draft', like DEFAULT 'draft' and DEFAULT ('draft'). Stripping parentheses
+// and single quotes only refused the first three with "would start in
+// "draft", not "draft"", and refused DEFAULT NULL.
+func workflowDefaultState(sqlText string) (state, shown string, ok bool) {
+	def := strings.TrimSpace(sqlText)
+	for len(def) >= 2 && def[0] == '(' && def[len(def)-1] == ')' {
+		def = strings.TrimSpace(def[1 : len(def)-1])
+	}
+	if def == "" || strings.EqualFold(def, "NULL") {
+		return "", "", false
+	}
+	if n := len(def); n >= 2 {
+		inner, quote := def[1:n-1], ""
+		switch open, end := def[0], def[n-1]; {
+		case open == '[' && end == ']':
+			if !strings.ContainsAny(inner, "[]") {
+				return inner, fmt.Sprintf("%q", inner), true
+			}
+		case open == end && (open == '\'' || open == '"' || open == '`'):
+			quote = def[:1]
+		}
+		// One quoted value: every quote character inside it is doubled.
+		if quote != "" && !strings.Contains(strings.ReplaceAll(inner, quote+quote, ""), quote) {
+			state = strings.ReplaceAll(inner, quote+quote, quote)
+			return state, fmt.Sprintf("%q", state), true
+		}
+	}
+	// A bare word, a number or an expression: compared as written.
+	return def, strings.TrimSpace(sqlText), true
+}
+
+// workflowSchemaFile names the file an app declares its column defaults in,
+// in the order the schema loader reads them (loadSchemaWithReaderCtx):
+// schema.prisma, else schema.sql. Empty when the app has neither.
+func workflowSchemaFile(appDir string) string {
+	if appDir == "" {
+		return ""
+	}
+	for _, name := range []string{"schema.prisma", "schema.sql"} {
+		if _, err := os.Stat(filepath.Join(appDir, name)); err == nil {
+			return name
+		}
+	}
+	return ""
+}
+
+// workflowDefaultFix is the last sentence of a workflowDefaultProblems
+// message: the default to declare, in the syntax of the app's schema file.
+func workflowDefaultFix(schemaFile, initial string) string {
+	switch schemaFile {
+	case "schema.prisma":
+		return fmt.Sprintf("In schema.prisma, give the field `@default(%q)` (or drop the default).", initial)
+	case "schema.sql":
+		return fmt.Sprintf("In schema.sql, give the column `DEFAULT '%s'` (or drop the default).", strings.ReplaceAll(initial, "'", "''"))
+	}
+	return "Make the column default equal `initial:` (or drop the default)."
+}
+
+// workflowEncryptedStateIssue judges the app's on-disk workflows.yaml against
+// an encryption config being written (encrypted.yaml or app.yaml `encrypted:`),
+// so encrypting a state column that has a timeout is refused when the
+// encryption is declared, not only when workflows.yaml is next written.
+func workflowEncryptedStateIssue(appDir string, encData, appData []byte) string {
+	if appDir == "" {
+		return ""
+	}
+	wf := readAppFileOrNil(appDir, "workflows.yaml")
+	if len(wf) == 0 {
+		return ""
+	}
+	return strings.Join(workflowEncryptedStateProblems(string(wf), parseEncryptedFieldsConfig(encData, appData)), "\n")
+}
+
+// workflowEncryptedStateProblems names each workflow with a timeout whose state
+// column is encrypted. The column stores ciphertext, so the timeout checker's
+// `state = ?` select and its conditional UPDATE never match and no timeout
+// ever fires; equality on the state is meaningless there.
+func workflowEncryptedStateProblems(content string, enc *EncryptedFieldConfig) []string {
+	if enc == nil || len(enc.Fields) == 0 {
+		return nil
+	}
+	var typed map[string]WorkflowYAML
+	if err := decodeConfigYAML([]byte(content), &typed); err != nil {
+		return nil
+	}
+	var problems []string
+	for _, name := range sortedWhenKeys(typed) {
+		wy := typed[name]
+		if len(wy.Timeout) == 0 {
+			continue // transitions read the decrypted state; only timeouts compare the stored one
+		}
+		for table, defs := range enc.Fields {
+			if sqliteIdentifierFold(table) != sqliteIdentifierFold(strings.TrimSpace(wy.Table)) {
+				continue
+			}
+			for _, def := range defs {
+				if sqliteIdentifierFold(def.Column) == sqliteIdentifierFold(strings.TrimSpace(wy.Field)) {
+					problems = append(problems, fmt.Sprintf("workflows.yaml %s: state column %s.%s is encrypted, so it holds ciphertext and the timeout checker's state comparison can never match: its `timeout:` would never fire. Stop encrypting the state column (encrypted.yaml / app.yaml `encrypted:`); keep the sensitive data in another column.", name, table, def.Column))
+				}
+			}
+		}
+	}
+	return problems
 }

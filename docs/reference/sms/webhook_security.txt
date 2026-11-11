@@ -1,0 +1,1 @@
+SMS_WEBHOOK_URL must resolve to a public destination. Requests and redirects use guarded dialing; private/internal endpoints are refused before credentials are sent.

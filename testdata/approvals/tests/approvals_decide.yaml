@@ -1,0 +1,76 @@
+decide_reports_stored_status:
+  as_user: "approver@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_email, title) VALUES (9001, 'label', '1', 999, 'requester@test.com', 'approver@test.com', 'Spend')"
+  steps:
+    - api: "POST /api/_approvals/9001/decide"
+      json: {decision: "approved", note: "ok"}
+      expect: {status: 200, json: {status: "approved"}}
+    - api: "POST /api/_approvals/9001/decide"
+      json: {decision: "approved"}
+      expect: {status: 200, json: {status: "approved"}}
+    - api: "POST /api/_approvals/9001/decide"
+      json: {decision: "approved", note: "ok"}
+      expect: {status: 200, json: {status: "approved"}}
+    - api: "POST /api/_approvals/9001/decide"
+      json: {decision: "approved", note: "a different note"}
+      expect: {status: 409, json: {status: "approved"}}
+    - api: "POST /api/_approvals/9001/decide"
+      json: {decision: "rejected"}
+      expect: {status: 409, json: {status: "approved"}}
+    - sql: "SELECT status FROM _benmore_approvals WHERE id = 9001 AND status = 'approved' AND note = 'ok'"
+      expect: {rows: 1}
+decide_unknown_id_admin_404:
+  as_user: "boss@test.com"
+  as_role: "admin"
+  steps:
+    - api: "POST /api/_approvals/424242/decide"
+      json: {decision: "approved"}
+      expect: {status: 404}
+decide_unknown_id_user_403:
+  as_user: "someone@test.com"
+  steps:
+    - api: "POST /api/_approvals/424242/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+self_approval_refused_at_create:
+  as_user: "mallory@test.com"
+  steps:
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "7", approver_email: "Mallory@Test.com", title: "mine"}
+      expect: {status: 403}
+    - sql: "SELECT id FROM _benmore_approvals WHERE requested_email = 'mallory@test.com'"
+      expect: {rows: 0}
+self_decision_refused:
+  as_user: "boss2@test.com"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_email, title) VALUES (9101, 'label', '2', 1, 'boss2@test.com', 'other@test.com', 'Mine')"
+  steps:
+    - api: "POST /api/_approvals/9101/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+    - sql: "SELECT id FROM _benmore_approvals WHERE id = 9101 AND status = 'pending'"
+      expect: {rows: 1}
+legacy_self_pending_cannot_be_resubmitted:
+  as_user: "legacy@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_email, title) VALUES (9201, 'label', '3', {{user_id}}, 'legacy@test.com', 'legacy@test.com', 'Old')"
+  steps:
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "3", approver_email: "legacy@test.com", title: "Old"}
+      expect: {status: 403}
+delegated_session_cannot_request_or_decide:
+  as_user: "support@test.com"
+  setup:
+    - sql: "UPDATE _benmore_sessions SET is_impersonation = 1 WHERE user_id = {{user_id}}"
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_email, title) VALUES (9301, 'label', '4', 1, 'someone@test.com', 'support@test.com', 'Via support')"
+  steps:
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "4", approver_email: "x@test.com", title: "t"}
+      expect: {status: 403}
+    - api: "POST /api/_approvals/9301/decide"
+      json: {decision: "approved"}
+      expect: {status: 403}
+    - sql: "SELECT id FROM _benmore_approvals WHERE id = 9301 AND status = 'pending'"
+      expect: {rows: 1}

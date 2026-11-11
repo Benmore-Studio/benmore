@@ -1,0 +1,13 @@
+# Status workflow: a purchase request moves submitted -> approved or rejected
+# (a manager decides) or withdrawn (the requester), and everyone who may read
+# a request may read its history.
+site_name: "Purchase requests"
+auth:
+  identifier: email
+versioned: [requests]               # keeps every state a change replaced: the history
+access:
+  requests:
+    read: owner_or_role:manager     # the requester; every request for a manager
+    write: everyone
+    update: owner_or_role:manager   # a transition is an update of the row
+    delete: admin

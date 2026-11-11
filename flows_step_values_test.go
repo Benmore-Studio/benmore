@@ -234,7 +234,7 @@ func TestRespondStatusTemplateIsTheStatus(t *testing.T) {
 	} {
 		steps := respond(c.status)
 		if name == "template from a set step" {
-			// mylogacy-api's shape: a step named calc whose output has status.
+			// A deployed app's shape: a step named calc whose output has status.
 			steps = "      - id: calc\n        run: set\n        with: { status: \"402\" }\n" +
 				"      - id: err\n        run: respond\n        with:\n          status: ${{ calc.status }}\n          json: { error: payment_required }\n"
 		}

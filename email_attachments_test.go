@@ -84,22 +84,29 @@ func TestBuildRawMIMEMessage_Attachment(t *testing.T) {
 }
 
 // TestWithToEmail_ParsesAttachments verifies the GHA flow parser reads the
-// attachments key off a `run: email` step's with-map.
+// attachments key off a `run: email` step's with-map. An entry that names no
+// file (no content, not a map) used to be dropped while the rest was sent; the
+// step now carries the reason and fails before it sends
+// (TestEmailWithAnAttachmentItCannotBuildIsNotSent).
 func TestWithToEmail_ParsesAttachments(t *testing.T) {
-	e := withToEmail(map[string]any{
-		"to":      "v@example.com",
-		"subject": "s",
-		"html":    "<p>b</p>",
-		"attachments": []any{
-			map[string]any{"filename": "a.pdf", "content_type": "application/pdf", "content": "aGVsbG8="},
-			map[string]any{"filename": "skip-me"}, // no content → dropped
-			"not-an-object",                       // non-object → skipped
-		},
-	})
-	if len(e.Attachments) != 1 {
-		t.Fatalf("expected 1 attachment, got %d", len(e.Attachments))
+	step := func(attachments ...any) *FlowEmail {
+		return withToEmail(map[string]any{"to": "v@example.com", "subject": "s", "html": "<p>b</p>", "attachments": attachments})
 	}
-	if e.Attachments[0].Filename != "a.pdf" || e.Attachments[0].Content != "aGVsbG8=" {
+	pdf := map[string]any{"filename": "a.pdf", "content_type": "application/pdf", "content": "aGVsbG8="}
+	e := step(pdf)
+	if len(e.Attachments) != 1 || e.AttachmentsError != "" {
+		t.Fatalf("expected 1 attachment and no error, got %d (%q)", len(e.Attachments), e.AttachmentsError)
+	}
+	if e.Attachments[0].Filename != "a.pdf" || e.Attachments[0].ContentType != "application/pdf" || e.Attachments[0].Content != "aGVsbG8=" {
 		t.Errorf("bad attachment: %+v", e.Attachments[0])
+	}
+	for name, bad := range map[string]any{
+		"no content":    map[string]any{"filename": "skip-me"},
+		"not an object": "not-an-object",
+	} {
+		e := step(pdf, bad)
+		if e.AttachmentsError == "" || !strings.Contains(e.AttachmentsError, "with.attachments[1]") || len(e.Attachments) != 0 {
+			t.Errorf("%s: %d attachment(s), error %q; want the step to carry why entry 1 names no file", name, len(e.Attachments), e.AttachmentsError)
+		}
 	}
 }

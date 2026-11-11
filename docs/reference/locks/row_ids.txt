@@ -1,0 +1,1 @@
+Locks are keyed by the row's canonical id; a request that spells an integer id any other way (/01, /1.0) is 404 on every row route, so it can neither bypass nor create a lock (api({at:'scoping'}) → primary_keys.canonical_ids).

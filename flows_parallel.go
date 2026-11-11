@@ -16,13 +16,14 @@ import (
 func newParallelFlowContext(parent *FlowContext) *FlowContext {
 	child := &FlowContext{
 		App: parent.App, Request: parent.Request, Writer: parent.Writer,
-		Session: parent.Session, apiClient: parent.apiClient, privateResponse: parent.privateResponse,
+		Session: parent.Session, apiClient: parent.apiClient, privateResponse: parent.privateResponse, verifiedRequest: parent.verifiedRequest,
 		Data: cloneComputeArg(parent.Data).(map[string]any), Params: maps.Clone(parent.Params),
-		RequestKeys: maps.Clone(parent.RequestKeys), SecretKeys: maps.Clone(parent.SecretKeys),
+		RequestKeys: maps.Clone(parent.RequestKeys), SecretKeys: maps.Clone(parent.SecretKeys), SQLTextKeys: maps.Clone(parent.SQLTextKeys),
 		NullParams: maps.Clone(parent.NullParams), requestStepSources: maps.Clone(parent.requestStepSources),
-		Tx: parent.Tx, Writes: parent.Writes, mcpReadConn: parent.mcpReadConn, mcpReadKey: parent.mcpReadKey,
+		Tx: parent.Tx, Writes: parent.Writes, mcpReadConn: parent.mcpReadConn, mcpReadKey: parent.mcpReadKey, queuedBody: parent.queuedBody,
 		command: parent.command, parallelOutputs: make(map[string]bool), parallelTxMu: parent.transactionMutex(),
-		reachedSteps: maps.Clone(parent.reachedSteps),
+		reachedSteps: maps.Clone(parent.reachedSteps), requestOnlyParams: parent.requestOnlyParams, computedKeys: maps.Clone(parent.computedKeys),
+		execCtx: parent.execCtx, timeLimit: parent.timeLimit, backgroundRun: parent.backgroundRun,
 	}
 	if child.Data == nil {
 		child.Data = make(map[string]any)
@@ -127,6 +128,7 @@ func mergeParallelFlowContext(parent, before, child *FlowContext) {
 	parent.Params, _ = mergeParallelMap(parent.Params, before.Params, child.Params, nil)
 	parent.NullParams, _ = mergeParallelMap(parent.NullParams, before.NullParams, child.NullParams, nil)
 	parent.requestStepSources, _ = mergeParallelMap(parent.requestStepSources, before.requestStepSources, child.requestStepSources, nil)
+	parent.computedKeys, _ = mergeParallelMap(parent.computedKeys, before.computedKeys, child.computedKeys, nil)
 	// Provenance must come from the branch whose value won the merge; otherwise
 	// a sibling's authored URL could certify a different request-derived value.
 	for key := range changed {
@@ -147,6 +149,11 @@ func mergeParallelFlowContext(parent, before, child *FlowContext) {
 	for key, secret := range child.SecretKeys {
 		if secret {
 			parent.markSecret(key)
+		}
+	}
+	for key, email := range child.SQLTextKeys {
+		if email {
+			parent.markSQLText(key)
 		}
 	}
 	if parent.lazyShadow != nil && child.lazyShadow != nil {
@@ -170,7 +177,7 @@ func flowValidateParallelHTTP(flow *Flow) error {
 	var walk func([]FlowStep, bool, bool) error
 	walk = func(steps []FlowStep, inside, direct bool) error {
 		for _, step := range steps {
-			if inside && (step.Type == "respond" || step.Type == "redirect" || step.Type == "serve_file" || step.Type == "parse" && step.Parse == "body") {
+			if inside && (step.Type == "respond" || step.Type == "redirect" || step.Type == "serve_file" || step.Type == "proxy" || step.Type == "parse" && step.Parse == "body") {
 				return fmt.Errorf("parallel: %s step %s shares the HTTP request or response; move it before or after the parallel block", step.Type, quoteForHint(step.Name))
 			}
 			if err := walk(step.Steps, inside || step.Type == "parallel", step.Type == "parallel"); err != nil {

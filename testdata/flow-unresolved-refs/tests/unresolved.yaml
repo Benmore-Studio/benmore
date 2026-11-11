@@ -1,0 +1,72 @@
+# A step that reads a value the request did not send fails before it writes
+# or queues anything.
+sql_params_reference_with_no_value_writes_no_row:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/sql-params"
+      json: { a: "kept" }
+      expect:
+        status: 500
+        contains: "reference in the step had no value"
+    - sql: "SELECT id FROM notes WHERE title = 'kept'"
+      expect: { rows: 0 }
+
+sql_quoted_reference_with_no_value_writes_no_row:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/sql-inline"
+      json: {}
+      expect:
+        status: 500
+        contains: "reference in the step had no value"
+    - sql: "SELECT id FROM notes WHERE title = 'inline'"
+      expect: { rows: 0 }
+
+sql_retry_does_not_run_the_statement_once_per_attempt:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/sql-retry"
+      json: {}
+      expect:
+        status: 500
+    - sql: "SELECT id FROM notes WHERE title = 'retry'"
+      expect: { rows: 0 }
+
+sql_step_with_a_handler_writes_no_row_either:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/sql-handled"
+      json: {}
+      expect:
+        status: 422
+        contains: "b is required"
+    - sql: "SELECT id FROM notes WHERE title = 'handled'"
+      expect: { rows: 0 }
+
+sql_step_whose_references_resolve_writes_the_row:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/sql-params"
+      json: { a: "both", b: "sent" }
+      expect:
+        status: 200
+    - sql: "SELECT id FROM notes WHERE title = 'both' AND body = 'sent'"
+      expect: { rows: 1 }
+
+enqueue_reference_with_no_value_queues_no_job:
+  as_user: "a@test.com"
+  steps:
+    - api: "POST /api/enqueue-unresolved"
+      json: {}
+      expect:
+        status: 500
+        contains: "reference in the step had no value"
+    - sql: "SELECT id FROM _benmore_jobs WHERE flow_name = 'worker'"
+      expect: { rows: 0 }
+    - api: "POST /api/enqueue-unresolved"
+      json: { b: "queued" }
+      expect:
+        status: 200
+    - flush: "jobs"
+    - sql: "SELECT id FROM notes WHERE title = 'worker' AND body = 'queued'"
+      expect: { rows: 1 }

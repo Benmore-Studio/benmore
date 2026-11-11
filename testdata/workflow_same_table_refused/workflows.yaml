@@ -1,0 +1,22 @@
+# Two workflows on one table. The framework supports one per table (the
+# transition routes are the table's), so the write gate and `benmore check`
+# refuse this file and the app does not load: an error, where it used to be a
+# ServeMux panic at every start and reload (tests/expected-failures.txt).
+# The second one spells the table `Orders`: tables compare as SQLite compares
+# them, so it is the same table.
+fulfilment:
+  table: orders
+  field: status
+  initial: draft
+  states: [draft, shipped]
+  transitions:
+    draft:
+      shipped: {}
+payment:
+  table: Orders
+  field: payment_status
+  initial: unpaid
+  states: [unpaid, paid]
+  transitions:
+    unpaid:
+      paid: { role: admin }

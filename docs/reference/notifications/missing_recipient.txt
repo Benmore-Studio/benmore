@@ -1,0 +1,1 @@
+A notification is stored only for a user id that has an account. A hook `notify:` whose id names none (a row with `assignee_id: 999`) is skipped: nothing is stored, the server logs `HOOK [notify] skipped: no account has user_id 999` once, and the hook job completes with that reason in its `error` (shown by `GET /api/_jobs` and describe_jobs).

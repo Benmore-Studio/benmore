@@ -1,0 +1,5 @@
+[
+  "Synchronous native HTTP flows with `transaction: true` buffer response headers, status and body until the database transaction commits. Buffered bodies are capped at 1 MiB; overflow fails the flow before commit and returns an error without sending the buffered response.",
+  "`run: serve_file` streams and is rejected recursively in a transactional HTTP flow before steps run. Use a non-transactional route for streamed files.",
+  "A transaction that completes without `respond` or `redirect` still commits its SQL writes and returns the 500 `flow_no_response` diagnostic. Missing a response does not imply rollback."
+]

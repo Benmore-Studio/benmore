@@ -1,0 +1,7 @@
+[
+  "Inspect the deployed schema and table columns before changing models. Use the actual table and mapped column names from introspection; do not infer API names from singular model names.",
+  "Generated CRUD routes enforce access, scopes, hooks, CSRF, validation, audit and events. Use them for user-facing mutations rather than bypassing them with raw SQL.",
+  "Schema changes regenerate src/bm.d.ts. Do not edit generated declarations or run a separate Prisma client generator.",
+  "Full-text declarations require the sqlite_fts5 build tag. Unchanged indexes are reused; changed definitions rebuild transactionally. Removing a declaration retains the existing index; it does not perform cleanup.",
+  "Migrations can commit before a later reload stage fails. Keeping the previous handler running is not a database rollback; assess schema compatibility and preserve backups before destructive changes."
+]

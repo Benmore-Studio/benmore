@@ -199,14 +199,24 @@ func purgeAppMCPConnectionCredentials(ctx context.Context, db *sql.DB, keep []st
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM main.sqlite_schema WHERE type='table' AND name=?`, appMCPConnectionCredentialsTable).Scan(&present); err != nil || present == 0 {
 		return 0, err
 	}
-	query, args := `DELETE FROM main._benmore_mcp_connection_credentials`, []any{}
+	where, args := ``, []any{}
 	if len(keep) > 0 {
-		query += ` WHERE connection NOT IN (?` + strings.Repeat(`,?`, len(keep)-1) + `)`
+		where = ` WHERE connection NOT IN (?` + strings.Repeat(`,?`, len(keep)-1) + `)`
 		for _, name := range keep {
 			args = append(args, name)
 		}
 	}
-	res, err := db.ExecContext(ctx, query, args...)
+	// Look before deleting. The table references _benmore_users, which a new
+	// app creates only after its first manifest load, and SQLite refuses a
+	// DELETE on a child table whose parent table is missing even when no row
+	// matches: every first start logged that as a failed purge. A read needs
+	// no parent, so an empty result is nothing to purge; a credential that is
+	// stored still goes through the DELETE and reports its error.
+	var stored int
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main._benmore_mcp_connection_credentials`+where+`)`, args...).Scan(&stored); err != nil || stored == 0 {
+		return 0, err
+	}
+	res, err := db.ExecContext(ctx, `DELETE FROM main._benmore_mcp_connection_credentials`+where, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -359,11 +369,14 @@ func serveAppMCPConnectionCredential(w http.ResponseWriter, r *http.Request, app
 		return
 	}
 	// Only a signed-in browser session: never a bearer/connector credential, API
-	// token, edge identity, impersonation or scoped session.
+	// token, impersonation or scoped session.
 	cookie, cookieErr := requestSessionCookie(r)
 	var session *Session
 	if cookieErr == nil && len(r.Header.Values("Authorization")) == 0 {
-		session = GetSessionFromDB(app.DB, cookie.Value)
+		session = getAppSession(app, r, cookie.Value)
+	}
+	if mfaEnrollmentWithheld(app, session) {
+		session = nil // held until the account enrolls MFA, as getSession holds it
 	}
 	if session == nil || session.ImpersonatorUserID != 0 || session.ActingAsGroup != "" || !directLoginSession(app, session) {
 		http.Error(w, "Connection credentials can be managed only from a signed-in browser session.", http.StatusForbidden)
@@ -740,7 +753,7 @@ func appMCPRegisterExternalTools(server *sdk.Server, app *App, generation *appMC
 				if err != nil {
 					return appMCPSDKFailure(err), nil
 				}
-				text, err := json.Marshal(result)
+				text, err := appMCPJSONText(result)
 				if err != nil {
 					return appMCPSDKFailure(err), nil
 				}

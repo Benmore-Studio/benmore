@@ -57,7 +57,7 @@ var (
 // The reference at api(at:"flows") → step_keys is rendered from it
 // (flowStepKeysReference).
 //
-// `timeout` is a root key of three types only. The loader maps a step-root
+// `timeout` is a root key of four types only. The loader maps a step-root
 // `timeout:` onto every FlowStep because the command runtime bounds each of
 // its steps with it, but an ordinary flow can cut off only an outbound call,
 // a compute function and a transcription.
@@ -75,17 +75,23 @@ var flowStepKeyTable = map[string]flowStepTypeKeys{
 		"to", "subject", "template", "html", "body", "text", "data", "vars",
 		"from", "reply_to", "attachments", "unsubscribe_url", "cc", "bcc", "unsubscribe_one_click",
 	}},
-	"sms":                    {with: []string{"to", "body", "text"}},
-	"webhook":                {with: []string{"url", "body", "payload"}},
-	"redirect":               {with: []string{"to", "allow_hosts"}},
-	"respond":                {with: []string{"status", "body", "json", "content_type", "headers"}},
-	"serve_file":             {with: []string{"path", "disposition", "filename"}},
-	"delete_upload":          {with: []string{"path"}},
+	"sms":        {with: []string{"to", "body", "text"}},
+	"webhook":    {with: []string{"url", "body", "payload"}},
+	"redirect":   {with: []string{"to", "allow_hosts"}},
+	"respond":    {with: []string{"status", "body", "json", "content_type", "headers"}},
+	"serve_file": {with: []string{"path", "disposition", "filename", "expires_in", "record"}},
+	"proxy": {root: []string{"timeout"}, with: []string{
+		"url", "method", "auth", "headers", "body", "json",
+		"content_types", "max_bytes", "timeout", "disposition", "filename", "cache_control", "path_slashes",
+	}},
+	"delete_upload":          {with: []string{"path", "record"}},
 	"inspect_private_upload": {with: []string{"source_path", "kind"}},
+	"extract_text":           {with: []string{"source_path", "ocr", "record"}},
 	"render_pdf_signatures":  {with: []string{"source_path", "source_sha256", "placements_json"}},
 	"purge_current_user":     {with: []string{"confirm"}},
 	"revoke_user_sessions":   {with: []string{"user_id"}},
 	"broadcast":              {with: []string{"room", "payload"}},
+	"notify":                 {with: []string{"user_id", "title", "body", "type", "link"}},
 	"parse":                  {with: []string{"source"}},
 	"set":                    {anyWith: true},
 	"if":                     {block: true, root: []string{"steps"}},
@@ -140,7 +146,7 @@ func flowStepLiveIgnored(runType string, with bool, key string) (flowStepLiveIgn
 }
 
 // flowStepTimeoutTypes names the step types with a `timeout`, for messages.
-const flowStepTimeoutTypes = "Only `run: api`, `run: compute` and `run: transcribe` steps can be cut off"
+const flowStepTimeoutTypes = "Only `run: api`, `run: proxy`, `run: compute` and `run: transcribe` steps can be cut off"
 
 // ghaStepSQLText is a SQL step's statement as the loader takes it: the
 // step-root `query:` when set, else `with.query` when that is text.
@@ -417,13 +423,13 @@ func flowStepKeysReference() map[string]any {
 		"`params` written both at the step root and under `with:` with different values: only `with.params` is bound.",
 	)
 	return map[string]any{
-		"rule":       "Each step type reads a fixed set of keys (by_type, plus the step-level keys in every_step). A key outside that set is refused when the file is written (unreleased): the write gate and `benmore check` name the step and the key, and a deployed app logs the same line as a `WARNING` each time it loads its flows. Before, such a key was accepted and did nothing at run time. On `run: set` every `with:` key is a variable and may have any name.",
-		"every_step": "Step-level keys go next to `run:`, never under `with:`: `id`, `if`, `else` (the steps to run when the step's `if:` is false, on an `if:` block and on a gated `if:` + `run:` step alike), `on_error`, and on a step that is one action `retry` and `retry_delay`. An `if:` block, a `for_each:` loop and `run: parallel` take no `retry` (a retried block would run its finished steps again; put `retry:` on the step to retry), no `with:` and no `timeout`. `steps:` belongs to those three only, `for_each:` and `as:` to the loop only: next to a `run:` they would be dropped and the step would run once.",
+		"rule":       "Each step type reads a fixed set of keys (by_type, plus the step-level keys in every_step). A key outside that set is refused when the file is written: the write gate and `benmore check` name the step and the key, and a deployed app logs the same line as a `WARNING` each time it loads its flows. On `run: set` every `with:` key is a variable and may have any name.",
+		"every_step": "Step-level keys go next to `run:`, never under `with:`: `id`, `if`, `else` (the steps to run when the step's `if:` is false, on an `if:` block and on a gated `if:` + `run:` step alike), `on_error`, and on a step that is one action `retry` and `retry_delay`. An `if:` block, a `for_each:` loop and `run: parallel` take no `retry` (a retried block would run its finished steps again; put `retry:` on the step to retry), no `with:` and no `timeout`. `steps:` belongs to those three only, `for_each:` and `as:` to the loop only: next to a `run:` they would be dropped and the step would run once. What each does: `step_retry` (retry, retry_delay), `on_error`, `else`, `for_each`, `parallel`.",
 		"by_type":    byType,
-		"timeout":    "`timeout` caps a `run: api`, `run: compute` or `run: transcribe` step. Write it under `with:` or at the step root; when both are set the step root wins. No other step type can be cut off, and `timeout` is refused on it at either position.",
-		"sql":        "A SQL step's statement is `query:` at the step root or `with.query` (not `with.sql`); written in both places with different text it is refused. `params` binds at either position on `run: sql`; `run: sql_dynamic` binds nothing and refuses `params`. A SQL step with no statement (no query, an empty one, one that is only a comment) is refused, and at run time it fails the flow with `no SQL statement` where it used to run nothing and report success; a `run: sql_dynamic` template that renders nothing fails the same way.",
+		"timeout":    "`timeout` caps a `run: api`, `run: proxy`, `run: compute` or `run: transcribe` step. Write it under `with:` or at the step root; when both are set the step root wins. No other step type can be cut off, and `timeout` is refused on it at either position.",
+		"sql":        "A SQL step's statement is `query:` at the step root or `with.query` (not `with.sql`); written in both places with different text it is refused. `params` binds at either position on `run: sql`; `run: sql_dynamic` binds nothing and refuses `params`. A SQL step with no statement (no query, an empty one, one that is only a comment) is refused, and at run time it fails the flow with `no SQL statement`; a `run: sql_dynamic` template that renders nothing fails the same way.",
 		"accepted_but_ignored": append([]string{
-			"These are still accepted and still ignored, because deployed apps carry them. The loader names each in a `WARNING`; do not rely on them, and expect a later release to either honor or refuse each:",
+			"These are accepted and ignored, because deployed apps carry them. The app log names each in a `WARNING` when the flows load; do not rely on them:",
 		}, ignored...),
 	}
 }

@@ -1,0 +1,27 @@
+# verify.yaml (optional)
+users:
+  admin: admin@example.com
+requirements:
+  signed-in-home:
+    tests: [tests/auth.yaml#login]
+    journeys: [dashboard]
+
+# tests/journeys/dashboard.yaml
+name: dashboard
+tags: [smoke]
+user: admin
+path: /dashboard
+viewport: {width: 390, height: 844}
+screenshot: true
+expected_failed_requests:
+  - {method: GET, path: /admin, status: 403}
+actions:
+  - {do: click, selector: "button[type=submit]"}
+# Optional only when a later target appears or is replaced after an earlier action.
+sequential_actions: true
+assertions:
+  - {visible: "main"}
+  - {text: {selector: "h1", contains: "Dashboard"}}
+  - {count: {selector: ".app-card", equals: 1}}
+  - {url: {contains: "/dashboard"}}
+  - {horizontal_overflow: false}

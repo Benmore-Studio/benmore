@@ -1,0 +1,15 @@
+{
+  "keys": [
+    "session_cache",
+    "query_live",
+    "query_cache",
+    "table_results",
+    "summary",
+    "response_bodies",
+    "request_options",
+    "imports",
+    "types",
+    "package",
+    "see_also"
+  ]
+}

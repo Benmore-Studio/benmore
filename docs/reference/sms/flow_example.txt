@@ -1,0 +1,20 @@
+# flows/send-code.yaml - text from a flow. Keys go under with: (a step-root
+# to:/body: is refused when the file is written).
+on:
+  request: { path: /api/send-code, method: POST, auth: required }
+jobs:
+  send_code:
+    steps:
+      - id: otp
+        run: sql
+        with:
+          query: "SELECT phone FROM _benmore_users WHERE id = :uid"   # the account table; user.id is its id
+          params: { uid: "${{ user.id }}" }
+      - id: msg
+        run: sms
+        with:
+          to: "${{ steps.otp.outputs.phone }}"   # E.164, e.g. +15551234567
+          body: "Your code is 482913. Reply STOP to opt out."
+      - run: respond
+        with:
+          json: { sent_to: "${{ steps.msg.outputs.to }}" }

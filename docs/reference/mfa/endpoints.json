@@ -1,0 +1,6 @@
+[
+  "POST /api/_auth/mfa/setup     → body: { password } from a session (none with a setup token) ⇒ { secret, otpauth_uri, backup_codes }. otpauth_uri is percent-encoded per the Key URI format: label `<site_name>:<email>` with colons dropped from site_name, `issuer=` the exact site_name.",
+  "POST /api/_auth/mfa/verify    → body: { code }  ⇒ enables MFA. On the require-enrollment flow ALSO returns { token, user_id } - the real session.",
+  "POST /api/_auth/mfa/disable   → body: { code }  ⇒ requires an active session (not a setup token) and a current TOTP code; { status: 'mfa_disabled' }. bm.mfa.disable(code) sends it; a wrong code answers 403 `invalid code`.",
+  "POST /api/_auth/token        → for an account with an active factor send { email, password, mfa_code } (a TOTP or backup code). Without it: 403 { error: 'mfa_required' }; wrong code: 403 { error: 'invalid MFA code' }; after 5 wrong codes 429. Apps with auth.otp refuse this endpoint (403 otp_required)."
+]

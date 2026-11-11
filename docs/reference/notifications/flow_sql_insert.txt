@@ -1,0 +1,1 @@
+A flow `run: sql` INSERT INTO _benmore_notifications stores a row but sends no live event (flow writes to `_benmore_*` tables are never announced) and skips the type/link checks and retention; use `run: notify` instead.

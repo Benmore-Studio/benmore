@@ -177,7 +177,7 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 	// Step 1 - create CF session.
 	sessionID, err := cfCreateSession(cfg)
 	if err != nil {
-		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast publish", err, map[string]any{"error": "upstream SFU unavailable"})
+		serverErrorJSONBody(w, r, app, http.StatusServiceUnavailable, "broadcast publish", err, map[string]any{"error": "upstream SFU unavailable"})
 		return
 	}
 
@@ -187,7 +187,7 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 	// subscribers will request by stable-naming convention "0", "1", …
 	answer, err := cfPublishTracks(cfg, sessionID, sdpOffer)
 	if err != nil {
-		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast publish", err, map[string]any{"error": "SFU rejected offer"})
+		serverErrorJSONBody(w, r, app, http.StatusServiceUnavailable, "broadcast publish", err, map[string]any{"error": "SFU rejected offer"})
 		return
 	}
 
@@ -268,14 +268,14 @@ func broadcastSubscribe(w http.ResponseWriter, r *http.Request, app *App) {
 	// Step 1 - create subscriber session.
 	subSessionID, err := cfCreateSession(cfg)
 	if err != nil {
-		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast subscribe", err, map[string]any{"error": "upstream SFU unavailable"})
+		serverErrorJSONBody(w, r, app, http.StatusServiceUnavailable, "broadcast subscribe", err, map[string]any{"error": "upstream SFU unavailable"})
 		return
 	}
 
 	// Step 2 - request to pull tracks from the publisher.
 	answer, err := cfPullTracks(cfg, subSessionID, publisherSessionID, sdpOffer)
 	if err != nil {
-		serverErrorJSONBody(w, r, app, http.StatusBadGateway, "broadcast subscribe", err, map[string]any{"error": "SFU rejected pull"})
+		serverErrorJSONBody(w, r, app, http.StatusServiceUnavailable, "broadcast subscribe", err, map[string]any{"error": "SFU rejected pull"})
 		return
 	}
 
@@ -318,7 +318,10 @@ func broadcastStop(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	var ownerID int64
 	app.DB.QueryRow("SELECT COALESCE(publisher_user_id, 0) FROM _benmore_broadcasts WHERE slug = ?", key).Scan(&ownerID)
-	if ownerID != 0 && ownerID != session.UserID && !session.IsAdmin() {
+	// Stopping someone else's stream is an admin-management action, so it
+	// needs the admin's unscoped credential (IsAdminConsole), not a scoped
+	// token an admin minted for an integration.
+	if ownerID != 0 && ownerID != session.UserID && !session.IsAdminConsole() {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not the publisher"})
 		return
 	}

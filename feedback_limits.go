@@ -31,6 +31,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,9 @@ const (
 	feedbackAnonWindow         = 10 * time.Minute
 	feedbackTotalsMaxAge       = time.Minute
 )
+
+// feedbackScreenshotRe is the only screenshot shape accepted (see decode).
+var feedbackScreenshotRe = regexp.MustCompile(`^data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]*={0,2}$`)
 
 // Variables so a test can reach the ceilings with a handful of rows.
 var (
@@ -93,6 +97,10 @@ func cutFeedbackField(s string, n int) string {
 
 // decode reads one submission within the limits above. It writes the refusal
 // itself and reports false.
+//
+// A screenshot is shown in <img src> by the admin panel and the platform
+// dashboard, so it must be what the widget sends (FileReader.readAsDataURL of
+// an image): a base64 image data URL, nothing that can carry markup.
 func (fi *feedbackIntake) decode(w http.ResponseWriter, r *http.Request, session *Session) (feedbackSubmission, bool) {
 	var body feedbackSubmission
 	if session == nil {
@@ -123,6 +131,10 @@ func (fi *feedbackIntake) decode(w http.ResponseWriter, r *http.Request, session
 	}
 	if len(body.Screenshot) > feedbackMaxScreenshotBytes {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "screenshot too large (2MB max)"})
+		return body, false
+	}
+	if body.Screenshot != "" && !feedbackScreenshotRe.MatchString(body.Screenshot) {
+		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "screenshot must be a base64 image data URL"})
 		return body, false
 	}
 	body.Name = cutFeedbackField(body.Name, feedbackMaxNameBytes)

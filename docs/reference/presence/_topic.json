@@ -1,0 +1,12 @@
+{
+  "keys": [
+    "summary",
+    "endpoint",
+    "js_snippet",
+    "why_it_exists",
+    "isolation",
+    "events",
+    "sweeper_behavior",
+    "see_also"
+  ]
+}

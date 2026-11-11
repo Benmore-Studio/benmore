@@ -1,0 +1,1 @@
+`benmore payments <app>` (app owner) answers the app's Stripe Connect state: `connections` by mode (`test`, `live`), each with `account` and `connected_at`, and `test_available` / `live_available` (whether the platform offers Connect in that mode). The CLI only reads: connect and disconnect in the dashboard.

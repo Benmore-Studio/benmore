@@ -9,3 +9,6 @@
 **/.benmore/
 /.benmore-public-export
 .DS_Store
+# The reference names a directory after each topic (uploads, ...); the rules
+# above must not hide one from the public repository.
+!/docs/reference/*/

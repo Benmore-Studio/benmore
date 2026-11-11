@@ -1,0 +1,19 @@
+import { DataTable, RecordForm, FlowForm, Gate } from 'sdui';
+
+// static/*.tsx is built for es2020, which has no top-level await: wrap the calls.
+async function boot() {
+  // A full CRUD surface for the contacts table - no per-column markup.
+  await RecordForm('#new', { table: 'contacts' });
+  await DataTable('#list', {
+    table: 'contacts',
+    columns: 'name,email,status',
+    onRowClick: (id) => RecordForm('#new', { table: 'contacts', id }), // edit
+  });
+
+  // Derive a form from a flow's declared inputs:
+  await FlowForm('#send', { flow: 'sendQuote' });
+
+  // Show an admin-only action:
+  await Gate('#danger-zone', { role: 'admin' });
+}
+boot();

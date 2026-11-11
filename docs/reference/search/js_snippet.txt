@@ -1,0 +1,13 @@
+let timer;
+function searchInput(input, onResults) {
+  input.oninput = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const q = input.value.trim();
+      if (!q) return onResults([]);
+      const rows = await fetch(`/api/notes?q=${encodeURIComponent(q)}`,
+        { credentials: 'same-origin' }).then(r => r.json());
+      onResults(rows);
+    }, 250);
+  };
+}

@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"path"
@@ -73,12 +72,15 @@ func validateAppMCPConnections(connections []AppMCPConnection) (map[string]bool,
 
 // appMCPLiteralPrivateHost refuses names and address literals that are private
 // without any lookup. A name that resolves privately is caught at connect time.
+// An address literal is read in every spelling a resolver reads
+// (literalOutboundIP): `127.1`, `0x7f000001`, `2130706433`, `0177.0.0.1` and an
+// IPv6 address with a zone are refused here as the runtime check refuses them.
 func appMCPLiteralPrivateHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
 		return true
 	}
-	ip := net.ParseIP(host)
+	ip := literalOutboundIP(host)
 	return ip != nil && blockedOutboundIP(ip)
 }
 

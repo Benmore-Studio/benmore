@@ -1,0 +1,25 @@
+{
+  "keys": [
+    "report_sources",
+    "aggregate_outputs",
+    "encrypted_operations",
+    "null_filters",
+    "aggregate_aliases",
+    "query_deadline",
+    "job_payloads",
+    "mcp_query_db",
+    "mcp_sql_write",
+    "security",
+    "summary",
+    "spec",
+    "text_match",
+    "saved_views",
+    "aggregate_col",
+    "js_snippet",
+    "boolean_filters",
+    "datetime_filters",
+    "unknown_aggregate_keys",
+    "hint",
+    "see_also"
+  ]
+}

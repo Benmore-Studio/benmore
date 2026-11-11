@@ -1,0 +1,23 @@
+# The one file here that loads: it must run and pass beside the broken ones.
+health_answers:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+
+owner_creates_and_reads_a_note:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/notes"
+      json:
+        title: "kept"
+      save:
+        note_id: "id"
+      expect:
+        status: 200
+    - get: "/api/notes/{{note_id}}"
+      expect:
+        status: 200
+        json:
+          title: "kept"

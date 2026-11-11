@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/worker
+    auth: required
+jobs:
+  go:
+    steps:
+      - run: sql
+        with:
+          query: "INSERT INTO notes (title, body) VALUES ('worker', :note)"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

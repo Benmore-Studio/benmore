@@ -1,0 +1,9 @@
+// Client kicks off the flow and polls.
+const r = await fetch('/api/sync/run', { method: 'POST', headers: { 'X-CSRF-Token': csrf } });
+const { job_id, status_url } = await r.json();   // 202 Accepted
+while (true) {
+  await new Promise(s => setTimeout(s, 2000));
+  const s = await (await fetch(status_url)).json();
+  if (s.status === 'completed') break;
+  if (s.status === 'failed') throw new Error(s.error || 'job failed');
+}

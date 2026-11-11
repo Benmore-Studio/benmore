@@ -1,0 +1,5 @@
+jobs:
+  - id: refresh_catalog
+    schedule: "every 15m"
+    flow: refresh_catalog
+    max_attempts: 1

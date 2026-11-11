@@ -38,6 +38,7 @@ package main
 // that are separate, not-yet-shipped features.
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -47,7 +48,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -161,6 +164,21 @@ func BlindIndexColumnsForTable(config *EncryptedFieldConfig, table string) map[s
 	return out
 }
 
+// hasBlindIndexes reports whether any encrypted field is blind-indexed.
+func hasBlindIndexes(config *EncryptedFieldConfig) bool {
+	if config == nil {
+		return false
+	}
+	for _, defs := range config.Fields {
+		for _, d := range defs {
+			if d.BlindIndex {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // EnsureBlindColumns adds `<col>_blind` to every table that has at
 // least one field flagged `blind_index: true`. Safe to call repeatedly
 // - uses pragma_table_info to skip columns that already exist.
@@ -174,7 +192,7 @@ func BlindIndexColumnsForTable(config *EncryptedFieldConfig, table string) map[s
 //
 // Index gives the query planner a B-tree to seek on, no more.
 func EnsureBlindColumns(db *sql.DB, config *EncryptedFieldConfig) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "blind index columns"), nil)
 	if err != nil {
 		return err
 	}
@@ -206,12 +224,12 @@ func ensureBlindColumnsWith(db mutationTx, config *EncryptedFieldConfig) error {
 			}
 			blindCol := d.Column + blindColSuffix
 			if !versionHasColumn(cols, blindCol) {
-				if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT", table, blindCol)); err != nil {
+				if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT", ddlIdent(table), blindCol)); err != nil {
 					return fmt.Errorf("blind column %s.%s: %w", table, blindCol, err)
 				}
 			}
 			idxName := fmt.Sprintf("idx_blind_%s_%s", table, d.Column)
-			if _, err := db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", idxName, table, blindCol)); err != nil {
+			if _, err := db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", idxName, ddlIdent(table), blindCol)); err != nil {
 				return fmt.Errorf("blind index %s: %w", idxName, err)
 			}
 		}
@@ -239,12 +257,15 @@ func ensureBlindColumnsWith(db mutationTx, config *EncryptedFieldConfig) error {
 // recreated each boot. The blind trigger's WHEN clause excludes NULL
 // (so a row with no email stays NULL on the blind column too).
 func InstallBlindIndexTriggers(db *sql.DB, config *EncryptedFieldConfig) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "blind index triggers"), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	if err := installBlindIndexTriggersWith(tx, config); err != nil {
+		return err
+	}
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -298,18 +319,28 @@ func installBlindIndexTriggersMode(db mutationTx, config *EncryptedFieldConfig, 
 				return fmt.Errorf("blind index %q.%q is not a plain table and column name", table, col)
 			}
 			blindCol := col + blindColSuffix
+			// Bare names as always, an SQL reserved word quoted (ddlIdent).
+			sqlTable, sqlCol := ddlIdent(table), ddlIdent(col)
 
 			// AFTER INSERT - populate blind from the raw INSERT value.
-			// The plaintext-only guard (NOT LIKE 'enc:%%') mirrors the
-			// encryption triggers: a bulk INSERT that already contains
-			// ciphertext (a restore, a migration) skips the blind step.
-			// SECURITY: the WHEN clause cannot tell ciphertext-as-blob
-			// from plaintext-with-prefix; the framework's encryption
-			// scheme guarantees ciphertext always starts with `enc:v1:`.
+			// The plaintext-only guard is the encryption triggers' own:
+			// NOT benmore_ciphertext_matches(value, table, column), true
+			// only for authentic ciphertext bound to this field. A row
+			// already holding that ciphertext (a restore, a migration, the
+			// encryption trigger's own UPDATE) skips the blind step.
+			// It used to be NOT LIKE 'enc:%', which also skipped plaintext
+			// such as "enc:x" or "ENC:1" (LIKE is case-insensitive) that the
+			// encryption trigger then sealed as plaintext: the blind column
+			// stayed NULL on insert, or kept the previous value's index on
+			// update, so equality search missed or matched the wrong row.
+			// The text differs from older builds, and every load drops and
+			// recreates these triggers (replace), so existing apps get it.
+			tableLit := "'" + strings.ReplaceAll(table, "'", "''") + "'"
+			colLit := "'" + strings.ReplaceAll(col, "'", "''") + "'"
 			triggerName := fmt.Sprintf("_benmore_blind_%s_%s_insert", table, col)
 			triggerSQL := fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_blind_index(NEW.%s) WHERE rowid = NEW.rowid; END",
-				triggerName, table, col, col, table, blindCol, col,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_blind_index(NEW.%s) WHERE rowid = NEW.rowid; END",
+				triggerName, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, blindCol, sqlCol,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
 				return fmt.Errorf("blind trigger %s: %w", triggerName, err)
@@ -323,8 +354,8 @@ func installBlindIndexTriggersMode(db mutationTx, config *EncryptedFieldConfig, 
 			// scoped to UPDATE OF the named encrypted column.
 			triggerName = fmt.Sprintf("_benmore_blind_%s_%s_update", table, col)
 			triggerSQL = fmt.Sprintf(
-				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NEW.%s NOT LIKE 'enc:%%' BEGIN UPDATE %s SET %s = benmore_blind_index(NEW.%s) WHERE rowid = NEW.rowid; END",
-				triggerName, col, table, col, col, table, blindCol, col,
+				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_blind_index(NEW.%s) WHERE rowid = NEW.rowid; END",
+				triggerName, sqlCol, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, blindCol, sqlCol,
 			)
 			if _, err := db.Exec(triggerSQL); err != nil {
 				return fmt.Errorf("blind trigger %s: %w", triggerName, err)
@@ -343,45 +374,108 @@ func installBlindIndexTriggersMode(db mutationTx, config *EncryptedFieldConfig, 
 	return nil
 }
 
-// RebuildAllBlindIndices recomputes every `<col>_blind` value under
-// the current blind-index key. Called immediately after a key rotation
-// has installed the new encryption key (and thus the new blind-index
-// key derived from it), so the existing blind columns - which were
-// computed under the OLD HMAC key - are stale and must be regenerated
-// or equality search breaks silently.
+// RebuildAllBlindIndices recomputes every `<col>_blind` value under the
+// database's current key in one transaction: every blind-indexed column is
+// rebuilt, or nothing changes. It returns the number of rows that hold a
+// value; each now carries the index its plaintext hashes to.
 //
-// Returns the number of rows rebuilt across all blind columns.
-//
-// The rebuild query decrypts the ciphertext, hashes it under the
-// current blind-index key, and writes the result. The trigger system
-// stays out of the way: this is a direct UPDATE on the blind column,
-// which is NOT what the blind trigger watches (it watches the source
-// encrypted column). So no infinite-trigger loops.
+// Key rotation does the same work inside its own transaction
+// (rebuildBlindIndicesTx), so re-sealed values and their indexes commit
+// together. This entry point repairs indexes left stale some other way.
+// Writing a blind sibling is not an edit of the row: updated_at, computed
+// values and content history stay as they were.
 func RebuildAllBlindIndices(app *App) (int, error) {
 	if app == nil || app.DB == nil || app.Encrypted == nil {
 		return 0, nil
 	}
-	if appBlindIndexKey.Load() == nil {
-		return 0, fmt.Errorf("blind-index key not initialised")
+	key := cryptoKeyForQuerier(app.DB)
+	if len(key) == 0 {
+		return 0, fmt.Errorf("no encryption key is registered for this database")
 	}
+	var total int
+	err := withRowMaintenanceTx(app.DB, "blind index rebuild", func(tx *sql.Tx) error {
+		var err error
+		total, err = rebuildBlindIndicesTx(tx, app.Encrypted, key)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	LogAudit(app, "blind_index_rebuilt", "_benmore_blind_index", "",
+		nil, nil, map[string]any{"rows_rebuilt": total})
+	return total, nil
+}
+
+// rebuildBlindIndicesTx rebuilds every configured blind column under key
+// within tx and returns the rows that hold a value. A configured column whose
+// sibling does not exist yet (encrypted.yaml changed without a reload) has
+// nothing to keep consistent and is skipped; the next load creates it and the
+// backfill endpoint fills it.
+func rebuildBlindIndicesTx(tx mutationTx, config *EncryptedFieldConfig, key []byte) (int, error) {
+	if config == nil {
+		return 0, nil
+	}
+	tables := make([]string, 0, len(config.Fields))
+	for table := range config.Fields {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
 	total := 0
-	for table, defs := range app.Encrypted.Fields {
-		for _, d := range defs {
+	for _, table := range tables {
+		for _, d := range config.Fields[table] {
 			if !d.BlindIndex {
 				continue
 			}
-			n, err := backfillBlindIndexOne(app, table, d.Column, false)
+			present, err := blindColumnExists(tx, table, d.Column)
 			if err != nil {
 				return total, fmt.Errorf("rebuild %s.%s: %w", table, d.Column, err)
 			}
-			total += n
+			if !present {
+				log.Printf("blind index: %s.%s%s does not exist yet; skipped (restart the app, then run the blind-index backfill)", table, d.Column, blindColSuffix)
+				continue
+			}
+			r, err := rebuildBlindColumn(tx, table, d.Column, key, false)
+			if err != nil {
+				return total, fmt.Errorf("rebuild %s.%s: %w", table, d.Column, err)
+			}
+			total += r.Indexed
 		}
 	}
-	if total > 0 {
-		LogAudit(app, "blind_index_rebuilt", "_benmore_blind_index", "",
-			nil, nil, map[string]any{"rows_rebuilt": total})
-	}
 	return total, nil
+}
+
+// withRowMaintenanceTx runs fn in one write transaction with the
+// row-maintenance triggers suspended (suspendRowMaintenanceTriggers), so a
+// derived-column write does not stamp updated_at or recompute computed fields,
+// and restores them before committing.
+func withRowMaintenanceTx(db *sql.DB, label string, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), label), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	suspended, err := suspendRowMaintenanceTriggers(tx)
+	if err != nil {
+		return fmt.Errorf("suspend row maintenance triggers: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := restoreRowMaintenanceTriggers(tx, suspended); err != nil {
+		return fmt.Errorf("restore row maintenance triggers: %w", err)
+	}
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
+		return fmt.Errorf("revision trigger order: %w", err)
+	}
+	return tx.Commit()
+}
+
+func blindColumnExists(q mutationQuerier, table, col string) (bool, error) {
+	var n int
+	if err := q.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, col+blindColSuffix).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // blindBackfillRefusal is a backfill refusal written for the operator who
@@ -390,98 +484,170 @@ type blindBackfillRefusal struct{ msg string }
 
 func (e *blindBackfillRefusal) Error() string { return e.msg }
 
-// backfillBlindIndexOne computes `<col>_blind` for every row of `table`
-// where the source column has a value. Used by:
-//   - the per-app backfill endpoint (one-shot agent-driven catch-up)
-//   - the rotation pathway (RebuildAllBlindIndices)
+// blindIndexRebuild counts what recomputing one blind column found.
+type blindIndexRebuild struct {
+	Indexed int // rows whose source holds a non-empty value; each now carries its index
+	Changed int // rows whose stored index was missing or stale (written, or would be)
+}
+
+// blindRebuildBatch bounds the rows held in memory between reading and
+// writing; rows are read in rowid order, one batch at a time.
+const blindRebuildBatch = 1000
+
+// rebuildBlindColumn computes `<col>_blind` for every row of table whose
+// source column holds a value, under key (the AES key that opens the values;
+// the blind key is derived from it, as the write triggers do). Used by the
+// backfill endpoint, RebuildAllBlindIndices and key rotation.
 //
-// Performs the computation in Go rather than via the SQL function so
-// the work can be batched + audit-summarised. Each row is read
-// (with auto-decryption via the scanRows pathway), the plaintext is
-// hashed, and the blind column is updated via a parameterised UPDATE.
-// Rows where the source value is NULL or empty get their blind set to
-// NULL (consistent with the trigger's WHEN clause).
+// Rows are scanned by position. The rebuild used to read `SELECT rowid, ...`
+// into a map keyed "rowid", but SQLite labels that column after an INTEGER
+// PRIMARY KEY (`id`), so on every Prisma model each row was skipped: rotation
+// left every existing index stale and the backfill reported 0 rows. Now every
+// row with a non-NULL source is accounted for - indexed, or empty (the empty
+// index the write trigger stores) - and the count is checked against the
+// table; a value the key cannot open fails the rebuild rather than indexing
+// the decryption-failure mask.
 //
-// dryRun=true counts rows without writing.
-func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (int, error) {
+// Only the blind column is written, and only where it differs. Callers run it
+// with the row-maintenance triggers suspended; with dryRun nothing is written.
+func rebuildBlindColumn(q mutationTx, table, col string, key []byte, dryRun bool) (blindIndexRebuild, error) {
+	var out blindIndexRebuild
+	if !isValidColumnName(table) || !isValidColumnName(col) {
+		return out, &blindBackfillRefusal{"invalid identifier"}
+	}
+	if len(key) == 0 {
+		return out, fmt.Errorf("no encryption key is registered for this database")
+	}
+	blindKey, err := DeriveBlindIndexKey(key)
+	if err != nil {
+		return out, err
+	}
+	cols, err := mainTableColumnsWith(q, table)
+	if err != nil {
+		return out, err
+	}
+	rowID, err := versionHistoryRowID(cols) // first of rowid/_rowid_/oid the table does not shadow
+	if err != nil {
+		return out, err
+	}
+	source, blindCol := quoteColumn(table, col), quoteIdent(col+blindColSuffix)
+	selectBatch := "SELECT " + rowID + ", " + source + ", " + blindCol + " FROM " + quoteIdent(table) +
+		" WHERE " + source + " IS NOT NULL AND " + rowID + " > ? ORDER BY " + rowID + " LIMIT " + strconv.Itoa(blindRebuildBatch)
+	type pendingWrite struct {
+		id    int64
+		blind string
+	}
+	seen := 0
+	for after := int64(math.MinInt64); ; {
+		rows, err := q.Query(selectBatch, after)
+		if err != nil {
+			return out, err
+		}
+		var writes []pendingWrite
+		n := 0
+		for rows.Next() {
+			var id int64
+			var raw, current any
+			if err := rows.Scan(&id, &raw, &current); err != nil {
+				rows.Close()
+				return out, err
+			}
+			n++
+			after = id
+			plain, sealed, err := appEncryptionRotationOpen(raw, key, table, col)
+			if err != nil {
+				rows.Close()
+				return out, fmt.Errorf("row %d: %w", id, err)
+			}
+			if !sealed {
+				var ok bool
+				if plain, ok = appEncryptionRotationScalar(raw); !ok {
+					rows.Close()
+					return out, fmt.Errorf("row %d: unsupported stored value type %T", id, raw)
+				}
+			}
+			// An empty value gets the empty index the write trigger stores.
+			if plain != "" {
+				out.Indexed++
+			}
+			want := BlindIndexHMACWithKey(blindKey, plain)
+			if stored, ok := current.(string); ok && stored == want {
+				continue
+			}
+			if stored, ok := current.([]byte); ok && string(stored) == want {
+				continue
+			}
+			writes = append(writes, pendingWrite{id, want})
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return out, err
+		}
+		seen += n
+		out.Changed += len(writes)
+		if !dryRun {
+			for _, w := range writes {
+				res, err := q.Exec("UPDATE "+quoteIdent(table)+" SET "+blindCol+" = ? WHERE "+rowID+" = ?", w.blind, w.id)
+				if err != nil {
+					return out, err
+				}
+				if affected, err := res.RowsAffected(); err != nil || affected != 1 {
+					return out, fmt.Errorf("row %d: blind index write matched %d rows (%v)", w.id, affected, err)
+				}
+			}
+		}
+		if n < blindRebuildBatch {
+			break
+		}
+	}
+	var total int
+	if err := q.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table) + " WHERE " + source + " IS NOT NULL").Scan(&total); err != nil {
+		return out, err
+	}
+	if seen != total {
+		return out, fmt.Errorf("read %d of the %d rows that hold a value", seen, total)
+	}
+	return out, nil
+}
+
+// backfillBlindIndexOne is the backfill endpoint's work: rebuild one blind
+// column under the database's current key, in one transaction (dryRun only
+// counts). Rows already carrying the right index are left untouched, so a
+// repeat run writes nothing.
+func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (blindIndexRebuild, error) {
+	var out blindIndexRebuild
 	if app == nil || app.DB == nil {
-		return 0, &blindBackfillRefusal{"app not initialised"}
+		return out, &blindBackfillRefusal{"app not initialised"}
 	}
 	if !isValidColumnName(table) || !isValidColumnName(col) {
-		return 0, &blindBackfillRefusal{"invalid identifier"}
+		return out, &blindBackfillRefusal{"invalid identifier"}
 	}
-	blindCol := col + blindColSuffix
-	// Verify the blind column actually exists (defensive - boot path
-	// should have created it, but the backfill might be invoked before
-	// a restart picks up a fresh encrypted.yaml).
-	var exists int
-	_ = app.DB.QueryRow(
-		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
-		table, blindCol).Scan(&exists)
-	if exists == 0 {
-		return 0, &blindBackfillRefusal{fmt.Sprintf("blind column %s.%s does not exist (restart the app after enabling blind_index)", table, blindCol)}
-	}
-	// Pull (id, plaintext) using the configured physical source column.
-	// Ordinary fields never gain decryption authority from a value prefix.
-	// rowid (not id): backfill must work for tables whose PK column is not
-	// named `id` (e.g. account_id TEXT PRIMARY KEY) — same reason the
-	// encryption/blind-index triggers use NEW.rowid. rowid == id for
-	// INTEGER PRIMARY KEY tables, so this is fully backward-compatible.
-	source := quoteColumn(table, col)
-	rows, err := queryNativeRowsWith(app.DB, app, table, fmt.Sprintf("SELECT rowid, %s FROM %s WHERE %s IS NOT NULL AND %s != ''", source, quoteIdent(table), source, source))
+	// The boot path creates the sibling; a backfill can run before a restart
+	// picks up a fresh encrypted.yaml.
+	present, err := blindColumnExists(app.DB, table, col)
 	if err != nil {
-		return 0, err
+		return out, err
 	}
-	updated := 0
-	for _, row := range rows {
-		idAny, ok := row["rowid"]
-		if !ok {
-			continue
-		}
-		var idStr string
-		switch v := idAny.(type) {
-		case int64:
-			idStr = strconv.FormatInt(v, 10)
-		case float64:
-			idStr = strconv.FormatInt(int64(v), 10)
-		case string:
-			idStr = v
-		default:
-			continue
-		}
-		ptAny, ok := row[col]
-		if !ok || ptAny == nil {
-			continue
-		}
-		// v2.7.57+: encrypted INTEGER/REAL columns come back from
-		// scanRows already coerced to int64/float64 (the type-aware
-		// decode that lets API consumers see numbers, not strings).
-		// Stringify with the same canonical form the SQL function
-		// uses on the way IN so the round-trip HMAC matches.
-		pt := stringifyForCrypto(ptAny)
-		if pt == "" {
-			continue
-		}
-		hash, err := blindIndexForApp(app, pt)
+	if !present {
+		return out, &blindBackfillRefusal{fmt.Sprintf("blind column %s.%s does not exist (restart the app after enabling blind_index)", table, col+blindColSuffix)}
+	}
+	key := cryptoKeyForQuerier(app.DB)
+	if len(key) == 0 {
+		return out, &blindBackfillRefusal{"no encryption key is loaded for this app"}
+	}
+	if dryRun {
+		tx, err := app.DB.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 		if err != nil {
-			return updated, err
+			return out, err
 		}
-		if dryRun {
-			updated++
-			continue
-		}
-		// Direct UPDATE on the blind column - doesn't fire the
-		// encryption trigger (different column) or the blind trigger
-		// (which watches UPDATE OF the source col only).
-		if _, err := app.DB.Exec(
-			"UPDATE "+quoteIdent(table)+" SET "+quoteIdent(blindCol)+" = ? WHERE rowid = ?",
-			hash, idStr,
-		); err != nil {
-			return updated, err
-		}
-		updated++
+		defer tx.Rollback()
+		return rebuildBlindColumn(tx, table, col, key, true)
 	}
-	return updated, nil
+	err = withRowMaintenanceTx(app.DB, "blind index backfill", func(tx *sql.Tx) error {
+		var err error
+		out, err = rebuildBlindColumn(tx, table, col, key, false)
+		return err
+	})
+	return out, err
 }
 
 // RegisterBlindIndexRoutes wires the per-app backfill endpoint.
@@ -543,15 +709,19 @@ func RegisterBlindIndexRoutes(mux appRouteRegistrar, app *App) {
 		if body.Confirm {
 			LogAudit(app, "blind_index_backfilled", "_benmore_blind_index", body.Table,
 				session, nil, map[string]any{
-					"table":  body.Table,
-					"column": body.Column,
-					"rows":   n,
+					"table":   body.Table,
+					"column":  body.Column,
+					"rows":    n.Indexed,
+					"changed": n.Changed,
 				})
 		}
+		// rows: rows holding a value, each indexed once this commits;
+		// changed: those whose index was missing or stale.
 		httpJSON(w, http.StatusOK, map[string]any{
 			"table":   body.Table,
 			"column":  body.Column,
-			"rows":    n,
+			"rows":    n.Indexed,
+			"changed": n.Changed,
 			"dry_run": !body.Confirm,
 		})
 	})
@@ -680,6 +850,51 @@ func blindFilterRefusal(r *http.Request, app *App, table string, session *Sessio
 		return base
 	}
 	return ""
+}
+
+// encryptedListParamProblem names a list filter or sort on an encrypted column
+// that cannot give a true answer, and why. Ciphertext keeps no order,
+// substring or (without a blind index) equality: an equality filter matched
+// nothing, a range or LIKE filter was dropped so every row came back, and a
+// sort ordered the ciphertext. Each looked like a real result.
+func encryptedListParamProblem(r *http.Request, app *App, table string) (col, why string) {
+	if app == nil || app.Encrypted == nil || len(app.Encrypted.Fields[table]) == 0 {
+		return "", ""
+	}
+	encrypted := map[string]bool{}
+	for _, def := range app.Encrypted.Fields[table] {
+		encrypted[def.Column] = true
+	}
+	blind := BlindIndexColumnsForTable(app.Encrypted, table)
+	q := r.URL.Query()
+	keys := make([]string, 0, len(q))
+	for key := range q {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if apiFilterReservedParam(key) {
+			continue
+		}
+		col, op := splitAPIFilterKey(key)
+		if !encrypted[col] {
+			continue
+		}
+		if op != "=" && op != "IN" {
+			return col, "ciphertext keeps no order or text, so only an equality filter (or __in) on a blind-indexed column can be applied; this one would be ignored and every row returned"
+		}
+		if !blind[col] {
+			return col, "it has no blind index, so an equality filter compares your value with ciphertext and can never match. Add the column to blind_index: in encrypted.yaml to filter on it"
+		}
+	}
+	sortCol := q.Get("sort")
+	if ob := q.Get("orderBy"); sortCol == "" && ob != "" {
+		sortCol = strings.SplitN(ob, ":", 2)[0]
+	}
+	if encrypted[sortCol] {
+		return sortCol, "sorting by it would order the ciphertext, not the values"
+	}
+	return "", ""
 }
 
 // writeBlindFilterRefusal renders the refusal for a blind-index probe.

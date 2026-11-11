@@ -67,6 +67,11 @@ func parseSchemaShorthand(data []byte) string {
 // SQLiteUUID4Default is the SQLite expression that generates a UUID v4 string.
 const SQLiteUUID4Default = `(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))))`
 
+// schemaShorthandHeader is the first line of every schema.sql generated from
+// schema.yaml, and the only thing that tells such a file from a hand-written
+// one (schemaYAMLOverwriteProblem).
+const schemaShorthandHeader = "-- Auto-generated from schema.yaml"
+
 // GenerateSQLFromModels converts a models map to SQL CREATE TABLE statements.
 func generateSQL(models map[string]string) string {
 	// First pass: identify which tables use +uuid
@@ -80,7 +85,7 @@ func generateSQL(models map[string]string) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("-- Auto-generated from schema.yaml\n\n")
+	sb.WriteString(schemaShorthandHeader + "\n\n")
 
 	for table, colSpec := range models {
 		sb.WriteString(generateTableSQL(table, colSpec, uuidTables))
@@ -92,7 +97,9 @@ func generateSQL(models map[string]string) string {
 
 func generateTableSQL(table, colSpec string, uuidTables map[string]bool) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", table))
+	// A table or column named with an SQL reserved word is quoted, any other
+	// name is written bare as before (ddlIdent, sql_ident.go).
+	sb.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", ddlIdent(table)))
 
 	isUUID := uuidTables[table]
 	if isUUID {
@@ -193,7 +200,7 @@ func parseShorthandColumn(spec, table string, uuidTables map[string]bool) string
 			} else {
 				colType = "INTEGER"
 			}
-			def := fmt.Sprintf("%s %s REFERENCES %s(id)", colName, colType, refTable)
+			def := fmt.Sprintf("%s %s REFERENCES %s(id)", ddlIdent(colName), colType, ddlIdent(refTable))
 			if notNull {
 				def += " NOT NULL"
 			}
@@ -224,7 +231,7 @@ func parseShorthandColumn(spec, table string, uuidTables map[string]bool) string
 	}
 
 	// Build column definition
-	def := fmt.Sprintf("%s %s", colName, colType)
+	def := fmt.Sprintf("%s %s", ddlIdent(colName), colType)
 	if notNull {
 		def += " NOT NULL"
 	}

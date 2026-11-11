@@ -1,0 +1,19 @@
+# A retried step ran its statement once per attempt.
+on:
+  request:
+    method: POST
+    path: /api/sql-retry
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: ins
+        run: sql
+        retry: 3
+        retry_delay: 10ms
+        with:
+          query: "INSERT INTO notes (title, body) VALUES ('retry', :b)"
+          params:
+            b: "${{ params.b }}"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

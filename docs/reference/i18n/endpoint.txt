@@ -1,0 +1,1 @@
+GET /api/_i18n/<lang> (404 `{"error":"language_not_found"}` for a language the app has no dictionary for)

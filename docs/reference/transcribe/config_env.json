@@ -1,0 +1,9 @@
+[
+  "`WHISPER_BIN` (default `whisper-cli` on PATH) - the whisper.cpp CLI.",
+  "`FFMPEG_BIN` (default `ffmpeg` on PATH) - decoder to 16kHz mono WAV.",
+  "`WHISPER_MODEL` (default `small.en`) - ggml model name; the file is `<WHISPER_MODEL_DIR>/ggml-<model>.bin`.",
+  "`WHISPER_MODEL_DIR` (default `/opt/benmore/models`, fallback `./models`) - where the ggml model files live.",
+  "`WHISPER_BIN`, `FFMPEG_BIN` and `WHISPER_MODEL_DIR` are host settings (the server's process environment). On the hosted platform they are platform-managed, like `PATH`, `LD_*`, `DYLD_*` and `GIT_*`: `set_env` refuses them and stored values are dropped. `WHISPER_MODEL` and `TRANSCRIBE_*` stay app-settable.",
+  "`TRANSCRIBE_TIMEOUT` (default `10m`) - per-call deadline; on timeout the whole subprocess group (ffmpeg/whisper + children) is killed, no orphans.",
+  "`TRANSCRIBE_THREADS` (default `2`) - whisper `--threads`. `TRANSCRIBE_NICE` (default `19`) - subprocess niceness so a transcription can't starve the app."
+]

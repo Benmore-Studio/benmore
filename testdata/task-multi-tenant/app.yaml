@@ -1,0 +1,29 @@
+# Multi-tenant app: each organisation is a tenant, its members hold a role in
+# it, and every project belongs to one organisation.
+site_name: "Team projects"
+auth:
+  identifier: email
+groups:
+  table: org_members            # one row per member of an organisation
+  key: org_id                   # the tenant column on every tenant table
+  user_field: user_id
+  role_field: member_role       # the member's role inside the organisation
+  bootstrap:
+    org_table: organizations    # POST /api/_groups/create founds one
+    founding_role: org_admin
+access:
+  organizations:
+    read: member-of:org_members(org_id, user_id)   # members read their own organisation
+    write: off                  # founded only through /api/_groups/create
+    update: role:org_admin
+    delete: off
+  org_members:
+    read: group                 # the roster of the caller's organisation
+    write: off                  # added by the bootstrap and flows/add-member.yaml only
+    update: off
+    delete: role:org_admin
+  projects:
+    read: group                 # every member of the organisation
+    write: group
+    update: group
+    delete: role:org_admin,manager

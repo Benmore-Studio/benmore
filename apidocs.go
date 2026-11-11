@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"math"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -31,7 +34,7 @@ func RegisterAPIDocsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_docs", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if requireAuth && session == nil {
-			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -43,12 +46,12 @@ func RegisterAPIDocsRoutes(mux appRouteRegistrar, app *App) {
 	openAPIHandler := func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if requireAuth && session == nil {
-			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "private, no-store")
-		json.NewEncoder(w).Encode(generateRuntimeOpenAPIFor(app, docsViewerFor(session)))
+		json.NewEncoder(w).Encode(generateRuntimeOpenAPIFor(app, docsViewerFor(session), registeredFlowOpenAPI(mux)))
 	}
 	for _, path := range []string{"/api/_openapi", "/openapi.json", "/api/openapi.json"} {
 		mux.HandleFunc("GET "+path, openAPIHandler)
@@ -61,7 +64,7 @@ func RegisterAPIDocsRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_schema", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
 		if session == nil {
-			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -204,10 +207,25 @@ func generateAPIDocs(app *App, viewer docsViewer) map[string]any {
 // operation) - `benmore verify` and tests. HTTP callers get
 // generateRuntimeOpenAPIFor with their own docsViewer.
 func generateRuntimeOpenAPI(app *App) map[string]any {
-	return generateRuntimeOpenAPIFor(app, fullDocs)
+	if len(app.Flows) == 0 {
+		return generateRuntimeOpenAPIFor(app, fullDocs)
+	}
+	tables := make([]string, 0, len(app.Tables))
+	for _, table := range app.Tables {
+		tables = append(tables, table.Name)
+	}
+	if app.DB != nil {
+		var err error
+		tables, err = GetTableNames(app.DB)
+		if err != nil {
+			return generateRuntimeOpenAPIFor(app, fullDocs)
+		}
+	}
+	mux := buildAppRouteMux(app, false, "", false, tables)
+	return generateRuntimeOpenAPIFor(app, fullDocs, mux.flows)
 }
 
-func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
+func generateRuntimeOpenAPIFor(app *App, viewer docsViewer, registered ...map[string]string) map[string]any {
 	paths := map[string]any{}
 	schemas := map[string]any{
 		"Problem": map[string]any{
@@ -228,6 +246,12 @@ func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
 	// duplicate operationIds. On collision we fall back to the raw table
 	// name so each table keeps a distinct, stable contract entry.
 	seenSchema := map[string]bool{}
+	// Custom fields are read once for the whole document; nil (no table, or
+	// a read error) lists none, as customFieldTableColumns does.
+	var tracked map[string]map[string]bool
+	if app != nil && app.DB != nil {
+		tracked, _ = customFieldColumns(app.DB)
+	}
 	for _, table := range sortedTables(app) {
 		// Belt-and-suspenders: sortedTables already strips every
 		// _benmore_* table, so this guard is normally dead code. Keep it
@@ -242,8 +266,9 @@ func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
 		}
 		seenSchema[schemaName] = true
 		schemas[schemaName] = openAPISchemaForTable(app, table)
-		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(table, "create")
-		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(table, "update")
+		custom := customFieldTableColumnsFrom(app, table, tracked)
+		schemas["Create"+schemaName] = openAPIWriteSchemaForTable(app, table, requestCreate, custom)
+		schemas["Update"+schemaName] = openAPIWriteSchemaForTable(app, table, requestUpdate, custom)
 		paths["/api/"+table.Name] = map[string]any{
 			"get": map[string]any{
 				"operationId": "list" + schemaName,
@@ -329,6 +354,15 @@ func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
 		viewer.pruneOpenAPIPaths(app, table.Name, paths)
 	}
 
+	if viewer.full && len(registered) > 0 {
+		addFlowOpenAPIPaths(app, paths, registered[0])
+	}
+
+	version := "1.0.0+" + tablesFingerprint(app)
+	if len(registered) > 0 {
+		version += flowOpenAPIFingerprint(app, registered[0])
+	}
+
 	return map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
@@ -336,7 +370,7 @@ func generateRuntimeOpenAPIFor(app *App, viewer docsViewer) map[string]any {
 			// Derive the version from the schema fingerprint so the contract
 			// version moves whenever the tables/columns change, letting
 			// consumers detect drift instead of seeing a frozen 1.0.0.
-			"version": "1.0.0+" + tablesFingerprint(app),
+			"version": version,
 		},
 		"paths": paths,
 		"components": map[string]any{
@@ -394,15 +428,28 @@ func openAPISchemaForTable(app *App, table Table) map[string]any {
 	return out
 }
 
-func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
+// openAPIWriteSchemaForTable is the Create<Model> or Update<Model> request
+// schema: the columns a generic create or PATCH may set (requestWritable, the
+// predicate /api/_schema uses), custom fields included. The schema refuses
+// unknown properties, so a column it lists and the write path drops, or the
+// reverse, is a wrong contract either way.
+func openAPIWriteSchemaForTable(app *App, table Table, mode requestWriteMode, custom []Column) map[string]any {
 	props := map[string]any{}
 	required := []string{}
-	for _, col := range table.Columns {
-		if col.PK || isManagedColumn(col.Name) || isSensitiveUserColumn(col.Name) {
+	writable := requestWritableAnyCaller(app, table.Name)
+	for _, col := range append(append([]Column(nil), table.Columns...), custom...) {
+		if !writable.column(col, mode) || isSensitiveUserColumn(col.Name) {
 			continue
 		}
-		props[col.Name] = openAPISchemaForColumn(col)
-		if mode == "create" && col.NotNull && col.Default == "" {
+		prop := openAPISchemaForColumn(col)
+		props[col.Name] = prop
+		if writable.tenantKeyColumn(col) {
+			// Listed because a platform admin's create keeps it; never
+			// required, since every other caller's row takes the session's.
+			prop["description"] = "Tenant key. Filled from the caller's session; only a platform admin's explicit value is stored."
+			continue
+		}
+		if mode == requestCreate && col.NotNull && col.Default == "" {
 			required = append(required, col.Name)
 		}
 	}
@@ -410,7 +457,7 @@ func openAPIWriteSchemaForTable(table Table, mode string) map[string]any {
 	// field in the request body (crud_update.go handleUpdate reads r.FormValue), NOT
 	// by any header. Model it on the Update schema only, and only when the
 	// table actually has an updated_at column for the check to compare against.
-	if mode == "update" && tableHasColumn(table, "updated_at") {
+	if mode == requestUpdate && tableHasColumn(table, "updated_at") {
 		props["_expected_updated_at"] = map[string]any{
 			"type":        "string",
 			"description": "Optimistic concurrency token: the row's current updated_at. If it no longer matches, the update fails with 409.",
@@ -524,7 +571,10 @@ func openAPIListParams(schemaName string) []map[string]any {
 		{"name": "limit", "in": "query", "description": "Rows per page, capped at 500; default 20 with cursor, otherwise 50. Explicit page/per_page takes precedence for offset paging.", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 500}},
 		{"name": "offset", "in": "query", "description": "Rows to skip (default 0, maximum 100000). Used with limit when neither page nor per_page is set; ignored with cursor.", "schema": map[string]any{"type": "integer", "minimum": 0, "maximum": 100000}},
 		{"name": "count", "in": "query", "description": "When truthy, return only {count: N} (the filtered total, ignoring paging).", "schema": map[string]any{"type": "boolean"}},
-		{"name": "include", "in": "query", "description": "Comma-separated relation names to expand inline (e.g. include=contact,tasks). Adds extra keys to each row.", "schema": map[string]any{"type": "string"}},
+		{"name": "include", "in": "query", "description": "Comma-separated relations to expand inline (e.g. include=contact,tasks): a related table name or a Prisma relation field name (include=notes for `notes CaseNote[]`). Adds extra keys to each row. An entry that names no relation is listed in the X-Ignored-Params response header as include=<entry>.", "schema": map[string]any{"type": "string"}},
+		{"name": "sort", "in": "query", "description": "Column to order by (with order=asc|desc, default asc). A sort or order the list does not apply (not a column, a direction other than asc/desc, any sort on a cursor page) is listed in X-Ignored-Params.", "schema": map[string]any{"type": "string"}},
+		{"name": "order", "in": "query", "description": "asc or desc, for sort or an orderBy without a direction.", "schema": map[string]any{"type": "string", "enum": []string{"asc", "desc"}}},
+		{"name": "orderBy", "in": "query", "description": "col or col:desc; used when sort is absent.", "schema": map[string]any{"type": "string"}},
 		{"name": "q", "in": "query", "description": "Full-text search query applied across the table's searchable text columns.", "schema": map[string]any{"type": "string"}},
 	}
 }
@@ -600,6 +650,20 @@ func openAPIWriteStatusSchema(status string) map[string]any {
 	}
 }
 
+// richSchemaTableVisible reports whether table is one the schema descriptor
+// describes to this caller (SQLite compares table names case-insensitively).
+func richSchemaTableVisible(opsFor map[string]map[string]bool, table string) bool {
+	if _, ok := opsFor[table]; ok {
+		return true
+	}
+	for name := range opsFor {
+		if strings.EqualFold(name, table) {
+			return true
+		}
+	}
+	return false
+}
+
 // generateRichSchema builds the per-user descriptor served at
 // GET /api/_schema - the source the schema-driven component layer
 // renders from. Unlike /api/_docs (static, table shape only) this
@@ -660,6 +724,8 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 		}
 		cols, _ := GetTableColumns(app.DB, table)
 		fks := fksByTable[table]
+		// writable: what a create by THIS caller stores (request_writable.go).
+		writable := requestWritableFor(app, table, session)
 
 		fields := make([]map[string]any, 0, len(cols))
 		for _, col := range cols {
@@ -674,10 +740,10 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 				"control":  schemaControlFor(col),
 				"label":    humanizeField(col.Name),
 				"required": col.NotNull && col.Default == "" && !col.PK,
-				"writable": ops["write"] && !isManagedColumn(col.Name) && !masked,
+				"writable": ops["write"] && writable.column(col, requestCreate) && !masked,
 			}
-			if col.Default != "" {
-				f["default"] = col.Default
+			if def, ok := schemaDefaultValue(col); ok {
+				f["default"] = def
 			}
 			if col.PK {
 				f["primary_key"] = true
@@ -686,7 +752,9 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 				f["encrypted"] = true
 				f["masked"] = masked
 			}
-			if fk, ok := fks[col.Name]; ok {
+			// A relation names its target only when the caller may see that
+			// table, as children (reverse relations) already do.
+			if fk, ok := fks[col.Name]; ok && richSchemaTableVisible(opsFor, fk.Table) {
 				f["relation"] = map[string]string{"table": fk.Table, "column": fk.Column}
 			}
 			fields = append(fields, f)
@@ -717,8 +785,9 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 	return map[string]any{"tables": out}
 }
 
-// isManagedColumn reports columns the framework owns - never user-writable
-// through a derived form (they're set server-side or via dedicated routes).
+// isManagedColumn reports columns the framework owns by name; a derived form
+// hides them (schemaControlFor). Whether a request may set a column is
+// requestWritable's answer (request_writable.go), not this list's.
 func isManagedColumn(name string) bool {
 	switch name {
 	case "id", "user_id", "created_at", "updated_at", "deleted_at", "role", "password_hash":
@@ -754,11 +823,32 @@ func sessionCanUnmask(session *Session, def *EncryptedFieldDef) bool {
 // schemaControlFor derives the form control / cell kind for a column from
 // its name + SQLite type. The single framework-owned home for the
 // classify mapping the sdui prototype hand-rolled client-side.
+//
+// The declared type decides first for values a text box or the wrong
+// picker would corrupt: a BOOLEAN is a checkbox (has_file is a flag, not an
+// upload), a DATETIME/TIMESTAMP an instant (datetime-local; RecordForm
+// converts between the viewer's zone and UTC), a DATE a date and a TIME a
+// time. A DATETIME named like a calendar date (date, *_date, dob, birthday,
+// birthdate) keeps the date control: those columns hold a day, not a moment.
 func schemaControlFor(col Column) string {
 	if col.PK || isManagedColumn(col.Name) {
 		return "hidden"
 	}
 	n := strings.ToLower(col.Name)
+	t := strings.ToUpper(col.Type)
+	switch {
+	case strings.Contains(t, "BOOL"):
+		return "checkbox"
+	case strings.Contains(t, "DATETIME"), strings.Contains(t, "TIMESTAMP"):
+		if n == "date" || strings.HasSuffix(n, "_date") || n == "dob" || n == "birthday" || n == "birthdate" {
+			return "date"
+		}
+		return "datetime"
+	case strings.Contains(t, "DATE"):
+		return "date"
+	case strings.Contains(t, "TIME"):
+		return "time"
+	}
 	switch {
 	case n == "email":
 		return "email"
@@ -782,7 +872,6 @@ func schemaControlFor(col Column) string {
 	case n == "notes" || n == "body" || n == "description" || n == "bio":
 		return "textarea"
 	}
-	t := strings.ToUpper(col.Type)
 	switch {
 	case strings.Contains(t, "INT"):
 		if n == "vip" || n == "active" || n == "done" || n == "enabled" ||
@@ -794,11 +883,133 @@ func schemaControlFor(col Column) string {
 		strings.Contains(t, "DOUB"), strings.Contains(t, "NUMERIC"),
 		strings.Contains(t, "DECIMAL"):
 		return "number"
-	case strings.Contains(t, "DATE"), strings.Contains(t, "TIME"):
-		return "date"
 	default:
 		return "text"
 	}
+}
+
+// schemaNumberLiteral matches a SQLite numeric literal as PRAGMA table_info
+// reports a column default (sign, decimal, exponent; hex is handled apart).
+var schemaNumberLiteral = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+// schemaDefaultValue turns a column's SQL default, as PRAGMA table_info
+// reports it (an empty string literal, 'draft', 0, TRUE or CURRENT_TIMESTAMP),
+// into the value a form starts from. /api/_schema used to hand out the SQL
+// text itself, so @default("") reached RecordForm as two apostrophes and was
+// saved as such.
+//
+// A quoted string is unquoted (a doubled quote inside it is one quote), a
+// number becomes a number and TRUE/FALSE a boolean, then the value takes the
+// column's type the way SQLite stores it: a BOOLEAN's 0/1 is false/true, a
+// numeric column's numeric text a number, a TEXT column's number its text. A
+// default SQLite computes at insert time (CURRENT_TIMESTAMP, a uuid() or any
+// other expression), a blob and NULL have no value to show: ok is false, and
+// the insert fills the column in.
+func schemaDefaultValue(col Column) (any, bool) {
+	raw := strings.TrimSpace(col.Default)
+	if raw == "" {
+		return nil, false
+	}
+	var v any
+	switch {
+	case raw[0] == '\'' || raw[0] == '"':
+		s, ok := sqlQuotedLiteral(raw)
+		if !ok {
+			return nil, false
+		}
+		v = s
+	case strings.EqualFold(raw, "TRUE"):
+		v = int64(1)
+	case strings.EqualFold(raw, "FALSE"):
+		v = int64(0)
+	default:
+		n, ok := sqlNumberLiteral(raw)
+		if !ok {
+			return nil, false
+		}
+		v = n
+	}
+
+	t := strings.ToUpper(col.Type)
+	switch {
+	case strings.Contains(t, "BOOL"):
+		switch x := v.(type) {
+		case int64:
+			return x != 0, true
+		case float64:
+			return x != 0, true
+		case string:
+			switch strings.ToLower(strings.TrimSpace(x)) {
+			case "1", "true":
+				return true, true
+			case "0", "false":
+				return false, true
+			}
+		}
+		return v, true
+	case strings.Contains(t, "INT"), strings.Contains(t, "REAL"), strings.Contains(t, "FLOA"),
+		strings.Contains(t, "DOUB"), strings.Contains(t, "NUM"), strings.Contains(t, "DEC"):
+		if s, ok := v.(string); ok {
+			if n, ok := sqlNumberLiteral(strings.TrimSpace(s)); ok {
+				return n, true
+			}
+		}
+		return v, true
+	case strings.Contains(t, "CHAR"), strings.Contains(t, "CLOB"), strings.Contains(t, "TEXT"):
+		if _, isString := v.(string); !isString {
+			return strings.TrimPrefix(raw, "+"), true
+		}
+	}
+	return v, true
+}
+
+// sqlQuotedLiteral unquotes one SQL string literal, where a doubled quote
+// stands for one. Text that is not exactly one literal ('a' || 'b') reports
+// false.
+func sqlQuotedLiteral(raw string) (string, bool) {
+	q := raw[0]
+	if len(raw) < 2 || raw[len(raw)-1] != q {
+		return "", false
+	}
+	inner := raw[1 : len(raw)-1]
+	var b strings.Builder
+	for i := 0; i < len(inner); i++ {
+		if inner[i] == q {
+			if i+1 < len(inner) && inner[i+1] == q {
+				b.WriteByte(q)
+				i++
+				continue
+			}
+			return "", false
+		}
+		b.WriteByte(inner[i])
+	}
+	return b.String(), true
+}
+
+// sqlNumberLiteral parses a SQLite integer (decimal or 0x hex) or real
+// literal: an integer as int64, anything else as float64.
+func sqlNumberLiteral(s string) (any, bool) {
+	if body := strings.TrimLeft(s, "+-"); strings.HasPrefix(body, "0x") || strings.HasPrefix(body, "0X") {
+		i, err := strconv.ParseInt(s, 0, 64)
+		if err != nil {
+			return nil, false
+		}
+		return i, true
+	}
+	if !schemaNumberLiteral.MatchString(s) {
+		return nil, false
+	}
+	if !strings.ContainsAny(s, ".eE") {
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i, true
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+		return nil, false
+	}
+	return f, true
 }
 
 // humanizeField turns snake_case (or a table name) into a Title-Case label.

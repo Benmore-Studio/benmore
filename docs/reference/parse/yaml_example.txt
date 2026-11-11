@@ -1,0 +1,20 @@
+# flows/stripe-events.yaml - read nested fields of a verified webhook body
+on:
+  request:
+    method: POST
+    path: /api/webhooks/stripe-events
+    verify: stripe
+    secret: "${{ env.STRIPE_WEBHOOK_SECRET }}"
+jobs:
+  stripe_events:
+    steps:
+      - id: evt
+        run: parse
+      - run: sql
+        with:
+          query: "INSERT OR IGNORE INTO charges (event_id, amount) VALUES (:id, :amount)"
+          params:
+            id: "${{ steps.evt.outputs.id }}"
+            amount: "${{ steps.evt.outputs.data.object.amount }}"
+      - run: respond
+        with: { status: 200, json: { received: true } }

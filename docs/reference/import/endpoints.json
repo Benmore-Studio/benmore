@@ -1,0 +1,7 @@
+[
+  "POST   /api/_import                 create (or resume) a session",
+  "PUT    /api/_import/{id}/chunk/{n}   stage chunk n, numbered from 0 (≤32 MiB)",
+  "POST   /api/_import/{id}/commit      verify staged bytes, start the load",
+  "GET    /api/_import/{id}             status: state, rows_loaded, received_chunks, error",
+  "DELETE /api/_import/{id}             cancel - only while state is \"staging\""
+]

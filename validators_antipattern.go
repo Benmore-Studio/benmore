@@ -40,12 +40,13 @@ var knownAppYAMLKeys = map[string]bool{
 	"database":         true,
 	"head":             true,
 	"oauth":            true,
-	"frontend":         true, // frontend.stack: html|react|gotmpl - picks the scaffold flavor
+	"frontend":         true, // a label older scaffolds wrote; nothing reads it (app_yaml_no_effect.go)
 	"scopes":           true, // legacy per-table public_read_when overrides
 	"access":           true, // v2.7.12 declarative per-table per-op access control
 	"auto_memberships": true, // v2.7.35 shorthand: synthesize on_insert hooks for "every active user → parent's join table"
 	"csp":              true, // per-directive CSP allowlist extensions: script_src, style_src, img_src, font_src, connect_src, frame_src
 	"table_scopes":     true, // `access`: auto-CRUD table access comes from access: alone; roles: scopes gate capabilities (bindRoleTableScopes)
+	"compliance":       true, // `hipaa`: opt-in stricter defaults (compliance.go, api(at:"compliance"))
 	"ws_rooms":         true, // v2.7.164 WS room-name patterns bound to membership tables (join-time authorization)
 	// Legacy inline encryption (encryption.go EncryptedYAML): runtime reads
 	// it and api(at:"encryption") documents it, but this list refused it.
@@ -89,13 +90,13 @@ var knownAuthKeys = map[string]bool{
 	"oauth":                 true,
 	"oauth_only":            true, // social login is the ONLY path; password login+signup refused (auth_login.go oauthOnly)
 	"mfa":                   true,
+	"idle_timeout":          true, // "15m", "1h": sessions idle longer end (auth_idle.go); 15m default under compliance: hipaa
 	"require_mfa_for_roles": true, // comma-separated roles that must enroll MFA before a session is issued
 	"mfa_setup_redirect":    true, // form-login redirect target when enrollment is required (default /mfa-setup)
 	"read_audit_sync":       true,
 	// Read by the runtime but missing here, so the write gate refused a
-	// documented key (read_audit: api(at:"audit"); edge_scopes: edges).
+	// documented key (read_audit: api(at:"audit")).
 	"read_audit":                  true, // '*' or comma-separated tables (read_audit.go IsReadAudited)
-	"edge_scopes":                 true, // scopes an edge may request via signIn (edge_auth_handlers.go)
 	"signup_redirect":             true, // post-signup destination (auth_login.go)
 	"signup_rate_limit":           true, // "<count>/<window>" sign-ups per client address (auth_signup_limits.go; default 30/10m)
 	"public_api":                  true, // legacy comma-separated anon tables (crud.go requireAPIAuth)
@@ -109,8 +110,9 @@ var knownAuthKeys = map[string]bool{
 // an author who wrote them believed a control was on. Refused with the key
 // that does the job.
 var deadAuthKeys = map[string]string{
-	"mfa":   "`auth.mfa` has no effect - every user can already enroll MFA (api(at:\"mfa\")). To REQUIRE it, list the roles: `require_mfa_for_roles: \"admin,staff\"`.",
-	"oauth": "`auth.oauth` has no effect - social login is configured by provider credentials and the top-level `oauth:` block (api(at:\"oauth\")); `auth.oauth_only: true` makes it the only sign-in path.",
+	"mfa":         "`auth.mfa` has no effect - every user can already enroll MFA (api(at:\"mfa\")). To REQUIRE it, list the roles: `require_mfa_for_roles: \"admin,staff\"`.",
+	"edge_scopes": "`auth.edge_scopes` has no effect - edges (pastes) were retired on 2026-10-26 and edge addresses answer 410 Gone. Remove the key.",
+	"oauth":       "`auth.oauth` has no effect - social login is configured by provider credentials and the top-level `oauth:` block (api(at:\"oauth\")); `auth.oauth_only: true` makes it the only sign-in path.",
 }
 
 // authFlagKeys are the auth keys the runtime reads as booleans (compared to
@@ -133,6 +135,13 @@ func validateAppYAML(content string) string {
 		if knownAppYAMLKeys[key] {
 			continue
 		}
+		if key == "retention" {
+			// The runtime used to run this section while this gate
+			// refused it; neither reads it (retention_document.go).
+			if msg := inlineRetentionProblem([]byte(content)); msg != "" {
+				return msg
+			}
+		}
 		return fmt.Sprintf("antipattern [unknown-app-yaml-key] in app.yaml: top-level key %q is not recognized by the framework. Known keys: %s. Common fabrications: `routes:`, `middleware:`, `pages:`, `database_url:`, `cdn:`, `theme.primary_color:` (the real `theme:` is just a string like \"zinc\"/\"blue\", plus `brand:` for the accent color). Read `help(topic: \"build\")` for the full app.yaml shape.", key, knownYAMLKeysList())
 	}
 	// Scope-format sanity check on roles. v2.5.10 widened the parser
@@ -143,6 +152,9 @@ func validateAppYAML(content string) string {
 	// because "own" isn't a real scope. Catch it at write time.
 	if v, ok := doc["table_scopes"]; ok && v != "access" {
 		return fmt.Sprintf("app.yaml: table_scopes must be `access` (auto-CRUD table access follows access: rules; roles: scopes gate only capabilities) or be omitted; got %v.", v)
+	}
+	if msg := complianceAppYAMLProblem(doc); msg != "" {
+		return msg
 	}
 	if rolesRaw, ok := doc["roles"].(map[string]any); ok {
 		for _, roleName := range slices.Sorted(maps.Keys(rolesRaw)) {
@@ -174,7 +186,7 @@ func validateAppYAML(content string) string {
 				}
 				parts := strings.SplitN(e, ":", 2)
 				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-					return fmt.Sprintf("app.yaml: role %q has invalid scope %q. Scopes must be \"*\" for full access, or \"resource:action\" pairs (e.g. \"customers:read\", \"shipments:write\"). The framework's CRUD gate checks every API call against this list, so a malformed scope means every call 403s with `scope denied: token does not have <table>:read permission`.\n\nFix:\n  roles:\n    %s:\n      scopes: [\"*\"]                     # full access (admins)\n  or\n  roles:\n    %s:\n      scopes: [\"customers:read\", \"shipments:read\", \"invites:read\"]\n\nNote: tenant scoping (each user only sees their own data) is automatic via the `groups:` config + ownership columns - scopes are about WHICH tables, not which rows.",
+					return fmt.Sprintf("app.yaml: role %q has invalid scope %q. Scopes must be \"*\" for full access, or \"resource:action\" pairs (e.g. \"customers:read\", \"shipments:write\"). The framework's CRUD gate checks every API call against this list, so a malformed scope means every call 403s with `scope denied: session does not have <table>:read permission`.\n\nFix:\n  roles:\n    %s:\n      scopes: [\"*\"]                     # full access (admins)\n  or\n  roles:\n    %s:\n      scopes: [\"customers:read\", \"shipments:read\", \"invites:read\"]\n\nNote: tenant scoping (each user only sees their own data) is automatic via the `groups:` config + ownership columns - scopes are about WHICH tables, not which rows.",
 						roleName, e, roleName, roleName)
 				}
 				// `read`, `write`, `delete`, `*` are framework CRUD
@@ -230,12 +242,17 @@ func validateAppYAML(content string) string {
 		}
 	}
 
-	// ws_rooms: block sanity (v2.7.164) - each value must parse as a
-	// membership rule. A typo'd rule is DROPPED at load time (the room
-	// stays unprotected), so catch it at write time where the agent can
-	// act on it.
+	// ws_rooms: block sanity (v2.7.164) - each pattern must be one the
+	// runtime can match and each value a membership rule. A pattern like
+	// "chat:*" or "a-:x-:y" matches none of the rooms it is written for;
+	// the loader keeps the app serving with those rooms closed
+	// (roomMembershipAllowed), so the place to stop it is here, where the
+	// author can act on it.
 	if wsRaw, ok := doc["ws_rooms"].(map[string]any); ok {
 		for _, pattern := range slices.Sorted(maps.Keys(wsRaw)) {
+			if msg := wsRoomPatternRefusal(pattern); msg != "" {
+				return "app.yaml: " + msg
+			}
 			v := wsRaw[pattern]
 			ruleStr, ok := v.(string)
 			if !ok || parseMemberOf("member-of:"+strings.ToLower(strings.TrimSpace(ruleStr))) == nil {
@@ -261,6 +278,14 @@ func validateAppYAML(content string) string {
 			if _, _, ok := parseSignupRateLimit(anyToString(v)); !ok {
 				return fmt.Sprintf("app.yaml: auth.signup_rate_limit = %v is malformed. Use \"<count>/<window>\" - e.g. \"100/hour\", \"30/10m\". Windows: s/sec, m/min, h/hour, d/day or a Go duration. It is the number of sign-ups one client address may make per window (default 30/10m).", v)
 			}
+		}
+		if msg := idleTimeoutAppYAMLProblem(doc); msg != "" {
+			return msg
+		}
+		// Write gate and `benmore check` only: a deployed file keeps loading
+		// with the lifetime it has had (RegisterAuthRoutes logs it).
+		if msg := sessionDurationAppYAMLProblem(doc); msg != "" {
+			return msg
 		}
 		for _, key := range authFlagKeys {
 			v, present := authRaw[key]
@@ -312,12 +337,14 @@ var knownAccessModes = map[string]bool{
 
 // validateAccessMode returns an error message when `mode` isn't a
 // recognized access mode. Accepts the special-cased `role:<name>`,
-// `perm:<resource>.<action>`, and `member-of:<table>(<join>,<user>)`
-// prefixes for developer-defined gates.
+// `owner_or_role:<roles>`, `perm:<resource>.<action>`, and
+// `member-of:<table>(<join>,<user>)` prefixes for developer-defined gates.
+// Its two messages list every mode it accepts
+// (TestAccessModeMessagesListEveryModeTheRuntimeHonors).
 func validateAccessMode(table, op, mode string) string {
 	m := strings.ToLower(strings.TrimSpace(mode))
 	if m == "" {
-		return fmt.Sprintf("app.yaml: access.%s.%s is empty. Allowed modes: anon, everyone, self, group, admin, role:<name>, perm:<resource>.<action>, member-of:<table>(<join_col>,<user_col>), off.", table, op)
+		return fmt.Sprintf("app.yaml: access.%s.%s is empty. Allowed modes: anon, everyone, self, group, admin, role:<name>, owner_or_role:<roles>, perm:<resource>.<action>, member-of:<table>(<join_col>,<user_col>), off.", table, op)
 	}
 	if strings.HasPrefix(m, "role:") {
 		if strings.TrimSpace(strings.TrimPrefix(m, "role:")) == "" {
@@ -356,12 +383,34 @@ func validateAccessMode(table, op, mode string) string {
 	if knownAccessModes[m] {
 		return ""
 	}
-	return fmt.Sprintf("app.yaml: access.%s.%s = %q is not a known access mode.\n\nAllowed modes:\n  anon      - no auth required (truly public)\n  everyone  - any authenticated user\n  self      - owner only (table needs user_id column)\n  group     - same-group only (table needs groups: config + group key column)\n  admin     - only role=admin\n  role:NAME - only users with that named role; admin bypasses\n  perm:RESOURCE.ACTION - users whose role scopes include the permission\n  member-of:TABLE(JOIN_COL, USER_COL) - members of the row's room/channel/project (membership table EXISTS)\n  off       - endpoint returns 404 to everyone\n\nMost common typos: `anonn` → `anon`, `every` → `everyone`, `own` → `self`, `groups` → `group`. For chat / public feeds set `read: anon` (anon viewers see history) + `write: everyone` (only authed users post) + `delete: self` (authors delete their own). For private rooms/channels use `member-of:` - it replaces hand-written EXISTS guards in flows.", table, op, mode)
+	return fmt.Sprintf("app.yaml: access.%s.%s = %q is not a known access mode.\n\nAllowed modes:\n  anon      - no auth required (truly public)\n  everyone  - any authenticated user\n  self      - owner only (table needs user_id column)\n  group     - same-group only (table needs groups: config + group key column)\n  admin     - only role=admin\n  role:NAME - only users with that named role; admin bypasses\n  owner_or_role:ROLES - the row's owner, plus users with one of the comma-separated roles (their group's rows on a table with the group key, otherwise every row)\n  perm:RESOURCE.ACTION - users whose role scopes include the permission\n  member-of:TABLE(JOIN_COL, USER_COL) - members of the row's room/channel/project (membership table EXISTS)\n  off       - endpoint returns 404 to everyone\n\nMost common typos: `anonn` → `anon`, `every` → `everyone`, `own` → `self`, `groups` → `group`. For chat / public feeds set `read: anon` (anon viewers see history) + `write: everyone` (only authed users post) + `delete: self` (authors delete their own). For private rooms/channels use `member-of:` - it replaces hand-written EXISTS guards in flows.", table, op, mode)
 }
 
-func knownYAMLKeysList() string { return sortedKeyList(knownAppYAMLKeys) }
+// knownYAMLKeysList and knownAuthKeysList are the keys the unknown-key errors
+// print as the real ones: the accepted keys without those that do nothing
+// (appYAMLNoEffectKeys) and, for auth, without those the gate refuses
+// (deadAuthKeys). An author sent to this list for a replacement must not be
+// handed `description:` or `auth.public_api`.
+func knownYAMLKeysList() string {
+	keys := map[string]bool{}
+	for key := range knownAppYAMLKeys {
+		if _, noEffect := appYAMLNoEffectEntry(key); !noEffect {
+			keys[key] = true
+		}
+	}
+	return sortedKeyList(keys)
+}
 
-func knownAuthKeysList() string { return sortedKeyList(knownAuthKeys) }
+func knownAuthKeysList() string {
+	keys := map[string]bool{}
+	for key := range knownAuthKeys {
+		_, noEffect := appYAMLNoEffectEntry("auth." + key)
+		if _, refused := deadAuthKeys[key]; !refused && !noEffect {
+			keys[key] = true
+		}
+	}
+	return sortedKeyList(keys)
+}
 
 func validatePageContract(path, content string) string {
 	if !strings.HasSuffix(strings.ToLower(path), ".html") {
@@ -568,38 +617,38 @@ var antipatterns = []antipattern{
 		name:        "nested-page",
 		re:          regexp.MustCompile(`<page\b[^>]*>[\s\S]*?<page\b`),
 		exts:        []string{".html"},
-		description: "Nested `<page>` tags detected. There is exactly ONE `<page>` wrapper per page file. Layouts (`layouts/*.html`) use `{{body}}` to inject child page content.",
+		description: "Nested `<page>` tags detected. There is exactly ONE `<page>` wrapper per page file. Layouts (`layouts/*.html`) use `{{content}}` to inject child page content.",
 	},
 
-	// ===== SPA antipatterns (React+TypeScript bundle source) =====
-	// Fire on src/*.{tsx,jsx,ts,js} - the React entry points compiled
-	// by esbuild at every app load. The framework auto-injects React,
-	// ReactDOM, Lucide, and bm.js for engine: raw pages, so the LLM
-	// doesn't need to reach for CDNs, manage CSRF manually, stash
-	// tokens in localStorage, or wire up ReactDOM.createRoot.
+	// ===== Browser-source antipatterns (TSX/TS/JSX/JS under src/) =====
+	// The framework compiles browser modules with embedded esbuild and
+	// serves its SDK at /_internal/bm.js ('bm') and its components at
+	// /_internal/sdui.js ('sdui'). It ships no React, ReactDOM or JSX
+	// runtime (bm_tsx_compile.go), so these messages point at the bm and
+	// sdui APIs that exist (embedded/bm.js, bm_types.go).
 	{
 		name:        "jsx-cdn-react",
 		re:          regexp.MustCompile(`(?:unpkg\.com|cdn\.jsdelivr\.net|esm\.sh|cdn\.skypack\.dev)/(?:react|react-dom|@babel/|lucide|bm)`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js", ".html"},
-		description: "Loading React/ReactDOM/Lucide/bm from a CDN - the framework embeds these and serves them at /_internal/react.js, /_internal/react-dom.js, /_internal/lucide.js, /_internal/bm.js, and auto-injects all four on every engine: raw page. The compiler also resolves named imports like `import { useState } from 'react'`, `import { useTable } from 'bm'`, `import { Button } from 'bm/ui'` to window globals automatically. Drop the CDN entirely; the globals (React, ReactDOM, lucide, bm) are already on window when your bundle runs.",
+		description: "Loading React/ReactDOM/Lucide/bm from a CDN. The framework serves its SDK at /_internal/bm.js (`import bm from 'bm'`; the import map is injected into every page under static/), its schema-driven components at /_internal/sdui.js (`import { DataTable } from 'sdui'`), and Lucide icons at /_internal/lucide.js. It does not ship React, ReactDOM or a JSX runtime, and there is no `bm/ui` module or window-global injection. Build UI with DOM APIs, bm.html`...` templates and sdui components; JSX compiles only when its runtime (react/jsx-runtime) resolves to a file under static/, for example through a tsconfig.json `paths` entry.",
 	},
 	{
 		name:        "spa-cdn-import",
 		re:          regexp.MustCompile(`import\s+(?:[\w*\s,{}]+\s+from\s+)?["'](?:https?:|//)[^"']+["']`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "Importing from an absolute URL (CDN, ESM service, etc.) in a bundle file. esbuild can't fetch remote modules during the framework's build step - this will fail compilation. The framework provides everything you need without a CDN: `import { useState } from 'react'`, `import { useTable, useAuth } from 'bm'`, `import { Button, Card } from 'bm/ui'`. These resolve to embedded window globals at build time. For anything else, write a custom flow in flows.yaml or fetch via bm.api() at runtime.",
+		description: "Importing from an absolute URL (CDN, ESM service, etc.) in a src/ directory (src/ or static/src/). The framework's own modules need no CDN: `import bm from 'bm'` (bm.table, bm.auth, bm.api, bm.live) and `import { DataTable, RecordForm } from 'sdui'` are served from /_internal/. Copy any other module under static/ and import it relatively, or call the service from a flow in flows.yaml. A URL import elsewhere in static/ is left as a runtime import the browser fetches; see api({at:'frontend'}) → cdn_imports for the CSP rule.",
 	},
 	{
 		name:        "spa-react-createroot",
 		re:          regexp.MustCompile(`\b(?:ReactDOM\.)?(?:createRoot|hydrateRoot)\s*\(`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "Calling ReactDOM.createRoot() / hydrateRoot() directly. Use `bm.mount(target, <Root />)` instead - it picks createRoot vs hydrateRoot automatically based on whether the page was prerendered, so the same code works whether SSR is on or off. The shape is identical to createRoot:\n  bm.mount(document.getElementById('root')!, <Root />);",
+		description: "Calling ReactDOM.createRoot() / hydrateRoot(). The framework ships no React and no mount helper (there is no bm.mount), so this only works if the app vendors React under static/ itself. Render into the page with DOM APIs or bm.html`...` templates, or mount sdui components: `DataTable(document.getElementById('root'), { table: 'notes' })`.",
 	},
 	{
 		name:        "jsx-localstorage-auth",
 		re:          regexp.MustCompile(`localStorage\.(?:setItem|getItem)\s*\(\s*['"](?:token|access_token|auth_token|jwt|csrf|csrf_token|session|user_id)['"]`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "Stashing auth/CSRF/session data in localStorage. Benmore uses HttpOnly session cookies - the browser attaches them automatically on same-origin fetches, and they're inaccessible to XSS. CSRF tokens are HMAC-derived and read from <meta name=\"csrf-token\"> (already in the document). bm.api() and bm.useAuth() handle all of this - don't roll your own.",
+		description: "Stashing auth/CSRF/session data in localStorage. Benmore uses HttpOnly session cookies - the browser attaches them automatically on same-origin fetches, and they're inaccessible to XSS. CSRF tokens are HMAC-derived and read from <meta name=\"csrf-token\"> (already in the document). bm.api.* and bm.auth.me() handle all of this - don't roll your own.",
 	},
 	{
 		name:        "jsx-mass-assign-userid",
@@ -611,19 +660,19 @@ var antipatterns = []antipattern{
 		name:        "jsx-window-reload",
 		re:          regexp.MustCompile(`window\.location\.reload\s*\(`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "Calling window.location.reload() defeats the SPA. bm.useTable() and bm.useRecord() subscribe to the invalidation bus and refetch automatically after any mutation (local bm.api(), HX-Trigger benmore:changed events, or cross-tab SSE). If you need to force a refresh: call the hook's .refresh() method, or bm.invalidate('table_name').",
+		description: "Calling window.location.reload() throws away page state. Refetch the data instead: subscribe with bm.live('<table>', () => render()) and re-read with bm.table('<table>').list(); bm.query entries can be refetched with bm.query.invalidateTable('<table>'). sdui data components refresh on bm.live events by themselves.",
 	},
 	{
 		name:        "jsx-bare-fetch-mutation",
 		re:          regexp.MustCompile(`\bfetch\s*\(\s*['"]/api/[^'"]+['"]\s*,\s*\{\s*method\s*:\s*['"](?:POST|PATCH|PUT|DELETE)['"]`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "Raw fetch() with a mutation method against /api/. This works but you lose CSRF auto-attachment, error normalization, and the invalidation bus that powers bm.useTable refetches. Prefer: bm.useTable('<table>').create(...) / .update(id, ...) / .remove(id), or bm.api('POST', '/api/<custom>', body) for non-CRUD endpoints. CSRF and credentials are handled.",
+		description: "Raw fetch() with a mutation method against /api/. This works but you lose CSRF auto-attachment and error normalization. Prefer: bm.table('<table>').create(body) / .update(id, body) / .delete(id), or bm.api.post('/api/<custom>', body) for non-CRUD endpoints. CSRF and credentials are handled.",
 	},
 	{
 		name:        "jsx-dangerously-set",
 		re:          regexp.MustCompile(`dangerouslySetInnerHTML\s*=`),
 		exts:        []string{".tsx", ".jsx", ".ts", ".js"},
-		description: "dangerouslySetInnerHTML is an XSS vector - values are injected as raw HTML without escaping. React's default `{value}` interpolation handles ~all UI safely. If you genuinely need to render HTML (e.g. server-sanitized markdown), use the framework's bm/ui <Markdown> component (already sanitized) or sanitize externally with DOMPurify. Reach for this only when you've made a deliberate decision.",
+		description: "dangerouslySetInnerHTML is an XSS vector - values are injected as raw HTML without escaping. Setting textContent or building markup with bm.html`...` (which escapes every value) handles ~all UI safely. If you genuinely need to render HTML (e.g. server-sanitized markdown), use bm.markdown(text) (returns sanitized HTML) or the sdui `Markdown(target, { text })` component or sanitize externally with DOMPurify. Reach for this only when you've made a deliberate decision.",
 	},
 
 	// ===== v2.7.27-v2.7.30 SDK footguns =====
@@ -731,20 +780,26 @@ func detectFrameworkAntipatterns(path, content string) string {
 			if strings.Contains(attrs, ":create=") || strings.Contains(attrs, ":patch=") {
 				continue
 			}
-			// HTMX wires the form: hx-post / hx-put / hx-patch on the <form>
-			// element submits it. Correct in both engines, primary shape in
-			// gotmpl. Don't flag as dead.
-			if strings.Contains(attrs, "hx-post=") || strings.Contains(attrs, "hx-put=") || strings.Contains(attrs, "hx-patch=") {
+			// HTMX wires the form: hx-post / hx-put / hx-patch / hx-delete on
+			// the <form> element submits it, and hx-get loads a result.
+			// Correct in both engines, primary shape in gotmpl. Don't flag as
+			// dead.
+			if strings.Contains(attrs, "hx-post=") || strings.Contains(attrs, "hx-put=") || strings.Contains(attrs, "hx-patch=") || strings.Contains(attrs, "hx-delete=") || strings.Contains(attrs, "hx-get=") {
 				continue
 			}
+			// An explicit method is wiring too. method="get" is navigation:
+			// a search or filter form whose fields become the target page's
+			// query values ({{param_<name>}}, or :param_<name> in gotmpl
+			// queries:), the documented optional-filter pattern. The runtime
+			// never puts the CSRF token into such a form (formSubmitsBody).
 			methodMatch := formMethodAttrRe.FindStringSubmatch(attrs)
-			if len(methodMatch) >= 2 && strings.ToUpper(methodMatch[1]) == "POST" {
+			if len(methodMatch) >= 2 && (strings.EqualFold(methodMatch[1], "POST") || strings.EqualFold(methodMatch[1], "GET")) {
 				continue
 			}
 			if isGotmpl {
-				return "antipattern [dead-form] in " + path + ": <form> in a gotmpl page needs explicit wiring. Either:\n\n  HTMX (preferred, server-rendered partial swap):\n    <form hx-post=\"/api/notes\" hx-target=\"#list\" hx-swap=\"afterbegin\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Plain POST (full-page navigation):\n    <form method=\"POST\" action=\"/some-route\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  In gotmpl, do NOT use `:create=\"...\"` - that's a mustache-only directive."
+				return "antipattern [dead-form] in " + path + ": <form> in a gotmpl page has no method and no HTMX attribute. Say what it does:\n\n  HTMX (preferred, server-rendered partial swap):\n    <form hx-post=\"/api/notes\" hx-target=\"#list\" hx-swap=\"afterbegin\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Plain POST (full-page navigation):\n    <form method=\"POST\" action=\"/some-route\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Search or filter (navigation; the page reads .param_city, and :param_city in queries:):\n    <form method=\"get\" action=\"/events\">\n      <input name=\"city\">\n      <button>Filter</button>\n    </form>\n\n  The runtime adds the CSRF token to POST and HTMX forms; don't write a _csrf field. In gotmpl, do NOT use `:create=\"...\"` - that's a mustache-only directive."
 			}
-			return "antipattern [dead-form] in " + path + ": <form> contains input/textarea/select elements but has NO submission wiring - no `:create=`, no `:patch=`, no `method=\"POST\"`, no `hx-post=`. Browser default is GET, which sends values into the URL and does nothing useful. Wire it:\n\n  Preferred - `:create` posts to the framework's auto-CRUD endpoint with CSRF + HTMX swap:\n    <form :create=\"tasks\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Plain HTML - explicit POST to a route you handle yourself (in flows.yaml):\n    <form method=\"POST\" action=\"/some-route\">\n      <input type=\"hidden\" name=\"_csrf\" value=\"{{csrf}}\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>"
+			return "antipattern [dead-form] in " + path + ": <form> contains input/textarea/select elements but has no `:create=`, `:patch=`, `method=`, or `hx-post=`/`hx-get=`. Say what it does:\n\n  Preferred - `:create` posts to the framework's auto-CRUD endpoint with CSRF + HTMX swap:\n    <form :create=\"tasks\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Plain HTML - explicit POST to a route you handle yourself (in flows.yaml):\n    <form method=\"POST\" action=\"/some-route\">\n      <input name=\"title\" required>\n      <button>Add</button>\n    </form>\n\n  Search or filter (navigation; the page reads {{param_city}}):\n    <form method=\"get\" action=\"/events\">\n      <input name=\"city\">\n      <button>Filter</button>\n    </form>\n\nThe runtime adds the CSRF token to every POST and HTMX form it serves; don't write a _csrf field."
 		}
 
 		// Nested forms - HTML forbids them. Browsers silently drop the inner
@@ -763,11 +818,13 @@ func detectFrameworkAntipatterns(path, content string) string {
 			return "antipattern [method-override] in " + path + ": `<input name=\"_method\" value=\"DELETE\">` (or similar) doesn't work in Benmore - the framework doesn't translate `_method` overrides like Rails/Laravel. HTML forms only support GET/POST. To send a real PATCH/DELETE, use HTMX:\n  <button hx-delete=\"/api/tasks/{{id}}\" hx-confirm=\"Delete?\">×</button>\n  <input type=\"checkbox\" hx-patch=\"/api/tasks/{{id}}\" hx-vals='js:{completed: event.target.checked}'>\nCSRF auto-injects from the <meta name=\"csrf-token\"> tag on any HTMX request - no token needed in the body."
 		}
 
-		// <form> posting to /api/... must include CSRF in the body (since it's
-		// a plain HTML form, not HTMX - HTMX gets CSRF from the meta tag).
-		if msg := detectFormMissingCSRF(path, content); msg != "" {
-			return msg
-		}
+		// No CSRF check on plain POST forms: this dispatcher reads only
+		// server-rendered pages, partials and layouts (static/ HTML gets
+		// validateFormSecurity alone), and servePage's InjectCSRF puts a
+		// valid _csrf into every POST and HTMX form those pages render.
+		// The old form-missing-csrf refusal blocked forms the runtime
+		// already fixed and suggested `value="{{.csrf}}"`, which renders
+		// empty.
 
 		// :patch / hx-patch to /api/<table>/ (trailing slash + no ID) or to
 		// /api/<table> with no ID resolution. The framework now supports
@@ -825,42 +882,6 @@ func detectNestedForms(path, content string) string {
 	return ""
 }
 
-// detectFormMissingCSRF flags a plain <form> that posts to /api/... but has
-// no {{csrf}} reference or _csrf input. Such forms 403 with "Invalid CSRF
-// token" - the agent's most-burned-turns failure mode. HTMX forms are fine
-// (CSRF comes from the meta header), so we only check plain method=POST.
-func detectFormMissingCSRF(path, content string) string {
-	for _, m := range formBlockRe.FindAllStringSubmatch(content, -1) {
-		if len(m) < 3 {
-			continue
-		}
-		attrs, body := m[1], m[2]
-		methodMatch := formMethodAttrRe.FindStringSubmatch(attrs)
-		if len(methodMatch) < 2 || strings.ToUpper(methodMatch[1]) != "POST" {
-			continue
-		}
-		// HTMX form: CSRF flows via header on submit, no body field needed.
-		if strings.Contains(attrs, "hx-post=") || strings.Contains(attrs, "hx-put=") || strings.Contains(attrs, "hx-patch=") || strings.Contains(attrs, "hx-delete=") {
-			continue
-		}
-		// Form posts to a real route - check action looks like /api/ or /flow/.
-		actionMatch := formActionAttrRe.FindStringSubmatch(attrs)
-		if len(actionMatch) < 2 {
-			continue
-		}
-		action := actionMatch[1]
-		if !strings.HasPrefix(action, "/api/") && !strings.HasPrefix(action, "/flow/") {
-			continue
-		}
-		// Body must reference the CSRF token.
-		if strings.Contains(body, "{{csrf}}") || strings.Contains(body, "{{.csrf}}") || strings.Contains(body, "{{ csrf ") || strings.Contains(body, "name=\"_csrf\"") || strings.Contains(body, "name='_csrf'") {
-			continue
-		}
-		return "antipattern [form-missing-csrf] in " + path + ": <form method=\"POST\" action=\"" + action + "\"> has no CSRF token, so Benmore will reject it with 403 Invalid CSRF token. Two fixes:\n\n  Add the token to the form body (plain HTML):\n    <input type=\"hidden\" name=\"_csrf\" value=\"{{csrf}}\">  (mustache)\n    <input type=\"hidden\" name=\"_csrf\" value=\"{{.csrf}}\">  (gotmpl: use the csrf helper)\n\n  Or switch to HTMX (CSRF auto-attaches from <meta name=\"csrf-token\">):\n    <form hx-post=\"" + action + "\" hx-target=\"#list\" hx-swap=\"afterbegin\">"
-	}
-	return ""
-}
-
 // detectPatchMissingID catches `hx-patch=\"/api/tasks/\"` and similar - a
 // PATCH against the list endpoint with no row ID. Returns 400 unless the
 // table is a singleton (UNIQUE(user_id)). We can't know the table shape at
@@ -879,10 +900,6 @@ func detectPatchMissingID(path, content string) string {
 // patchNoIDRe matches hx-patch or :patch attributes pointing at /api/<table>/
 // (trailing slash) with no ID after it. Captures the table name.
 var patchNoIDRe = regexp.MustCompile(`(?:hx-patch|:patch)\s*=\s*["']/api/([a-z_][a-z0-9_]*)/["']`)
-
-// formActionAttrRe extracts the action="..." value from a <form> tag's
-// attribute string.
-var formActionAttrRe = regexp.MustCompile(`(?i)\baction\s*=\s*["']([^"']+)["']`)
 
 // detectGotmplEngine checks whether a page declared `engine: gotmpl` in
 // its frontmatter. Cheap heuristic - looks for the literal string inside
@@ -903,7 +920,7 @@ func detectGotmplEngine(content string) bool {
 // detectRawEngine checks whether a page declared `engine: raw`. Raw
 // pages opt out of ALL template scanning - they're SPAs / static HTML
 // bundles where double-braces and colon-prefixed attrs are real syntax
-// (React's `${x}`, Vue's `:class`, etc.), not Benmore framework
+// (JS template literals' `${x}`, Vue's `:class`, etc.), not Benmore framework
 // directives. Validators must skip them entirely.
 func detectRawEngine(content string) bool {
 	if !strings.HasPrefix(content, "---") {
@@ -917,8 +934,6 @@ func detectRawEngine(content string) bool {
 	return rawEngineRe.MatchString(fm)
 }
 
-// isSPASource returns true if the (lowercased) path is a React/TS
-// bundle source. Mirrors validators_write.go's isSPASourceFile.
 var rawEngineRe = regexp.MustCompile(`(?m)^\s*engine\s*:\s*["']?raw["']?\s*$`)
 
 var gotmplEngineRe = regexp.MustCompile(`(?m)^\s*engine\s*:\s*["']?gotmpl["']?\s*$`)
@@ -1042,7 +1057,7 @@ func validateFormSecurity(content string) string {
 		}
 		methodMatch := formMethodAttrRe.FindStringSubmatch(attrs)
 		if len(methodMatch) < 2 || strings.ToUpper(methodMatch[1]) != "POST" {
-			return "security violation: this file contains a <form> with an <input type=\"password\"> that does NOT specify method=\"POST\". The browser default is GET - submitting will put the user's password in the URL bar, browser history, server access logs, and Cloudflare logs. ALWAYS write password forms one of these two ways:\n\n  Option 1 (recommended) - use the framework's :create directive, which auto-posts via HTMX and adds CSRF:\n    <form :create=\"_benmore_users\">\n      <input name=\"email\" type=\"email\" required>\n      <input name=\"password\" type=\"password\" required>\n      <button>Sign up</button>\n    </form>\n\n  Option 2 - plain HTML with explicit method:\n    <form method=\"POST\" action=\"/signup\">\n      <input type=\"hidden\" name=\"_csrf\" value=\"{{csrf}}\">\n      <input name=\"email\" type=\"email\" required>\n      <input name=\"password\" type=\"password\" required>\n      <button>Sign up</button>\n    </form>"
+			return "security violation: this file contains a <form> with an <input type=\"password\"> that does NOT specify method=\"POST\". The browser default is GET - submitting will put the user's password in the URL bar, browser history, server access logs, and Cloudflare logs. ALWAYS write password forms one of these two ways:\n\n  Option 1 (recommended) - use the framework's :create directive, which auto-posts via HTMX and adds CSRF:\n    <form :create=\"_benmore_users\">\n      <input name=\"email\" type=\"email\" required>\n      <input name=\"password\" type=\"password\" required>\n      <button>Sign up</button>\n    </form>\n\n  Option 2 - plain HTML with explicit method (the runtime adds the _csrf field to every POST form it serves; don't write one):\n    <form method=\"POST\" action=\"/signup\">\n      <input name=\"email\" type=\"email\" required>\n      <input name=\"password\" type=\"password\" required>\n      <button>Sign up</button>\n    </form>"
 		}
 	}
 	return ""

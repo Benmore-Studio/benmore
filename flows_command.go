@@ -17,7 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // FlowCommand is an inert compiled declaration. It contains no executable
@@ -255,14 +255,14 @@ func compileFlowCommand(cn, jn, on *yaml.Node, tables map[string]bool, columns m
 			}
 		}
 	}
-	for _, s := range []*AppMCPSchema{cmd.PreparedSchema, cmd.PreviewSchema} {
+	for i, s := range []*AppMCPSchema{cmd.PreparedSchema, cmd.PreviewSchema} {
 		if s == nil || s.Type != "object" {
 			return nil, fmt.Errorf("prepared and preview schemas must be objects")
 		}
 		if err := validateAppMCPSchema(s, 0); err != nil {
 			return nil, err
 		}
-		if err := validateBoundedUpdateSchema(s, 0); err != nil {
+		if err := validateBoundedSchemaAt(s, 0, []string{"prepared_schema", "preview_schema"}[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -1063,6 +1063,9 @@ func compileCommandPhase(n *yaml.Node, phase string, writes []string, tables map
 // execution time.
 func convertCommandGHASteps(raw []FlowStepGHA) []FlowStep {
 	steps := convertGHASteps(raw)
+	// Command phases resolve references by the authored id and refuse their
+	// own reserved ids at compile time.
+	restoreStepIDs(steps)
 	var restore func([]FlowStepGHA, []FlowStep) error
 	restore = func(source []FlowStepGHA, converted []FlowStep) error {
 		if len(source) != len(converted) {

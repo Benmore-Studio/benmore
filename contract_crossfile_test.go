@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// An access: rule or an encrypted field that names a table/column missing
-// from the schema binds nothing: the real table keeps its implicit default
-// and the real column is stored in plaintext. `benmore check` warns.
+// An access: rule that names a table missing from the schema binds nothing:
+// the real table keeps its implicit default, and `benmore check` warns. An
+// encrypted field naming a missing table or column stops the app loading, so
+// it is an error on encrypted.yaml (validators_load_refs.go), not a warning.
 func TestCrossFileWarnsOnUnboundAccessAndEncryption(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) {
@@ -23,14 +24,24 @@ func TestCrossFileWarnsOnUnboundAccessAndEncryption(t *testing.T) {
 	write("app.yaml", "site_name: x\naccess:\n  default:\n    read: admin\n  note: admin\n  notes: self\n  _benmore_users:\n    read: group\n")
 	write("encrypted.yaml", "tables:\n  notes:\n    fields: [bodyy, secret_note]\n  memos:\n    fields: [x]\n")
 	got := strings.Join(CrossFileWarnings(dir, ""), "\n")
-	for _, want := range []string{"access.note names a table", "notes.bodyy is not a column", "table \"memos\" is not in schema"} {
+	for _, want := range []string{"access.note names a table"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing warning %q in:\n%s", want, got)
 		}
 	}
-	for _, bad := range []string{"access.notes ", "access.default", "access._benmore_users", "notes.secret_note"} {
+	for _, bad := range []string{"access.notes ", "access.default", "access._benmore_users", "secret_note", "bodyy", "memos"} {
 		if strings.Contains(got, bad) {
-			t.Errorf("false warning %q in:\n%s", bad, got)
+			t.Errorf("false or duplicate warning %q in:\n%s", bad, got)
 		}
+	}
+	enc, _ := os.ReadFile(filepath.Join(dir, "encrypted.yaml"))
+	refusal := ValidateOnWriteIn(dir, "encrypted.yaml", string(enc))
+	for _, want := range []string{"notes.bodyy is an encrypted field", `the table "memos"`} {
+		if !strings.Contains(refusal, want) {
+			t.Errorf("encrypted.yaml error lacks %q:\n%s", want, refusal)
+		}
+	}
+	if strings.Contains(refusal, "notes.secret_note is") {
+		t.Errorf("mapped column refused:\n%s", refusal)
 	}
 }

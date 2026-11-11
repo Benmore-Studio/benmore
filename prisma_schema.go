@@ -72,6 +72,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -86,6 +87,23 @@ type PrismaModel struct {
 	Uniques    []PrismaIndex // @@unique entries (same shape, different emit)
 	CompoundID []string      // @@id([a, b]) columns; empty when single-field @id
 	FullText   []PrismaIndex // @@fulltext([title, body]) - backed by SQLite FTS5
+	// Relations are the model's relation fields. They have no column;
+	// `?include=<Name>` expands them (includes.go).
+	Relations []PrismaRelation
+}
+
+// PrismaRelation is a relation field: a pointer that owns a foreign key
+// (`patient Patient @relation(fields: [patientId], references: [id])`) or a
+// back-relation whose foreign key lives on the other model (`notes
+// CaseNote[]`, `profile Profile?`).
+type PrismaRelation struct {
+	Name       string // field name as declared, e.g. "notes"
+	Model      string // related model, e.g. "CaseNote"
+	Table      string // related model's table, set once every model is parsed
+	List       bool   // `CaseNote[]`
+	Column     string // FK column on this model (pointer); "" for a back-relation
+	References string // column the FK references on the related model (pointer)
+	Label      string // @relation("Label") / @relation(name: "Label"); "" when unnamed
 }
 
 // PrismaField is one line inside a model block. Reverse-relation list
@@ -233,6 +251,20 @@ func ParsePrismaSchema(src string) ([]PrismaModel, error) {
 				// if the table really doesn't exist.
 			}
 		}
+		// Relation fields keep only targets that are models of this file;
+		// a reserved model (User) has no table, and an unknown capitalized
+		// type is an enum or a typo, never a relation.
+		relations := models[mi].Relations[:0]
+		for _, rel := range models[mi].Relations {
+			if _, reserved := reservedModels[rel.Model]; reserved {
+				continue
+			}
+			if t, ok := modelByName[rel.Model]; ok {
+				rel.Table = t
+				relations = append(relations, rel)
+			}
+		}
+		models[mi].Relations = relations
 	}
 
 	if len(errs) > 0 {
@@ -273,6 +305,11 @@ func parsePrismaModel(name, body string, modelStartLine int) (PrismaModel, []str
 			errs = append(errs, fmt.Sprintf("schema.prisma line %d, model %s: %s", absLine, name, err))
 			continue
 		}
+		if !isField {
+			if rel, ok := parsePrismaRelationField(line); ok {
+				m.Relations = append(m.Relations, rel)
+			}
+		}
 		if fkSourceField != "" {
 			fkPending[fkSourceField] = struct{ table, column string }{f.FKTable, f.FKColumn}
 			continue
@@ -282,6 +319,17 @@ func parsePrismaModel(name, body string, modelStartLine int) (PrismaModel, []str
 		}
 		m.Fields = append(m.Fields, f)
 	}
+	// A pointer's FK must name a declared column (the same lookup the FK
+	// attachment below uses); otherwise the schema is in error and the
+	// relation is not kept.
+	relations := m.Relations[:0]
+	for _, rel := range m.Relations {
+		if rel.Column != "" && !slices.ContainsFunc(m.Fields, func(f PrismaField) bool { return f.Column == rel.Column }) {
+			continue
+		}
+		relations = append(relations, rel)
+	}
+	m.Relations = relations
 
 	// Attach pending FKs to their scalar columns. The pending key is
 	// already snake-cased (parsePrismaRelation lowercased the source
@@ -772,6 +820,7 @@ func parsePrismaColumnListSorts(a string) ([]string, []string) {
 func indexColumnSQL(idx PrismaIndex) string {
 	parts := make([]string, len(idx.Columns))
 	for i, c := range idx.Columns {
+		c = ddlExprIdent(c)
 		if i < len(idx.Sorts) && idx.Sorts[i] != "" {
 			parts[i] = c + " " + idx.Sorts[i]
 		} else {
@@ -779,6 +828,41 @@ func indexColumnSQL(idx PrismaIndex) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+// prismaRelationLabelRe reads a relation's name: @relation("Label", ...) or
+// @relation(name: "Label", ...).
+var prismaRelationLabelRe = regexp.MustCompile(`^@relation\(\s*(?:name\s*:\s*)?"([^"]*)"`)
+
+// parsePrismaRelationField reads a relation field (a field whose type is
+// another model): its name, the related model, whether it is a list, the
+// relation's label and, for a pointer that owns the foreign key, the FK
+// column and the column it references. The related model is checked against
+// the parsed models later.
+func parsePrismaRelationField(line string) (PrismaRelation, bool) {
+	m := fieldLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return PrismaRelation{}, false
+	}
+	name, prismaType, mods, attrs := m[1], m[2], m[3], strings.TrimSpace(m[4])
+	if prismaScalarSQLType(prismaType) != "" || !isCapitalIdent(prismaType) {
+		return PrismaRelation{}, false
+	}
+	rel := PrismaRelation{Name: name, Model: prismaType, List: strings.Contains(mods, "[]")}
+	for _, a := range splitAttrs(attrs) {
+		if !strings.HasPrefix(a, "@relation(") {
+			continue
+		}
+		if lm := prismaRelationLabelRe.FindStringSubmatch(a); lm != nil {
+			rel.Label = lm[1]
+		}
+		if !rel.List {
+			if src, ref, _, err := parsePrismaRelation(a, prismaType); err == nil {
+				rel.Column, rel.References = src, ref
+			}
+		}
+	}
+	return rel, true
 }
 
 // parsePrismaRelation pulls fields/references columns from a relation
@@ -832,12 +916,12 @@ func EmitSQL(models []PrismaModel) string {
 		for _, idx := range m.Indexes {
 			fmt.Fprintf(&out, "CREATE INDEX IF NOT EXISTS idx_%s_%s ON %s(%s);\n",
 				m.Table, strings.Join(idx.Columns, "_"),
-				m.Table, indexColumnSQL(idx))
+				ddlIdent(m.Table), indexColumnSQL(idx))
 		}
 		for _, u := range m.Uniques {
 			fmt.Fprintf(&out, "CREATE UNIQUE INDEX IF NOT EXISTS uniq_%s_%s ON %s(%s);\n",
 				m.Table, strings.Join(u.Columns, "_"),
-				m.Table, indexColumnSQL(u))
+				ddlIdent(m.Table), indexColumnSQL(u))
 		}
 	}
 	// AFTER UPDATE triggers for @updatedAt fields. SQLite doesn't
@@ -856,13 +940,15 @@ func EmitSQL(models []PrismaModel) string {
 	return out.String()
 }
 
+// Names go through ddlIdent / ddlExprIdent (sql_ident.go): a reserved word
+// is quoted, every other name is written as it always was.
 func writeCreateTable(out *strings.Builder, m PrismaModel) {
-	fmt.Fprintf(out, "CREATE TABLE IF NOT EXISTS %s (\n", m.Table)
+	fmt.Fprintf(out, "CREATE TABLE IF NOT EXISTS %s (\n", ddlIdent(m.Table))
 	var lines []string
 	var fks []string
 
 	for _, f := range m.Fields {
-		parts := []string{"    " + f.Column, f.Type}
+		parts := []string{"    " + ddlIdent(f.Column), f.Type}
 		if f.IsID && f.Type == "INTEGER" && f.Autoincr {
 			parts = append(parts, "PRIMARY KEY AUTOINCREMENT")
 		} else if f.IsID && len(m.CompoundID) == 0 {
@@ -885,12 +971,12 @@ func writeCreateTable(out *strings.Builder, m PrismaModel) {
 				refCol = "id"
 			}
 			fks = append(fks, fmt.Sprintf("    FOREIGN KEY (%s) REFERENCES %s(%s)",
-				f.Column, f.FKTable, refCol))
+				ddlIdent(f.Column), ddlIdent(f.FKTable), ddlIdent(refCol)))
 		}
 	}
 
 	if len(m.CompoundID) > 0 {
-		lines = append(lines, fmt.Sprintf("    PRIMARY KEY (%s)", strings.Join(m.CompoundID, ", ")))
+		lines = append(lines, fmt.Sprintf("    PRIMARY KEY (%s)", strings.Join(ddlExprIdents(m.CompoundID), ", ")))
 	}
 
 	all := append(lines, fks...)

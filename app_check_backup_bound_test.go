@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,18 +65,27 @@ func TestValidationLoadDoesNotCopyTheDatabaseOnEveryCall(t *testing.T) {
 	}
 }
 
-// The app's own boot keeps its per-boot pre-migrate snapshot.
-func TestBootLoadStillTakesPreMigrateBackup(t *testing.T) {
+// The app's own boot snapshots before a schema change, and only then: a boot
+// that changes nothing has nothing to undo (schema_change_plan.go).
+func TestBootLoadTakesPreMigrateBackupOnlyForASchemaChange(t *testing.T) {
 	dir := checkLoadFixture(t)
 	before := countPreMigrateBackups(dir)
-	time.Sleep(1100 * time.Millisecond)
 	app, err := loadApp(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	app.DB.Close()
+	if after := countPreMigrateBackups(dir); after != before {
+		t.Fatalf("unchanged boot load took a backup: before=%d after=%d", before, after)
+	}
+	os.WriteFile(filepath.Join(dir, "schema.prisma"), []byte("model Note {\n id Int @id @default(autoincrement())\n body String\n extra String?\n}\n"), 0644)
+	app, err = loadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.DB.Close()
 	if after := countPreMigrateBackups(dir); after != before+1 {
-		t.Fatalf("boot load backups: before=%d after=%d", before, after)
+		t.Fatalf("schema-change boot load backups: before=%d after=%d", before, after)
 	}
 }
 
@@ -117,5 +127,105 @@ func TestValidationLoadInterruptsRunawayMigration(t *testing.T) {
 	}
 	if _, err := os.Stat(mig); err != nil {
 		t.Errorf("a timed-out migration must stay in place for the app's own boot: %v", err)
+	}
+}
+
+// A pending file the Prisma step adopts (prisma_migrate_adopt.go) is
+// tenant-authored SQL too, and it runs before the user-migration runner, so
+// the validation deadline must reach it. Running out of time fails the load,
+// leaves the file pending and generates no second file for the change.
+func TestValidationLoadInterruptsRunawayAdoptedMigration(t *testing.T) {
+	dir := checkLoadFixture(t)
+	old := checkMigrationTimeout
+	checkMigrationTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { checkMigrationTimeout = old })
+	v1 := "model Note {\n id Int @id @default(autoincrement())\n body String\n}\n"
+	v2 := "model Note {\n id Int @id @default(autoincrement())\n body String\n tag String @default(\"\")\n}\n"
+	body := "-- Migration: add tag\n--\n" +
+		"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) DELETE FROM notes WHERE id IN (SELECT x FROM c);\n" +
+		"ALTER TABLE notes ADD COLUMN tag TEXT NOT NULL DEFAULT '';\n"
+	migDir := filepath.Join(dir, "migrations")
+	before, _ := os.ReadDir(migDir)
+	mig := filepath.Join(migDir, "0002_20260101T000000Z_add_tag.sql")
+	content := withSchemaChainHeader(body, prismaModelsDigest(mustParse(t, v1)), prismaModelsDigest(mustParse(t, v2)))
+	if err := os.WriteFile(mig, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "schema.prisma"), []byte(v2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan string, 1)
+	go func() { done <- tryLoadApp(dir) }()
+	var msg string
+	select {
+	case msg = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("validation load never returned: a router core is pinned by an adopted migration file")
+	}
+	if !strings.Contains(msg, "0002_20260101T000000Z_add_tag.sql did not finish") {
+		t.Fatalf("load error = %q, want the adopted file's time limit", msg)
+	}
+	if _, err := os.Stat(mig); err != nil {
+		t.Errorf("a timed-out adopted file must stay pending for the app's own boot: %v", err)
+	}
+	after, _ := os.ReadDir(migDir)
+	if len(after) != len(before)+1 {
+		t.Errorf("migrations/ holds %d files, want %d: a timeout must not generate a second file for the change", len(after), len(before)+1)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM notes").Scan(&n); err != nil || n != 20000 {
+		t.Errorf("notes = %d (%v), want the 20000 rows untouched by the rolled-back file", n, err)
+	}
+}
+
+// A generated migration is snapshotted before it runs. The loader's own
+// pre-migrate snapshot (schema_backup) is taken after the Prisma step, so on
+// its own it already held the migrated database.
+func TestGeneratedMigrationIsBackedUpBeforeItRuns(t *testing.T) {
+	dir := checkLoadFixture(t)
+	backups := func() map[string]bool {
+		out := map[string]bool{}
+		entries, _ := os.ReadDir(filepath.Join(dir, ".benmore", "backups"))
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".db") {
+				out[e.Name()] = true
+			}
+		}
+		return out
+	}
+	before := backups()
+	schema := "model Note {\n id Int @id @default(autoincrement())\n body String\n tag String?\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "schema.prisma"), []byte(schema), 0644); err != nil {
+		t.Fatal(err)
+	}
+	app, err := loadApp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.DB.Close()
+	preMigration := false
+	for name := range backups() {
+		if before[name] {
+			continue
+		}
+		db, err := sql.Open("sqlite3", filepath.Join(dir, ".benmore", "backups", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !dbColumnExists(db, "notes", "tag") {
+			var n int
+			db.QueryRow("SELECT COUNT(*) FROM notes").Scan(&n)
+			preMigration = n == 20000
+		}
+		db.Close()
+	}
+	if !preMigration {
+		t.Fatal("no snapshot taken during the load holds the database before the generated migration added notes.tag")
 	}
 }

@@ -112,7 +112,7 @@ func importCallerAuthorized(w http.ResponseWriter, r *http.Request, app *App) (*
 	// bulk-load into the tenant it stepped into. See types.go:622.
 	// IsAdminConsole too (rule 15b): an atomic bulk load is an admin
 	// management surface, so a delegated credential an admin minted (a
-	// scoped API token or Bearer session, an edge identity) does not
+	// scoped API token or Bearer session) does not
 	// qualify even when its scopes cover the table. The CLI path uses the
 	// owner token above and is unaffected.
 	if !session.IsAdminBypass() || !session.IsAdminConsole() {
@@ -129,7 +129,7 @@ func importCallerAuthorized(w http.ResponseWriter, r *http.Request, app *App) (*
 // fails, because importCallerAuthorized already required admin-or-owner.
 func importTableAuthorized(w http.ResponseWriter, r *http.Request, app *App, session *Session, table string) bool {
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return false
 	}
 	return EnforceCRUDAccess(w, r, app, table, OpWrite, 0)
@@ -200,6 +200,10 @@ type importCreateReq struct {
 	// optional for it; without it, NDJSON's shape is still validated at
 	// load time from the first object's keys (newNDJSONSource).
 	Columns []string `json:"columns,omitempty"`
+	// Owner is optional, Mode A only, and owner-token only: the email of an
+	// existing user of THIS app who owns every imported row (user_id). See
+	// import_owner.go. An admin-session import always owns its own rows.
+	Owner string `json:"owner,omitempty"`
 }
 
 func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
@@ -265,6 +269,39 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 	if req.Format != "sql" && !viaOwnerToken && !importTableAuthorized(w, r, app, session, req.Table) {
 		return
 	}
+	// Row ownership (import_owner.go), settled before the resume lookup so a
+	// staging session is only ever resumed for the same chosen owner.
+	var ownerID int64
+	var ownerEmail string
+	if req.Owner != "" {
+		if req.Format == "sql" {
+			httpJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "owner applies to CSV/NDJSON imports only; a SQL restore writes user_id exactly as the dump has it",
+			})
+			return
+		}
+		// An admin session already owns what it imports (as an auto-CRUD
+		// create does), and user_id stays protected from it.
+		if !viaOwnerToken {
+			httpJSON(w, http.StatusForbidden, map[string]any{
+				"error": "owner requires an owner token (X-Benmore-Import-Token); an admin-session import always owns its rows",
+			})
+			return
+		}
+		var err error
+		ownerID, ownerEmail, err = resolveImportOwner(app.DB, req.Owner)
+		if err != nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if req.Format != "sql" {
+		if err := checkImportOwnerPlan(app.DB, req.Table, session.UserID, ownerID); err != nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
 	gz := 0
 	if req.Gzip {
 		gz = 1
@@ -293,10 +330,10 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 	lookupErr := app.DB.QueryRow(`SELECT id FROM _benmore_imports
 		WHERE state='staging' AND table_name=? AND format=? AND gzip=?
 		  AND sha256=? AND bytes_total=? AND null_as=? AND uncompressed_bytes=?
-		  AND created_by=? AND created_by_subject=?
+		  AND created_by=? AND created_by_subject=? AND owner_user_id=?
 		ORDER BY created_at DESC LIMIT 1`,
 		table, req.Format, gz, req.SHA256, req.Bytes, req.NullAs, req.UncompressedBytes,
-		session.UserID, session.Email).Scan(&resumeID)
+		session.UserID, session.Email, ownerID).Scan(&resumeID)
 	if lookupErr == nil && resumeID != "" {
 		httpJSON(w, http.StatusOK, map[string]any{
 			"import_id":  resumeID,
@@ -363,10 +400,10 @@ func handleImportCreate(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	_, err = app.DB.Exec(`INSERT INTO _benmore_imports
 		(id, table_name, format, gzip, bytes_total, uncompressed_bytes, sha256,
-		 null_as, state, created_by, created_by_subject)
-		VALUES (?,?,?,?,?,?,?,?, 'staging', ?, ?)`,
+		 null_as, state, created_by, created_by_subject, owner_user_id, owner_email)
+		VALUES (?,?,?,?,?,?,?,?, 'staging', ?, ?, ?, ?)`,
 		id, table, req.Format, gz, req.Bytes, req.UncompressedBytes, req.SHA256,
-		req.NullAs, session.UserID, session.Email)
+		req.NullAs, session.UserID, session.Email, ownerID, ownerEmail)
 	if err != nil {
 		serverError(w, r, app, "_import create", err, "Server error")
 		return
@@ -404,12 +441,33 @@ func importSessionFor(w http.ResponseWriter, r *http.Request, app *App) (*import
 			})
 			return nil, false
 		}
-		return sess, true
+		return lapsedImportChecked(w, app, sess)
 	}
 	// An owner token already proved full ownership authority, so the
 	// per-table write-scope/access: check is redundant for it - same as
 	// at create time.
 	if _, viaOwnerToken := importOwnerToken(app, r); !viaOwnerToken && !importTableAuthorized(w, r, app, session, sess.TableName) {
+		return nil, false
+	}
+	return lapsedImportChecked(w, app, sess)
+}
+
+// lapsedImportChecked fails a running row whose load's process died once its
+// lease lapses (failLapsedImport), after the caller passed the import's
+// gates, so no caller waits on it forever (cluster mode) or until a restart.
+func lapsedImportChecked(w http.ResponseWriter, app *App, sess *importSession) (*importSession, bool) {
+	if sess.State == importStateRunning && failLapsedImport(app, sess.ID) {
+		return reloadImportSession(w, app, sess.ID)
+	}
+	return sess, true
+}
+
+// reloadImportSession re-reads an import once its per-import lock is held:
+// the state importSessionFor read may have changed while it waited.
+func reloadImportSession(w http.ResponseWriter, app *App, id string) (*importSession, bool) {
+	sess, err := loadImportSession(app.DB, id)
+	if err != nil {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "unknown import"})
 		return nil, false
 	}
 	return sess, true
@@ -420,7 +478,16 @@ func handleImportChunk(w http.ResponseWriter, r *http.Request, app *App) {
 	if !ok {
 		return
 	}
-	if sess.State != "staging" {
+	// Held across check, write and re-check, so a commit of this import
+	// (which takes the same lock) waits for the part to land, or this
+	// upload sees the commit's state before writing (importLocks).
+	lock := importLockFor(app, sess.ID)
+	lock.RLock()
+	defer lock.RUnlock()
+	if sess, ok = reloadImportSession(w, app, sess.ID); !ok {
+		return
+	}
+	if sess.State != importStateStaging {
 		httpJSON(w, http.StatusConflict, map[string]any{
 			"error": fmt.Sprintf("import is %s; chunks can only be added while staging", sess.State),
 		})
@@ -432,6 +499,9 @@ func handleImportChunk(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
+	// A full 32 MB chunk can outlast the server's 15 s read deadline; the
+	// caller is authenticated by now (importSessionFor).
+	extendBulkBodyDeadlines(w)
 	r.Body = http.MaxBytesReader(w, r.Body, maxImportChunkBytes+1)
 	written, err := writeImportChunk(app, sess.ID, n, r.Body)
 	if err != nil {
@@ -450,8 +520,10 @@ func handleImportChunk(w http.ResponseWriter, r *http.Request, app *App) {
 		serverError(w, r, app, "_import chunk", fmt.Errorf("import %s chunk %d write failed: %w", sess.ID, n, err), "Server error")
 		return
 	}
+	// The lock covers commits in this process; this re-check still catches a
+	// cluster sibling that committed or cancelled during the write.
 	current, err := loadImportSession(app.DB, sess.ID)
-	if err != nil || current.State != "staging" {
+	if err != nil || current.State != importStateStaging {
 		part := filepath.Join(importStagingDir(app, sess.ID), fmt.Sprintf("part-%d", n))
 		if rmErr := os.Remove(part); rmErr != nil && !os.IsNotExist(rmErr) {
 			log.Printf("IMPORT %s: remove raced chunk %d: %v", sess.ID, n, rmErr)
@@ -483,7 +555,13 @@ func handleImportCommit(w http.ResponseWriter, r *http.Request, app *App) {
 	if !ok {
 		return
 	}
-	if sess.State != "staging" {
+	lock := importLockFor(app, sess.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if sess, ok = reloadImportSession(w, app, sess.ID); !ok {
+		return
+	}
+	if sess.State != importStateStaging {
 		httpJSON(w, http.StatusConflict, map[string]any{
 			"error": fmt.Sprintf("import is already %s", sess.State),
 		})
@@ -501,7 +579,7 @@ func handleImportCommit(w http.ResponseWriter, r *http.Request, app *App) {
 		}
 	}()
 	rollback := func() {
-		if _, err := saveImportStateIf(app.DB, sess.ID, "running", "staging", 0, ""); err != nil {
+		if _, err := saveImportStateIf(app.DB, sess.ID, importStateRunning, importStateStaging, 0, ""); err != nil {
 			log.Printf("IMPORT %s: failed to roll back commit state: %v", sess.ID, err)
 		}
 	}
@@ -525,8 +603,8 @@ func handleImportCommit(w http.ResponseWriter, r *http.Request, app *App) {
 	// the row), so every check after this point runs against a row this
 	// handler exclusively owns.
 	res, err := app.DB.Exec(
-		`UPDATE _benmore_imports SET state='running', rows_loaded=0, error='' WHERE id=? AND state='staging'`,
-		sess.ID)
+		`UPDATE _benmore_imports SET state='running', rows_loaded=0, error='', lease_expires_at=? WHERE id=? AND state='staging'`,
+		time.Now().Add(importLeaseTTL).UTC().Format("2006-01-02 15:04:05"), sess.ID)
 	if err != nil {
 		serverError(w, r, app, "_import commit", err, "Server error")
 		return
@@ -669,7 +747,7 @@ func handleImportCancel(w http.ResponseWriter, r *http.Request, app *App) {
 		})
 		return
 	}
-	changed, err := saveImportStateIf(app.DB, sess.ID, "staging", "cancelled", 0, "cancelled by caller")
+	changed, err := saveImportStateIf(app.DB, sess.ID, importStateStaging, importStateCancelled, 0, "cancelled by caller")
 	if err != nil {
 		serverError(w, r, app, "_import cancel", err, "Server error")
 		return

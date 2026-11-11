@@ -1,0 +1,103 @@
+# ?q= must match every word of the query, whatever its length. A query holding
+# a 1-2 character word used to be matched whole, as one literal phrase.
+multiword_with_short_word_ands_every_word:
+  as_user: "words@test.com"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "Revenue grew in the third quarter"}
+      expect: {status: 200}
+    - api: "POST /api/tasks"
+      json: {title: "third quarter only"}
+      expect: {status: 200}
+    - api: "POST /api/tasks"
+      json: {title: "Quarter notes", note: "the third draft is in review"}
+      expect: {status: 200}
+    - get: "/api/tasks?q=third%20quarter&count=true"
+      expect: {status: 200, json: {count: 3}}
+    # "in" is in the first row's title and the third row's note.
+    - get: "/api/tasks?q=third%20in%20quarter"
+      expect:
+        status: 200
+        contains:
+          - "Revenue grew"
+          - "Quarter notes"
+        not_contains: "third quarter only"
+    - get: "/api/tasks?q=quarter%20IN%20third&count=true"
+      expect: {status: 200, json: {count: 2}}
+    - get: "/api/tasks?q=third%20in%20quarter&page=1&per_page=1"
+      expect:
+        status: 200
+        contains: '"total":2'
+    - get: "/api/tasks?q=third%20in%20absent&count=true"
+      expect: {status: 200, json: {count: 0}}
+
+short_words_only:
+  as_user: "short@test.com"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "C# and Go"}
+      expect: {status: 200}
+    - api: "POST /api/tasks"
+      json: {title: "Go only"}
+      expect: {status: 200}
+    - get: "/api/tasks?q=c%23%20go"
+      expect:
+        status: 200
+        contains: "C# and Go"
+        not_contains: "Go only"
+    # LIKE wildcards in a short word stay literal.
+    - get: "/api/tasks?q=_%20go&count=true"
+      expect: {status: 200, json: {count: 0}}
+
+deleted_and_foreign_rows_never_match:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "INSERT INTO tasks (title, user_id) VALUES ('foreign: up in the third quarter', 99999)"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "kept: up in the third quarter"}
+      expect: {status: 200}
+    - api: "POST /api/tasks"
+      json: {title: "trashed: up in the third quarter"}
+      save: {tid: "id"}
+      expect: {status: 200}
+    - api: "DELETE /api/tasks/{{tid}}"
+      bearer: true
+      expect: {status: 200}
+    - sql: "SELECT id FROM tasks WHERE title LIKE '%up in the third quarter'"
+      expect: {rows: 3}
+    - get: "/api/tasks?q=up%20third"
+      expect:
+        status: 200
+        contains: "kept: up"
+        not_contains:
+          - "trashed: up"
+          - "foreign: up"
+    - get: "/api/tasks?q=up%20third&count=true"
+      expect: {status: 200, json: {count: 1}}
+
+# A NUL ended the MATCH string early (500 "unterminated string"). A control
+# character separates words, as tab and newline do.
+control_characters_separate_words:
+  as_user: "ctl@test.com"
+  steps:
+    - api: "POST /api/tasks"
+      json: {title: "weekly report"}
+      expect: {status: 200}
+    - get: "/api/tasks?q=rep%00"
+      expect: {status: 200, contains: "weekly report"}
+    - get: "/api/tasks?q=report%00we"
+      expect: {status: 200, contains: "weekly report"}
+    - get: "/api/tasks?q=report%00x&count=true"
+      expect: {status: 200, json: {count: 0}}
+
+# Each different short word is its own scan, so one search takes at most 8.
+too_many_short_words_is_refused:
+  as_user: "bound@test.com"
+  steps:
+    - get: "/api/tasks?q=10%2011%2012%2013%2014%2015%2016%2017"
+      expect: {status: 200}
+    - get: "/api/tasks?q=10%2011%2012%2013%2014%2015%2016%2017%2018"
+      expect:
+        status: 400
+        contains: "at most 8"

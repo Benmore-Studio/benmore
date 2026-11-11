@@ -9,8 +9,6 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPMetadataReadsLiveSchemaAndDiscardsDirtyConnection(t *testing.T) {
@@ -165,7 +163,7 @@ func TestAppMCPMetadataAuthorizerAndCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeAppMCPMetadata)
+		mustSQLiteConn(raw).RegisterAuthorizer(authorizeAppMCPMetadata)
 		return nil
 	}); err != nil {
 		closeConn()

@@ -1,0 +1,5 @@
+[
+  "A draft's `user:` is the verify.yaml user that maps to `as` (`benmore qa draft --as <email>` reads the workspace's verify.yaml and passes it as `user`; qa_inventory otherwise reads the app's own verify.yaml). Only with no mapping does it write `user: qa   # map in verify.yaml`, and the result's verify_yaml_hint names that mapping. Emails compare case-insensitively; a user name must be letters, digits, `_`, `.` or `-`.",
+  "The framework's own chrome - the testing banner, the cookie banner and the feedback widget (ids bm-test-banner, bm-cookie, bm-fb-*, bm-feedback-*) - is left out of `elements`, `forms`, `links` and the drafts' candidate actions; it is not the app's surface.",
+  "`benmore qa draft [dir] [--app NAME] [--as EMAIL] [--env dev|prod] [--force]` runs qa_inventory and writes each crawled page's draft to `tests/journeys/<name>.yaml` under `dir` (default: the current directory). The app is the one `dir` is linked to (its .benmore/app marker); `--app NAME` names it for a directory that is not linked, and with neither the command exits 2. A file that already exists is kept and reported as `kept`; `--force` replaces it."
+]

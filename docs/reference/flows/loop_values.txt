@@ -1,0 +1,1 @@
+Each for_each iteration replaces the entire loop variable, including flattened nested objects and array elements. A missing field belongs to that row: use an explicit default for optional values; without one, the step fails on the unresolved reference and the flow stops instead of reusing a previous row's value.

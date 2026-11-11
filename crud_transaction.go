@@ -61,7 +61,15 @@ func handleTransaction(w http.ResponseWriter, r *http.Request, app *App) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	if err := decoder.Decode(&body); err != nil {
-		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		if !answerIfRequestBodyTooLarge(w, err) {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		}
+		return
+	}
+	// Same cap as /batch (maxBatchItems): every operation runs inside one
+	// write transaction that holds the app's write lock until it commits.
+	if len(body.Operations) > maxBatchItems {
+		writeBatchTooLarge(w, "operations", len(body.Operations))
 		return
 	}
 	for i := range body.Operations {
@@ -96,10 +104,12 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 		validTables[t] = true
 	}
 	for i, op := range operations {
+		// An unknown table answers the unmatched-route 404, as a refused
+		// table does (EnforceCRUDAccess, security.md 14f). It used to get
+		// 400 "unknown table 'x'" while a forbidden one got the 404, which
+		// told a caller which names were real tables.
 		if !validTables[op.Table] {
-			httpJSON(w, http.StatusBadRequest, map[string]any{
-				"error": fmt.Sprintf("operation %d: unknown table '%s'", i, op.Table),
-			})
+			writeUnmatchedAPINotFound(w)
 			return
 		}
 		if op.Action != "insert" && op.Action != "update" && op.Action != "delete" {
@@ -120,7 +130,9 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			scopeAction = "delete"
 		}
 		if err := checkScope(session, op.Table, scopeAction); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{
+			// The scope refusal names the table, so only a caller who may
+			// read it gets it; anyone else gets the unmatched-route 404.
+			writeTableRefusal(w, app, op.Table, session, http.StatusForbidden, map[string]any{
 				"error": fmt.Sprintf("operation %d: %s", i, err.Error()),
 			})
 			return
@@ -146,7 +158,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			if op.Action == "delete" {
 				lockScope = "delete"
 			}
-			if locked, by := CheckLock(app.DB, op.Table, fmt.Sprint(op.ID), session.UserID); locked && canAccessRowScoped(app, op.Table, fmt.Sprint(op.ID), session, lockScope) {
+			if locked, by := CheckLock(app.DB, op.Table, valueText(op.ID), session.UserID); locked && canAccessRowScoped(app, op.Table, valueText(op.ID), session, lockScope) {
 				httpJSON(w, http.StatusConflict, lockErrorResponse(app.DevMode, by))
 				return
 			}
@@ -165,6 +177,9 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 	oldRows := make([]map[string]any, len(operations))
 	newRows := make([]map[string]any, len(operations))
 	var hookRefreshTables []string
+	// Masked encrypted-field echoes the updates dropped, as table.column (a
+	// transaction spans tables).
+	var ignored []string
 
 	for i, op := range operations {
 		// Resolve forward reference
@@ -180,7 +195,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 
 		memberOfVal := func(col string) string {
 			if v, ok := op.Data[col]; ok && v != nil {
-				return fmt.Sprint(v)
+				return valueText(v)
 			}
 			return ""
 		}
@@ -189,7 +204,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			if op.Action == "delete" {
 				action = "delete"
 			}
-			oldRows[i], err = txAuthorizedRow(tx, app, op.Table, fmt.Sprint(op.ID), session, action)
+			oldRows[i], err = txAuthorizedRow(tx, app, op.Table, valueText(op.ID), session, action)
 			if err != nil {
 				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "not found or not authorized"})
 				return
@@ -216,11 +231,11 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			results[i] = transactionResult{Table: op.Table, Action: "insert", ID: id}
 
 		case "update":
-			rowID := fmt.Sprintf("%v", op.ID)
+			rowID := valueText(op.ID)
 			expected := ""
 			if op.Data != nil {
 				if v, ok := op.Data["_expected_updated_at"]; ok && v != nil {
-					expected = fmt.Sprint(v)
+					expected = valueText(v)
 				}
 				delete(op.Data, "_expected_updated_at")
 			}
@@ -235,7 +250,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 					return
 				}
 				if errors.Is(updateErr, errUpdateConflict) {
-					httpJSON(w, http.StatusConflict, map[string]any{"error": "conflict", "message": "Record was modified by another user"})
+					httpJSON(w, http.StatusConflict, withRefusalDocs(map[string]any{"error": "conflict", "message": "Record was modified by another user"}, "conflict"))
 					return
 				}
 				if respondStorageFull(w, app, updateErr) {
@@ -256,10 +271,13 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			}
 			results[i] = transactionResult{Table: op.Table, Action: "update", ID: op.ID}
 			oldRows[i], newRows[i] = before, after
+			for _, field := range maskedEchoFields(tx, app, session, op.Table, before, op.Data) {
+				ignored = append(ignored, op.Table+"."+field)
+			}
 			hookRefreshTables = append(hookRefreshTables, refreshTables...)
 
 		case "delete":
-			rowID := fmt.Sprintf("%v", op.ID)
+			rowID := valueText(op.ID)
 			if err := txDelete(tx, app, op.Table, rowID, session); err != nil {
 				if respondStorageFull(w, app, err) {
 					return
@@ -292,7 +310,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 		// Insert and delete audit rows commit (or roll back) with the
 		// mutation; the update pipeline writes its own inside the same tx.
 		if op.Action != "update" {
-			if err := LogAuditTx(tx, app, op.Action, op.Table, fmt.Sprint(results[i].ID), session, oldRows[i], newRows[i]); err != nil {
+			if err := LogAuditTx(tx, app, op.Action, op.Table, valueText(results[i].ID), session, oldRows[i], newRows[i]); err != nil {
 				if respondStorageFull(w, app, err) {
 					return
 				}
@@ -303,16 +321,11 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 
 	}
 
-	// Commit
-	if err := tx.Commit(); err != nil {
-		if respondStorageFull(w, app, err) {
-			return
-		}
-		serverErrorJSON(w, r, app, "_transaction", err, "commit failed")
-		return
-	}
-
-	// Post-commit: fire hooks, audit, SSE for each operation
+	// Event rows for every operation. Insert and delete hook jobs and
+	// webhook deliveries are queued here, in operation order and after every
+	// operation ran (what they saw when they were queued after commit), and
+	// commit with the writes; updates queued theirs in their own pipeline.
+	eventRows := make([]map[string]any, len(results))
 	for i, res := range results {
 		row := newRows[i]
 		if res.Action == "delete" {
@@ -327,17 +340,37 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 				eventRow["old_"+k] = v
 			}
 		}
-
 		injectSessionContext(eventRow, session)
+		eventRows[i] = eventRow
 		if res.Action != "update" {
-			FireHooks(app, res.Action, res.Table, eventRow)
-			FireWebhookSubscriptions(app, res.Action, res.Table, eventRow, session)
+			// The stored row, not the session-context event row.
+			if err := enqueueRowEffectsTx(tx, app, res.Action, res.Table, eventRow, row, session); err != nil {
+				if respondStorageFull(w, app, err) {
+					return
+				}
+				serverErrorJSON(w, r, app, "_transaction "+res.Action+" "+res.Table, err, "effect queue write failed")
+				return
+			}
 		}
-		FireFlowsForEvent(app, "on_"+res.Action, res.Table, eventRow)
+	}
+
+	// Commit
+	if err := tx.Commit(); err != nil {
+		if respondStorageFull(w, app, err) {
+			return
+		}
+		serverErrorJSON(w, r, app, "_transaction", err, "commit failed")
+		return
+	}
+
+	// Post-commit: event flows and SSE for each operation
+	for i, res := range results {
+		FireFlowsForEvent(app, "on_"+res.Action, res.Table, eventRows[i])
 		Broadcast(app, res.Table, res.Action, session)
 	}
-	broadcastHookRefreshes(app, hookRefreshTables, results)
+	broadcastHookRefreshes(app, session, hookRefreshTables, results)
 	appendHXTrigger(w, "benmore:changed")
+	addIgnoredFields(w, ignored)
 
 	httpJSON(w, http.StatusOK, map[string]any{
 		"status":  "committed",
@@ -346,18 +379,35 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 	})
 }
 
-func broadcastHookRefreshes(app *App, tables []string, results []transactionResult) {
+// broadcastHookRefreshes announces the tables a transactional SQL hook wrote,
+// other than the ones the request itself mutated (already broadcast). Each
+// refresh is scoped by the writing session, like the mutation's own event:
+// a tenant table reaches the session's tenant (none: admins only), an owner
+// table the writer in full and other readers as the generic refresh. It used
+// to go out unscoped, so every tenant's readers got the generic refresh.
+func broadcastHookRefreshes(app *App, session *Session, tables []string, results []transactionResult) {
 	mutated := make(map[string]bool, len(results))
 	for _, result := range results {
 		mutated[result.Table] = true
 	}
 	seen := make(map[string]bool, len(tables))
+	pending := make([]string, 0, len(tables))
 	for _, table := range tables {
 		if table == "" || mutated[table] || seen[table] {
 			continue
 		}
 		seen[table] = true
-		BroadcastUnscoped(app, table, "refresh")
+		pending = append(pending, table)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	var actor Session
+	if session != nil {
+		actor = *session
+	}
+	for _, refresh := range canonicalHookRefreshScopes(app, pending, "", actor) {
+		BroadcastScopedDirect(app, refresh.Table, "refresh", refresh.GroupID, refresh.UserID)
 	}
 }
 
@@ -416,7 +466,13 @@ func txInsertWithPlan(tx *sql.Tx, app *App, table string, data map[string]any, s
 	if err := membershipCreateDenial(tx, app, table, session); err != nil {
 		return nil, err
 	}
+	if err := membershipCreateIdentityDenial(app, table, session, data); err != nil {
+		return nil, err
+	}
 	validCols := plan.validCols
+	// A workflow's state column always starts in its initial state, sent,
+	// null or left out.
+	data = withWorkflowInitial(app, table, data)
 
 	allowed := func(name string) bool {
 		return validCols[name] && !plan.protected.has(name) && !workflowCreateStateRefused(app, table, name, data[name])
@@ -528,9 +584,16 @@ type updateRequestError struct {
 	status  int
 	message string
 	cause   error
-	// noopEcho: everything submitted was an unchanged command-owned echo, so a
-	// single-row PATCH answers 200 with nothing written.
+	// noopEcho: everything submitted was an unchanged echo (a command-owned
+	// column's stored value, or the mask the caller reads for an encrypted
+	// column), so a single-row PATCH answers 200 with nothing written.
 	noopEcho bool
+	// ignored: the masked encrypted-field echoes the noop dropped, for
+	// X-Ignored-Fields.
+	ignored []string
+	// noFields: nothing submitted was a writable column (the 400 "No fields
+	// to update"), so a single-row PATCH can name what it dropped and why.
+	noFields bool
 }
 
 func (e *updateRequestError) Error() string { return e.message }
@@ -570,7 +633,9 @@ func protectedUpdateFields(app *App, table string) map[string]bool {
 	// With groups.role_field, a membership row's identity column carries the
 	// in-tenant role: re-pointing it hands that role to whoever the new value
 	// names, so it is as protected as the role column (H-10). A new row may
-	// still name any identity; its role column is never client-written.
+	// name any identity through a writable user_field; its role column is
+	// never client-written, and a protected user_field takes only the caller
+	// (membershipNamedIdentityDenial).
 	if g := app.Group; g != nil && g.RoleField != "" && g.Table != "" && identIs(table, g.Table) {
 		protected.add(g.UserField)
 	}
@@ -655,14 +720,27 @@ func applyCanonicalUpdateTxContextMode(ctx context.Context, tx *sql.Tx, app *App
 	}
 	if d := memberOfRepointDenialWith(q, app, table, actor, func(col string) string {
 		if v, ok := values[col]; ok && v != nil {
-			return fmt.Sprint(v)
+			return valueText(v)
 		}
 		return ""
 	}); d != nil {
 		return nil, nil, nil, &memberOfUpdateError{denial: d}
 	}
+	// An edit of a _benmore_users row (the admin panel writes deactivated_at
+	// and verified) may not end the standing of the app's last usable durable
+	// admin (last_admin_guard.go).
+	lastAdminCheck, err := lastDurableAdminUpdate(app, q, table, id)
+	if err != nil {
+		return nil, nil, nil, updateInternalError(err)
+	}
 	if err := txUpdateMode(q, app, table, id, values, actor, expectedUpdatedAt, restore); err != nil {
 		return nil, nil, nil, err
+	}
+	if err := lastAdminCheck(); err != nil {
+		if errors.Is(err, errLastDurableAdmin) {
+			return nil, nil, nil, &updateRequestError{status: http.StatusConflict, message: lastAdminAccountRefusal, cause: err}
+		}
+		return nil, nil, nil, updateInternalError(err)
 	}
 	mainTable := "main." + quoteIdent(table)
 	eventRows, err := queryNativeRowsWith(q, app, table, fmt.Sprintf("SELECT * FROM %s WHERE id = ?", mainTable), id)
@@ -697,7 +775,8 @@ func applyCanonicalUpdateTxContextMode(ctx context.Context, tx *sql.Tx, app *App
 	for k, v := range before {
 		afterEvent["old_"+k] = v
 	}
-	injectSessionContext(afterEvent, actor)
+	// The row as stored: the subscription adds session context only under
+	// names that are not columns (webhookDataRow).
 	if err := enqueueWebhookSubscriptionsTx(q, app, "update", table, afterEvent, actor); err != nil {
 		return nil, nil, nil, &updateRequestError{status: http.StatusInternalServerError, message: "update side effect failed", cause: err}
 	}
@@ -752,6 +831,11 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 		}
 		return updateInternalError(err)
 	}
+	// An encrypted value sent back as the mask this caller reads (a read row
+	// echoed by an edit form) is unchanged, not a new value: dropped before
+	// type checks, so a masked number no longer fails the whole update.
+	data, maskedEchoes := dropMaskedEchoes(tx, app, session, table, before, data)
+	echoed += len(maskedEchoes)
 	data, err = normalizePrismaFields(prismaWriteColumns(app, table), data, func(name string) bool { return validCols[name] && !protected.has(name) })
 	if err != nil {
 		return &updateRequestError{status: http.StatusUnprocessableEntity, message: err.Error(), cause: err}
@@ -769,14 +853,14 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 		values = append(values, v)
 	}
 	if len(sets) == 0 {
-		return &updateRequestError{status: http.StatusBadRequest, message: "No fields to update", noopEcho: echoed > 0}
+		return &updateRequestError{status: http.StatusBadRequest, message: "No fields to update", noopEcho: echoed > 0, noFields: true, ignored: maskedEchoes}
 	}
 
 	var submitted []string
 	changed := make(map[string]any)
 	for k, v := range data {
 		if !protected.has(k) && validCols[k] {
-			if current, ok := before[k]; !ok || current == nil || fmt.Sprint(current) != fmt.Sprint(v) {
+			if current, ok := before[k]; !ok || current == nil || valueText(current) != valueText(v) {
 				changed[k] = v
 			}
 			before[k] = v
@@ -859,7 +943,7 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 		values = append(values, pargs...)
 	}
 
-	result, err := tx.Exec(sqlStr, values...)
+	result, err := execVersioned(tx, table, id, session, sqlStr, values...)
 	if err != nil {
 		// An UPDATE rejected by a database constraint is a caller refusal,
 		// just as on create. Classify the driver code at this mutation
@@ -907,7 +991,7 @@ func membershipActivationDenial(app *App, table string, session *Session, row, c
 	}
 	if session != nil && session.EffectiveHasGroup() {
 		for col, v := range row {
-			if identIs(col, g.Key) && v != nil && fmt.Sprint(v) == session.EffectiveGroupID() {
+			if identIs(col, g.Key) && v != nil && valueText(v) == session.EffectiveGroupID() {
 				return nil
 			}
 		}
@@ -931,6 +1015,9 @@ func txDeleteRow(tx *sql.Tx, app *App, table string, id string, session *Session
 		return nil, err
 	}
 	if err := membershipDeleteDenial(tx, app, table, session, row); err != nil {
+		return nil, err
+	}
+	if err := refuseLastAdminRowDelete(app, tx, table, id); err != nil {
 		return nil, err
 	}
 	before := make(map[string]any, len(row))
@@ -957,7 +1044,7 @@ func txDeleteRow(tx *sql.Tx, app *App, table string, id string, session *Session
 		values = append(values, pargs...)
 	}
 
-	result, err := tx.Exec(sqlStr, values...)
+	result, err := execVersioned(tx, table, id, session, sqlStr, values...)
 	if err != nil {
 		return nil, err
 	}
@@ -1030,7 +1117,7 @@ func validateTxMutationRules(tx mutationTx, app *App, event, table string, row m
 		if errs := ValidateFields(r, rules); len(errs) > 0 {
 			return fmt.Errorf("field validation failed: %v", errs)
 		}
-		if err := ValidateCrossField(app.validatorConfig(), table, row); err != nil {
+		if err := ValidateCrossField(app.validatorConfig(), table, row, appTableColumns(app, table)); err != nil {
 			return err
 		}
 	}

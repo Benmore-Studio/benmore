@@ -1,0 +1,8 @@
+# `contains:` compares text. An unquoted number is not text and would be
+# skipped, so the answer would never be searched for it.
+health_holds_a_number:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        contains: 424242

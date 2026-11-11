@@ -1,0 +1,38 @@
+# auth.idle_timeout defaults to 15m under compliance: hipaa (api(at:"auth") idle_timeout).
+fresh_session_works:
+  as_user: "idle@test.com"
+  steps:
+    - get: "/api/_auth/sessions"
+      expect:
+        status: 200
+
+idle_session_is_refused:
+  as_user: "idle@test.com"
+  steps:
+    - sql: "UPDATE _benmore_sessions SET last_seen_at = CAST(strftime('%s','now') AS INTEGER) - 1200"
+    - get: "/api/_auth/sessions"
+      expect:
+        status: 401
+
+session_inside_the_window_is_touched:
+  as_user: "touch@test.com"
+  steps:
+    - sql: "UPDATE _benmore_sessions SET last_seen_at = CAST(strftime('%s','now') AS INTEGER) - 300 WHERE email = 'touch@test.com'"
+    - get: "/api/_auth/sessions"
+      expect:
+        status: 200
+    - sql: "SELECT * FROM _benmore_sessions WHERE email = 'touch@test.com' AND last_seen_at >= CAST(strftime('%s','now') AS INTEGER) - 5"
+      expect:
+        rows: 1
+
+sdk_heartbeat_is_not_activity:
+  as_user: "hb@test.com"
+  steps:
+    - sql: "UPDATE _benmore_sessions SET last_seen_at = CAST(strftime('%s','now') AS INTEGER) - 300 WHERE email = 'hb@test.com'"
+    - api: "POST /api/_presence/heartbeat"
+      json: {slug: "room", action: "heartbeat"}
+      expect:
+        status_in: [200, 204, 400, 403, 404]
+    - sql: "SELECT * FROM _benmore_sessions WHERE email = 'hb@test.com' AND last_seen_at < CAST(strftime('%s','now') AS INTEGER) - 250"
+      expect:
+        rows: 1

@@ -1,0 +1,23 @@
+# flows/attachment-remove.yaml - delete a private file, then its row
+on:
+  request:
+    method: POST
+    path: /api/attachments/:id/remove
+    auth: required
+    transaction: true
+jobs:
+  remove:
+    steps:
+      - id: file
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT id, file_url FROM attachments WHERE id = :id AND user_id = :user_id" }
+      - run: delete_upload                              # before the DELETE: a storage failure keeps the row
+        with:
+          path: "${{ steps.file.outputs.file_url }}"
+          record: { table: attachments, id: "${{ steps.file.outputs.id }}" }
+      - run: sql
+        expect_rows: "=1"
+        with: { query: "DELETE FROM attachments WHERE id = :id AND user_id = :user_id" }
+      - run: respond
+        with: { status: 200, json: { removed: "${{ steps.file.outputs.id }}" } }

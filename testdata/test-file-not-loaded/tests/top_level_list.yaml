@@ -1,0 +1,4 @@
+# Not loaded: the top level is a list of steps, not a mapping of test names.
+- get: "/health"
+  expect:
+    status: 200

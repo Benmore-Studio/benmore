@@ -38,6 +38,16 @@ func registerVersionHistoryClock(conn *sqlite3.SQLiteConn, now func() time.Time)
 	}, false); err != nil {
 		return err
 	}
+	// True when the recorded history already reaches instant: a write that
+	// moves the row's timestamp no further loses no interval if it records no
+	// version. Unknown or unparsable values are never covered.
+	if err := conn.RegisterFunc("benmore_history_covers", func(boundary, instant any) bool {
+		end, known := versionLatestInstant(boundary)
+		at, valid := versionLatestInstant(instant)
+		return known && valid && !at.After(end)
+	}, true); err != nil {
+		return err
+	}
 	return conn.RegisterFunc("benmore_history_end", func(startValue, candidate any) string {
 		start, _ := versionLatestInstant(startValue)
 		end, valid := versionLatestInstant(candidate)

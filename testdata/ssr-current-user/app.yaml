@@ -1,0 +1,3 @@
+site_name: "ssr-current-user"
+auth:
+  identifier: email

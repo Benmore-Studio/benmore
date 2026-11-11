@@ -1,0 +1,30 @@
+# flows/dashboard.yaml - three independent reads at the same time
+on:
+  request:
+    method: GET
+    path: /api/dashboard
+    auth: required
+jobs:
+  load:
+    steps:
+      - run: parallel
+        steps:
+          - id: open
+            run: sql
+            with: { query: "SELECT COUNT(*) AS n FROM tasks WHERE user_id = :user_id AND status = 'open'" }
+          - id: done
+            run: sql
+            with: { query: "SELECT COUNT(*) AS n FROM tasks WHERE user_id = :user_id AND status = 'done'" }
+          - id: hours
+            run: sql
+            with: { query: "SELECT COALESCE(SUM(hours), 0) AS total FROM time_entries WHERE user_id = :user_id" }
+        on_error:                     # the block fails when any branch fails
+          - run: respond
+            with: { status: 503, json: { error: dashboard_unavailable } }
+      - run: respond
+        with:
+          status: 200
+          json:
+            open: "${{ steps.open.outputs.n }}"
+            done: "${{ steps.done.outputs.n }}"
+            hours: "${{ steps.hours.outputs.total }}"

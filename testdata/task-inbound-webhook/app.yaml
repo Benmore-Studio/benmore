@@ -1,0 +1,8 @@
+# Inbound webhook: a payment provider calls the app. The delivery is verified,
+# recorded once, and the order is marked paid by a background job.
+site_name: "Orders"
+auth:
+  identifier: email
+access:
+  orders: { read: self, write: admin, update: admin, delete: admin }   # customers read their own; only the job marks one paid
+  webhook_events: { all: admin }     # written only by the webhook flow

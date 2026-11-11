@@ -83,10 +83,17 @@ elif ! dlo "$BASE/checksums.txt.sigstore.json" "$tmp/checksums.txt.sigstore.json
   [ "$REQUIRE_SIG" != 1 ] || err "release $VERSION has no checksums.txt.sigstore.json"
   say "warning: release $VERSION has no Sigstore bundle; skipped signature verification"
 else
-  cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity-regexp "^https://github\\.com/$REPO/\\.github/workflows/release\\.yml@refs/tags/v" \
-    "$tmp/checksums.txt" >/dev/null 2>&1 || err "signature verification of checksums.txt failed"
+  # cosign 3 writes the protobuf bundle format, which cosign 2.4-2.x reads only
+  # with --new-bundle-format; the retry changes parsing only, so a bad
+  # signature fails both attempts.
+  verify_bundle() {
+    cosign verify-blob --bundle "$tmp/checksums.txt.sigstore.json" "$@" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "^https://github\\.com/$REPO/\\.github/workflows/release\\.yml@refs/tags/v" \
+      "$tmp/checksums.txt" >/dev/null 2>&1
+  }
+  verify_bundle || verify_bundle --new-bundle-format ||
+    err "signature verification of checksums.txt failed (cosign older than 2.4 cannot read this release's bundle; upgrade cosign)"
   say "✓ checksums.txt signature verified"
 fi
 expected="$(awk -v name="$ASSET" '$2 == name { print $1; exit }' "$tmp/checksums.txt")"

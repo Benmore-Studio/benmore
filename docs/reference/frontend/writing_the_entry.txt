@@ -1,0 +1,17 @@
+// static/app.tsx
+import bm, { type User, type Message } from 'bm';
+
+async function boot() {
+  const me: User | null = await bm.auth.me();
+  if (!me) { location.href = '/login.html'; return; }
+
+  const messages: Message[] = await bm.table('messages').list({ limit: 50 });
+  // bm.table('typo') is a type error in your editor / tsc against
+  // src/bm.d.ts. Push does not type-check: it would 404 at runtime.
+
+  // ev is { table, action } - never the row. Refetch on every event.
+  bm.live('messages', async () => {
+    render(await bm.table('messages').list({ limit: 50 }));
+  });
+}
+boot();

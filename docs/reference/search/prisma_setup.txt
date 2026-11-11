@@ -1,0 +1,7 @@
+model Note {
+  id     Int    @id @default(autoincrement())
+  title  String
+  body   String
+  userId Int    @map("user_id")
+  @@fulltext([title, body])
+}

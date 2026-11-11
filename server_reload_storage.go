@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"database/sql"
 	"fmt"
@@ -35,11 +36,16 @@ func validateReloadEncryptionKey(app *App, encrypted *EncryptedFieldConfig, next
 // blind-index installation must not change the active encryption policy.
 func installReloadStorage(db *sql.DB, versioned *VersionedConfig, encrypted *EncryptedFieldConfig) error {
 	key := cryptoKeyForQuerier(db)
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "reload storage install"), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Encrypted config never covers a framework table; a trigger an earlier
+	// load put on one goes (config_framework_tables.go).
+	if err := dropConfigTriggersOnFrameworkTables(tx); err != nil {
+		return fmt.Errorf("framework-table triggers: %w", err)
+	}
 	if err := ensureBlindColumnsWith(tx, encrypted); err != nil {
 		return fmt.Errorf("blind columns: %w", err)
 	}
@@ -52,6 +58,12 @@ func installReloadStorage(db *sql.DB, versioned *VersionedConfig, encrypted *Enc
 	if err := installVersioningTriggersTx(tx, versioned, encrypted, key); err != nil {
 		return fmt.Errorf("versioning: %w", err)
 	}
+	// The encryption and blind-index triggers were just created again, so they
+	// are newer than an enrolled table's revision triggers; put those first
+	// again in this transaction (app_mcp_revision_order.go).
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
+		return fmt.Errorf("revision trigger order: %w", err)
+	}
 	return tx.Commit()
 }
 
@@ -63,22 +75,14 @@ func installEncryptionBeforeMigrations(db *sql.DB, encrypted *EncryptedFieldConf
 	if encrypted == nil {
 		return nil
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "encryption install"), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	existing := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{}}
-	for table, defs := range encrypted.Fields {
-		cols, err := mainTableColumnsWith(tx, table)
-		if err != nil {
-			return err
-		}
-		for _, def := range defs {
-			if versionHasColumn(cols, def.Column) {
-				existing.Fields[table] = append(existing.Fields[table], def)
-			}
-		}
+	existing, err := encryptedFieldsThatExist(tx, encrypted)
+	if err != nil {
+		return err
 	}
 	if err := ensureBlindColumnsWith(tx, existing); err != nil {
 		return err
@@ -89,5 +93,30 @@ func installEncryptionBeforeMigrations(db *sql.DB, encrypted *EncryptedFieldConf
 	if err := installBlindIndexTriggersMode(tx, existing, false); err != nil {
 		return err
 	}
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
+		return fmt.Errorf("revision trigger order: %w", err)
+	}
 	return tx.Commit()
+}
+
+// encryptedFieldsThatExist is the part of encrypted whose columns the
+// database has: what a start protects before its migration files run (they
+// may create the rest). nil for a nil config.
+func encryptedFieldsThatExist(q mutationQuerier, encrypted *EncryptedFieldConfig) (*EncryptedFieldConfig, error) {
+	if encrypted == nil {
+		return nil, nil
+	}
+	existing := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{}}
+	for table, defs := range encrypted.Fields {
+		cols, err := mainTableColumnsWith(q, table)
+		if err != nil {
+			return nil, err
+		}
+		for _, def := range defs {
+			if versionHasColumn(cols, def.Column) {
+				existing.Fields[table] = append(existing.Fields[table], def)
+			}
+		}
+	}
+	return existing, nil
 }

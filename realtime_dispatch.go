@@ -213,30 +213,49 @@ type realtimeAudience struct {
 //     actor only (others get the generic refresh);
 //   - owner (user_id) tables: the owner; with no owner, admins only.
 //
-// A table with no row-level scope keeps the scope as given.
-func realtimeAudienceFor(app *App, table, groupID string, userID int64) realtimeAudience {
+// Only a table that carries the tenant key is confined to a tenant. A schema
+// table without it (any table in an app without groups:, a groups.shared
+// catalog, a table the app simply keeps outside the tenant) has rows that
+// carry no tenant, and rowScopeClause lets readers in every tenant reach them
+// (a global role, a record share, a membership row), so its event is never
+// confined to the raising tenant. Such a table with no row-level scope at all
+// (no user_id, not member-of/owner_or_role) is readable row-for-row by every
+// reader of the table, so every reader gets the full event. The tenant root
+// (groups.bootstrap org_table, whose row ids are the tenants) and framework
+// pseudo-tables (presence, notifications) keep the scope as given.
+func realtimeAudienceFor(policyView *App, table, groupID string, userID int64) realtimeAudience {
 	a := realtimeAudience{tenant: groupID, owner: userID}
 	if groupID == "0" {
 		a.tenant = ""
 	}
 	a.ownerOnly = a.tenant == "" && userID > 0
-	if app == nil || table == "" {
+	if policyView == nil || table == "" {
 		return a
 	}
-	hasUID := hasColumn(app, table, "user_id")
-	grouped := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-	mode := app.Access.ModeFor(table, OpRead, hasUID, grouped)
+	hasUID := hasColumn(policyView, table, "user_id")
+	grouped := policyView.Group != nil && policyView.Group.Key != "" && hasColumn(policyView, table, policyView.Group.Key)
+	untenanted := !grouped && realtimeSchemaTable(policyView, table) && !tenantRootTable(policyView, table)
+	if untenanted {
+		a.tenant = ""
+	}
+	mode := policyView.Access.ModeFor(table, OpRead, hasUID, grouped)
 	if mode == "anon" || mode == "everyone" {
+		if untenanted {
+			a.ownerOnly = false
+		}
 		return a
 	}
 	rowScoped := false
 	switch {
-	case strings.HasPrefix(mode, "member-of:"), strings.HasPrefix(mode, "owner_or_role:"), explicitSelfFor(app, table, OpRead):
+	case strings.HasPrefix(mode, "member-of:"), strings.HasPrefix(mode, "owner_or_role:"), explicitSelfFor(policyView, table, OpRead):
 		rowScoped = true
 	case grouped:
 		rowScoped = a.tenant == ""
 	case hasUID:
 		rowScoped = true
+	case untenanted:
+		// Every reader of the table reads every row.
+		a.ownerOnly = false
 	}
 	if rowScoped {
 		a.ownerOnly = true
@@ -245,6 +264,22 @@ func realtimeAudienceFor(app *App, table, groupID string, userID int64) realtime
 		}
 	}
 	return a
+}
+
+// realtimeSchemaTable reports an app schema table, as opposed to a framework
+// table or a realtime pseudo-table (presence, notifications) whose events are
+// scoped by their own rules.
+func realtimeSchemaTable(app *App, table string) bool {
+	folded := sqliteIdentifierFold(table)
+	if strings.HasPrefix(folded, "_benmore_") || strings.HasPrefix(folded, "sqlite_") {
+		return false
+	}
+	for _, t := range app.Tables {
+		if sqliteIdentifierFold(t.Name) == folded {
+			return true
+		}
+	}
+	return false
 }
 
 // classify reports whether a client receives nothing (skip) or the full event
@@ -267,7 +302,8 @@ func deliverRealtimeChange(app *App, change realtimeChange) {
 		deliverRealtimeRefresh(app)
 		return
 	}
-	audience := realtimeAudienceFor(app, change.table, change.groupID, change.userID)
+	policyView := realtimePolicySnapshot(app)
+	audience := realtimeAudienceFor(policyView, change.table, change.groupID, change.userID)
 
 	sseMsg := fmt.Sprintf(`{"table":"%s","action":"%s"}`, change.table, change.action)
 	sseHub.mu.RLock()
@@ -280,7 +316,7 @@ func deliverRealtimeChange(app *App, change realtimeChange) {
 	sseHub.mu.RUnlock()
 	for _, c := range sseTargets {
 		skip, full := audience.classify(c.isAdmin, c.groupID, c.userID)
-		if skip || !c.principal.canRead(change.table, change.userID) {
+		if skip || !c.principal.canReadWithPolicy(policyView, change.table, change.userID) {
 			continue
 		}
 		msg := realtimeSSEGenericRefresh
@@ -305,7 +341,7 @@ func deliverRealtimeChange(app *App, change realtimeChange) {
 	for _, c := range wsTargets {
 		skip, full := audience.classify(c.isAdmin, c.groupID, c.userID)
 		if skip || (full && !wsClientSubscribed(c, change.table)) ||
-			!c.principal.canRead(change.table, change.userID) {
+			!c.principal.canReadWithPolicy(policyView, change.table, change.userID) {
 			continue
 		}
 		msg := realtimeWSGenericRefresh

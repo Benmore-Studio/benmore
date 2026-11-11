@@ -1,0 +1,6 @@
+home_renders:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200

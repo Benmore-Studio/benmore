@@ -1,0 +1,33 @@
+# flows/log-time.yaml - POST /api/tasks/:id/time with a typed, validated body
+on:
+  request:
+    method: POST
+    path: /api/tasks/:id/time
+    auth: required
+    inputs:
+      hours:     { type: number, required: true, min: 0.25, max: 24, label: "Hours" }
+      kind:      { type: enum, values: [dev, review, meeting], default: dev }
+      billable:  { type: bool, default: true }
+      worked_on: { type: date }
+      note:      { type: textarea, help: "Shown on the invoice" }
+jobs:
+  log:
+    steps:
+      - id: task
+        run: sql
+        with: { query: "SELECT id FROM tasks WHERE id = :id AND user_id = :user_id" }
+      - if: ${{ !steps.task.outputs.rows }}
+        run: respond
+        with: { status: 404, json: { error: task_not_found } }
+      - id: entry
+        run: sql
+        with:
+          query: "INSERT INTO time_entries (task_id, hours, kind, billable, worked_on, note, user_id) VALUES (:id, :hours, :kind, :billable, :worked_on, :note, :user_id) RETURNING id"
+          params:
+            billable: "${{ params.billable }}"            # a whole-value boolean binds 1/0
+            worked_on: "${{ params.worked_on || '' }}"    # optional inputs need a fallback
+            note: "${{ params.note || '' }}"
+      - run: respond
+        with:
+          status: 201
+          json: { id: "${{ steps.entry.outputs.id }}", kind: "${{ params.kind }}", hours: "${{ params.hours }}" }

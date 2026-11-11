@@ -1,0 +1,13 @@
+on:
+  request:
+    method: GET
+    path: /api/probe/:resourceId
+    auth: none
+jobs:
+  probe:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          json:
+            resourceId: ${{ resourceId }}

@@ -36,6 +36,10 @@ type XLSXSheet struct {
 	// its Excel serial, see xlsxSerial); text is never sniffed, so "007" stays
 	// text. nil keeps the legacy sniffing.
 	Formats []string
+	// CellFormats types single cells by [row][column] (data rows, not the
+	// header), overriding Formats, for a column whose rows hold different
+	// kinds of value (a field/value receipt). Setting it makes the sheet typed.
+	CellFormats [][]string
 	// FreezeHeader bolds row 1 and keeps it in view while scrolling.
 	FreezeHeader bool
 }
@@ -150,7 +154,7 @@ func writeZipFile(zw *zip.Writer, name, content string) {
 
 func buildSheet(sheet XLSXSheet) string {
 	headers, rows := sheet.Headers, sheet.Rows
-	typed := sheet.Formats != nil
+	typed := sheet.Formats != nil || sheet.CellFormats != nil
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	sb.WriteString(`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`)
@@ -195,6 +199,9 @@ func buildSheet(sheet XLSXSheet) string {
 			format := xlsxText
 			if typed && colIdx < len(sheet.Formats) && sheet.Formats[colIdx] != "" {
 				format = sheet.Formats[colIdx]
+			}
+			if rowIdx < len(sheet.CellFormats) && colIdx < len(sheet.CellFormats[rowIdx]) && sheet.CellFormats[rowIdx][colIdx] != "" {
+				format = sheet.CellFormats[rowIdx][colIdx]
 			}
 			if typed && format != xlsxText {
 				if val == "" {

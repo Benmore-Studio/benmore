@@ -14,9 +14,10 @@ package main
 //   - the caller keeps the route's status and shape. In dev mode
 //     (app.DevMode, the predicate publicConstraintMessage uses) the answer
 //     carries the full error text as before. Otherwise it carries only the
-//     route's generic text and the request id - text routes answer
-//     "<text> (request id: <id>)", JSON routes {"error": <text>,
-//     "request_id": <id>} - so raw SQLite text (table and column names, SQL
+//     route's generic text and the request id - text routes (outside
+//     /api/) answer "<text> (request id: <id>)", JSON routes and every
+//     /api/ route {"error": <text>, "request_id": <id>} - so raw SQLite
+//     text (table and column names, SQL
 //     fragments, sometimes values) never reaches a production caller.
 //     Both modes set the X-Request-Id response header.
 //
@@ -78,7 +79,15 @@ func requestErrorID(r *http.Request) string {
 func recordRequestError(r *http.Request, detail string) string {
 	id := requestErrorID(r)
 	if r != nil {
+		if slot := requestLogSlotFor(r); slot != nil {
+			// Kept as is: the reporter worker scrubs it (scrubErrorEvent), so a
+			// 5xx storm costs no scrubbing on the failing requests.
+			slot.mu.Lock()
+			slot.exportError = detail
+			slot.mu.Unlock()
+		}
 		setRequestLogError(r, serverErrorText(detail))
+		recordRequestFrames(r)
 	}
 	return id
 }
@@ -89,6 +98,15 @@ func recordRequestError(r *http.Request, detail string) string {
 // query cancelled because the caller went away is no server fault: its row
 // says so, and the journal gets no line for each abandoned request.
 func noteServerError(r *http.Request, where string, err error) string {
+	if r != nil {
+		if slot := requestLogSlotFor(r); slot != nil {
+			slot.mu.Lock()
+			if slot.where == "" {
+				slot.where = where
+			}
+			slot.mu.Unlock()
+		}
+	}
 	detail := serverErrorDetail(where, err)
 	id := recordRequestError(r, detail)
 	if r != nil && errors.Is(err, context.Canceled) && r.Context().Err() != nil {
@@ -113,9 +131,21 @@ func serverError(w http.ResponseWriter, r *http.Request, app *App, where string,
 }
 
 // serverErrorStatus is serverError for a route whose server error has another
-// 5xx status (a failed upstream call answered 502, a timeout 504).
+// 5xx status (a failed upstream call answered 502, a timeout 504). Under /api/
+// the answer is the JSON route shape ({"error", "request_id"}), so every API
+// error body is JSON: an auto-CRUD list or batch failure answered text while
+// its refusals answered JSON (Round 2 B15).
 func serverErrorStatus(w http.ResponseWriter, r *http.Request, app *App, status int, where string, err error, public string) {
-	answerServerError(w, app, status, noteServerError(r, where, err), err, public)
+	id := noteServerError(r, where, err)
+	if r != nil && r.URL != nil && strings.HasPrefix(r.URL.Path, "/api/") {
+		if public == "" {
+			public = "Server error"
+		}
+		w.Header().Del("Content-Length")
+		answerServerErrorJSON(w, app, status, id, err, map[string]any{"error": public})
+		return
+	}
+	answerServerError(w, app, status, id, err, public)
 }
 
 // answerServerError writes a text server error whose detail is already
@@ -123,6 +153,20 @@ func serverErrorStatus(w http.ResponseWriter, r *http.Request, app *App, status 
 func answerServerError(w http.ResponseWriter, app *App, status int, id string, err error, public string) {
 	w.Header().Set(requestIDHeader, id)
 	http.Error(w, serverErrorAnswerText(app, id, err, public), status)
+}
+
+// serverErrorWithDetail is serverError for a caller who may read the error
+// itself: a signed-in app admin on a full-access credential
+// (Session.IsAdminConsole), who can already read every table and the schema
+// in the admin console, as flowFailureDetailVisible decides for a failed flow.
+// The answer carries the text the request log keeps (one line, credential-
+// shaped text redacted) and the request id, as text/plain that no cache keeps.
+// The caller decides; everyone else gets serverError's generic text.
+func serverErrorWithDetail(w http.ResponseWriter, r *http.Request, where string, err error, public string) {
+	id := noteServerError(r, where, err)
+	w.Header().Set(requestIDHeader, id)
+	w.Header().Set("Cache-Control", "no-store")
+	http.Error(w, serverErrorDevText(public, errors.New(serverErrorText(errorText(err))))+" (request id: "+id+")", http.StatusInternalServerError)
 }
 
 // serverErrorMessage records err (noteServerError), sets X-Request-Id and
@@ -183,7 +227,8 @@ func serverErrorCode(w http.ResponseWriter, r *http.Request, app *App, where str
 }
 
 // serverErrorDevMode is the dev-mode predicate of the constraint path
-// (publicConstraintMessage): `benmore serve --dev`.
+// (publicConstraintMessage). App.DevMode is set only by tests; `benmore
+// serve` and hosted instances always run with it off.
 func serverErrorDevMode(app *App) bool {
 	return app != nil && app.DevMode
 }

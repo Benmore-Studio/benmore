@@ -1,0 +1,14 @@
+on:
+  request:
+    method: POST
+    path: /api/sql-inline
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: ins
+        run: sql
+        with:
+          query: "INSERT INTO notes (title, body) VALUES ('inline', '${{ params.b }}')"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

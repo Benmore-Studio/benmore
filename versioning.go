@@ -8,12 +8,37 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 )
 
 // VersionedConfig holds the list of tables with content versioning enabled.
 type VersionedConfig struct {
 	Tables []string
+	// Derived holds, per table, the columns a same-row computed field writes.
+	// It never comes from app.yaml: withComputedVersionMaintenance fills it
+	// from computed.yaml so the history trigger can tell a recalculation from
+	// a change.
+	Derived map[string][]string
+}
+
+// withComputedVersionMaintenance returns config with the computed columns of
+// its tables attached. Every installer of history triggers runs after the
+// computed triggers of the same generation, so both describe one config.
+func withComputedVersionMaintenance(config *VersionedConfig, computed *ComputedFieldConfig) *VersionedConfig {
+	if config == nil {
+		return nil
+	}
+	next := &VersionedConfig{Tables: config.Tables}
+	for _, table := range config.Tables {
+		if cols := computedExprColumns(computed, table); len(cols) != 0 {
+			if next.Derived == nil {
+				next.Derived = map[string][]string{}
+			}
+			next.Derived[table] = cols
+		}
+	}
+	return next
 }
 
 // LoadVersionedConfig reads the versioned: section from app.yaml.
@@ -36,6 +61,11 @@ func parseVersionedConfig(data []byte) *VersionedConfig {
 
 // Startup/reload and write validation use the same section parser as on-demand
 // consumers, so a malformed replacement cannot silently disable history.
+//
+// History is kept for the app's own tables only. A framework table in the
+// list is dropped here, for every consumer: no history table, no trigger and
+// no versions route exists for it (config_framework_tables.go; the write gate
+// refuses the entry and the load logs it).
 func parseVersionedSection(value any) (*VersionedConfig, error) {
 	if value == nil {
 		return nil, nil
@@ -57,12 +87,18 @@ func parseVersionedSection(value any) (*VersionedConfig, error) {
 		if err := configIdentError(fmt.Sprintf("app.yaml: versioned[%d]", i), table); err != nil {
 			return nil, err
 		}
+		if frameworkOwnedTableName(table) {
+			continue
+		}
 		identity := sqliteIdentifierFold(table)
 		if seen[identity] {
 			return nil, fmt.Errorf("app.yaml: versioned repeats table %q", table)
 		}
 		seen[identity] = true
 		config.Tables = append(config.Tables, table)
+	}
+	if len(config.Tables) == 0 {
+		return nil, nil
 	}
 	return config, nil
 }
@@ -112,7 +148,7 @@ func handleListVersions(w http.ResponseWriter, r *http.Request, app *App, table 
 	id := r.PathValue("id")
 
 	if err := checkScope(session, table, "read"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -134,7 +170,10 @@ func handleListVersions(w http.ResponseWriter, r *http.Request, app *App, table 
 	// The listing reveals who changed the row and when; audited tables
 	// record it.
 	if IsReadAudited(app, table) {
-		LogReadAccess(app, table, id, "versions", session)
+		if err := LogReadAccess(app, r, table, id, "versions", session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 
 	httpJSON(w, http.StatusOK, map[string]any{
@@ -156,7 +195,7 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	id := r.PathValue("id")
 
 	if err := checkScope(session, table, "read"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -196,10 +235,15 @@ func handleGetVersion(w http.ResponseWriter, r *http.Request, app *App, table st
 	// recover the plaintext through version history. The history table shares
 	// the source table's encrypted-field config (same column names).
 	sanitizeResponseRows(app, table, rows, session)
+	// ?fields= as on the live single-row read (crud_read.go), after masking.
+	projectResponseRows(rows, crudSelectFields(r, app, table, "*"))
 	// A version snapshot is the row's past content: an audited table
 	// records the read like a live GET.
 	if IsReadAudited(app, table) {
-		LogReadAccess(app, table, id, "version", session)
+		if err := LogReadAccess(app, r, table, id, "version", session); err != nil {
+			readAuditRefused(w, r, app, table, err)
+			return
+		}
 	}
 	httpJSON(w, http.StatusOK, rows[0])
 }
@@ -218,8 +262,17 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 
 	id := r.PathValue("id")
 
+	// A table the caller may not read answers the unmatched-route 404 before
+	// any scope or row message (security.md 14f); revert used to answer
+	// {"error":"not found"} or a 403 naming the table without the table gate,
+	// so it told real tables from names that match nothing.
+	if !tableReadGateFor(app, table, session) {
+		writeUnmatchedAPINotFound(w)
+		return
+	}
+
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -229,13 +282,16 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 	version := r.PathValue("version")
 
-	// Get the source table columns (what to restore)
+	// Restore the source columns the version has (see revertSnapshotColumns).
 	cols, _ := GetTableColumns(app.DB, table)
-	var colNames []string
-	for _, col := range cols {
-		if col.PK {
-			continue // don't overwrite id
-		}
+	historyCols, _ := GetTableColumns(app.DB, table+"_history")
+	restore, notInVersion := revertSnapshotColumns(cols, historyCols)
+	if len(restore) == 0 {
+		httpJSON(w, http.StatusNotFound, map[string]any{"error": "version not found"})
+		return
+	}
+	colNames := make([]string, 0, len(restore))
+	for _, col := range restore {
 		colNames = append(colNames, quoteColumn(table, col.Name)) // historyFrom aliases the history table as table
 	}
 
@@ -255,9 +311,26 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 
 	versionRow := rows[0]
+	// History gains a column added to the source with NULL for every older
+	// version, so NULL under a column the table now declares NOT NULL means
+	// the version predates it. Copying that NULL failed the whole revert.
+	for _, col := range restore {
+		if v, ok := versionRow[col.Name]; col.NotNull && ok && versionedValueIsNull(v) {
+			delete(versionRow, col.Name)
+			notInVersion = append(notInVersion, col.Name)
+		}
+	}
 	// A revert restores every column except command-owned ones, which only
 	// their command may change; they keep their current value.
 	skippedOwned := stripOwnedFields(app, table, versionRow)
+	// Hidden credential columns keep their current value too (see
+	// revertHiddenColumn).
+	for column := range versionRow {
+		if revertHiddenColumn(app, table, column) {
+			delete(versionRow, column)
+		}
+	}
+	kept := revertKeptColumns(app, table, cols, skippedOwned, notInVersion)
 
 	// Reverts are updates, including write policy, edit ACLs, locks, validators,
 	// protected columns, membership, before/after hooks, audit and broadcasts.
@@ -279,7 +352,82 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 		"id":                  id,
 		"reverted_to_version": version,
 		"owned_fields_kept":   skippedOwned,
+		"kept":                kept,
 	})
+}
+
+// revertSnapshotColumns splits the source table's non-key columns into those
+// a revert reads from the version and those no version can hold: a column the
+// history table lacks (added after history last reconciled) keeps its current
+// value. The version snapshot records no column set of its own, so a column
+// added later that history does carry is judged by its value in handleRevert.
+func revertSnapshotColumns(cols, historyCols []Column) (restore []Column, notInVersion []string) {
+	for _, col := range cols {
+		if col.PK {
+			continue // don't overwrite id
+		}
+		if !versionHasColumn(historyCols, col.Name) {
+			notInVersion = append(notInVersion, col.Name)
+			continue
+		}
+		restore = append(restore, col)
+	}
+	return restore, notInVersion
+}
+
+// revertKept is one column a revert left at its current value, and why.
+type revertKept struct {
+	Column string `json:"column"`
+	Reason string `json:"reason"`
+}
+
+// revertHiddenColumn reports whether a revert leaves column at its current
+// value because it is a hidden credential column (apiHiddenColumn: `*_token`,
+// `*_secret`, `api_key`, ...). No response carries such a column, version
+// snapshots included, so the reverting caller cannot see what the version
+// holds; restoring it let anyone who may edit the row bring back a token or
+// secret that was rotated or revoked. App admins are no exception: they
+// cannot read hidden columns either. A deliberate change of the value is an
+// ordinary update that names it. Protected columns (a blind-index sibling,
+// password_hash) are reported as protected, not hidden.
+func revertHiddenColumn(app *App, table, column string) bool {
+	return apiHiddenColumn(app, table, column)
+}
+
+// revertKeptColumns lists, sorted, the columns a revert did not take from the
+// version: command-owned ones (only their command writes them), the workflow
+// state column (it moves only through transitions), protected ownership,
+// tenant, identity and derived columns (protectedUpdateFields: no update
+// writes them), hidden credential columns (revertHiddenColumn), and columns
+// the version predates. id, and updated_at (the revert's own write sets it),
+// are not listed.
+func revertKeptColumns(app *App, table string, cols []Column, owned, notInVersion []string) []revertKept {
+	ownedSet := newProtectedFields(owned...)
+	workflowSet := newProtectedFields(workflowProtectedFields(app, table)...)
+	protected := protectedFields(protectedUpdateFields(app, table))
+	absent := newProtectedFields(notInVersion...)
+	kept := []revertKept{}
+	for _, col := range cols {
+		reason := ""
+		switch {
+		case col.PK || identIs(col.Name, "updated_at"):
+		case ownedSet.has(col.Name):
+			reason = "command_owned"
+		case workflowSet.has(col.Name):
+			reason = "workflow_state"
+		case protected.has(col.Name):
+			reason = "protected"
+		case revertHiddenColumn(app, table, col.Name):
+			reason = "hidden"
+		case absent.has(col.Name):
+			reason = "not_in_version"
+		}
+		if reason != "" {
+			kept = append(kept, revertKept{Column: col.Name, Reason: reason})
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].Column < kept[j].Column })
+	return kept
 }
 
 // historyFrom names a table's history table ALIASED AS the source table, so

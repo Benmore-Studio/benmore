@@ -1,0 +1,13 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-post
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - run: api
+        with: { method: POST, url: "https://example.com/x", json: { a: 1 } }
+      - run: respond
+        with: { json: { ok: true } }

@@ -1,0 +1,38 @@
+on:
+  request:
+    method: POST
+    path: /api/public-contract
+    auth: none
+    contract:
+      request_body_required: false
+      request_body_media_types: [application/json, application/x-www-form-urlencoded]
+      request_body:
+        type: object
+        properties:
+          code: {type: string, minLength: 1, maxLength: 12, pattern: '^[A-Z]+$'}
+        additionalProperties: false
+      query:
+        type: object
+        properties:
+          code: {type: string}
+        additionalProperties: false
+      responses:
+        '200':
+          type: object
+          properties:
+            accepted: {type: boolean}
+            count: {type: integer, minimum: 1, maximum: 5}
+            labels:
+              type: array
+              minItems: 1
+              maxItems: 3
+              items: {type: string, minLength: 2, maxLength: 4}
+          required: [accepted, count, labels]
+          additionalProperties: false
+jobs:
+  respond:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          json: {accepted: true, count: 2, labels: [ok]}

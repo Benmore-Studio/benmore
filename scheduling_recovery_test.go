@@ -41,7 +41,7 @@ func TestScheduledTaskHeartbeatKeepsLiveClaim(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	auditExec(t, app.DB, "INSERT INTO _benmore_scheduled_tasks(id,user_id,kind,flow,run_at,status,claimed_at) VALUES (7,1,'flow','slow',?,'running',?)", future, stale)
 
-	stop := startScheduledTaskHeartbeat(app, int64(7))
+	stop := startScheduledTaskHeartbeat(app, int64(7), stale)
 	time.Sleep(150 * time.Millisecond)
 	sweepScheduledTasks(app) // the other generation's sweep
 	stop()

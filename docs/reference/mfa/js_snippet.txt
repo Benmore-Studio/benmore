@@ -1,0 +1,45 @@
+// ===== Voluntary enrollment (already signed in) =====
+const csrf = document.querySelector('meta[name="csrf-token"]').content;
+
+const { secret, otpauth_uri, backup_codes } = await fetch('/api/_auth/mfa/setup',
+  { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    credentials: 'same-origin',
+    body: JSON.stringify({ password: currentPassword }) }).then(r => r.json());
+// render QR from otpauth_uri; show backup_codes ONCE
+
+await fetch('/api/_auth/mfa/verify', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+  body: JSON.stringify({ code: '123456' }),
+});
+
+
+// ===== Mandatory enrollment (auth.require_mfa_for_roles flow) =====
+
+// 1. Password sign-in. Inspect the response - there might be no token.
+const login = await fetch('/api/_auth/token', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email, password }),
+}).then(r => r.json());
+
+if (login.mfa_setup_required) {
+  // 2. Enrollment branch - use the setup token, NOT a session cookie.
+  const headers = { 'X-MFA-Setup-Token': login.setup_token,
+                    'Content-Type': 'application/json' };
+
+  const enroll = await fetch('/api/_auth/mfa/setup',
+    { method: 'POST', headers }).then(r => r.json());
+  // render QR from enroll.otpauth_uri; persist enroll.backup_codes ONCE
+
+  // 3. Verify with first code. Response carries the real session token.
+  const verified = await fetch('/api/_auth/mfa/verify',
+    { method: 'POST', headers,
+      body: JSON.stringify({ code: userTypedCode }) }).then(r => r.json());
+
+  localStorage.setItem('bm_token', verified.token);
+} else {
+  // Normal path - fully signed in.
+  localStorage.setItem('bm_token', login.token);
+}

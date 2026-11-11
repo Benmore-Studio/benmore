@@ -1,0 +1,17 @@
+on:
+  request:
+    method: POST
+    path: /api/probe/:resourceId
+    auth: none
+    rate_limit: "1000/m per ip"
+    transaction: true
+jobs:
+  probe:
+    steps:
+      - run: sql
+        query: INSERT INTO probe_writes (value) VALUES (:resourceId)
+      - run: respond
+        with:
+          status: 200
+          json:
+            resourceId: ${{ resourceId }}

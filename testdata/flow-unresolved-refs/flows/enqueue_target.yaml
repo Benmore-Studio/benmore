@@ -1,0 +1,17 @@
+on:
+  request:
+    method: POST
+    path: /api/enqueue-target
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: q
+        run: enqueue
+        with:
+          flow: job_writes_target
+          with:
+            label: "target"
+            target_user_id: "${{ user.id }}"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

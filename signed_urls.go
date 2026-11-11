@@ -35,7 +35,7 @@ func cryptoRandRead(b []byte) { _, _ = cryptorand.Read(b) }
 // serverSecret on first use so callers that fire before
 // RegisterSignedURLRoutes still get a secret-keyed MAC instead of the
 // previous hardcoded fallback (which would let anyone with source
-// access forge signed URLs and edge tokens).
+// access forge signed URLs).
 var (
 	signedURLKey   []byte
 	signedURLKeyMu sync.Mutex
@@ -61,9 +61,9 @@ func computeURLSignature(host, path string, expires int64) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// csrfKeyBytes returns the HMAC key used for signed URLs AND for
-// edge_auth tokens. Both must be unguessable to attackers, so we
-// derive from serverSecret rather than ever returning a static literal.
+// csrfKeyBytes returns the HMAC key used for signed URLs. It must be
+// unguessable to attackers, so we derive it from serverSecret rather than
+// ever returning a static literal.
 func csrfKeyBytes() []byte {
 	signedURLKeyMu.Lock()
 	defer signedURLKeyMu.Unlock()
@@ -148,12 +148,19 @@ func registerSignedURLRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 
-		expiresIn := 1 * time.Hour // default 1 hour
+		// Default 1 hour, or mediaPlaybackSignTTL for audio/video so a
+		// <video src> keeps playing past the hour (signedLinkTTL).
+		var requested time.Duration
 		if ei := r.URL.Query().Get("expires_in"); ei != "" {
 			if seconds, err := strconv.Atoi(ei); err == nil && seconds > 0 {
-				expiresIn = time.Duration(seconds) * time.Second
+				// Bounded before multiplying so a huge value cannot wrap.
+				requested = oauthMaxSignedURLTTL
+				if int64(seconds) < int64(oauthMaxSignedURLTTL/time.Second) {
+					requested = time.Duration(seconds) * time.Second
+				}
 			}
 		}
+		expiresIn := signedLinkTTL(path, requested, time.Hour)
 
 		// Clamp the lifetime to a safer ceiling. A signed URL is a BEARER
 		// credential: once minted it grants access to the private object for its

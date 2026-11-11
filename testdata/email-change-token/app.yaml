@@ -1,0 +1,3 @@
+site_name: "email-change-token fixture"
+auth:
+  identifier: email

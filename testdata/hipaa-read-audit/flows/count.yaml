@@ -1,0 +1,10 @@
+on:
+  request: { method: GET, path: /api/patient-count, auth: required }
+jobs:
+  count:
+    steps:
+      - run: sql
+        id: n
+        with: { query: "SELECT COUNT(*) AS n FROM patients" }
+      - run: respond
+        with: { json: { n: "${{ steps.n.outputs.n }}" } }

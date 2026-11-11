@@ -1,0 +1,17 @@
+{
+  "keys": [
+    "approval_dedupe",
+    "flow_authorization",
+    "upgrade",
+    "summary",
+    "scheduled",
+    "request_errors",
+    "auth",
+    "approvals",
+    "approver_identity",
+    "recovery",
+    "decide_authority",
+    "hint",
+    "see_also"
+  ]
+}

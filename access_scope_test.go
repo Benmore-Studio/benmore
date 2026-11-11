@@ -80,7 +80,7 @@ func TestRowScopeClause_DeleteMemberOf(t *testing.T) {
 	if bypass {
 		t.Fatal("member-of delete must not bypass row scoping")
 	}
-	if !strings.Contains(pred, `EXISTS (SELECT 1 FROM main."room_members" WHERE main."room_members"."room_id" = main."rooms"."id" AND main."room_members"."member_id" = ?)`) {
+	if !strings.Contains(pred, `EXISTS (SELECT 1 FROM main."room_members" AS _benmore_membership WHERE _benmore_membership."room_id" = main."rooms"."id" AND _benmore_membership."member_id" = ?)`) {
 		t.Fatalf("delete member-of should use membership predicate, got %q", pred)
 	}
 	if len(args) != 3 || args[0] != int64(42) || args[1] != "rooms" || args[2] != "u@example.com" {

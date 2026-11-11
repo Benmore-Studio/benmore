@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.yaml.in/yaml/v3"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,10 +18,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
-	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"gopkg.in/yaml.v3"
 )
 
 type exposureHarness struct {
@@ -669,7 +667,7 @@ func TestAppMCPExposureUnknownCommitReconcilesFromDurableRow(t *testing.T) {
 	}
 	hook := func(fail bool) {
 		if err := conn.Raw(func(raw any) error {
-			raw.(*sqlite3.SQLiteConn).RegisterCommitHook(func() int {
+			mustSQLiteConn(raw).RegisterCommitHook(func() int {
 				if fail {
 					return 1
 				}

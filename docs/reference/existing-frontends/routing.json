@@ -1,0 +1,6 @@
+[
+  "The contents of static/ are served from the URL root, so generated root-relative references such as /assets/app.js resolve to static/assets/app.js. Do not add an extra /static prefix to framework-generated asset paths.",
+  "An app with a reviewed mcp.yaml answers the same root-relative paths, from the source it last loaded rather than from the directory: copied build output is served after the reload that follows the deploy or push. Caching of both forms: api({at:'frontend'}) how_compile_works.",
+  "Unknown browser navigation routes fall back to static/index.html for client-side routers. Asset-looking paths such as missing .js, .css, or .png files return a real 404 and never fall back to HTML.",
+  "Script source is not served from the root: /app.tsx answers the same 404 as /static/app.tsx, and so does any .ts, .tsx, .mts, .cts or .jsx file and any `run: compute` module under static/. Copy built browser output (.js, .css, images, fonts), not source; a page that loads raw .jsx or .tsx for an in-browser transpiler gets that 404. See api({at:'compute'}) server_only_sources."
+]

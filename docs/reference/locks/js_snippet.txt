@@ -1,0 +1,17 @@
+const lockUrl = '/api/notes/1/lock';
+const post = { method: 'POST', headers: { 'X-CSRF-Token': csrf }, credentials: 'same-origin' };
+const r = await fetch(lockUrl, post);
+if (r.status === 409) {
+  const { locked_by, expires_at } = await r.json();
+  return alert('Locked by ' + locked_by + ' until ' + new Date(expires_at).toLocaleTimeString());
+}
+if (!r.ok) throw new Error('lock failed: ' + r.status);
+// A lock lasts 30 s: renew it while the edit is open.
+const renew = setInterval(() => fetch(lockUrl, post), 20000);
+try {
+  // … do the long edit …
+} finally {
+  clearInterval(renew);
+  await fetch(lockUrl, { method: 'DELETE',
+    headers: { 'X-CSRF-Token': csrf }, credentials: 'same-origin' });
+}

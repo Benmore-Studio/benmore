@@ -1,0 +1,1 @@
+A cookie-authenticated `json:`, `json_array:` or `ndjson:` step sends the CSRF token in `X-CSRF-Token`, as the browser SDK does (form steps send `_csrf`; `anon: true` and `bearer: true` steps send none), so a test can send what a signed-in page sends.

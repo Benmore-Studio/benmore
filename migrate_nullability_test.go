@@ -12,7 +12,7 @@ import (
 
 // TestMigrate_NullabilityChange locks the fix for the silent NOT NULL → NULL
 // gap: the migrator must (a) NOTICE the divergence (not silently skip it),
-// (b) block it by default, and (c) on --force rebuild the table so the column
+// (b) keep it by default (reported as Retained), and (c) on --force rebuild the table so the column
 // actually becomes nullable, preserving existing rows.
 func TestMigrate_NullabilityChange(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -39,13 +39,14 @@ func TestMigrate_NullabilityChange(t *testing.T) {
 		},
 	}}
 
-	// (a) + (b): default migrate must NOTICE + BLOCK, and NOT change the DB.
+	// (a) + (b): default migrate must NOTICE it as kept (Retained, as
+	// DiffSchema reports it), and NOT change the DB.
 	res, err := Migrate(db, schema, false)
 	if err != nil {
 		t.Fatalf("Migrate(force=false): %v", err)
 	}
-	if !hasSubstr(res.Blocked, "project_id nullability") {
-		t.Fatalf("expected a nullability notice in Blocked, got: %v", res.Blocked)
+	if !hasSubstr(res.Retained, "leads.project_id: the database column is NOT NULL, the schema says NULL") || len(res.Blocked) != 0 {
+		t.Fatalf("expected a nullability notice in Retained, got: retained=%v blocked=%v", res.Retained, res.Blocked)
 	}
 	if _, err := db.Exec(`INSERT INTO leads (project_id, name) VALUES (NULL, 'still-not-null')`); err == nil {
 		t.Fatal("expected NULL insert to still fail before --force rebuild")

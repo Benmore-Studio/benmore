@@ -1,0 +1,24 @@
+// CRITICAL: SSE events are NAMED (event: change\ndata: {...}).
+// Use addEventListener('change'), NOT onmessage.
+// onmessage only fires for events with NO 'event:' line - so every
+// framework broadcast is silently ignored if you wire onmessage alone.
+function liveInvalidate(tableName, onChange) {
+  const es = new EventSource('/sse/events');
+  const handler = ev => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg?.table === tableName || msg?.action === 'refresh') onChange(msg);
+    } catch (_) { /* not JSON: ignore */ }
+  };
+  es.addEventListener('change', handler);   // ← REQUIRED - catches framework events
+  es.onmessage = handler;                    // ← belt-and-braces
+  return () => es.close();
+}
+
+// Wire it once on app boot.
+const stop = liveInvalidate('notes', msg => {
+  console.log('notes changed:', msg.action);   // no row id - refetch
+  refreshNoteList();
+});
+
+// Clean up on unmount / route change. stop();

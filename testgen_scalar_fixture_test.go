@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,7 +91,7 @@ func TestGeneratedUUIDLifecycleUsesDeclaredType(t *testing.T) {
 			// than treating a successful PATCH receipt as proof of the change.
 			want := map[string]string{"Int": "2", "Float": "2.0", "Boolean": "1", "DateTime": "2026-01-02"}[scalar]
 			journey.Steps = append(journey.Steps[:2],
-				AppTestStep{SQL: "SELECT id FROM typed_records WHERE CAST(metric AS TEXT) = '" + want + "'", Expect: AppTestExpect{Rows: 1}},
+				AppTestStep{SQL: "SELECT id FROM typed_records WHERE CAST(metric AS TEXT) = '" + want + "'", Expect: AppTestExpect{Rows: expectRows(1)}},
 				journey.Steps[2])
 			result := runSingleTest(app, server.URL, generated.Name, "uuid_lifecycle_typed_records", journey)
 			if !result.Pass {
@@ -104,8 +105,8 @@ func TestGeneratedUUIDLifecycleUsesDeclaredType(t *testing.T) {
 	}
 }
 
-// Real relationships remain an explicit unsupported fixture prerequisite. A
-// suffix alone is not a relationship, and no existing parent's ID is guessed.
+// A suffix alone is not a relationship, and no existing parent's ID is
+// guessed: a required foreign key references a parent the test creates first.
 func TestGeneratedRequiredIDDoesNotGuessForeignKey(t *testing.T) {
 	app, server := generatedScalarFixture(t, `model Parent {
  id Int @id @default(autoincrement())
@@ -126,23 +127,29 @@ model Child {
 	mustExec(t, app.DB, "INSERT INTO fixture_parents(id,user_id,label) VALUES (1,99999,'unrelated synthetic row')")
 	generated := generateCRUDTests(app)
 	journey := generated.Tests["create_fixture_children"]
-	if _, ok := journey.Steps[0].Data["parent_id"]; ok {
-		t.Fatal("generator invented a foreign parent ID")
+	if len(journey.Steps) != 2 || journey.Steps[0].API != "POST /api/fixture_parents" {
+		t.Fatalf("the required parent is not created first: %+v", journey.Steps)
+	}
+	if ref, _ := journey.Steps[1].Data["parent_id"].(string); !strings.HasPrefix(ref, "{{") {
+		t.Fatalf("generator invented a foreign parent ID: %#v", journey.Steps[1].Data["parent_id"])
+	}
+	if journey.Steps[1].Expect.Status != http.StatusOK {
+		t.Fatal("the child create's success assertion was loosened")
 	}
 	app.JoinMap = nil
 	if _, ok := smartFormData(app, "fixture_children", tableColumns(app, "fixture_children"))["parent_id"]; ok {
 		t.Fatal("generator ignored the physical FK when cached metadata was absent")
 	}
-	if journey.Steps[0].Expect.Status != http.StatusOK {
-		t.Fatal("unsupported prerequisite was hidden by loosening the success assertion")
+	if planned := planGeneratedRow(app, "fixture_children", "metadata", plainGeneratedSession(app)); len(planned.Steps) != 1 {
+		t.Fatalf("the physical FK must still be planned without cached metadata: %+v", planned)
 	}
 	result := runSingleTest(app, server.URL, generated.Name, "create_fixture_children", journey)
-	if result.Pass {
-		t.Fatal("unsupported parent prerequisite should remain visible")
+	if !result.Pass {
+		t.Fatalf("child create with its own parent failed: %+v", result)
 	}
-	var count int
-	if err := app.DB.QueryRow("SELECT count(*) FROM fixture_children").Scan(&count); err != nil || count != 0 {
-		t.Fatalf("unsupported parent fixture wrote data: count=%d err=%v", count, err)
+	var parentOwner int64
+	if err := app.DB.QueryRow("SELECT p.user_id FROM fixture_children c JOIN fixture_parents p ON p.id = c.parent_id").Scan(&parentOwner); err != nil || parentOwner == 99999 {
+		t.Fatalf("child references the unrelated parent: owner=%d err=%v", parentOwner, err)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 )
@@ -79,7 +78,11 @@ func canShareResource(app *App, table string, id string, session *Session) bool 
 	}
 	// IsAdminBypass, not IsAdmin: a stepped-in admin acts AS the tenant, so it
 	// can only share rows the tenant could (owner / admin-grant), not anything.
-	if session.IsAdminBypass() {
+	// IsAdminConsole as well: handing out and revoking access on any row is
+	// admin management (security.md 15b), so an admin's scoped API token
+	// (delegated access, say notes:write for an integration) gets only what
+	// the owner and admin-grant checks below give any other caller.
+	if session.IsAdminBypass() && session.IsAdminConsole() {
 		return true
 	}
 	// Sharing hands out access, so the caller must STILL be able to edit the
@@ -169,9 +172,13 @@ func registerPermissionTables(mux appRouteRegistrar, app *App, tables []string) 
 		})
 	}
 
-	log.Printf("  permissions: share/revoke API registered for %d tables", len(tables))
+	routeInfof(mux, "  permissions: share/revoke API registered for %d tables", len(tables))
 }
 
+// The share, list and revoke handlers answer every refusal through
+// writeTableRefusal: a caller who may not read the table gets the
+// unmatched-route 404 (security.md 14f), not a 403 that confirmed the table
+// exists; a caller who may read it keeps the 403 naming what was refused.
 func handleShare(w http.ResponseWriter, r *http.Request, app *App, table string) {
 	session := getSession(app, r)
 	if session == nil {
@@ -180,7 +187,7 @@ func handleShare(w http.ResponseWriter, r *http.Request, app *App, table string)
 	}
 
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -192,7 +199,7 @@ func handleShare(w http.ResponseWriter, r *http.Request, app *App, table string)
 	id := r.PathValue("id")
 
 	if !canShareResource(app, table, id, session) {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "only the owner or an admin can share this resource"})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, map[string]any{"error": "only the owner or an admin can share this resource"})
 		return
 	}
 
@@ -297,7 +304,7 @@ func handleListPermissions(w http.ResponseWriter, r *http.Request, app *App, tab
 	}
 	// Token scopes apply to ACL management like any other table operation.
 	if err := checkScope(session, table, "read"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -305,7 +312,7 @@ func handleListPermissions(w http.ResponseWriter, r *http.Request, app *App, tab
 
 	// Must be owner, admin, or have admin permission on the resource to view permissions
 	if !canShareResource(app, table, id, session) {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not authorized to view permissions"})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, map[string]any{"error": "not authorized to view permissions"})
 		return
 	}
 
@@ -335,7 +342,7 @@ func handleRevokePermission(w http.ResponseWriter, r *http.Request, app *App, ta
 		return
 	}
 	if err := checkScope(session, table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, scopeDeniedBody(err))
 		return
 	}
 
@@ -348,7 +355,7 @@ func handleRevokePermission(w http.ResponseWriter, r *http.Request, app *App, ta
 	permissionId := r.PathValue("permissionId")
 
 	if !canShareResource(app, table, id, session) {
-		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not authorized to revoke"})
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, map[string]any{"error": "not authorized to revoke"})
 		return
 	}
 

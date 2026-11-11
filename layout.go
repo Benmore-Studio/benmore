@@ -7,7 +7,13 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 )
 
 const tailwindPath = "/_internal/tailwind.js"
@@ -36,8 +42,26 @@ func WrapLayout(content, title string, app *App, session *Session) string {
 	return WrapLayoutWithPage(content, title, app, session, nil)
 }
 
-// WrapLayoutWithPage wraps page content with full SEO support.
+// WrapLayoutWithPage wraps page content with full SEO support. The canonical
+// link names the page's route; a route with path parameters gets none, since
+// no request names the record (servePage uses wrapLayoutAt with the request's
+// path instead).
 func WrapLayoutWithPage(content, title string, app *App, session *Session, page *Page) string {
+	return wrapLayoutAt(content, title, app, session, page, pageSEOPath(page))
+}
+
+// pageSEOPath is the canonical path of a page rendered outside a request for
+// it: its route, or "" for a route with path parameters.
+func pageSEOPath(page *Page) string {
+	if page == nil {
+		return ""
+	}
+	return pageCanonicalPath(page.Route, nil)
+}
+
+// wrapLayoutAt is WrapLayoutWithPage with the path the canonical link and
+// og:url name (pageCanonicalPath).
+func wrapLayoutAt(content, title string, app *App, session *Session, page *Page, canonicalPath string) string {
 	if title == "" {
 		title = "Benmore App"
 	}
@@ -96,15 +120,11 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 	sb.WriteString(`</title>`)
 
 	// SEO meta tags
-	seo := buildSEOTags(app, page, title)
+	seo := buildSEOTagsAt(app, page, title, canonicalPath)
 	sb.WriteString(seo)
 
 	// Favicon
-	if app != nil && app.Design != nil {
-		if favicon, ok := app.Design.SEO["favicon"]; ok {
-			sb.WriteString(fmt.Sprintf(`<link rel="icon" href="%s">`, favicon))
-		}
-	}
+	sb.WriteString(appFaviconLink(app))
 
 	// Feed discovery + alternate formats
 	sb.WriteString(`<link rel="alternate" type="application/atom+xml" title="Feed" href="/feed.xml">`)
@@ -113,7 +133,7 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 	if app != nil {
 		sb.WriteString(PWAMetaTags(app))
 		if IsPWAEnabled(app) {
-			sb.WriteString(`<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js')}</script>`)
+			sb.WriteString(pwaRegisterScriptTag)
 		}
 	}
 
@@ -224,13 +244,37 @@ func WrapLayoutWithPage(content, title string, app *App, session *Session, page 
 	// Analytics beacon - auto-injected when features.analytics is enabled (default: true)
 	if app.FeatureEnabled("analytics") {
 		sb.WriteString(AnalyticsBeaconJS())
-		sb.WriteString(AnalyticsCookieNotice(app))
+		if !pageOptsOutOfCookieBanner([]byte(content)) {
+			sb.WriteString(AnalyticsCookieNotice(app))
+		}
 	}
 	// Form control styling handled by @tailwindcss/forms plugin (embedded in tailwind.min.js)
 	sb.WriteString(`</body></html>`)
 
 	return sb.String()
 }
+
+// appFaviconLink is the icon link of the server-rendered shells: seo.favicon
+// when set, else the scaffold's static/favicon.svg when the app has one.
+// Without a link the browser asks for /favicon.ico, and a 404 there fails
+// browser journeys; the scaffold ships only the SVG.
+func appFaviconLink(app *App) string {
+	if app == nil {
+		return ""
+	}
+	if app.Design != nil {
+		if favicon, ok := app.Design.SEO["favicon"]; ok {
+			return fmt.Sprintf(`<link rel="icon" href="%s">`, html.EscapeString(favicon))
+		}
+	}
+	if _, err := app.readSourceFile(appStaticFaviconSVG); err == nil {
+		return `<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">`
+	}
+	return ""
+}
+
+// appStaticFaviconSVG is the icon the scaffold ships.
+const appStaticFaviconSVG = "static/favicon.svg"
 
 // loadNamedLayout reads a layout file from the app's layouts/ directory.
 func loadNamedLayout(app *App, name string) string {
@@ -259,11 +303,7 @@ func wrapHTMLShell(content, title string, app *App, session *Session, page *Page
 	seo := buildSEOTags(app, page, title)
 	sb.WriteString(seo)
 
-	if app != nil && app.Design != nil {
-		if favicon, ok := app.Design.SEO["favicon"]; ok {
-			sb.WriteString(fmt.Sprintf(`<link rel="icon" href="%s">`, favicon))
-		}
-	}
+	sb.WriteString(appFaviconLink(app))
 	if app != nil {
 		if headHTML, err := app.readSourceFile("head.html"); err == nil {
 			sb.WriteString(InterpolateEnv(string(headHTML), app.Dir))
@@ -368,19 +408,24 @@ func readFile(dir, name string) ([]byte, error) {
 
 // buildSEOTags generates comprehensive meta tags: SEO, Open Graph, Twitter, JSON-LD, AI discoverability.
 func buildSEOTags(app *App, page *Page, title string) string {
+	return buildSEOTagsAt(app, page, title, pageSEOPath(page))
+}
+
+// buildSEOTagsAt is buildSEOTags with the page path that canonical, og:url and
+// the WebPage/BreadcrumbList JSON-LD name: the route, or for a route with path
+// parameters this request's record (/event/42). "" emits none of them.
+func buildSEOTagsAt(app *App, page *Page, title, canonicalPath string) string {
 	var sb strings.Builder
 
 	siteName := ""
 	siteDesc := ""
 	siteImage := ""
 	siteURL := ""
-	brand := ""
 	if app != nil && app.Design != nil {
 		siteName = app.Design.SEO["site_name"]
 		siteDesc = app.Design.SEO["description"]
 		siteImage = app.Design.SEO["image"]
 		siteURL = app.Design.SEO["url"]
-		brand = app.Design.Colors["_brand"]
 	}
 
 	desc := siteDesc
@@ -404,12 +449,12 @@ func buildSEOTags(app *App, page *Page, title string) string {
 	}
 	sb.WriteString(fmt.Sprintf(`<meta name="robots" content="%s">`, html.EscapeString(robots)))
 
-	// Theme color (for browser UI)
+	// Theme color (for browser UI): pwa.theme_color, else the brand color.
 	themeColor := "#09090b"
-	if brand != "" {
-		themeColor = brand
+	if c := pwaThemeColor(app); c != "" {
+		themeColor = c
 	}
-	sb.WriteString(fmt.Sprintf(`<meta name="theme-color" content="%s">`, themeColor))
+	sb.WriteString(fmt.Sprintf(`<meta name="theme-color" content="%s">`, html.EscapeString(themeColor)))
 	// Respect the app's theme mode for color-scheme. Default to "light" so
 	// form controls (checkboxes, radios) don't render with dark-mode styling
 	// on users' systems. Only apps that explicitly set mode: dark get "dark".
@@ -447,9 +492,10 @@ func buildSEOTags(app *App, page *Page, title string) string {
 	if image != "" {
 		sb.WriteString(fmt.Sprintf(`<meta property="og:image" content="%s">`, html.EscapeString(image)))
 	}
-	if siteURL != "" && page != nil {
-		sb.WriteString(fmt.Sprintf(`<meta property="og:url" content="%s%s">`, siteURL, page.Route))
-		sb.WriteString(fmt.Sprintf(`<link rel="canonical" href="%s%s">`, siteURL, page.Route))
+	if siteURL != "" && page != nil && canonicalPath != "" {
+		href := canonicalHref(siteURL, canonicalPath)
+		sb.WriteString(fmt.Sprintf(`<meta property="og:url" content="%s">`, href))
+		sb.WriteString(fmt.Sprintf(`<link rel="canonical" href="%s">`, href))
 	} else if siteURL != "" {
 		sb.WriteString(fmt.Sprintf(`<meta property="og:url" content="%s">`, siteURL))
 	}
@@ -516,12 +562,16 @@ func buildSEOTags(app *App, page *Page, title string) string {
 	}
 
 	// JSON-LD: WebPage schema (every page)
-	if siteURL != "" && route != "" {
+	urlPath := ""
+	if page != nil {
+		urlPath = canonicalPath
+	}
+	if siteURL != "" && urlPath != "" {
 		webpage := map[string]any{
 			"@context": "https://schema.org",
 			"@type":    "WebPage",
 			"name":     title,
-			"url":      siteURL + route,
+			"url":      siteURL + urlPath,
 		}
 		if desc != "" {
 			webpage["description"] = desc
@@ -530,8 +580,8 @@ func buildSEOTags(app *App, page *Page, title string) string {
 	}
 
 	// JSON-LD: BreadcrumbList (auto-generated from URL path)
-	if siteURL != "" && route != "" && route != "/" {
-		parts := strings.Split(strings.Trim(route, "/"), "/")
+	if siteURL != "" && urlPath != "" && urlPath != "/" {
+		parts := strings.Split(strings.Trim(urlPath, "/"), "/")
 		items := []map[string]any{{
 			"@type":    "ListItem",
 			"position": 1,
@@ -541,10 +591,14 @@ func buildSEOTags(app *App, page *Page, title string) string {
 		path := ""
 		for i, part := range parts {
 			path += "/" + part
+			name := part
+			if unescaped, err := url.PathUnescape(part); err == nil {
+				name = unescaped // a path-parameter value, re-escaped in urlPath
+			}
 			items = append(items, map[string]any{
 				"@type":    "ListItem",
 				"position": i + 2,
-				"name":     strings.Title(strings.ReplaceAll(part, "-", " ")),
+				"name":     strings.Title(strings.ReplaceAll(name, "-", " ")),
 				"item":     siteURL + path,
 			})
 		}
@@ -612,6 +666,11 @@ func pagePubliclyListable(page *Page) bool {
 	}
 	if page.Auth == "required" || page.Type != "" || page.Require != "" ||
 		pageRole(page) != "" || page.Redirect != "" {
+		return false
+	}
+	// A route with path parameters (/event/:id) is a pattern, not a URL:
+	// listing it sends crawlers to a page with no record.
+	if pageRouteHasParams(page.Route) {
 		return false
 	}
 	return page.Robots != "noindex"
@@ -732,50 +791,136 @@ func GenerateLLMsTxt(app *App, baseURL string) string {
 	return sb.String()
 }
 
-// GenerateSecurityTxt creates a /.well-known/security.txt file.
-func GenerateSecurityTxt(app *App, baseURL string) string {
-	contact := ""
-	if app != nil && app.Design != nil {
-		if c := app.Design.SEO["security_contact"]; c != "" {
-			contact = c
-		}
+// securityTxtContact is the RFC 9116 Contact URI for seo.security_contact:
+// an address becomes mailto:, a value that already names a scheme (mailto:,
+// tel:, https:) is kept. "" when none is configured, or when the value spans
+// lines (it would add fields of its own).
+func securityTxtContact(app *App) string {
+	if app == nil || app.Design == nil {
+		return ""
 	}
-	return fmt.Sprintf("Contact: mailto:%s\nPreferred-Languages: en\nCanonical: %s/.well-known/security.txt\n", contact, baseURL)
+	c := strings.TrimSpace(app.Design.SEO["security_contact"])
+	if c == "" || strings.ContainsAny(c, "\r\n") {
+		return ""
+	}
+	if !uriSchemeRe.MatchString(c) && strings.Contains(c, "@") {
+		c = "mailto:" + c
+	}
+	return c
 }
 
-// GenerateAtomFeed creates an Atom feed of public pages.
+// uriSchemeRe matches a value that starts with a URI scheme (RFC 3986).
+var uriSchemeRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
+
+// GenerateSecurityTxt creates /.well-known/security.txt (RFC 9116). Contact
+// and Expires are required, so with no seo.security_contact there is no file
+// (ok false: the route answers 404) rather than an invalid one. Expires is the
+// start of the current UTC day plus 364 days: under a year ahead, as the RFC
+// recommends, and identical for every request that day so caches agree.
+func GenerateSecurityTxt(app *App, baseURL string, now time.Time) (string, bool) {
+	contact := securityTxtContact(app)
+	if contact == "" {
+		return "", false
+	}
+	expires := now.UTC().Truncate(24*time.Hour).AddDate(0, 0, 364)
+	return fmt.Sprintf("Contact: %s\nExpires: %s\nPreferred-Languages: %s\nCanonical: %s/.well-known/security.txt\n",
+		contact, expires.Format(time.RFC3339), getLang(app), baseURL), true
+}
+
+// atomPageUpdated is when a listed page last changed: the modification time
+// of its source file. ok is false when the file can't be read (a page set
+// built in memory).
+func atomPageUpdated(app *App, page *Page) (time.Time, bool) {
+	if app == nil || app.Dir == "" || page == nil || page.File == "" {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(filepath.Join(app.Dir, filepath.Base(page.File)))
+	if err != nil || info.IsDir() {
+		return time.Time{}, false
+	}
+	return info.ModTime().UTC().Truncate(time.Second), true
+}
+
+// GenerateAtomFeed creates an Atom feed (RFC 4287) of public pages, newest
+// first. Each entry's <updated> is its page file's modification time; the
+// feed's is the newest of those, else app.yaml's, else process start. The
+// feed-level <author> (seo.author, else the site name) covers every entry.
 func GenerateAtomFeed(app *App, baseURL string) string {
 	siteName := "App"
+	author := ""
 	if app != nil && app.Design != nil {
 		if n := app.Design.SEO["site_name"]; n != "" {
 			siteName = n
 		}
+		author = strings.TrimSpace(app.Design.SEO["author"])
 	}
+	if author == "" {
+		author = siteName
+	}
+
+	type feedEntry struct {
+		route, title, desc string
+		updated            time.Time
+		dated              bool
+	}
+	var entries []feedEntry
+	var newest time.Time
+	if app != nil {
+		for route, page := range app.Pages {
+			if !pagePubliclyListable(page) {
+				continue
+			}
+			title := page.Title
+			if title == "" {
+				title = strings.TrimPrefix(route, "/")
+				if title == "" {
+					title = "Home"
+				}
+			}
+			e := feedEntry{route: route, title: title, desc: page.Description}
+			e.updated, e.dated = atomPageUpdated(app, page)
+			if e.dated && e.updated.After(newest) {
+				newest = e.updated
+			}
+			entries = append(entries, e)
+		}
+	}
+	if newest.IsZero() && app != nil && app.Dir != "" {
+		if info, err := os.Stat(filepath.Join(app.Dir, "app.yaml")); err == nil {
+			newest = info.ModTime().UTC().Truncate(time.Second)
+		}
+	}
+	if newest.IsZero() {
+		newest = startTime.UTC().Truncate(time.Second)
+	}
+	for i := range entries {
+		if !entries[i].dated {
+			entries[i].updated = newest
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].updated.Equal(entries[j].updated) {
+			return entries[i].updated.After(entries[j].updated)
+		}
+		return entries[i].route < entries[j].route
+	})
 
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
 	sb.WriteString(fmt.Sprintf(`<feed xmlns="http://www.w3.org/2005/Atom"><title>%s</title><link href="%s"/>`, html.EscapeString(siteName), html.EscapeString(baseURL)))
 	sb.WriteString(fmt.Sprintf(`<link rel="self" href="%s/feed.xml"/>`, html.EscapeString(baseURL)))
 	sb.WriteString(fmt.Sprintf(`<id>%s/</id>`, html.EscapeString(baseURL)))
+	sb.WriteString(fmt.Sprintf(`<updated>%s</updated>`, newest.Format(time.RFC3339)))
+	sb.WriteString(fmt.Sprintf(`<author><name>%s</name></author>`, html.EscapeString(author)))
 
-	for route, page := range app.Pages {
-		if !pagePubliclyListable(page) {
-			continue
-		}
-		title := page.Title
-		if title == "" {
-			title = strings.TrimPrefix(route, "/")
-			if title == "" {
-				title = "Home"
-			}
-		}
-		desc := page.Description
+	for _, e := range entries {
 		sb.WriteString(`<entry>`)
-		sb.WriteString(fmt.Sprintf(`<title>%s</title>`, html.EscapeString(title)))
-		sb.WriteString(fmt.Sprintf(`<link href="%s%s"/>`, html.EscapeString(baseURL), html.EscapeString(route)))
-		sb.WriteString(fmt.Sprintf(`<id>%s%s</id>`, html.EscapeString(baseURL), html.EscapeString(route)))
-		if desc != "" {
-			sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, html.EscapeString(desc)))
+		sb.WriteString(fmt.Sprintf(`<title>%s</title>`, html.EscapeString(e.title)))
+		sb.WriteString(fmt.Sprintf(`<link href="%s%s"/>`, html.EscapeString(baseURL), html.EscapeString(e.route)))
+		sb.WriteString(fmt.Sprintf(`<id>%s%s</id>`, html.EscapeString(baseURL), html.EscapeString(e.route)))
+		sb.WriteString(fmt.Sprintf(`<updated>%s</updated>`, e.updated.Format(time.RFC3339)))
+		if e.desc != "" {
+			sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, html.EscapeString(e.desc)))
 		}
 		sb.WriteString(`</entry>`)
 	}

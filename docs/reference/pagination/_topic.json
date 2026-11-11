@@ -1,0 +1,11 @@
+{
+  "keys": [
+    "sdk_offset",
+    "page_cap",
+    "cursor_contract",
+    "summary",
+    "offset_example",
+    "cursor_example",
+    "js_snippet"
+  ]
+}

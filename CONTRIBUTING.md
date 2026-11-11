@@ -43,7 +43,7 @@ command in the framework edition. See `benmore help` and `benmore docs`.
 - Keep the framework **app-agnostic**: no hardcoded domains, emails, or
   branding. Configuration comes from `app.yaml` / `env.yaml` / CLI flags.
 - All SQL is parameterized - never concatenate user input into queries.
-- `go vet ./...` must pass before you open a PR.
+- `go vet -tags sqlite_fts5 ./...` must pass before you open a PR.
 - Match the style of the surrounding code.
 - If an app-building agent gets stuck in a loop, stop and inspect the loop
   before adding code. The framework may already support the behavior and the

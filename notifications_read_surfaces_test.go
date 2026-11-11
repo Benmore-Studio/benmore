@@ -85,7 +85,7 @@ func TestNotificationBadgeAndLiveHintsHonorCredentialScopes(t *testing.T) {
 	}
 }
 
-func TestNotificationReadSurfacesSeparateRoleAndEdgeScopes(t *testing.T) {
+func TestNotificationReadSurfacesSeparateRoleAndCredentialScopes(t *testing.T) {
 	app := ssrTestApp(t)
 	EnsureNotificationsTable(app.DB)
 	crudScopeMustExec(t, app.DB, "INSERT INTO _benmore_notifications(user_id,title) VALUES(5,'private')")
@@ -96,9 +96,8 @@ func TestNotificationReadSurfacesSeparateRoleAndEdgeScopes(t *testing.T) {
 	}{
 		{"role-scopes-are-not-delegation", &Session{UserID: 5, Scopes: "notes:read"}, true},
 		{"scoped-admin", &Session{UserID: 5, Role: "admin", CredentialScopes: "notes:read"}, false},
-		{"edge-empty", &Session{UserID: 5, ID: "edge:badge"}, false},
-		{"edge-unrelated", &Session{UserID: 5, ID: "edge:badge", CredentialScopes: "notes:read"}, false},
-		{"edge-read", &Session{UserID: 5, ID: "edge:badge", CredentialScopes: "_notifications:read"}, true},
+		{"scoped-unrelated", &Session{UserID: 5, ID: "apitoken:1", CredentialScopes: "notes:read"}, false},
+		{"scoped-read", &Session{UserID: 5, ID: "apitoken:1", CredentialScopes: "_notifications:read"}, true},
 		{"anonymous", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

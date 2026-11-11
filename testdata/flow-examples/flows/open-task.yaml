@@ -1,0 +1,22 @@
+# flows/open-task.yaml - send the caller to the task's tracker, or to its page here
+on:
+  request:
+    method: GET
+    path: /api/tasks/:id/open
+    auth: required
+jobs:
+  open:
+    steps:
+      - id: task
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT id, tracker_url FROM tasks WHERE id = :id AND user_id = :user_id" }
+      - if: ${{ steps.task.outputs.tracker_url }}
+        run: redirect
+        with:
+          to: "${{ steps.task.outputs.tracker_url }}"   # a stored URL on another host
+          allow_hosts: [tracker.example.com]            # the only hosts it may leave the app for
+        else:                                           # runs when the if: above is false
+          - run: redirect
+            with:
+              to: "/tasks/${{ steps.task.outputs.id }}"

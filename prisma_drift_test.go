@@ -51,7 +51,11 @@ func TestDetectSchemaDrift_MissingTable(t *testing.T) {
 		Fields: []PrismaField{{Column: "id", Type: "INTEGER"}}}}
 	drifts, _ := DetectSchemaDrift(db, models)
 	if len(drifts) != 1 || drifts[0].Kind != "missing_table" {
-		t.Errorf("expected missing_table, got %v", drifts)
+		t.Fatalf("expected missing_table, got %v", drifts)
+	}
+	// r1104 finding 12: the advice read "Restart the app or restart the app".
+	if detail := drifts[0].Detail; strings.Contains(strings.ToLower(detail), "restart the app or restart") || !strings.Contains(detail, "Restart the app to apply pending migrations") {
+		t.Errorf("missing_table advice: %q", detail)
 	}
 }
 

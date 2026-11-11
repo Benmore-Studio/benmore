@@ -1,0 +1,73 @@
+// An app as it exists today: ordinary names, and names that are SQL
+// keywords SQLite accepts bare (key, desc, action, offset, first, last, end,
+// plan, query, view, cast, raise).
+
+model Project {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  name      String
+  key       String   @unique
+  desc      String?
+  action    String   @default("none")
+  offset    Int      @default(0)
+  total     Int      @default(0)
+  priority  Int      @default(0)
+  slug      String?  @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+  tasks     Task[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([priority])
+  @@map("projects")
+}
+
+model Task {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  projectId Int       @map("project_id")
+  project   Project   @relation(fields: [projectId], references: [id])
+  title     String
+  first     String?
+  last      String?
+  end       DateTime?
+  plan      String?
+  query     String?
+  view      Int       @default(0)
+  cast      String?
+  raise     Float?
+  quantity  Int       @default(1)
+  price     Float     @default(0)
+  amount    Float     @default(0)
+  range     Int       @default(0)
+  dueAt     DateTime  @default(now()) @map("due_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([projectId])
+  @@unique([projectId, title])
+  @@fulltext([title, plan])
+  @@map("tasks")
+}
+
+model Membership {
+  projectId Int    @map("project_id")
+  userId    Int    @map("user_id")
+  level     String @default("member")
+  joinedAt  DateTime @default(now()) @map("joined_at")
+
+  @@id([projectId, userId])
+  @@map("memberships")
+}
+
+model Note {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  body      String
+  filter    String?
+  window    String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("notes")
+}

@@ -113,7 +113,7 @@ func credentialManagementSessionWith(db rowQuerier, session *Session, strict boo
 // database failure is returned instead of being folded into "not allowed", so
 // a caller can tell a refusal from an unhealthy store.
 func credentialManagementSessionErr(db rowQuerier, session *Session, strict bool) (bool, error) {
-	if session == nil || session.ActingAsGroup != "" || strings.HasPrefix(session.ID, "apitoken:") || strings.HasPrefix(session.ID, "edge:") {
+	if session == nil || session.ActingAsGroup != "" || strings.HasPrefix(session.ID, "apitoken:") {
 		return false, nil
 	}
 	var valid int
@@ -131,8 +131,8 @@ func credentialManagementSessionErr(db rowQuerier, session *Session, strict bool
 // IsAdminConsole reports whether s may use the app's admin-only management
 // surfaces (admin panel, audit log, webhooks, jobs, schema fields, analytics,
 // key rotation, test reset): an admin whose credential is not delegated. A
-// scoped API token or Bearer session, or an edge identity, carries only the
-// scopes it was minted with, even when an admin minted it. Row visibility
+// scoped API token or Bearer session carries only the scopes it was minted
+// with, even when an admin minted it. Row visibility
 // keeps using IsAdmin, so an admin's orders:read token still reads all orders.
 func (s *Session) IsAdminConsole() bool {
 	return s != nil && s.IsAdmin() && accountManagementSession(s)
@@ -141,14 +141,13 @@ func (s *Session) IsAdminConsole() bool {
 // accountManagementSession reports whether session may manage the account
 // itself: profile edits, sessions, API tokens, MFA, password. A scoped
 // credential (an API token or Bearer session narrowed to, say, notes:read)
-// and an edge-bridge identity are delegated access - handing one to an
-// integration must not let it rewrite the profile or list and revoke the
-// owner's other credentials. Unscoped ("" / "*") credentials qualify;
+// is delegated access - handing one to an integration must not let it
+// rewrite the profile or list and revoke the owner's other credentials. Unscoped ("" / "*") credentials qualify;
 // endpoints that also exclude API tokens or support sessions add
 // credentialManagementSession / directLoginSession on top. (Minting stays
 // open to scoped sessions: scopesWithin already caps it at a subset.)
 func accountManagementSession(session *Session) bool {
-	if session == nil || strings.HasPrefix(session.ID, "edge:") {
+	if session == nil {
 		return false
 	}
 	return session.CredentialScopes == "" || session.CredentialScopes == "*"
@@ -181,7 +180,7 @@ func delegatedIdentitySession(app *App, session *Session) bool {
 	if session.ImpersonatorUserID != 0 {
 		return true
 	}
-	if strings.HasPrefix(session.ID, "apitoken:") || strings.HasPrefix(session.ID, "edge:") {
+	if strings.HasPrefix(session.ID, "apitoken:") {
 		return false
 	}
 	if app == nil || app.DB == nil {
@@ -263,11 +262,11 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	// CSRF: this mint is a cookie-session mutation like its siblings
 	// (settings/mfa/profile, and handleRevokeAPIToken below). Without it a
-	// logged-in victim could be navigated to /bmp-auth (or have this endpoint
-	// POSTed cross-site) and a full-scope bmr_ token minted on their behalf.
-	// requireCSRF exempts Bearer callers, so the CLI/MCP/SDK are unaffected;
-	// bmp-auth.html already sends X-CSRF-Token, so no legitimate browser
-	// client breaks. (Task 22 folded in.)
+	// logged-in victim could be navigated to a page that mints on load (or
+	// have this endpoint POSTed cross-site) and a full-scope bmr_ token
+	// minted on their behalf. requireCSRF exempts Bearer callers, so the
+	// CLI/MCP/SDK are unaffected; a legitimate browser caller sends
+	// X-CSRF-Token from the page's csrf-token meta tag. (Task 22 folded in.)
 	if !requireCSRF(w, r) {
 		return
 	}
@@ -313,6 +312,17 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 		t := time.Now().Add(dur).UTC().Format(time.RFC3339)
 		expiresAt = &t
 	}
+	// A token minted from a narrowed session (app scopes, embed) or from a
+	// password-for-Bearer exchange session expires no later than that
+	// session. Those sessions are not a person's interactive sign-in, and a
+	// token without an expiry turned one bounded credential into a permanent
+	// one. Ordinary sign-in sessions keep the caller's expiry.
+	capped, err := apiTokenExpiryForSession(app.DB, session, expiresAt)
+	if err != nil {
+		serverErrorJSON(w, r, app, "api tokens", err, "failed to create token")
+		return
+	}
+	expiresAt = capped
 
 	stored, err := insertAPITokenWithinCap(app.DB, session.UserID, body.Name, tokenHash, body.Scopes, expiresAt)
 	if err != nil {
@@ -320,7 +330,7 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	if !stored {
-		httpJSON(w, http.StatusConflict, map[string]any{"error": "api_token_limit", "message": apiTokenCapMessage, "limit": maxAPITokensPerUser})
+		httpJSON(w, http.StatusConflict, withRefusalDocs(map[string]any{"error": "api_token_limit", "message": apiTokenCapMessage, "limit": maxAPITokensPerUser}, "api_token_limit"))
 		return
 	}
 
@@ -329,7 +339,41 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 		"token":  rawToken,
 		"name":   body.Name,
 		"scopes": body.Scopes,
+		"expires_at": func() any {
+			if expiresAt == nil {
+				return nil
+			}
+			return *expiresAt
+		}(),
 	})
+}
+
+// apiTokenExpiryForSession caps a new API token's expiry at the minting
+// session's own expiry when that session is scoped (not ” or '*') or came
+// from the token exchange (login_at = loginAtTokenExchange). A failed read or
+// an unparseable expiry is an error: the mint fails closed.
+func apiTokenExpiryForSession(db rowQuerier, session *Session, requested *string) (*string, error) {
+	var sessExpires, scopes string
+	var loginAt int64
+	if err := db.QueryRow("SELECT COALESCE(expires_at,''), COALESCE(scopes,''), COALESCE(login_at,0) FROM _benmore_sessions WHERE id=?", session.ID).Scan(&sessExpires, &scopes, &loginAt); err != nil {
+		return nil, fmt.Errorf("read minting session: %w", err)
+	}
+	if (scopes == "" || scopes == "*") && loginAt != loginAtTokenExchange {
+		return requested, nil
+	}
+	limit, err := time.Parse(time.RFC3339, sessExpires)
+	if err != nil {
+		if limit, err = time.Parse("2006-01-02 15:04:05", sessExpires); err != nil {
+			return nil, fmt.Errorf("minting session expiry %q: %w", sessExpires, err)
+		}
+	}
+	if requested != nil {
+		if want, err := time.Parse(time.RFC3339, *requested); err == nil && !want.After(limit) {
+			return requested, nil
+		}
+	}
+	capped := limit.UTC().Format(time.RFC3339)
+	return &capped, nil
 }
 
 // handleListAPITokens lists the authenticated user's API tokens.

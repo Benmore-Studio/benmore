@@ -1,0 +1,6 @@
+[
+  "inherits: accepts a single string or a list. Cycles are detected and broken at load (a parent re-entering the chain is silently skipped).",
+  "Grant scoping: POST .../roles {\"role\":\"admin\"} is GLOBAL; POST .../roles {\"role\":\"admin\",\"group_id\":\"1\"} applies ONLY when acting in group 1. Session resolution filters tenant-scoped grants by the request's effective group (act-as target when set, else native group) - so session.Roles only contains roles relevant to the current request's group. A group_id needs `groups:` in app.yaml: in an app without it the grant is refused 400 (omit group_id for a global grant).",
+  "expires_at is optional RFC3339; expired grants are filtered at session-load and GC'd by a 5-min background sweep that audit-logs each eviction.",
+  "PATCH/DELETE targeting: omit group_id to target the GLOBAL grant (group_id IS NULL); set group_id=X for that group's grant; DELETE ...?group_id=all removes every variant in one shot."
+]

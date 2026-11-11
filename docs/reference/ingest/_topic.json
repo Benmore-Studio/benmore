@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "hooks",
+    "completion",
+    "time_limits",
+    "summary",
+    "rate_limit",
+    "endpoint",
+    "content_type",
+    "js_snippet",
+    "see_also"
+  ]
+}

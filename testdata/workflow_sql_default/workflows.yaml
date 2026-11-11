@@ -1,0 +1,16 @@
+orders:
+  table: orders
+  field: status
+  initial: draft
+  states: [draft, done]
+  transitions:
+    draft:
+      done: {}
+tickets:
+  table: tickets
+  field: status
+  initial: new
+  states: [new, closed]
+  transitions:
+    new:
+      closed: {}

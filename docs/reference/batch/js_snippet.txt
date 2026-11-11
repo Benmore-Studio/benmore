@@ -1,0 +1,13 @@
+// Bulk create
+await fetch('/api/notes/batch', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  body: JSON.stringify([{ title: 'A' }, { title: 'B' }, { title: 'C' }]),
+});
+
+// Bulk update - set status='done' on many rows
+await fetch('/api/notes/batch', {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  body: JSON.stringify({ ids: [1, 2, 3], fields: { status: 'done' } }),
+});

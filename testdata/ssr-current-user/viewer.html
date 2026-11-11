@@ -1,0 +1,14 @@
+<page title="Viewer" layout="none">
+<p id="plain">[{{current_user}}]</p>
+<p id="triple">[{{{current_user}}}]</p>
+<p id="quad">[{{{{current_user}}}}]</p>
+<p id="json">[{{current_user | json}}]</p>
+<p id="dot">[{{current_user.Email}}|{{current_user.email}}|{{current_user.ID}}]</p>
+<p id="attr" title="{{current_user}}">attr</p>
+<a id="href" href="/x?u={{current_user}}">link</a>
+<script>var viewer = {{current_user}}; var viewerText = "{{current_user}}";</script>
+<p id="section">[{{#current_user}}SIGNED-IN{{/current_user}}]</p>
+<p id="inverted">[{{^current_user}}SIGNED-OUT{{/current_user}}]</p>
+<p id="if">[{{#if current_user}}IF-IN{{else}}IF-OUT{{/if}}]</p>
+<p id="user">[{{#user}}USER-IN{{/user}}{{^user}}USER-OUT{{/user}}]</p>
+</page>

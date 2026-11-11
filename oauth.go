@@ -358,7 +358,7 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 	}
 
 	if isPrivateURL(provider.TokenURL) {
-		serverErrorStatus(w, r, app, http.StatusBadGateway, "oauth "+name, fmt.Errorf("OAuth blocked: provider %s TokenURL is private/internal", provider.Name), "OAuth provider misconfigured")
+		serverErrorStatus(w, r, app, http.StatusInternalServerError, "oauth "+name, fmt.Errorf("OAuth blocked: provider %s TokenURL is private/internal", provider.Name), "OAuth provider misconfigured")
 		return
 	}
 	req, _ := http.NewRequest("POST", provider.TokenURL, strings.NewReader(tokenData.Encode()))
@@ -400,7 +400,7 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 	// so this only adds a binding check, never a new trust assumption.
 	if expectedNonce != "" {
 		if idTok, _ := tokenResp["id_token"].(string); idTok != "" {
-			if claimNonce, present := oauthIDTokenNonce(idTok); present && claimNonce != expectedNonce {
+			if oauthIDTokenNonceMismatch(idTok, expectedNonce) {
 				log.Printf("OAuth nonce mismatch for provider %s: rejecting id_token", provider.Name)
 				http.Error(w, "Authentication failed", http.StatusBadRequest)
 				return
@@ -410,7 +410,7 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 
 	// Get user info
 	if isPrivateURL(provider.UserInfoURL) {
-		serverErrorStatus(w, r, app, http.StatusBadGateway, "oauth "+name, fmt.Errorf("OAuth blocked: provider %s UserInfoURL is private/internal", provider.Name), "OAuth provider misconfigured")
+		serverErrorStatus(w, r, app, http.StatusInternalServerError, "oauth "+name, fmt.Errorf("OAuth blocked: provider %s UserInfoURL is private/internal", provider.Name), "OAuth provider misconfigured")
 		return
 	}
 	req, _ = http.NewRequest("GET", provider.UserInfoURL, nil)
@@ -622,7 +622,11 @@ func oauthFindOrCreateUser(app *App, email, displayName string, emailVerified bo
 					return 0, err
 				}
 			}
-			markEmailVerified(app, userID, email)
+			// The sign-in stops here if the mark is not stored: the next
+			// one finds the account unverified again and repeats this.
+			if err := markEmailVerified(app, userID, email); err != nil {
+				return 0, err
+			}
 		}
 		return userID, nil
 	}
@@ -651,7 +655,11 @@ func oauthFindOrCreateUser(app *App, email, displayName string, emailVerified bo
 	// A provider-proven address verifies the new account and activates the
 	// invites waiting on it; an unproven one leaves both for later.
 	if emailVerified {
-		markEmailVerified(app, userID, email)
+		// Not stored: no sign-in. The account exists unverified, so the
+		// next sign-in takes the existing-account path above and marks it.
+		if err := markEmailVerified(app, userID, email); err != nil {
+			return 0, err
+		}
 	}
 	return userID, nil
 }
@@ -805,6 +813,15 @@ func oauthIDTokenNonce(idToken string) (string, bool) {
 		return "", false
 	}
 	return n, true
+}
+
+// oauthIDTokenNonceMismatch reports an id_token that carries a nonce claim
+// other than the one this sign-in sent. A token without the claim is not a
+// mismatch (oauthIDTokenNonce). The nonce is this browser's sign-in secret,
+// so it is compared in constant time, like the state value.
+func oauthIDTokenNonceMismatch(idToken, expectedNonce string) bool {
+	claimNonce, present := oauthIDTokenNonce(idToken)
+	return present && subtle.ConstantTimeCompare([]byte(claimNonce), []byte(expectedNonce)) != 1
 }
 
 // HasOAuthProviders returns true if any OAuth provider is configured.

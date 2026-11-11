@@ -35,11 +35,11 @@ func TestEmailAllowedForApp(t *testing.T) {
 
 		// Closed exact-allowlist mode: domain empty + allow_emails set → ONLY
 		// the listed addresses pass, even a same-domain non-listed address.
-		{"exact-only: listed passes", mk("", "richard@benmore.tech, x@gmail.com"), "richard@benmore.tech", true},
-		{"exact-only: second listed passes", mk("", "richard@benmore.tech, x@gmail.com"), "x@gmail.com", true},
-		{"exact-only: same-domain but unlisted rejected", mk("", "richard@benmore.tech"), "intern@benmore.tech", false},
-		{"exact-only: unrelated rejected", mk("", "richard@benmore.tech"), "anyone@gmail.com", false},
-		{"exact-only: case-insensitive", mk("", "Richard@Benmore.Tech"), "richard@benmore.tech", true},
+		{"exact-only: listed passes", mk("", "dana@example.org, x@gmail.com"), "dana@example.org", true},
+		{"exact-only: second listed passes", mk("", "dana@example.org, x@gmail.com"), "x@gmail.com", true},
+		{"exact-only: same-domain but unlisted rejected", mk("", "dana@example.org"), "intern@example.org", false},
+		{"exact-only: unrelated rejected", mk("", "dana@example.org"), "anyone@gmail.com", false},
+		{"exact-only: case-insensitive", mk("", "Dana@Example.Org"), "dana@example.org", true},
 	}
 
 	for _, c := range cases {

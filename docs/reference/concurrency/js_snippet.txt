@@ -1,0 +1,16 @@
+// Read with timestamp
+const note = await fetch('/api/notes/1', { credentials: 'same-origin' }).then(r => r.json());
+
+// Update with the timestamp - fails fast if someone beat us to it
+const res = await fetch('/api/notes/1', {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+  credentials: 'same-origin',
+  body: JSON.stringify({
+    title: 'New title',
+    _expected_updated_at: note.updated_at,
+  }),
+});
+if (res.status === 409) {
+  // Refetch + re-prompt the user.
+}

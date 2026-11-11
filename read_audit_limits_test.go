@@ -33,7 +33,7 @@ func TestReadAuditPageLimitsPreserveActorIsolation(t *testing.T) {
 	RegisterReadAuditAPI(mux, app)
 	// Keep this fixture's flush explicit and deterministic, without a timer.
 	app.readAudit = &readAuditBuffer{db: app.DB}
-	LogReadAccess(app, "notes", "pending", "read", GetSessionFromDB(app.DB, owner))
+	LogReadAccess(app, nil, "notes", "pending", "read", GetSessionFromDB(app.DB, owner))
 	for _, value := range []string{"-1", "0", "1001", "100000", "banana", "1.5", "9999999999999999999999999"} {
 		t.Run("invalid_"+value, func(t *testing.T) {
 			w := crudScopeRequest(t, mux, "GET", "/api/_audit/reads?limit="+url.QueryEscape(value), owner, nil)

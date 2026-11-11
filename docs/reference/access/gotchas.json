@@ -1,0 +1,7 @@
+[
+  "A table WITHOUT user_id or the groups key (a `system_logs`, `feature_flags`, etc.) needs explicit access.<table>.read: everyone, or non-admins will 404.",
+  "role:<name> matches a role the caller actually holds: the users.role column, a grant in the RBAC join table (api({at:'rbac'})), or the in-tenant role from groups.role_field. Declaring a role under `roles:` gives it to no one; a role nobody holds matches no one.",
+  "The rooms/channels/membership shape needs no `read: off` + hand-written EXISTS guards in flows. Declare member-of: and delete such custom flows (or keep them; they coexist fine).",
+  "`auth.public_api` (a comma-separated table list) does not make a table public: an anonymous request still gets 401, and the write gate and `benmore check` warn about the key. A public read is `access.<table>.read: anon`.",
+  "`benmore check` and the post-write check warn (source `security`) when a table whose read mode is `anon` or `everyone` has a column named like personal data (email, phone, address, ssn, dob, card or account numbers, tax or national ids): confirm the exposure is meant, or scope the table."
+]

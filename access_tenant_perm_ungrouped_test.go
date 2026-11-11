@@ -99,7 +99,9 @@ func TestTenantRolePermissionDoesNotPassPermGateOnUngroupedTable(t *testing.T) {
 	assertStatus(t, mux, http.MethodPost, "/api/brokers", global, map[string]any{"name": "by-global"}, http.StatusOK)
 
 	// groups.shared keeps counting tenant-held permissions, as for role:.
+	app.mu.Lock()
 	app.Group.Shared = []string{"brokers"}
+	app.mu.Unlock()
 	assertStatus(t, mux, http.MethodGet, "/api/brokers/1", member, nil, http.StatusOK)
 }
 
@@ -115,7 +117,7 @@ func TestTenantRolePermissionOnTenantRootReachesOnlyOwnTenantRow(t *testing.T) {
 	assertStatus(t, mux, http.MethodPatch, "/api/companies/2", admin, map[string]any{"name": "pwned"}, http.StatusNotFound)
 	assertStatus(t, mux, http.MethodDelete, "/api/companies/2", admin, nil, http.StatusNotFound)
 	assertStatus(t, mux, http.MethodPatch, "/api/companies/1", admin, map[string]any{"name": "acme-renamed"}, http.StatusOK)
-	assertStatus(t, mux, http.MethodPost, "/api/companies", admin, map[string]any{"name": "new-co"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodPost, "/api/companies", admin, map[string]any{"name": "new-co"}, http.StatusForbidden)
 	var name string
 	if err := app.DB.QueryRow("SELECT name FROM companies WHERE id = 2").Scan(&name); err != nil || name != "globex" {
 		t.Fatalf("other tenant's row changed: %q %v", name, err)

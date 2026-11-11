@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 )
 
 func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string) {
@@ -25,26 +27,39 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": errUpdateTarget.Error()})
 		return
 	}
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
 	session := getSession(app, r)
+	// A lock answers 409 only on a row the caller may edit; any other
+	// row is the scoped update's 404, never a confirmation it exists.
+	// An anonymous caller (an `update: anon` table) holds no lock, so any
+	// lock blocks it, the rule DELETE and batch already apply; this check
+	// used to run only with a session, so anonymous PATCH ignored locks.
+	var lockUID int64
 	if session != nil {
-		// A lock answers 409 only on a row the caller may edit; any other
-		// row is the scoped update's 404, never a confirmation it exists.
-		if locked, lockedBy := CheckLock(app.DB, table, id, session.UserID); locked && canAccessRowScoped(app, table, id, session, "edit") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(lockErrorResponse(app.DevMode, lockedBy))
-			return
-		}
+		lockUID = session.UserID
 	}
-	if err := r.ParseForm(); err != nil {
-		httpError(w, "Bad request", http.StatusBadRequest)
+	if locked, lockedBy := CheckLock(app.DB, table, id, lockUID); locked && canAccessRowScoped(app, table, id, session, "edit") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(lockErrorResponse(app.DevMode, lockedBy))
 		return
 	}
-	fields := getUpdateFields(r, app, table)
+	// validateCSRF has already parsed a form body for a cookie request (it
+	// reads the token with FormValue); a Bearer request skips it, so this is
+	// its first parse. Either way parseFormBody reports a body cut by the cap.
+	if err := parseFormBody(r); err != nil {
+		if !answerIfRequestBodyTooLarge(w, err) {
+			httpError(w, "Bad request", http.StatusBadRequest)
+		}
+		return
+	}
+	fields, err := getUpdateFields(r, app, table)
+	if answerIfRequestBodyTooLarge(w, err) {
+		return
+	}
 	expected := ""
 	if value := fields["_expected_updated_at"]; value != nil {
 		expected = jsonToFormValue(value)
@@ -53,6 +68,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		expected = r.FormValue("_expected_updated_at")
 	}
 	delete(fields, "_expected_updated_at")
+	var stripped []string
+	if cols, err := GetTableColumns(app.DB, table); err == nil {
+		names := make([]string, 0, len(fields))
+		for k := range fields {
+			names = append(names, k)
+		}
+		setIgnoredFieldsHeader(w, r, names, cols)
+		stripped = updateStrippedFields(app, table, id, session, fields, cols)
+		if len(stripped) > 0 {
+			w.Header().Set("X-Stripped-Fields", strings.Join(stripped, ","))
+		}
+	}
 	values := make(map[string]any, len(fields))
 	for key, value := range fields {
 		values[key] = value
@@ -75,7 +102,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 			return
 		}
 		if errors.Is(err, errUpdateConflict) {
-			httpJSON(w, http.StatusConflict, map[string]any{"error": "conflict", "message": "Record was modified by another user"})
+			httpJSON(w, http.StatusConflict, withRefusalDocs(map[string]any{"error": "conflict", "message": "Record was modified by another user"}, "conflict"))
 			return
 		}
 		if respondStorageFull(w, app, err) {
@@ -83,8 +110,20 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		}
 		var requestErr *updateRequestError
 		if errors.As(err, &requestErr) && requestErr.noopEcho {
-			// Only unchanged command-owned values were submitted: nothing to write.
+			// Only unchanged echoes were submitted (command-owned values, or
+			// the mask of an encrypted field): nothing to write.
+			addIgnoredFields(w, requestErr.ignored)
 			httpJSON(w, http.StatusOK, map[string]any{"status": "updated"})
+			return
+		}
+		if errors.As(err, &requestErr) && requestErr.noFields && len(stripped) > 0 {
+			// Everything submitted was a column PATCH never writes: say which
+			// and where it does change, instead of a bare "No fields to update".
+			httpJSON(w, http.StatusBadRequest, withRefusalDocs(map[string]any{
+				"error":           requestErr.message,
+				"stripped_fields": stripped,
+				"hint":            strippedUpdateHint(app, table, id, stripped),
+			}, refusalNoFields))
 			return
 		}
 		if errors.As(err, &requestErr) {
@@ -94,6 +133,8 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		}
 		return
 	}
+	// The same decision the pipeline made, on the same row in this tx.
+	addIgnoredFields(w, maskedEchoFields(tx, app, session, table, before, values))
 	if err := tx.Commit(); err != nil {
 		if respondStorageFull(w, app, err) {
 			return
@@ -112,7 +153,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 	injectSessionContext(eventRow, session)
 	FireFlowsForEvent(app, "on_update", table, eventRow)
 	Broadcast(app, table, "update", session)
-	broadcastHookRefreshes(app, refreshTables, []transactionResult{{Table: table, Action: "update"}})
+	broadcastHookRefreshes(app, session, refreshTables, []transactionResult{{Table: table, Action: "update"}})
 	appendHXTrigger(w, "benmore:changed")
 	if isHTMX(r) {
 		w.Header().Set("HX-Refresh", "true")
@@ -120,7 +161,93 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": "updated"})
+	body := map[string]any{"status": "updated"}
+	if len(stripped) > 0 {
+		body["stripped_fields"] = stripped
+		body["hint"] = strippedUpdateHint(app, table, id, stripped)
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// updateStrippedFields names the submitted columns a PATCH drops because no
+// update may write them: the workflow state column, the owner and tenant
+// keys, timestamps, computed and credential columns (protectedUpdateFields).
+// The update saved the other fields and answered 200 with no sign the state
+// change was ignored (Round 2 B8); create already names its drops in
+// X-Stripped-Fields. Like create, an echo of the caller's own user_id or
+// tenant is harmless and not named, nor is an id equal to the path id (a
+// form that sends the whole row back). The list is computed from the
+// request and the schema alone, never from the stored row, so it reveals
+// nothing about the row's values.
+func updateStrippedFields(app *App, table, id string, session *Session, fields map[string]any, cols []Column) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	protected := protectedFields(protectedUpdateFields(app, table))
+	columns := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		columns[sqliteIdentifierFold(c.Name)] = true
+	}
+	groupKey := ""
+	if app.Group != nil {
+		groupKey = app.Group.Key
+	}
+	var stripped []string
+	for name, value := range fields {
+		if name == "" || strings.HasPrefix(name, "_") || !protected.has(name) || !columns[sqliteIdentifierFold(name)] {
+			continue
+		}
+		text := ""
+		if value != nil {
+			text = strings.TrimSpace(valueText(value))
+		}
+		switch {
+		case identIs(name, "id") && text == id:
+			continue
+		case identIs(name, "user_id") && session != nil && text == fmt.Sprint(session.UserID):
+			continue
+		case identIs(name, groupKey) && session != nil && session.EffectiveHasGroup() && text == session.EffectiveGroupID():
+			continue
+		}
+		stripped = append(stripped, name)
+	}
+	slices.Sort(stripped)
+	return stripped
+}
+
+// strippedUpdateHint says why each stripped column was dropped and, for a
+// workflow state column, the route that does change it.
+func strippedUpdateHint(app *App, table, id string, stripped []string) string {
+	var parts, managed []string
+	for _, field := range stripped {
+		if wf := workflowForStateColumn(app, table, field); wf != nil {
+			parts = append(parts, fmt.Sprintf("%s is the state column of the %q workflow and changes only through a transition: POST /api/%s/%s/transition with {\"to\":\"<state>\"} (GET /api/%s/%s/transitions lists the states you may move to)", field, wf.Name, table, id, table, id))
+			continue
+		}
+		managed = append(managed, field)
+	}
+	if len(managed) > 0 {
+		verb := "is"
+		if len(managed) > 1 {
+			verb = "are"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s managed by the framework (owner, tenant, timestamps, computed or credential columns) and never written by PATCH; change it server-side in a flow if the app needs to", strings.Join(managed, ", "), verb))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// workflowForStateColumn returns the workflow whose state column on table is
+// col, or nil.
+func workflowForStateColumn(app *App, table, col string) *Workflow {
+	if app == nil || app.Workflows == nil {
+		return nil
+	}
+	for _, wf := range app.Workflows.Workflows {
+		if wf != nil && wf.Table == table && identIs(wf.Field, col) {
+			return wf
+		}
+	}
+	return nil
 }
 
 // tableHasUniqueUserID reports whether `table` has a single-column UNIQUE

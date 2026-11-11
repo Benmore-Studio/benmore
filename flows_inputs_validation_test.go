@@ -188,3 +188,137 @@ func TestFlowInputValidationRejectsMaskedBody(t *testing.T) {
 		t.Fatalf("masked body accepted: %d %s", w.Code, w.Body.String())
 	}
 }
+
+// An optional input the caller leaves out (or sends as null) takes its
+// declared `default:` everywhere a sent value would land: `${{ params.x }}`,
+// `:x` in SQL and with.params. Defaults were documented but never bound, so a
+// quote request without `hours` failed with template_unresolved (500).
+func TestFlowInputDefaultsAreBound(t *testing.T) {
+	app, _ := auditApp(t)
+	const source = `on:
+  request:
+    method: POST
+    path: /api/quote
+    inputs:
+      service_id: {type: number, required: true}
+      hours: {type: number, default: 1}
+      rush: {type: bool, default: false}
+      tier: {type: enum, values: [standard, rush], default: standard}
+jobs:
+  main:
+    steps:
+      - id: q
+        run: sql
+        with:
+          query: "SELECT :hours * 100 AS cents, CASE WHEN :rush_flag THEN 1 ELSE 0 END AS rush_sql, :tier AS tier_sql"
+          params:
+            rush_flag: '${{ params.rush }}'
+      - run: respond
+        with:
+          json:
+            hours: '${{ params.hours }}'
+            rush: '${{ params.rush }}'
+            tier: '${{ params.tier }}'
+            cents: '${{ steps.q.outputs.cents }}'
+            rush_sql: '${{ steps.q.outputs.rush_sql }}'
+            tier_sql: '${{ steps.q.outputs.tier_sql }}'
+`
+	if msg := ValidateOnWrite("flows/quote.yaml", source); msg != "" {
+		t.Fatalf("write gate refused the flow: %s", msg)
+	}
+	flows, err := parseGHAFlowFile("flows/quote.yaml", []byte(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	RegisterFlows(mux, app, flows)
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/quote", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		return w
+	}
+	for _, tc := range []struct {
+		body string
+		want map[string]any
+	}{
+		{`{"service_id":7}`, map[string]any{"hours": 1.0, "rush": false, "tier": "standard", "cents": 100.0, "rush_sql": 0.0, "tier_sql": "standard"}},
+		{`{"service_id":7,"hours":null,"rush":null}`, map[string]any{"hours": 1.0, "rush": false, "tier": "standard", "cents": 100.0, "rush_sql": 0.0, "tier_sql": "standard"}},
+		{`{"service_id":7,"hours":3,"rush":true,"tier":"rush"}`, map[string]any{"hours": 3.0, "rush": true, "tier": "rush", "cents": 300.0, "rush_sql": 1.0, "tier_sql": "rush"}},
+	} {
+		w := post(tc.body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d body=%s", tc.body, w.Code, w.Body.String())
+		}
+		var got map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s: %v (%s)", tc.body, err, w.Body.String())
+		}
+		for k, v := range tc.want {
+			if got[k] != v {
+				t.Errorf("%s: %s=%#v, want %#v (body %s)", tc.body, k, got[k], v, w.Body.String())
+			}
+		}
+	}
+	// A default never stands in for a required input.
+	if w := post(`{"hours":2}`); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("missing required input: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// An async flow's job carries the defaults, as it carries sent values.
+func TestFlowInputDefaultsReachAsyncJob(t *testing.T) {
+	app, _ := auditApp(t)
+	EnsureJobsTable(app.DB)
+	flow := Flow{Name: "async-defaults", Async: true, Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/async-defaults", Inputs: map[string]FlowInput{"hours": {Type: "number", Default: 2}}}}
+	mux := http.NewServeMux()
+	RegisterFlows(mux, app, []Flow{flow})
+	r := httptest.NewRequest(http.MethodPost, "/api/async-defaults", strings.NewReader(`{}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var payload string
+	if err := app.DB.QueryRow("SELECT payload FROM _benmore_jobs ORDER BY id DESC LIMIT 1").Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		t.Fatalf("payload %q: %v", payload, err)
+	}
+	if data["hours"] != 2.0 {
+		t.Fatalf("job payload hours=%#v, want the default 2 (payload %s)", data["hours"], payload)
+	}
+}
+
+// The write gate refuses a default a caller could not have sent, since it is
+// bound in place of one.
+func TestFlowInputDefaultMustMatchType(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		ok    bool
+	}{
+		{"hours: {type: number, default: 1}", true},
+		{"hours: {type: number, default: 2.5, min: 1, max: 5}", true},
+		{"hours: {type: number, default: lots}", false},
+		{"hours: {type: number, default: 9, max: 5}", false},
+		{"tier: {type: enum, values: [standard, rush], default: express}", false},
+		{"rush: {type: bool, default: yes please}", false},
+		{"rush: {type: bool, default: false}", true},
+		{"day: {type: date, default: '2026-01-31'}", true},
+		{"day: {type: date, default: tomorrow}", false},
+		{"note: {type: text, default: 5}", false},
+	} {
+		source := "on:\n  request:\n    method: POST\n    path: /api/defaults\n    inputs:\n      " + tc.input + "\njobs:\n  main:\n    steps:\n      - run: respond\n        with: {json: {ok: true}}\n"
+		msg := ValidateOnWrite("flows/defaults.yaml", source)
+		if (msg == "") != tc.ok {
+			t.Errorf("%s: write gate=%q, want ok=%v", tc.input, msg, tc.ok)
+		}
+		if !tc.ok && !strings.Contains(msg, "default") {
+			t.Errorf("%s: refusal does not name the default: %q", tc.input, msg)
+		}
+	}
+}

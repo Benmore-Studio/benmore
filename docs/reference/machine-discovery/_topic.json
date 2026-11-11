@@ -1,0 +1,11 @@
+{
+  "keys": [
+    "summary",
+    "audience",
+    "docs_disabled",
+    "requests",
+    "openapi",
+    "llms",
+    "indexing"
+  ]
+}

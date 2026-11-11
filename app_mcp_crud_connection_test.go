@@ -9,8 +9,6 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 func TestAppMCPNativeCRUDProtectsRowsAndPageTotal(t *testing.T) {
@@ -25,7 +23,7 @@ func TestAppMCPNativeCRUDProtectsRowsAndPageTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = conn.Raw(func(raw any) error {
-		sqlite := raw.(*sqlite3.SQLiteConn)
+		sqlite := mustSQLiteConn(raw)
 		return sqlite.RegisterFunc("audit_private_read", func() int64 {
 			// A schema expression must not gain write authority from either query.
 			if _, err := sqlite.Exec("INSERT INTO side_effects DEFAULT VALUES", nil); err != nil {

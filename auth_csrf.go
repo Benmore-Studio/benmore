@@ -12,11 +12,19 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const csrfTokenName = "_csrf"
+
+// csrfPeerSecret, when set, names one more secret whose CSRF tokens this
+// process accepts for r ("" adds none). Only the platform router sets it: on
+// the platform host it also accepts the tokens the _platform dashboard signs
+// with its own secret, because dashboard pages call /platform/* with them
+// (platform_dashboard_account.go). Every app process accepts only its own.
+var csrfPeerSecret func(r *http.Request) string
 
 // generateCSRFToken creates a CSRF token derived from HMAC(secret, random_nonce + timestamp).
 // No storage needed - validation recomputes the HMAC.
@@ -263,11 +271,14 @@ func csrfTokenReason(r *http.Request, token string) (string, bool) {
 	// fallback won't match a bound signature either.
 	payload := nonce + "|" + tsStr
 	sid := authRawSessionID(r)
-	boundSig := authCSRFSign(payload, sid)
-	unboundSig := authCSRFSign(payload, "")
-	if !hmac.Equal([]byte(providedSig), []byte(boundSig)) &&
-		!hmac.Equal([]byte(providedSig), []byte(unboundSig)) {
-		return "hmac_mismatch", false
+	if !csrfSignatureMatches(providedSig, payload, sid, serverSecret) {
+		peer := ""
+		if csrfPeerSecret != nil {
+			peer = csrfPeerSecret(r)
+		}
+		if peer == "" || peer == serverSecret || !csrfSignatureMatches(providedSig, payload, sid, peer) {
+			return "hmac_mismatch", false
+		}
 	}
 
 	// Check expiry (24 hours)
@@ -283,7 +294,45 @@ func csrfTokenReason(r *http.Request, token string) (string, bool) {
 	return "", true
 }
 
-// InjectCSRF adds a hidden CSRF field to all forms in HTML content.
+// csrfSignatureMatches checks a token signature against secret, bound to the
+// request's session or (the legacy form) unbound.
+func csrfSignatureMatches(providedSig, payload, sid, secret string) bool {
+	return hmac.Equal([]byte(providedSig), []byte(authCSRFSignWithSecret(payload, sid, secret))) ||
+		hmac.Equal([]byte(providedSig), []byte(authCSRFSignWithSecret(payload, "", secret)))
+}
+
+// formTagMethodRe reads the method attribute of a <form> opening tag (or of
+// its attribute text). The attribute must start the tag text or follow a
+// separator, so data-method= or formmethod= on the tag are not read.
+var formTagMethodRe = regexp.MustCompile(`(?i)(?:^|[\s"'/])method\s*=\s*["']?\s*([a-z]+)`)
+
+// formTagBodyAttrRe matches the attributes that make a form send its fields
+// in a request body without method="post": HTMX hx-post/put/patch/delete
+// (data- prefixed too) and the mustache :create / :patch directives, which
+// compile to hx-post / hx-patch.
+var formTagBodyAttrRe = regexp.MustCompile(`(?i)(?:^|[\s"'/])(?:(?:data-)?hx-(?:post|put|patch|delete)|:create|:patch)\s*=`)
+
+// formSubmitsBody reports whether a <form> opening tag (or its attribute text)
+// sends its fields in a request body: method="post", or an attribute from
+// formTagBodyAttrRe. Every other form puts its fields in the URL (method="get",
+// hx-get, or no method at all, which the browser submits as GET) or sends
+// nothing (method="dialog"), so it must never carry the CSRF token: a token
+// in a URL reaches browser history, server and CDN logs and Referer headers,
+// and an unbound token is accepted for any session for 24 hours.
+func formSubmitsBody(tag string) bool {
+	if formTagBodyAttrRe.MatchString(tag) {
+		return true
+	}
+	m := formTagMethodRe.FindStringSubmatch(tag)
+	return m != nil && strings.EqualFold(m[1], "post")
+}
+
+// InjectCSRF adds a hidden CSRF field to every form in server-rendered HTML
+// that submits a request body (formSubmitsBody). GET forms - search and
+// filter forms whose fields become the next page's query values - get none,
+// so the token never lands in a URL. A form that already declares a _csrf
+// field still gets the injected one first: the first value is the one read,
+// and a hand-written `value="{{csrf}}"` renders empty.
 func InjectCSRF(content string) string {
 	token := generateCSRFToken()
 	csrfField := fmt.Sprintf(`<input type="hidden" name="%s" value="%s">`, csrfTokenName, token)
@@ -305,7 +354,9 @@ func InjectCSRF(content string) string {
 		}
 		endOfTag := pos + closeIdx + 1
 		result.WriteString(content[i:endOfTag])
-		result.WriteString(csrfField)
+		if formSubmitsBody(content[pos+len("<form") : endOfTag-1]) {
+			result.WriteString(csrfField)
+		}
 		i = endOfTag
 	}
 	return result.String()

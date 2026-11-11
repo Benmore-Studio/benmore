@@ -14,23 +14,28 @@ on:
 
 permissions:
   contents: write # needed to create the GitHub Release + upload assets
+  id-token: write # Sigstore keyless signing of checksums.txt
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
     container:
       # Keep the C cross-compilers pinned; select the patched Go from go.mod.
-      image: ghcr.io/goreleaser/goreleaser-cross:v1.26.3
+      image: ghcr.io/goreleaser/goreleaser-cross:v1.26.3@sha256:7fa2f6adefc63b9d51daa5678c1f37349583e55bfa0ebead1665443014d346d0
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # full history so the changelog can be built
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: false
+
+      # cosign signs checksums.txt (goreleaser `signs:`); verify a release with
+      # cosign verify-blob --bundle checksums.txt.sigstore.json (see SECURITY.md).
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

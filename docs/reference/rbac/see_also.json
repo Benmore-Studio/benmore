@@ -1,0 +1,6 @@
+[
+  "api({at:'access'})",
+  "api({at:'scoping'})",
+  "api({at:'act-as'})",
+  "api({at:'auth'})"
+]

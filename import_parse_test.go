@@ -194,7 +194,9 @@ func TestCSVSourceDisjointHeaderErrors(t *testing.T) {
 func TestNDJSONSource(t *testing.T) {
 	cols := []Column{{Name: "sku", Type: "TEXT"}, {Name: "qty", Type: "INTEGER"}}
 	// Blank lines are skipped; an absent key (present in the first object,
-	// missing from a later one) is NULL; JSON types survive.
+	// missing from a later one) is importMissing, so the loader leaves the
+	// column out of that row's INSERT and it takes its DEFAULT; JSON types
+	// survive.
 	in := "{\"sku\":\"ABC\",\"qty\":7}\n\n{\"sku\":\"DEF\"}\n"
 	src, eff, err := newNDJSONSource(strings.NewReader(in), cols)
 	if err != nil {
@@ -219,8 +221,8 @@ func TestNDJSONSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Next: %v", err)
 	}
-	if row[1] != nil {
-		t.Errorf("absent key should be nil, got %#v", row[1])
+	if row[1] != importMissing {
+		t.Errorf("absent key should be importMissing, got %#v", row[1])
 	}
 
 	if _, err := src.Next(); err != io.EOF {

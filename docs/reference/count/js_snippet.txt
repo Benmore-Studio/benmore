@@ -1,0 +1,8 @@
+// Total rows (true count, NOT (await list()).length).
+const total = await bm.table('articles').count();
+
+// With a filter - same as ?where[col]=val on the auto-CRUD endpoint.
+const open  = await bm.table('tickets').count({ where: { status: 'open' } });
+
+// Raw HTTP form for non-SDK clients.
+const { count } = await fetch('/api/articles?count=true').then(r => r.json());

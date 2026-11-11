@@ -1,0 +1,6 @@
+[
+  "A page is an *.html file at the app root: about.html → /about, index.html → /. Files under static/ are the HTML/TSX stack, not server-rendered; a root head.html is not a page, and folders other than partials/ and layouts/ hold no pages.",
+  "partials/<name>.html: shared fragments. A mustache page includes one with `<include src=\"partials/<name>.html\" />` (self-closing, double-quoted src). gotmpl pages also get every partial as a named template: `{{template \"<name>\" .}}`.",
+  "layouts/<name>.html: a page with `layout: <name>` (or `<page layout=\"<name>\">`) is placed into that file at its `{{content}}` marker. With no layout or `layout: none`, partials/kit.html is placed before the page when it exists. Every page is then wrapped in the framework's HTML document (head, the CSRF meta tag, Tailwind, Alpine and HTMX; HTMX requests carry the token in X-CSRF-Token).",
+  "A root page holds only the body: a file at the app root that starts with `<!DOCTYPE>`, `<html>`, `<head>` or `<body>` is refused when it is written. A full HTML document belongs under static/, or declares `engine: raw`."
+]

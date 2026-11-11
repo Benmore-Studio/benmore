@@ -1,0 +1,1 @@
+The generic panic page says 'A server error occurred.' and preserves the request-id reference. Account purge clears the matching user's sample and sample_user_id in grouped diagnostics; events still queued at the purge cannot restore purged samples.

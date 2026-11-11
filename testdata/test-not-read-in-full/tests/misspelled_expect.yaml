@@ -1,0 +1,8 @@
+# `expects:` is not a key a step takes (`expect:` is). Its status 500 would
+# never be checked: /health answers 200 and the test reported PASS.
+health_is_down:
+  anon: true
+  steps:
+    - get: "/health"
+      expects:
+        status: 500

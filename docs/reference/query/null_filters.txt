@@ -1,0 +1,1 @@
+where:{column:null} and where:{column:{eq:null}} select NULL values; ne:null selects non-NULL values. Other comparisons keep SQL NULL semantics.

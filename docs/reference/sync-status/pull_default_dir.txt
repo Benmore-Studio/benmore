@@ -1,0 +1,1 @@
+`benmore pull <app>` with no directory, run inside that app's workspace (its .benmore/app marker names the app, dev or prod), refreshes the workspace in place and does not nest a second copy at ./<app>. `benmore pull .` pulls the current workspace's app. Anywhere else the default is ./<app>.

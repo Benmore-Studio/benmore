@@ -1,0 +1,1 @@
+Benmore's zero-dependency ESM browser SDK has one runtime, served at /_internal/bm.js. Native Benmore apps import `bm` through the framework import map and use generated src/bm.d.ts schema types. External Vite/Next/CRA frontends install and import `@benmore/bm`, whose generic declarations work without a schema-specific file.

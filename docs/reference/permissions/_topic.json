@@ -1,0 +1,18 @@
+{
+  "keys": [
+    "reserved_routes",
+    "share_dialog_errors",
+    "share_dialog",
+    "grant_actions",
+    "sharing_authority",
+    "recipient_resolution",
+    "share_expiry",
+    "list_shape",
+    "sdk_revoke",
+    "hard_delete_atomicity",
+    "summary",
+    "row_lifetime",
+    "tenant_boundary",
+    "endpoints"
+  ]
+}

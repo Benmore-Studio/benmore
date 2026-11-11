@@ -24,7 +24,7 @@ const appMCPGrantsRoute = "/api/_mcp/grants"
 
 // appMCPGrantsSession admits only the account holder's own interactive browser
 // session: no Authorization header at all (so no API token, Bearer session or
-// connector token), no scoped, edge, act-as or support/delegated session.
+// connector token), no scoped, act-as or support/delegated session.
 func appMCPGrantsSession(w http.ResponseWriter, r *http.Request, app *App) *Session {
 	w.Header().Set("Cache-Control", "no-store")
 	if cookie, err := requestSessionCookie(r); err != nil || cookie.Value == "" || len(r.Header.Values("Authorization")) > 0 {

@@ -90,7 +90,7 @@ func TestAppBufferReloadAndShutdownPreservePendingEntries(t *testing.T) {
 	InitReadAudit(app, false)
 	InitMetering(app)
 	session := &Session{UserID: 1, Email: "fixture@example.com"}
-	LogReadAccess(app, "notes", "1", "read", session)
+	LogReadAccess(app, nil, "notes", "1", "read", session)
 	Increment(app, "user:1", "reads")
 	// Simulate the worker generation transition used by hotReloadApp. The
 	// old flush workers must retain their own stop channel and pending buffer.
@@ -100,7 +100,7 @@ func TestAppBufferReloadAndShutdownPreservePendingEntries(t *testing.T) {
 	app.mu.Unlock()
 	InitReadAudit(app, true)
 	InitMetering(app)
-	LogReadAccess(app, "notes", "2", "read", session)
+	LogReadAccess(app, nil, "notes", "2", "read", session)
 	Increment(app, "user:1", "reads")
 	app.Shutdown()
 	db, err := OpenDB(app.Dir)

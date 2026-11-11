@@ -57,7 +57,7 @@ func registerFetchRoutes(mux appRouteRegistrar, app *App, client *http.Client) {
 		}
 		req, err := http.NewRequestWithContext(r.Context(), "GET", fetchURL, nil)
 		if err != nil {
-			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Request error")
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "fetch", err, "Request error")
 			return
 		}
 		req.Header.Set("Accept", "application/json")
@@ -70,7 +70,7 @@ func registerFetchRoutes(mux appRouteRegistrar, app *App, client *http.Client) {
 		setFetchHeaders(req, desc.Headers)
 		resp, err := client.Do(req)
 		if err != nil {
-			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Failed to load data")
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "fetch", err, "Failed to load data")
 			return
 		}
 		defer resp.Body.Close()
@@ -79,7 +79,7 @@ func registerFetchRoutes(mux appRouteRegistrar, app *App, client *http.Client) {
 			if err == nil {
 				err = fmt.Errorf("upstream %s answered %d with %d bytes (limit %d)", req.URL.Host, resp.StatusCode, len(body), 1<<20)
 			}
-			serverErrorStatus(w, r, app, http.StatusBadGateway, "fetch", err, "Data unavailable")
+			serverErrorStatus(w, r, app, http.StatusServiceUnavailable, "fetch", err, "Data unavailable")
 			return
 		}
 		var data any
@@ -200,6 +200,11 @@ func ExpandFetchTagsAsync(content string, app *App, ctx *RenderContext) string {
 		// before any data was rendered; running it now would expand an env
 		// placeholder inside a rendered row value.
 
+		// A value the renderer refused for its position (fetchAttrValue)
+		// fails the tag rather than sending a reshaped request.
+		if strings.Contains(rawURL, fetchRefusedValue) || strings.Contains(headers, fetchRefusedValue) {
+			return renderFetchError(app, "fetch: a value in url= or headers= would change the request (another host, a path segment, a parameter or a header)")
+		}
 		if _, _, err := resolveFetchURL(app, rawURL); err != nil {
 			return renderFetchError(app, err.Error())
 		}

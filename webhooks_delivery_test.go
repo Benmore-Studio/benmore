@@ -42,7 +42,7 @@ func TestWebhookDeliveryRechecksSubscriptionAndStripsSecrets(t *testing.T) {
 	}
 	subID, _ := res.LastInsertId()
 
-	FireWebhookSubscriptions(app, "insert", "notes", map[string]any{"id": 1, "title": "hello", "api_key": "live-credential"}, nil)
+	_ = enqueueWebhookSubscriptionsTx(app.DB, app, "insert", "notes", map[string]any{"id": 1, "title": "hello", "api_key": "live-credential"}, nil)
 	data := webhookTestJobPayload(t, app)
 	sub := data["_webhook_subscription"].(map[string]any)
 	if _, ok := sub["secret"]; ok {

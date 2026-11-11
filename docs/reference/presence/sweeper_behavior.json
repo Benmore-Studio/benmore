@@ -1,0 +1,5 @@
+[
+  "18s heartbeat from the client (paced under any sensible CDN keep-alive)",
+  "Server cron runs every 60s, retires anyone whose last_seen_at is >90s old",
+  "pagehide() fires `action: leave` synchronously via navigator.sendBeacon - survives tab close. A beacon cannot set X-CSRF-Token, so the SDK sends the token as `_csrf` in the JSON body and the heartbeat endpoint validates it there exactly like the header. A beacon without the token answers 403 and the member stays listed until the 90s sweep. A hand-written beacon must do the same: `navigator.sendBeacon('/api/_presence/heartbeat', new Blob([JSON.stringify({slug, action:'leave', _csrf: token})], {type:'application/json'}))`."
+]

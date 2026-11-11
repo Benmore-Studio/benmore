@@ -1,0 +1,12 @@
+{
+  "keys": [
+    "summary",
+    "script_cdns",
+    "directives",
+    "websockets",
+    "media_cdn",
+    "app_yaml_example",
+    "gotchas",
+    "see_also"
+  ]
+}

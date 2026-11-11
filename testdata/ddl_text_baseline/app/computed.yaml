@@ -1,0 +1,10 @@
+projects:
+  total:
+    sql: "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND deleted_at IS NULL"
+    triggers:
+      - table: tasks
+        on: [insert, update, delete]
+        fk: project_id
+tasks:
+  amount:
+    expr: "quantity * price"

@@ -1,0 +1,2 @@
+# The write gate refuses auth.session_duration: "1w"; the app still loads.
+app.yaml

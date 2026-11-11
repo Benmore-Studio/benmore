@@ -196,3 +196,35 @@ func TestFeedbackWidgetShowsARefusal(t *testing.T) {
 		}
 	}
 }
+
+// The admin panel and the platform dashboard show a screenshot in <img src>.
+// A visitor could store any string there (only its length was checked), so a
+// value that closed the attribute ran script for whoever opened the item.
+// Only a base64 image data URL is accepted now.
+func TestFeedbackScreenshotMustBeAnImageDataURL(t *testing.T) {
+	app, _ := feedbackCSRFFixture(t)
+	mux := http.NewServeMux()
+	RegisterFeedbackAPI(mux, app)
+	for _, bad := range []string{
+		`x" onerror="alert(1)`,
+		`data:image/png;base64,AAAA" onerror="alert(1)`,
+		`javascript:alert(1)`,
+		`data:text/html;base64,PHNjcmlwdD4=`,
+		`data:image/svg+xml,<svg onload=alert(1)>`,
+		"data:image/png;base64,AAAA\n",
+	} {
+		if w := anonFeedbackPost(mux, "203.0.113.60", map[string]string{"body": "see", "screenshot": bad}); w.Code != http.StatusBadRequest {
+			t.Fatalf("screenshot %q: status %d, want 400 (%s)", bad, w.Code, w.Body.String())
+		}
+	}
+	for _, good := range []string{"", "data:image/png;base64,iVBORw0KGgo=", "data:image/jpeg;base64,/9j/4AAQ", "data:image/svg+xml;base64,PHN2Zz4="} {
+		if w := anonFeedbackPost(mux, "203.0.113.61", map[string]string{"body": "see", "screenshot": good}); w.Code != http.StatusOK {
+			t.Fatalf("screenshot %q: status %d, want 200 (%s)", good, w.Code, w.Body.String())
+		}
+	}
+	var stored int
+	app.DB.QueryRow(`SELECT COUNT(*) FROM _benmore_feedback WHERE screenshot LIKE '%onerror%' OR screenshot LIKE 'javascript:%'`).Scan(&stored)
+	if stored != 0 {
+		t.Fatalf("%d unsafe screenshots stored", stored)
+	}
+}

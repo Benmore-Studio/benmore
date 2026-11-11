@@ -1,0 +1,70 @@
+# A write and the jobs that carry its hooks commit together: when the job
+# cannot be queued the write is refused, never saved with its effect lost.
+# The trigger stands in for SQLITE_FULL / SQLITE_BUSY on the jobs insert.
+create_fails_when_its_hook_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+  steps:
+    - api: "POST /api/docs"
+      json: {title: "jobfail-create"}
+      expect: {status: 500}
+    - sql: "SELECT id FROM docs WHERE title = 'jobfail-create'"
+      expect: {rows: 0}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND new_values LIKE '%jobfail-create%'"
+      expect: {rows: 0}
+
+batch_fails_when_a_hook_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+  steps:
+    - api: "POST /api/docs/batch"
+      json_array:
+        - {title: "jf-batch-ok"}
+        - {title: "jobfail-batch"}
+      expect: {status: 500}
+    - sql: "SELECT id FROM docs WHERE title IN ('jf-batch-ok', 'jobfail-batch')"
+      expect: {rows: 0}
+
+transaction_fails_when_a_hook_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+  steps:
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {table: "docs", action: "insert", data: {title: "jobfail-tx"}}
+      expect: {status: 500}
+    - sql: "SELECT id FROM docs WHERE title = 'jobfail-tx'"
+      expect: {rows: 0}
+
+delete_fails_when_its_hook_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+    - sql: "INSERT INTO docs (id, title, user_id) VALUES (9101, 'jobfail-delete', {{user_id}})"
+  steps:
+    - api: "DELETE /api/docs/9101"
+      json: {}
+      expect: {status: 500}
+    - sql: "SELECT id FROM docs WHERE id = 9101"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'delete' AND row_id = '9101'"
+      expect: {rows: 0}
+
+batch_delete_fails_when_a_hook_job_cannot_be_queued:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "CREATE TRIGGER IF NOT EXISTS jobs_refuse_jobfail BEFORE INSERT ON _benmore_jobs WHEN NEW.payload LIKE '%jobfail%' BEGIN SELECT RAISE(ABORT, 'jobs table refused'); END"
+    - sql: "INSERT INTO docs (id, title, user_id) VALUES (9201, 'jf-bd-ok', {{user_id}})"
+    - sql: "INSERT INTO docs (id, title, user_id) VALUES (9202, 'jobfail-bd', {{user_id}})"
+  steps:
+    - api: "DELETE /api/docs/batch"
+      json: {ids: [9201, 9202]}
+      expect: {status: 500}
+    - sql: "SELECT id FROM docs WHERE id IN (9201, 9202)"
+      expect: {rows: 2}
+    - sql: "SELECT id FROM _benmore_audit_log WHERE table_name = 'docs' AND action = 'delete' AND row_id IN ('9201', '9202')"
+      expect: {rows: 0}

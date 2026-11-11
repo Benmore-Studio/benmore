@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // yaml.v3 decodes a mapping by comparing every key with every later key to

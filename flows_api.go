@@ -6,7 +6,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +14,6 @@ import (
 	neturl "net/url"
 	"sort"
 	"strings"
-	"time"
 )
 
 const maxAPIResponseBody = 1 << 20
@@ -109,6 +107,27 @@ func apiFormBody(ctx *FlowContext, form map[string]string) []byte {
 	return []byte(values.Encode())
 }
 
+// apiTextBody renders a text `body:`. A body that is one `${{ }}` reference
+// to an object or list sends it as JSON; it used to be written with Go's %v
+// ("map[text:hi]"), which no upstream can read. A body written as a JSON
+// document keeps each value whole (interpolateCtxJSON), as a webhook body
+// does, so a request value cannot add or override keys of the call.
+func apiTextBody(ctx *FlowContext, template string) []byte {
+	if expr, ok := soleFlowExpr(template); ok {
+		v, found := flowDataValue(ctx, expr)
+		if !found {
+			v, found = flowLookup(flatDataForCtx(ctx), expr)
+		}
+		switch v.(type) {
+		case map[string]any, []any, []map[string]any:
+			if b, err := json.Marshal(v); found && err == nil {
+				return b
+			}
+		}
+	}
+	return []byte(interpolateCtxJSON(template, ctx))
+}
+
 // soleFlowExpr returns the expression of a template that is exactly one
 // `{{ ... }}` reference (surrounding whitespace allowed).
 func soleFlowExpr(template string) (string, bool) {
@@ -135,16 +154,21 @@ func execAPIRequest(ctx *FlowContext, step *FlowStep, api *FlowAPICall, literalQ
 // test server. The caller supplies this client per invocation; there is no
 // app/YAML/global client override.
 func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall, literalQuery map[string]string, client *http.Client) error {
-	timeout := 30 * time.Second
+	allowance := flowAPIDefaultTimeout
 	if step.Timeout > 0 {
-		timeout = step.Timeout
+		allowance = step.Timeout
 	}
-	parentContext := context.Background()
-	if ctx != nil && ctx.Request != nil {
-		parentContext = ctx.Request.Context()
+	// A synchronous run's call ends at the run's time limit
+	// (flows_time_limit.go).
+	if ctx.boundStepTimeout(allowance) <= 0 {
+		return ctx.timeLimitError(quoteForHint(step.Name))
 	}
-	requestContext, cancel := context.WithTimeout(parentContext, timeout)
+	// The call also ends when the caller goes away. Neither of those counts
+	// against the host's circuit; the step's own allowance does
+	// (flows_outbound_call.go).
+	call, cancel := ctx.startOutboundCall(allowance, true)
 	defer cancel()
+	requestContext := call.ctx
 	if err := requestContext.Err(); err != nil {
 		return err
 	}
@@ -161,28 +185,13 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 		return fmt.Errorf("api %s: %w", url, err)
 	}
 
+	// bodyBytes is captured for signers that hash the payload (AWS sigv4 etc.).
+	bodyBytes, hasBody, contentType, err := apiRequestBody(ctx, api)
+	if err != nil {
+		return fmt.Errorf("api %s: %w", url, err)
+	}
 	var body io.Reader
-	var bodyBytes []byte // captured for signers that hash the payload (AWS sigv4 etc.)
-	contentType := "application/json"
-
-	if api.JSON != nil {
-		// Recursively resolve string leaves (ctx interpolation) while keeping
-		// nested arrays/objects intact, then marshal the whole structure.
-		// interpolateJSONValues is the same resolver respond bodies use. #94.
-		jsonData := interpolateJSONValues(api.JSON, ctx)
-		bodyBytes, _ = json.Marshal(jsonData)
-		body = bytes.NewReader(bodyBytes)
-	} else if api.JSONArray != nil {
-		// A list body (`json:` or `body:` written as a list), resolved the
-		// same way element by element.
-		bodyBytes, _ = json.Marshal(resolveJSONValue(api.JSONArray, ctx))
-		body = bytes.NewReader(bodyBytes)
-	} else if api.Form != nil {
-		bodyBytes = apiFormBody(ctx, api.Form)
-		body = bytes.NewReader(bodyBytes)
-		contentType = "application/x-www-form-urlencoded"
-	} else if api.Body != "" {
-		bodyBytes = []byte(interpolateCtx(api.Body, ctx))
+	if hasBody {
 		body = bytes.NewReader(bodyBytes)
 	}
 
@@ -194,7 +203,7 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 	// Circuit breaker: skip if endpoint is known-dead
 	host := circuitKey(ctx.App, url)
 	if err := CheckCircuit(host); err != nil {
-		return fmt.Errorf("api %s: %s", url, err)
+		return flowTransientError{fmt.Errorf("api %s: %s", url, err)}
 	}
 
 	req, err := http.NewRequestWithContext(requestContext, method, url, body)
@@ -275,15 +284,18 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 		return err
 	}
 	if client == nil {
-		client = safeHTTPClientStrict(timeout)
+		// The client's own limit is the step's allowance, so it never ends
+		// a call before the run's time limit would (that cut is not the
+		// host's).
+		client = safeHTTPClientStrict(allowance)
 	}
 	if err := requestContext.Err(); err != nil {
 		return fmt.Errorf("api %s: %w", url, err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		RecordFailure(host)
-		return fmt.Errorf("api %s: %w", url, err)
+		call.recordFailure(host)
+		return flowOutboundTransportError(fmt.Errorf("api %s: %w", url, err))
 	}
 	defer resp.Body.Close()
 
@@ -294,7 +306,7 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 		RecordSuccess(host)
 	}
 	if err != nil {
-		return fmt.Errorf("api %s response read: %w", url, err)
+		return flowOutboundTransportError(fmt.Errorf("api %s response read: %w", url, err))
 	}
 	if len(respBody) > maxAPIResponseBody {
 		return fmt.Errorf("api %s response exceeds the %d-byte limit", url, maxAPIResponseBody)
@@ -304,7 +316,7 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 	}
 
 	if resp.StatusCode >= 400 && !apiHandlesStatus(api, resp.StatusCode) {
-		return fmt.Errorf("api %s returned %d: %s", url, resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+		return flowOutboundStatusError(resp.StatusCode, fmt.Errorf("api %s returned %d: %s", url, resp.StatusCode, string(respBody[:min(len(respBody), 200)])))
 	}
 
 	if step.Name != "" {
@@ -330,6 +342,41 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 	}
 
 	return nil
+}
+
+// apiRequestBody renders an outbound call's body: `json:` (a map, a list or
+// one reference), `form:` or a text `body:`, in that order. hasBody is false
+// when the call declares none; contentType is the default the call sends
+// (an author's Content-Type header replaces it). Shared by `run: api` and
+// `run: proxy`.
+func apiRequestBody(ctx *FlowContext, api *FlowAPICall) (body []byte, hasBody bool, contentType string, err error) {
+	contentType = "application/json"
+	switch {
+	case api.JSON != nil:
+		// Recursively resolve string leaves (ctx interpolation) while keeping
+		// nested arrays/objects intact, then marshal the whole structure.
+		// interpolateJSONValues is the same resolver respond bodies use. #94.
+		body, _ = json.Marshal(interpolateJSONValues(api.JSON, ctx))
+	case api.JSONArray != nil:
+		// A list body (`json:` or `body:` written as a list), resolved the
+		// same way element by element.
+		body, _ = json.Marshal(resolveJSONValue(api.JSONArray, ctx))
+	case api.JSONRef != "":
+		// The referenced value itself, as JSON: a step's object or list, or
+		// JSON text, which is sent as the value it encodes. An unresolved
+		// reference fails the step before anything is sent.
+		if body, err = json.Marshal(resolveJSONValue(api.JSONRef, ctx)); err != nil {
+			return nil, false, "", fmt.Errorf("json body: %w", err)
+		}
+	case api.Form != nil:
+		body = apiFormBody(ctx, api.Form)
+		contentType = "application/x-www-form-urlencoded"
+	case api.Body != "":
+		body = apiTextBody(ctx, api.Body)
+	default:
+		return nil, false, contentType, nil
+	}
+	return body, true, contentType, nil
 }
 
 // apiMethodOverrideHeaders make many servers (Express method-override,
@@ -409,12 +456,14 @@ func execStepAPIPaginatedWithClient(ctx *FlowContext, step *FlowStep, client *ht
 	if strategy == "" {
 		strategy = "cursor"
 	}
+	// Out-of-range values are refused at write time (paginateValueProblems);
+	// a deployed step keeps the default, or the cap.
 	maxPages := pag.MaxPages
 	if maxPages <= 0 {
-		maxPages = 50
+		maxPages = flowPaginateDefaultPages
 	}
-	if maxPages > 500 {
-		maxPages = 500
+	if maxPages > flowPaginateMaxPages {
+		maxPages = flowPaginateMaxPages
 	}
 	itemsField := pag.ItemsField
 	if itemsField == "" {
@@ -429,11 +478,19 @@ func execStepAPIPaginatedWithClient(ctx *FlowContext, step *FlowStep, client *ht
 	var accum []any
 	var lastStatus int
 	pagesFetched := 0
-	page := pag.PageStart
-	if page <= 0 {
-		page = 1
+	// Pages count from 1 unless the step says where its upstream starts;
+	// `page_start: 0` used to be read as unset, so a zero-based upstream
+	// lost its first page.
+	page := 1
+	if pag.PageStartSet && pag.PageStart >= 0 {
+		page = pag.PageStart
 	}
 	cursor := ""
+	// Without a cursor_field there is nowhere to read the next cursor: the
+	// step read one page and reported success as if that were everything.
+	if strategy == "cursor" && strings.TrimSpace(pag.CursorField) == "" {
+		return fmt.Errorf("paginate: the cursor strategy needs `cursor_field`, the dotted path of the next cursor in each answer (for example `cursor_field: $.next_cursor`); without it only the first page could be read. For numbered pages set `strategy: page`")
+	}
 
 	for i := 0; i < maxPages; i++ {
 		// The cursor comes from the upstream's response: it is sent as a
@@ -522,7 +579,7 @@ func extractPageItems(envelope any, itemsField, cursorField string) ([]any, stri
 		// Try parsing the raw body if json didn't pre-parse.
 		if raw, ok := envMap["body"].(string); ok && raw != "" {
 			var parsed any
-			if json.Unmarshal([]byte(raw), &parsed) == nil {
+			if unmarshalJSONExact([]byte(raw), &parsed) == nil {
 				body = parsed
 			}
 		}
@@ -532,7 +589,7 @@ func extractPageItems(envelope any, itemsField, cursorField string) ([]any, stri
 	cursor := ""
 	if cursorField != "" {
 		if v := lookupJSONPath(body, cursorField); v != nil {
-			cursor = fmt.Sprintf("%v", v)
+			cursor = valueText(v)
 		}
 	}
 	return itemsSlice, cursor, status
@@ -577,7 +634,7 @@ func buildAPIResponseEnvelope(statusCode int, header http.Header, respBody []byt
 		"headers": hdrs,
 	}
 	var parsed any
-	if err := json.Unmarshal(respBody, &parsed); err == nil {
+	if err := unmarshalJSONExact(respBody, &parsed); err == nil {
 		envelope["json"] = parsed
 		if m, ok := parsed.(map[string]any); ok {
 			for k, v := range m {
@@ -599,26 +656,21 @@ func webhookCallerMayChooseContextURL(s *Session) bool {
 	return s != nil && s.IsAdmin() && !s.connectorGrant && s.ImpersonatorUserID == 0 && s.ActingAsGroup == ""
 }
 
-// dataWithoutSecrets is a copy of the flow context without the values the
-// secret taint marks as env-derived (top-level step outputs and dotted keys).
+// dataWithoutSecrets is the flow context as a whole-context webhook body
+// sends it: a copy without the values derived from env (contextSecretFilter:
+// a secret-taint key and its dotted descendants, and any string holding an
+// env value or a secret-derived value). An author who means to send one
+// names it in `body:` or `payload:`.
 func (ctx *FlowContext) dataWithoutSecrets() map[string]any {
+	values := flowSecretValues(ctx, true)
 	ctx.DataMu.Lock()
 	defer ctx.DataMu.Unlock()
+	filter := contextSecretFilter{secretKeys: ctx.SecretKeys, values: values}
 	out := make(map[string]any, len(ctx.Data))
 	for k, v := range ctx.Data {
-		if ctx.SecretKeys[k] {
-			continue
+		if kept, ok := filter.keep(k, v); ok {
+			out[k] = kept
 		}
-		if m, ok := v.(map[string]any); ok {
-			trimmed := make(map[string]any, len(m))
-			for ck, cv := range m {
-				if !ctx.SecretKeys[k+"."+ck] {
-					trimmed[ck] = cv
-				}
-			}
-			v = trimmed
-		}
-		out[k] = v
 	}
 	return out
 }
@@ -658,21 +710,22 @@ func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
 		return err
 	}
 	// With no body the step sends the whole flow context: every request
-	// field and step output, env-derived values included. That default is
-	// kept only for a URL the author fixed; a request- or row-chosen URL
-	// must say what it receives. A declared payload never reaches here.
+	// field and step output, but never a value derived from env
+	// (dataWithoutSecrets). A literal URL used to receive those too: a
+	// `run: set` of `${{ env.X }}` or a SQL step binding one went to the
+	// endpoint unasked (round 2026-11-04). The default is kept only for a
+	// URL the author fixed; a request- or row-chosen URL must say what it
+	// receives. A declared payload never reaches here.
 	if body == "" {
-		payload := ctx.Data
 		if key := ctx.taintedRef(step.Webhook); key != "" {
 			// A global admin of the app (a service account calling a
-			// delivery callback) may still choose where the context goes,
-			// minus env-derived values; anyone else must say what it sends.
+			// delivery callback) may still choose where the context goes;
+			// anyone else must say what it sends.
 			if !webhookCallerMayChooseContextURL(ctx.Session) {
 				return fmt.Errorf("webhook: the URL takes request input %q, so the step must set `body:`; with no body it would send the whole flow context there", key)
 			}
-			payload = ctx.dataWithoutSecrets()
 		}
-		data, _ := json.Marshal(payload)
+		data, _ := json.Marshal(ctx.dataWithoutSecrets())
 		body = string(data)
 	}
 
@@ -681,7 +734,18 @@ func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
 		return fmt.Errorf("SECURITY: blocked webhook to private URL: %s", url)
 	}
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	// The breaker run: api uses, keyed by app and host: a dead endpoint is not
+	// called again for the cooldown after cbFailureThreshold failures in a row.
+	host := circuitKey(ctx.App, url)
+	if err := CheckCircuit(host); err != nil {
+		return flowTransientError{fmt.Errorf("webhook: %w", err)}
+	}
+	// A delivery may take flowWebhookTimeout; a synchronous run's also ends
+	// at the run's time limit (flows_time_limit.go), which does not count
+	// against the host. It does not end when the caller goes away.
+	call, cancel := ctx.startOutboundCall(flowWebhookTimeout, false)
+	defer cancel()
+	req, err := http.NewRequestWithContext(call.ctx, "POST", url, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -691,15 +755,23 @@ func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
 	// the strict SSRF-guarded client). The private-URL check above stays.
 	client := ctx.apiClient
 	if client == nil {
-		client = safeHTTPClientStrict(10 * time.Second)
+		client = safeHTTPClientStrict(flowWebhookTimeout)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		call.recordFailure(host)
+		return flowOutboundTransportError(err)
 	}
 	resp.Body.Close()
+	// As for run: api, only a transport failure or a 5xx counts against the
+	// host; a 4xx is the endpoint answering.
+	if resp.StatusCode >= 500 {
+		RecordFailure(host)
+	} else {
+		RecordSuccess(host)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook: delivery returned HTTP %d", resp.StatusCode)
+		return flowOutboundStatusError(resp.StatusCode, fmt.Errorf("webhook: delivery returned HTTP %d", resp.StatusCode))
 	}
 	return nil
 }

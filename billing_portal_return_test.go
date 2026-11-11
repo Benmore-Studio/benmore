@@ -130,12 +130,12 @@ func (stripeErrorTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // Stripe's error body (a masked secret key, the account's dashboard log URL)
-// was relayed to the app's end user in the 502; it is logged instead.
+// was relayed to the app's end user in the error; it is logged instead.
 func TestBillingPortalDoesNotRelayStripeErrorBody(t *testing.T) {
 	mux, sid, _ := billingPortalFixture(t, nil)
 	http.DefaultTransport = stripeErrorTransport{}
 	w := postPortal(mux, sid, `{}`)
-	if w.Code != http.StatusBadGateway || strings.Contains(w.Body.String(), "sk_live") || strings.Contains(w.Body.String(), "dashboard.stripe.com") {
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "sk_live") || strings.Contains(w.Body.String(), "dashboard.stripe.com") {
 		t.Fatalf("portal failure relayed Stripe's error body: %d %s", w.Code, w.Body.String())
 	}
 }

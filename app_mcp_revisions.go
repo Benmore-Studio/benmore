@@ -169,6 +169,12 @@ func verifyAppMCPRevisionStorage(tx *sql.Tx, tables []string) error {
 	if err := appMCPVerifyRevisionTriggerSet(tx, targets); err != nil {
 		return err
 	}
+	// The ledger is only kept when its triggers run first (app_mcp_revision_order.go).
+	if table, err := appMCPRevisionTriggerOrderProblem(tx, tables); err != nil {
+		return err
+	} else if table != "" {
+		return appMCPRevisionTriggerOrderError(table)
+	}
 	for _, target := range targets {
 		if err := appMCPVerifyRevisionRows(tx, target.name); err != nil {
 			return err

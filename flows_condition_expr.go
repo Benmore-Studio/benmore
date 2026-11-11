@@ -4,7 +4,8 @@ package main
 
 // Flow condition expressions: `&&`, `||`, `!` and parentheses around the
 // comparison operators in `if:` and `success_when:`, and `${{ }}` value
-// expressions in serve_file's `disposition:`.
+// expressions that use them anywhere a flow value is written
+// (flows_value_expr.go; serve_file's `disposition:` first).
 //
 // The author's condition is parsed into a tree before any value is
 // resolved. Refs are looked up only when the tree is evaluated, and a
@@ -40,6 +41,7 @@ type condExpr struct {
 	kind        condExprKind
 	lit         any    // condLit: string, bool or nil
 	ref         string // condRef: translated ref, pipes appended (`x.y | default:''`)
+	src         string // condRef: the ref as written (`steps.x.outputs.y`)
 	op          string // condCmp: = != > < >= <=
 	left, right *condExpr
 }
@@ -53,32 +55,62 @@ const condMaxDepth = 64
 // operand (or the last one), `a && b` the first falsy one (or the last).
 // `!` and comparisons return a bool. Truthiness is isTruthyCondition.
 func (e *condExpr) eval(flat map[string]any) any {
+	return e.operand(flat).v
+}
+
+// condOperand is an evaluated node with what a comparison needs to know
+// about where it came from. Both flags describe the reference the author
+// wrote, never the value.
+type condOperand struct {
+	v any
+	// unresolved: a reference the flow owns (a step output, the caller's
+	// identity, an env value) that has no value.
+	unresolved bool
+	// request: a request field read with no fallback, sent or not.
+	request bool
+}
+
+// operand resolves the tree like eval and keeps, for a reference, whether it
+// had a value and whether it reads the request. `a || b` and `a && b` return
+// one of their operands, so its flags travel with it.
+func (e *condExpr) operand(flat map[string]any) condOperand {
 	switch e.kind {
 	case condLit:
-		return e.lit
+		return condOperand{v: e.lit}
 	case condRef:
-		if v, ok := resolveBindExpr(e.ref, flat); ok {
-			return v
+		// A ref is a name and its pipes, never an expression: resolve it
+		// without the grammar dispatch (resolveBindExpr), so nothing here
+		// can parse again.
+		v, ok := resolveBindRef(e.ref, flat)
+		if flowRefReadsRequest(e.ref, e.src, flat) {
+			return condOperand{v: v, request: !flowRefHasFallback(e.ref)}
 		}
-		return nil
+		return condOperand{v: v, unresolved: !ok}
 	case condNot:
-		return !isTruthyCondition(e.left.eval(flat))
+		return condOperand{v: !isTruthyCondition(e.left.eval(flat))}
 	case condAnd:
-		l := e.left.eval(flat)
-		if !isTruthyCondition(l) {
+		l := e.left.operand(flat)
+		if !isTruthyCondition(l.v) {
 			return l
 		}
-		return e.right.eval(flat)
+		return e.right.operand(flat)
 	case condOr:
-		l := e.left.eval(flat)
-		if isTruthyCondition(l) {
+		l := e.left.operand(flat)
+		if isTruthyCondition(l.v) {
 			return l
 		}
-		return e.right.eval(flat)
+		return e.right.operand(flat)
 	case condCmp:
-		return compareLiteralCondition(condOperandText(e.left.eval(flat)), e.op, condOperandText(e.right.eval(flat)))
+		l, r := e.left.operand(flat), e.right.operand(flat)
+		// A value of the flow's own that is missing never equals a request
+		// field read with no fallback (flows_condition_unresolved.go). Any
+		// other missing value is empty, as it always was here.
+		if (l.unresolved && r.request) || (r.unresolved && l.request) {
+			return condOperand{v: condNoValue(e.op)}
+		}
+		return condOperand{v: compareLiteralCondition(condOperandText(l.v), e.op, condOperandText(r.v))}
 	}
-	return nil
+	return condOperand{}
 }
 
 // condOperandText formats an operand for compareLiteralCondition the way
@@ -88,7 +120,7 @@ func condOperandText(v any) string {
 	if v == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", v)
+	return valueText(v)
 }
 
 // conditionUsesExpressionSyntax reports whether a condition needs the
@@ -624,7 +656,7 @@ func (p *condParser) parsePrimary(depth int) (*condExpr, error) {
 			}
 			ref += " | " + seg
 		}
-		return &condExpr{kind: condRef, ref: ref}, p.advance()
+		return &condExpr{kind: condRef, ref: ref, src: t.text}, p.advance()
 	case condTokEOF:
 		return nil, fmt.Errorf("condition ends where a value was expected")
 	}

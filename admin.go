@@ -3,7 +3,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -38,8 +40,8 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			// by the primary role column OR a global grant in
 			// _benmore_user_roles (the gate used to read only the column, so
 			// an admin by grant got 403 here and nowhere else), on a
-			// credential that is not delegated - a scoped token or an edge
-			// identity never opens the panel, whoever minted it.
+			// credential that is not delegated - a scoped token never opens
+			// the panel, whoever minted it.
 			if !session.IsAdminConsole() {
 				http.Error(w, "Forbidden - admin access required", http.StatusForbidden)
 				return
@@ -146,7 +148,9 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			announceFlowWrites(ctx, false)
 		}
 		if ctx.Error != nil {
-			http.Redirect(w, r, "/_admin/tools?error="+url.QueryEscape(ctx.Error.Error()), http.StatusSeeOther)
+			// Redacted like the flow's own failure text: the redirect URL is
+			// kept in browser history and access logs.
+			http.Redirect(w, r, "/_admin/tools?error="+url.QueryEscape(serverErrorText(flowFailureText(ctx, ctx.Error))), http.StatusSeeOther)
 		} else {
 			http.Redirect(w, r, "/_admin/tools?msg="+url.QueryEscape(targetFlow.Name+" executed successfully"), http.StatusSeeOther)
 		}
@@ -220,28 +224,46 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 		var uid int64
 		fmt.Sscanf(userID, "%d", &uid)
 		session := getSession(app, r)
-		oldRole := getUserRole(app.DB, uid)
 		newRole := strings.TrimSpace(strings.ToLower(role))
-		// The same last-admin guard as revoking an admin grant (rbac.go): an
-		// admin demoting their own primary role must leave another active
-		// admin, or keep a global admin grant themselves.
-		if session != nil && uid == session.UserID && oldRole == "admin" && newRole != "admin" && !UserHasGlobalAdminGrant(app.DB, uid) {
-			var others int
-			app.DB.QueryRow(`SELECT (
-				(SELECT COUNT(*) FROM _benmore_users
-					WHERE role = 'admin' AND id != ? AND (deactivated_at IS NULL OR deactivated_at = ''))
-				+
-				(SELECT COUNT(*) FROM _benmore_user_roles
-					WHERE role = 'admin' AND user_id != ? AND group_id IS NULL
-					  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')))
-			)`, uid, uid).Scan(&others)
-			if others == 0 {
-				httpError(w, "cannot remove the admin role from the last active admin", http.StatusBadRequest)
+		// The primary role is GLOBAL, so it follows the grant API's rule:
+		// user, admin, or a role app.yaml roles: declares - never a typo or a
+		// tenant role name that would pass role: gates in every tenant.
+		if err := undeclaredRoleError(app, newRole); err != nil {
+			httpError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The last-admin guard (last_admin_guard.go), in the transaction that
+		// writes the role: demoting the app's last usable durable admin -
+		// the caller or anyone else - is refused. A time-bounded admin grant
+		// elsewhere does not count, nor does a deactivated admin.
+		tx, err := app.DB.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverError(w, r, app, "set role", err, "Role change failed")
+			return
+		}
+		defer tx.Rollback()
+		var stored sql.NullString
+		tx.QueryRow("SELECT role FROM _benmore_users WHERE id = ?", uid).Scan(&stored)
+		oldRole := stored.String
+		if oldRole == "" {
+			oldRole = "user"
+		}
+		if oldRole == "admin" && newRole != "admin" {
+			if err := refuseLastDurableAdmin(app, tx, uid, dropsPrimaryAdmin); err != nil {
+				if errors.Is(err, errLastDurableAdmin) {
+					httpError(w, lastAdminRefusal, http.StatusBadRequest)
+				} else {
+					serverError(w, r, app, "set role", err, "Role change failed")
+				}
 				return
 			}
 		}
-		if err := SetUserRole(app.DB, uid, role); err != nil {
+		if err := SetUserRole(tx, uid, role); err != nil {
 			httpError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			serverError(w, r, app, "set role", err, "Role change failed")
 			return
 		}
 		// A primary-role change is a grant like any other: audit it.
@@ -254,7 +276,7 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 		http.Redirect(w, r, "/_admin/_benmore_users", http.StatusSeeOther)
 	}))
 
-	log.Printf("  admin: /_admin (requires admin role; legacy /admin redirects unless user page exists)")
+	routeInfof(mux, "  admin: /_admin (requires admin role; legacy /admin redirects unless user page exists)")
 }
 
 // adminShell wraps admin content in a self-contained admin layout with sidebar.
@@ -714,7 +736,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 				<div style="font-size:13px;font-weight:600;color:#dc2626;">Reset Test Data</div>
 				<div style="font-size:12px;color:#64748b;margin-top:2px;">Wipe all app tables and re-run seeds.sql</div>
 			</div>
-			<button onclick="if(confirm('This will DELETE all data and re-seed. Continue?')){fetch('/api/_testing/reset',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}}).then(function(r){return r.json()}).then(function(d){alert('Reset complete: '+d.tables_cleared+' tables cleared');location.reload();})}" style="padding:8px 20px;font-size:12px;font-weight:600;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;">Reset &amp; Reseed</button>
+			<button onclick="if(confirm('This will DELETE all data and re-seed. Continue?')){fetch('/api/_testing/reset',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}}).then(function(r){return r.json()}).then(function(d){if(d.error){alert('Reset failed, no data was changed: '+d.error);return}alert('Reset complete: '+d.tables_cleared+' tables cleared');location.reload();})}" style="padding:8px 20px;font-size:12px;font-weight:600;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;">Reset &amp; Reseed</button>
 		</div>`)
 	}
 
@@ -859,6 +881,12 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	rows, rowsErr := queryNativeRowsWith(app.DB, app, table, query, args...)
 	if rowsErr != nil {
 		rows = nil
+	} else if IsReadAudited(app, table) {
+		// An admin browsing a table reads its rows like a list read does.
+		if err := LogReadAccess(app, r, table, "", "admin_list", getSession(app, r)); err != nil {
+			serverError(w, r, app, "admin "+table, err, "Read audit unavailable")
+			return
+		}
 	}
 	var total int64
 	app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&total)
@@ -988,10 +1016,17 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		return
 	}
 	row := rows[0]
+	if IsReadAudited(app, table) {
+		if err := LogReadAccess(app, r, table, id, "admin_read", getSession(app, r)); err != nil {
+			serverError(w, r, app, "admin "+table, err, "Read audit unavailable")
+			return
+		}
+	}
 	cols, _ := GetTableColumns(app.DB, table)
 	// A hidden column is left out of the form, so saving it keeps its value.
 	cols = adminVisibleColumns(app, table, cols)
 	csrf := generateCSRFToken()
+	userRole := ""
 
 	var sb strings.Builder
 
@@ -1034,21 +1069,13 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 			inputType = "email"
 		}
 		if col.Name == "role" && table == "_benmore_users" {
-			// Show all roles defined in app config, plus defaults
+			// role is protected on update, so this form only shows it; the
+			// role form below changes it through /_admin/set-role.
+			userRole = val
 			sb.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px;">
 				<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">%s</label>
-				<select name="%s" style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--background));color:hsl(var(--foreground));font-size:13px;">
-					<option value="user" %s>user</option>
-					<option value="admin" %s>admin</option>`,
-				formatColName(col.Name), col.Name, sel(val, "user"), sel(val, "admin")))
-			if app.Roles != nil {
-				for roleName := range app.Roles.Roles {
-					if roleName != "admin" && roleName != "user" {
-						sb.WriteString(fmt.Sprintf(`<option value="%s" %s>%s</option>`, roleName, sel(val, roleName), roleName))
-					}
-				}
-			}
-			sb.WriteString(`</select></div>`)
+				<input value="%s" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
+			</div>`, formatColName(col.Name), html.EscapeString(val)))
 			continue
 		}
 
@@ -1059,6 +1086,9 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	}
 
 	sb.WriteString(`<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Save Changes</button></form></div>`)
+	if table == "_benmore_users" {
+		sb.WriteString(adminGlobalRoleForm(app, id, userRole, csrf))
+	}
 
 	// Related records
 	allTables, _ := GetTableNames(app.DB)
@@ -1140,6 +1170,44 @@ func adminVisibleColumns(app *App, table string, cols []Column) []Column {
 		}
 	}
 	return out
+}
+
+// adminGlobalRoleForm is the user page's primary-role form. It posts to
+// /_admin/set-role and offers the roles that endpoint accepts (user, admin and
+// the roles app.yaml roles: declares), and says the role is global: it applies
+// in every tenant, unlike a tenant role, which lives on the membership row
+// (groups.role_field).
+func adminGlobalRoleForm(app *App, userID, current, csrf string) string {
+	roles := []string{"user", "admin"}
+	if app.Roles != nil {
+		for _, name := range app.Roles.KnownRoles() {
+			if name != "user" && name != "admin" {
+				roles = append(roles, name)
+			}
+		}
+	}
+	var opts strings.Builder
+	listed := false
+	for _, name := range roles {
+		listed = listed || name == current
+		fmt.Fprintf(&opts, `<option value="%s" %s>%s</option>`, html.EscapeString(name), sel(current, name), html.EscapeString(name))
+	}
+	if !listed && current != "" {
+		fmt.Fprintf(&opts, `<option value="" selected disabled>%s (not declared)</option>`, html.EscapeString(current))
+	}
+	tenantNote := ""
+	if app.Group != nil && app.Group.RoleField != "" {
+		tenantNote = fmt.Sprintf(" A role inside one tenant is set on the user's %s row (%s).", html.EscapeString(app.Group.Table), html.EscapeString(app.Group.RoleField))
+	}
+	return fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;margin-top:16px;">
+		<form method="POST" action="/_admin/set-role">
+		<input type="hidden" name="_csrf" value="%s">
+		<input type="hidden" name="user_id" value="%s">
+		<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">Global role</label>
+		<select name="role" style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--background));color:hsl(var(--foreground));font-size:13px;">%s</select>
+		<p style="font-size:12px;color:hsl(var(--muted-foreground));margin:8px 0 12px;">A role set here is global: it applies in every tenant.%s</p>
+		<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Set role</button>
+		</form></div>`, html.EscapeString(csrf), html.EscapeString(userID), opts.String(), tenantNote)
 }
 
 func sel(val, option string) string {

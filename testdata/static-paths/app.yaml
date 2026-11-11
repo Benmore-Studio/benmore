@@ -1,0 +1,5 @@
+site_name: "static-paths fixture"
+# No mcp.yaml: static/ is served from the directory. The twin fixture
+# static-paths-reviewed holds the same files behind a reviewed mcp.yaml.
+frontend:
+  stack: html

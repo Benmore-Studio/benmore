@@ -974,7 +974,7 @@ func TestAppMCPCommandApprovalResealRejectsStaleCiphertext(t *testing.T) {
 	}
 	updateAuthorizations := 0
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(action int, table, column, _ string) int {
+		mustSQLiteConn(raw).RegisterAuthorizer(func(action int, table, column, _ string) int {
 			if action == sqlite3.SQLITE_UPDATE && table == "_benmore_mcp_command_approvals" && column == "state_ciphertext" {
 				updateAuthorizations++
 			}
@@ -1045,7 +1045,7 @@ func TestAppMCPCommandApprovalResealRejectsStaleCiphertext(t *testing.T) {
 		_ = conn.Close()
 		t.Fatal(err)
 	}
-	if err := conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil); return nil }); err != nil {
+	if err := conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(nil); return nil }); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)
 	}
@@ -1148,7 +1148,7 @@ func TestAppMCPCommandApprovalResealNativeFailureRollsBackAndCancellationRefuses
 	}
 	updates, denied := 0, false
 	if err := conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(action int, table, column, _ string) int {
+		mustSQLiteConn(raw).RegisterAuthorizer(func(action int, table, column, _ string) int {
 			if action == sqlite3.SQLITE_UPDATE && table == "_benmore_mcp_command_approvals" && column == "state_ciphertext" {
 				updates++
 				if updates == 2 {
@@ -1199,7 +1199,7 @@ func TestAppMCPCommandApprovalResealNativeFailureRollsBackAndCancellationRefuses
 		_ = conn.Close()
 		t.Fatal(err)
 	}
-	if err := conn.Raw(func(raw any) error { raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(nil); return nil }); err != nil {
+	if err := conn.Raw(func(raw any) error { mustSQLiteConn(raw).RegisterAuthorizer(nil); return nil }); err != nil {
 		_ = conn.Close()
 		t.Fatalf("clear native authorizer: %v", err)
 	}

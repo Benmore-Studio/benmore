@@ -1,0 +1,12 @@
+{
+  "keys": [
+    "summary",
+    "why",
+    "built_in_recipes",
+    "failure_behavior",
+    "benmore_subscriptions",
+    "signed_input",
+    "body_handling",
+    "hint"
+  ]
+}

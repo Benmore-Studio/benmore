@@ -1,0 +1,4 @@
+import { query } from 'sdui';
+const byStatus = await query({ table:'contacts', group_by:['status'],
+  aggregates:[{fn:'count',as:'n'},{fn:'sum',col:'budget',as:'total'}],
+  order_by:[{col:'n',dir:'desc'}] });

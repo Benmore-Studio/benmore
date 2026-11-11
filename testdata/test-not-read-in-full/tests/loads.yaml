@@ -1,0 +1,54 @@
+# Tests the runner reads in full: they run and pass beside the refused files.
+health_answers:
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+
+# A request step with no `expect:`, or an empty one, passes on a status below 400.
+request_step_without_expect:
+  anon: true
+  steps:
+    - get: "/health"
+    - get: "/health"
+      expect: {}
+
+# A `sql:` step with no `expect:` passes when its statement runs; `rows` is the
+# one key it checks. `flush:` and `set_auth:` steps take no `expect:`.
+every_kind_of_step:
+  as_user: "owner@test.com"
+  setup:
+    - sql: "DELETE FROM notes"
+  steps:
+    - api: "POST /api/notes"
+      json:
+        title: "kept"
+      save:
+        note_id: "id"
+      expect:
+        status: 200
+    - sql: "UPDATE notes SET title = 'renamed' WHERE id = {{note_id}}"
+    - sql: "SELECT id FROM notes WHERE title = 'renamed'"
+      expect:
+        rows: 1
+    - flush: jobs
+    - set_auth: "none"
+    - get: "/api/notes/{{note_id}}"
+      expect:
+        status: 401
+
+# A merge key brings in the keys of an anchored test; they are read like any other.
+merged_from_an_anchor: &health
+  anon: true
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+        contains:
+          - "status"
+          - "healthy"
+        max_duration: "5s"
+
+uses_the_anchor:
+  <<: *health

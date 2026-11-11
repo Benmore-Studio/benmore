@@ -118,7 +118,9 @@ func TestScopingIndexesTurnScansIntoSearches(t *testing.T) {
 	app := scopingTestApp(t)
 	ownerList := `SELECT * FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 50`
 	tenantList := `SELECT * FROM projects WHERE org_id = ? ORDER BY id DESC LIMIT 50`
-	session := &Session{UserID: 7}
+	// projects carries the tenant key: membership counts only for a caller
+	// with a tenant (a tenantless caller gets no membership EXISTS at all).
+	session := &Session{UserID: 7, GroupID: "1"}
 	rule := memberOfFor(app, "projects", OpRead)
 	if rule == nil {
 		t.Fatal("member-of rule not resolved")

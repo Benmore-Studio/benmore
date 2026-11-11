@@ -27,9 +27,14 @@ func TestEscapeFTS5Query(t *testing.T) {
 		{"123e4567-e89b-12d3-a456-426614174000", `"123e4567-e89b-12d3-a456-426614174000"`},
 		// Multi-space collapses cleanly.
 		{"  multi   space   ", `"multi" "space"`},
+		// A control character separates words like whitespace does. A NUL
+		// inside a phrase ended the MATCH string ("unterminated string").
+		{"rep\x00", `"rep"`},
+		{"alice\x00cooper\x1f", `"alice" "cooper"`},
 		// Empty → empty (caller should skip the MATCH entirely).
 		{"", ""},
 		{"   ", ""},
+		{"\x00", ""},
 	}
 	for _, c := range cases {
 		got := escapeFTS5Query(c.in)
@@ -39,24 +44,9 @@ func TestEscapeFTS5Query(t *testing.T) {
 	}
 }
 
-func TestFTSTrigramUsable(t *testing.T) {
-	usable := []string{"test", "abc", "john smith", "abcd efg hij"}
-	fallback := []string{"ab", "a", "x y", "ab cdef", "abcd ef gh", ""}
-	for _, q := range usable {
-		if !ftsTrigramUsable(q) {
-			t.Errorf("ftsTrigramUsable(%q) = false, want true", q)
-		}
-	}
-	for _, q := range fallback {
-		if ftsTrigramUsable(q) {
-			t.Errorf("ftsTrigramUsable(%q) = true, want false", q)
-		}
-	}
-}
-
 func TestBuildFTSLikeFallback_EscapesWildcards(t *testing.T) {
 	clause, args := buildFTSLikeFallback("contacts", []string{"name", "email"}, "a%_x")
-	if clause != `(contacts.name LIKE ? ESCAPE '\' OR contacts.email LIKE ? ESCAPE '\')` {
+	if clause != `("contacts"."name" LIKE ? ESCAPE '\' OR "contacts"."email" LIKE ? ESCAPE '\')` {
 		t.Errorf("clause = %q", clause)
 	}
 	if len(args) != 2 || args[0] != `%a\%\_x%` {

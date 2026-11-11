@@ -1,0 +1,1 @@
+Materialized aggregates: named SQL values declared under `aggregates:` in app.yaml, computed in the background on a timer and cached, for dashboard numbers that are too slow to compute on every request. Each is one value for the whole app, not per viewer or tenant. Admins read them from GET /api/_aggregates; server-rendered pages print them as `{{aggregate.<name>}}`.

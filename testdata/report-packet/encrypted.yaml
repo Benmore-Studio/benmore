@@ -1,0 +1,39 @@
+{
+  "tables": {
+    "case_records": {
+      "fields": [
+        "narrative",
+        "client_reference",
+        "budget_cents"
+      ],
+      "blind_index": [
+        "client_reference",
+        "budget_cents"
+      ],
+      "unmask_roles": [
+        "self",
+        "reviewer",
+        "admin"
+      ]
+    },
+    "case_documents": {
+      "fields": [
+        "body"
+      ],
+      "unmask_roles": [
+        "self",
+        "reviewer",
+        "admin"
+      ]
+    },
+    "reference_bulletins": {
+      "fields": [
+        "body"
+      ],
+      "unmask_roles": [
+        "reviewer",
+        "admin"
+      ]
+    }
+  }
+}

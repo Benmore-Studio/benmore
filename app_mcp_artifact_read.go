@@ -702,14 +702,10 @@ func appMCPRegisterReadArtifactTool(server *sdk.Server, app *App, generation *ap
 			artifact, err := createAppMCPReadArtifact(ctx, app, tool, flow, current, kind, result)
 			if err != nil {
 				log.Printf("MCP artifact.create %s (%s): %v", tool.Name, kind, err) // layout and budget text only, never a value
-				code := "incomplete_result"
-				if strings.Contains(err.Error(), "PDF") {
-					code = "unavailable_provider"
-				}
-				return appMCPSDKFailure(appMCPResultFailure(code)), nil
+				return appMCPSDKFailure(appMCPResultFailure(appMCPArtifactFailureCode(err))), nil
 			}
 			return appMCPCommandResult(map[string]any{"artifact_id": artifact.ID, "kind": artifact.Kind, "sha256": artifact.SHA256, "size": artifact.Size,
-				"download_url": appMCPOAuthOrigin(resource) + "/api/_mcp/artifacts/" + artifact.ID, "read_completeness": result.Completeness.State}), nil
+				"download_url": appMCPArtifactDownloadURL(resource, artifact.ID), "read_completeness": result.Completeness.State}), nil
 		})
 }
 

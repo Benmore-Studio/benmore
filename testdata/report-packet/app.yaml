@@ -1,0 +1,65 @@
+{
+  "site_name": "Casework",
+  "theme": "slate",
+  "mode": "light",
+  "auth": {
+    "identifier": "email",
+    "session_duration": "2h",
+    "signup": false,
+    "password_reset": false,
+    "read_audit": "case_records,case_documents",
+    "read_audit_sync": true
+  },
+  "features": {
+    "testing": true,
+    "analytics": false,
+    "sse": true
+  },
+  "frontend": {
+    "stack": "html"
+  },
+  "groups": {
+    "table": "members",
+    "key": "org_id",
+    "user_field": "user_id",
+    "role_field": "member_role",
+    "active_field": "active",
+    "bootstrap": {
+      "org_table": "organizations",
+      "founding_role": "reviewer"
+    }
+  },
+  "access": {
+    "notes": "admin",
+    "organizations": {
+      "read": "role:reviewer",
+      "write": "admin",
+      "update": "role:reviewer",
+      "delete": "admin"
+    },
+    "members": "admin",
+    "case_records": {
+      "read": "group",
+      "write": "group",
+      "update": "self",
+      "delete": "self"
+    },
+    "case_documents": {
+      "read": "self",
+      "write": "self",
+      "update": "self",
+      "delete": "self"
+    },
+    "reference_bulletins": {
+      "read": "everyone",
+      "write": "admin",
+      "update": "admin",
+      "delete": "admin"
+    }
+  },
+  "versioned": [
+    "case_records",
+    "case_documents",
+    "reference_bulletins"
+  ]
+}

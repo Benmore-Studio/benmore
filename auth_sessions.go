@@ -16,8 +16,8 @@ import (
 )
 
 // Session cookie names. Over HTTPS the cookie carries the __Host- prefix, so
-// a browser keeps it only host-only, Secure and on Path=/: no other app or
-// edge on a sibling subdomain can set or shadow it with a Domain-scoped
+// a browser keeps it only host-only, Secure and on Path=/: no other app on a
+// sibling subdomain can set or shadow it with a Domain-scoped
 // cookie (the cookie-tossing path to session fixation). Plain-HTTP
 // development keeps the unprefixed name, which HTTPS requests ignore.
 const (
@@ -48,8 +48,25 @@ func requestSessionCookie(r *http.Request) (*http.Cookie, error) {
 
 // clearSessionCookies expires the session cookie under both names.
 func clearSessionCookies(w http.ResponseWriter, devMode bool) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-	http.SetCookie(w, &http.Cookie{Name: devSessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: !devMode, SameSite: http.SameSiteLaxMode})
+	expireSessionCookie(w, sessionCookieName, devMode)
+	expireSessionCookie(w, devSessionCookieName, devMode)
+}
+
+// expireSessionCookie expires the session cookie stored under name.
+func expireSessionCookie(w http.ResponseWriter, name string, devMode bool) {
+	http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: name == sessionCookieName || !devMode, SameSite: http.SameSiteLaxMode})
+}
+
+// replaceSessionCookie swaps the browser's session for another one (a support
+// session, and the admin's own session when it ends). The cookie is the one
+// sign-in sets (sessionCookie: named by the app's mode, never by the
+// request's scheme), and the other name is expired. requestSessionCookie
+// reads the prefixed name first, so a new session set under the other name
+// next to a live prefixed cookie is never read: the answer says the session
+// changed and the browser keeps acting as the old one.
+func replaceSessionCookie(w http.ResponseWriter, app *App, token string, duration time.Duration) {
+	expireSessionCookie(w, sessionCookieNameFor(app.DevMode), app.DevMode) // sessionCookie names by !DevMode
+	http.SetCookie(w, sessionCookie(token, app.DevMode, duration))
 }
 
 // EnsureSessionsTable creates the sessions table.
@@ -77,6 +94,14 @@ func EnsureSessionsTable(db *sql.DB) {
 	// audit trail keeps naming them after the originating session ends.
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN impersonator_user_id INTEGER DEFAULT 0")
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN impersonator_email TEXT DEFAULT ''")
+	// started_by_session_id: the stored key of the admin's own session a
+	// support session was started from, whether its token came as the cookie
+	// or as a Bearer header. The support session lives only as long as that
+	// session (supportSessionStarterLive). impersonator_session_id stays the
+	// cookie session end-impersonation hands back, and is empty for a Bearer
+	// start: that support token goes to an API caller and must not be
+	// tradeable for the admin's session.
+	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN started_by_session_id TEXT DEFAULT ''")
 	// Add ip + user_agent columns so the Sessions tab on /profile can
 	// show a real device label instead of "unknown ip". Captured by
 	// AttachSessionContext right after CreateSession.
@@ -91,10 +116,17 @@ func EnsureSessionsTable(db *sql.DB) {
 	// the column, and every session minted any other way - never counts as a
 	// recent sign-in (recentDirectSignIn).
 	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN login_at INTEGER NOT NULL DEFAULT 0")
+	// last_seen_at: unix time of the session's last counted request, for
+	// auth.idle_timeout (auth_idle.go). 0 reads as created_at.
+	db.Exec("ALTER TABLE _benmore_sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0")
 	// Every credential revocation (password change/reset, claim, purge,
 	// email change, session list) filters by user_id; without an index each
 	// was a full scan of every session in the app.
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_benmore_sessions_user ON _benmore_sessions(user_id)")
+	// A credential revocation also ends the support sessions the account
+	// started (endSupportSessionsStartedBy). Those rows sit under the
+	// customers' user ids, so the index above does not find them.
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_benmore_sessions_impersonator ON _benmore_sessions(impersonator_user_id) WHERE is_impersonation = 1")
 	// Expiry is compared as datetime(expires_at) on purpose (rows hold both
 	// RFC3339 and SQLite text forms, which don't compare as plain text), so
 	// the cleanup sweeps index that expression. datetime() of a column is
@@ -127,13 +159,6 @@ func AttachSessionContext(db *sql.DB, sessionToken string, r *http.Request) {
 		clientIP(r), ua, sessionStorageKey(sessionToken),
 	); err != nil {
 		log.Printf("session context update failed: %v", err)
-	}
-}
-
-// NewSessionStore creates a session store backed by SQLite.
-func NewSessionStore() *SessionStore {
-	return &SessionStore{
-		sessions: make(map[string]*Session),
 	}
 }
 
@@ -201,7 +226,10 @@ func resolveMembershipRoleForValueWith(db rowQuerier, group *GroupConfig, member
 		query += " AND " + verifiedAccountEmailSQLForSchema(schema)
 		args = append(args, email)
 	}
-	if err := db.QueryRow(query+" LIMIT 1", args...).Scan(&role); err != nil {
+	err := oldestMembershipRow(func(order string) error {
+		return db.QueryRow(query+order, args...).Scan(&role)
+	}, quoteColumn(name, group.RoleField))
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", nil
 		}
@@ -211,6 +239,27 @@ func resolveMembershipRoleForValueWith(db rowQuerier, group *GroupConfig, member
 		return "", nil
 	}
 	return strings.TrimSpace(role.String), nil
+}
+
+// oldestMembershipRow runs a membership lookup (scan appends the ORDER BY and
+// LIMIT it is given) so that a user with several live rows in one tenant
+// gets the role of the oldest. Without an order SQLite returned whichever row
+// the plan met first, so a later duplicate - a POST to the membership table
+// whose user_id the framework replaced with the caller's own, carrying the
+// column's default role - could change a member's role, and an index added
+// later could change it again. The oldest row is the one the tenant itself
+// resolves to (resolveGroupIDFor) and the one the member was invited or
+// founded with; a duplicate added later can neither raise nor lower it.
+// fallback orders a view or WITHOUT ROWID table, which has no rowid.
+func oldestMembershipRow(scan func(order string) error, fallback string) error {
+	err := scan(" ORDER BY rowid LIMIT 1")
+	if err == nil || errors.Is(err, sql.ErrNoRows) || fallback == "" {
+		return err
+	}
+	if retry := scan(" ORDER BY " + fallback + " LIMIT 1"); retry == nil || errors.Is(retry, sql.ErrNoRows) {
+		return retry
+	}
+	return err
 }
 
 // mainAuthorityTable returns the membership table pinned to the main schema,
@@ -323,6 +372,9 @@ func tableHasRowID(db *sql.DB, table string) bool {
 const defaultSessionDuration = 30 * 24 * time.Hour // 30 days
 
 // ParseSessionDuration parses duration strings like "30d", "7d", "24h", "1h".
+// It answers the default for anything it cannot read and takes some loose
+// spellings; sessionDurationSetting (auth_session_duration.go) is what decides
+// whether a configured value is an accepted form and warns or refuses.
 func ParseSessionDuration(s string) time.Duration {
 	if s == "" {
 		return defaultSessionDuration
@@ -356,20 +408,49 @@ func CreateSession(db *sql.DB, userID int64, email string, groupID string, durat
 func createSessionWith(db interface {
 	Exec(string, ...any) (sql.Result, error)
 }, userID int64, email string, groupID string, duration time.Duration, scopes ...string) (string, error) {
-	token := generateToken(32)
-	if duration <= 0 {
-		duration = defaultSessionDuration
-	}
-	expires := time.Now().Add(duration)
 	scopeStr := ""
 	if len(scopes) > 0 {
 		scopeStr = scopes[0]
 	}
-	if _, err := db.Exec("INSERT INTO _benmore_sessions (id, user_id, email, group_id, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-		sessionStorageKey(token), userID, email, groupID, scopeStr, expires.UTC().Format(time.RFC3339)); err != nil {
+	return insertSessionRow(db, userID, email, groupID, duration, scopeStr, 0)
+}
+
+// insertSessionRow writes a new session row and returns the session token.
+// login_at is named only when it is not the column default, so a session
+// table without that column (one no EnsureSessionsTable has migrated) still
+// takes ordinary sessions.
+func insertSessionRow(db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, userID int64, email, groupID string, duration time.Duration, scopes string, loginAt int64) (string, error) {
+	token := generateToken(32)
+	if duration <= 0 {
+		duration = defaultSessionDuration
+	}
+	expires := time.Now().Add(duration).UTC().Format(time.RFC3339)
+	var err error
+	if loginAt == 0 {
+		_, err = db.Exec("INSERT INTO _benmore_sessions (id, user_id, email, group_id, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+			sessionStorageKey(token), userID, email, groupID, scopes, expires)
+	} else {
+		_, err = db.Exec("INSERT INTO _benmore_sessions (id, user_id, email, group_id, scopes, expires_at, login_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			sessionStorageKey(token), userID, email, groupID, scopes, expires, loginAt)
+	}
+	if err != nil {
 		return "", err
 	}
 	return token, nil
+}
+
+// createTokenExchangeSession is CreateSession for the password-for-Bearer
+// exchange (POST /api/_auth/token): the row carries loginAtTokenExchange from
+// the INSERT on, so `auth.api_tokens: false` turns it off.
+func createTokenExchangeSession(db *sql.DB, userID int64, email, groupID string, duration time.Duration, scopes string) string {
+	token, err := insertSessionRow(db, userID, email, groupID, duration, scopes, loginAtTokenExchange)
+	if err != nil {
+		log.Printf("ERROR creating session: %s", err)
+		return ""
+	}
+	return token
 }
 
 // recentSignInWindow is how long a direct sign-in stands in for re-entering
@@ -410,7 +491,7 @@ func createSignInSessionTx(tx *sql.Tx, userID int64, email, groupID string, dura
 // from a direct sign-in (createSignInSession) made within recentSignInWindow:
 // the session cookie, not a Bearer header, and a row that is not
 // impersonation, act-as or scoped. Older sign-ins, Bearer-presented tokens,
-// API tokens, edge identities and sessions minted outside a sign-in are false.
+// API tokens and sessions minted outside a sign-in are false.
 func recentDirectSignIn(app *App, r *http.Request, sess *Session) bool {
 	if app == nil || app.DB == nil || r == nil || sess == nil || sess.UserID <= 0 || !directLoginSession(app, sess) {
 		return false
@@ -552,6 +633,13 @@ func loadStoredSessionChecked(db mutationQuerier, strict bool, ids ...string) (*
 		if !live {
 			return nil, nil
 		}
+		live, err = supportSessionStarterLive(db, storedID, strict)
+		if err != nil && strict {
+			return nil, fmt.Errorf("read session starter: %w", err)
+		}
+		if !live {
+			return nil, nil
+		}
 	}
 	gid := ""
 	if groupID.Valid && groupID.String != "0" {
@@ -625,6 +713,31 @@ func impersonatorStillAdmin(db mutationQuerier, adminID int64, strict bool) (boo
 	return userHasGlobalAdminGrantWithSchema(db, adminID, schema)
 }
 
+// supportSessionStarterLive reports whether the admin session a support
+// session was started from is still live: its row exists, belongs to the
+// admin and has not expired. The support session acts on that sign-in, so it
+// ends with it however that happens - revoked from the session list, logged
+// out, ended by an operator, deleted by the idle timeout or a credential
+// revocation, expired - without each of those paths having to know about
+// support rows. A support row that names no starter (started with an API
+// token, or written before the column) is judged by its admin's standing
+// alone, as before; revokeUserAccessExcept ends those by the admin's id.
+func supportSessionStarterLive(db mutationQuerier, supportID string, strict bool) (bool, error) {
+	table := "_benmore_sessions"
+	if strict {
+		table = "main." + table
+	}
+	var live int
+	err := db.QueryRow(`SELECT COUNT(*) FROM `+table+` s
+		WHERE s.id = ? AND (COALESCE(s.started_by_session_id, '') = '' OR EXISTS (
+			SELECT 1 FROM `+table+` o WHERE o.id = s.started_by_session_id
+			AND o.user_id = s.impersonator_user_id AND datetime(o.expires_at) > datetime('now')))`, supportID).Scan(&live)
+	if err != nil {
+		return false, err
+	}
+	return live == 1, nil
+}
+
 // DeleteSessionFromDB removes the session a token authenticates (logout,
 // cleanup of a minted session), whether its row is hashed or legacy.
 func DeleteSessionFromDB(db *sql.DB, token string) {
@@ -653,9 +766,19 @@ func CleanExpiredSessions(app *App) {
 			case <-ticker.C:
 				app.DB.Exec("DELETE FROM _benmore_sessions WHERE datetime(expires_at) < datetime('now')")
 				app.DB.Exec("DELETE FROM _benmore_api_tokens WHERE expires_at IS NOT NULL AND datetime(expires_at) < datetime('now')")
+				deleteExpiredOTPCodes(app.DB)
 			}
 		}
 	})
+}
+
+// deleteExpiredOTPCodes removes sign-in codes past their expiry; a code that
+// was never used would otherwise stay in _benmore_otp forever. An app without
+// the table (no auth) is not an error worth logging.
+func deleteExpiredOTPCodes(db *sql.DB) {
+	if _, err := db.Exec("DELETE FROM _benmore_otp WHERE datetime(expires_at) < datetime('now')"); err != nil && !strings.Contains(err.Error(), "no such table") {
+		log.Printf("expired sign-in codes not removed: %v", err)
+	}
 }
 
 // sessionCookie builds a session cookie with proper security flags.
@@ -688,74 +811,129 @@ func isPersistentAPIToken(tok string) bool {
 	return strings.HasPrefix(tok, "bmr_") || strings.HasPrefix(tok, "bma_")
 }
 
+// userAPITokenSwitchedOff reports whether tok is a user-created API token
+// ("bmr_") while app.yaml has `auth.api_tokens: false`. The switch turns the
+// credentials it stops minting off as well: an existing token stops
+// authenticating while it is off and works again if it is switched back on
+// (rows are kept, so users can still list and revoke them). OAuth access
+// tokens ("bma_") belong to the app's OAuth provider and are not affected.
+func userAPITokenSwitchedOff(app *App, tok string) bool {
+	return strings.HasPrefix(tok, "bmr_") && authFeatureDisabled(app, "api_tokens")
+}
+
+// loginAtTokenExchange is the _benmore_sessions.login_at value of a session
+// minted by the password-for-Bearer exchange (POST /api/_auth/token). Like 0
+// it is never a recent sign-in (recentDirectSignIn wants > 0); unlike 0 it
+// names where the session came from, so `auth.api_tokens: false` can turn
+// these sessions off (tokenExchangeSessionSwitchedOff). Sessions minted by
+// the exchange before this marker existed hold 0 and cannot be told apart
+// from other non-interactive sessions; they last until they expire or are
+// revoked.
+const loginAtTokenExchange = -1
+
+// tokenExchangeSessionSwitchedOff reports whether session came from the
+// token exchange while app.yaml has `auth.api_tokens: false`, whatever header
+// or cookie presents it. The extra read happens only on apps with the switch
+// off, and a failed read refuses the session (an auth gate fails closed).
+func tokenExchangeSessionSwitchedOff(app *App, session *Session) bool {
+	if session == nil || strings.HasPrefix(session.ID, "apitoken:") || !authFeatureDisabled(app, "api_tokens") {
+		return false
+	}
+	var loginAt int64
+	if err := app.DB.QueryRow("SELECT COALESCE(login_at, 0) FROM _benmore_sessions WHERE id = ?", session.ID).Scan(&loginAt); err != nil {
+		return true
+	}
+	return loginAt == loginAtTokenExchange
+}
+
 func getSession(app *App, r *http.Request) *Session {
 	if actor, private := appMCPPrivateSession(app, r); private {
 		return actor
 	}
+	// A credential held for MFA enrollment authenticates nothing here; the
+	// enrollment endpoints reach it through mfaEnrollmentSession.
+	if s := requestCredentialSession(app, r); s != nil && !s.mfaEnrollmentPending {
+		return s
+	}
+	return nil
+}
+
+// requestCredentialSession is the session the request's credential resolves
+// to, including one held for MFA enrollment (Session.mfaEnrollmentPending).
+func requestCredentialSession(app *App, r *http.Request) *Session {
 	// Answer repeat lookups within one request from its cache
 	// (auth_session_cache.go); never shared across requests.
 	if holder := requestSessionHolderFor(r); holder != nil {
-		if cred, ok := requestSessionCredential(r); ok {
-			now := time.Now()
-			if s, hit := holder.get(app, cred, now); hit {
-				return s
-			}
-			s := resolveRequestSession(app, r)
-			holder.put(app, cred, s, now)
+		cred := requestSessionCredential(r)
+		now := time.Now()
+		if s, hit := holder.get(app, cred, now); hit {
 			return s
 		}
+		s := resolveRequestSession(app, r)
+		holder.put(app, cred, s, now)
+		return s
 	}
 	return resolveRequestSession(app, r)
 }
 
-// resolveRequestSession resolves the request's identity from the database:
-// cookie, then Bearer session or API token, then the edge bridge.
-func resolveRequestSession(app *App, r *http.Request) *Session {
-	var session *Session
-
+// presentedRequestSession resolves the credential the request presents: the
+// session cookie (web clients), else a Bearer session id or API token. It
+// applies the checks every credential carries (expiry, revocation,
+// deactivation) but none of the app's request-time gates.
+func presentedRequestSession(app *App, r *http.Request) *Session {
 	// 1. Cookie (web clients) - always a session ID, never scoped
 	if cookie, err := requestSessionCookie(r); err == nil && cookie.Value != "" {
-		session = GetSessionFromDB(app.DB, cookie.Value)
+		if session := getAppSession(app, r, cookie.Value); session != nil {
+			return session
+		}
 	}
-
 	// 2. Bearer token (API/native clients) - either session ID or API token
-	if session == nil {
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			token := strings.TrimPrefix(auth, "Bearer ")
-			if isPersistentAPIToken(token) {
-				// Prefixed token → persistent API token (hash-based lookup)
-				session = GetSessionFromAPIToken(app.DB, token)
-			} else {
-				// Unprefixed → session ID (direct lookup)
-				session = GetSessionFromDB(app.DB, token)
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if isPersistentAPIToken(token) {
+			// Prefixed token → persistent API token (hash-based lookup)
+			if userAPITokenSwitchedOff(app, token) {
+				return nil
 			}
+			return GetSessionFromAPIToken(app.DB, token)
 		}
+		// Unprefixed → session ID (direct lookup)
+		return getAppSession(app, r, token)
 	}
+	return nil
+}
 
-	// 3. Edge-bridge identity. The router proxies authorized edge
-	//    requests with `X-Benmore-Edge-User: <user_id>` after it has
-	//    verified the visitor's consent token. Trusted ONLY when the
-	//    request arrived from the loopback proxy (the per-app
-	//    process listens on 127.0.0.1; only the router can hit it).
-	//    See edge_router.go for the verification path.
-	if session == nil {
-		if uid := edgeBridgeUserID(r); uid > 0 {
-			session = sessionForEdgeBridge(app, uid)
-			if session != nil {
-				session.Scopes = r.Header.Get("X-Benmore-Edge-Scope")
-				session.CredentialScopes = session.Scopes
-			}
-		}
+// resolveRequestSession resolves the request's identity from the database:
+// cookie, then Bearer session or API token.
+func resolveRequestSession(app *App, r *http.Request) *Session {
+	// The benmore.ai dashboard, once the platform router owns its sign-in,
+	// takes every identity from the router and none from its own tables
+	// (platform_dashboard_identity_client.go).
+	if s, decided := dashboardIdentityFromRouter(app, r); decided {
+		return s
 	}
-
+	session := presentedRequestSession(app, r)
 	if session == nil {
+		return nil
+	}
+	if tokenExchangeSessionSwitchedOff(app, session) {
 		return nil
 	}
 
 	// Deactivation is already checked in GetSessionFromDB (returns nil if deactivated).
-	// Check verified enforcement here since it depends on app config.
-	if app.Design != nil && app.Design.Auth["require_verified"] == "true" && !session.Verified {
+	// Check verified enforcement here since it depends on app config. The
+	// sign-in paths issue no session to such an account, and a 401 for a
+	// credential refused here names the reason
+	// (presentedCredentialAwaitsVerification, email_verify_gate.go).
+	if requireVerifiedEmail(app) && !session.Verified {
 		return nil // unverified users blocked when require_verified is set
+	}
+
+	// auth.require_mfa_for_roles binds every credential the account holds,
+	// not only the sign-in that issues one (mfa_enrollment_gate.go).
+	if mfaEnrollmentWithheld(app, session) {
+		session.mfaEnrollmentPending = true
+		return session
 	}
 
 	// The tenant cached on a session row holds only while the membership
@@ -767,7 +945,7 @@ func resolveRequestSession(app *App, r *http.Request) *Session {
 	if session.HasGroup() && app.Group != nil && app.Group.Table != "" && app.Group.UserField != "" &&
 		!session.IsAdmin() && !groupMembershipLive(app.DB, app.Group, session, session.GroupID) {
 		session.GroupID = ""
-		if !strings.HasPrefix(session.ID, "apitoken:") && !strings.HasPrefix(session.ID, "edge:") {
+		if !strings.HasPrefix(session.ID, "apitoken:") {
 			app.DB.Exec("UPDATE _benmore_sessions SET group_id = '' WHERE id = ?", session.ID)
 		}
 		session.Roles = LoadSessionRoles(app.DB, session.UserID, session.Role, session.EffectiveGroupID())
@@ -795,7 +973,7 @@ func resolveRequestSession(app *App, r *http.Request) *Session {
 		if resolved != "" {
 			session.GroupID = resolved
 			// Only persist for real sessions, not API tokens
-			if !strings.HasPrefix(session.ID, "apitoken:") && !strings.HasPrefix(session.ID, "edge:") {
+			if !strings.HasPrefix(session.ID, "apitoken:") {
 				app.DB.Exec("UPDATE _benmore_sessions SET group_id = ? WHERE id = ?", resolved, session.ID)
 			}
 			// CRITICAL (v2.7.59+): re-load session.Roles now that the
@@ -874,14 +1052,16 @@ func applySessionRoleScopesWith(app *App, db rowQuerier, session *Session, schem
 	//
 	// SECURITY: if roles are configured but NONE of the user's roles are
 	// defined, deny access (empty scopes that will be checked = denied on
-	// first API call). Undefined roles must NOT get full access.
+	// first API call). Undefined roles must NOT get full access. The one
+	// exception is the built-in admin role of a global admin, which holds
+	// every scope unless roles: declares it (sessionRoleScopes).
 	if app.Roles != nil {
 		session.accessTables = app.Roles.accessTables
 		held := session.Roles
 		if len(held) == 0 {
 			held = []string{session.Role}
 		}
-		roleScopes := app.Roles.ResolveScopesForRoles(held)
+		roleScopes := app.Roles.sessionRoleScopes(session, held)
 		if roleScopes != "" {
 			session.Scopes = intersectScopes(session.Scopes, roleScopes)
 		} else {

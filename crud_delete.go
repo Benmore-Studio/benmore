@@ -5,6 +5,7 @@ package main
 // Record deletion and soft-delete cascades.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +31,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 
 	// CSRF validation - HX-Request header is trivially forgeable, never bypass CSRF for it
-	if !validateCSRF(r) && !isBearerAuth(r) {
+	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
@@ -39,7 +40,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 	session := getSession(app, r)
 	if session != nil {
 		if err := checkScope(session, table, "delete"); err != nil {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 	}
@@ -93,6 +94,15 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 	if writeMembershipManageDenial(w, membershipDeleteDenial(tx, app, table, session, deletedRow)) {
 		return
 	}
+	if err := refuseLastAdminRowDelete(app, tx, table, id); err != nil {
+		var refused *mutationValidationError
+		if errors.As(err, &refused) {
+			httpError(w, refused.Error(), http.StatusConflict)
+		} else {
+			serverError(w, r, app, table+" delete", err, "Delete failed")
+		}
+		return
+	}
 
 	// Fire before-hooks (can abort)
 	beforeRow := make(map[string]any, len(deletedRow))
@@ -114,7 +124,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 	}
 	deleteArgs := append([]any{id}, scopeArgs...)
 
-	result, err := tx.Exec(deleteSQL, deleteArgs...)
+	result, err := execVersioned(tx, table, id, session, deleteSQL, deleteArgs...)
 	if err != nil {
 		if strings.Contains(err.Error(), "FOREIGN KEY") {
 			httpError(w, fmt.Sprintf("Cannot delete: other records reference this %s. Delete those first.", table), http.StatusConflict)
@@ -146,23 +156,34 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 		serverError(w, r, app, table+" delete", err, "Delete failed")
 		return
 	}
+	// Cascade soft deletes to child tables, in this transaction.
+	var cascaded []cascadedDelete
+	if softDelete {
+		if cascaded, err = cascadeSoftDelete(tx, app, table, deletedRow, session); err != nil {
+			if !respondStorageFull(w, app, err) {
+				serverError(w, r, app, table+" delete", err, "Delete failed")
+			}
+			return
+		}
+	}
+	// Hook jobs and webhook deliveries commit with the delete.
+	// Subscriptions deliver the row as stored.
+	stored := copyRow(deletedRow)
+	injectSessionContext(deletedRow, session)
+	if err := enqueueRowEffectsTx(tx, app, "delete", table, deletedRow, stored, session); err != nil {
+		if !respondStorageFull(w, app, err) {
+			serverError(w, r, app, table+" delete", err, "Delete failed")
+		}
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		if !respondStorageFull(w, app, err) {
 			serverError(w, r, app, table+" delete", err, "Delete failed")
 		}
 		return
 	}
-
-	// Cascade soft deletes to child tables
-	if softDelete {
-		cascadeSoftDelete(app, table, deletedRow, session)
-	}
-
-	// Fire delete hooks
-	injectSessionContext(deletedRow, session)
-	FireHooks(app, "delete", table, deletedRow)
+	fireCascadedDeleteEvents(app, cascaded, session)
 	FireFlowsForEvent(app, "on_delete", table, deletedRow)
-	FireWebhookSubscriptions(app, "delete", table, deletedRow, session)
 	Broadcast(app, table, "delete", session)
 	appendHXTrigger(w, "benmore:changed")
 
@@ -175,9 +196,10 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 	json.NewEncoder(w).Encode(map[string]any{"status": "deleted"})
 }
 
-// cascadeSoftDelete soft-deletes the live children of a soft-deleted parent:
-// rows of tables that have a foreign key on the parent's id and a deleted_at
-// column of their own (convention-based cascading, one level deep).
+// cascadeSoftDelete soft-deletes the live children of a soft-deleted parent,
+// in the parent's own transaction: rows of tables that have a foreign key on
+// the parent's id and a deleted_at column of their own (convention-based
+// cascading, one level deep).
 //
 // Each child goes through the ordinary delete pipeline as the caller who
 // deleted the parent, so the cascade removes exactly the children that caller
@@ -185,18 +207,23 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 // must admit the caller, the row must be in their delete scope
 // (rowScopeClause) and not locked by someone else, and before-delete hooks may
 // refuse it. A child the caller could not delete stays live. Each deleted
-// child gets an audit row, and its after-delete hooks, on_delete flows and
-// webhook subscriptions fire as for any delete. Children in another tenant
-// than the parent (both tables carry the groups key) are never cascaded, for
-// admins too.
+// child gets an audit row and queues its after-delete hook jobs and webhook
+// subscriptions in the transaction; the caller fires the returned children's
+// on_delete flows and broadcasts after COMMIT, before the parent's (the order
+// these effects always had). Children in another tenant than the parent (both
+// tables carry the groups key) are never cascaded, for admins too.
 //
 // It used to be one unscoped UPDATE per child table: other owners' and other
 // tenants' rows were deleted with the parent, with no audit row and no hook.
-func cascadeSoftDelete(app *App, parentTable string, parent map[string]any, session *Session) {
+// It then ran in its own transaction after the parent's commit, so a crash or
+// a write error between the two left the children live with a deleted parent;
+// an error now fails the parent's delete instead.
+func cascadeSoftDelete(tx *sql.Tx, app *App, parentTable string, parent map[string]any, session *Session) ([]cascadedDelete, error) {
 	parentID, ok := parent["id"]
 	if !ok || parentID == nil {
-		return
+		return nil, nil
 	}
+	var all []cascadedDelete
 	// Walk the JoinMap to find child tables with FKs pointing at parentTable
 	for childTable, fks := range app.joinMapSnapshot() {
 		for fkCol, fk := range fks {
@@ -213,19 +240,46 @@ func cascadeSoftDelete(app *App, parentTable string, parent map[string]any, sess
 			if session != nil && checkScope(session, childTable, "delete") != nil {
 				continue
 			}
-			if n, err := cascadeSoftDeleteChildren(app, childTable, fkCol, parentTable, parent, session); err != nil {
-				log.Printf("CASCADE SOFT DELETE ERROR [%s.%s → %s]: %s", childTable, fkCol, parentTable, err)
-			} else if n > 0 {
-				log.Printf("CASCADE SOFT DELETE: %d rows in %s (via %s = %v)", n, childTable, fkCol, parentID)
+			deleted, err := cascadeSoftDeleteChildren(tx, app, childTable, fkCol, parentTable, parent, session)
+			if err != nil {
+				return nil, fmt.Errorf("cascade soft delete %s.%s -> %s: %w", childTable, fkCol, parentTable, err)
 			}
+			if len(deleted) > 0 {
+				log.Printf("CASCADE SOFT DELETE: %d rows in %s (via %s = %v)", len(deleted), childTable, fkCol, parentID)
+			}
+			all = append(all, deleted...)
 		}
+	}
+	return all, nil
+}
+
+// cascadedDelete is a child row the cascade deleted, with the session context
+// its on_delete flows read.
+type cascadedDelete struct {
+	table string
+	row   map[string]any
+}
+
+// fireCascadedDeleteEvents runs a committed cascade's post-commit effects:
+// each child's on_delete flows, then one broadcast per child table.
+func fireCascadedDeleteEvents(app *App, deleted []cascadedDelete, session *Session) {
+	var tables []string
+	seen := map[string]bool{}
+	for _, c := range deleted {
+		FireFlowsForEvent(app, "on_delete", c.table, c.row)
+		if !seen[c.table] {
+			seen[c.table] = true
+			tables = append(tables, c.table)
+		}
+	}
+	for _, t := range tables {
+		Broadcast(app, t, "delete", session)
 	}
 }
 
-// cascadeSoftDeleteChildren deletes the children of one child table in one
-// transaction and fires their post-commit effects. It returns how many rows
-// were deleted.
-func cascadeSoftDeleteChildren(app *App, childTable, fkCol, parentTable string, parent map[string]any, session *Session) (int, error) {
+// cascadeSoftDeleteChildren deletes the children of one child table in tx and
+// queues their hook jobs and webhook deliveries there.
+func cascadeSoftDeleteChildren(tx *sql.Tx, app *App, childTable, fkCol, parentTable string, parent map[string]any, session *Session) ([]cascadedDelete, error) {
 	query := fmt.Sprintf("SELECT id FROM main.%s WHERE %s = ? AND deleted_at IS NULL", quoteIdent(childTable), quoteColumn(childTable, fkCol))
 	args := []any{parent["id"]}
 	if g := app.Group; g != nil && g.Key != "" && hasColumn(app, childTable, g.Key) && hasColumn(app, parentTable, g.Key) {
@@ -238,37 +292,33 @@ func cascadeSoftDeleteChildren(app *App, childTable, fkCol, parentTable string, 
 		query += fmt.Sprintf(" AND %s IS ?", quoteColumn(childTable, g.Key))
 		args = append(args, parentTenant)
 	}
-	candidates, err := queryNativeRowsWith(app.DB, app, childTable, query, args...)
+	candidates, err := queryNativeRowsWith(tx, app, childTable, query, args...)
 	if err != nil || len(candidates) == 0 {
-		return 0, err
+		return nil, err
 	}
 	var lockUID int64
 	if session != nil {
 		lockUID = session.UserID
 	}
-	var ids []string
+	var deleted []cascadedDelete
 	for _, c := range candidates {
-		id := fmt.Sprint(c["id"])
-		if locked, _ := CheckLock(app.DB, childTable, id, lockUID); locked {
-			continue // held by someone else, as for DELETE /api/<child>/<id>
+		id := valueText(c["id"])
+		// Held by someone else, as for DELETE /api/<child>/<id>. Read in tx
+		// (CheckLock writes through the pool and would wait on this
+		// transaction); an expired lock does not count.
+		var holder int64
+		lockErr := tx.QueryRow(`SELECT user_id FROM main._benmore_locks WHERE table_name = ? AND row_id = ? AND datetime(expires_at) >= datetime('now')`, childTable, id).Scan(&holder)
+		if lockErr == nil && holder != lockUID {
+			continue
 		}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-
-	tx, err := app.DB.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	var deleted []map[string]any
-	for _, id := range ids {
+		if lockErr != nil && !errors.Is(lockErr, sql.ErrNoRows) {
+			return nil, lockErr
+		}
 		// A savepoint per child: a before-hook that refuses one row must not
-		// leave its own writes behind while the cascade carries on.
+		// leave its own writes (or its queued effects) behind while the
+		// cascade carries on.
 		if _, err := tx.Exec("SAVEPOINT benmore_cascade_row"); err != nil {
-			return 0, err
+			return nil, err
 		}
 		row, err := txDeleteRow(tx, app, childTable, id, session)
 		if err == nil {
@@ -278,35 +328,28 @@ func cascadeSoftDeleteChildren(app *App, childTable, fkCol, parentTable string, 
 			var refused *mutationValidationError
 			var notManaged *membershipManageError
 			if !errors.Is(err, errUpdateTarget) && !errors.As(err, &refused) && !errors.As(err, &notManaged) {
-				return 0, err
+				return nil, err
 			}
 			// Out of the caller's delete scope, or refused by a before-hook.
 			if _, rbErr := tx.Exec("ROLLBACK TO benmore_cascade_row"); rbErr != nil {
-				return 0, rbErr
+				return nil, rbErr
 			}
 			if _, rbErr := tx.Exec("RELEASE benmore_cascade_row"); rbErr != nil {
-				return 0, rbErr
+				return nil, rbErr
 			}
 			continue
 		}
-		if _, err := tx.Exec("RELEASE benmore_cascade_row"); err != nil {
-			return 0, err
-		}
-		deleted = append(deleted, row)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	for _, row := range deleted {
+		stored := copyRow(row)
 		injectSessionContext(row, session)
-		FireHooks(app, "delete", childTable, row)
-		FireFlowsForEvent(app, "on_delete", childTable, row)
-		FireWebhookSubscriptions(app, "delete", childTable, row, session)
+		if err := enqueueRowEffectsTx(tx, app, "delete", childTable, row, stored, session); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec("RELEASE benmore_cascade_row"); err != nil {
+			return nil, err
+		}
+		deleted = append(deleted, cascadedDelete{table: childTable, row: row})
 	}
-	if len(deleted) > 0 {
-		Broadcast(app, childTable, "delete", session)
-	}
-	return len(deleted), nil
+	return deleted, nil
 }
 
 // getCascadedChildIDs returns IDs of rows that were just cascade soft-deleted.
@@ -320,7 +363,7 @@ func getCascadedChildIDs(app *App, childTable, fkCol, parentID string) []string 
 	var ids []string
 	for _, row := range rows {
 		if id, ok := row["id"]; ok {
-			ids = append(ids, fmt.Sprintf("%v", id))
+			ids = append(ids, valueText(id))
 		}
 	}
 	return ids

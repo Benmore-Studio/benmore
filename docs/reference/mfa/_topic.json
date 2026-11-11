@@ -1,0 +1,18 @@
+{
+  "keys": [
+    "setup_grant_revocation",
+    "factor_changes",
+    "summary",
+    "existing_credentials",
+    "endpoints",
+    "config",
+    "voluntary_flow",
+    "required_flow",
+    "security",
+    "code_replay",
+    "login_steps",
+    "login_challenges",
+    "secret_storage",
+    "js_snippet"
+  ]
+}

@@ -1,0 +1,14 @@
+// Offset: resolves to {data, page, per_page, total}; the rows are in data.
+async function pageOf(n) {
+  return fetch(`/api/notes?page=${n}&per_page=20`).then(r => r.json());
+}
+
+// Cursor (stable for "load more" UIs)
+let cursor = 0;
+async function loadMore() {
+  if (cursor === null) return [];
+  const url = '/api/notes?limit=20&cursor=' + encodeURIComponent(cursor);
+  const { data, next_cursor } = await fetch(url).then(r => r.json());
+  cursor = next_cursor;
+  return data;
+}

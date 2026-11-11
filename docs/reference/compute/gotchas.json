@@ -1,0 +1,5 @@
+[
+  "For long-running work run the flow in the background (`mode: async` on on.request, or a cron job), not a long compute - compute is for synchronous algos inside a step.",
+  "A thrown error fails the step: the flow's error answer carries `failed_type: \"compute\"`, and a caller signed in as an admin also gets the JS message in `step_error` (`compute: <module>.<function> threw: <message>`). Compile errors show file + line.",
+  "This is the server-side authoritative path: don't trust a client-computed value for a gate. Re-derive it here (e.g. a before_insert hook that recomputes IRR and rejects when IRR < 8%)."
+]

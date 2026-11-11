@@ -18,8 +18,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 type appMCPCanonicalUpdateFixture struct {
@@ -591,7 +589,7 @@ func TestAppMCPCanonicalUpdateCancelsRunningSQLAndReleasesLeases(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return fmt.Errorf("unexpected sqlite driver connection %T", raw)
 		}
@@ -682,7 +680,7 @@ func TestAppMCPCanonicalUpdateCancelsRunningWhenAndReusesConnection(t *testing.T
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		return raw.(*sqlite3.SQLiteConn).RegisterFunc("mcp_when_started", func() int {
+		return mustSQLiteConn(raw).RegisterFunc("mcp_when_started", func() int {
 			select {
 			case <-started:
 			default:
@@ -738,7 +736,7 @@ func TestAppMCPCanonicalUpdateCancelsRunningWhenAndReusesConnection(t *testing.T
 		t.Fatalf("reacquire replacement SQLite connection: %v", err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		return raw.(*sqlite3.SQLiteConn).RegisterFunc("mcp_when_started", func() int { return 1 }, true)
+		return mustSQLiteConn(raw).RegisterFunc("mcp_when_started", func() int { return 1 }, true)
 	}); err != nil {
 		_ = conn.Close()
 		t.Fatalf("reinstall test-only when observer on replacement connection: %v", err)
@@ -883,7 +881,11 @@ func TestAppMCPCanonicalUpdateKeepsPrivateSecondaryRefreshScopedAcrossReload(t *
 	if !reflect.DeepEqual(sameSSE, wantSameSSE) || !reflect.DeepEqual(sameWS, wantSameWS) {
 		t.Fatalf("same-group events SSE=%q WS=%q", sameSSE, sameWS)
 	}
-	if !reflect.DeepEqual(foreignSSE, []string{`{"table":"public_notes","action":"refresh"}`}) || !reflect.DeepEqual(foreignWS, []string{`{"type":"change","table":"public_notes","action":"refresh"}`}) {
+	// notes carries no tenant key, so it is not confined to the actor's tenant:
+	// a reader in another tenant (who could hold a record share) gets the same
+	// generic refresh as the colleague. The private secondary (group_notes)
+	// still never reaches the foreign tenant.
+	if !reflect.DeepEqual(foreignSSE, []string{`{"table":"","action":"refresh"}`, `{"table":"public_notes","action":"refresh"}`}) || !reflect.DeepEqual(foreignWS, []string{`{"type":"change","action":"refresh"}`, `{"type":"change","table":"public_notes","action":"refresh"}`}) {
 		t.Fatalf("foreign group received a private secondary hint: SSE=%q WS=%q", foreignSSE, foreignWS)
 	}
 	for _, event := range append(append(sameSSE, sameWS...), append(foreignSSE, foreignWS...)...) {

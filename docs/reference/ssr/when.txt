@@ -1,0 +1,1 @@
+Use server-rendered pages when crawlers need the HTML at the request path: marketing, blog, docs, public listings. Signed-in app screens belong in the TSX stack (api({at:'frontend'})): crawlers can't see past sign-in, and the TSX stack has the typed SDK and live updates.

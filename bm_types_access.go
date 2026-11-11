@@ -109,6 +109,12 @@ func flowListedFor(f Flow, session *Session) bool {
 	if len(f.Permissions) > 0 && (session == nil || !scopesWithin(session.Scopes, strings.Join(f.Permissions, " "))) {
 		return false
 	}
+	// Once the operator enforces it, a scoped credential cannot call an
+	// auth-required or role: flow that declares no permissions, admins'
+	// tokens included (flows_scoped_credentials.go).
+	if (f.Auth == "required" || f.Role != "") && scopedFlowUnpermitted(&f, session) && scopedFlowsRequirePermissions() {
+		return false
+	}
 	if session.IsAdmin() {
 		return true
 	}

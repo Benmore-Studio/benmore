@@ -1,0 +1,5 @@
+[
+  "A SERVER-ONLY `crypto` global is injected so you never hand-roll hashing in JS. Synchronous (unlike the browser's async crypto.subtle): `crypto.sha256(str)` → hex; `crypto.hmacSha256(key, str)` → hex; `crypto.randomHex(nBytes)` → crypto-random hex (default 16 bytes, which a value over 4096 also gets; for unguessable share tokens); `crypto.randomUUID()` → v4 UUID.",
+  "IMPORTANT - these exist ONLY server-side (not in the browser). A module that calls them won't run client-side, so it breaks the dual-use 'one module, both paths' promise. Use them for inherently-server-side work: password/token hashing, HMAC signing, gate checks, token minting. Keep dual-use math (the import-from-TSX path) in pure JS.",
+  "For a password/token gate, store `crypto.sha256(secret)` (or better, salt it) and constant-compare the hex on read - never write a plaintext or empty hash. For real USER passwords use the framework's auth (bcrypt) instead of rolling your own here."
+]

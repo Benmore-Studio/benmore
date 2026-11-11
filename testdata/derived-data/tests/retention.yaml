@@ -1,0 +1,68 @@
+# api(at:"retention"): the sweep hard-deletes rows older than a policy's ttl.
+# `flush: retention` runs one sweep. Run: benmore test <dir> --app
+
+sweep_deletes_expired_rows_and_keeps_the_rest:
+  as_user: "owner@retention.test"
+  setup:
+    - sql: "DELETE FROM events"
+    - sql: "DELETE FROM drafts"
+    - sql: "DELETE FROM deleted_events"
+    # events: ttl 90d on created_at, in both timestamp spellings.
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('expired', {{user_id}}, datetime('now', '-91 days'))"
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('expired-rfc3339', {{user_id}}, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 days'))"
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('recent', {{user_id}}, datetime('now', '-89 days'))"
+    - sql: "INSERT INTO events (title, user_id, created_at) VALUES ('unreadable-timestamp', {{user_id}}, 'not a date')"
+    # drafts: ttl 7d on expires_at; the table also has deleted_at.
+    - sql: "INSERT INTO drafts (title, user_id, expires_at) VALUES ('expired', {{user_id}}, datetime('now', '-8 days'))"
+    - sql: "INSERT INTO drafts (title, user_id, expires_at) VALUES ('no-expiry', {{user_id}}, NULL)"
+    - sql: "INSERT INTO drafts (title, user_id, expires_at, deleted_at) VALUES ('trashed-8-days-ago', {{user_id}}, datetime('now', '+30 days'), datetime('now', '-8 days'))"
+    - sql: "INSERT INTO drafts (title, user_id, expires_at, deleted_at) VALUES ('trashed-yesterday', {{user_id}}, datetime('now', '+30 days'), datetime('now', '-1 days'))"
+  steps:
+    - flush: "retention"
+    - sql: "SELECT title FROM events"
+      expect:
+        rows: 2
+    - sql: "SELECT title FROM events WHERE title IN ('recent', 'unreadable-timestamp')"
+      expect:
+        rows: 2
+    # A soft-deleted row goes once it has been deleted for longer than the
+    # ttl, whatever its expires_at says.
+    - sql: "SELECT title FROM drafts"
+      expect:
+        rows: 2
+    - sql: "SELECT title FROM drafts WHERE title IN ('no-expiry', 'trashed-yesterday')"
+      expect:
+        rows: 2
+    # The sweep is not an API delete: the on_delete hook did not run.
+    - sql: "SELECT id FROM deleted_events"
+      expect:
+        rows: 0
+    # One audit row per table and kind of deletion.
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action = 'ttl_delete' AND table_name = 'events' AND user_email = 'system:retention' AND new_values LIKE '%\"rows_deleted\":2%' AND new_values LIKE '%\"ttl\":\"90d\"%'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action = 'ttl_delete' AND table_name = 'drafts' AND new_values LIKE '%\"rows_deleted\":1%'"
+      expect:
+        rows: 1
+    - sql: "SELECT id FROM _benmore_audit_log WHERE action = 'ttl_purge' AND table_name = 'drafts' AND new_values LIKE '%\"rows_purged\":1%'"
+      expect:
+        rows: 1
+
+# The same delete through the API does run the hook (the contrast for the
+# sweep above).
+api_delete_runs_the_hook:
+  as_user: "deleter@retention.test"
+  steps:
+    - api: "POST /api/events"
+      json: {title: "deleted by its owner"}
+      save: {eid: "id"}
+      expect:
+        status: 200
+    - api: "DELETE /api/events/{{eid}}"
+      json: {}
+      expect:
+        status: 200
+    - flush: "jobs"
+    - sql: "SELECT id FROM deleted_events WHERE title = 'deleted by its owner'"
+      expect:
+        rows: 1

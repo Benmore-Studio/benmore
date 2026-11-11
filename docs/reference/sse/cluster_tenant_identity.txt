@@ -1,0 +1,1 @@
+Cluster change events preserve opaque tenant IDs exactly, including numeric-looking text such as 001 or 1e2. SSE and WebSocket subscribers pass their normal current-access checks.

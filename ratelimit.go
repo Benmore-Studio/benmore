@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -218,6 +219,24 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
 }
 
+// rateLimitedMessage is the refusal text of the request limiters in front of
+// an app: the app-wide limiter, the router's front door and NDJSON ingest.
+const rateLimitedMessage = "Rate limit exceeded. Try again later."
+
+// refuseRateLimited answers 429 with Retry-After. Under /api/ the body is the
+// JSON error envelope (the path test serverErrorStatus and notFoundHandler
+// use): it was text/plain, so a client's res.json() threw on the one answer
+// it most needs to read. Any other path (a page, a form post) keeps the text
+// a browser shows as it is.
+func refuseRateLimited(w http.ResponseWriter, r *http.Request, retry time.Duration) {
+	setRetryAfter(w, retry)
+	if r != nil && r.URL != nil && strings.HasPrefix(r.URL.Path, "/api/") {
+		httpRefusal(w, rateLimitedMessage, http.StatusTooManyRequests, refusalRateLimit)
+		return
+	}
+	http.Error(w, rateLimitedMessage, http.StatusTooManyRequests)
+}
+
 func (rl *RateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -313,8 +332,7 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 		key := "ip:" + rateLimitClientHost(r)
 
 		if ok, retry, _ := rl.Check(key); !ok {
-			setRetryAfter(w, retry)
-			http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
+			refuseRateLimited(w, r, retry)
 			return
 		}
 

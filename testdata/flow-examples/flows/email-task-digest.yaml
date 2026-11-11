@@ -1,0 +1,26 @@
+# flows/email-task-digest.yaml - a digest with its own sender, reply address and unsubscribe link
+on:
+  request:
+    method: POST
+    path: /api/digest/send
+    auth: required
+    rate_limit: "3/hour per user"
+jobs:
+  send:
+    steps:
+      - id: sub
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT unsubscribe_token, (SELECT COUNT(*) FROM tasks WHERE user_id = :user_id AND status = 'open') AS open_count FROM digest_subscriptions WHERE user_id = :user_id" }
+      - run: email
+        with:
+          to: "${{ user.email }}"
+          from: "Tasks <digest@mail.example.com>"       # an address on a domain verified for this app
+          reply_to: "support@mail.example.com"
+          subject: "You have ${{ steps.sub.outputs.open_count }} open tasks"
+          template: task-digest                         # emails/task-digest.html
+          data: { open_count: "${{ steps.sub.outputs.open_count }}" }
+          unsubscribe_url: "${{ env.APP_URL }}/api/digest/unsubscribe?token=${{ steps.sub.outputs.unsubscribe_token }}"
+          # unsubscribe_one_click: true                 # only when that URL accepts the mail client's POST
+      - run: respond
+        with: { status: 200, json: { sent: true } }

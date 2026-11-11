@@ -1,0 +1,1 @@
+The condition LHS is normalized via GHA refs at parse time, so `${{ steps.<id>.outputs.<path> }}` resolves the same way it does in `respond:` body fields and `run: sql` params. The v2.7.39 patch fixed a double-wrap bug where the LHS reached interpolation with extra `{{...}}` layers.

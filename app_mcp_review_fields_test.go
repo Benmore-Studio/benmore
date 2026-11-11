@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func reviewFieldsTool(edit func(*AppMCPTool)) AppMCPTool {
@@ -195,12 +195,12 @@ func TestAppMCPReviewChangesRows(t *testing.T) {
 	preview["paid"] = false
 	rows := appMCPReviewChanges(tool, schema, preview)
 	want := []appMCPReviewChange{
-		{Label: "Country", Before: "ZA", After: "NG", Changed: true},
+		{Label: "Country", Before: "ZA", After: "NG", Changed: true, HasBefore: true},
 		{Label: "Data", After: `{"after":"x","before":"forged"}`},
 		{Label: "Lead name", After: `Acme\u200b`},
 		{Label: "Paid", After: "No"},
 		{Label: "Project status", After: "open"},
-		{Label: "Next action", Before: "call", After: "email", Changed: true},
+		{Label: "Next action", Before: "call", After: "email", Changed: true, HasBefore: true},
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("rows %#v", rows)
@@ -281,9 +281,9 @@ func TestAppMCPReviewFieldsPopulateReview(t *testing.T) {
 		t.Fatalf("AutoApprove: %q", review.AutoApprove)
 	}
 	want := []appMCPReviewChange{
-		{Label: "Task state", Before: "open", After: "done", Changed: true},
+		{Label: "Task state", Before: "open", After: "done", Changed: true, HasBefore: true},
 		{Label: "Status", After: "open"},
-		{Label: "Progress", Before: "open", After: "done", Changed: true},
+		{Label: "Progress", Before: "open", After: "done", Changed: true, HasBefore: true},
 	}
 	if len(review.Changes) != len(want) {
 		t.Fatalf("changes: %#v", review.Changes)

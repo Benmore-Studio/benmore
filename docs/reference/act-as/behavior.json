@@ -1,0 +1,9 @@
+[
+  "While stepped in, the admin bypass is off: every auto-CRUD read and write is filtered to the acting-as group, exactly as for a member of it.",
+  "On POST, the framework AUTO-INJECTS the acting-as group_key - a body value for that column is ignored. So an admin acting-as district 3 who POSTs `{district_id: 1, ...}` lands the row in district 3, not 1.",
+  "GET on a row in a different tenant returns 404 (would-leak-existence), exactly as it would for a non-admin who isn't in that group.",
+  "State is per-session and persisted on `_benmore_sessions.acting_as_group`, so it survives restarts and is visible in the audit trail.",
+  "Only a session (the cookie, or a Bearer session token from POST /api/_auth/token) can hold step-in. A persistent API token (bmr_/bma_) has no session row, so POST answers 400 and nothing changes.",
+  "Liveness check at step-in: the group_id must appear in the configured `groups.table` under the configured `groups.key`. Prevents stepping into a nonexistent tenant.",
+  "The three endpoints exist only when app.yaml declares `groups:` (table, key, user_field); without it they answer 404."
+]

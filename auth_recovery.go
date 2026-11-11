@@ -157,16 +157,21 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 		authRedirect(w, r, app.Paths.ResetPassword, "Invalid reset link")
 		return
 	}
+	// A rejected password sends the form back with the link's token, so the
+	// person can try again from the same page: without it the page rendered
+	// an empty token and every retry failed as an invalid link. The token is
+	// the one the emailed link already carried in its URL.
+	retry := app.Paths.ResetPassword + "?token=" + url.QueryEscape(token)
 	if password == "" {
-		authRedirect(w, r, app.Paths.ResetPassword, "Password is required")
+		authRedirect(w, r, retry, "Password is required")
 		return
 	}
 	if password != confirm {
-		authRedirect(w, r, app.Paths.ResetPassword, "Passwords do not match")
+		authRedirect(w, r, retry, "Passwords do not match")
 		return
 	}
 	if msg := validatePasswordComplexity(password); msg != "" {
-		authRedirect(w, r, app.Paths.ResetPassword, msg)
+		authRedirect(w, r, retry, msg)
 		return
 	}
 
@@ -183,11 +188,11 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	if len(password) > maxBcryptBytes {
-		authRedirect(w, r, app.Paths.ResetPassword, "Password must be at most 72 bytes")
+		authRedirect(w, r, retry, "Password must be at most 72 bytes")
 		return
 	}
 	if pending != 0 && bcrypt.CompareHashAndPassword([]byte(previousHash), []byte(password)) == nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Choose a different password from the temporary password")
+		authRedirect(w, r, retry, "Choose a different password from the temporary password")
 		return
 	}
 	hash, err := generateBcryptHash([]byte(password))
@@ -244,7 +249,6 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	invalidateRequestSession(r) // the account's sessions are gone
-	revokeEdgeGrantsAfterCredentialChange(app, userID)
 	// A completed reset link proves the address and replaces the password:
 	// on the hosted dashboard it also revokes the account's CLI and MCP
 	// credentials.

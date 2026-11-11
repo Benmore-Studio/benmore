@@ -32,8 +32,8 @@ func TestAppYAMLAuthKeysCheckedWhateverTheLayout(t *testing.T) {
 	}
 }
 
-// Every auth key the runtime reads must pass the gate: read_audit and
-// edge_scopes are documented (api(at:"audit"), edges) yet were refused.
+// Every auth key the runtime reads must pass the gate: read_audit is
+// documented (api(at:"audit")) yet was refused.
 func TestAppYAMLAcceptsEveryRuntimeAuthKey(t *testing.T) {
 	re := regexp.MustCompile(`\.Auth\["([a-z_]+)"\]`)
 	files, _ := filepath.Glob("*.go")
@@ -60,6 +60,12 @@ func TestAppYAMLAcceptsEveryRuntimeAuthKey(t *testing.T) {
 		value := "true"
 		if key == "signup_rate_limit" {
 			value = "30/10m" // has its own value grammar, checked at write time
+		}
+		if key == "idle_timeout" {
+			value = "15m" // a duration, checked at write time
+		}
+		if key == "session_duration" {
+			value = "7d" // a duration or whole days, checked at write time
 		}
 		if msg := validateAppYAML("site_name: x\nauth:\n  " + key + ": \"" + value + "\"\n"); strings.Contains(msg, "auth."+key) {
 			t.Errorf("auth.%s refused: %s", key, msg)

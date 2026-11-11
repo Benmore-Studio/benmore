@@ -1,0 +1,1 @@
+A queued payload must decode as a JSON object or null (empty input). Malformed JSON and other top-level values fail the job on its first attempt without executing any handler. Correct the queued input before explicitly retrying; valid jobs continue to drain normally.

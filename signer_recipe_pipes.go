@@ -108,6 +108,7 @@ func evalExpr(expr string, env *recipeEnv) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	unset := env.paramUnset(parts[0])
 
 	for _, p := range parts[1:] {
 		name, arg, hasArg := splitPipeArg(p)
@@ -126,6 +127,14 @@ func evalExpr(expr string, env *recipeEnv) (string, error) {
 			// The fallback reads the recipe's own app environment, never the
 			// process environment (see recipeEnv.orEnv).
 			val, err = env.orEnv(val, argVal, hasArg)
+		} else if name == "if_unset" {
+			// Whether the binding was passed at all is a property of the
+			// operand, not of its value, so only evalExpr can answer it.
+			if !hasArg {
+				err = fmt.Errorf("if_unset needs an arg")
+			} else if unset {
+				val = argVal
+			}
 		} else {
 			val, err = pipe(val, argVal, hasArg)
 		}
@@ -237,6 +246,7 @@ var pipes = map[string]pipeFn{
 	"lower":       pipeLower,
 	"upper":       pipeUpper,
 	"default":     pipeDefault,
+	"if_unset":    pipeIfUnset,
 	"or_env":      pipeOrEnv,
 	"urlencode":   pipeURLEncode,
 	"pct_encode":  pipePctEncode,
@@ -346,6 +356,29 @@ func pipeDefault(input, fallback string, hasArg bool) (string, error) {
 		return fallback, nil
 	}
 	return input, nil
+}
+
+// pipeIfUnset is the registry entry for if_unset; evalExpr applies it, since
+// it depends on whether the expression's operand was passed, not on its value.
+// `{{ params.prefix | if_unset:'Bearer ' }}` gives 'Bearer ' when the sign
+// block has no `prefix:`, and keeps an explicit `prefix: ""` empty, which
+// `default:` cannot tell apart from an omitted one.
+func pipeIfUnset(input, _ string, hasArg bool) (string, error) {
+	if !hasArg {
+		return "", fmt.Errorf("if_unset needs an arg")
+	}
+	return input, nil
+}
+
+// paramUnset reports whether an expression operand names a `params.<key>`
+// binding the caller did not pass. Any other operand counts as set.
+func (e *recipeEnv) paramUnset(operand string) bool {
+	name := strings.TrimSpace(operand)
+	if e == nil || !strings.HasPrefix(name, "params.") {
+		return false
+	}
+	_, ok := e.vars[name]
+	return !ok
 }
 
 // pipeOrEnv is the registry entry for or_env; evalExpr routes the pipe to

@@ -574,13 +574,19 @@ func (exec *appMCPCommandExecution) executeHookedWrite(step *FlowStep, args []an
 				}
 				injectSessionContext(event, &cap.actor)
 				if action == "insert" || action == "update" {
-					if err := ValidateCrossField(cap.generation.validators, table, event); err != nil {
+					if err := ValidateCrossField(cap.generation.validators, table, event, appTableColumns(view, table)); err != nil {
 						return newAppMCPCommandHookError(table, action, err, true)
 					}
 				}
 				if action == "insert" && cap.generation.workflows != nil {
 					for _, workflow := range cap.generation.workflows.Workflows {
-						if workflow != nil && sqliteIdentifierFold(workflow.Table) == sqliteIdentifierFold(table) && workflowCreateStateRefused(view, table, workflow.Field, row[workflow.Field]) {
+						if workflow == nil {
+							continue
+						}
+						// row is the RETURNING * row: what the command stored. Every
+						// create path starts a row in `initial`, so a command's insert
+						// must too (a NULL state is a row no transition leaves).
+						if sqliteIdentifierFold(workflow.Table) == sqliteIdentifierFold(table) && workflowCreateStateRefused(view, table, workflow.Field, row[workflow.Field]) {
 							return newAppMCPCommandHookError(table, action, errors.New("new rows must start in the workflow's initial state"), true)
 						}
 					}
@@ -658,6 +664,7 @@ func (exec *appMCPCommandExecution) executeHookedWrite(step *FlowStep, args []an
 			case "delete":
 				event = cloneCommandHookRow(oldRows[i])
 			}
+			stored := copyRow(event) // what a subscription delivers (webhookDataRow)
 			injectSessionContext(event, &cap.actor)
 			if hasOn {
 				refresh, err := fireAfterHooksTx(ctxTx, view, action, key, event)
@@ -667,7 +674,7 @@ func (exec *appMCPCommandExecution) executeHookedWrite(step *FlowStep, args []an
 				cap.noteHookRefresh(refresh)
 			}
 			if subscribed {
-				if err := enqueueWebhookSubscriptionsTx(ctxTx, view, action, table, event, &cap.actor); err != nil {
+				if err := enqueueWebhookSubscriptionsTx(ctxTx, view, action, table, stored, &cap.actor); err != nil {
 					return newAppMCPCommandHookError(table, action, err, false)
 				}
 			}
@@ -743,8 +750,8 @@ func appMCPValidateWorkflowTransition(cap *appMCPCommandCapability, tx appMCPCon
 		if !ok {
 			return fmt.Errorf("workflow transition %q to %q is not allowed", from, to)
 		}
-		if transition.Role != "" && !appMCPCommandHasWorkflowRole(cap, tx, transition.Role) {
-			return fmt.Errorf("role '%s' required for this transition", transition.Role)
+		if transition.Role != "" && !appMCPCommandHasWorkflowRole(cap, tx, workflow.Table, transition.Role) {
+			return errors.New(workflowRoleRequired(transition.Role))
 		}
 		if transition.When != "" {
 			met, err := evaluateWhen(tx, cap.generation.view, table, transition.When, before)
@@ -756,12 +763,29 @@ func appMCPValidateWorkflowTransition(cap *appMCPCommandCapability, tx appMCPCon
 	return nil
 }
 
-func appMCPCommandHasWorkflowRole(cap *appMCPCommandCapability, tx appMCPContextTx, requiredRole string) bool {
+// appMCPCommandHasWorkflowRole is hasWorkflowRole read inside the command's
+// transaction: the same any-of role list and the same sources for each role.
+func appMCPCommandHasWorkflowRole(cap *appMCPCommandCapability, tx appMCPContextTx, table, requiredRole string) bool {
 	actor := &cap.actor
-	if requiredRole == "" || actor.IsAdmin() || hasRole(actor.Role, requiredRole) {
+	if requiredRole == "" || actor.IsAdmin() {
 		return true
 	}
+	roles := workflowRoleNames(requiredRole)
+	if len(roles) == 0 {
+		return false
+	}
+	for _, role := range roles {
+		if hasRole(actor.Role, role) {
+			return true
+		}
+	}
 	app := cap.generation.view
+	// A role grant counts as on the CRUD transition route (hasWorkflowRole).
+	if workflowRoleFromGrant(app, table, actor, roles, func(query string, args ...any) *sql.Row {
+		return tx.tx.QueryRowContext(tx.ctx, query, args...)
+	}) {
+		return true
+	}
 	roleField := workflowMembershipRoleField(app)
 	if roleField == "" {
 		return false
@@ -784,10 +808,16 @@ func appMCPCommandHasWorkflowRole(cap *appMCPCommandCapability, tx appMCPContext
 		tenant = " AND " + quoteColumn(app.Group.Table, app.Group.Key) + " = ?"
 		args = append(args, actor.EffectiveGroupID())
 	}
-	query := "SELECT " + quoteColumn(app.Group.Table, roleField) + " FROM main." + quoteIdent(app.Group.Table) + " WHERE " + quoteColumn(app.Group.Table, app.Group.UserField) + " = ?" + tenant + membershipLiveConds(app.Group, app.Group.Table, "", appColumnChecker(app, app.Group.Table)) + " LIMIT 1"
+	query := "SELECT " + quoteColumn(app.Group.Table, roleField) + " FROM main." + quoteIdent(app.Group.Table) + " WHERE " + quoteColumn(app.Group.Table, app.Group.UserField) + " = ?" + tenant + membershipLiveConds(app.Group, app.Group.Table, "", appColumnChecker(app, app.Group.Table))
 	var role string
-	// Exact, as the CRUD transition route compares (hasWorkflowRole).
-	return tx.tx.QueryRowContext(tx.ctx, query, args...).Scan(&role) == nil && role == requiredRole
+	// Exact, as the CRUD transition route compares (hasWorkflowRole), and
+	// from the same (oldest) membership row.
+	if oldestMembershipRow(func(order string) error {
+		return tx.tx.QueryRowContext(tx.ctx, query+order, args...).Scan(&role)
+	}, quoteColumn(app.Group.Table, roleField)) != nil {
+		return false
+	}
+	return slices.Contains(roles, role)
 }
 
 func appMCPEnqueueTransitionHooks(cap *appMCPCommandCapability, tx appMCPContextTx, table string, before, after map[string]any) error {
@@ -808,6 +838,7 @@ func appMCPEnqueueTransitionHooks(cap *appMCPCommandCapability, tx appMCPContext
 					continue
 				}
 			}
+			hook.reportEvent = "transition"
 			payload := hookJobPayload(hook, table, after)
 			if err := sealJobPayloadRow(tx, cap.generation.view, table, payload); err != nil {
 				return err
@@ -825,7 +856,7 @@ func appMCPEnqueueEventFlows(cap *appMCPCommandCapability, tx appMCPContextTx, t
 		if flow.Trigger.Type != "on_"+action || sqliteIdentifierFold(flow.Trigger.Table) != sqliteIdentifierFold(table) {
 			continue
 		}
-		if err := cap.enqueueEffect(tx, "flow", table, action, "flow", flow.Name, appMCPEventFlowPayload(cap.generation.view, row)); err != nil {
+		if err := cap.enqueueEffect(tx, "flow", table, action, "flow", flow.Name, appMCPEventFlowPayload(cap.generation.view, table, row)); err != nil {
 			return fmt.Errorf("enqueue event flow %q: %w", flow.Name, err)
 		}
 	}
@@ -837,15 +868,15 @@ func appMCPEnqueueEventFlows(cap *appMCPCommandCapability, tx appMCPContextTx, t
 // enqueue guards treat the row's columns as request input exactly as CRUD's
 // synchronous event path does (flowEventRowTaint). Reserved job keys a column
 // could carry are dropped first, so a row can neither forge nor clear them.
-func appMCPEventFlowPayload(view *App, row map[string]any) map[string]any {
+func appMCPEventFlowPayload(view *App, table string, row map[string]any) map[string]any {
 	payload := make(map[string]any, len(row)+1)
 	for name, value := range row {
-		if name == flowRequestKeysPayloadField || name == flowJobActorPayloadField || name == appMCPEffectKey {
+		if name == flowRequestKeysPayloadField || name == flowComputedKeysPayloadField || name == flowSQLTextKeysPayloadField || name == flowJobActorPayloadField || name == flowRequestBodyPayloadField || name == appMCPEffectKey {
 			continue
 		}
 		payload[name] = value
 	}
-	tainted := flowEventRowTaint(view, payload)
+	tainted := flowEventRowTaint(view, table, payload)
 	keys := make([]string, 0, len(tainted))
 	for name := range tainted {
 		keys = append(keys, name)
@@ -853,6 +884,9 @@ func appMCPEventFlowPayload(view *App, row map[string]any) map[string]any {
 	if len(keys) > 0 {
 		slices.Sort(keys)
 		payload[flowRequestKeysPayloadField] = keys
+		// The row is stored data, as on the synchronous event path: a JSON
+		// column still decodes in the flow's JSON bodies.
+		payload[flowComputedKeysPayloadField] = keys
 	}
 	return payload
 }
@@ -944,7 +978,7 @@ func appMCPHookRefusedResult(hook *appMCPCommandHookError) *sdk.CallToolResult {
 	if hook.Refused && hook.Message != "" {
 		text = "hook_refused: " + hook.Message
 	}
-	return &sdk.CallToolResult{Meta: sdk.Meta{"error_code": "hook_refused"}, IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: text}}}
+	return &sdk.CallToolResult{Meta: sdk.Meta{"error_code": "hook_refused", "docs": refusalDocsAt(refusalConnectorError, "hook_refused")}, IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: text}}}
 }
 
 // appMCPBroadcastCommitted publishes the recorded effects of a confirmed

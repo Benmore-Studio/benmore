@@ -1,0 +1,167 @@
+founder_creates_an_organisation_and_is_its_admin:
+  as_user: "ann@tenants.test"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Acme" }
+      save: { org_id: "group_id" }
+      expect:
+        status: 200
+        json: { status: created, founding_role: org_admin }
+    - sql: "SELECT id FROM org_members WHERE org_id = {{org_id}} AND user_id = {{user_id}} AND member_role = 'org_admin'"
+      expect: { rows: 1 }
+    - api: "POST /api/projects"
+      json: { name: "Website" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM projects WHERE name = 'Website' AND org_id = {{org_id}} AND user_id = {{user_id}}"
+      expect: { rows: 1 }
+    - get: "/api/organizations"
+      expect: { status: 200, contains: "Acme" }
+    - api: "PATCH /api/organizations/{{org_id}}"
+      json: { name: "Acme Ltd" }
+      expect: { status: 200 }
+    - api: "POST /api/_groups/create"
+      json: { name: "Second" }
+      expect: { status: 409 }
+
+another_tenants_rows_are_invisible:
+  as_user: "bob@tenants.test"
+  setup:
+    - sql: "INSERT INTO organizations (id, name) VALUES (900, 'Other Co')"
+    - sql: "INSERT INTO projects (id, org_id, name, user_id) VALUES (9001, 900, 'Other tenant project', 99999)"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Bobs" }
+      expect: { status: 200 }
+    - api: "POST /api/projects"
+      json: { name: "Mine" }
+      expect: { status: 200 }
+    - get: "/api/projects"
+      expect:
+        status: 200
+        contains: "Mine"
+        not_contains: "Other tenant project"
+    - get: "/api/projects/9001"
+      expect: { status: 404 }
+    - api: "PATCH /api/projects/9001"
+      json: { name: "Taken" }
+      expect: { status: 404 }
+    - get: "/api/organizations"
+      expect:
+        status: 200
+        contains: "Bobs"
+        not_contains: "Other Co"
+    - get: "/api/organizations/900"
+      expect: { status: 404 }
+    # Nobody joins an organisation by writing the membership table.
+    - api: "POST /api/org_members"
+      json: { org_id: 900 }
+      expect: { status: 404 }
+    - sql: "SELECT id FROM org_members WHERE org_id = 900"
+      expect: { rows: 0 }
+    - sql: "SELECT id FROM projects WHERE id = 9001 AND name = 'Other tenant project'"
+      expect: { rows: 1 }
+
+a_member_reads_and_writes_but_does_not_administer:
+  as_user: "cy@tenants.test"
+  setup:
+    - sql: "INSERT INTO organizations (id, name) VALUES (500, 'Globex')"
+    - sql: "INSERT INTO org_members (org_id, user_id, member_role) VALUES (500, {{user_id}}, 'member')"
+    - sql: "INSERT INTO projects (id, org_id, name, user_id) VALUES (5001, 500, 'Globex roadmap', 99999)"
+  steps:
+    - get: "/api/projects"
+      expect: { status: 200, contains: "Globex roadmap" }
+    - get: "/api/organizations"
+      expect: { status: 200, contains: "Globex" }
+    - get: "/api/org_members"
+      expect: { status: 200, json_length: 1, contains: '"member_role":"member"' }
+    - api: "POST /api/projects"
+      json: { name: "Member idea" }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM projects WHERE name = 'Member idea' AND org_id = 500"
+      expect: { rows: 1 }
+    - api: "PATCH /api/projects/5001"
+      json: { name: "Globex roadmap v2" }
+      expect: { status: 200 }
+    - api: "DELETE /api/projects/5001"
+      json: {}
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - api: "PATCH /api/organizations/500"
+      json: { name: "Renamed by a member" }
+      expect:
+        status: 403
+        json: { error: forbidden }
+    - api: "POST /api/org/members"
+      json: { email: "cy@tenants.test" }
+      expect:
+        status: 403
+        json: { error: not_org_admin }
+    - sql: "SELECT id FROM projects WHERE id = 5001"
+      expect: { rows: 1 }
+    - sql: "SELECT id FROM organizations WHERE id = 500 AND name = 'Globex'"
+      expect: { rows: 1 }
+
+an_admin_adds_a_member_with_a_role:
+  as_user: "dee@tenants.test"
+  users:
+    - "eve@tenants.test"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Initech" }
+      save: { org_id: "group_id" }
+      expect: { status: 200 }
+    - api: "POST /api/org/members"
+      json: { email: "eve@tenants.test", role: manager }
+      expect:
+        status: 201
+        json: { role: manager }
+    - sql: "SELECT m.id FROM org_members m JOIN _benmore_users u ON u.id = m.user_id WHERE u.email = 'eve@tenants.test' AND m.org_id = {{org_id}} AND m.member_role = 'manager'"
+      expect: { rows: 1 }
+    - api: "POST /api/org/members"
+      json: { email: "eve@tenants.test" }
+      expect:
+        status: 409
+        json: { error: already_a_member }
+    - api: "POST /api/org/members"
+      json: { email: "nobody@tenants.test" }
+      expect:
+        status: 404
+        json: { error: no_such_account }
+    - api: "POST /api/org/members"
+      json: { email: "eve@tenants.test", role: org_admin }
+      expect: { status: 422 }
+    - api: "POST /api/projects"
+      json: { name: "Launch" }
+      save: { project_id: "id" }
+      expect: { status: 200 }
+    # eve signs in: a manager may delete a project, and may not add members.
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: { email: "eve@tenants.test", password: "testpass123" }
+      save: { eve: "token" }
+      expect: { status: 200 }
+    - set_auth: "{{eve}}"
+    - get: "/api/projects"
+      expect: { status: 200, contains: "Launch" }
+    - api: "POST /api/org/members"
+      json: { email: "dee@tenants.test" }
+      expect:
+        status: 403
+        json: { error: not_org_admin }
+    - api: "DELETE /api/projects/{{project_id}}"
+      json: {}
+      expect: { status: 200 }
+    - sql: "SELECT id FROM projects WHERE id = {{project_id}}"
+      expect: { rows: 0 }
+
+signed_out_callers_get_nothing:
+  anon: true
+  steps:
+    - get: "/api/projects"
+      expect: { status: 401 }
+    - get: "/api/organizations"
+      expect: { status: 401 }
+    - api: "POST /api/_groups/create"
+      json: { name: "Nobody" }
+      expect: { status: 401 }

@@ -78,7 +78,7 @@ func TestAppMCPCommandAggregateReadAndDatabaseBoundaries(t *testing.T) {
 		defer cap.leaveReadPhase()
 		guard := cap.guard
 		if err := cap.conn.Raw(func(raw any) error {
-			conn, ok := raw.(*sqlite3.SQLiteConn)
+			conn, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("command connection is not SQLite")
 			}
@@ -470,7 +470,7 @@ func TestAppMCPCommandOutcomeFinalizerBarrierAndUnknownCommit(t *testing.T) {
 			}
 			pendingWriteReached = true
 			if err := cap.conn.Raw(func(raw any) error {
-				conn, ok := raw.(*sqlite3.SQLiteConn)
+				conn, ok := sqliteConnOf(raw)
 				if !ok {
 					return errors.New("command connection is not SQLite")
 				}
@@ -870,7 +870,7 @@ func TestAppMCPCommandCanceledNativeMetadataDiscardsAndReusesPool(t *testing.T) 
 			}
 			reachedWrite = true
 			if err := cap.conn.Raw(func(raw any) error {
-				conn, ok := raw.(*sqlite3.SQLiteConn)
+				conn, ok := sqliteConnOf(raw)
 				if !ok {
 					return errors.New("metadata cancellation connection is not SQLite")
 				}
@@ -993,7 +993,7 @@ func commandInstallPreBeginAuthorizer(t *testing.T, db *sql.DB, authorize func(i
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("pre-BEGIN authorizer fixture connection is not SQLite")
 		}
@@ -1025,7 +1025,7 @@ func commandRestorePreBeginAuthorizer(t *testing.T, db *sql.DB) func() {
 			return
 		}
 		restoreErr := conn.Raw(func(raw any) error {
-			sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+			sqliteConn, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("authorizer cleanup connection is not SQLite")
 			}
@@ -1418,7 +1418,7 @@ func TestAppMCPCommandBusyTimeoutRestoreDenialDiscardsConnection(t *testing.T) {
 		}
 	}()
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("busy timeout fault connection is not SQLite")
 		}
@@ -1525,7 +1525,7 @@ func TestAppMCPCommandNativeMetadataRestorationFaultDisposesAfterRollback(t *tes
 			}
 			writeReached = true
 			return cap.conn.Raw(func(raw any) error {
-				conn, ok := raw.(*sqlite3.SQLiteConn)
+				conn, ok := sqliteConnOf(raw)
 				if !ok {
 					return errors.New("metadata cleanup fixture connection is not SQLite")
 				}
@@ -1679,7 +1679,7 @@ func TestAppMCPCommandNativeMetadataAuthorizerIsClosed(t *testing.T) {
 func commandSQLiteConnID(conn *sql.Conn) (string, error) {
 	var id string
 	err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("native pool connection is not SQLite")
 		}
@@ -1732,7 +1732,7 @@ func createCommandAttachedTasks(t *testing.T, app *App) string {
 	}
 	var originalLimit int
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("ATTACH fixture connection is not SQLite")
 		}
@@ -1748,7 +1748,7 @@ func createCommandAttachedTasks(t *testing.T, app *App) string {
 		t.Fatal("blocked ATTACH unexpectedly appeared in database_list")
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("ATTACH fixture connection is not SQLite")
 		}
@@ -1763,7 +1763,7 @@ func createCommandAttachedTasks(t *testing.T, app *App) string {
 	defer func() {
 		if limitRaised {
 			_ = conn.Raw(func(raw any) error {
-				sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+				sqliteConn, ok := sqliteConnOf(raw)
 				if !ok {
 					return errors.New("ATTACH fixture connection is not SQLite during limit restore")
 				}
@@ -1774,7 +1774,7 @@ func createCommandAttachedTasks(t *testing.T, app *App) string {
 	}()
 	_, attachErr := conn.ExecContext(context.Background(), `ATTACH DATABASE ':memory:' AS attached`)
 	restoreErr := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("ATTACH fixture connection is not SQLite during limit restore")
 		}
@@ -1816,7 +1816,7 @@ func commandAssertAttachedLimit(t *testing.T, conn *sql.Conn, want int) error {
 	t.Helper()
 	var got int
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("ATTACH fixture connection is not SQLite")
 		}
@@ -1909,7 +1909,7 @@ func TestAppMCPCommandCleanupRestoresNativeStorageCeiling(t *testing.T) {
 	}
 	var beforeID string
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("storage fixture connection is not SQLite")
 		}
@@ -1941,7 +1941,7 @@ func TestAppMCPCommandCleanupRestoresNativeStorageCeiling(t *testing.T) {
 	}
 	defer conn.Close()
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("reused command connection is not SQLite")
 		}
@@ -2021,7 +2021,7 @@ func TestAppMCPCommandCleanupFailureDisposesAfterRollback(t *testing.T) {
 		}
 		applyReached = true
 		return true, cap.conn.Raw(func(raw any) error {
-			conn, ok := raw.(*sqlite3.SQLiteConn)
+			conn, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("command connection is not SQLite")
 			}
@@ -2080,7 +2080,7 @@ func commandCancelAtSQLiteAction(t *testing.T, cap *appMCPCommandCapability, ctx
 		close(released)
 	}()
 	if err := cap.conn.Raw(func(raw any) error {
-		conn, ok := raw.(*sqlite3.SQLiteConn)
+		conn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("command connection is not SQLite")
 		}

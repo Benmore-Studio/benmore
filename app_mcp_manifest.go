@@ -15,13 +15,14 @@ import (
 	"slices"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // AppMCPManifest is an opt-in reviewed contract, not an exposure switch.
 // No handler is enabled until registration and current grant checks succeed.
 type AppMCPManifest struct {
 	sourceHashes    map[string]string  // immutable fingerprints of bytes accepted during staging
+	sourceVersion   string             // version of sourceHashes as a whole: the ?v= of the generation's scripts (capturedSourceVersion)
 	Version         int                `yaml:"version"`
 	Connector       AppMCPIdentity     `yaml:"connector"`
 	ContractDigest  string             `yaml:"contract_digest"`
@@ -474,7 +475,7 @@ func validateAppMCPManifestGated(m *AppMCPManifest, externalEnabled bool) error 
 				return fmt.Errorf("tool %q lacks canonical table read permission", tool.Name)
 			}
 		}
-		for _, schema := range []*AppMCPSchema{tool.InputSchema, tool.OutputSchema} {
+		for i, schema := range []*AppMCPSchema{tool.InputSchema, tool.OutputSchema} {
 			if schema == nil || schema.Type != "object" {
 				return fmt.Errorf("tool %q requires object input/output schemas", tool.Name)
 			}
@@ -482,7 +483,7 @@ func validateAppMCPManifestGated(m *AppMCPManifest, externalEnabled bool) error 
 				return fmt.Errorf("tool %q: %w", tool.Name, err)
 			}
 			if commandTool {
-				if err := validateBoundedUpdateSchema(schema, 0); err != nil {
+				if err := validateBoundedSchemaAt(schema, 0, []string{"input_schema", "output_schema"}[i]); err != nil {
 					return fmt.Errorf("tool %q: %w", tool.Name, err)
 				}
 			}
@@ -595,28 +596,29 @@ func validateAppMCPSchema(s *AppMCPSchema, depth int) error {
 	return nil
 }
 
-func validateAppMCPBindings(dir string, m *AppMCPManifest, flows []Flow) error {
+// validateAppMCPSourceBindings is every check of a manifest against the rest
+// of the reviewed source: schema tables and columns, the groups configuration,
+// encrypted fields, roles, flows and pinned OpenAPI documents. The strict
+// loaders run all of it (stageRuntimeConfig, runtimeConfig.reviewRefusal); add
+// a binding check here, not at a single call site, so no path can skip it.
+// Unmet file-handler requirements are returned separately because a served
+// load keeps such a manifest (see appMCPFileRequirementProblems).
+func validateAppMCPSourceBindings(dir string, m *AppMCPManifest, flows []Flow, definitions []crudTableDefinition, roles *RolesConfig, group *GroupConfig, encrypted *EncryptedFieldConfig) (fileProblems []string, err error) {
 	if m == nil {
-		return nil
-	}
-	definitions, err := appMCPSchemaTableDefinitions(dir)
-	if err != nil {
-		return err
+		return nil, nil
 	}
 	if err := validateAppMCPFileColumnBindings(m, definitions); err != nil {
-		return err
+		return nil, err
 	}
-	if err := validateAppMCPFileMembershipConstraintBindings(dir, m, LoadGroupConfig(dir), definitions); err != nil {
-		return err
+	if err := validateAppMCPBindingsForTables(m, flows, eligibleCRUDTables(definitions), roles); err != nil {
+		return nil, err
 	}
-	if err := validateAppMCPFileUploadTenantBindings(m, LoadGroupConfig(dir), definitions); err != nil {
-		return err
+	if err := validateAppMCPDeclaredSources(dir, m); err != nil {
+		return nil, err
 	}
-	if err := validateAppMCPBindingsForTables(m, flows, eligibleCRUDTables(definitions), LoadRolesConfig(dir)); err != nil {
-		return err
-	}
-	return validateAppMCPDeclaredSources(dir, m)
+	return appMCPFileRequirementProblems(m, group, encrypted, definitions), nil
 }
+
 func validateAppMCPYAMLNode(node *yaml.Node, depth int, enumValue bool) error {
 	if depth > 64 {
 		return fmt.Errorf("manifest exceeds nesting limit")
@@ -671,30 +673,39 @@ func appMCPSchemaTableDefinitions(dir string) ([]crudTableDefinition, error) {
 	return appMCPSchemaTableDefinitionsWithReader(func(name string) ([]byte, error) { return readOptionalConfig(dir, name) })
 }
 func appMCPSchemaTableDefinitionsWithReader(readSource func(string) ([]byte, error)) ([]crudTableDefinition, error) {
+	ddl, err := appMCPSchemaDDLWithReader(readSource)
+	if err != nil {
+		return nil, err
+	}
+	return appMCPSQLTableDefinitions(ddl)
+}
+
+// appMCPSchemaDDLWithReader is the SQL the command table inventory is read
+// from: schema.prisma emitted as SQL, else schema.sql, else "".
+func appMCPSchemaDDLWithReader(readSource func(string) ([]byte, error)) (string, error) {
 	data, err := readSource("schema.prisma")
 	if os.IsNotExist(err) {
 		data, err = nil, nil
 	}
 
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if data != nil {
 		models, err := ParsePrismaSchema(string(data))
 		if err != nil {
-			return nil, fmt.Errorf("schema.prisma: %w", err)
+			return "", fmt.Errorf("schema.prisma: %w", err)
 		}
-		data = []byte(EmitSQL(models))
-	} else {
-		data, err = readSource("schema.sql")
-		if os.IsNotExist(err) {
-			data, err = nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
+		return EmitSQL(models), nil
 	}
-	return appMCPSQLTableDefinitions(string(data))
+	data, err = readSource("schema.sql")
+	if os.IsNotExist(err) {
+		data, err = nil, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func appMCPSQLTableDefinitions(source string) ([]crudTableDefinition, error) {

@@ -1,0 +1,7 @@
+[
+  "benmore login                      # browser sign-in; saves the CLI token",
+  "benmore login --device             # no browser here: approve a code on any signed-in device",
+  "printf '%s' \"$TOKEN\" | benmore login --token-stdin",
+  "printf '%s' \"$TOKEN\" | benmore bootstrap --token-stdin",
+  "BENMORE_TOKEN=TOKEN benmore <command>"
+]

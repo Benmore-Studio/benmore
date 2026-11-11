@@ -248,6 +248,7 @@ encrypted:
 		t.Fatal(err)
 	}
 	t.Cleanup(app.Shutdown)
+	EnsureAuditLogTable(app.DB) // created when the app's routes are built
 	key := cryptoKeyForQuerier(app.DB)
 	known, err := fieldEncryptCtx(key, "companies", "name", "other-company-private")
 	if err != nil {

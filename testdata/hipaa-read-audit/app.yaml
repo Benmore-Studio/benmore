@@ -1,0 +1,15 @@
+site_name: "hipaa read audit fixture"
+compliance: hipaa
+auth:
+  identifier: email
+access:
+  patients:
+    read: self
+    write: self
+    update: self
+    delete: self
+  notices:
+    read: anon
+    write: role:admin
+frontend:
+  stack: html

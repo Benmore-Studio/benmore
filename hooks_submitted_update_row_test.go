@@ -45,7 +45,7 @@ func TestBeforeUpdateHookSQLSeesOnlySubmittedFields(t *testing.T) {
 		return s
 	}
 
-	// The portal's guard: a caller may submit status and nothing else. The
+	// A submitted-field guard: a caller may submit status and nothing else. The
 	// placeholder comparison is the fallback for runtimes without
 	// {{_submitted}}; it must stay false for a column the request did not send.
 	app.Hooks = &HookConfig{BeforeUpdate: map[string][]Hook{"notes": {

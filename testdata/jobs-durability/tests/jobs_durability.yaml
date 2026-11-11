@@ -1,0 +1,69 @@
+tx_enqueue_returns_existing_job_not_zero:
+  as_user: "enq@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, unique_key, run_at) VALUES (7001, 'flow', 'noop', '{}', 'pending', 'report:legacy', datetime('now', '+1 day'))"
+  steps:
+    - api: "POST /api/tx-enqueue-unique"
+      json: {}
+      expect:
+        status: 200
+        contains: "7001"
+    - sql: "SELECT id FROM _benmore_jobs WHERE unique_key = 'report:legacy'"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_jobs WHERE id = 7001 AND status_token IS NOT NULL AND status_token != ''"
+      expect: {rows: 1}
+
+lease_less_running_job_is_recovered_and_frees_its_group:
+  setup:
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, attempts, started_at, unique_key) VALUES (7101, 'flow', 'noop', '{\"project_id\": 42}', 'running', 1, datetime('now', '-2 hours'), 'stuck:key')"
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, run_at, status_token) VALUES (7102, 'flow', 'noop', '{\"project_id\": 42}', 'pending', datetime('now', '-1 minute'), 'tok7102')"
+  steps:
+    - flush: "jobs"
+    - sql: "SELECT id FROM _benmore_jobs WHERE id = 7101 AND status = 'failed' AND lease_expires_at IS NULL"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_jobs WHERE id = 7102 AND status <> 'pending'"
+      expect: {rows: 1}
+
+recent_lease_less_running_job_is_left_alone:
+  setup:
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, attempts, started_at) VALUES (7111, 'flow', 'noop', '{}', 'running', 1, datetime('now', '-1 minute'))"
+  steps:
+    - flush: "jobs"
+    - sql: "SELECT id FROM _benmore_jobs WHERE id = 7111 AND status = 'running'"
+      expect: {rows: 1}
+
+admin_retry_unique_key_clash_is_409:
+  as_user: "boss@test.com"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, unique_key, status_token) VALUES (7201, 'flow', 'noop', '{}', 'failed', 'dup:key', 'tok7201')"
+    - sql: "INSERT INTO _benmore_jobs (id, job_type, flow_name, payload, status, unique_key, status_token, run_at) VALUES (7202, 'flow', 'noop', '{}', 'pending', 'dup:key', 'tok7202', datetime('now', '+1 day'))"
+  steps:
+    - api: "POST /api/_jobs/7201/retry"
+      expect: {status: 409}
+    - sql: "SELECT id FROM _benmore_jobs WHERE id = 7201 AND status = 'failed'"
+      expect: {rows: 1}
+
+cron_minute_is_unique:
+  steps:
+    - sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_cron_unique'"
+      expect: {rows: 1}
+
+import_running_row_carries_a_lease:
+  steps:
+    - sql: "SELECT name FROM pragma_table_info('_benmore_imports') WHERE name = 'lease_expires_at'"
+      expect: {rows: 1}
+
+account_purge_succeeds_when_pending_approvals_become_identical:
+  as_user: "approver@test.com"
+  setup:
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES (8001, 'notes', '1', 99999, 'req@test.com', {{user_id}}, 'approver@test.com', 'Pay')"
+    - sql: "INSERT INTO _benmore_approvals (id, table_name, row_id, requested_by, requested_email, approver_id, approver_email, title) VALUES (8002, 'notes', '1', 99999, 'req@test.com', NULL, '', 'Pay')"
+  steps:
+    - api: "POST /settings/delete-account"
+      data:
+        confirm: "DELETE"
+    - sql: "SELECT 1 AS absent WHERE NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_approvals_pending_unique')"
+      expect: {rows: 1}
+    - sql: "SELECT id FROM _benmore_approvals WHERE id IN (8001, 8002) AND status = 'pending' AND approver_email = ''"
+      expect: {rows: 2}

@@ -1,0 +1,6 @@
+[
+  "Password change: replacing the account password (change, reset, temporary-password change) and claiming a never-verified account revoke every connector grant of that account and drop its pending consents and codes, like sessions and API tokens.",
+  "Account deletion: deleting an account erases its operations and approvals (attempt rows go with their operation, as they do in the expiry sweep), deletes its file-processing metadata and bytes atomically, deletes its stored external connection credentials and revokes or deletes its grants.",
+  "Database restore: every database restore revokes connector grants and deletes access/refresh credentials and pending authorizations. File snapshots are restored only when a live snapshot of the same owner account corroborates them. Stored external connection credentials are carried forward from the live rows only for the same user id.",
+  "Key rotation: ENCRYPTION_KEY rotation reseals operations, approvals and attempts in one transaction with the configured encrypted columns and TOTP secrets (all move or none do), and command activity waits while it runs. It also reseals stored external connection credentials (a row that no longer authenticates is deleted and logged at error level)."
+]

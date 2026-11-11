@@ -1,0 +1,5 @@
+[
+  "Contents: MCP telemetry aggregates tool outcomes, latency buckets, attempts/retries, effect outcomes and digest prefixes without arguments, outputs, credentials or identity. Telemetry is best effort; domain audit remains authoritative.",
+  "Access: GET /api/_mcp/telemetry is restricted to an app admin whose credential is unscoped (a scoped API token or session is refused). Responses expose telemetry_version 1 and a source schema_revision SHA-256 over captured schema and migration hashes, separate from contract/execution revisions; unavailable historical schema identity stays empty.",
+  "Workflow completion: it counts only declared nonterminal-to-terminal transitions confirmed at the end of a newly applied command transaction, after hooks; rollback, unknown execution, replay and already-terminal updates do not count."
+]

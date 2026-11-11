@@ -1,0 +1,60 @@
+// Columns named with SQL reserved words. A schema with any one of them used
+// to stop the app from loading (`near "order": syntax error`): the DDL the
+// framework generates wrote the name bare.
+
+model Plan {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  title     String
+  limit     Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+  steps     Step[]
+
+  @@map("plans")
+}
+
+model Step {
+  id          Int       @id @default(autoincrement())
+  userId      Int       @map("user_id")
+  group       Int
+  plan        Plan      @relation(fields: [group], references: [id])
+  title       String
+  order       Int       @default(0)
+  from        String?
+  to          String?
+  index       Int       @default(0)
+  values      String?
+  default     Boolean   @default(false)
+  check       Int       @default(0)
+  table       String?
+  set         String?
+  transaction String?
+  select      String?
+  where       String?
+  unique      String?   @unique
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  @@index([order])
+  @@index([group, order(sort: Desc)])
+  @@unique([group, index])
+  @@fulltext([title, to])
+  @@map("steps")
+}
+
+// A table named with a reserved word.
+model Order {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  title     String
+  index     Int       @default(0)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([index])
+  @@fulltext([title])
+  @@map("order")
+}

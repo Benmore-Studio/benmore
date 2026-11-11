@@ -1,0 +1,5 @@
+# Ignored: fields are encrypted on the app's own tables only. An encrypted
+# sign-in address could no longer sign in.
+tables:
+  _benmore_users:
+    fields: [email]

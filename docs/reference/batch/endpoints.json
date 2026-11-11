@@ -1,0 +1,5 @@
+[
+  "POST /api/<table>/batch    body: [{row1}, {row2}, ...]",
+  "PATCH /api/<table>/batch   body: {ids: [...], fields: {col: val}}",
+  "DELETE /api/<table>/batch  body: {ids: [...]}"
+]

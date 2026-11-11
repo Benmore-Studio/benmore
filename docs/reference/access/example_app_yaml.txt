@@ -1,0 +1,21 @@
+access:
+  default:                # global per-op fallback
+    read:   admin
+    write:  admin
+
+  posts:                  # per-op explicit
+    read:   anon          # public browsing - anonymous OK
+    write:  self          # owner only
+    update: self
+    delete: admin
+
+  messages: everyone      # shorthand: all ops, same mode (chat case)
+  settings: off           # endpoint disabled entirely
+  orders:                 # multi-tenant
+    read:   group
+    write:  group
+    update: admin
+    delete: admin
+
+  _benmore_users:         # framework user table
+    read: group           # multi-tenant directory - admins bypass

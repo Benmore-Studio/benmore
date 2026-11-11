@@ -1,0 +1,1 @@
+Write the YAML inline under sign: (compute, headers, query, before). The inline form covers a new protocol with no framework change.

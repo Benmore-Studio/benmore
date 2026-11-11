@@ -87,3 +87,42 @@ func TestAdminToolsRunnerTreatsFormAsRequestInput(t *testing.T) {
 		t.Fatal("a posted user_group_id stood in for the session's tenant")
 	}
 }
+
+// The tools runner put a failed flow's raw error into its redirect URL,
+// which browser history and access logs keep; a `run: api` URL there carried
+// its env token. It is redacted like the flow's own failure text.
+func TestAdminToolsRunnerRedactsFlowError(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	app := &App{Dir: dir, DB: db, SessionDuration: time.Hour, Stop: make(chan struct{})}
+	t.Cleanup(app.Shutdown)
+	mux := buildAppMux(app, true, "http://localhost")
+	if err := EnsureUsersTable(db); err != nil {
+		t.Fatal(err)
+	}
+	EnsureSessionsTable(db)
+	res, err := db.Exec("INSERT INTO _benmore_users (username, email, role, verified) VALUES ('boss', 'boss@example.com', 'admin', 1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, _ := res.LastInsertId()
+	sid := CreateSession(db, uid, "boss@example.com", "", time.Hour)
+	SetAppEnv(dir, "PARTNER_API_TOKEN", jobErrorRedactToken)
+	app.Flows = append(app.Flows, Flow{Name: "sync", Role: "admin", Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/admin/sync"},
+		Steps: []FlowStep{{Name: "call", Type: "api", API: &FlowAPICall{Method: "GET",
+			URL: "https://partner.invalid/status/404/{{env.PARTNER_API_TOKEN}}?key={{env.PARTNER_API_TOKEN}}"}}}})
+
+	loc := adminToolsRun(mux, sid, url.Values{"_flow_path": {"/api/admin/sync"}})
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(loc, "error=") {
+		t.Fatalf("failed flow reported success: %q", loc)
+	}
+	checkJobErrorRedacted(t, "tools redirect", loc+"\n"+u.Query().Get("error"))
+}

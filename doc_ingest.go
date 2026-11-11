@@ -2,9 +2,11 @@
 
 package main
 
-// Bounded document ingest core (epic #313, F06.3-F06.5): CSV and XLSX/XLSM
-// readers that turn a file into immutable "source blocks" carrying sheet and
-// cell coordinates, the extracted value, its type and quality flags.
+// Bounded document ingest core (epic #313): CSV and OOXML readers that turn a
+// file into immutable source blocks with exact source coordinates, values,
+// types and quality flags. DOCX/PPTX are a text-only contract; Complete means
+// the full declared text scope was read, not that the rendered document was
+// visually understood or reconstructed.
 //
 // Internal library, not yet exposed through any route, tool or manifest.
 //
@@ -28,14 +30,21 @@ import (
 // traced to the parser that produced it. Bump it when extraction semantics change.
 const IngestParserVersion = "doc-ingest/1"
 
+// IngestOOXMLTextParserVersion is recorded for the text-only Word and
+// PowerPoint readers. It is intentionally independent of the spreadsheet
+// parser so changing one extraction contract never rewrites the other.
+const IngestOOXMLTextParserVersion = "doc-ooxml-text/1"
+
 // Formats reported in IngestResult.Format.
 const (
 	IngestFormatCSV  = "csv"
 	IngestFormatXLSX = "xlsx"
 	IngestFormatXLSM = "xlsm"
+	IngestFormatDOCX = "docx"
+	IngestFormatPPTX = "pptx"
 )
 
-// SourceBlock kinds. Only cell blocks are produced today.
+// SourceBlock kinds.
 const BlockKindCell = "cell"
 
 // SourceBlock value types.
@@ -51,16 +60,29 @@ const (
 // Quality flags. Block-level flags describe one value; result-level flags
 // (IngestResult.Quality) describe the whole file.
 const (
-	QualityCachedFormulaResult   = "cached_formula_result"
-	QualityFreshnessNotVerified  = "freshness_not_verified"
-	QualityFormulaNoCachedValue  = "formula_no_cached_value"
-	QualityUnparseableNumber     = "unparseable_number"
-	QualityUnknownCellType       = "unknown_cell_type"
-	QualityInvalidBool           = "invalid_bool"
-	QualityDateOutOfRange        = "date_out_of_range"
-	QualityDate1900LeapBug       = "date_1900_leap_year_bug"
-	QualityMacrosNotExecuted     = "macros_present_not_executed"
-	QualityExternalLinksNotFetch = "external_links_present_not_resolved"
+	QualityCachedFormulaResult       = "cached_formula_result"
+	QualityFreshnessNotVerified      = "freshness_not_verified"
+	QualityFormulaNoCachedValue      = "formula_no_cached_value"
+	QualityUnparseableNumber         = "unparseable_number"
+	QualityUnknownCellType           = "unknown_cell_type"
+	QualityInvalidBool               = "invalid_bool"
+	QualityDateOutOfRange            = "date_out_of_range"
+	QualityDate1900LeapBug           = "date_1900_leap_year_bug"
+	QualityMacrosNotExecuted         = "macros_present_not_executed"
+	QualityExternalLinksNotFetch     = "external_links_present_not_resolved"
+	QualityTextOnly                  = "text_only"
+	QualityLayoutNotReconstructed    = "layout_not_reconstructed"
+	QualityImagesNotExtracted        = "images_not_extracted"
+	QualityChartsNotExtracted        = "charts_not_extracted"
+	QualitySmartArtNotExtracted      = "smartart_not_extracted"
+	QualityFieldsUnevaluated         = "fields_not_evaluated"
+	QualityHiddenSlide               = "hidden_slide"
+	QualityNoExtractableText         = "no_extractable_text"
+	QualityInheritedTextNotExtracted = "inherited_layout_text_not_extracted"
+	QualityNumberingNotComputed      = "numbering_not_computed"
+	QualityTrackedChanges            = "tracked_changes_unsupported"
+	QualityAltChunk                  = "altchunk_unsupported"
+	QualityEncryptedOOXML            = "encrypted_office_document"
 )
 
 // IngestLimits bounds every resource a parse may use. The zero value is NOT

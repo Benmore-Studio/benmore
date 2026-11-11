@@ -32,11 +32,48 @@ func docsViewerFor(session *Session) docsViewer {
 }
 
 func (v docsViewer) showsTable(app *App, table string) bool {
-	return v.full || SessionCanAccessTable(app, table, OpRead, v.session)
+	if v.full {
+		// A table whose every operation is `off` has no API to describe.
+		for _, op := range []AccessOp{OpRead, OpWrite, OpUpdate, OpDelete} {
+			if !accessOpOff(app.Access, table, op) {
+				return true
+			}
+		}
+		return false
+	}
+	return SessionCanAccessTable(app, table, OpRead, v.session)
 }
 
+// allowsOp: an `off` operation answers 404 to every caller, admins included
+// (EnforceCRUDAccess), so even the full developer contract leaves it out.
 func (v docsViewer) allowsOp(app *App, table string, op AccessOp) bool {
+	if accessOpOff(app.Access, table, op) {
+		return false
+	}
 	return v.full || SessionCanAccessTable(app, table, op, v.session)
+}
+
+// accessOpOff reports whether app.yaml declares op `off` for table. Only a
+// declaration can be `off`; the implicit column-inferred default never is.
+func accessOpOff(access *AccessConfig, table string, op AccessOp) bool {
+	mode, ok := access.DeclaredModeFor(table, op)
+	return ok && mode == "off"
+}
+
+// crudRouteAccessOff reports whether the auto-CRUD route method+path on table
+// needs an access op app.yaml turns `off` (restore needs read and update).
+// Such a route is registered but unreachable.
+func crudRouteAccessOff(access *AccessConfig, table, method, path string) bool {
+	ops := []AccessOp{docsRouteOp(method)}
+	if method == "POST" && strings.HasSuffix(path, "/restore") {
+		ops = []AccessOp{OpRead, OpUpdate}
+	}
+	for _, op := range ops {
+		if accessOpOff(access, table, op) {
+			return true
+		}
+	}
+	return false
 }
 
 // docsRouteOp maps a documented CRUD route onto the access op that gates it.
@@ -70,9 +107,6 @@ func (v docsViewer) routes(app *App, table string) []docsRoute {
 // pruneOpenAPIPaths drops the operations of table's OpenAPI paths that this
 // viewer's access gate refuses, and a path left with no operations.
 func (v docsViewer) pruneOpenAPIPaths(app *App, table string, paths map[string]any) {
-	if v.full {
-		return
-	}
 	if !v.allowsOp(app, table, OpRead) || !v.allowsOp(app, table, OpUpdate) {
 		delete(paths, "/api/"+table+"/{id}/restore")
 	}

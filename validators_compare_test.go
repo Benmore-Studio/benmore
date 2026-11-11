@@ -37,7 +37,7 @@ func TestCrossFieldComparesWholeOperands(t *testing.T) {
 		{"value >= 0", map[string]any{"value": 2.5}, true},
 		{"qty < 10", map[string]any{"qty": "nan"}, false},
 	} {
-		if got := evaluateCrossFieldExpr(c.rule, c.data); got != c.want {
+		if got := evaluateCrossFieldExpr(c.rule, c.data, nil); got != c.want {
 			t.Errorf("%s with %v = %v, want %v", c.rule, c.data, got, c.want)
 		}
 	}

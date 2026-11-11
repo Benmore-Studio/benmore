@@ -312,7 +312,7 @@ const appMCPPageBaseHTML = `<!doctype html>
 
 // Shared fragments for the review pages (single and batch).
 const appMCPPageFragments = `
-{{define "changes"}}{{if .Changes}}<table class="changes"><thead><tr><th scope="col">Field</th>{{if .ShowBefore}}<th scope="col">Before</th><th scope="col">After</th>{{else}}<th scope="col">Value</th>{{end}}</tr></thead><tbody>{{range .Changes}}<tr class="{{if .Changed}}changed{{end}}"><th scope="row">{{.Label}}{{if .Changed}}<span class="tag">Changed</span>{{end}}</th>{{if $.ShowBefore}}<td data-label="Before">{{if .Before}}{{.Before}}{{else}}<span class="none">(empty)</span>{{end}}</td>{{end}}<td data-label="{{if $.ShowBefore}}After{{else}}Value{{end}}">{{if .After}}{{.After}}{{else}}<span class="none">(empty)</span>{{end}}</td></tr>{{end}}</tbody></table><details class="raw"><summary>Exact data</summary><pre>{{.Preview}}</pre></details>{{else}}<pre>{{.Preview}}</pre>{{end}}{{end}}
+{{define "changes"}}{{if .Changes}}<table class="changes"><thead><tr><th scope="col">Field</th>{{if .ShowBefore}}<th scope="col">Before</th><th scope="col">After</th>{{else}}<th scope="col">Value</th>{{end}}</tr></thead><tbody>{{range .Changes}}<tr class="{{if .Changed}}changed{{end}}"><th scope="row">{{.Label}}{{if .Changed}}<span class="tag">Changed</span>{{end}}</th>{{if not $.ShowBefore}}<td data-label="Value">{{else if .HasBefore}}<td data-label="Before">{{if .Before}}{{.Before}}{{else}}<span class="none">(empty)</span>{{end}}</td><td data-label="After">{{else}}<td colspan="2" data-label="Value">{{end}}{{if .After}}{{.After}}{{else}}<span class="none">(empty)</span>{{end}}</td></tr>{{end}}</tbody></table><details class="raw"><summary>Exact data</summary><pre>{{.Preview}}</pre></details>{{else}}<pre>{{.Preview}}</pre>{{end}}{{end}}
 {{define "told"}}{{if and .Description (not .HasText)}}<details><summary>What the assistant was told</summary><p class="small muted">{{.Description}}</p></details>{{end}}{{end}}
 {{define "effects"}}{{if .Effects}}<p class="small muted">Side effects, queued with the change and delivered after it is applied, only while the assistant's connection stays authorized:</p><ul>{{range .Effects}}<li>{{.}}</li>{{end}}</ul>{{else}}<p class="small muted">No downstream effects: this change sends no email, notification, webhook or background job.</p>{{end}}{{end}}
 {{define "why"}}{{if .AutoApprove}}<p class="note">Why this needs your approval: {{.AutoApprove}}</p>{{end}}{{end}}
@@ -368,7 +368,11 @@ var appMCPBatchReviewPage = appMCPPageSet(`<div class="card"><p class="eyebrow">
 {{template "effects" .}}
 {{template "expiry" .}}</section>{{end}}
 <div class="actions"><button class="btn btn-primary" type="submit">Approve selected changes</button></div></form>
-<p class="small muted">Approving grants no other access.</p>{{else}}<p class="lead">Nothing from this connection is waiting for your approval.</p>{{end}}{{end}}</div>`)
+<p class="small muted">Approving grants no other access.</p>{{else}}<p class="lead">Nothing from this connection is waiting for your approval.</p>{{end}}
+{{if .Blocked}}<h2>Can't be applied</h2>{{range .Blocked}}<section class="item"><span class="item-title">{{.Heading}}</span>{{if .Summary}}<span class="muted">{{.Summary}}</span>{{end}}
+<p class="meta"><span>Tool <code>{{.Tool}}</code></span></p>
+<p class="note {{.StateKind}}">{{.StateText}}</p>
+{{template "expiry" .}}</section>{{end}}{{end}}{{end}}</div>`)
 
 // ---- rendering -------------------------------------------------------------
 
@@ -381,7 +385,7 @@ type appMCPPageOpts struct {
 	FormAction string
 	// Referrer is the Referrer-Policy; "" omits the header. A page that posts a
 	// form must use "same-origin", never "no-referrer": on 2026-10-14
-	// (benmore-go#464) the single and batch review pages sent
+	// the single and batch review pages sent
 	// no-referrer, a real browser posted the approve form with `Origin: null`,
 	// and appMCPBoundCSRF refused it, so no person could approve any connector
 	// change on any app, while every Go test passed (net/http never derives
@@ -538,11 +542,27 @@ func appMCPExpiryText(expiresAt int64, now time.Time) string {
 	}
 }
 
-// appMCPReviewStateNote is the plain sentence for a state past "prepared".
-func appMCPReviewStateNote(state string) (kind, text string) {
-	switch state {
+// appMCPReviewStateNote is the plain sentence for a state past "prepared". It
+// reads the derived state _status reports (appMCPDerivedOperationState), so
+// "Approved" is said only of an approval _commit would still accept.
+func appMCPReviewStateNote(review *appMCPReview) (kind, text string) {
+	switch review.State {
 	case "approved":
+		if review.ByConsent {
+			// Only the connection can check its standing consent (errAppMCPConsentUnjudged).
+			return "", "Approved automatically under the permission you gave this connection. Your assistant can apply it only while that permission and the app's approved writes stay on."
+		}
 		return "ok", "Approved. Your assistant can now apply this change."
+	case "denied":
+		switch review.Reason {
+		case appMCPBlockApprovalLapsed:
+			return "bad", "The approval no longer holds: the browser session that approved it has ended (for example, you signed out), so your assistant can't apply this change. Ask the assistant to prepare it again, approve the new request, and stay signed in until it is applied."
+		case appMCPBlockActorChanged:
+			return "bad", "Your role in this app changed after this was prepared, so this change can't be approved or applied now. Ask the assistant to prepare it again."
+		case appMCPBlockSourceChanged:
+			return "bad", "The app's reviewed connector changed after this was prepared, so this change can't be approved or applied as shown. Ask the assistant to prepare it again."
+		}
+		return "bad", "This change can't be applied now. Ask the assistant to prepare it again."
 	case "running":
 		return "", "This change is being applied now."
 	case "succeeded":
@@ -569,13 +589,17 @@ func newAppMCPReviewView(review *appMCPReview, id string, now time.Time) appMCPR
 	if v.Heading == "" {
 		v.Heading = review.Tool
 	}
+	// The Before column appears when any row is a real before/after pair,
+	// even one whose before was read as empty; context rows then span both
+	// columns instead of showing an "(empty)" before nobody read.
 	for _, c := range review.Changes {
-		if c.Before != "" {
+		if c.HasBefore {
 			v.ShowBefore = true
 		}
 	}
 	exp := time.Unix(review.ExpiresAt, 0).UTC()
 	v.Expires, v.ExpiresText, v.ExpiresClock = exp.Format(time.RFC3339), appMCPExpiryText(review.ExpiresAt, now), exp.Format("2006-01-02 15:04 UTC")
+	v.StateKind, v.StateText = appMCPReviewStateNote(review)
 	return v
 }
 

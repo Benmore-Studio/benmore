@@ -1,0 +1,4 @@
+[
+  "BENMORE_TOKEN: ephemeral bearer credential used by every hosted command; never written to the credential file.",
+  "Incomplete credentials on non-TTY stdin fail immediately with usage exit 2 instead of opening a browser or waiting for input."
+]

@@ -1,0 +1,16 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-on-error
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO note (title, user_id) VALUES ('x', 1)" }
+        on_error:
+          - run: email
+            with: { to: ops@example.com, subject: failed, text: "${{ error }}" }
+      - run: respond
+        with: { json: { ok: true } }

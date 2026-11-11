@@ -1,0 +1,23 @@
+# `benmore test` on this app must FAIL its source check for app.yaml and
+# retention.yaml (tests/expected-failures.txt): a push refuses both files.
+# A deployed copy still loads, and tests/ proves what it does then: the
+# aggregate that would write is refused and writes nothing, and the retention
+# policies that name framework tables, an unknown key or a missing column do
+# not run, while the policy on the app's own table still does.
+site_name: "Retention and aggregates guardrails fixture"
+auth:
+  identifier: email
+
+# events keeps its earlier row states in events_history; the sweep removes the
+# stored versions of the rows it deletes (tests/retention.yaml).
+versioned:
+  - events
+
+aggregates:
+  event_count:
+    sql: "SELECT COUNT(*) FROM events"
+    refresh: "5m"
+  # Not a SELECT: refused at write time and at every refresh.
+  writes_a_row:
+    sql: "INSERT INTO notes (title) VALUES ('written by an aggregate') RETURNING id"
+    refresh: "5m"

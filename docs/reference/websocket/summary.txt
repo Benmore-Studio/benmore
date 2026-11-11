@@ -1,0 +1,1 @@
+A standard (RFC 6455) WebSocket endpoint. TWO message families: (1) `subscribe`/`unsubscribe` to table CRUD events for live invalidation, and (2) `join`/`leave`/`broadcast` for room-based fan-out (chat, presence, WebRTC signaling). DON'T mix the two - `subscribe` takes `tables: [...]`, NOT a `room`. Sending `{type:'subscribe', room:'X'}` is silently no-op'd.

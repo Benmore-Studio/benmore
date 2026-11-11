@@ -1,0 +1,10 @@
+on:
+  request:
+    method: POST
+    path: /api/unsafe_sync
+    mode: async
+jobs:
+  run:
+    steps:
+      - run: sql
+        query: "SELECT 1"

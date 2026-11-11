@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 var (
@@ -443,14 +443,15 @@ headers:
 //
 //	header  - header name. Default Authorization. Override when the
 //	          vendor uses a non-standard name (e.g. x-api-key).
-//	prefix  - string prepended to the token. Default "Bearer ".
-//	          Set to "" for raw token (e.g. `prefix: ""` with
-//	          `header: x-api-key` for Anthropic-style API keys).
+//	prefix  - string prepended to the token. Default "Bearer " when the
+//	          key is omitted (if_unset, not default:, so an explicit empty
+//	          value is kept). Set to "" for raw token (e.g. `prefix: ""`
+//	          with `header: x-api-key` for Anthropic-style API keys).
 const recipeBearerToken = `
 compute:
   token:  "{{ params.token | or_env:'API_TOKEN' | required:'sign.token or env.API_TOKEN must be set' }}"
   hdr:    "{{ params.header | default:'Authorization' }}"
-  pfx:    "{{ params.prefix | default:'Bearer ' }}"
+  pfx:    "{{ params.prefix | if_unset:'Bearer ' }}"
   out:    "{{pfx}}{{token}}"
 headers:
   "{{hdr}}": "{{out}}"

@@ -1,0 +1,1 @@
+Successful ordinary-app reloads refresh server-rendered root pages, partials and discovered auth paths; no connector manifest is needed. Added or deleted routes and changed page gates take effect with the accepted configuration. A rejected reload keeps the published pages. See api(at:frontend) root_page_reload for routing and verification.

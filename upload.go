@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"mime/multipart"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -49,6 +51,10 @@ func limitUploadBody(w http.ResponseWriter, r *http.Request, client string) (rel
 		removeMultipartTemp(r)
 		releaseSlot()
 	}
+	// A 50 MB file does not arrive within the server's 15 s read deadline on
+	// an ordinary connection. Extended only once the request holds a slot,
+	// so slow bodies cannot outnumber the slots.
+	extendBulkBodyDeadlines(w)
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+uploadBodyOverhead)
 	if err := r.ParseMultipartForm(uploadMemoryThreshold); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -157,6 +163,10 @@ type S3Storage struct {
 	Endpoint string // custom endpoint for R2/MinIO
 	Key      string
 	Secret   string
+	// Token is the session token of temporary credentials (an STS session
+	// scoped to one app's backup prefix, backup_session.go); empty for a
+	// long-lived key.
+	Token string
 }
 
 func (s3 *S3Storage) objectURL(path string) string {
@@ -254,6 +264,10 @@ func (s3 *S3Storage) SaveWithMeta(path string, data io.Reader, contentType, disp
 			signAWSv4PayloadHash(req, payloadHash, key, secret, s3.Region, "s3")
 		} else {
 			// DO Spaces / R2 / MinIO accept basic auth as a fallback
+			// (temporary credentials still carry their session token).
+			if token != "" {
+				req.Header.Set("X-Amz-Security-Token", token)
+			}
 			req.SetBasicAuth(key, secret)
 		}
 	}
@@ -360,6 +374,9 @@ func (s3 *S3Storage) Delete(path string) error {
 			}
 			signAWSv4(req, nil, key, secret, s3.Region, "s3")
 		} else {
+			if token != "" {
+				req.Header.Set("X-Amz-Security-Token", token)
+			}
 			req.SetBasicAuth(key, secret)
 		}
 	}
@@ -415,6 +432,9 @@ func (s3 *S3Storage) FetchContext(ctx context.Context, path string) (*http.Respo
 			}
 			signAWSv4(req, nil, key, secret, s3.Region, "s3")
 		} else {
+			if token != "" {
+				req.Header.Set("X-Amz-Security-Token", token)
+			}
 			req.SetBasicAuth(key, secret)
 		}
 	}
@@ -498,23 +518,63 @@ func privateUploadPath(app *App, backend StorageBackend, raw string) (string, er
 		if err != nil || u.Scheme != "https" || u.Host != store.CDNDomain || u.User != nil {
 			return "", fmt.Errorf("delete upload: URL is not this app's configured CDN")
 		}
-		prefix := "/private/" + appMediaPrefix(app) + "/"
-		if !strings.HasPrefix(u.Path, prefix) {
+		// Compared on the raw text, not the parsed URL: url.Parse lowercases
+		// the scheme, and the stored spelling is the only accepted one.
+		prefix := "https://" + store.CDNDomain + "/private/" + appMediaPrefix(app) + "/"
+		key, ok := strings.CutPrefix(raw, prefix)
+		if !ok {
 			return "", fmt.Errorf("delete upload: CDN URL is outside this app's private prefix")
 		}
-		return privateLogicalUploadPath(strings.TrimPrefix(u.Path, prefix))
+		return privateUploadKeyAfterPrefix(key)
 	case *S3Storage:
-		prefix := store.objectURL("")
-		if !strings.HasPrefix(raw, prefix) {
+		key, ok := strings.CutPrefix(raw, store.objectURL(""))
+		if !ok {
 			return "", fmt.Errorf("delete upload: URL is not this app's configured S3 bucket")
 		}
-		return privateLogicalUploadPath(strings.TrimPrefix(raw, prefix))
+		return privateUploadKeyAfterPrefix(key)
 	default:
 		return "", fmt.Errorf("delete upload: URL references are unsupported by the selected backend")
 	}
 }
 
+// privateUploadReadPath is privateUploadPath for a read (serve_file). A dev
+// instance may also read the production prefix (appMediaReadPrefixes), which
+// the rows refresh-dev --with-data copies still name, so its CDN URLs resolve
+// too. Writes and deletes keep privateUploadPath, which accepts the
+// instance's own prefix only.
+func privateUploadReadPath(app *App, backend StorageBackend, raw string) (string, error) {
+	logical, err := privateUploadPath(app, backend, raw)
+	store, isCDN := backend.(*CDNStorage)
+	if err == nil || !isCDN || strings.ContainsAny(raw, "\\\x00?#%") {
+		return logical, err
+	}
+	for _, p := range appMediaReadPrefixes(app)[1:] {
+		if key, ok := strings.CutPrefix(raw, "https://"+store.CDNDomain+"/private/"+p+"/"); ok {
+			return privateUploadKeyAfterPrefix(key)
+		}
+	}
+	return logical, err
+}
+
+// privateUploadKeyAfterPrefix checks the key part of a stored URL. The prefix
+// already ends in a slash, so a key starting with another one is a doubled
+// slash: privateLogicalUploadPath would take it for the one leading slash of a
+// served path and return the same object as the stored URL.
+func privateUploadKeyAfterPrefix(key string) (string, error) {
+	if strings.HasPrefix(key, "/") {
+		return "", fmt.Errorf("delete upload: invalid private upload URL")
+	}
+	return privateLogicalUploadPath(key)
+}
+
 func deletePrivateUpload(app *App, raw string) error {
+	return deletePrivateUploadAuthorized(app, raw, nil)
+}
+
+// deletePrivateUploadAuthorized deletes the private upload raw names once
+// authorize (when set) accepts the backend and the logical path the
+// reference resolved to; its error stops the delete before any I/O.
+func deletePrivateUploadAuthorized(app *App, raw string, authorize func(backend StorageBackend, logical string) error) error {
 	backend := storageBackendForApp(app)
 	if backend == nil {
 		return fmt.Errorf("delete upload: storage backend unavailable")
@@ -523,10 +583,63 @@ func deletePrivateUpload(app *App, raw string) error {
 	if err != nil {
 		return err
 	}
+	if authorize != nil {
+		if err := authorize(backend, path); err != nil {
+			return err
+		}
+	}
 	if err := backend.Delete(path); err != nil {
 		return fmt.Errorf("delete upload %q: %w", path, err)
 	}
 	return nil
+}
+
+// uploadsDisabledCode is the stable `error` value of a request refused
+// because the app set features.uploads: false.
+const uploadsDisabledCode = "uploads_disabled"
+
+// errUploadsDisabled is what a path that would store an uploaded file
+// returns while the app has features.uploads: false.
+var errUploadsDisabled = errors.New("file uploads are turned off for this app (features.uploads: false in app.yaml)")
+
+// uploadsAllowed is the one check behind features.uploads. Every path that
+// stores a file a client or a connector source sent calls it before it
+// reads or stores anything: handleFileUploadAt (multipart creates,
+// POST /api/_upload, POST /api/_files) and the connector's file pull. The
+// switch used to be consulted only by the two upload routes, so a multipart
+// POST /api/<table> still stored its file parts.
+func uploadsAllowed(app *App) error {
+	if app != nil && !app.FeatureEnabled("uploads") {
+		return errUploadsDisabled
+	}
+	return nil
+}
+
+// uploadFilePart names a file part of a parsed multipart form (the first in
+// name order), or "" when the form carries fields only.
+func uploadFilePart(form *multipart.Form) string {
+	if form == nil {
+		return ""
+	}
+	name := ""
+	for field, headers := range form.File {
+		if len(headers) > 0 && (name == "" || field < name) {
+			name = field
+		}
+	}
+	return name
+}
+
+// writeUploadsDisabled answers a create that carries a file part while
+// uploads are off: 403 with a stable code, in the shape of the create's
+// other configuration refusal (field_owned_by_command). The two upload
+// routes answer 404 instead, because the whole route is off.
+func writeUploadsDisabled(w http.ResponseWriter, field string) {
+	httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+		"error":   uploadsDisabledCode,
+		"field":   field,
+		"message": errUploadsDisabled.Error() + ": the file was not accepted and nothing was saved; send the request without file parts",
+	}, uploadsDisabledCode))
 }
 
 // HandleFileUpload processes file uploads from multipart forms.
@@ -534,6 +647,20 @@ func deletePrivateUpload(app *App, raw string) error {
 // Accepts *App so storage resolves per-app in multi-tenant host mode
 // (fixes: global storageBackend was last-loaded-app wins).
 func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSize int64, allowedTypes []string) (string, error) {
+	url, _, err := handleFileUploadAt(app, r, fieldName, folder, maxSize, allowedTypes)
+	return url, err
+}
+
+// handleFileUploadAt is HandleFileUpload that also returns the storage path
+// it reserved (set as soon as the ownership row or any bytes may exist, even
+// on error) so a caller whose enclosing operation is refused can remove them
+// with discardStoredUpload.
+func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, maxSize int64, allowedTypes []string) (url, destPath string, err error) {
+	// features.uploads: false closes every caller, present and future,
+	// before the part is read: no bytes, no ownership row.
+	if err := uploadsAllowed(app); err != nil {
+		return "", "", err
+	}
 	if maxSize == 0 {
 		maxSize = maxUploadSize
 	}
@@ -543,15 +670,15 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	file, header, err := r.FormFile(fieldName)
 	if err != nil {
 		if err == http.ErrMissingFile {
-			return "", nil // no file uploaded, not an error
+			return "", "", nil // no file uploaded, not an error
 		}
-		return "", fmt.Errorf("upload: %w", err)
+		return "", "", fmt.Errorf("upload: %w", err)
 	}
 	defer file.Close()
 
 	// Check file size
 	if header.Size > maxSize {
-		return "", fmt.Errorf("file too large (max %dMB)", maxSize/(1<<20))
+		return "", "", fmt.Errorf("file too large (max %dMB)", maxSize/(1<<20))
 	}
 
 	// Check file type
@@ -559,7 +686,7 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	ext = strings.TrimPrefix(ext, ".")
 	// The extension becomes part of the storage key and the served URL.
 	if !safeUploadExt(ext) {
-		return "", fmt.Errorf("file extension not allowed (letters and digits only, at most 10)")
+		return "", "", fmt.Errorf("file extension not allowed (letters and digits only, at most 10)")
 	}
 	if len(allowedTypes) > 0 {
 		allowed := false
@@ -570,7 +697,7 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 			}
 		}
 		if !allowed {
-			return "", fmt.Errorf("file type .%s not allowed (allowed: %s)", ext, strings.Join(allowedTypes, ", "))
+			return "", "", fmt.Errorf("file type .%s not allowed (allowed: %s)", ext, strings.Join(allowedTypes, ", "))
 		}
 	}
 
@@ -593,12 +720,12 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	}
 	for _, d := range dangerousMimes {
 		if strings.HasPrefix(mimeType, d) {
-			return "", fmt.Errorf("file type not allowed: %s", mimeType)
+			return "", "", fmt.Errorf("file type not allowed: %s", mimeType)
 		}
 	}
 	switch ext {
 	case "svg", "svgz", "xml", "xhtml", "html", "htm", "js", "mjs":
-		return "", fmt.Errorf("file type not allowed: .%s", ext)
+		return "", "", fmt.Errorf("file type not allowed: .%s", ext)
 	}
 
 	// Generate safe filename: uuid.ext
@@ -608,7 +735,12 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	if folder == "" {
 		folder = "files"
 	}
-	destPath := filepath.Join("uploads", folder, safeName)
+	// compliance: hipaa keeps every upload on the private (signed URL) tier:
+	// the auto-CRUD table folder and /api/_files go under uploads/private/.
+	if app.hipaa() && !isPrivateUploadPath("uploads/"+folder+"/") {
+		folder = "private/" + folder
+	}
+	destPath = filepath.Join("uploads", folder, safeName)
 
 	// Object metadata: a correct Content-Type so media renders, and
 	// force-download for active/unknown content (belt on top of the MIME
@@ -621,35 +753,58 @@ func HandleFileUpload(app *App, r *http.Request, fieldName, folder string, maxSi
 	// fails later, retain this harmless reservation: a remote failure may
 	// have persisted bytes even when it returned an error.
 	if err := recordPrivateUploadOwner(app, r, destPath); err != nil {
-		return "", fmt.Errorf("record upload owner: %w", err)
+		return "", "", fmt.Errorf("record upload owner: %w", err)
 	}
 
 	if backend != nil {
 		if ms, ok := backend.(metaSaver); ok {
-			url, err := ms.SaveWithMeta(destPath, file, contentType, disposition)
+			url, err = ms.SaveWithMeta(destPath, file, contentType, disposition)
 			if err != nil {
-				return "", fmt.Errorf("save upload: %w", err)
+				return "", destPath, fmt.Errorf("save upload: %w", err)
 			}
-			return url, nil
+			return url, destPath, nil
 		}
-		url, err := backend.Save(destPath, file)
+		url, err = backend.Save(destPath, file)
 		if err != nil {
-			return "", fmt.Errorf("save upload: %w", err)
+			return "", destPath, fmt.Errorf("save upload: %w", err)
 		}
-		return url, nil
+		return url, destPath, nil
 	}
 
 	// Fallback: direct local save (if InitStorage wasn't called)
 	os.MkdirAll(filepath.Dir(destPath), 0755)
 	dest, err := os.Create(destPath)
 	if err != nil {
-		return "", fmt.Errorf("save upload: %w", err)
+		return "", destPath, fmt.Errorf("save upload: %w", err)
 	}
 	defer dest.Close()
 	if _, err := io.Copy(dest, file); err != nil {
-		return "", fmt.Errorf("write upload: %w", err)
+		return "", destPath, fmt.Errorf("write upload: %w", err)
 	}
-	return "/" + destPath, nil
+	return "/" + destPath, destPath, nil
+}
+
+// discardStoredUpload removes the bytes a refused request left behind, then
+// their ownership row, and only if the byte delete succeeded (or the object was
+// already gone). Best effort and logged: the request is already being refused.
+func discardStoredUpload(app *App, destPath string) {
+	var err error
+	if backend := storageBackendForApp(app); backend != nil {
+		err = backend.Delete(destPath)
+	} else if err = os.Remove(destPath); os.IsNotExist(err) {
+		err = nil
+	}
+	if err != nil {
+		// Keep the ownership row: bytes with no row look like a legacy file
+		// and fall under the looser reference-only rule (upload_owners.go).
+		log.Printf("discard refused upload %s: %v (ownership row kept)", destPath, err)
+		return
+	}
+	if app != nil && app.DB != nil {
+		if _, err := app.DB.Exec(`DELETE FROM _benmore_upload_owners WHERE path = ?`, uploadRelPath(destPath)); err != nil && !strings.Contains(err.Error(), "no such table") {
+			log.Printf("discard refused upload %s ownership: %v", destPath, err)
+		}
+	}
 }
 
 func generateShortID() string {
@@ -704,19 +859,20 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 			return
 		}
 
-		// `kind` becomes the storage folder under uploads/. Whitelist to
-		// safe identifiers so an attacker can't traverse with "../foo".
-		kind := r.FormValue("kind")
-		if kind == "" {
-			kind = "files"
+		// `kind` becomes the storage folder under uploads/.
+		kind, err := normalizeUploadKind(r.FormValue("kind"))
+		if err != nil {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
 		}
-		for _, c := range kind {
-			ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-				(c >= '0' && c <= '9') || c == '-' || c == '_'
-			if !ok {
-				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid kind (alphanumeric/-/_ only)"})
+		if app.hipaa() {
+			// Under compliance: hipaa the default is private and a public
+			// kind is refused: PHI must never land on the public tier.
+			if r.FormValue("kind") != "" && kind != "private" {
+				httpJSON(w, http.StatusBadRequest, map[string]any{"error": hipaaPublicUploadRefusal(kind)})
 				return
 			}
+			kind = "private"
 		}
 
 		// HandleFileUpload parses the multipart body, validates size +
@@ -724,6 +880,11 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 		// Returns the stored path/URL.
 		savedURL, err := HandleFileUpload(app, r, "file", kind, 0, nil)
 		if err != nil {
+			// The owner account's media allowance on the hosted platform:
+			// 507 with the usage and the way out, like the database limit.
+			if respondMediaAllowance(w, err) {
+				return
+			}
 			msg := err.Error()
 			status := http.StatusBadRequest
 			switch {
@@ -757,6 +918,34 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 		}
 		httpJSON(w, http.StatusOK, out)
 	})
+}
+
+// normalizeUploadKind maps POST /api/_upload's `kind` onto its storage
+// folder under uploads/. Only the folder `private` is the private tier
+// (isPrivateUploadPath); every other folder is PUBLIC. So `private` and
+// `public` are matched in any letter case (`Private` used to make a public
+// folder named Private, silently), and a kind that reads as private but is
+// not that folder (`private-docs`, `my_private`) is refused rather than
+// stored public. Other names stay public folders (`avatars`), restricted to
+// letters, digits, `-` and `_` so a kind cannot traverse ("../foo").
+func normalizeUploadKind(kind string) (string, error) {
+	if kind == "" {
+		return "files", nil
+	}
+	for _, c := range kind {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_'
+		if !ok {
+			return "", fmt.Errorf("invalid kind (alphanumeric/-/_ only)")
+		}
+	}
+	switch lower := strings.ToLower(kind); {
+	case lower == "private" || lower == "public":
+		return lower, nil
+	case strings.Contains(lower, "private"):
+		return "", fmt.Errorf("kind %q is not private: only kind=private stores a private file, and every other kind is a PUBLIC folder. Use kind=private, or a public folder name without \"private\"", kind)
+	}
+	return kind, nil
 }
 
 // ParseUploadDirective extracts :upload, :max, :types from an HTML input element.
@@ -895,7 +1084,7 @@ func uploadsReaderSniffActive(f io.ReaderAt) bool {
 
 func (s3 *S3Storage) resolveCreds() (key, secret, token string) {
 	if s3.Key != "" {
-		return s3.Key, s3.Secret, ""
+		return s3.Key, s3.Secret, s3.Token
 	}
 	// Non-AWS endpoints (R2, MinIO, Spaces) never have IMDS - return
 	// empty so the caller can choose to send unsigned.

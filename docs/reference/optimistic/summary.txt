@@ -1,0 +1,1 @@
+Optimistic local mutation + reconcile. `apply()` runs immediately so the UI updates instantly; `request()` races the server; on failure, `revert(snapshot)` restores the pre-apply state. Replaces the ~7-line try/catch a chat, form or list would otherwise hand-write.

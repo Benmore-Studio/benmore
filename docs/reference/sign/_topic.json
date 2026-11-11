@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "compute_order",
+    "summary",
+    "why",
+    "built_in_recipes",
+    "inline_form_example",
+    "before_step_example",
+    "available_variables",
+    "adding_a_new_recipe",
+    "hint"
+  ]
+}

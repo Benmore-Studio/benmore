@@ -1,0 +1,1 @@
+One pending approval per (table, row_id, requester, approver_email, title) is a unique index; a concurrent double submit answers the stored request's id (200) and notifies once. Duplicate pending rows stored before the index are removed at startup, the oldest kept.

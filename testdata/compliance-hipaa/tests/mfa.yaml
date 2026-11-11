@@ -1,0 +1,75 @@
+# compliance: hipaa defaults auth.require_mfa_for_roles to "*": every account needs a TOTP factor.
+account_with_totp_works:
+  as_user: "mfa@test.com"
+  steps:
+    - get: "/api/_auth/sessions"
+      expect:
+        status: 200
+
+account_without_totp_is_held_for_enrollment:
+  as_user: "mfa@test.com"
+  steps:
+    - sql: "UPDATE _benmore_users SET totp_secret = NULL WHERE email = 'mfa@test.com'"
+    # The held credential is told why and where to go (api(at:"mfa") existing_credentials):
+    # 403 mfa_enrollment_required from an API, a redirect to the setup page on a page.
+    - api: "GET /api/_auth/sessions"
+      expect:
+        status: 403
+        json:
+          error: "mfa_enrollment_required"
+          redirect: "/mfa-setup"
+    - get: "/"
+      expect:
+        status: 303
+        redirect: "/mfa-setup"
+    # No credential, no hold: the plain 401.
+    - set_auth: "none"
+    - get: "/api/_auth/sessions"
+      expect:
+        status: 401
+
+# Sign-up makes the decision sign-in makes: the new account has no factor, so
+# it gets the enrollment step (the setup cookie and the setup page) and no
+# session. It used to get a session that every route then refused.
+signup_form_starts_enrollment_without_a_session:
+  anon: true
+  steps:
+    - get: "/api/_csrf"
+      save:
+        csrf: "token"
+      expect:
+        status: 200
+    - api: "POST /signup"
+      data:
+        _csrf: "{{csrf}}"
+        email: "signup-form@test.com"
+        password: "Correct-Horse-9-Battery"
+      expect:
+        status: 303
+        redirect: "/mfa-setup"
+    - sql: "SELECT u.id FROM _benmore_users u WHERE u.email = 'signup-form@test.com' AND NOT EXISTS (SELECT 1 FROM _benmore_sessions s WHERE s.user_id = u.id)"
+      expect:
+        rows: 1
+
+signup_json_starts_enrollment_without_a_session:
+  anon: true
+  steps:
+    - get: "/api/_csrf"
+      save:
+        csrf: "token"
+      expect:
+        status: 200
+    - api: "POST /signup"
+      json:
+        _csrf: "{{csrf}}"
+        email: "signup-json@test.com"
+        password: "Correct-Horse-9-Battery"
+      expect:
+        status: 200
+        json:
+          mfa_setup_required: true
+          redirect: "/mfa-setup"
+        not_contains: '"user"'
+    - sql: "SELECT u.id FROM _benmore_users u WHERE u.email = 'signup-json@test.com' AND NOT EXISTS (SELECT 1 FROM _benmore_sessions s WHERE s.user_id = u.id)"
+      expect:
+        rows: 1

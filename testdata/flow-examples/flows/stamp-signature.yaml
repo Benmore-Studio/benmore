@@ -1,0 +1,39 @@
+# flows/stamp-signature.yaml - stamp the caller's signature image onto their PDF
+on:
+  request:
+    method: POST
+    path: /api/documents/:id/sign
+    auth: required
+    mode: async                       # reading and rendering can take minutes
+jobs:
+  sign:
+    steps:
+      - id: doc
+        run: sql
+        expect_rows: "=1"
+        with: { query: "SELECT id, file_url, signature_url FROM documents WHERE id = :id AND user_id = :user_id" }
+      - id: pdf
+        run: inspect_private_upload
+        with: { source_path: "${{ steps.doc.outputs.file_url }}", kind: pdf }
+      - id: sig
+        run: inspect_private_upload
+        with: { source_path: "${{ steps.doc.outputs.signature_url }}", kind: png }
+      - id: place
+        run: sql                      # one placement on the last page, as JSON text
+        with:
+          query: "SELECT json_array(json_object('page', :page, 'rect', json_object('x', 0.6, 'y', 0.85, 'width', 0.3, 'height', 0.08), 'signature_path', :sig_path, 'signature_sha256', :sig_sha)) AS placements"
+          params:
+            page: "${{ steps.pdf.outputs.page_count }}"
+            sig_path: "${{ steps.sig.outputs.source_path }}"
+            sig_sha: "${{ steps.sig.outputs.source_sha256 }}"
+      - id: out
+        run: render_pdf_signatures
+        with:
+          source_path: "${{ steps.pdf.outputs.source_path }}"
+          source_sha256: "${{ steps.pdf.outputs.source_sha256 }}"   # the bytes that were inspected
+          placements_json: "${{ steps.place.outputs.placements }}"
+      - run: sql
+        expect_rows: "=1"
+        with:
+          query: "UPDATE documents SET signed_url = :path, signed_sha256 = :sha WHERE id = :id AND user_id = :user_id"
+          params: { path: "${{ steps.out.outputs.path }}", sha: "${{ steps.out.outputs.sha256 }}" }

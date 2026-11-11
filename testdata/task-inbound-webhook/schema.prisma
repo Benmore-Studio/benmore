@@ -1,0 +1,17 @@
+model Order {
+  id        Int      @id @default(autoincrement())
+  item      String
+  status    String   @default("pending")
+  paidAt    String   @default("") @map("paid_at")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("orders")
+}
+
+model WebhookEvent {
+  id         Int      @id @default(autoincrement())
+  eventId    String   @unique @map("event_id")     // the provider's id: one row per event
+  kind       String
+  receivedAt DateTime @default(now()) @map("received_at")
+  @@map("webhook_events")
+}

@@ -94,6 +94,9 @@ func (app *App) recordingStore() *RecordingStore {
 
 // IsRecordingEnabled checks if recording is enabled for this app.
 func IsRecordingEnabled(app *App, devMode bool) bool {
+	if app.hipaa() {
+		return false // DOM snapshots and input events would capture PHI, in dev and prod alike
+	}
 	if app.Design == nil {
 		return devMode // default: on in dev, off in prod
 	}
@@ -139,6 +142,9 @@ func RecorderScript(app *App, devMode bool) string {
   var events = [];
   var maskInputs = %v;
   var sensitiveFields = ['password','credit','card','cvv','ssn','secret','token'];
+  // Inputs also count by one-time-code names and by the autocomplete hint a
+  // sign-in or MFA form gives its code and password fields.
+  var sensitiveInputNames = sensitiveFields.concat(['otp','totp','mfa','passcode','2fa']);
   var maxEvents = 5000;
   var flushInterval = 5000;
 
@@ -147,10 +153,13 @@ func RecorderScript(app *App, devMode bool) string {
   function isSensitive(el){
     if(!el) return false;
     var name = (el.name||'').toLowerCase();
+    var id = (el.id||'').toLowerCase();
     var type = (el.type||'').toLowerCase();
     if(type === 'password') return true;
-    for(var i=0;i<sensitiveFields.length;i++){
-      if(name.indexOf(sensitiveFields[i])>=0) return true;
+    var ac = String((el.getAttribute && el.getAttribute('autocomplete')) || '').toLowerCase();
+    if(ac.indexOf('one-time-code')>=0 || ac.indexOf('password')>=0 || /(^|\s)cc-/.test(ac)) return true;
+    for(var i=0;i<sensitiveInputNames.length;i++){
+      if(name.indexOf(sensitiveInputNames[i])>=0 || id.indexOf(sensitiveInputNames[i])>=0) return true;
     }
     return false;
   }
@@ -348,6 +357,9 @@ func RegisterRecordingRoutes(mux appRouteRegistrar, app *App) {
 		return
 	}
 	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
+		// Captured sessions are per-admin reads: a shared cache in front of
+		// the app (a CDN rule caching /_internal/*) must never keep one.
+		w.Header().Set("Cache-Control", "private, no-store")
 		s := getSession(app, r)
 		if s == nil || !s.IsAdminConsole() {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})

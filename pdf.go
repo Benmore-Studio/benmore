@@ -46,6 +46,62 @@ func findChrome() string {
 	return ""
 }
 
+// pdfChromeLocator finds the browser /pdf runs. Tests replace it with a
+// stand-in executable so no real Chrome starts.
+var pdfChromeLocator = findChrome
+
+// pdfRendererFailure is why Chrome produced no PDF, as the caller sees it:
+// a stable machine-readable reason (the X-Benmore-PDF-Unavailable header)
+// and a short text for the body.
+type pdfRendererFailure struct{ reason, text string }
+
+var (
+	pdfRendererStartFailed = pdfRendererFailure{"renderer_start_failed", "renderer could not start"}
+	pdfRendererCrashed     = pdfRendererFailure{"renderer_crashed", "renderer crashed"}
+	pdfRendererFailed      = pdfRendererFailure{"renderer_failed", "renderer exited with an error"}
+	pdfRendererNoOutput    = pdfRendererFailure{"renderer_no_output", "renderer wrote no PDF"}
+)
+
+// pdfUnavailableHeader carries the stable reason of a 501 from /pdf.
+const pdfUnavailableHeader = "X-Benmore-PDF-Unavailable"
+
+// pdfRendererLogTail bounds how much of Chrome's own output one failure adds
+// to the log: the end holds the fatal line and the stack.
+const pdfRendererLogTail = 4 << 10
+
+// classifyPDFRendererFailure maps a failed (not timed-out) Chrome run to the
+// caller's reason: killed by a signal (an abort, a crash, the memory or task
+// limit of the service) is a crash, any other exit an error, and a process
+// that never ran (missing, not executable, refused by the host) could not
+// start.
+func classifyPDFRendererFailure(err error) pdfRendererFailure {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return pdfRendererStartFailed
+	}
+	if exitErr.ExitCode() == -1 {
+		return pdfRendererCrashed
+	}
+	return pdfRendererFailed
+}
+
+// pdfRendererUnavailable answers a render the host's Chrome could not
+// complete with the documented 501 "PDF generation unavailable": nothing in
+// the request can fix it. The body carries a fixed reason text and the
+// request id, never Chrome's output, which names temporary paths, flags and
+// the host's binary; that goes to the log and the request error record
+// (benmore errors / logs), whatever the app's dev mode.
+func pdfRendererUnavailable(w http.ResponseWriter, r *http.Request, pagePath string, failure pdfRendererFailure, err error, output []byte) {
+	if len(output) > pdfRendererLogTail {
+		output = output[len(output)-pdfRendererLogTail:]
+	}
+	log.Printf("PDF ERROR [%s]: Chrome %s (%s): %v\n%s", pagePath, failure.text, failure.reason, err, output)
+	id := recordRequestError(r, serverErrorDetail("pdf "+r.URL.Path, fmt.Errorf("Chrome %s: %w", failure.text, err)))
+	w.Header().Set(requestIDHeader, id)
+	w.Header().Set(pdfUnavailableHeader, failure.reason)
+	http.Error(w, publicServerErrorText("PDF generation unavailable - "+failure.text, id), http.StatusNotImplemented)
+}
+
 // RegisterPDFRoutes registers GET /pdf/{page...} for rendering any page to PDF.
 func RegisterPDFRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /pdf/{page...}", func(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +207,7 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	// Find Chrome - check once, fail fast
-	chromePath := findChrome()
+	chromePath := pdfChromeLocator()
 	if chromePath == "" {
 		http.Error(w, "PDF generation unavailable - Chrome not installed", http.StatusNotImplemented)
 		return
@@ -165,7 +221,7 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 		App:     app,
 		Page:    page,
 	}
-	ctx.Data["current_user"] = session
+	ctx.Data["current_user"] = pageCurrentUser(session)
 	if session != nil {
 		ctx.Data["logged_in"] = true
 		userMap := LoadUserFields(app.DB, session.UserID)
@@ -209,7 +265,7 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 
 	title := page.Title
 	if title == "" {
-		title = strings.Title(strings.TrimPrefix(page.Route, "/"))
+		title = pageDefaultTitle(page.Route)
 	}
 
 	fullHTML := WrapLayoutWithPage(content, title, app, session, page)
@@ -253,15 +309,19 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 			pdfServerError(w, r, app, http.StatusGatewayTimeout, fmt.Errorf("Chrome timed out after 30s: %w", err), "PDF generation timed out")
 			return
 		}
-		log.Printf("PDF ERROR [%s]: Chrome failed: %s\n%s", pagePath, err.Error(), string(output))
-		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("Chrome failed: %w: %s", err, output), fmt.Sprintf("PDF generation failed: %s\n%s", err.Error(), string(output)))
+		if r.Context().Err() != nil {
+			// The caller went away and cancelled the render; nobody reads
+			// this answer and Chrome did nothing wrong.
+			log.Printf("PDF [%s]: render cancelled: the client disconnected", pagePath)
+			return
+		}
+		pdfRendererUnavailable(w, r, pagePath, classifyPDFRendererFailure(err), err, output)
 		return
 	}
 
 	// Verify the PDF file was actually created
 	if !pdfOutputComplete(pdfPath) {
-		log.Printf("PDF ERROR [%s]: PDF file not created", pagePath)
-		pdfServerError(w, r, app, http.StatusInternalServerError, errors.New("PDF file not created"), "")
+		pdfRendererUnavailable(w, r, pagePath, pdfRendererNoOutput, errors.New("Chrome exited without writing a complete PDF"), output)
 		return
 	}
 
@@ -298,6 +358,9 @@ func runPDFChrome(ctx context.Context, cmd *exec.Cmd, path string) (result []byt
 		"XDG_CONFIG_HOME": filepath.Join(home, "config"),
 		"XDG_DATA_HOME":   filepath.Join(home, "data"),
 		"XDG_RUNTIME_DIR": filepath.Join(home, "runtime"),
+	}
+	if chromeKeepsHome() {
+		delete(runtimeDirs, "HOME")
 	}
 	for _, dir := range runtimeDirs {
 		if err := os.MkdirAll(dir, 0700); err != nil {

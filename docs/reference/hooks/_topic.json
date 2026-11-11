@@ -1,0 +1,17 @@
+{
+  "keys": [
+    "summary",
+    "triggers",
+    "job_numbers",
+    "sql_refresh",
+    "job_notes",
+    "yaml_example",
+    "hint",
+    "when_conditions",
+    "default_payloads",
+    "json_templates",
+    "html_emails",
+    "durable_effects",
+    "submitted_fields"
+  ]
+}

@@ -1,0 +1,6 @@
+[
+  "Flow step: `run: sms` with `with: { to, body }`. `text:` is accepted as an alias for `body:`. Output: `${{ steps.<id>.outputs.to }}`.",
+  "Hook: `sms:` with nested `to:` and `body:` (NOT a top-level `body:` - that key belongs to `webhook:`). Optional `when:` guard.",
+  "Both interpolate the usual way: `${{ }}` refs in flows, `{{column}}` row values in hooks.",
+  "An empty `to:` or `body:` after interpolation is a hard error, not a skip: nothing is sent and the step fails (a phone column that is NULL or blank, for example). A reference to a value that does not exist, in `to:` or in `body:`, fails the step before anything is sent; give an optional value a fallback (`${{ params.name || 'there' }}`)."
+]

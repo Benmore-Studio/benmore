@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -138,13 +139,213 @@ func authzWarnings(dir string) []CheckFinding {
 	for _, msg := range globalUniqueOnTenantTableWarnings(group, models) {
 		findings = append(findings, CheckFinding{Severity: "warning", Source: "security", File: "schema.prisma", Message: msg})
 	}
-	if msg := rolesWithoutTableScopesWarning(parseRolesConfig(appYAML), models); msg != "" {
+	if msg := membershipUniqueWarning(group, models, migrationUniqueIndexes(dir)); msg != "" {
+		findings = append(findings, CheckFinding{Severity: "warning", Source: "security", File: "schema.prisma", Message: msg})
+	}
+	roles := parseRolesConfig(appYAML)
+	if msg := rolesWithoutTableScopesWarning(roles, models); msg != "" {
+		warn(msg)
+	}
+	for _, msg := range roleModeOwnerRowsWarnings(access, group, roles, models) {
 		warn(msg)
 	}
 	if msg := dynamicWSRoomWarning(dir, parseWSRooms(appYAML)); msg != "" {
 		findings = append(findings, CheckFinding{Severity: "warning", Source: "security", File: "static/", Message: msg})
 	}
+	findings = append(findings, unmaskOwnerAliasWarnings(dir)...)
+	if msg := mfaSetupPageWarning(dir, appYAML); msg != "" {
+		warn(msg)
+	}
 	return findings
+}
+
+// mfaSetupPageWarning flags an app that makes accounts enroll MFA before a
+// session is issued (auth.require_mfa_for_roles, which `compliance: hipaa`
+// defaults to "*") while no page answers its enrollment redirect
+// (auth.mfa_setup_redirect, default /mfa-setup): every listed account,
+// under "*" every account, is sent to a 404 and can never sign in. An
+// absolute URL is not checked.
+func mfaSetupPageWarning(dir string, appYAML []byte) string {
+	var doc map[string]any
+	if err := decodeConfigYAML(appYAML, &doc); err != nil {
+		return ""
+	}
+	auth, _ := doc["auth"].(map[string]any)
+	roles := strings.TrimSpace(anyToString(auth["require_mfa_for_roles"]))
+	if auth["require_mfa_for_roles"] == nil {
+		roles = ""
+	}
+	// The hipaa default ("*", mfaRequiredRoles) applies to an app with sign-in;
+	// an app.yaml with an auth: block is the static sign of one.
+	hipaaDefault := false
+	if roles == "" && doc["compliance"] == complianceHIPAA && doc["auth"] != nil {
+		roles, hipaaDefault = "*", true
+	}
+	if roles == "" {
+		return ""
+	}
+	target := "/mfa-setup"
+	if v := strings.TrimSpace(anyToString(auth["mfa_setup_redirect"])); auth["mfa_setup_redirect"] != nil && v != "" {
+		target = v
+	}
+	if !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+		return ""
+	}
+	page := strings.Trim(strings.SplitN(strings.SplitN(target, "?", 2)[0], "#", 2)[0], "/")
+	if page == "" {
+		return ""
+	}
+	candidates := []string{"static/" + page + ".html", "static/" + page + "/index.html", page + ".html"}
+	if filepath.Ext(page) != "" {
+		candidates = append(candidates, "static/"+page, page)
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(filepath.Join(dir, filepath.FromSlash(c))); err == nil && st.Mode().IsRegular() {
+			return ""
+		}
+	}
+	// Under the hipaa default the builder never wrote the key: name the line
+	// that is in their app.yaml.
+	who, locked := fmt.Sprintf("auth.require_mfa_for_roles (%s) sends each listed account", roles), "Every such account"
+	if hipaaDefault {
+		who, locked = "compliance: hipaa makes every account enroll MFA (under it auth.require_mfa_for_roles defaults to \"*\") and sends each one", "Every account"
+	}
+	return fmt.Sprintf("app.yaml: %s to %s to enroll an authenticator before it gets a session, but no page serves %s (looked for %s). %s is locked out at sign-in. Add the page (the scaffold's static/mfa-setup.html) or point auth.mfa_setup_redirect at the page that enrolls.", who, target, target, strings.Join(candidates, ", "), locked)
+}
+
+// unmaskOwnerAliasWarnings flags `owner` or `self` in an encrypted field's
+// unmask roles while the app also has a role of that name. In unmask roles
+// both words always mean the row's owner (encryptedFieldAccessFor: the row's
+// user_id is the viewer), never a role, so the role's holders - typically a
+// tenant's founding "owner" - read the field masked unless they own the row.
+// The finding is filed under the file that declares the unmask roles.
+func unmaskOwnerAliasWarnings(dir string) []CheckFinding {
+	appYAML, _ := os.ReadFile(filepath.Join(dir, "app.yaml"))
+	if len(appYAML) == 0 {
+		return nil
+	}
+	schema, _ := os.ReadFile(filepath.Join(dir, "schema.prisma"))
+	declared := aliasRoleDeclarations(appYAML, schema)
+	if len(declared) == 0 {
+		return nil
+	}
+	encYAML, _ := os.ReadFile(filepath.Join(dir, "encrypted.yaml"))
+	fromEncFile := parseEncryptedFieldsConfig(encYAML, nil)
+	merged := parseEncryptedFieldsConfig(encYAML, appYAML)
+	if merged == nil {
+		return nil
+	}
+	// file -> alias -> affected declarations
+	hits := map[string]map[string][]string{}
+	tables := make([]string, 0, len(merged.Fields))
+	for table := range merged.Fields {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
+	for _, table := range tables {
+		inEncFile := fromEncFile != nil && fromEncFile.Fields[table] != nil
+		for _, def := range merged.Fields[table] {
+			for _, role := range def.Roles {
+				role = strings.TrimSpace(role)
+				if len(declared[role]) == 0 {
+					continue
+				}
+				file, where := "encrypted.yaml", fmt.Sprintf("tables.%s.unmask_roles", table)
+				if !inEncFile {
+					file, where = "app.yaml", fmt.Sprintf("encrypted.%s.%s roles", table, def.Column)
+				}
+				if hits[file] == nil {
+					hits[file] = map[string][]string{}
+				}
+				if !slices.Contains(hits[file][role], where) {
+					hits[file][role] = append(hits[file][role], where)
+				}
+			}
+		}
+	}
+	var findings []CheckFinding
+	for _, file := range []string{"encrypted.yaml", "app.yaml"} {
+		var parts []string
+		for _, alias := range []string{"owner", "self"} {
+			where := hits[file][alias]
+			if len(where) == 0 {
+				continue
+			}
+			verb := "list"
+			if len(where) == 1 {
+				verb = "lists"
+			}
+			parts = append(parts, fmt.Sprintf("%s %s `%s`, which in unmask roles always means the row's owner (`self` and `owner` are aliases: the account whose user_id is on the row), never a role. This app also has a role named %q (%s), and holders of that role read these fields as \"****\" unless they own the row. To let that role unmask, give it a distinct name (e.g. org_%s) everywhere it is assigned and gated, and list the new name in the unmask roles; keep `self` for the row owner.",
+				strings.Join(where, ", "), verb, alias, alias, strings.Join(declared[alias], ", "), alias))
+		}
+		if len(parts) > 0 {
+			findings = append(findings, CheckFinding{Severity: "warning", Source: "security", File: file, Message: file + ": " + strings.Join(parts, " ")})
+		}
+	}
+	return findings
+}
+
+// aliasRoleDeclarations returns where app.yaml (and the membership table's
+// role default in schema.prisma) declares a role named "owner" or "self":
+// global roles:, groups.bootstrap.founding_role, the default of the
+// groups.role_field column, and role:/owner_or_role: access gates.
+func aliasRoleDeclarations(appYAML, schema []byte) map[string][]string {
+	out := map[string][]string{}
+	add := func(name, where string) {
+		name = strings.TrimSpace(name)
+		if name != "owner" && name != "self" {
+			return
+		}
+		if !slices.Contains(out[name], where) {
+			out[name] = append(out[name], where)
+		}
+	}
+	if roles := parseRolesConfig(appYAML); roles != nil {
+		for name := range roles.Roles {
+			add(name, "app.yaml roles:")
+		}
+	}
+	group := parseGroupConfig(appYAML)
+	if group != nil && group.Bootstrap != nil {
+		add(group.Bootstrap.FoundingRole, "groups.bootstrap.founding_role")
+	}
+	if group != nil && group.Table != "" && group.RoleField != "" && len(schema) > 0 {
+		models, _ := ParsePrismaSchema(string(schema))
+		for _, m := range models {
+			if sqliteIdentifierFold(m.Table) != sqliteIdentifierFold(group.Table) {
+				continue
+			}
+			for _, f := range m.Fields {
+				if sqliteIdentifierFold(f.Column) == sqliteIdentifierFold(group.RoleField) && f.Default != "" {
+					add(strings.Trim(f.Default, `'"`), fmt.Sprintf("the default of %s.%s", m.Table, f.Column))
+				}
+			}
+		}
+	}
+	if access, _ := parseAccessConfig(appYAML); access != nil {
+		var gates []string
+		for table, ops := range access.rules {
+			for op, mode := range ops {
+				gates = append(gates, table+"\x00"+string(op)+"\x00"+mode)
+			}
+		}
+		sort.Strings(gates)
+		for _, gate := range gates {
+			parts := strings.SplitN(gate, "\x00", 3)
+			mode := parts[2]
+			var roles []string
+			switch {
+			case strings.HasPrefix(mode, "role:"):
+				roles = splitCommaList(strings.TrimPrefix(mode, "role:"))
+			case strings.HasPrefix(mode, "owner_or_role:"):
+				roles = splitCommaList(strings.TrimPrefix(mode, "owner_or_role:"))
+			}
+			for _, r := range roles {
+				add(r, fmt.Sprintf("access.%s.%s", parts[0], parts[1]))
+			}
+		}
+	}
+	return out
 }
 
 // tenantAdminRoleWarnings flags a tenant (membership) role named "admin".
@@ -285,6 +486,97 @@ func globalUniqueOnTenantTableWarnings(group *GroupConfig, models []PrismaModel)
 	return out
 }
 
+// membershipUniqueWarning flags a groups membership table (groups.table) on
+// which nothing makes (groups.key, groups.user_field) unique. Without it a
+// repeated invite or create adds a second live row for the same member in the
+// same tenant: the member then counts twice in rosters, and only one row's
+// groups.role_field can apply (the oldest, oldestMembershipRow). A unique or
+// primary key on any subset of the pair is enough, and so is a unique index a
+// migration creates (extra, from migrationUniqueIndexes: the partial index an
+// app that soft-deletes and re-adds members needs). Warning only: whether a
+// member may hold two rows is the author's call.
+func membershipUniqueWarning(group *GroupConfig, models []PrismaModel, extra map[string][][]string) string {
+	if group == nil || group.Table == "" || group.Key == "" || group.UserField == "" {
+		return ""
+	}
+	var model *PrismaModel
+	for i := range models {
+		if sqliteIdentifierFold(models[i].Table) == sqliteIdentifierFold(group.Table) {
+			model = &models[i]
+		}
+	}
+	if model == nil {
+		return ""
+	}
+	// Block attributes list field names snake-cased; a @map renames the
+	// column, so resolve each name to the field it belongs to.
+	fieldOf := func(name string) *PrismaField {
+		for i := range model.Fields {
+			f := &model.Fields[i]
+			for _, alias := range []string{f.Column, f.Name, camelToSnake(f.Name)} {
+				if sqliteIdentifierFold(alias) == sqliteIdentifierFold(name) {
+					return f
+				}
+			}
+		}
+		return nil
+	}
+	keyField, userField := fieldOf(group.Key), fieldOf(group.UserField)
+	if keyField == nil || userField == nil {
+		return ""
+	}
+	pair := func(cols []string) bool {
+		for _, c := range cols {
+			f := fieldOf(c)
+			if f == nil || (f != keyField && f != userField) {
+				return false
+			}
+		}
+		return len(cols) > 0
+	}
+	if keyField.IsUnique || userField.IsUnique || (len(model.CompoundID) == 0 && (keyField.IsID || userField.IsID)) || pair(model.CompoundID) {
+		return ""
+	}
+	for _, u := range model.Uniques {
+		if pair(u.Columns) {
+			return ""
+		}
+	}
+	for _, cols := range extra[sqliteIdentifierFold(model.Table)] {
+		if pair(cols) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("%s is the groups membership table, but nothing makes (%s, %s) unique: a repeated invite or create adds a second live row for the same member in the same tenant, who then counts twice, and only the oldest row's role applies. Add @@unique([%s, %s]) to the model, or, if removed members are soft-deleted and added again, a migration with CREATE UNIQUE INDEX ... ON %s(%s, %s) WHERE deleted_at IS NULL.",
+		model.Table, keyField.Column, userField.Column, keyField.Name, userField.Name, model.Table, keyField.Column, userField.Column)
+}
+
+// migrationUniqueIndexRe matches CREATE UNIQUE INDEX ... ON <table> (<cols>).
+var migrationUniqueIndexRe = regexp.MustCompile(`(?is)\bcreate\s+unique\s+index\s+(?:if\s+not\s+exists\s+)?[^\s(]+\s+on\s+["\x60\[]?(\w+)["\x60\]]?\s*\(([^)]*)\)`)
+
+// migrationUniqueIndexes returns the unique indexes the app's migrations
+// create, by folded table name, each as its column names.
+func migrationUniqueIndexes(dir string) map[string][][]string {
+	files, _ := filepath.Glob(filepath.Join(dir, "migrations", "*.sql"))
+	out := map[string][][]string{}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, m := range migrationUniqueIndexRe.FindAllStringSubmatch(string(data), -1) {
+			var cols []string
+			for _, part := range strings.Split(m[2], ",") {
+				if fields := strings.Fields(part); len(fields) > 0 {
+					cols = append(cols, strings.Trim(fields[0], "\"`[]"))
+				}
+			}
+			out[sqliteIdentifierFold(m[1])] = append(out[sqliteIdentifierFold(m[1])], cols)
+		}
+	}
+	return out
+}
+
 // dynamicRoomRe matches a bm.room(...) call whose name is built at run time
 // (template literal with ${...}, or string concatenation).
 var dynamicRoomRe = regexp.MustCompile("\\broom\\(\\s*(`[^`]*\\$\\{|['\"][^'\"]*['\"]\\s*\\+)")
@@ -331,9 +623,15 @@ func dynamicWSRoomWarning(dir string, rules []WSRoomRule) string {
 		return ""
 	}
 	sort.Strings(hits)
-	return fmt.Sprintf("%s join WebSocket rooms by a computed name, but app.yaml declares no ws_rooms: rules - any signed-in connection can join an undeclared room and read its messages. Bind the pattern to a membership table, e.g. ws_rooms: {\"chat:*\": \"room_members(room_id, user_id)\"}.",
-		strings.Join(hits, ", "))
+	return fmt.Sprintf("%s join WebSocket rooms by a computed name, but app.yaml declares no ws_rooms: rules - any signed-in connection can join an undeclared room and read its messages. Bind the room names to a membership table, e.g. %s for rooms named like chat:42 (the value after `chat:` is checked as room_members.room_id).",
+		strings.Join(hits, ", "), dynamicWSRoomExample)
 }
+
+// dynamicWSRoomExample is the rule dynamicWSRoomWarning tells an author to
+// write. It is advice an author copies, so a test reads it back out of the
+// warning and proves it keeps a non-member out of chat:42
+// (TestDynamicRoomWarningAdvisesAPatternThatGates).
+const dynamicWSRoomExample = `ws_rooms: {"chat::id": "room_members(room_id, user_id)"}`
 
 // modelShape reports whether table (per schema.prisma) has user_id and the
 // tenant key, the inputs ModeFor's implicit default needs.
@@ -364,6 +662,97 @@ func sortedSetKeys(m map[string]bool) []string {
 	return out
 }
 
+// roleModeOwnerRowsWarnings flags a role: or perm: mode governing read,
+// update or delete on a table that has user_id and no groups: key (the tenant
+// root aside). rowScopeClause keeps such a table owner-scoped under those
+// modes: the mode decides who may call, and a holder still reaches only the
+// rows they own, so `update: role:manager` does not let a manager approve
+// another user's request (that row answers 404). owner_or_role: is the mode
+// that gives holders every row. Advisory: owner-only may be what is meant.
+// On the 2026-11-05 fleet snapshot it flagged one app (prod and dev).
+func roleModeOwnerRowsWarnings(access *AccessConfig, group *GroupConfig, roles *RolesConfig, models []PrismaModel) []string {
+	if access == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range models {
+		table := m.Table
+		if table == "" || seen[sqliteIdentifierFold(table)] {
+			continue
+		}
+		seen[sqliteIdentifierFold(table)] = true
+		hasUID, hasGroup := modelShape(models, table, group)
+		if !hasUID || hasGroup || tenantRootName(group, table) {
+			continue
+		}
+		ops := map[string][]string{}
+		var modes []string
+		for _, op := range []AccessOp{OpRead, OpUpdate, OpDelete} {
+			mode, ok := access.DeclaredModeFor(table, op)
+			if !ok || !ownerScopedRoleMode(mode, roles) {
+				continue
+			}
+			if ops[mode] == nil {
+				modes = append(modes, mode)
+			}
+			ops[mode] = append(ops[mode], string(op))
+		}
+		for _, mode := range modes {
+			out = append(out, fmt.Sprintf("access.%s: %s uses `%s` on a table with user_id and no tenant key. %s",
+				table, strings.Join(ops[mode], "/"), mode, roleModeOwnerRowsHint(mode, roles)))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ownerScopedRoleMode reports a role: or perm: mode that an owner-scoped
+// table narrows for some holder. A mode only `admin` passes is not: on a
+// table without the tenant key only a global admin holds it there, and
+// global admins bypass row scope.
+func ownerScopedRoleMode(mode string, roles *RolesConfig) bool {
+	return len(roleModeHolders(mode, roles)) > 0
+}
+
+// roleModeHolders returns the roles other than admin that pass a role: mode
+// (its list) or a perm: mode (the roles granting the permission), and nil for
+// any other mode.
+func roleModeHolders(mode string, roles *RolesConfig) []string {
+	var names []string
+	switch {
+	case strings.HasPrefix(mode, "role:"):
+		names = splitCommaList(strings.TrimPrefix(mode, "role:"))
+	case strings.HasPrefix(mode, "perm:"):
+		names = permGrantingRoles(&App{Roles: roles}, strings.Replace(strings.TrimPrefix(mode, "perm:"), ".", ":", 1))
+	}
+	var out []string
+	for _, name := range names {
+		if name != "admin" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// tenantRootName reports whether table is groups.bootstrap.org_table, where a
+// role: or perm: mode scopes by tenant id rather than user_id.
+func tenantRootName(group *GroupConfig, table string) bool {
+	return group != nil && group.Key != "" && group.Bootstrap != nil && group.Bootstrap.OrgTable != "" &&
+		sqliteIdentifierFold(group.Bootstrap.OrgTable) == sqliteIdentifierFold(table)
+}
+
+// roleModeOwnerRowsHint explains a role: or perm: mode on an owner-scoped
+// table and names the owner_or_role: mode that widens it (benmore check and
+// describe use the same text).
+func roleModeOwnerRowsHint(mode string, roles *RolesConfig) string {
+	widen := "owner_or_role:<roles>"
+	if holders := roleModeHolders(mode, roles); len(holders) > 0 {
+		widen = "owner_or_role:" + strings.Join(holders, ",")
+	}
+	return fmt.Sprintf("The mode only decides who may call: a holder still reaches only rows they own (user_id), and another user's row answers 404 (admins bypass). If holders should reach every row, use `%s` (owners keep their own rows); keep `%s` if owner-only is meant.", widen, mode)
+}
+
 // rolesWithoutTableScopesWarning flags a roles: block that would 403 every
 // auto-CRUD call: with roles declared, a session holds only its roles'
 // scopes, so when no role scope names a schema table (or `*`), or the default
@@ -390,7 +779,7 @@ func rolesWithoutTableScopesWarning(roles *RolesConfig, models []PrismaModel) st
 	_, hasUser := roles.Roles["user"]
 	switch {
 	case !namesTable:
-		return "app.yaml: roles: names no table, so every auto-CRUD call (cookie and bearer) gets 403 `scope denied: token does not have <table>:read permission` for every account. If your roles: are capability scopes (flows, MCP tools) and table access should follow access:, add `table_scopes: access` at the top level of app.yaml."
+		return "app.yaml: roles: names no table, so every auto-CRUD call (cookie and bearer) gets 403 `scope denied: session does not have <table>:read permission` for every account (`token` on an API token). If your roles: are capability scopes (flows, MCP tools) and table access should follow access:, add `table_scopes: access` at the top level of app.yaml."
 	case !hasUser:
 		return "app.yaml: roles: does not declare `user`, the role every new account holds, so those accounts get no scopes and every auto-CRUD call 403s for them. Declare `user` with its table scopes, or add `table_scopes: access` at the top level of app.yaml to let access: alone decide table access."
 	}

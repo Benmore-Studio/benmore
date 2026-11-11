@@ -1,0 +1,18 @@
+# flows/close-stale-tasks.yaml - every night, close tasks nobody touched for 30 days
+on:
+  schedule:
+    cron: "0 3 * * *"       # 03:00 server time; also "every 6h" or "@daily"
+    transaction: true       # both statements commit together, or neither does
+jobs:
+  close:
+    steps:
+      - id: closed
+        run: sql
+        with:
+          query: "UPDATE tasks SET status = 'closed' WHERE status = 'open' AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 days') RETURNING id"
+      - run: sql
+        with:
+          query: "INSERT INTO maintenance_runs (kind, changed, fired_at) VALUES ('close-stale-tasks', :changed, :fired_at)"
+          params:
+            changed: "${{ steps.closed.outputs.rows | length }}"
+            fired_at: "${{ fired_at }}"

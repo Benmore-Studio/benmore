@@ -1,0 +1,4 @@
+site_name: "Compliance hipaa without auth"
+compliance: hipaa
+frontend:
+  stack: html

@@ -1,0 +1,7 @@
+[
+  "benmore domain <app>                     # the app's custom domains: domain, verified, cname_target and, while unverified, the challenge_txt record (name, value)",
+  "benmore domain <app> <domain>            # attach a domain (unverified); answers cname_target, challenge_txt and instructions for the DNS records to create",
+  "benmore domain <app> <domain> --verify   # check that domain's DNS now; answers results: [{domain, verified, reason}]",
+  "benmore domain <app> <domain> --remove   # detach that domain",
+  "Without <domain>, `--verify` checks every attached domain and `--remove` detaches ALL of them. Only the app owner manages custom domains (MCP set_custom_domain); another member gets 404. An attach is refused with 409 while another app holds the domain (see gotchas). An account may attach 5 times and verify 10 times an hour; a further request answers 429."
+]

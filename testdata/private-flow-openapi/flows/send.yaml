@@ -1,0 +1,32 @@
+on:
+  request:
+    method: POST
+    path: /api/contract/:other_ref
+    auth: required
+    contract:
+      headers:
+        type: object
+        properties:
+          Idempotency-Key: {type: string, minLength: 36, maxLength: 36, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+        required: [Idempotency-Key]
+        additionalProperties: false
+      request_body:
+        type: object
+        properties:
+          label: {type: string}
+        required: [label]
+        additionalProperties: false
+      responses:
+        '200':
+          type: object
+          properties:
+            accepted: {type: boolean, enum: [true]}
+          required: [accepted]
+          additionalProperties: false
+jobs:
+  respond:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          json: {accepted: true}

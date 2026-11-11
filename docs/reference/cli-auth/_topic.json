@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "summary",
+    "commands",
+    "password_signin",
+    "environment",
+    "device_login",
+    "token_source",
+    "persistence",
+    "account_deletion",
+    "ci"
+  ]
+}

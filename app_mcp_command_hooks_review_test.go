@@ -295,7 +295,9 @@ func TestAppMCPCommandRowCountErrorClassificationIsNarrow(t *testing.T) {
 }
 
 func TestAppMCPExposureSQLFailureRemainsOperational(t *testing.T) {
-	flow := strings.Replace(commandTaskFlowFixture, "status = 'done'", "status = NULL", 1)
+	// A runtime SQL error that is not a declarative constraint (malformed JSON).
+	// A constraint failure is final instead: TestAppMCPExposureConstraintFailureIsFinal.
+	flow := strings.Replace(commandTaskFlowFixture, "status = 'done'", "status = json('{')", 1)
 	h := newExposureHarnessWithFlow(t, flow, "")
 	id := h.prepare()
 	h.approveOK(id)

@@ -27,8 +27,8 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/crypto/argon2"
-	"gopkg.in/yaml.v3"
 )
 
 // Field encryption prefix - makes encrypted values self-describing.
@@ -143,6 +143,10 @@ type dbCryptoKeys struct {
 	// ephemeral: generated for this process only. Values that must outlive
 	// the process (TOTP secrets) are not sealed under such a key.
 	ephemeral bool
+	// source is the generated ENCRYPTION_KEY text an ephemeral key was
+	// derived from, kept so durableSealKey can save it to env.yaml the first
+	// time a framework secret must outlive the process. Empty otherwise.
+	source string
 }
 
 // dbCryptoRegistry maps canonical data.db paths → *dbCryptoKeys. Populated:
@@ -189,6 +193,12 @@ func RegisterDBEncryptionKey(dbPath string, aesKey []byte) {
 }
 
 func registerDBEncryptionKey(dbPath string, aesKey []byte, ephemeral bool) {
+	registerDBEncryptionKeySource(dbPath, aesKey, ephemeral, "")
+}
+
+// registerDBEncryptionKeySource is registerDBEncryptionKey that also keeps
+// the generated key text of an ephemeral key (dbCryptoKeys.source).
+func registerDBEncryptionKeySource(dbPath string, aesKey []byte, ephemeral bool, source string) {
 	if dbPath == "" || len(aesKey) == 0 {
 		return
 	}
@@ -197,7 +207,10 @@ func registerDBEncryptionKey(dbPath string, aesKey []byte, ephemeral bool) {
 		log.Printf("  encryption: blind-index derivation for %s failed: %s", dbPath, err)
 		blind = nil
 	}
-	dbCryptoRegistry.Store(canonicalDBPath(dbPath), &dbCryptoKeys{aes: aesKey, blind: blind, ephemeral: ephemeral})
+	if !ephemeral {
+		source = ""
+	}
+	dbCryptoRegistry.Store(canonicalDBPath(dbPath), &dbCryptoKeys{aes: aesKey, blind: blind, ephemeral: ephemeral, source: source})
 }
 
 // cryptoKeysForDBPath returns the registered keys for a database file, or
@@ -309,8 +322,10 @@ func initFieldEncryption(dir string, config *EncryptedFieldConfig, keyStr string
 		appEncryptionKey = derived
 		appEncryptionKeyEphemeral = ephemeral
 	}
-	// Shared processes use only the per-database registry.
-	registerDBEncryptionKey(filepath.Join(dir, "data.db"), derived, ephemeral)
+	// Shared processes use only the per-database registry. A generated key
+	// keeps its text so a framework secret that must outlive the process
+	// can make it durable first (durableSealKey).
+	registerDBEncryptionKeySource(filepath.Join(dir, "data.db"), derived, ephemeral, keyStr)
 	// Blind-index key is HKDF-derived from the AES key so it has the
 	// same lifecycle (rotated with the encryption key) but is
 	// cryptographically distinct material. Failure to derive is fatal
@@ -336,6 +351,9 @@ func initFieldEncryption(dir string, config *EncryptedFieldConfig, keyStr string
 // rotation (where we MUST overwrite). Preserves comments + other keys.
 func replaceEnvYamlKey(dir string, key string, value string) error {
 	path := dir + "/env.yaml"
+	if err := refuseEnvYAMLLink(path); err != nil {
+		return err
+	}
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -358,17 +376,51 @@ func replaceEnvYamlKey(dir string, key string, value string) error {
 		// Append at the bottom - matches appendToEnvYaml's shape.
 		lines = append(lines, "", "# Auto-rotated encryption key - do NOT commit this file", key+": "+value)
 	}
-	os.Chmod(path, 0600)
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0600); err != nil {
+	mode := envYAMLMode()
+	// Never through a link (a link to data.db would be truncated and given
+	// env.yaml's mode); the mode is set before the secret is written.
+	f, err := openNoFollow(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_ = f.Chmod(mode) // the hosted unit's UMask narrows the create mode
+	_, err = f.Write([]byte(strings.Join(lines, "\n")))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		return err
 	}
 	chownToDirOwner(path, dir) // ownership seam fix - see fileowner_unix.go
 	return nil
 }
 
+// refuseEnvYAMLLink refuses an env.yaml that exists and is not a regular file
+// (a link, say): the writers never write or chmod through one.
+func refuseEnvYAMLLink(path string) error {
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file; refusing to write the key through it", path)
+	}
+	return nil
+}
+
+// envYAMLMode is the mode for an env.yaml this process writes: owner-only,
+// except in a hosted app, whose router (the directory's benmore group) reads
+// the key from it to pin it in the instance's vault. Owner-only there left
+// the router unable to restart the app or change its environment.
+func envYAMLMode() os.FileMode {
+	if hostedTenantProcess() {
+		return 0640
+	}
+	return 0600
+}
+
 // appendToEnvYaml appends a key-value pair to env.yaml if it doesn't already exist.
 func appendToEnvYaml(dir string, key string, value string) error {
 	path := dir + "/env.yaml"
+	if err := refuseEnvYAMLLink(path); err != nil {
+		return err
+	}
 
 	// Check if key already exists
 	existing, _ := os.ReadFile(path)
@@ -376,13 +428,15 @@ func appendToEnvYaml(dir string, key string, value string) error {
 		return nil
 	}
 
-	// Ensure restricted permissions on env.yaml (contains secrets)
-	os.Chmod(path, 0600)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	// Restricted permissions on env.yaml (contains secrets), set through the
+	// descriptor before the key is written; never through a link.
+	mode := envYAMLMode()
+	f, err := openNoFollow(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, mode)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	_ = f.Chmod(mode) // the hosted unit's UMask narrows the create mode
 
 	if _, err = fmt.Fprintf(f, "\n# Auto-generated encryption key - do NOT commit this file\n%s: %s\n", key, value); err != nil {
 		return err
@@ -395,12 +449,15 @@ func appendToEnvYaml(dir string, key string, value string) error {
 // benmore_encrypt() and benmore_decrypt() SQL functions available in
 // every connection - triggers, queries, generated columns, everything.
 func RegisterEncryptedSQLiteDriver() {
-	sql.Register("sqlite3_benmore", benmoreSQLiteDriver(true))
+	// Each connection is wrapped (db_write_lock.go): read-only transactions
+	// stop taking the write lock, write-lock holders are named in the logs, and
+	// a served write transaction has a time limit.
+	sql.Register("sqlite3_benmore", &benmoreDriver{SQLiteDriver: benmoreSQLiteDriver(true), limited: true})
 	// Framework maintenance on a database that is not being served (a restore
 	// candidate, a file being recovered) needs the same SQL functions, so app
 	// triggers still compile, but not the storage ceiling: it never grows the
 	// served database through SQLite.
-	sql.Register(sqliteMaintenanceDriver, benmoreSQLiteDriver(false))
+	sql.Register(sqliteMaintenanceDriver, &benmoreDriver{SQLiteDriver: benmoreSQLiteDriver(false)})
 }
 
 // sqliteMaintenanceDriver is the framework driver without the storage
@@ -504,6 +561,17 @@ func benmoreSQLiteDriver(enforceStorageLimit bool) *sqlite3.SQLiteDriver {
 				}
 				table, column := stringifyForCrypto(tableValue), stringifyForCrypto(columnValue)
 				return fieldCiphertextMatches(aesKeyForConn(), table, column, stringifyForCrypto(value))
+			}, false); err != nil {
+				return err
+			}
+
+			// A computed field whose column is encrypted is written sealed by
+			// its own trigger, which rewrites it only when the stored
+			// ciphertext does not already hold the computed value
+			// (computed.go computedSeal). Trigger-only for approved commands,
+			// like benmore_ciphertext_matches (commandVerifiedTriggerFunction).
+			if err := conn.RegisterFunc("benmore_ciphertext_holds", func(stored, value, tableValue, columnValue any) bool {
+				return fieldCiphertextHolds(aesKeyForConn(), stringifyForCrypto(tableValue), stringifyForCrypto(columnValue), stored, value)
 			}, false); err != nil {
 				return err
 			}
@@ -655,12 +723,15 @@ func benmoreSQLiteDriver(enforceStorageLimit bool) *sqlite3.SQLiteDriver {
 // InstallEncryptionTriggers atomically replaces the INSERT/UPDATE triggers
 // that encrypt configured columns. A failed replacement leaves the prior set.
 func InstallEncryptionTriggers(db *sql.DB, config *EncryptedFieldConfig) error {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(withLongWriteTx(context.Background(), "encryption triggers"), nil)
 	if err != nil {
 		return fmt.Errorf("begin encrypted-field trigger replacement: %w", err)
 	}
 	defer tx.Rollback()
 	if err := installEncryptionTriggersWith(tx, config); err != nil {
+		return err
+	}
+	if err := reseatAppMCPRevisionTriggers(tx); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -727,10 +798,13 @@ func installEncryptionTriggersMode(tx mutationTx, config *EncryptedFieldConfig, 
 			// connector's trigger check regenerates exactly that text
 			// (verifyAppMCPDeclaredTriggerClosure), so the names must be
 			// plain identifiers. A checked load already refused anything
-			// else; a config read without that check gets no trigger.
+			// else; a config read without that check gets no trigger. A
+			// plain identifier that is an SQL reserved word (`from`, `to`)
+			// is written quoted (ddlIdent), there and here alike.
 			if !membershipIdentRe.MatchString(table) || !membershipIdentRe.MatchString(col) {
 				return fmt.Errorf("encrypted-field trigger %q.%q is not a plain table and column name", table, col)
 			}
+			sqlTable, sqlCol := ddlIdent(table), ddlIdent(col)
 			// Table/column SQL string literals bind ciphertext to its field
 			// through benmore_encrypt_plaintext (M-3).
 			// Single-quotes doubled defensively even though these are
@@ -751,7 +825,7 @@ func installEncryptionTriggersMode(tx mutationTx, config *EncryptedFieldConfig, 
 			triggerName := fmt.Sprintf("_benmore_enc_%s_%s_insert", table, col)
 			triggerSQL := fmt.Sprintf(
 				"CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
-				triggerName, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit,
+				triggerName, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, sqlCol, sqlCol, tableLit, colLit,
 			)
 			if _, err := tx.Exec(triggerSQL); err != nil {
 				return fmt.Errorf("create encrypted-field trigger %q: %w", triggerName, err)
@@ -763,7 +837,7 @@ func installEncryptionTriggersMode(tx mutationTx, config *EncryptedFieldConfig, 
 			triggerName = fmt.Sprintf("_benmore_enc_%s_%s_update", table, col)
 			triggerSQL = fmt.Sprintf(
 				"CREATE TRIGGER IF NOT EXISTS %s AFTER UPDATE OF %s ON %s FOR EACH ROW WHEN NEW.%s IS NOT NULL AND NOT benmore_ciphertext_matches(NEW.%s, %s, %s) BEGIN UPDATE %s SET %s = benmore_encrypt_plaintext(NEW.%s, %s, %s) WHERE rowid = NEW.rowid; END",
-				triggerName, col, table, col, col, tableLit, colLit, table, col, col, tableLit, colLit,
+				triggerName, sqlCol, sqlTable, sqlCol, sqlCol, tableLit, colLit, sqlTable, sqlCol, sqlCol, tableLit, colLit,
 			)
 			if _, err := tx.Exec(triggerSQL); err != nil {
 				return fmt.Errorf("create encrypted-field trigger %q: %w", triggerName, err)
@@ -848,6 +922,11 @@ func LoadEncryptedFieldsConfig(dir string) *EncryptedFieldConfig {
 // parseEncryptedFieldsConfig is LoadEncryptedFieldsConfig over file
 // contents (nil = file absent), so write-time validators can evaluate a
 // not-yet-written encrypted.yaml / app.yaml with the same precedence.
+//
+// Fields are encrypted on the app's own tables only. An entry for a framework
+// table is dropped here, for every consumer: no trigger, masking rule, blind
+// index or key rotation covers it (config_framework_tables.go; the write gate
+// refuses the entry and the load logs it).
 func parseEncryptedFieldsConfig(encData, appData []byte) *EncryptedFieldConfig {
 	config := &EncryptedFieldConfig{Fields: make(map[string][]EncryptedFieldDef)}
 
@@ -866,6 +945,9 @@ func parseEncryptedFieldsConfig(encData, appData []byte) *EncryptedFieldConfig {
 		}
 		if yamlUnmarshal(data, &wrapper) == nil {
 			for table, spec := range wrapper.Tables {
+				if frameworkOwnedTableName(table) {
+					continue
+				}
 				blindSet := map[string]bool{}
 				for _, b := range spec.BlindIndex {
 					blindSet[strings.TrimSpace(b)] = true
@@ -890,7 +972,7 @@ func parseEncryptedFieldsConfig(encData, appData []byte) *EncryptedFieldConfig {
 		var raw EncryptedYAML
 		if yamlUnmarshal(data, &raw) == nil && len(raw.Encrypted) > 0 {
 			for table, defs := range raw.Encrypted {
-				if _, already := config.Fields[table]; already {
+				if _, already := config.Fields[table]; already || frameworkOwnedTableName(table) {
 					continue
 				}
 				for _, d := range defs {
@@ -944,7 +1026,7 @@ func maskEncryptedFieldsWith(app *App, db rowQuerier, table string, rows []map[s
 				continue
 			}
 			if val, ok := row[def.Column]; ok && val != nil {
-				row[def.Column] = maskValue(fmt.Sprintf("%v", val))
+				row[def.Column] = maskValue(val)
 			}
 		}
 	}
@@ -1082,13 +1164,27 @@ func rowOwnedBy(row map[string]any, userID int64) bool {
 	}
 }
 
-// maskValue returns a masked version of a string, showing only the last 4 characters.
-func maskValue(s string) string {
-	if len(s) <= 4 {
-		return "****"
+// encryptedFieldMask is what a viewer outside an encrypted field's unmask
+// roles reads in place of any non-NULL value. It is one constant so the mask
+// carries nothing of the plaintext: no characters, not its length, not
+// whether it was empty, and not the column's type - a masked INTEGER, REAL or
+// BOOLEAN field reads as this string, not as a number or a boolean. A
+// last-four display (card numbers) is not a mask mode: keep the last four in
+// their own unencrypted column.
+const encryptedFieldMask = "****"
+
+// maskValue returns what a viewer who may not unmask a field reads in place
+// of value. NULL stays NULL; every other value becomes encryptedFieldMask.
+// Every masking path (auto-CRUD reads and includes, /api/_query, versions,
+// exports, realtime events, command reads, gotmpl queries: and <query> tags)
+// goes through it. The previous mask kept the last four bytes and the byte
+// length, so a masked 50000 read "*0000" and multibyte text was cut into
+// invalid UTF-8.
+func maskValue(value any) any {
+	if value == nil {
+		return nil
 	}
-	masked := strings.Repeat("*", len(s)-4) + s[len(s)-4:]
-	return masked
+	return encryptedFieldMask
 }
 
 // encryptAuditFieldsCopy returns a shallow copy of `row` with every
@@ -1157,26 +1253,56 @@ func cryptoIsEncrypted(s string) bool {
 }
 
 func fieldCiphertextMatches(key []byte, table, column, value string) bool {
+	_, ok := fieldCiphertextOpen(key, table, column, value)
+	return ok
+}
+
+// fieldCiphertextOpen is the plaintext of value when it is authentic
+// ciphertext of table.column under key (v2 must name that field; v1 carries
+// no field), else ok is false.
+func fieldCiphertextOpen(key []byte, table, column, value string) (plain string, ok bool) {
 	if len(key) == 0 || table == "" || column == "" || !cryptoIsEncrypted(value) {
-		return false
+		return "", false
 	}
 	if strings.HasPrefix(value, encPrefixV2) {
 		body := strings.TrimPrefix(value, encPrefixV2)
 		sep := strings.IndexByte(body, ':')
 		if sep < 0 {
-			return false
+			return "", false
 		}
 		aad, err := hex.DecodeString(body[:sep])
 		if err != nil {
-			return false
+			return "", false
 		}
 		storedTable, storedColumn, ok := cryptoParseAAD(aad)
 		if !ok || storedTable != table || storedColumn != column {
-			return false
+			return "", false
 		}
 	}
-	_, err := fieldDecryptCtx(key, column, value)
-	return err == nil
+	plain, err := fieldDecryptCtx(key, column, value)
+	return plain, err == nil
+}
+
+// fieldCiphertextHolds reports whether stored is authentic ciphertext of
+// table.column holding value, compared in the canonical text the encryption
+// triggers seal (stringifyForCrypto). A NULL value is held only by NULL. It
+// never fails: a value it cannot open is not held, so a computed field's
+// trigger writes a fresh seal (computedSeal).
+func fieldCiphertextHolds(key []byte, table, column string, stored, value any) bool {
+	if versionedValueIsNull(value) {
+		return versionedValueIsNull(stored)
+	}
+	var text string
+	switch s := stored.(type) {
+	case string:
+		text = s
+	case []byte:
+		text = string(s)
+	default:
+		return false
+	}
+	plain, ok := fieldCiphertextOpen(key, table, column, text)
+	return ok && plain == stringifyForCrypto(value)
 }
 
 // decryptFailMask replaces a value that LOOKS encrypted but could not be
@@ -1255,10 +1381,15 @@ func mainDatabasePathForQuerier(db rowQuerier) (string, error) {
 	return path, nil
 }
 
+// fieldEncryptForDB seals a framework secret the app reads back later
+// (webhook subscription signing secrets, OAuth provider tokens) under db's
+// key. The key must be durable: an app without a configured ENCRYPTION_KEY
+// first saves its generated key to env.yaml, and when that is impossible
+// nothing is sealed (durableSealKey).
 func fieldEncryptForDB(db mutationQuerier, value string) (string, error) {
-	key := cryptoKeyForQuerier(db)
-	if len(key) == 0 && isolateAppEnvironment.Load() {
-		return "", fmt.Errorf("database encryption key is not registered")
+	key, err := durableSealKey(db)
+	if err != nil {
+		return "", err
 	}
 	return fieldEncryptWithKey(key, value)
 }
@@ -1605,6 +1736,16 @@ func (e *rotationRefusal) Error() string { return e.msg }
 // A refusal written for the operator is a *rotationRefusal; any other error
 // is a failure the HTTP endpoint reports through serverErrorJSON.
 func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error) {
+	return rotateEncryptionKey(app, newKeySource, dryRun, &encryptionRotationReport{})
+}
+
+// encryptionRotationReport carries what a committed rotation did besides
+// re-sealing: the rows whose blind index it rebuilt under the new key.
+type encryptionRotationReport struct {
+	BlindIndexRows int
+}
+
+func rotateEncryptionKey(app *App, newKeySource string, dryRun bool, report *encryptionRotationReport) (int, error) {
 	if app == nil || app.DB == nil {
 		return 0, &rotationRefusal{"nil app"}
 	}
@@ -1632,6 +1773,12 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	sealedJobs, err := countSealedJobRows(app.DB)
 	if err != nil {
 		return 0, fmt.Errorf("count sealed job rows: %w", err)
+	}
+	// Stored idempotent create responses of tables with encrypted fields are
+	// sealed under this key too (crud_idempotency.go).
+	sealedResponses, err := countSealedIdempotencyResponses(app.DB)
+	if err != nil {
+		return 0, fmt.Errorf("count sealed idempotency responses: %w", err)
 	}
 	if (app.Encrypted == nil || len(app.Encrypted.Fields) == 0) && totpSealed == 0 && !commandPresent && credentialRows == 0 {
 		return 0, &rotationRefusal{"no encrypted fields configured in encrypted.yaml - nothing to rotate"}
@@ -1759,12 +1906,16 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	// secrets and the connector command stores - so either all of it is under
 	// the new key or none is, and a retry still finds the old key everywhere.
 	// app.DB opens with _txlock=immediate, so this takes the write lock at
-	// BEGIN and no writer can break a later upgrade. We bypass the UPDATE
-	// trigger by writing a value that already starts with enc:v: (the trigger's
-	// WHEN clause excludes already-encrypted values).
+	// BEGIN and no writer can break a later upgrade. The encryption triggers
+	// are suspended so the old process key cannot rewrite a re-sealed value.
+	// Rotation is not an edit: history, the @updatedAt stamp and computed
+	// fields are suspended too (suspendRowMaintenanceTriggers), so updated_at,
+	// ?as_of= and _expected_updated_at tokens survive it, and every blind
+	// index is rebuilt under the new key before the same commit.
 	rotated := 0
-	if len(plans) > 0 || totpSealed > 0 || commandPresent || credentialsPresent || sealedJobs > 0 {
-		tx, err := app.DB.Begin()
+	blindRebuilt := 0
+	if len(plans) > 0 || totpSealed > 0 || commandPresent || credentialsPresent || sealedJobs > 0 || sealedResponses > 0 {
+		tx, err := app.DB.BeginTx(withLongWriteTx(context.Background(), "encryption key rotation"), nil)
 		if err != nil {
 			return 0, fmt.Errorf("begin rotation transaction: %w", err)
 		}
@@ -1779,6 +1930,14 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 		encryptionTriggers, err := suspendEncryptionTriggers(tx)
 		if err != nil {
 			return fail(fmt.Errorf("suspend field encryption triggers during rotation: %w", err))
+		}
+		maintenanceTriggers, err := suspendRowMaintenanceTriggers(tx)
+		if err != nil {
+			return fail(fmt.Errorf("suspend updated_at and computed-field triggers during rotation: %w", err))
+		}
+		sealedComputedTriggers, err := suspendSealedComputedTriggers(tx)
+		if err != nil {
+			return fail(fmt.Errorf("suspend encrypted computed-field triggers during rotation: %w", err))
 		}
 
 		for _, p := range plans {
@@ -1832,6 +1991,13 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 			}
 			log.Printf("encryption-rotate: %s.%s staged (%d rows)", p.Table, p.Column, len(ids))
 		}
+		// The blind-index key is derived from the AES key, so every stored
+		// index is stale once the values move. Rebuild them here, from the
+		// re-sealed values, so they commit with them; a row that cannot be
+		// read fails the whole rotation.
+		if blindRebuilt, err = rebuildBlindIndicesTx(tx, app.Encrypted, newKey); err != nil {
+			return fail(fmt.Errorf("rebuild blind indexes under the new key: %w", err))
+		}
 		// Each TOTP swap compares the value read, so a concurrent enrollment
 		// or disable is never overwritten.
 		n, commandMoved := 0, 0
@@ -1857,11 +2023,28 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 		if err != nil {
 			return fail(fmt.Errorf("rotate sealed job rows: %w", err))
 		}
+		// So are stored idempotent responses, so a retry after the swap
+		// still answers the original response.
+		responsesMoved, err := rotateSealedIdempotencyResponsesTx(tx, oldKey, newKey)
+		if err != nil {
+			return fail(fmt.Errorf("rotate sealed idempotency responses: %w", err))
+		}
+		if err := restoreRowMaintenanceTriggers(tx, maintenanceTriggers); err != nil {
+			return fail(fmt.Errorf("restore updated_at and computed-field triggers after rotation: %w", err))
+		}
+		if err := restoreEncryptionTriggers(tx, sealedComputedTriggers); err != nil {
+			return fail(fmt.Errorf("restore encrypted computed-field triggers after rotation: %w", err))
+		}
 		if err := restoreEncryptionTriggers(tx, encryptionTriggers); err != nil {
 			return fail(fmt.Errorf("restore field encryption triggers after rotation: %w", err))
 		}
 		if err := restoreVersioningTriggers(tx, versionTriggers); err != nil {
 			return fail(fmt.Errorf("restore history after rotation: %w", err))
+		}
+		// Recreated triggers are newer than a connector-enrolled table's
+		// revision triggers, which must fire first (app_mcp_revision_order.go).
+		if err := reseatAppMCPRevisionTriggers(tx); err != nil {
+			return fail(fmt.Errorf("revision trigger order after rotation: %w", err))
 		}
 
 		if err := tx.Commit(); err != nil {
@@ -1870,7 +2053,7 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 		}
 		n += credentialsMoved
 		rotated += n + commandMoved
-		log.Printf("encryption-rotate: committed %d row(s) (%d TOTP secret(s), %d command storage row(s)); re-sealed %d queued job(s)", rotated, n, commandMoved, jobsMoved)
+		log.Printf("encryption-rotate: committed %d row(s) (%d TOTP secret(s), %d command storage row(s)); re-sealed %d queued job(s) and %d idempotent response(s)", rotated, n, commandMoved, jobsMoved, responsesMoved)
 	}
 
 	// Swap in-memory key BEFORE writing env.yaml - if env.yaml write
@@ -1892,29 +2075,25 @@ func RotateEncryptionKey(app *App, newKeySource string, dryRun bool) (int, error
 	if err := replaceEnvYamlKey(app.Dir, "ENCRYPTION_KEY", newKeySource); err != nil {
 		return rotated, fmt.Errorf("DB rotation completed (%d rows) but env.yaml write FAILED: %w. CRITICAL: in-memory key now differs from env.yaml - the next process restart will load the stale OLD key and fail to decrypt rotated rows. Manually edit env.yaml to set ENCRYPTION_KEY=<new source> before restart.", rotated, err)
 	}
-	// Blind-index key is HKDF-derived from the AES key. Rotate it
-	// in-step so every blind index recomputed below uses the new HMAC
-	// material. If derivation fails, we abort BEFORE rebuilding (the
-	// blind indices would otherwise be left half-rebuilt under
-	// inconsistent keys). The new key is already persisted, so a later boot can rebuild.
+	// The process blind-index key (lookups that do not resolve a per-DB key)
+	// follows the AES key. The stored indexes were rebuilt under the new key
+	// inside the rotation transaction above.
 	if err := SetBlindIndexKey(newKey); err != nil {
 		return rotated, fmt.Errorf("DB rotation completed (%d rows) but blind-index key derivation FAILED: %w. Equality search on blind-indexed columns is now broken until the next successful boot.", rotated, err)
 	}
-	// Rebuild every blind index under the new HMAC key. Skipping this
-	// would leave the sibling `<col>_blind` values pointing at HMACs
-	// computed under the OLD key - equality search would silently
-	// return zero rows.
-	if rebuilt, err := RebuildAllBlindIndices(app); err != nil {
-		return rotated, fmt.Errorf("DB rotation completed (%d rows) but blind-index rebuild FAILED after %d rows: %w", rotated, rebuilt, err)
-	} else if rebuilt > 0 {
-		log.Printf("encryption-rotate: rebuilt %d blind-index rows under new HMAC key", rebuilt)
+	report.BlindIndexRows = blindRebuilt
+	if hasBlindIndexes(app.Encrypted) {
+		log.Printf("encryption-rotate: rebuilt %d blind-index row(s) under the new key", blindRebuilt)
+		LogAudit(app, "blind_index_rebuilt", "_benmore_blind_index", "",
+			&Session{Email: "system:rotation"}, nil,
+			map[string]any{"rows_rebuilt": blindRebuilt, "reason": "encryption_key_rotated"})
 	}
 
 	// Audit-log the rotation (rotation itself is a significant security
 	// event; record who did it and how many rows changed).
 	LogAudit(app, "encryption_key_rotated", "_benmore_audit_log", "",
 		&Session{Email: "system:rotation"}, nil,
-		map[string]any{"rows_rotated": rotated, "tables": len(plans)})
+		map[string]any{"rows_rotated": rotated, "tables": len(plans), "blind_index_rows_rebuilt": blindRebuilt})
 
 	return rotated, nil
 }
@@ -1951,7 +2130,8 @@ func RegisterEncryptionRotationRoute(mux appRouteRegistrar, app *App) {
 			return
 		}
 
-		rotated, err := RotateEncryptionKey(app, body.NewKey, !body.Confirm)
+		var report encryptionRotationReport
+		rotated, err := rotateEncryptionKey(app, body.NewKey, !body.Confirm, &report)
 		var refusal *rotationRefusal
 		if errors.As(err, &refusal) {
 			httpJSON(w, http.StatusInternalServerError, map[string]any{"error": refusal.Error()})
@@ -1969,8 +2149,9 @@ func RegisterEncryptionRotationRoute(mux appRouteRegistrar, app *App) {
 			return
 		}
 		httpJSON(w, http.StatusOK, map[string]any{
-			"rows_rotated": rotated,
-			"status":       "rotated",
+			"rows_rotated":             rotated,
+			"blind_index_rows_rebuilt": report.BlindIndexRows,
+			"status":                   "rotated",
 		})
 	})
 }

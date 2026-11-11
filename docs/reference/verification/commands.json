@@ -1,0 +1,4 @@
+[
+  "benmore verify [dir] [--app NAME] [--quick|--release] [--json]",
+  "benmore ship [dir] --promote   # interactive terminal required; release verification, then explicit production confirmation"
+]

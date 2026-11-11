@@ -9,8 +9,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 const commandJSONAggregate = `(SELECT json_group_array(json_array(title, NULL, json_array_length(json_array(id, NULL)), json_array('nested', id)) ORDER BY id) FROM tasks WHERE project_id = :project_id AND org_id = :tenant)`
@@ -90,7 +88,7 @@ func TestCommandJSONArrayFunctionsDoNotExpandTableOrFunctionAuthority(t *testing
 	defer conn.Close()
 	guard := &appMCPCommandExecution{phase: "prepare", allowedReads: commandTableSet([]string{"tasks"})}
 	err = conn.Raw(func(raw any) error {
-		sqlite := raw.(*sqlite3.SQLiteConn)
+		sqlite := mustSQLiteConn(raw)
 		// Harmless test functions make SQLite consult the real authorizer even if a host lacks these extensions.
 		for _, name := range []string{"readfile", "load_extension", "unknown_function"} {
 			if err := sqlite.RegisterFunc(name, func(s string) string { return "must never run" }, true); err != nil {

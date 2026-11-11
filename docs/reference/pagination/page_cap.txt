@@ -1,0 +1,1 @@
+One list page holds at most 500 rows. A request whose limit (or per_page) asks for more gets 500 rows and the response header `X-Limit-Capped: 500`. To read a whole table, follow `next_cursor` (cursor pages) or step `offset` until a page comes back short.

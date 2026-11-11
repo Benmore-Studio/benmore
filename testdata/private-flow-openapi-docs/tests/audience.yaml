@@ -1,0 +1,19 @@
+# With docs enabled, ordinary callers get the table docs only; the custom
+# flow contract is in the developer/admin audience alone.
+user_sees_no_flow_contract:
+  as_user: user@contract.test
+  steps:
+    - get: /api/_openapi
+      expect:
+        status: 200
+        contains: ['"openapi":"3.1.0"', '"/api/notes"']
+        not_contains: ['flow_read', '/api/contract']
+admin_sees_flow_contract:
+  as_user: developer@contract.test
+  setup:
+    - sql: "UPDATE _benmore_users SET role='admin' WHERE id={{user_id}}"
+  steps:
+    - get: /api/_openapi
+      expect:
+        status: 200
+        contains: ['flow_read', '"/api/contract/{ref_code}"', '"/api/notes"']

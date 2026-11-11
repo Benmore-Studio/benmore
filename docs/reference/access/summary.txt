@@ -1,0 +1,1 @@
+Declarative per-model, per-operation access control. Default-private floor - tables without user_id / group_key default to admin-only. `which_topic` routes a who-may-see-or-change-this-row question to the key that answers it, across access, scoping, rbac, permissions and act-as.

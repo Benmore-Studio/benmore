@@ -1,0 +1,5 @@
+[
+  "api({at:'sdk'})",
+  "api({at:'frontend'})",
+  "api({at:'sync-status'})"
+]

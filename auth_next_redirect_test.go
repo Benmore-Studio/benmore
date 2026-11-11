@@ -33,7 +33,7 @@ func TestIsSafeNextRejectsControlCharacters(t *testing.T) {
 	EnsureLoginAttemptsTable(app.DB)
 	app.Paths = DiscoverAuthPaths(nil)
 	mustExec(t, app.DB, "INSERT INTO _benmore_users (id, username, email, password_hash) VALUES (7, 'u', 'u@example.com', 'x')")
-	mustExec(t, app.DB, "CREATE TABLE _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
+	mustExec(t, app.DB, "CREATE TABLE IF NOT EXISTS _benmore_otp (email TEXT, code TEXT, attempts INTEGER DEFAULT 0, expires_at DATETIME)")
 	mustExec(t, app.DB, "INSERT INTO _benmore_otp (email, code, expires_at) VALUES ('u@example.com', '123456', datetime('now', '+10 minutes'))")
 	form := url.Values{"code": {"123456"}, "next": {"/\t/evil.example"}}
 	r := httptest.NewRequest(http.MethodPost, app.Paths.VerifyOTP, strings.NewReader(form.Encode()))

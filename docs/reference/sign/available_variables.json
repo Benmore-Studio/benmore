@@ -1,0 +1,42 @@
+[
+  {
+    "name": "method",
+    "from": "request method (GET/POST/...)"
+  },
+  {
+    "name": "host",
+    "from": "request URL host"
+  },
+  {
+    "name": "path",
+    "from": "request URL path (default '/')"
+  },
+  {
+    "name": "query",
+    "from": "request URL raw query string"
+  },
+  {
+    "name": "url.{host,path,query,scheme}",
+    "from": "explicit URL field access"
+  },
+  {
+    "name": "body",
+    "from": "request body bytes as string"
+  },
+  {
+    "name": "now",
+    "from": "current time as unix nanoseconds - pipe through fmt: or unix"
+  },
+  {
+    "name": "env.<KEY>",
+    "from": "the app's own environment (env.yaml, `benmore env`)"
+  },
+  {
+    "name": "params.<key>",
+    "from": "bindings you passed in under sign:"
+  },
+  {
+    "name": "<any compute binding>",
+    "from": "earlier in the compute list (order matters)"
+  }
+]

@@ -1,0 +1,16 @@
+on:
+  request:
+    method: POST
+    path: /api/enqueue-unresolved
+    auth: required
+jobs:
+  go:
+    steps:
+      - id: q
+        run: enqueue
+        with:
+          flow: worker
+          with:
+            note: "${{ params.b }}"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

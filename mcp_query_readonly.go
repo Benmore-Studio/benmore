@@ -87,7 +87,7 @@ func openReadOnlyQueryConn(ctx context.Context, db *sql.DB) (conn *sql.Conn, key
 		return nil, nil, nil, err
 	}
 	if err = conn.Raw(func(raw any) error {
-		sqlite, ok := raw.(*sqlite3.SQLiteConn)
+		sqlite, ok := sqliteConnOf(raw)
 		if !ok {
 			return fmt.Errorf("read-only query requires the SQLite authorizer")
 		}
@@ -115,7 +115,7 @@ func openReadOnlyQueryConn(ctx context.Context, db *sql.DB) (conn *sql.Conn, key
 	closeConn = func() {
 		closeOnce.Do(func() {
 			_ = conn.Raw(func(raw any) error {
-				sqlite, ok := raw.(*sqlite3.SQLiteConn)
+				sqlite, ok := sqliteConnOf(raw)
 				if !ok {
 					return driver.ErrBadConn
 				}
@@ -146,7 +146,7 @@ func openReadOnlyQueryConn(ctx context.Context, db *sql.DB) (conn *sql.Conn, key
 		return nil, nil, nil, err
 	}
 	if err = conn.Raw(func(raw any) error {
-		raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(authorizeReadOnlyQuery)
+		mustSQLiteConn(raw).RegisterAuthorizer(authorizeReadOnlyQuery)
 		return nil
 	}); err != nil {
 		closeConn()
@@ -201,10 +201,11 @@ func readOnlyQueryMaskedColumn(table, column string) bool {
 		return false
 	}
 	c := strings.ToLower(column)
-	if t == "_benmore_sessions" && (c == "id" || c == "" || c == "impersonator_session_id") {
+	if t == "_benmore_sessions" && (c == "id" || c == "" || c == "impersonator_session_id" || c == "started_by_session_id") {
 		// Stored ids are hashes, but a row an older process wrote holds
 		// the raw credential until it is rekeyed (auth_session_keys.go).
-		// An impersonation row names the admin's own session the same way.
+		// An impersonation row names the admin's own session the same way,
+		// as the one to hand back and as the one it was started from.
 		return true
 	}
 	if t == "_benmore_broadcasts" && c == "publisher_session_id" {
@@ -213,9 +214,16 @@ func readOnlyQueryMaskedColumn(table, column string) bool {
 		return true
 	}
 	if t == "_benmore_idempotency" && c == "response" {
-		// A stored create response is the row as its creator was shown it,
-		// encrypted fields decrypted for that caller; a viewer reading the
-		// app table itself sees ciphertext.
+		// A stored create response is the row as its creator was shown it.
+		// It is sealed when the table has encrypted fields, but entries an
+		// older runtime wrote hold those fields decrypted for that caller.
+		return true
+	}
+	if strings.HasSuffix(c, "_ciphertext") {
+		// Sealed framework records (connector operations, approvals,
+		// attempts, connection credentials). DecryptRowFields would open an
+		// enc: value in a read-only result, which put generated tokens,
+		// prepared intents and receipts in front of a viewer.
 		return true
 	}
 	if t == "_benmore_jobs" && c == "payload" {
@@ -267,4 +275,46 @@ func isReadOnlyQuery(sql string) bool {
 		}
 	}
 	return true
+}
+
+// sanitizeConsoleQuery gates the read-only Query console. Returns the cleaned
+// single statement, or a non-empty error message to reject with. The console
+// needs editor access + opens a mode=ro connection, but it executes in the ROUTER
+// process (filesystem access to every tenant), so we defend in depth:
+//   - exactly ONE statement (no ';'-chained trailing writes / ATTACH)
+//   - must be a read query (SELECT / WITH)
+//   - no ATTACH/DETACH (cross-tenant DB), no PRAGMA/VACUUM, no write DDL/DML,
+//     no load_extension( (would be RCE if the driver allowed extensions)
+//
+// mode=ro stops writes to THIS db but does NOT stop ATTACH-ing another tenant's
+// db read-only - which is why ATTACH is rejected at the statement level here.
+func sanitizeConsoleQuery(sqlText string) (string, string) {
+	clean := strings.TrimSpace(sqlText)
+	clean = strings.TrimSuffix(clean, ";")
+	clean = strings.TrimSpace(clean)
+	if clean == "" {
+		return "", "sql required"
+	}
+	if strings.Contains(clean, ";") {
+		return "", "only a single statement is allowed"
+	}
+	up := strings.ToUpper(clean)
+	if !strings.HasPrefix(up, "SELECT") && !strings.HasPrefix(up, "WITH") {
+		return "", "only read-only SELECT / WITH queries are allowed"
+	}
+	// Whitespace-normalized + padded so word-boundary token checks are simple.
+	padded := " " + strings.Join(strings.Fields(up), " ") + " "
+	for _, bad := range []string{
+		" ATTACH ", " DETACH ", " PRAGMA ", " VACUUM ", " INSERT ", " UPDATE ",
+		" DELETE ", " DROP ", " ALTER ", " CREATE ", " REPLACE ", " TRUNCATE ", " REINDEX ",
+	} {
+		if strings.Contains(padded, bad) {
+			return "", "disallowed keyword (" + strings.TrimSpace(bad) + ") - the console is read-only; writes, ATTACH/DETACH, and PRAGMA are blocked"
+		}
+	}
+	// load_extension is a function call (no surrounding spaces) - check raw.
+	if strings.Contains(strings.ToLower(clean), "load_extension") {
+		return "", "load_extension is not permitted"
+	}
+	return clean, ""
 }

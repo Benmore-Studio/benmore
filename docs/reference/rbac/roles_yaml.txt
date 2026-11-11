@@ -1,0 +1,10 @@
+# app.yaml - roles can inherit transitively.
+roles:
+  viewer:
+    scopes: "policies:read"
+  editor:
+    scopes: "policies:write"
+    inherits: viewer              # editor = policies:read + policies:write
+  manager:
+    scopes: "team:manage"
+    inherits: [editor]            # union of editor's chain + team:manage

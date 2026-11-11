@@ -1,0 +1,17 @@
+{
+  "keys": [
+    "summary",
+    "commands",
+    "workspace_sync",
+    "failed_migrations",
+    "instance_migrations",
+    "manifest_errors",
+    "instance_baselines",
+    "pull_default_dir",
+    "exit_codes",
+    "statuses",
+    "safety",
+    "excludes",
+    "see_also"
+  ]
+}

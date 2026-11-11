@@ -4,25 +4,6 @@ package main
 
 // Small utility helpers used across the runtime.
 
-import "strings"
-
-// extractTableFromSQL pulls the first table name after FROM in a SQL
-// statement. Returns "" if no FROM clause is found. Used to attribute
-// queries to a table for caching invalidation and dev-mode warnings.
-func extractTableFromSQL(sql string) string {
-	upper := strings.ToUpper(sql)
-	idx := strings.Index(upper, "FROM ")
-	if idx < 0 {
-		return ""
-	}
-	rest := strings.TrimSpace(sql[idx+5:])
-	parts := strings.Fields(rest)
-	if len(parts) > 0 {
-		return strings.Trim(parts[0], "\"'`")
-	}
-	return ""
-}
-
 // levenshtein computes the edit distance between two strings.
 // Used to suggest "did you mean?" for typos in column names etc.
 func levenshtein(a, b string) int {

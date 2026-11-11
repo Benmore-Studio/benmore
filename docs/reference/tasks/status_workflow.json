@@ -1,0 +1,34 @@
+[
+  "Status workflow with a readable history: a purchase request starts `submitted`; a `manager` approves or rejects it and marks an approved one ordered (a `when:` condition allows it only up to an amount); its requester may withdraw it. Nobody writes the status column directly, and everyone who may read a request may read who changed it and when.",
+  {
+    "file": "app.yaml",
+    "content": "# Status workflow: a purchase request moves submitted -> approved or rejected\n# (a manager decides) or withdrawn (the requester), and everyone who may read\n# a request may read its history.\nsite_name: \"Purchase requests\"\nauth:\n  identifier: email\nversioned: [requests]               # keeps every state a change replaced: the history\naccess:\n  requests:\n    read: owner_or_role:manager     # the requester; every request for a manager\n    write: everyone\n    update: owner_or_role:manager   # a transition is an update of the row\n    delete: admin"
+  },
+  {
+    "file": "schema.prisma",
+    "content": "model Request {\n  id          Int      @id @default(autoincrement())\n  title       String\n  amountCents Int      @map(\"amount_cents\")\n  status      String   @default(\"submitted\")     // moved only by workflows.yaml\n  userId      Int      @map(\"user_id\")\n  createdAt   DateTime @default(now()) @map(\"created_at\")\n  updatedAt   DateTime @default(now()) @updatedAt @map(\"updated_at\")\n  @@map(\"requests\")\n}"
+  },
+  {
+    "file": "workflows.yaml",
+    "content": "# workflows.yaml - the only way a request's status changes\nrequests:\n  table: requests\n  field: status\n  initial: submitted\n  transitions:\n    submitted:\n      approved:  { role: manager }\n      rejected:  { role: manager }\n      withdrawn: {}                 # no role: whoever may update the row, here its requester\n    approved:\n      ordered:   { role: manager, when: \"amount_cents <= 500000\" }"
+  },
+  {
+    "check": "A create starts in `submitted` whatever it sends. GET /api/requests/<id>/transitions answers {current, transitions} with only the moves the caller may make. POST /api/requests/<id>/transition {to} answers 200 {status:'transitioned', from, to}; without the role 403 `role 'manager' required for this transition`; with an unmet `when:` 422 `condition not met`; from a final state 409 {error:'no transitions from current state'}. A PATCH that sends `status` changes the other fields and names it in X-Stripped-Fields. GET /api/requests/<id>/versions lists one entry per change (`_version`, `_changed_by`, `_valid_from`, `_valid_to`), and /versions/<n> shows the row as it was; another member gets 404 on the request, its history and its transitions.",
+    "notes": [
+      "A transition is an update: the caller needs the table's `update` rule and row scope as well as the transition's role, which is why `update` is `owner_or_role:manager` (`workflows.transition_writes`).",
+      "`manager` is the account's own role here; in a multi-tenant app a transition role also matches the member's role in the current tenant (`workflows.transition_roles`).",
+      "`versioned:` gives the history to the people who may read the row. Every transition is also in the admin's audit log (GET /api/_audit, action `transition`).",
+      "Give the state column the same `@default` as `initial:`; a different one is refused when the file is written (`workflows.create_null_state`).",
+      "From page code: `bm.workflow('requests', id).transitionTo('approved')`."
+    ],
+    "read_next": [
+      "workflows.keys",
+      "workflows.transition_roles",
+      "workflows.transition_writes",
+      "hooks.when_conditions",
+      "versioning.summary",
+      "versioning.snapshot_scope",
+      "audit.summary"
+    ]
+  }
+]

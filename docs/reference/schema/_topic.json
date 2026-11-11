@@ -1,0 +1,30 @@
+{
+  "keys": [
+    "unapplied_changes",
+    "config_references",
+    "computed_encrypted",
+    "removed_models",
+    "migration_file_drops",
+    "required_backfill",
+    "time_defaults",
+    "relation_migrations",
+    "scalar_writes",
+    "reserved_table_names",
+    "framework_tables",
+    "derived_config",
+    "summary",
+    "sql_metadata",
+    "custom_fields",
+    "custom_field_values",
+    "reserved_word_names",
+    "schema_drift",
+    "schema_file",
+    "example",
+    "workflow",
+    "field_types",
+    "attributes",
+    "referential_actions",
+    "cross_field_validators",
+    "related_topics"
+  ]
+}

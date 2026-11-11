@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"syscall"
@@ -109,4 +110,34 @@ func (d *treeDir) openRegular(name string) (*os.File, os.FileInfo, error) {
 		}
 	}
 	return nil, nil, fmt.Errorf("%s: %w", name, errTreeChanged)
+}
+
+// errTreeTooLarge: the file is larger than the caller's read limit.
+var errTreeTooLarge = errors.New("file is larger than the read limit")
+
+// readRegularBounded reads the regular file name (openRegular: never a link,
+// FIFO or device) whole, refusing one larger than limit. The size is judged
+// on the opened handle and the read itself is capped, so a file that grows
+// after the check still cannot make the reader allocate past limit.
+func (d *treeDir) readRegularBounded(name string, limit int64) ([]byte, error) {
+	f, _, err := d.openRegular(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > limit {
+		return nil, fmt.Errorf("%s: %w (%d bytes, limit %d)", name, errTreeTooLarge, st.Size(), limit)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s: %w (limit %d)", name, errTreeTooLarge, limit)
+	}
+	return data, nil
 }

@@ -1,0 +1,1 @@
+benmore tool browser_check --args-json '{"app":"<app>","actions":[{"do":"fill","selector":"#name","text":""},{"do":"select","selector":"#status","value":"active"}],"script":"return {name:document.querySelector(\"#name\").value,status:document.querySelector(\"#status\").value}"}'

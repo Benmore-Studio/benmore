@@ -1,0 +1,7 @@
+[
+  "HTML, SVG, XML and JavaScript are refused at upload with 415 (`file type not allowed`): by content for HTML and XML, and by extension for .html, .htm, .xhtml, .svg, .svgz, .xml, .js, .mjs. Executables and scripts (.exe, .sh, binaries) are NOT refused: like every type outside images, audio/video, pdf, txt, csv and json they are served as a download (Content-Disposition: attachment) with nosniff; on the CDN backend a script-killing CSP is layered on too.",
+  "PRIVATE files are never directly fetchable: use `bm.signedUrl(ref, { record })` or a flow ending in `run: serve_file` (api({at:'flows'})). Don't hand the raw URL to the browser.",
+  "Don't assume the returned reference is `/uploads/...` - under the platform CDN backend it's a full https://<cdn>/... URL. Store + render whatever the upload returns.",
+  "Each file is capped at 50 MB and a multipart body at 51 MB unless MAX_UPLOAD_BODY_BYTES raises it (see size_limits); over either answers 413. On the hosted platform the total is capped too, by the owner account's media storage allowance (see storage_allowance: 507 `storage cap reached` with code `media_storage_limit`); a self-hosted app has no total quota.",
+  "delete_upload is intentionally unavailable over HTTP/SDK; invoke it only inside a server flow after an authorization-scoped lookup."
+]

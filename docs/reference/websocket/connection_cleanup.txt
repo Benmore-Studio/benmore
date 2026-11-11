@@ -1,0 +1,1 @@
+A connection the server can no longer write to is closed, which frees its place under the connection limits. Cluster tenant identity follows api(at:'sse') (cluster_tenant_identity).

@@ -1,0 +1,15 @@
+# Queued by enqueue_identity and enqueue_target. It writes as `:user_id`,
+# which a queued flow has only when the runtime set it.
+on:
+  request:
+    method: POST
+    path: /api/job-writes-identity
+    auth: required
+jobs:
+  go:
+    steps:
+      - run: sql
+        with:
+          query: "INSERT INTO notes (title, body, user_id) VALUES (:label, 'job', :user_id)"
+      - run: respond
+        with: { status: 200, json: { ok: true } }

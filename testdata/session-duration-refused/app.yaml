@@ -1,0 +1,10 @@
+# `benmore test` on this app must FAIL its source check for app.yaml: "1w" is
+# not a session lifetime (there is no week unit), and a push refuses it. A
+# deployed copy still loads, with a warning, and its sessions last the 30-day
+# default; tests/session.yaml proves that.
+site_name: "Session duration refused fixture"
+auth:
+  identifier: email
+  session_duration: "1w"
+frontend:
+  stack: html

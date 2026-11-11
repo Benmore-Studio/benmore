@@ -1,0 +1,9 @@
+[
+  "Values are appended, NEVER replace. The framework's defaults stay - you can only widen.",
+  "Each value is one space-separated string of origins, NOT a YAML list. `script_src: \"https://a.com https://b.com\"`, not `[a.com, b.com]`.",
+  "Seven directives are accepted: script_src, style_src, img_src, font_src, connect_src, frame_src, frame_ancestors. Anything else is flagged by the validator (unknown-csp-key). For `frame_ancestors`, the exact value `'none'` is a standalone deny-all override; do not combine it with other sources because browsers ignore `'none'` in a mixed list. The write gate rejects mixed or incorrectly-cased forms.",
+  "The framework's own confirmation pages (email-change and verify-email confirmation, the required password change, OAuth/connector consent) always forbid framing, whatever frame_ancestors says.",
+  "frame_ancestors widens WHO MAY IFRAME the app (default: locked to self + platform + desktop webview). '*' allows any embedder - meant for apps shipping public /embed pages; it applies app-wide, so keep embeddable routes unauthenticated + read-only.",
+  "Legacy apps that stashed these values under `seo.<directive>_src:` still work, but new code should use the top-level `csp:` block - it's the documented surface and validator-checked.",
+  "The framework's defaults already include rsms.me and Google Fonts - don't re-add those. A script CDN (unpkg, jsDelivr, esm.sh, Skypack) is allowed when your source names it (see script_cdns); add it here only when the URL is not in any file. Check the actual response header (Content-Security-Policy) before assuming an origin is blocked."
+]

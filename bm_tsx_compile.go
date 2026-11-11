@@ -75,9 +75,10 @@ type tsxCacheEntry struct {
 	// after the build and recorded only when both agree, and only for a real
 	// bundle (never a compile-error module). A ?v= equal to it names exactly
 	// this body, which is what makes the immutable response safe.
-	treeVersion string
-	compiled    time.Time
-	checked     atomic.Int64 // unix nanos of the last full input check
+	treeVersion    string
+	failureVersion string // input-tree content hash for failed-build reporting
+	compiled       time.Time
+	checked        atomic.Int64 // unix nanos of the last full input check
 }
 
 // tsxServed is a compiled module ready to serve: its strong validator and,
@@ -269,6 +270,20 @@ func compileTSXEntry(ctx context.Context, srcPath, staticRoot string, throttle b
 	}
 }
 
+// tsxCachedBundle is diagnostic-only: a miss never starts a compiler or reads
+// source text. Freshness uses only the cache's existing input stat checks.
+func tsxCachedBundle(entryPath string) (bundle []byte, version string, ok bool) {
+	tsxCacheMu.RLock()
+	entry := tsxCache[entryPath]
+	tsxCacheMu.RUnlock()
+	// The throttled check: callers (error reports, decode_stack) run per
+	// frame and must not stat every bundle input each time.
+	if entry == nil || entry.treeVersion == "" || !entry.expires.IsZero() || !tsxCacheEntryUsable(entry, true) {
+		return nil, "", false
+	}
+	return entry.body, entry.treeVersion, true
+}
+
 // compileTSXFresh builds srcPath and stores the entry. A request-path build
 // (trackTree) also records the tree version it was built from; direct
 // compiles (tests, the captured-compiler child) never serve a ?v= URL.
@@ -289,6 +304,9 @@ func compileTSXFresh(ctx context.Context, srcPath, staticRoot string, trackTree 
 	}
 	entry := &tsxCacheEntry{body: built.body, inputs: built.inputs, expires: built.expires,
 		served: newTSXServed(built.body), compiled: time.Now()}
+	if !built.bundle {
+		entry.failureVersion = treeBefore
+	}
 	entry.when.Store(entry.compiled.UnixNano())
 	entry.checked.Store(entry.compiled.UnixNano())
 	if built.bundle && treeBefore != "" {
@@ -315,60 +333,9 @@ func compileTSXBuild(ctx context.Context, srcPath, staticRoot string) (tsxBuildR
 	}
 	entryMtime := info.ModTime()
 
-	// esbuild reports metafile input paths relative to its working
-	// directory. Pin it to the entry's directory so we can resolve those
-	// paths back to absolute on-disk locations deterministically,
-	// regardless of the host process's cwd.
+	// browserBundleOptions pins the working directory to the entry's.
 	absWorkingDir := filepath.Dir(srcPath)
-
-	// Compile. Format: ESM (so the agent writes modern code), target
-	// ES2020 (every modern browser; preserves async/await + optional
-	// chaining unchanged). 'bm' is external - runtime import-map
-	// resolves it to /_internal/bm.js. Metafile is requested so we can
-	// invalidate the cache against the whole import graph, not just the
-	// entry file.
-	result, buildErr := buildAppSources(ctx, esbuild.BuildOptions{
-		EntryPoints:   []string{srcPath},
-		AbsWorkingDir: absWorkingDir,
-		Metafile:      true,
-		Bundle:        true,
-		Format:        esbuild.FormatESModule,
-		Target:        esbuild.ES2020,
-		// JSXAutomatic uses the modern transform that imports `jsx` from
-		// "react/jsx-runtime" (or whatever the agent's tsconfig sets as
-		// jsxImportSource). For now we treat JSX as a syntax-only
-		// feature - agents pulling in a renderer (Preact/React/HTMX
-		// alternative) will provide the runtime. Most demos won't need
-		// JSX at all; plain TSX without <Tag/> elements just gives them
-		// types + autocomplete.
-		JSX: esbuild.JSXAutomatic,
-		// External 'bm' + 'sdui' - resolved at runtime via the HTML's
-		// import map (both injected/served by the framework). Left as bare
-		// specifiers so esbuild doesn't try to bundle them from disk.
-		External: []string{"bm", "sdui"},
-		Loader: map[string]esbuild.Loader{
-			".tsx": esbuild.LoaderTSX,
-			".ts":  esbuild.LoaderTS,
-			".jsx": esbuild.LoaderJSX,
-			".js":  esbuild.LoaderJS,
-			".css": esbuild.LoaderCSS,
-			// .png / .svg / etc. are intentionally NOT loaders here.
-			// `LoaderFile` would need an Outdir which conflicts with
-			// our in-memory Write:false model. If the agent wants to
-			// embed an image, they reference it as /static/foo.png
-			// directly (same-origin) - esbuild doesn't need to know.
-		},
-		Write:         false,
-		Sourcemap:     esbuild.SourceMapInline,
-		LegalComments: esbuild.LegalCommentsNone,
-		Platform:      esbuild.PlatformBrowser,
-		LogLevel:      esbuild.LogLevelSilent,
-		// Refuse, before esbuild reads it, any file outside static/: the
-		// output is public, a failed build's error text included
-		// (bundle_containment.go).
-		Plugins: []esbuild.Plugin{staticContainmentPlugin(staticRoot)},
-	})
-
+	result, buildErr := buildAppSources(ctx, browserBundleOptions(srcPath, staticRoot))
 	if buildErr != nil {
 		return tsxBuildResult{}, buildErr
 	}
@@ -429,6 +396,63 @@ func compileTSXBuild(ctx context.Context, srcPath, staticRoot string) (tsxBuildR
 		inputs = map[string]time.Time{srcPath: entryMtime}
 	}
 	return tsxBuildResult{body: out, inputs: inputs, bundle: true}, nil
+}
+
+// browserBundleOptions are the esbuild options of a browser bundle of
+// srcPath. The write gate and `benmore check` build with the same options
+// (bundle_check.go), so they refuse exactly what this build would fail on.
+//
+// Format: ESM (so the agent writes modern code), target ES2020 (every modern
+// browser; preserves async/await + optional chaining unchanged). 'bm' is
+// external - runtime import-map resolves it to /_internal/bm.js. Metafile is
+// requested so we can invalidate the cache against the whole import graph,
+// not just the entry file.
+func browserBundleOptions(srcPath, staticRoot string) esbuild.BuildOptions {
+	return esbuild.BuildOptions{
+		EntryPoints: []string{srcPath},
+		// esbuild reports metafile input paths relative to its working
+		// directory. Pin it to the entry's directory so we can resolve those
+		// paths back to absolute on-disk locations deterministically,
+		// regardless of the host process's cwd.
+		AbsWorkingDir: filepath.Dir(srcPath),
+		Metafile:      true,
+		Bundle:        true,
+		Format:        esbuild.FormatESModule,
+		Target:        esbuild.ES2020,
+		// JSXAutomatic uses the modern transform that imports `jsx` from
+		// "react/jsx-runtime" (or whatever the agent's tsconfig sets as
+		// jsxImportSource). For now we treat JSX as a syntax-only
+		// feature - agents pulling in a renderer (Preact/React/HTMX
+		// alternative) will provide the runtime. Most demos won't need
+		// JSX at all; plain TSX without <Tag/> elements just gives them
+		// types + autocomplete.
+		JSX: esbuild.JSXAutomatic,
+		// External 'bm' + 'sdui' - resolved at runtime via the HTML's
+		// import map (both injected/served by the framework). Left as bare
+		// specifiers so esbuild doesn't try to bundle them from disk.
+		External: []string{"bm", "sdui"},
+		Loader: map[string]esbuild.Loader{
+			".tsx": esbuild.LoaderTSX,
+			".ts":  esbuild.LoaderTS,
+			".jsx": esbuild.LoaderJSX,
+			".js":  esbuild.LoaderJS,
+			".css": esbuild.LoaderCSS,
+			// .png / .svg / etc. are intentionally NOT loaders here.
+			// `LoaderFile` would need an Outdir which conflicts with
+			// our in-memory Write:false model. If the agent wants to
+			// embed an image, they reference it as /static/foo.png
+			// directly (same-origin) - esbuild doesn't need to know.
+		},
+		Write:         false,
+		Sourcemap:     esbuild.SourceMapInline,
+		LegalComments: esbuild.LegalCommentsNone,
+		Platform:      esbuild.PlatformBrowser,
+		LogLevel:      esbuild.LogLevelSilent,
+		// Refuse, before esbuild reads it, any file outside static/: the
+		// output is public, a failed build's error text included
+		// (bundle_containment.go).
+		Plugins: []esbuild.Plugin{staticContainmentPlugin(staticRoot)},
+	}
 }
 
 // bundleInputMtimes parses esbuild's metafile JSON and returns the
@@ -607,7 +631,10 @@ func serveTSXIfPresent(w http.ResponseWriter, r *http.Request, app *App, urlRel 
 			serverError(w, r, app, "static "+urlRel, err, "esbuild: build unavailable")
 			return true
 		}
-		writeTSXAsset(w, r, served, false)
+		reportTSXCompileFailure(app, urlRel, served.body)
+		// Immutable only for the ?v= that names this generation, and never for
+		// a build that failed (static_captured.go).
+		writeTSXAsset(w, r, served, capturedBundleImmutable(r, manifest, served.body))
 		return true
 	}
 
@@ -636,6 +663,7 @@ func serveTSXIfPresent(w http.ResponseWriter, r *http.Request, app *App, urlRel 
 	if r.Context().Err() != nil {
 		return true
 	}
+	reportTSXCompileFailure(app, urlRel, entry.body, entry.failureVersion)
 	writeTSXAsset(w, r, entry.served, version != "" && entry.treeVersion == version)
 	return true
 }

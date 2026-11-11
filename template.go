@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,11 +18,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // queryCache provides a simple in-memory cache for <query cache="5m"> tags.
-// Keyed on SHA256(sql + args), entries expire based on the cache duration.
+// Keyed on SHA256 of the app, statement, arguments and the viewer's unmask
+// class (queryCacheKey); entries expire based on the cache duration.
 var queryCache = struct {
 	mu      sync.RWMutex
 	entries map[string]*queryCacheEntry
@@ -29,16 +33,24 @@ var queryCache = struct {
 type queryCacheEntry struct {
 	rows      []map[string]any
 	expiresAt time.Time
-	table     string // which table this query reads from (for per-table invalidation)
+	// tables are the tables the statement read, as SQLite reported them
+	// (joins, subqueries and views included). A change to any of them
+	// invalidates the entry, and every render served from it is read-audited
+	// against them. A mock result reads nothing and has none.
+	tables []string
 }
 
-// queryCacheKey identifies one app's query and arguments. The cache is
-// process-wide, so the key carries the app directory (a `benmore host`
-// process serves many apps, and two apps can run the same SQL text), and
-// the parts are JSON-encoded so ("1","23") and ("12","3") differ. An
-// argument JSON can't encode yields "" and the query is not cached.
-func queryCacheKey(appDir, sql string, args []any) string {
-	enc, err := json.Marshal([]any{appDir, sql, args})
+// queryCacheKey identifies everything a cached <query> result depends on.
+// The cache is process-wide, so the key carries the app directory (a
+// `benmore host` process serves many apps, and two apps can run the same SQL
+// text). The statement and its arguments carry every session value the page
+// bound ({{user_id}}, :current_user, owned=, scope="owner"), and class is the
+// viewer's unmask class (pageQueryPolicy.class), since the same rows are
+// masked differently for different viewers. The parts are JSON-encoded so
+// ("1","23") and ("12","3") differ. An argument JSON can't encode yields ""
+// and the query is not cached.
+func queryCacheKey(appDir, sql string, args []any, class string) string {
+	enc, err := json.Marshal([]any{appDir, sql, args, class})
 	if err != nil {
 		return ""
 	}
@@ -46,14 +58,14 @@ func queryCacheKey(appDir, sql string, args []any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func queryCacheGet(key string) ([]map[string]any, bool) {
+func queryCacheGet(key string) (*queryCacheEntry, bool) {
 	queryCache.mu.RLock()
 	defer queryCache.mu.RUnlock()
 	entry, ok := queryCache.entries[key]
 	if !ok || time.Now().After(entry.expiresAt) {
 		return nil, false
 	}
-	return entry.rows, true
+	return entry, true
 }
 
 // The key carries request-derived arguments, so a visitor can mint entries at
@@ -65,7 +77,7 @@ const (
 	queryCacheMaxRows    = 2000
 )
 
-func queryCacheSet(key string, rows []map[string]any, ttl time.Duration, table string) {
+func queryCacheSet(key string, rows []map[string]any, ttl time.Duration, tables ...string) {
 	if len(rows) > queryCacheMaxRows {
 		return
 	}
@@ -88,17 +100,21 @@ func queryCacheSet(key string, rows []map[string]any, ttl time.Duration, table s
 			delete(queryCache.entries, soonestKey)
 		}
 	}
-	queryCache.entries[key] = &queryCacheEntry{rows: rows, expiresAt: now.Add(ttl), table: table}
+	queryCache.entries[key] = &queryCacheEntry{rows: rows, expiresAt: now.Add(ttl), tables: tables}
 }
 
-// InvalidateQueryCacheForTable clears cached queries that read from the given table.
-// Only the mutated table's caches are cleared - other tables stay warm.
+// InvalidateQueryCacheForTable clears cached queries that read from the given
+// table, through a join, subquery or view as well as FROM. Only the mutated
+// table's caches are cleared - other tables stay warm.
 func InvalidateQueryCacheForTable(table string) {
 	queryCache.mu.Lock()
 	defer queryCache.mu.Unlock()
 	for key, entry := range queryCache.entries {
-		if entry.table == table {
-			delete(queryCache.entries, key)
+		for _, read := range entry.tables {
+			if sqliteIdentifierFold(read) == sqliteIdentifierFold(table) {
+				delete(queryCache.entries, key)
+				break
+			}
 		}
 	}
 }
@@ -308,6 +324,10 @@ func ExtractQueries(content string) []QueryTag {
 func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 	content := page.RawHTML
 
+	// Templates read render data by name, fields and methods included, so
+	// it holds template values only (page_values.go).
+	sealPageData(ctx.Data)
+
 	// 0. Frontmatter dispatch. If the file starts with `---` and declares
 	// `engine: gotmpl`, route through the html/template path. Pages without
 	// frontmatter, or with `engine:` set to anything else (or omitted),
@@ -358,8 +378,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 			//   <!doctype html><html>…my JS bundle…</html>
 			//
 			// Same origin as the backend - cookies, CSRF, /api/* all
-			// just work. Edges live at a different origin; raw pages do
-			// not.
+			// just work.
 			return string(injectI18nBootstrap([]byte(finalizeRender(app, page, ctx, body)), app)), nil
 		}
 	}
@@ -428,8 +447,7 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 		if layoutData, err := app.readSourceFile(layoutPath); err == nil {
 			layoutHTML := string(layoutData)
 			layoutHTML = processIncludesWithReader(layoutHTML, app.Partials, app.Dir, app.readAppInclude)
-			layoutHTML = strings.Replace(layoutHTML, "{{content}}", content, 1)
-			content = RenderMustache(layoutHTML, ctx.Data)
+			content = renderLayout(layoutHTML, content, ctx.Data)
 		}
 	} else if ctx.Page != nil {
 		// layout="none" or "" - no layout wrapping. Auto-inject partials/kit.html
@@ -458,6 +476,41 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 	}
 
 	return content
+}
+
+// layoutContentSlot is where a layout places the rendered page.
+const layoutContentSlot = "{{content}}"
+
+// layoutPageKey names the rendered page in the layout's render data. The NUL
+// bytes keep it apart from every query, row and request key.
+const layoutPageKey = "\x00benmore-layout-page\x00"
+
+// layoutPageHTML is a page that has already been rendered. The mustache
+// renderer writes it verbatim, without scanning it for tags.
+type layoutPageHTML string
+
+// renderLayout renders a layout's own tags and places the rendered page at
+// its first {{content}} slot. The page is a finished render (html/template
+// output, mustache output, or an engine: raw body), so it is written as a
+// value and never scanned again: splicing it into the layout source before
+// the layout's mustache pass let any {{...}} inside a request parameter or a
+// stored row expand against the viewer's render data, and {{{{x}}}} emit raw
+// HTML. Writing it through the renderer, rather than replacing a marker
+// afterwards, keeps the HTML context tracking intact, so layout variables
+// after the slot are escaped for the context the page leaves them in.
+func renderLayout(layoutHTML, page string, data map[string]any) string {
+	start := strings.Index(layoutHTML, layoutContentSlot)
+	if start < 0 {
+		return RenderMustache(layoutHTML, data)
+	}
+	end := start + len(layoutContentSlot)
+	// {{{content}}} and {{{{content}}}} name the same slot; left as is, the
+	// braces around the replacement would turn it into a sanitized or raw tag.
+	for n := 0; n < 2 && start > 0 && end < len(layoutHTML) && layoutHTML[start-1] == '{' && layoutHTML[end] == '}'; n++ {
+		start, end = start-1, end+1
+	}
+	layoutHTML = layoutHTML[:start] + "{{" + layoutPageKey + "}}" + layoutHTML[end:]
+	return RenderMustache(layoutHTML, mergeData(data, map[string]any{layoutPageKey: layoutPageHTML(page)}))
 }
 
 // injectRawPageEssentials was the React-SPA head/body injector for
@@ -515,8 +568,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 				// as numbers by ExpandShorthand.
 				where, whereArgs, bindErr := bindTemplateSQL(q.Attrs["where"], ctx.Data, ctx.User)
 				if bindErr != nil {
-					content = content[:q.Start] + queryErrorHTML(app, q, bindErr) + content[q.End:]
-					continue
+					return "", queryTagError(q, bindErr)
 				}
 				resolvedAttrs := make(map[string]string, len(q.Attrs))
 				for k, v := range q.Attrs {
@@ -530,8 +582,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 				var expandErr error
 				sql, args, expandErr = ExpandShorthand(app, q.From, resolvedAttrs, userID, whereArgs)
 				if expandErr != nil {
-					content = content[:q.Start] + queryErrorHTML(app, q, expandErr) + content[q.End:]
-					continue
+					return "", queryTagError(q, expandErr)
 				}
 			} else if q.SQL != "" {
 				// Raw SQL mode - {{vars}} and :current_user bind as ? args in
@@ -539,8 +590,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 				var bindErr error
 				sql, args, bindErr = bindTemplateSQL(q.SQL, ctx.Data, ctx.User)
 				if bindErr != nil {
-					content = content[:q.Start] + queryErrorHTML(app, q, bindErr) + content[q.End:]
-					continue
+					return "", queryTagError(q, bindErr)
 				}
 			} else {
 				continue
@@ -555,23 +605,43 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 				}
 				scoped, scopeErr := injectOwnerScope(sql, uid, ctx.User != nil)
 				if scopeErr != nil {
-					content = content[:q.Start] + queryErrorHTML(app, q, scopeErr) + content[q.End:]
-					continue
+					return "", queryTagError(q, scopeErr)
 				}
 				sql = scoped
 			}
 
-			// Query cache: <query cache="5m" ...> caches results for the given duration
+			// The viewer's read boundary (page_query_reads.go), as for gotmpl
+			// queries: and /api/_query. It is resolved before the cache so the
+			// cache can key on it. Row identity is proven from the statement
+			// that runs, where a ? bound to the viewer's id is the viewer.
+			mockStr := q.Attrs["mock"]
+			var policy *pageQueryPolicy
+			class := "mock:" + mockStr
+			if mockStr == "" {
+				source := parsePageQuerySource(sql, boundViewerParam(sql, args, ctx.User))
+				policy = newPageQueryPolicy(app, ctx.User, source, ctx.Page != nil && ctx.Page.Scope == "owner")
+				class = policy.class()
+			}
+
+			// Query cache: <query cache="5m" ...> caches results for the given
+			// duration. The key holds the statement, its arguments and the
+			// viewer's unmask class: a result is shared only by viewers who
+			// would get exactly the same rows and masks from the database.
 			var cacheTTL time.Duration
 			if cacheStr := q.Attrs["cache"]; cacheStr != "" {
 				cacheTTL, _ = time.ParseDuration(cacheStr)
 			}
 			var cacheKey string
 			if cacheTTL > 0 {
-				cacheKey = queryCacheKey(app.Dir, sql, args)
+				cacheKey = queryCacheKey(app.Dir, sql, args, class)
 			}
 			if cacheKey != "" {
-				if cachedRows, ok := queryCacheGet(cacheKey); ok {
+				if entry, ok := queryCacheGet(cacheKey); ok {
+					// This viewer reads the tables now, whoever filled the entry.
+					if err := logPageQueryTables(app, ctx.Request, entry.tables, ctx.User); err != nil {
+						return "", queryTagError(q, err)
+					}
+					cachedRows := entry.rows
 					if q.As != "" {
 						ctx.Data[q.As] = cachedRows
 						if len(cachedRows) == 1 {
@@ -612,9 +682,10 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 			// Mock query mode: <query mock="5" ...> generates fake rows without hitting DB.
 			// Used in prototype phase - pages render with realistic dummy data before schema exists.
 			var rows []map[string]any
+			var tables []string
 			var err error
 
-			if mockStr := q.Attrs["mock"]; mockStr != "" {
+			if mockStr != "" {
 				mockCount := 3 // default
 				// Accept 0 explicitly to render the empty-state branch
 				// (inverted mustache section).
@@ -623,7 +694,7 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 				}
 				rows = generateMockRows(app, q, mockCount)
 			} else {
-				rows, err = QueryRows(app.DB, sql, args...)
+				rows, tables, err = runPageQuery(ctx.queryContext(), app, ctx.Request, ctx.User, policy, sql, args...)
 			}
 
 			// N+1 detection: track query count and log SQL
@@ -637,18 +708,16 @@ func executeQueries(content string, app *App, ctx *RenderContext) (string, error
 			}
 
 			if err != nil {
-				content = content[:q.Start] + queryErrorHTML(app, q, err) + content[q.End:]
-				continue
+				// Never render the tag empty, or as a notice beside an empty
+				// state section: the page answers 5xx with the request id and
+				// the SQL error stays in the request log outside dev mode, as
+				// for gotmpl queries:.
+				return "", queryTagError(q, err)
 			}
 
 			// Cache results if cache attribute was set
 			if cacheKey != "" && cacheTTL > 0 {
-				// Determine table name for per-table cache invalidation
-				cacheTable := q.From
-				if cacheTable == "" {
-					cacheTable = extractTableFromSQL(sql)
-				}
-				queryCacheSet(cacheKey, rows, cacheTTL, cacheTable)
+				queryCacheSet(cacheKey, rows, cacheTTL, tables...)
 			}
 
 			// Store results in context
@@ -889,7 +958,7 @@ func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string 
 			if end >= 0 {
 				key := strings.TrimSpace(template[i+4 : i+4+end])
 				val := lookupValue(data, key)
-				write(neutralizeReparse(fmt.Sprintf("%v", val)))
+				write(neutralizeReparse(valueText(val)))
 				i = i + 4 + end + 4
 				continue
 			}
@@ -901,7 +970,7 @@ func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string 
 			if end >= 0 {
 				key := strings.TrimSpace(template[i+3 : i+3+end])
 				val := lookupValue(data, key)
-				s := fmt.Sprintf("%v", val)
+				s := valueText(val)
 				// Sanitized HTML is only meaningful where HTML is being
 				// written; in attributes and scripts escape it like {{ }}.
 				if c.writesHTML() {
@@ -1004,7 +1073,7 @@ func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string 
 						closeIdx := findMatchingClose(template[nextI:], openTag, closeTag)
 						if closeIdx >= 0 {
 							body := template[nextI : nextI+closeIdx]
-							fieldVal := fmt.Sprintf("%v", lookupValue(data, field))
+							fieldVal := valueText(lookupValue(data, field))
 							write(evaluateSwitch(body, fieldVal, data, c))
 							i = nextI + closeIdx + len(closeTag)
 							continue
@@ -1048,7 +1117,14 @@ func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string 
 						pipe = strings.TrimSpace(tag[pipeIdx+3:])
 					}
 					val := lookupValue(data, key)
-					s := fmt.Sprintf("%v", val)
+					if page, ok := val.(layoutPageHTML); ok && pipe == "" {
+						// A layout's rendered page: written as is, and fed to
+						// the context tracker like the layout's own markup.
+						write(string(page))
+						i = nextI
+						continue
+					}
+					s := valueText(val)
 					rawHTML, jsonPipe := false, false
 					if pipe != "" {
 						s = ApplyPipe(val, pipe)
@@ -1308,7 +1384,7 @@ func evaluateIfExpr(expr string, data map[string]any) bool {
 		right = strings.Trim(right, `"'`)
 
 		// Resolve left side from data
-		leftVal := fmt.Sprintf("%v", lookupValue(data, left))
+		leftVal := valueText(lookupValue(data, left))
 
 		switch op {
 		case "=":
@@ -1430,6 +1506,16 @@ func loadPagesFromSources(dir string, captured map[string][]byte) (map[string]*P
 		if err != nil {
 			return nil, nil, err
 		}
+		// Page files are read through an os.Root at the app dir, like the
+		// partials below: a page that is a symlink leading outside the app
+		// is unreadable (the load fails, as it does for a dangling link)
+		// instead of becoming a route that holds the target's bytes. The
+		// router loads every tenant's pages this way (routerSourceView).
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer root.Close()
 		for _, entry := range entries {
 			if entry.IsDir() {
 				if entry.Name() == "partials" {
@@ -1447,7 +1533,22 @@ func loadPagesFromSources(dir string, captured map[string][]byte) (map[string]*P
 			if !strings.HasSuffix(entry.Name(), ".html") || entry.Name() == "head.html" || isMetadataSidecar(entry.Name()) {
 				continue
 			}
-			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			// Non-blocking and regular files only (as openRootRegular): the
+			// router runs this for every tenant, and a FIFO named x.html
+			// would otherwise hang each source read of the app.
+			f, err := root.OpenFile(entry.Name(), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+			}
+			var data []byte
+			if info, statErr := f.Stat(); statErr != nil {
+				err = statErr
+			} else if !info.Mode().IsRegular() {
+				err = errors.New("not a regular file")
+			} else {
+				data, err = io.ReadAll(f)
+			}
+			f.Close()
 			if err != nil {
 				return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
 			}
@@ -1489,12 +1590,9 @@ func loadPagesFromSources(dir string, captured map[string][]byte) (map[string]*P
 		}
 		content := string(data)
 
-		// Determine route from filename
-		pageName := strings.TrimSuffix(name, ".html")
-		route := "/" + pageName
-		if pageName == "index" {
-			route = "/"
-		}
+		// Route from the filename; `-:name` parts are path parameters
+		// (event-:id.html → /event/:id, page_path_params.go).
+		route := pageRouteForFile(name)
 
 		page := &Page{Route: route, File: name}
 		setPageAttrsFromSource(page, content)
@@ -1572,7 +1670,7 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 		// Find the workflow for this table
 		var wf *Workflow
 		for _, w := range app.Workflows.Workflows {
-			if w.Table == table {
+			if identIs(w.Table, table) {
 				wf = w
 				break
 			}
@@ -1614,7 +1712,7 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 		sb.WriteString(`<div class="flex flex-wrap gap-2" data-transitions>`)
 		for to, t := range targets {
 			// Check role
-			if t.Role != "" && (session == nil || !hasWorkflowRole(app, session, t.Role)) {
+			if t.Role != "" && (session == nil || !hasWorkflowRole(app, session, wf.Table, t.Role)) {
 				continue
 			}
 			label := strings.Title(strings.ReplaceAll(to, "_", " "))

@@ -1,0 +1,2 @@
+GET /api/<table>?count=true             → {"count": N}
+GET /api/<table>?count=true&where[status]=open  → {"count": N filtered}

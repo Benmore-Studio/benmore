@@ -43,3 +43,21 @@ func TestRecordingBeaconIsBounded(t *testing.T) {
 		t.Fatalf("oversized batch accepted: %d", code)
 	}
 }
+
+// The admin read endpoints return captured sessions, so no response from them
+// (allowed or refused) may be stored by a shared cache.
+func TestRecordingReadsAreNotCacheable(t *testing.T) {
+	app := &App{DevMode: true}
+	mux := http.NewServeMux()
+	RegisterRecordingRoutes(mux, app)
+	for _, path := range []string{"/_internal/recordings", "/_internal/recording/s1", "/_internal/latest-snapshot"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s without a session: status %d, want 403", path, rec.Code)
+		}
+		if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") || !strings.Contains(cc, "private") {
+			t.Fatalf("%s: Cache-Control %q, want private, no-store", path, cc)
+		}
+	}
+}

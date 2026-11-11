@@ -1,0 +1,1 @@
+QA at scale: derive every page, button, form, access rule, flow and workflow transition from the app (qa_inventory), store browser journeys under tests/journeys/*.yaml, and replay them all in one shared headless browser (browser_batch / benmore verify) with no agent in the loop.

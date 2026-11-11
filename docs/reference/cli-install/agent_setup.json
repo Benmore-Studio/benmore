@@ -1,0 +1,5 @@
+[
+  "benmore bootstrap installs the full shared skill bundle for Codex and Claude Code, sets up Claude hooks, authenticates, and attempts to restore deployed apps. Incomplete headless credentials fail before setup writes; --no-login explicitly supports offline packaging.",
+  "benmore skill install --agent codex installs to ~/.agents/skills/benmore-cli. --agent all installs both harnesses; an omitted --agent retains the Claude default.",
+  "Codex reads an app's AGENTS.md and pushes edits explicitly. Claude imports the same instructions through CLAUDE.md; only installed Edit/Write hooks push automatically."
+]

@@ -1,0 +1,15 @@
+import bm from 'bm';
+
+const p = bm.presence('huddle:42');
+const members = await p.members();     // → [{user_id, joined_at, last_seen_at, ...}]
+const unsub   = p.onChange(refreshBadge);
+
+async function refreshBadge() {
+  const n = await p.count();
+  document.querySelector('#presence-badge').textContent =
+    n + ' watching';
+}
+
+// Explicit leave when the user closes the panel. pagehide auto-fires
+// it too - you don't have to wire window-level handlers.
+closeBtn.addEventListener('click', () => { p.leave(); unsub(); });

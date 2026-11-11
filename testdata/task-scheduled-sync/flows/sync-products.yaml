@@ -1,0 +1,40 @@
+# flows/sync-products.yaml - hourly: read every page, upsert each product, fail when nothing was stored
+on:
+  schedule:
+    cron: "@hourly"
+jobs:
+  sync:
+    steps:
+      - id: list
+        run: api
+        with:
+          url: https://api.example.com/v1/products
+          headers: { Authorization: "Bearer ${{ env.SUPPLIER_TOKEN }}" }
+          query: { limit: "100" }        # sent with every page
+          paginate:
+            strategy: cursor
+            cursor_field: $.next         # where each answer carries the next cursor
+            cursor_param: after          # sent as ?after=<cursor> from the second page on
+            items_field: $.data          # the list inside each answer
+            max_pages: 50
+      - for_each: ${{ steps.list.outputs.items }}
+        as: p
+        steps:
+          - run: sql
+            with:
+              query: "INSERT INTO products (external_id, name, price_cents, synced_at) VALUES (:ext, :name, :price, :at) ON CONFLICT (external_id) DO UPDATE SET name = excluded.name, price_cents = excluded.price_cents, synced_at = excluded.synced_at"
+              params: { ext: "${{ p.id }}", name: "${{ p.name }}", price: "${{ p.price_cents }}", at: "${{ fired_at }}" }
+      - id: stored
+        run: sql
+        expect_rows: ">0"                # zero rows stored is a failed run, not a quiet success
+        with:
+          query: "SELECT id FROM products WHERE synced_at = :at"
+          params: { at: "${{ fired_at }}" }
+      - run: sql
+        with:
+          query: "INSERT INTO sync_runs (fired_at, pages, items, stored) VALUES (:at, :pages, :items, :stored)"
+          params:
+            at: "${{ fired_at }}"
+            pages: "${{ steps.list.outputs.pages_fetched }}"
+            items: "${{ steps.list.outputs.item_count }}"
+            stored: "${{ steps.stored.outputs.rows | length }}"

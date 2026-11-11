@@ -153,7 +153,7 @@ func establishCanonicalAdmissionAttachment(t *testing.T, app *App, attachSQL, ve
 	defer conn.Close()
 	var originalLimit int
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("unexpected SQLite connection type")
 		}
@@ -167,7 +167,7 @@ func establishCanonicalAdmissionAttachment(t *testing.T, app *App, attachSQL, ve
 	}
 	restoreLimit := func() error {
 		err := conn.Raw(func(raw any) error {
-			sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+			sqliteConn, ok := sqliteConnOf(raw)
 			if !ok {
 				return errors.New("unexpected SQLite connection type during ATTACH limit restore")
 			}
@@ -192,7 +192,7 @@ func establishCanonicalAdmissionAttachment(t *testing.T, app *App, attachSQL, ve
 		t.Fatalf("blocked ordinary ATTACH left an attachment behind: count=%d err=%v", absent, err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn := raw.(*sqlite3.SQLiteConn)
+		sqliteConn := mustSQLiteConn(raw)
 		if previous := sqliteConn.SetLimit(sqlite3.SQLITE_LIMIT_ATTACHED, 1); previous != originalLimit {
 			return fmt.Errorf("ATTACH limit changed unexpectedly before setup: %d", previous)
 		}
@@ -212,7 +212,7 @@ func establishCanonicalAdmissionAttachment(t *testing.T, app *App, attachSQL, ve
 		t.Fatalf("same-connection attachment did not persist after restoring limit zero: count=%d err=%v", present, err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		if limit := raw.(*sqlite3.SQLiteConn).SetLimit(sqlite3.SQLITE_LIMIT_ATTACHED, -1); limit != originalLimit {
+		if limit := mustSQLiteConn(raw).SetLimit(sqlite3.SQLITE_LIMIT_ATTACHED, -1); limit != originalLimit {
 			return fmt.Errorf("ATTACH limit after setup=%d, want %d", limit, originalLimit)
 		}
 		return nil
@@ -397,7 +397,7 @@ func registerCanonicalAdmissionObserver(t *testing.T, f appMCPCanonicalUpdateFix
 		t.Fatal(err)
 	}
 	if err := conn.Raw(func(raw any) error {
-		sqliteConn, ok := raw.(*sqlite3.SQLiteConn)
+		sqliteConn, ok := sqliteConnOf(raw)
 		if !ok {
 			return errors.New("unexpected SQLite connection type")
 		}

@@ -1,0 +1,12 @@
+unreadable_duration_keeps_the_thirty_day_default:
+  as_user: "member@fixture.test"
+  steps:
+    - get: "/health"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM _benmore_sessions WHERE email = 'member@fixture.test' LIMIT 1"
+      expect:
+        rows: 1
+    - sql: "SELECT 1 FROM _benmore_sessions WHERE email = 'member@fixture.test' AND round(julianday(expires_at) - julianday(created_at)) != 30"
+      expect:
+        rows: 0

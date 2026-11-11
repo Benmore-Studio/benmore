@@ -1,0 +1,19 @@
+{
+  "keys": [
+    "describe",
+    "route_discovery",
+    "tenant_root_role_scope",
+    "summary",
+    "which_topic",
+    "operations",
+    "modes",
+    "how",
+    "role_mode_rows",
+    "member_of",
+    "defaults",
+    "example_app_yaml",
+    "behavior_notes",
+    "gotchas",
+    "owner_or_elevated_pattern"
+  ]
+}

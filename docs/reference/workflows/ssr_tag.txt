@@ -1,0 +1,1 @@
+SSR pages can render `<transitions table="orders" id="{{id}}">`: buttons for the transitions the signed-in viewer may take from the row's current state. The row is read through the table's read mode and row scope, so a record the viewer can't read (another tenant's or owner's) renders nothing.

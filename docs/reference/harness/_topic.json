@@ -1,0 +1,33 @@
+{
+  "keys": [
+    "summary",
+    "guide",
+    "guide_surfaces",
+    "guide_agent_setup",
+    "guide_identity_environment",
+    "guide_lifecycles",
+    "guide_reading_contracts",
+    "guide_iterating",
+    "guide_proving",
+    "guide_diagnosing",
+    "guide_cli_commands",
+    "guide_usage_accounting",
+    "entrypoints",
+    "probe_redirects",
+    "focus",
+    "edit_hooks"
+  ],
+  "generated": {
+    "guide": "harnessGuideOverview()",
+    "guide_agent_setup": "harnessGuideSection(\"guide_agent_setup\")",
+    "guide_cli_commands": "harnessGuideSection(\"guide_cli_commands\")",
+    "guide_diagnosing": "harnessGuideSection(\"guide_diagnosing\")",
+    "guide_identity_environment": "harnessGuideSection(\"guide_identity_environment\")",
+    "guide_iterating": "harnessGuideSection(\"guide_iterating\")",
+    "guide_lifecycles": "harnessGuideSection(\"guide_lifecycles\")",
+    "guide_proving": "harnessGuideSection(\"guide_proving\")",
+    "guide_reading_contracts": "harnessGuideSection(\"guide_reading_contracts\")",
+    "guide_surfaces": "harnessGuideSection(\"guide_surfaces\")",
+    "guide_usage_accounting": "harnessGuideSection(\"guide_usage_accounting\")"
+  }
+}

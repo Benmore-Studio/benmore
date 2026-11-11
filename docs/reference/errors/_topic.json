@@ -1,0 +1,31 @@
+{
+  "keys": [
+    "cli",
+    "monitor_identity",
+    "surfaces",
+    "health_counts",
+    "cron_monitors",
+    "browser_context",
+    "failed_requests",
+    "server_capture",
+    "grouping",
+    "minimum_level",
+    "error_page",
+    "client_capture",
+    "sentry",
+    "review_fixes",
+    "export_privacy",
+    "audit_delivery",
+    "reporting_environment",
+    "slack",
+    "symbolication",
+    "summary",
+    "update_constraints",
+    "common_envelopes",
+    "server_errors",
+    "text_answers",
+    "journal_tail",
+    "docs_field",
+    "hint"
+  ]
+}

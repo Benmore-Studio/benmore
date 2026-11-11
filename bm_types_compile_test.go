@@ -30,6 +30,7 @@ func TestGeneratedBMTypesCompileFixture(t *testing.T) {
 			{Name: "body", Type: "TEXT", NotNull: true},
 			{Name: "user_id", Type: "INTEGER", NotNull: true},
 			{Name: "created_at", Type: "DATETIME", NotNull: true},
+			{Name: "reply_to", Type: "INTEGER"},
 		},
 	}}}
 
@@ -60,6 +61,12 @@ async function validUses() {
   // ts-expect-error token in this comment - tsc would treat it as a directive.)
   const msg2: Message = await bm.table('messages').create({ body: 'hello' });
   msg2.created_at.toUpperCase();
+  // A nullable column reads back as null, never absent; writes may omit it
+  // or clear it with null.
+  const replyTo: number | null = msg.reply_to;
+  if (msg.reply_to !== null) msg.reply_to.toFixed();
+  await bm.table('messages').update(msg.id, { reply_to: null });
+  void replyTo;
   const grants = await bm.permissions.list('messages', msg.id);
   for (const grant of grants.permissions ?? []) {
     const grantId: number = grant.id;
@@ -84,6 +91,8 @@ async function invalidUses() {
   const msg = await table('messages').get(1);
   // @ts-expect-error row field type must stay string
   const bad: number = msg.body;
+  // @ts-expect-error a nullable column may be null
+  const required: number = msg.reply_to;
 }
 
 void validUses;

@@ -71,9 +71,10 @@ package main
 //     poison a downstream flow step that marshals the output.
 //   - Caller bound: vm.Interrupt only fires between JS statements, NOT
 //     inside a native Go call (built-ins, and regex via dlclark/regexp2,
-//     which has no match timeout). Execution runs in its own goroutine and
-//     the caller waits against the deadline, so a catastrophic-backtracking
-//     regex returns a timeout to the caller instead of hanging the request.
+//     bounded only by computeRegexMatchTimeout). Execution runs in its own
+//     goroutine and the caller waits against the deadline, so a
+//     catastrophic-backtracking regex returns a timeout to the caller
+//     instead of hanging the request.
 //     RESIDUAL: the abandoned goroutine runs until the native call returns.
 
 import (
@@ -94,7 +95,7 @@ import (
 	"time"
 
 	esbuild "github.com/benmore-studio/benmore/third_party/esbuild/pkg/api"
-	"github.com/dlclark/regexp2"
+	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
 )
 
@@ -102,11 +103,24 @@ import (
 // patterns RE2 can't express (lookaround, backreferences) on regexp2, whose
 // default match timeout is unlimited, and vm.Interrupt can't stop a match in
 // progress. With this bound the goroutine a timed-out compute call leaves
-// behind ends shortly after its deadline; goja reports a timed-out match as
-// no match. Only compute runs goja in this process.
+// behind ends shortly after its deadline; goja throws a timed-out match as a
+// catchable RangeError (computeRegexTimeoutMessage keeps the matched input out
+// of the step error). goja uses regexp2/v2, so this must set the v2 package's
+// default; a v1 setting would not reach goja. Only compute runs goja in this
+// process.
 const computeRegexMatchTimeout = 5 * time.Second
 
 func init() { regexp2.DefaultMatchTimeout = computeRegexMatchTimeout }
+
+// computeRegexTimeoutMessage replaces a regexp2 match-timeout error, which
+// quotes the whole input the pattern ran on, with a fixed text, so request or
+// row data a module matched against stays out of the step error and the logs.
+func computeRegexTimeoutMessage(msg string) string {
+	if strings.Contains(msg, "match timeout after ") {
+		return fmt.Sprintf("RangeError: a regular expression match exceeded the %s match limit (input omitted)", computeRegexMatchTimeout)
+	}
+	return msg
+}
 
 // computeCacheEntry is a parsed goja program ready to invoke.
 type computeCacheEntry struct {
@@ -225,6 +239,29 @@ func compileComputeModule(modulePath, allowedRoot string, reviewedHashes map[str
 	return compileComputeModuleContext(context.Background(), modulePath, allowedRoot, reviewedHashes)
 }
 
+// computeBuildOptions is how a compute module is bundled. The compile below
+// and the import list behind a write's next_steps hint
+// (computeModuleImportsSource) read the same graph from it.
+func computeBuildOptions(modulePath string, plugins ...esbuild.Plugin) esbuild.BuildOptions {
+	return esbuild.BuildOptions{
+		EntryPoints:   []string{modulePath},
+		AbsWorkingDir: filepath.Dir(modulePath),
+		Bundle:        true,
+		Format:        esbuild.FormatCommonJS,
+		Target:        esbuild.ES2017, // goja handles ES2017 well; safer than ES2020
+		Metafile:      true,
+		Loader: map[string]esbuild.Loader{
+			".tsx": esbuild.LoaderTSX,
+			".ts":  esbuild.LoaderTS,
+			".jsx": esbuild.LoaderJSX,
+			".js":  esbuild.LoaderJS,
+		},
+		LogLevel: esbuild.LogLevelSilent,
+		Write:    false,
+		Plugins:  plugins,
+	}
+}
+
 func compileComputeModuleContext(ctx context.Context, modulePath, allowedRoot string, reviewedHashes map[string]string) (*goja.Program, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -335,25 +372,9 @@ func compileComputeModuleContext(ctx context.Context, modulePath, allowedRoot st
 	// async/await + optional chaining etc. transpile down. CommonJS
 	// format so the wrapper's `module.exports` pattern works. No
 	// externals (server-side has no 'bm' SDK - compute is pure).
-	result, buildErr := buildAppSources(ctx, esbuild.BuildOptions{
-		EntryPoints:   []string{modulePath},
-		AbsWorkingDir: filepath.Dir(modulePath),
-		Bundle:        true,
-		Format:        esbuild.FormatCommonJS,
-		Target:        esbuild.ES2017, // goja handles ES2017 well; safer than ES2020
-		Metafile:      true,
-		Loader: map[string]esbuild.Loader{
-			".tsx": esbuild.LoaderTSX,
-			".ts":  esbuild.LoaderTS,
-			".jsx": esbuild.LoaderJSX,
-			".js":  esbuild.LoaderJS,
-		},
-		LogLevel: esbuild.LogLevelSilent,
-		Write:    false,
-		// Refuse, before esbuild reads it, any file outside static/
-		// (bundle_containment.go). The input check below stays.
-		Plugins: []esbuild.Plugin{staticContainmentPlugin(allowedRoot), snapshotPlugin},
-	})
+	// Refuse, before esbuild reads it, any file outside static/
+	// (bundle_containment.go). The input check below stays.
+	result, buildErr := buildAppSources(ctx, computeBuildOptions(modulePath, staticContainmentPlugin(allowedRoot), snapshotPlugin))
 	if buildErr != nil {
 		return nil, buildErr
 	}
@@ -621,7 +642,8 @@ func RunComputeContext(parent context.Context, app *App, moduleName, functionNam
 	// Run the whole goja invocation in its own goroutine and wait on it
 	// against the deadline. vm.Interrupt only fires between JS statements -
 	// it does NOT interrupt a native Go call (goja built-ins, and notably
-	// regexp matching, which uses dlclark/regexp2 with no match timeout). So
+	// regexp matching, which dlclark/regexp2 stops only at
+	// computeRegexMatchTimeout). So
 	// a catastrophic-backtracking regex, or any long built-in, would run the
 	// CALLER's goroutine (an HTTP handler) unbounded despite the timeout.
 	// Bounding the wait here guarantees the caller gets a timeout error at
@@ -856,12 +878,15 @@ func runComputeInVM(vm *goja.Runtime, program *goja.Program, functionName, modul
 	// the process, so it fails the step instead.
 	defer func() {
 		if r := recover(); r != nil {
-			out, err = nil, fmt.Errorf("compute: %s.%s failed: %v", moduleName, functionName, r)
+			out, err = nil, fmt.Errorf("compute: %s.%s failed: %s", moduleName, functionName, computeRegexTimeoutMessage(fmt.Sprint(r)))
 		}
 	}()
 	if _, err := vm.RunProgram(program); err != nil {
 		if strings.Contains(err.Error(), "compute_timeout") {
 			return nil, fmt.Errorf("compute: %s timed out", moduleName)
+		}
+		if msg := computeRegexTimeoutMessage(err.Error()); msg != err.Error() {
+			return nil, fmt.Errorf("compute: %s module init failed: %s", moduleName, msg)
 		}
 		return nil, fmt.Errorf("compute: %s module init failed: %w", moduleName, err)
 	}
@@ -898,7 +923,7 @@ func runComputeInVM(vm *goja.Runtime, program *goja.Program, functionName, modul
 			return nil, fmt.Errorf("compute: %s.%s timed out", moduleName, functionName)
 		}
 		// Pull the JS error message out for a clean stack-free signal.
-		return nil, fmt.Errorf("compute: %s.%s threw: %s", moduleName, functionName, err.Error())
+		return nil, fmt.Errorf("compute: %s.%s threw: %s", moduleName, functionName, computeRegexTimeoutMessage(err.Error()))
 	}
 	if result == nil {
 		return nil, nil

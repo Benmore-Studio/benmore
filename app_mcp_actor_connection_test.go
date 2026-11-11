@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github.com/mattn/go-sqlite3"
 	"reflect"
 	"sync"
 	"testing"
@@ -209,7 +208,7 @@ func TestAppMCPGrantActorSnapshotAndStartedCancellationRestorePool(t *testing.T)
 				t.Fatal(err)
 			}
 			err = conn.Raw(func(raw any) error {
-				native := raw.(*sqlite3.SQLiteConn)
+				native := mustSQLiteConn(raw)
 				return native.RegisterFunc("actor_started", func() int64 {
 					if _, err := native.Exec("INSERT INTO actor_effects VALUES(1)", nil); err == nil {
 						writes++
@@ -336,7 +335,7 @@ func TestAppMCPGrantActorReportsKeyScanFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = conn.Raw(func(raw any) error {
-		return raw.(*sqlite3.SQLiteConn).RegisterFunc("actor_key_failure", func() (string, error) { return "", errors.New("key scan failed") }, false)
+		return mustSQLiteConn(raw).RegisterFunc("actor_key_failure", func() (string, error) { return "", errors.New("key scan failed") }, false)
 	})
 	_ = conn.Close()
 	if err != nil {

@@ -1,0 +1,33 @@
+{
+  "keys": [
+    "soft_delete_restore",
+    "singleton_updates",
+    "include_read_policy",
+    "automatic_indexes",
+    "deep_pagination",
+    "boolean_filters",
+    "datetime_filters",
+    "missing_group",
+    "email_keyed_grants",
+    "membership_identity",
+    "live_membership",
+    "summary",
+    "how",
+    "example_app_yaml",
+    "field_projection",
+    "includes",
+    "list_sorting",
+    "list_filters",
+    "foreign_keys",
+    "command_owned_fields",
+    "hidden_columns",
+    "tenant_bootstrap",
+    "tenant_unique_constraints",
+    "soft_delete_cascade",
+    "membership_management",
+    "tenant_roles",
+    "tenant_root_self_scope",
+    "primary_keys",
+    "see_also"
+  ]
+}

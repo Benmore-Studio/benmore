@@ -1,0 +1,27 @@
+on:
+  request:
+    method: GET
+    path: /api/plain-contract
+    auth: none
+    contract:
+      responses:
+        '200':
+          content:
+            text/plain: {type: string}
+        '500':
+          content:
+            application/json:
+              type: object
+              properties:
+                error: {type: string}
+              required: [error]
+              additionalProperties: false
+            text/plain: {type: string}
+jobs:
+  respond:
+    steps:
+      - run: respond
+        with:
+          status: 200
+          content_type: text/plain
+          body: Ready

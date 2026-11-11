@@ -1,0 +1,30 @@
+model Document {
+  id              Int      @id @default(autoincrement())
+  fileUrl         String   @map("file_url")
+  extractedText   String   @default("") @map("extracted_text")
+  extractComplete String   @default("") @map("extract_complete")
+  extractError    String   @default("") @map("extract_error")
+  userId          Int      @map("user_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+}
+
+model Contract {
+  id           Int      @id @default(autoincrement())
+  fileUrl      String   @map("file_url")
+  extractError String   @default("") @map("extract_error")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("contracts")
+}
+
+model Brief {
+  id           Int      @id @default(autoincrement())
+  fileUrl      String   @map("file_url")
+  extractError String   @default("") @map("extract_error")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("briefs")
+}

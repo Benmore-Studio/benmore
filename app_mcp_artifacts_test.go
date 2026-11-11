@@ -498,6 +498,11 @@ func TestAppMCPArtifactExportsCommittedReviewedCommand(t *testing.T) {
 	if artifactID == "" || exported["kind"] != "html" {
 		t.Fatalf("artifact result = %#v", exported)
 	}
+	// Like artifact.create, the result says where the person downloads it
+	// (r1104 finding 10): the same retrieval route, same session rules.
+	if exported["download_url"] != h.server.URL+"/api/_mcp/artifacts/"+artifactID {
+		t.Fatalf("artifact.export download_url = %#v, want %s/api/_mcp/artifacts/%s", exported["download_url"], h.server.URL, artifactID)
+	}
 	var recordedOperation, digest, ownerCreatedAt, requiredScopes string
 	if err := h.app.DB.QueryRow(`SELECT operation_id,content_sha256,owner_created_at,required_scopes FROM _benmore_mcp_artifacts WHERE id=?`, artifactID).Scan(&recordedOperation, &digest, &ownerCreatedAt, &requiredScopes); err != nil {
 		t.Fatal(err)
@@ -549,9 +554,12 @@ func TestAppMCPArtifactHTMLTextIsEscaped(t *testing.T) {
 }
 
 func TestAppMCPArtifactPDFUsesSandbox(t *testing.T) {
-	if findChrome() == "" {
+	chrome := findChrome()
+	if chrome == "" {
 		t.Skip("Chrome is required for PDF artifact rendering")
 	}
+	// The render's 30 s budget is for printing, not for a cold disk.
+	warmTestChrome(t, chrome)
 	pdf, err := renderAppMCPArtifactPDF(context.Background(), nil, []byte("<!doctype html><title>report</title><p>frozen</p>"))
 	if err != nil {
 		t.Fatal(err)
@@ -615,5 +623,35 @@ func TestAppMCPArtifactTenantlessOnlyWithoutGroups(t *testing.T) {
 	}
 	if status, _ := mcpArtifactGet(t, app, a.ID, sessionID); status != http.StatusNotFound {
 		t.Fatalf("a group app served a tenantless artifact: %d", status)
+	}
+}
+
+// A committed receipt is immutable: exporting it again in the same format
+// returns the artifact already made instead of storing another copy (export
+// has no read-artifact budget and command artifacts are never evicted).
+func TestAppMCPArtifactExportReusesTheSameFormat(t *testing.T) {
+	h := newExposureHarness(t)
+	operationID := h.prepare()
+	h.approveOK(operationID)
+	if result, code := h.call(h.client, appMCPCommitTool, map[string]any{"operation_id": operationID}); code != "" || result["outcome"] != "applied" {
+		t.Fatalf("command commit: code=%q result=%#v", code, result)
+	}
+	first, code := h.call(h.client, mcpArtifactExportTool, map[string]any{"operation_id": operationID, "format": "html"})
+	if code != "" {
+		t.Fatalf("first export: %s", code)
+	}
+	for i := 0; i < 3; i++ {
+		again, code := h.call(h.client, mcpArtifactExportTool, map[string]any{"operation_id": operationID, "format": "html"})
+		if code != "" || again["artifact_id"] != first["artifact_id"] || again["sha256"] != first["sha256"] || again["download_url"] != first["download_url"] {
+			t.Fatalf("repeat export %d: code=%q result=%#v first=%#v", i, code, again, first)
+		}
+	}
+	sheet, code := h.call(h.client, mcpArtifactExportTool, map[string]any{"operation_id": operationID, "format": "xlsx"})
+	if code != "" || sheet["artifact_id"] == first["artifact_id"] || sheet["kind"] != "xlsx" {
+		t.Fatalf("xlsx export: code=%q result=%#v", code, sheet)
+	}
+	var stored int
+	if err := h.app.DB.QueryRow(`SELECT count(*) FROM _benmore_mcp_artifacts WHERE operation_id=?`, operationID).Scan(&stored); err != nil || stored != 2 {
+		t.Fatalf("stored artifacts = %d (err %v), want one per format", stored, err)
 	}
 }

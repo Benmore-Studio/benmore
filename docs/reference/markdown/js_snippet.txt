@@ -1,0 +1,17 @@
+import bm from 'bm';
+
+// Async. bm.markdown POSTs /_internal/markdown and caches per text.
+const html = await bm.markdown('# Title\n\nSome **markdown** and a table.');
+postBodyEl.innerHTML = html;   // sanitized - safe for innerHTML
+
+// One-line "chat" subset (no wrapping <p>):
+const line = await bm.markdown(msg, { inline: true });
+
+// Render a whole message list in ONE request:
+const htmls = await bm.markdownBatch(messages.map(m => m.body));
+
+// STYLE + DIAGRAMS: add the theme + hydrate mermaid.
+//   <link rel="stylesheet" href="/_internal/markdown.css">   (wrap output in class="benmark")
+//   load /_internal/mermaid.js, then:
+//   import { hydrate } from '/_internal/markdown-hydrate.js'; hydrate(el);
+// The Markdown and KnowledgeBase components from 'sdui' do all of this for you.

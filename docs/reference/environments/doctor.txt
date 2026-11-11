@@ -1,0 +1,1 @@
+`benmore doctor`'s drift check warns `no prod instance yet` for an app that was never promoted. The item is informational for `benmore verify --release`, like ordinary code drift.

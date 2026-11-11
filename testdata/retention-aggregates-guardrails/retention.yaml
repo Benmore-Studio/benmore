@@ -1,0 +1,24 @@
+policies:
+  # The app's own table: runs.
+  - table: events
+    ttl: "30d"
+
+  # Framework tables: never swept by a policy.
+  - table: _benmore_users
+    ttl: "1d"
+  - table: _benmore_audit_log
+    ttl: "1d"
+  - table: _benmore_sessions
+    ttl: "1d"
+
+  # `col` is not a key (the key is `column`): the policy does not run. It
+  # must not fall back to created_at.
+  - table: drafts
+    ttl: "1d"
+    col: updated_at
+
+  # notes has no expires_at: the policy does not run, and its soft-deleted
+  # rows are not purged either.
+  - table: notes
+    ttl: "1d"
+    column: expires_at

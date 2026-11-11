@@ -1,0 +1,1 @@
+expires_at is RFC3339 UTC ("2026-11-05T04:04:21Z") on acquire and renew, on the 409 and on the status endpoint (whose locked_at is RFC3339 too). _benmore_locks stores SQLite UTC text.

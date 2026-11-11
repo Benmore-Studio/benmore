@@ -1,0 +1,5 @@
+[
+  "Vite: set base: '/' in vite.config, run the normal external build, then copy the contents of dist/ into static/.",
+  "Next.js: set output: 'export'; use images: {unoptimized: true} when next/image requires it; build externally, then copy the contents of out/ into static/.",
+  "Create React App: run its external production build, then copy the contents of build/ into static/."
+]

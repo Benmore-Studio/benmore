@@ -1,0 +1,1 @@
+Tasks + approvals are user-scoped. For recurring schedules use cron.yaml (global); this is one-shot per-record.

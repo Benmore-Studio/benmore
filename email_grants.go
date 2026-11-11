@@ -16,6 +16,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -80,15 +81,37 @@ func sessionGrantEmail(s *Session) string {
 	return s.Email
 }
 
+// errEmailNotMarkedVerified is markEmailVerified's answer when its UPDATE
+// changed no row: no such account, or its address is no longer the proven
+// one (a stale proof for an old address changes nothing).
+var errEmailNotMarkedVerified = errors.New("no account holds that email address, so none was marked verified")
+
 // markEmailVerified records that userID has just proven control of email
 // and attaches the invites that were waiting on it. The email must be the
-// account's current one; a stale proof for an old address changes nothing.
-func markEmailVerified(app *App, userID int64, email string) {
+// account's current one. A nil error means the account row now says
+// verified = 1; on any error it does not, and the caller must not report the
+// address as verified (the result used to be dropped, so a failed write
+// still read as a completed verification).
+//
+// The invites are a second write. Their failure is logged and does not undo
+// or fail the verification: the proof stands on its own, and an invite that
+// cannot be attached (a constraint of the app's own table) must not keep the
+// account from ever verifying.
+func markEmailVerified(app *App, userID int64, email string) error {
 	if app == nil || app.DB == nil || userID == 0 || email == "" {
-		return
+		return errEmailNotMarkedVerified
 	}
-	app.DB.Exec("UPDATE _benmore_users SET verified = 1 WHERE id = ? AND email = ? COLLATE NOCASE", userID, email)
-	activateEmailInvites(app, userID, email)
+	res, err := app.DB.Exec("UPDATE _benmore_users SET verified = 1 WHERE id = ? AND email = ? COLLATE NOCASE", userID, email)
+	if err != nil {
+		return fmt.Errorf("mark email verified: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return errEmailNotMarkedVerified
+	}
+	if err := activateEmailInvites(app, userID, email); err != nil {
+		log.Printf("auth: account %d is verified, but its pending invites were not attached: %v", userID, err)
+	}
+	return nil
 }
 
 // claimUnverifiedAccount hands an existing, never-verified account to the
@@ -155,7 +178,6 @@ func claimUnverifiedAccountAs(app *App, userID int64, email, action string) erro
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	revokeEdgeGrantsAfterCredentialChange(app, userID)
 	syncPlatformUserFromDashboard(app, email, string(hash))
 	return nil
 }
@@ -163,12 +185,30 @@ func claimUnverifiedAccountAs(app *App, userID int64, email, action string) erro
 // activateEmailInvites attaches pending invites addressed to email (the
 // app-level user_roles table, when it exists) to userID - only once that
 // account has verified the address.
-func activateEmailInvites(app *App, userID int64, email string) {
+//
+// An app with no user_roles table, or one without the invite columns, has no
+// invites: nil. With the table in place a failed UPDATE is returned (it used
+// to be dropped, leaving the invite pending with nothing said). Zero rows is
+// the ordinary answer - nobody invited this address - so no count is checked.
+// Every caller has already committed the proof this follows (a verified
+// address, an OTP sign-in, an email change), so each logs the error and
+// carries on; the next verification link or OTP sign-in tries again.
+func activateEmailInvites(app *App, userID int64, email string) error {
 	if app == nil || app.DB == nil || userID == 0 || email == "" {
-		return
+		return nil
 	}
-	app.DB.Exec(`UPDATE user_roles SET user_id = ?, is_active = 1, invite_accepted_at = datetime('now')
+	var inviteCols int
+	if err := app.DB.QueryRow("SELECT COUNT(*) FROM pragma_table_xinfo('user_roles') WHERE lower(name) IN ('email', 'user_id', 'is_active', 'invite_accepted_at')").Scan(&inviteCols); err != nil {
+		return fmt.Errorf("activate email invites: %w", err)
+	}
+	if inviteCols != 4 {
+		return nil
+	}
+	if _, err := app.DB.Exec(`UPDATE user_roles SET user_id = ?, is_active = 1, invite_accepted_at = datetime('now')
 		WHERE email = ? AND user_id IS NULL AND is_active = 0
 		AND EXISTS (SELECT 1 FROM _benmore_users WHERE id = ? AND email = ? COLLATE NOCASE AND COALESCE(verified, 0) = 1)`,
-		userID, email, userID, email)
+		userID, email, userID, email); err != nil {
+		return fmt.Errorf("activate email invites: %w", err)
+	}
+	return nil
 }

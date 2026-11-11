@@ -1,0 +1,5 @@
+[
+  "benmore usage --local [--json]",
+  "benmore usage sync",
+  "benmore telemetry on|off|status"
+]

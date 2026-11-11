@@ -99,6 +99,7 @@ func TestPDFRenderCannotReachLocalFilesOrLoopback(t *testing.T) {
 	if chrome == "" {
 		t.Skip("no Chrome installed")
 	}
+	warmTestChrome(t, chrome)
 	if !headlessPrintWorks(t, chrome) {
 		t.Skip("headless Chrome cannot print in this environment")
 	}
@@ -186,8 +187,9 @@ func headlessPrintWorks(t *testing.T, chrome string) bool {
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+	args := append(append([]string{}, chromeKeychainFreeArgs...), "--headless=new", "--disable-gpu", "--no-sandbox",
 		"--user-data-dir="+filepath.Join(dir, "profile"), "--print-to-pdf="+filepath.Join(dir, "probe.pdf"), "data:text/html,probe")
+	cmd := exec.CommandContext(ctx, chrome, args...)
 	cmd.WaitDelay = 2 * time.Second
 	path := filepath.Join(dir, "probe.pdf")
 	if _, err := runPDFChrome(ctx, cmd, path); err != nil {

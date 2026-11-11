@@ -1,0 +1,117 @@
+# This app has a reviewed mcp.yaml, so static/ is served from the source
+# captured when the app loaded. Every path form the directory-backed twin
+# (testdata/static-paths) answers must answer here too, from that capture.
+#
+# If these fail with "public, no-cache" where "private, no-cache,
+# must-revalidate" is expected, the manifest no longer binds the files (a
+# fixture file changed): run
+#   benmore mcp review testdata/static-paths-reviewed --reviewed
+
+# A copied Vite / Next export / CRA build references its files from the URL
+# root. Those requests answered 404 once a reviewed manifest was loaded.
+root_relative_files_are_served_from_the_reviewed_source:
+  anon: true
+  steps:
+    - get: "/assets/x.js"
+      expect:
+        status: 200
+        contains: "root-relative script"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/assets/x.css"
+      expect:
+        status: 200
+        contains: "root-relative stylesheet"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/styles.css"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+    # The same file under /static/ answers the same way.
+    - get: "/static/assets/x.js"
+      expect:
+        status: 200
+        contains: "root-relative script"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/assets/missing.js"
+      expect:
+        status: 404
+    # Script source is not a browser asset at either path.
+    - get: "/static/app.tsx"
+      expect:
+        status: 404
+    - get: "/app.tsx"
+      expect:
+        status: 404
+        not_contains: "static paths bundle"
+
+# Pages carry the version of the bytes being served; exactly that URL is
+# cached for a year, every other spelling revalidates.
+page_versions_name_the_served_bytes:
+  anon: true
+  steps:
+    - get: "/"
+      expect:
+        status: 200
+        contains:
+          - "static paths home"
+          - "shared head partial"
+          - "/static/styles.css?v=031c63c03f66"
+          - "/static/app.js?v="
+        not_contains: "<include"
+        headers:
+          Cache-Control: "no-store"
+    - get: "/guide/"
+      expect:
+        status: 200
+        contains:
+          - "static paths guide"
+          - "shared head partial"
+          - "/static/styles.css?v=031c63c03f66"
+        not_contains: "<include"
+    - get: "/static/styles.css?v=031c63c03f66"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+        headers:
+          Cache-Control: "public, max-age=31536000, immutable"
+          CDN-Cache-Control: ""
+    - get: "/static/styles.css"
+      expect:
+        status: 200
+        contains: "static paths stylesheet"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/static/styles.css?v=000000000000"
+      expect:
+        status: 200
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+    - get: "/static/styles.css?v=031c63c03f66&x=1"
+      expect:
+        status: 200
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+    # The compiled bundle: the version a page carries for a script covers the
+    # whole reviewed source and the framework release, so it cannot be written
+    # down here (the Go tests follow it from the page). Other spellings
+    # revalidate.
+    - get: "/static/app.js"
+      expect:
+        status: 200
+        contains: "static paths bundle"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"
+          CDN-Cache-Control: "no-store"
+    - get: "/static/app.js?v=000000000000"
+      expect:
+        status: 200
+        contains: "static paths bundle"
+        headers:
+          Cache-Control: "private, no-cache, must-revalidate"

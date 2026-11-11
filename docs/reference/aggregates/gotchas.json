@@ -1,0 +1,5 @@
+[
+  "App-wide means app-wide. An aggregate over a tenant-keyed or owner-scoped table counts every tenant's and every user's rows, and a page that prints it shows that number to everyone who can open the page. For a per-user or per-tenant number use POST /api/_query (api({at:'query'})) or a flow, which run as the caller.",
+  "After changing `aggregates:`, read GET /api/_aggregates as an admin: every declared name is listed with `stale: false`. A name that is missing is not refreshed: its declaration lacks `sql` or a `refresh` that is a duration. The write gate refuses such a declaration (declare), so this is seen only in an app.yaml that was deployed with one.",
+  "It is a cache, not a live value. A number that must be right after each write is computed in the request (`?count=true`, /api/_query, a flow) or kept in a computed column (api({at:'computed'}))."
+]

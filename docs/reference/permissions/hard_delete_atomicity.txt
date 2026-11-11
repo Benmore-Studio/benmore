@@ -1,0 +1,1 @@
+A hard-delete through single, batch or transactional auto-CRUD commits only if its row grants and locks are cleaned up in the same transaction. Cleanup failure rolls back the row deletion and audit effects. Optional absent grant/lock ledgers remain supported. Direct authored SQL retains the row_lifetime cleanup responsibility below.

@@ -10,12 +10,43 @@ import (
 // checkScope validates that the session's scopes allow the given action on the given table.
 // Returns nil if allowed, an error if denied.
 // Empty scopes means unrestricted (cookie sessions, backward compatible).
-// Admin role does NOT bypass scopes - scopes are a constraint ON TOP of roles.
+// Admin does NOT bypass a credential's scopes - they are a constraint ON TOP
+// of roles. (The built-in admin role itself holds every scope unless roles:
+// declares it: sessionRoleScopes.)
 func checkScope(session *Session, table string, action string) error {
 	if !hasScope(session, table, action) && !accessDecidesTable(session, table, action) {
-		return fmt.Errorf("scope denied: token does not have %s:%s permission", table, action)
+		return scopeDenied(session, table, action)
 	}
 	return nil
+}
+
+// scopeDeniedBody is the 403 body of a scope refusal: its sentence, and
+// where role and token scopes are documented (refusal_docs.go).
+func scopeDeniedBody(err error) map[string]any {
+	return withRefusalDocs(map[string]any{"error": err.Error()}, refusalScopeDenied)
+}
+
+// scopeDenied names what refused table:action. A credential that carries its
+// own scopes (an API token, a scoped Bearer session, a connector grant) is a
+// token, and when those scopes leave the permission out the token is the
+// reason. Otherwise the account's roles are: role scopes narrow every
+// session of an app with a roles: block, a cookie sign-in included, which
+// used to be told its "token" lacked the permission.
+func scopeDenied(session *Session, table, action string) error {
+	cred := ""
+	token := false
+	if session != nil {
+		cred = session.CredentialScopes
+		token = strings.HasPrefix(session.ID, "apitoken:") || (cred != "" && cred != "*")
+	}
+	if token && cred != "" && cred != "*" && !hasScope(&Session{Scopes: cred}, table, action) {
+		return fmt.Errorf("scope denied: token does not have %s:%s permission", table, action)
+	}
+	noun := "session"
+	if token {
+		noun = "token"
+	}
+	return fmt.Errorf("scope denied: %s does not have %s:%s permission: no role the account holds grants it under roles: in app.yaml", noun, table, action)
 }
 
 // hasScope checks if the session is allowed to perform the given action on the given table.
@@ -56,6 +87,18 @@ func hasScope(session *Session, table string, action string) bool {
 		// Delete does NOT imply read or write - it's a separate destructive action
 	}
 	return false
+}
+
+// scopedCredential reports whether a signed-in caller's credential was
+// minted with explicit scopes (an API token or Bearer session narrowed for an
+// integration, a connector grant): delegated access, the complement of
+// accountManagementSession. Auto-CRUD narrows it table by table; a surface
+// with no table of its own must ask for a named scope (a flow's
+// permissions:, the directory's _benmore_users, notifications'
+// _notifications) before acting as the user for it. An unscoped credential
+// ("" or "*"), an ordinary sign-in included, is never one.
+func scopedCredential(session *Session) bool {
+	return session != nil && !accountManagementSession(session)
 }
 
 // scopesWithin reports whether every requested permission is covered by the
@@ -191,15 +234,6 @@ func isScopeIdentifier(s string) bool {
 		}
 	}
 	return true
-}
-
-// sessionHasFullAccess reports whether the session is an unrestricted
-// credential (cookie session, legacy bearer, or an explicit "*" token).
-// Admin-management actions such as granting roles require it: a token
-// scoped to, say, contacts:read held by an admin must never be able to widen
-// its own or anyone else's access.
-func sessionHasFullAccess(s *Session) bool {
-	return s != nil && (s.Scopes == "" || s.Scopes == "*")
 }
 
 // accessDecidesTable is the `table_scopes: access` path of the auto-CRUD scope

@@ -1,0 +1,14 @@
+access:
+  streams:
+    read:   anon       # logged-out viewers can browse + watch
+    write:  self       # owners create their own stream rows
+    update: self
+    delete: self
+  messages:
+    read:   anon       # chat history visible to anon viewers
+    write:  everyone   # only authed users can post
+    update: admin
+    delete: self
+
+features:
+  ws_anonymous: true   # allow anon /sse/events + /ws + /api/_broadcast/subscribe
