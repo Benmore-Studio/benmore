@@ -1,0 +1,12 @@
+# A `run: respond` with a status and no body is the flow's answer: the caller
+# gets that status with an empty body, the steps after it do not run, and a
+# `transaction: true` flow commits what it wrote before it.
+site_name: "Flow respond status only"
+auth:
+  identifier: email
+access:
+  entries:
+    read: self
+    write: off                  # written by the flows only
+    update: off
+    delete: off

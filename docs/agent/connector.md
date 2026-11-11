@@ -149,7 +149,11 @@ an unrelated snapshot. That includes, for a manifest still in the whole-tree for
 never writes (hidden directories outside `static/` such as `.sdd/`), and in
 either form such files under `flows/` or `emails/`: deploy of `mcp.yaml` is
 blocked naming them, and the `mcp_connector_withheld` warning lists them; delete
-them on the server or keep identical copies locally, then review again. Editor/agent
+them on the server or keep identical copies locally, then review again. Deploy
+does not upload a hidden directory outside `static/`: when the digest covers a
+workspace file in one that the server lacks or holds with other content, deploy
+of `mcp.yaml` is blocked naming it; send it with `benmore push <file>`, or move
+it to a plain directory and review again. Editor/agent
 auto-run config outside `static/` (`.vscode/`, `.mcp.json`, ...) is not part of
 the digest: hosted apps refuse it and deploy keeps it local. An interrupted multi-file deploy is not atomic; inspect
 its reported failures, correct/review the intended source and rerun it.
@@ -428,6 +432,17 @@ As written, a task that does not exist or is already done leaves the prepare
 Count the row first and refuse with a message (see "Refuse in prepare with a
 message").
 
+A command file is `flows/<name>.yaml`, and `<name>` is the command's name: it
+starts with a lowercase letter and holds only lowercase letters, digits and
+underscores, 1 to 64 characters (`flows/receive_stock.yaml`; a hyphen, capital
+letter or dot is refused). Once the app has an `mcp.yaml`, every command flow
+must be bound by exactly one tool in it: one that no tool binds, or that two
+bind, is refused with `command "<name>" requires exactly one declaration
+binding`. In an app with no
+`mcp.yaml` a command flow loads without a connector: it cannot run, and the
+columns it lists under `command.owns` are still refused to generic CRUD
+(`benmore docs scoping.command_owned_fields`).
+
 Every command flow needs the three jobs `prepare`, `apply` and `readback` and 1
 to 64 `dependencies` (an insert-only command still names one, for example the
 row it must not duplicate); review refuses `missing "readback"`,
@@ -484,8 +499,30 @@ omitted and the approved operation is one deterministic shape either way.
 paths still need a required, non-nullable path; a nullable one is refused at
 review.
 
-The runtime still applies current table scopes, access, validators and applicable
-hooks. Use actual domain bounds, bind every value, and make the preview describe
+**A command's SQL is not checked against the table's `access:` rule.** The
+runtime checks the tool's `permissions` against the actor's and the grant's
+scopes, then validators, workflow states and transition role guards, record
+locks and applicable hooks. Which rows the command may touch is decided by its
+SQL alone: a caller who holds the permission can change every row the SQL
+matches, including a row their own `PATCH` is refused on. So the prepare SQL and
+the apply SQL must each carry the owner, tenant and role predicate, bound from
+the actor and never from an argument:
+
+```yaml
+- id: cancel_order
+  run: sql
+  expect_rows: '=1'
+  with:
+    query: UPDATE orders SET status = 'cancelled' WHERE id = :id AND status = 'placed' AND (user_id = :actor OR :role = 'manager')
+    params: {id: '${{ params.id }}', actor: '${{ user.id }}', role: '${{ user.role }}'}
+```
+
+On a group-keyed table add `AND org_id = :tenant`, bound to
+`${{ user.group_id }}`. In an app whose `app.yaml` has no `roles:` block every
+account holds every `<table>:write` scope, so there the permission tells no two
+accounts apart and the SQL predicate is the only thing that does.
+
+Use actual domain bounds, bind every value, and make the preview describe
 the exact proposed change. Review/check/deploy the command first; then the owner
 enables writes separately:
 
@@ -619,8 +656,13 @@ Rules, all enforced by the runtime:
 
 Enabling approved writes refuses a table that carries a trigger the framework
 did not generate (`unrecognized or changed trigger ... on enrolled table`): an
-unknown trigger could write tables the revision ledger never sees. A command
-can declare its own triggers instead. The declaration only points at a trigger;
+unknown trigger could write tables the revision ledger never sees. The triggers
+the framework generates from your own declarations (`@updatedAt`, `@@fulltext`,
+computed and encrypted fields, `versioned:` history) are accepted when their
+stored definition is exactly the generated one, so a command can write a
+versioned table: each update or delete it makes records a version in the
+command's transaction, with `_changed_by` set to the user who approved it. A
+command can declare its own triggers instead. The declaration only points at a trigger;
 its SQL comes from the `CREATE TRIGGER` statement in a reviewed `migrations/*.sql`
 file (the UP section):
 

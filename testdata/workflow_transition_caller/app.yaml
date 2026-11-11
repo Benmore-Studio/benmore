@@ -1,0 +1,12 @@
+# Purchase requests with separation of duties: a request is decided by an
+# approver other than its requester, and only the requester takes a returned
+# request back to draft.
+site_name: "Request decisions"
+auth:
+  identifier: email
+access:
+  requests:
+    read: owner_or_role:approver
+    write: everyone
+    update: owner_or_role:approver    # a transition is an update of the row
+    delete: admin

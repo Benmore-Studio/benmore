@@ -1,0 +1,11 @@
+model Request {
+  id          Int      @id @default(autoincrement())
+  title       String
+  amountCents Int      @map("amount_cents")
+  poNumber    String?  @map("po_number")
+  status      String   @default("draft")         // moved only by workflows.yaml
+  userId      Int      @map("user_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+  @@map("requests")
+}

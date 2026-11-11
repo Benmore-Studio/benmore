@@ -1,0 +1,20 @@
+# What flow SQL keeps: DDL on the app's own tables, and adding an audit row.
+on:
+  request: { method: POST, path: /api/cache-setup, auth: required }
+jobs:
+  cache_setup:
+    steps:
+      - run: sql
+        with:
+          query: "CREATE TABLE IF NOT EXISTS my_cache (k TEXT PRIMARY KEY, v TEXT)"
+      - run: sql
+        with:
+          query: "CREATE INDEX IF NOT EXISTS my_cache_v ON my_cache (v)"
+      - run: sql
+        with:
+          query: "INSERT INTO my_cache (k, v) VALUES ('a', 'b') ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+      - run: sql
+        with:
+          query: "INSERT INTO _benmore_audit_log (action, table_name, row_id, user_email) VALUES ('fixture', 'my_cache', 'a', :user_email)"
+      - run: respond
+        with: { status: 200, json: { done: true } }

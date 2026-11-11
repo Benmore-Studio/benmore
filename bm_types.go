@@ -57,7 +57,7 @@ func GenerateBMTypes(app *App) string {
 //   bm.createStore(initial) / bm.query             app state + cached reads
 //   bm.live.scoped('notes', refresh)               SSE subs (debounced)
 //   bm.auth.me() / bm.auth.signOut()               session
-//   bm.upload(file)                                multipart upload → {path}
+//   bm.upload(file)                                multipart upload → {path, url, filename, size}
 //   bm.html` + "`" + `<li>${name}</li>` + "`" + `                      XSS-safe HTML (auto-escapes)
 //
 // Anti-patterns to avoid:
@@ -659,8 +659,11 @@ export interface RoomClient {
     fetch<T = any>(key: unknown, fetcher: () => Promise<T> | T, opts?: QueryFetchOpts): Promise<T>;
     refetch<T = any>(key: unknown, opts?: { background?: boolean }): Promise<T | undefined>;
     invalidate(match: unknown | ((rawKey: unknown, stableKey: string) => boolean), opts?: { refetch?: boolean; background?: boolean }): string[];
-    tableKey(table: TableName, spec?: Record<string, unknown>): unknown[];
+    /** The key table(table, opts) caches under, for the same arguments: opts.key when given, else derived from the request. Pass it to subscribe/get/set/invalidate/mutate. */
+    tableKey(table: TableName, opts?: Omit<QuerySpec, 'table'> & QueryFetchOpts): unknown;
+    /** Cached under opts.key when given: name one to subscribe to the result. */
     read<T = any>(spec: QuerySpec, opts?: QueryFetchOpts): Promise<T[]>;
+    /** Cached under tableKey(table, opts). */
     table<T = any>(table: TableName, opts?: Omit<QuerySpec, 'table'> & QueryFetchOpts): Promise<T[]>;
     invalidateTable(table: TableName, opts?: { refetch?: boolean; background?: boolean }): string[];
     mutate<T = any>(opts: QueryMutateOpts<T>): Promise<T>;
@@ -724,7 +727,7 @@ export interface RoomClient {
   export function upload(
     file: File | Blob,
     opts?: { kind?: string; filename?: string }
-  ): Promise<{ path: string; url?: string; size: number; mime: string }>;
+  ): Promise<{ path: string; url: string; filename: string; size: number }>;
 
   // ── audit (read the audit trail; admin endpoint) ─────────────────────
   export const audit: {

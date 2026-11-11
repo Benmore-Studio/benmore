@@ -376,6 +376,7 @@ func reloadAppConfigStaged(app *App, config *runtimeConfig, nextEnv map[string]s
 	// the new manifest, flows and YAML-only template source.
 	storeAppEnv(app.Dir, nextEnv)
 	app.mu.Unlock()
+	logWSRoomRuleReferences(app.DB, config.wsRooms)
 	// Connections the new manifest no longer declares lose their stored
 	// credentials, so re-adding one later does not bring them back.
 	purgeUndeclaredAppMCPConnectionCredentials(app.DB, config.mcp)
@@ -1246,6 +1247,28 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 func accountHoldMiddleware(handler http.Handler, app *App) http.Handler {
 	handler = mfaEnrollmentMiddleware(handler, app)
 	return passwordChangeMiddleware(handler, app)
+}
+
+// accountHoldRefusal answers a request whose credential resolved to no
+// session because its account is held (a temporary password to replace, MFA to
+// enroll) with the same 403 the two gates give, and reports whether it did.
+// It is for the handshakes those gates skip as static paths, GET /sse/events
+// and GET /ws: the caller has already been refused a session and opens no
+// stream either way; without this it answered 401 `authentication required`,
+// which tells a signed-in client to sign in again.
+func accountHoldRefusal(w http.ResponseWriter, r *http.Request, app *App) bool {
+	var body map[string]any
+	if authRawSessionID(r) != "" && pendingPasswordChange(app, r) != nil {
+		body = passwordChangeRefusal()
+	} else if held := mfaEnrollmentSession(app, r); held != nil {
+		body = mfaEnrollmentRefusal(app, held)
+	}
+	if body == nil {
+		return false
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	httpJSON(w, http.StatusForbidden, body)
+	return true
 }
 
 // wrapMiddleware applies the standard middleware chain to a handler.

@@ -189,9 +189,8 @@ func RegisterUsageAPI(mux appRouteRegistrar, app *App) {
 
 	// GET /api/_usage/history - all periods for a scope (admin)
 	mux.HandleFunc("GET /api/_usage/history", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 

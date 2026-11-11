@@ -1,0 +1,17 @@
+# flows/pick-stock.yaml - several roles by the account's own role
+# (_benmore_users.role): sign-in is required, and the first step refuses.
+on:
+  request:
+    method: POST
+    path: /api/pick-stock
+    auth: required
+jobs:
+  pick:
+    steps:
+      - if: ${{ user.role != 'warehouse' && user.role != 'manager' && user.role != 'admin' }}
+        run: respond
+        with: { status: 403, json: { error: forbidden } }
+      - run: sql
+        with: { query: "INSERT INTO stock_moves (sku, kind, moved_by) VALUES (:sku, 'pick', :user_id)" }
+      - run: respond
+        with: { status: 201, json: { picked: true } }

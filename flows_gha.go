@@ -418,6 +418,11 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	for _, problem := range append(valueProblems, transactionalSends...) {
 		log.Printf("WARNING: %s: %s", path, problem)
 	}
+	// A respond with no `with:` answers 200 and ends the run: a warning at
+	// write time too.
+	for _, where := range bareRespondSteps(file) {
+		log.Printf("WARNING: %s: %s: %s", path, where, bareRespondProblem)
+	}
 	// Bounds declared on an input that is not a number are not checked: a
 	// warning at write time, since deployed files carry them.
 	if file.On.Request != nil {
@@ -1523,15 +1528,41 @@ func withToRespond(with map[string]any) *FlowRespond {
 			r.JSONArray = normalized
 		}
 	}
+	// A number or boolean written as the body (`body: 0`, `json: false`) is
+	// that JSON value. It used to be dropped, and the step with it.
+	scalar := ""
+	if r.Body == "" && r.JSON == nil && r.JSONArray == nil {
+		for _, key := range []string{"body", "json"} {
+			if scalar = respondScalarBody(with[key]); scalar != "" {
+				break
+			}
+		}
+		r.Body = scalar
+	}
 	// Declared content type and response headers, through the allowlist
 	// (flows_respond_headers.go). They used to be accepted and dropped.
 	r.ContentType, r.Headers = respondHeadersFromWith(with)
+	if scalar != "" && r.ContentType == "" {
+		r.ContentType = "application/json"
+	}
 	if (r.JSON != nil || r.JSONArray != nil) && r.ContentType != "" && !respondContentTypeIsJSON(r.ContentType) {
 		// A map or list body is sent as JSON; a deployed file declaring
 		// another type keeps answering application/json.
 		r.ContentType = ""
 	}
 	return r
+}
+
+// respondScalarBody is the JSON text of a respond body written as a YAML
+// number or boolean, "" for any other value.
+func respondScalarBody(v any) string {
+	switch v.(type) {
+	case bool, int, int64, uint64, float64:
+		if text, err := json.Marshal(v); err == nil {
+			return string(text)
+		}
+	}
+	return ""
 }
 
 // stringMap coerces a generic YAML map to map[string]string, stringifying

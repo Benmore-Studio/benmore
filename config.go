@@ -347,6 +347,10 @@ func designFromAppYAML(raw map[string]any) *DesignConfig {
 		for k, v := range m {
 			config.Recording[k] = anyToString(v)
 		}
+		// The recorder compares its switches to "true"/"false", and YAML
+		// hands `no`/`off` over as text and `0` as a number, so
+		// `enabled: no` left the recorder ON.
+		canonicalSwitchValues(config.Recording, recordingSwitchKeys)
 	}
 	if m, ok := raw["table"].(map[string]any); ok {
 		config.Table = m
@@ -401,8 +405,8 @@ func parseAutoMembershipConfig(m map[string]any) map[string]AutoMembershipConfig
 	return out
 }
 
-// parseFeaturesConfig parses the features: section from app.yaml.
-// Supports both boolean values and map values (e.g., search: { tables: [...] }).
+// parseFeaturesConfig parses the features: section from app.yaml. Each
+// switch is read by featureSwitchValue.
 func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 	fc := &FeaturesConfig{}
 
@@ -411,27 +415,7 @@ func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 		if !ok {
 			return nil
 		}
-		switch val := v.(type) {
-		case bool:
-			return &val
-		case string:
-			// String values like "auth" or "public" mean the feature is
-			// enabled. YAML 1.2 hands `no`/`off`/`0` over as strings too;
-			// only "false" used to count as off, so `ws_anonymous: no`
-			// switched the WS/SSE session gate OFF.
-			canon, known := canonicalAuthFlag(val)
-			if strings.TrimSpace(val) == "" {
-				known = false
-			}
-			b := canon == "true" || (!known && key != "ws_anonymous")
-			return &b
-		case map[string]any:
-			// A map means enabled (e.g., search: { tables: [...] })
-			b := true
-			return &b
-		default:
-			return nil
-		}
+		return featureSwitchValue(key, v)
 	}
 
 	fc.Admin = parseBoolFeature("admin")
@@ -1394,6 +1378,20 @@ func logUnusableWSRoomPatterns(rules []WSRoomRule) {
 		if _, closed := wsRoomClosedLead(wr.Pattern); closed {
 			log.Printf("SECURITY: app.yaml: %s", wsRoomPatternRefusal(wr.Pattern))
 		}
+	}
+}
+
+// logWSRoomRuleReferences says, once per load, which ws_rooms rules name a
+// membership table or column the database does not have: the rooms of such a
+// rule refuse every join. Read from the live database after migrations ran,
+// so a table only a migration creates counts. `benmore check` and the
+// post-write check warn about the same rules from the app's sources.
+func logWSRoomRuleReferences(db rowQuerier, rules []WSRoomRule) {
+	if db == nil || len(rules) == 0 {
+		return
+	}
+	for _, msg := range wsRoomReferenceWarnings(rules, liveWSRoomSchema(db)) {
+		log.Printf("WARNING: %s", msg)
 	}
 }
 

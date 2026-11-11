@@ -54,6 +54,22 @@ func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured 
 	}
 	var out []Flow
 	names := map[string]bool{}
+	// What app.yaml, schema.prisma and workflows.yaml say about roles, read
+	// once and only when a flow has a role gate to judge.
+	var roleGates *flowRoleGateContext
+	roleGateContext := func() *flowRoleGateContext {
+		if roleGates == nil {
+			read := func(name string) []byte {
+				if captured != nil {
+					return captured[name]
+				}
+				data, _ := readOptionalConfig(dir, name)
+				return data
+			}
+			roleGates = newFlowRoleGateContext(read("app.yaml"), read("schema.prisma"), read("workflows.yaml"))
+		}
+		return roleGates
+	}
 	var commandTables map[string]bool
 	var commandColumns map[string]map[string]string
 	commandTablesLoaded := false
@@ -137,6 +153,19 @@ func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured 
 		}
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		// A role gate that admits nobody but a global admin, or not the
+		// tenant admins its name suggests: a warning when the file is
+		// written, and this line for a deployed file
+		// (validators_flow_role_gate.go). The jobs of one file share a gate.
+		roleProblems := map[string]bool{}
+		for _, flow := range flows {
+			if flow.Trigger.Type == "http" && strings.TrimSpace(flow.Role) != "" {
+				if problem := flowRoleGateProblem(flow.Role, roleGateContext()); problem != "" && !roleProblems[problem] {
+					roleProblems[problem] = true
+					log.Printf("WARNING: %s: %s", filepath.ToSlash(path), problem)
+				}
+			}
 		}
 		for _, flow := range flows {
 			if names[flow.Name] {

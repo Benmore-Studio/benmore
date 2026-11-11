@@ -139,6 +139,17 @@ func flowStepValueFindings(file FlowFileGHA) (problems, sends []string) {
 					problems = append(problems, where+": "+problem)
 				}
 			}
+			// DDL on a framework object, which the runtime refuses when the
+			// step runs (app_sql_guard.go). A deployed file still loads.
+			if rt := ghaStepRunType(s); rt == "sql" || rt == "sql_dynamic" {
+				withQuery, _ := s.With["query"].(string)
+				for _, query := range []string{s.Query, withQuery} {
+					if problem := appSQLFrameworkDDLProblem(query); problem != "" {
+						problems = append(problems, where+": "+problem)
+						break
+					}
+				}
+			}
 			walk(job, here+".steps", s.Steps, transactional)
 			walk(job, here+".else", s.Else, transactional)
 			// The handler runs after the transaction was rolled back
@@ -154,15 +165,18 @@ func flowStepValueFindings(file FlowFileGHA) (problems, sends []string) {
 
 // transactionalSendProblem names a fire-and-forget send inside a
 // `transaction: true` flow. It runs at once, so a later failing step rolls the
-// rows back after the email, SMS or webhook has already gone. `run: api` is
+// rows back after the email, SMS or webhook has already gone. The step is
+// not refused and still runs, and the text says so (it used to read "can't
+// run", which a builder took for a refusal). `run: api` is
 // left alone: later steps read its outputs (live flows POST to a payment API
 // and store the result), which `run: enqueue` cannot give them. It is a
 // warning when the file is written and in `benmore check`, and a log line
 // when the file loads (flowTransactionalSendProblems).
 func transactionalSendProblem(runType string) string {
+	sent := map[string]string{"email": "email", "sms": "text message", "webhook": "request"}[runType]
 	switch runType {
 	case "email", "sms", "webhook":
-		return fmt.Sprintf("`run: %s` can't run in a `transaction: true` flow: it sends at once, so a later failing step rolls the database back after the message has already gone. Queue it with `run: enqueue` (`with: { flow: <flow that sends>, with: { ... } }`): the job is written inside the transaction and runs only after COMMIT. Or send from a separate flow.", runType)
+		return fmt.Sprintf("`run: %s` in a `transaction: true` flow sends at once and is not undone by a rollback: when a later step fails, the rows are rolled back after the "+sent+" has already gone. Queue it with `run: enqueue` (`with: { flow: <flow that sends>, with: { ... } }`): the job is written inside the transaction and runs only after COMMIT. Or send from a separate flow.", runType)
 	}
 	return ""
 }

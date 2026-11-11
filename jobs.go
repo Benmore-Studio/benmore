@@ -1064,7 +1064,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 			actor.Permissions = strings.Fields(actor.Scopes)
 		}
 	}
-	if flow.Role != "" && !HasAnyRole(actor, []string{flow.Role}) {
+	if flow.Role != "" && !flowRoleAllowed(actor, flow.Role) {
 		return nil, fmt.Errorf("the account this job was queued for no longer holds role %q; not run", flow.Role)
 	}
 	if len(flow.Permissions) > 0 && !scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " ")) {
@@ -1657,9 +1657,8 @@ const jobRetryIsEffectSQL = "(CASE WHEN json_valid(payload) = 1 THEN json_type(p
 func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 	// GET /api/_jobs - list jobs (admin only)
 	mux.HandleFunc("GET /api/_jobs", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 
@@ -1754,9 +1753,8 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 
 	// GET /api/_jobs/{id} - get specific job
 	mux.HandleFunc("GET /api/_jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 
@@ -1774,9 +1772,8 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 
 	// POST /api/_jobs/{id}/retry - retry a failed job
 	mux.HandleFunc("POST /api/_jobs/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		// Admin cookie sessions need CSRF like every other mutation; a
@@ -1821,9 +1818,8 @@ func RegisterJobsAPI(mux appRouteRegistrar, app *App) {
 
 	// DELETE /api/_jobs/{id} - delete a job
 	mux.HandleFunc("DELETE /api/_jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !requireCSRF(w, r) {

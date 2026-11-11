@@ -16,7 +16,7 @@ jobs:
         run: sql
         with:
           query: "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'org_admin'"
-          params: { org: "${{ user.group_id }}" }
+          params: { org: "${{ user.group_id || 0 }}" }
       - if: ${{ !steps.me.outputs.rows }}
         run: respond
         with: { status: 403, json: { error: not_org_admin } }
@@ -30,7 +30,7 @@ jobs:
         run: sql
         with:
           query: "INSERT INTO org_members (org_id, user_id, member_role) VALUES (:org, :member, :role) ON CONFLICT (org_id, user_id) DO NOTHING RETURNING id"
-          params: { org: "${{ user.group_id }}", member: "${{ steps.account.outputs.id }}" }
+          params: { org: "${{ user.group_id || 0 }}", member: "${{ steps.account.outputs.id }}" }
       - if: ${{ !steps.added.outputs.rows }}
         run: respond
         with: { status: 409, json: { error: already_a_member } }

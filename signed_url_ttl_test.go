@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,6 +100,19 @@ func TestParseSignedLinkLifetime(t *testing.T) {
 	for _, in := range []any{0, -5, "0s", "500ms", "7h", 21601, "21601", int64(1) << 62, float64(1.5), "soon", "${{ params.ttl }}", "{{ttl}}", true, nil, []any{1}} {
 		if got, err := parseSignedLinkLifetime(in); err == nil {
 			t.Errorf("parseSignedLinkLifetime(%#v) = %s, want an error", in, got)
+		}
+	}
+	// "Too long" is told apart from "cannot be read": only the first may be
+	// answered with the cap. A negative number is never too long, however
+	// large: multiplied into nanoseconds it would wrap into a positive value.
+	for _, in := range []any{21601, "21601", "7h", int64(1) << 62, uint64(1) << 63, float64(1e12), "99999999999999999999"} {
+		if _, err := parseSignedLinkLifetime(in); !errors.Is(err, errSignedLinkLifetimeTooLong) {
+			t.Errorf("parseSignedLinkLifetime(%#v) error = %v, want the too-long error", in, err)
+		}
+	}
+	for _, in := range []any{-5, "-5", "-30s", int64(-9223372037), "-9223372037", -(int64(1) << 62), "-99999999999999999999", "0", "soon", "1.5"} {
+		if _, err := parseSignedLinkLifetime(in); err == nil || errors.Is(err, errSignedLinkLifetimeTooLong) {
+			t.Errorf("parseSignedLinkLifetime(%#v) error = %v, want a refusal that is not the too-long error", in, err)
 		}
 	}
 }

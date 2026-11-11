@@ -35,6 +35,32 @@ admin_routes_refuse_a_member_in_json:
         json: {error: "admin required"}
         headers: {Content-Type: "application/json"}
 
+# The same routes without a valid credential: unauthenticated (401), as on
+# every other route, not the member's 403.
+admin_routes_ask_a_signed_out_caller_to_sign_in:
+  anon: true
+  steps:
+    - get: "/api/_audit"
+      expect:
+        status: 401
+        json: {error: "authentication required"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/_analytics/summary"
+      expect:
+        status: 401
+        json: {error: "authentication required"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/_schema/notes/fields"
+      expect:
+        status: 401
+        json: {error: "authentication required"}
+        headers: {Content-Type: "application/json"}
+    - get: "/api/_jobs"
+      expect:
+        status: 401
+        json: {error: "authentication required"}
+        headers: {Content-Type: "application/json"}
+
 # The per-caller schema descriptor is never served anonymously.
 anonymous_schema_is_refused_in_json:
   anon: true

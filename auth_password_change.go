@@ -75,8 +75,7 @@ func passwordChangeMiddleware(next http.Handler, app *App) http.Handler {
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		if strings.HasPrefix(r.URL.Path, "/api/") || wantsJSON(r) || isBearerAuth(r) {
-			body := map[string]any{"error": "password_change_required", "redirect": passwordChangePagePath}
-			httpJSON(w, http.StatusForbidden, withRefusalDocs(body, "password_change_required"))
+			httpJSON(w, http.StatusForbidden, passwordChangeRefusal())
 			return
 		}
 		if isHTMX(r) {
@@ -86,6 +85,13 @@ func passwordChangeMiddleware(next http.Handler, app *App) http.Handler {
 		}
 		http.Redirect(w, r, passwordChangePagePath, http.StatusSeeOther)
 	})
+}
+
+// passwordChangeRefusal is the 403 body for a session whose account must
+// replace a temporary password.
+func passwordChangeRefusal() map[string]any {
+	body := map[string]any{"error": "password_change_required", "redirect": passwordChangePagePath}
+	return withRefusalDocs(body, "password_change_required")
 }
 
 func registerPasswordChangeRoutes(mux *http.ServeMux, app *App) {

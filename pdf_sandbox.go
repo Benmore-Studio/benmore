@@ -211,6 +211,12 @@ func pdfChromeArgs(proxyAddr, docURL, pdfPath, profileDir string) []string {
 		// WebRTC UDP would bypass the proxy.
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
+		// Chrome's default print header and footer put the date, the
+		// title, the page count and the document's address on every sheet;
+		// here that address is the sandbox's own (pdfOriginHost and the
+		// render token). A page that wants a header, a footer or page
+		// numbers draws them with CSS @page margin boxes.
+		"--no-pdf-header-footer",
 		"--print-to-pdf="+pdfPath,
 		docURL,
 	)

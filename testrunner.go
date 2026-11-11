@@ -19,6 +19,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -91,6 +92,16 @@ type AppTestStep struct {
 
 	// Assertions
 	Expect AppTestExpect `yaml:"expect"`
+
+	// DurationAttempts, set only by the framework test generator (it is not a
+	// key of a test file), makes `expect.max_duration` the bound on the
+	// FASTEST of up to this many requests: a request that passes everything
+	// else and only took too long is sent again, and the step passes at the
+	// first one within the bound. The time of one request is the handler's
+	// work plus whatever the machine was doing at that moment, so a single
+	// measurement fails a cheap endpoint on a busy machine; a handler that is
+	// really slow is slow on every request and still fails.
+	DurationAttempts int `yaml:"-"`
 }
 
 // AppTestFilePart is one file of a `files:` step.
@@ -219,18 +230,19 @@ func RunAllTests(app *App, generated []AppTestFile, includeDisk bool) []AppTestR
 		}
 	}
 
-	// Summary
+	return append(results, testRunSummary(results))
+}
+
+// testRunSummary is the SUMMARY entry of a run: what `--json` output carries
+// where the text output prints its first line, counted the same way
+// (testResultCounts).
+func testRunSummary(results []AppTestResult) AppTestResult {
 	total, passed := testResultCounts(results)
 	message := fmt.Sprintf("%d/%d tests passed", passed, total)
 	if skipped := testResultSkipped(results); skipped > 0 {
 		message += fmt.Sprintf(", %d skipped", skipped)
 	}
-	results = append(results, AppTestResult{
-		File: "SUMMARY", Test: "TOTAL", Pass: passed == total,
-		Message: message,
-	})
-
-	return results
+	return AppTestResult{File: "SUMMARY", Test: "TOTAL", Pass: passed == total, Message: message}
 }
 
 // RunAppTests discovers and runs developer-written test files from tests/ directory.
@@ -303,6 +315,9 @@ func testResultsPassed(results []AppTestResult) bool {
 	return len(results) > 0
 }
 
+// sourceCheckTestPrefix starts the test name of a source-check result.
+const sourceCheckTestPrefix = "source check"
+
 // sourceCheckTestResults is a failed result for each error the source layers
 // of a check report (RunSourceCheck: the per-file validators of the write gate
 // and the cross-file checks; the database is never opened). `benmore test`
@@ -316,7 +331,7 @@ func sourceCheckTestResults(dir string) []AppTestResult {
 		if f.Severity != "error" {
 			continue
 		}
-		out = append(out, AppTestResult{File: f.File, Test: "source check (" + f.Source + ")", Pass: false,
+		out = append(out, AppTestResult{File: f.File, Test: sourceCheckTestPrefix + " (" + f.Source + ")", Pass: false,
 			Message: withDocsLine(f.Message+" (`benmore push` and the platform write gate refuse this file)", f.Docs)})
 	}
 	return out
@@ -407,8 +422,16 @@ func isAppTestFile(rel string) bool {
 // unloadedTestFile is the failed result for a tests/ file that was not run.
 // File is the app-relative path, as for a source-check result.
 func unloadedTestFile(rel, problem string) AppTestResult {
-	return AppTestResult{File: rel, Test: "load", Pass: false, Message: problem}
+	return AppTestResult{File: rel, Test: "load", Pass: false, Message: withDocsLine(problem, testFileLoadDocs)}
 }
+
+// Where the runner's own refusals are documented, as `benmore check` names
+// them for the same file (checkSourceDocs["tests"]).
+const (
+	testFileLoadDocs  = "verification.test_file_load" // a file that is not loaded
+	testKeysDocs      = "verification.test_keys"      // a test that is not read in full
+	testVariablesDocs = "verification.test_variables" // `{{name}}` and the test users' tokens
+)
 
 // fileErrorReason is err without the path of the disposable copy a test run
 // reads.
@@ -422,6 +445,7 @@ func fileErrorReason(err error) string {
 
 const (
 	appTestFileNotLoaded = "cannot load this test file, so none of its tests ran: "
+	appTestFileNotYAML   = "it is not valid YAML ("
 	appTestFileShape     = "A test file is a mapping of test name to test case (`my_test:` with `steps:` under it)."
 	appTestFileEmpty     = "this test file defines no tests (it is empty or holds only comments). Add a test, or delete the file."
 )
@@ -489,7 +513,7 @@ func readAppTestFile(data []byte) (map[string]AppTestCase, map[string][]appTestP
 		if err == io.EOF {
 			return fail(appTestFileEmpty)
 		}
-		return fail(appTestFileNotLoaded + "it is not valid YAML (" + strings.TrimPrefix(err.Error(), "yaml: ") + ").")
+		return fail(appTestFileNotLoaded + appTestFileNotYAML + strings.TrimPrefix(err.Error(), "yaml: ") + ").")
 	}
 	// The decoder reads one document; tests after a `---` would never run.
 	for {
@@ -499,7 +523,7 @@ func readAppTestFile(data []byte) (map[string]AppTestCase, map[string][]appTestP
 			break
 		}
 		if err != nil {
-			return fail(appTestFileNotLoaded + "it is not valid YAML (" + strings.TrimPrefix(err.Error(), "yaml: ") + ").")
+			return fail(appTestFileNotLoaded + appTestFileNotYAML + strings.TrimPrefix(err.Error(), "yaml: ") + ").")
 		}
 		if !emptyYAMLDocument(&extra) {
 			return fail(appTestFileNotLoaded + "it holds more than one YAML document (separated by `---`), and only the first would be read. Put every test in one document.")
@@ -677,6 +701,16 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 		cookies, bearerToken, testUserID = loginTestUser(app, tc.AsUser, role)
 	}
 
+	// The `users:` accounts exist before setup runs, so setup SQL can look one
+	// up by email. They used to be created after it: a seed row owned by one
+	// (`(SELECT id FROM _benmore_users WHERE email = ...)`) got NULL.
+	userTokens := map[string]string{}
+	for _, email := range tc.Users {
+		if _, token, _ := loginTestUser(app, email, "user"); token != "" {
+			userTokens[testUserTokenVar(email)] = token
+		}
+	}
+
 	// Run setup steps ({{user_id}} is substituted with the authenticated user's ID)
 	for _, setup := range tc.Setup {
 		if setup.SQL != "" {
@@ -699,22 +733,29 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 		}
 	}
 
-	// Pre-create declared test users
-	for _, email := range tc.Users {
-		loginTestUser(app, email, "user")
-	}
-
 	// Run test steps with variable capture and substitution.
-	// Steps can capture IDs via `save: "var_name"`, referenced as {{var_name}}.
-	// {{last_id}} is always the most recently captured ID.
-	// {{user_id}} is always the authenticated user's ID.
+	// Steps capture response fields with `save: {name: field}`, read back as
+	// {{name}}. {{user_id}} is the authenticated user's ID.
 	vars := make(map[string]string)
 	if testUserID > 0 {
 		vars["user_id"] = fmt.Sprintf("%d", testUserID)
 	}
+	// Each test user's session token is the variable <local part>_token
+	// (bob@example.com: bob_token), so a step can act as that user with
+	// `set_auth: "bob_token"`. The `users:` accounts used to be created and
+	// their sessions thrown away: nothing in a test could act as one where
+	// the token exchange needs a second factor (compliance: hipaa).
+	maps.Copy(vars, userTokens)
+	if bearerToken != "" {
+		vars[testUserTokenVar(tc.AsUser)] = bearerToken
+	}
 	anon := tc.Anon
 	for i, step := range tc.Steps {
+		// `expect` is read from the step as written: a value another field
+		// received is never scanned for a second variable.
+		expect, expectProblem := substituteExpectVars(step.Expect, vars)
 		step = substituteVars(step, vars)
+		step.Expect = expect
 
 		// set_auth: switch the auth context for this and all subsequent steps
 		if step.SetAuth != "" {
@@ -723,13 +764,24 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 				bearerToken = ""
 				anon = true
 			} else {
-				// Use the value as a Bearer token (e.g., an API token from a saved variable)
+				// A Bearer token: the value itself (a token a step saved,
+				// written {{name}}), or the saved variable the value names.
 				cookies = nil
 				bearerToken = step.SetAuth
+				if token, named := vars[step.SetAuth]; named {
+					bearerToken = token
+				}
 				anon = false
 			}
 			result.Steps = append(result.Steps, AppTestStepResult{Action: "set_auth", Pass: true})
 			continue
+		}
+
+		if expectProblem != "" {
+			result.Steps = append(result.Steps, AppTestStepResult{Action: testStepLabel(step), Pass: false, Message: expectProblem})
+			result.Pass = false
+			result.Message = fmt.Sprintf("Step %d failed: %s", i+1, expectProblem)
+			break
 		}
 
 		stepResult, responseData := executeTestStepWithCapture(app, base, client, cookies, bearerToken, anon, step)
@@ -780,14 +832,41 @@ func executeTestStepWithCapture(app *App, base string, client *http.Client, cook
 	return result, nil
 }
 
-// substituteVars replaces all {{var_name}} references in step strings with captured values.
-func substituteVars(step AppTestStep, vars map[string]string) AppTestStep {
-	replace := func(s string) string {
-		for k, v := range vars {
-			s = strings.ReplaceAll(s, "{{"+k+"}}", v)
-		}
+// testVarRef is a `{{name}}` reference: two braces around text that holds no
+// brace. One pattern for every field of a step.
+var testVarRef = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
+
+// testVarName is the shape of a name `expect` requires to be saved: letters,
+// digits, `_` and `-`. Other text between braces (`{{ spaced }}`,
+// `{{user.email}}`, `{{#each}}`) is template text an app may render or store,
+// and stays text unless a variable of exactly that name was saved.
+var testVarName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// replaceTestVars replaces each `{{name}}` of s that names a saved variable
+// with its value, in one pass: a value is written as it is and never scanned
+// for another variable. A `{{name}}` nothing saved stays as written.
+func replaceTestVars(s string, vars map[string]string) string {
+	if !strings.Contains(s, "{{") {
 		return s
 	}
+	return testVarRef.ReplaceAllStringFunc(s, func(ref string) string {
+		if value, saved := vars[ref[2:len(ref)-2]]; saved {
+			return value
+		}
+		return ref
+	})
+}
+
+// testUserTokenVar names the variable that holds a test user's session token:
+// the part of the email before the `@`, then `_token`.
+func testUserTokenVar(email string) string {
+	local, _, _ := strings.Cut(email, "@")
+	return local + "_token"
+}
+
+// substituteVars replaces all {{var_name}} references in step strings with captured values.
+func substituteVars(step AppTestStep, vars map[string]string) AppTestStep {
+	replace := func(s string) string { return replaceTestVars(s, vars) }
 	step.API = replace(step.API)
 	step.Get = replace(step.Get)
 	step.Post = replace(step.Post)
@@ -804,9 +883,11 @@ func substituteVars(step AppTestStep, vars map[string]string) AppTestStep {
 		step.JSONArray = substituteVarsInSlice(step.JSONArray, vars)
 	}
 	if step.NDJSON != nil {
+		ndjson := make([]map[string]any, len(step.NDJSON))
 		for i, obj := range step.NDJSON {
-			step.NDJSON[i] = substituteVarsInMap(obj, vars)
+			ndjson[i] = substituteVarsInMap(obj, vars)
 		}
+		step.NDJSON = ndjson
 	}
 	if step.Files != nil {
 		files := make(map[string]AppTestFilePart, len(step.Files))
@@ -822,20 +903,7 @@ func substituteVars(step AppTestStep, vars map[string]string) AppTestStep {
 func substituteVarsInMap(m map[string]any, vars map[string]string) map[string]any {
 	out := make(map[string]any, len(m))
 	for k, v := range m {
-		switch val := v.(type) {
-		case string:
-			replaced := val
-			for vk, vv := range vars {
-				replaced = strings.ReplaceAll(replaced, "{{"+vk+"}}", vv)
-			}
-			out[k] = replaced
-		case map[string]any:
-			out[k] = substituteVarsInMap(val, vars)
-		case []any:
-			out[k] = substituteVarsInSlice(val, vars)
-		default:
-			out[k] = v
-		}
+		out[k] = substituteVarsInValue(v, vars)
 	}
 	return out
 }
@@ -844,65 +912,147 @@ func substituteVarsInMap(m map[string]any, vars map[string]string) map[string]an
 func substituteVarsInSlice(s []any, vars map[string]string) []any {
 	out := make([]any, len(s))
 	for i, v := range s {
-		switch val := v.(type) {
-		case string:
-			replaced := val
-			for vk, vv := range vars {
-				replaced = strings.ReplaceAll(replaced, "{{"+vk+"}}", vv)
-			}
-			out[i] = replaced
-		case map[string]any:
-			out[i] = substituteVarsInMap(val, vars)
-		case []any:
-			out[i] = substituteVarsInSlice(val, vars)
-		default:
-			out[i] = v
-		}
+		out[i] = substituteVarsInValue(v, vars)
 	}
 	return out
 }
 
-func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*http.Cookie, bearerToken string, anon bool, step AppTestStep) (AppTestStepResult, []byte) {
-	// Determine method and path
-	method := "GET"
-	path := ""
-
-	if step.API != "" {
-		parts := strings.SplitN(step.API, " ", 2)
-		if len(parts) == 2 {
-			method = parts[0]
-			path = parts[1]
-		} else {
-			path = parts[0]
-		}
-	} else if step.Get != "" {
-		method = "GET"
-		path = step.Get
-	} else if step.Post != "" {
-		method = "POST"
-		path = step.Post
-	} else if step.SQL != "" {
-		return executeSQLTestStep(app, step), nil
-	} else if step.Flush != "" {
-		return executeFlushStep(app, step), nil
-	} else {
-		// runSingleTest refuses such a test before its first step; a step
-		// with no action never becomes a request for the empty path.
-		return AppTestStepResult{Action: "step", Pass: false, Message: "this step has no action"}, nil
+func substituteVarsInValue(v any, vars map[string]string) any {
+	switch val := v.(type) {
+	case string:
+		return replaceTestVars(val, vars)
+	case map[string]any:
+		return substituteVarsInMap(val, vars)
+	case []any:
+		return substituteVarsInSlice(val, vars)
 	}
+	return v
+}
 
-	action := fmt.Sprintf("%s %s", method, path)
-	stepStart := time.Now()
+// substituteExpectVars reads the saved variables into every text of a step's
+// `expect` (redirect, contains, not_contains, the paths and values of json,
+// the values of headers) and returns why the step cannot be checked, "" when
+// it can:
+//
+//   - a `{{name}}` no earlier step saved. `expect` used to keep such text as
+//     written, also for a saved name, so `not_contains: "{{secret}}"` compared
+//     the response with those characters and passed on every response;
+//   - a `contains`, `not_contains` or `redirect` whose whole text is a saved
+//     value that is empty, which the check would skip.
+//
+// The step's own maps and lists are left as they are.
+func substituteExpectVars(expect AppTestExpect, vars map[string]string) (AppTestExpect, string) {
+	problem := ""
+	// read substitutes into one text of `expect.<key>`. needsText marks a
+	// check that an empty text turns off.
+	read := func(key, text string, needsText bool) string {
+		for _, ref := range testVarRef.FindAllStringSubmatch(text, -1) {
+			if _, saved := vars[ref[1]]; saved || !testVarName.MatchString(ref[1]) || problem != "" {
+				continue
+			}
+			known := "nothing is saved yet"
+			if len(vars) > 0 {
+				known = "saved so far: " + codeList(slices.Sorted(maps.Keys(vars)))
+			}
+			problem = fmt.Sprintf("`expect.%s` reads `%s`, but no earlier step of this test saved `%s` (%s), so the step was not run: compared as written, the check would prove nothing. A `save:` entry saves nothing when the response has no such field or it is null. Braces that are text and not a variable: leave the pair open (`{{%s`)", key, ref[0], ref[1], known, ref[1])
+		}
+		out := replaceTestVars(text, vars)
+		if needsText && out == "" && text != "" && problem == "" {
+			problem = fmt.Sprintf("`expect.%s` reads `%s`, whose saved value is empty, so the step was not run: the check would compare nothing", key, text)
+		}
+		return out
+	}
+	var walk func(key string, v any, needsText bool) any
+	walk = func(key string, v any, needsText bool) any {
+		switch val := v.(type) {
+		case string:
+			return read(key, val, needsText)
+		case []string:
+			out := make([]string, len(val))
+			for i, item := range val {
+				out[i] = read(key, item, needsText)
+			}
+			return out
+		case []any:
+			out := make([]any, len(val))
+			for i, item := range val {
+				out[i] = walk(key, item, needsText)
+			}
+			return out
+		case map[string]any:
+			out := make(map[string]any, len(val))
+			for k, item := range val {
+				out[read(key, k, false)] = walk(key, item, false)
+			}
+			return out
+		}
+		return v
+	}
+	expect.Redirect = read("redirect", expect.Redirect, true)
+	expect.Contains = walk("contains", expect.Contains, true)
+	expect.NotContains = walk("not_contains", expect.NotContains, true)
+	if expect.JSONField != nil {
+		expect.JSONField, _ = walk("json", expect.JSONField, false).(map[string]any)
+	}
+	if expect.Headers != nil {
+		headers := make(map[string]string, len(expect.Headers))
+		for name, value := range expect.Headers {
+			headers[name] = read("headers", value, false)
+		}
+		expect.Headers = headers
+	}
+	return expect, withDocsLine(problem, testVariablesDocs)
+}
 
-	// Build request
+// testStepRequestLine is the method and path of a request step (`api`, `get`,
+// `post`); ok is false for any other step.
+func testStepRequestLine(step AppTestStep) (method, path string, ok bool) {
+	switch {
+	case step.API != "":
+		if parts := strings.SplitN(step.API, " ", 2); len(parts) == 2 {
+			return parts[0], parts[1], true
+		}
+		return "GET", step.API, true
+	case step.Get != "":
+		return "GET", step.Get, true
+	case step.Post != "":
+		return "POST", step.Post, true
+	}
+	return "", "", false
+}
+
+// testStepLabel names a step in a result, as running it would.
+func testStepLabel(step AppTestStep) string {
+	if method, path, ok := testStepRequestLine(step); ok {
+		return method + " " + path
+	}
+	if step.SQL != "" {
+		return fmt.Sprintf("SQL: %s", truncate(step.SQL, 60))
+	}
+	if step.Flush != "" {
+		return "flush: " + step.Flush
+	}
+	return "step"
+}
+
+// buildTestStepRequest is the request a step sends, before its credential is
+// attached (a session cookie or a Bearer token; neither for an anonymous
+// step). A cookie-authenticated step carries the CSRF token as a page of the
+// app would send it: in the `_csrf` field of a form or multipart body, and in
+// X-CSRF-Token for a JSON body or no body. A step with no body used to put
+// the token in a form body for POST, PATCH and DELETE; the server reads a form
+// body only on POST, PUT and PATCH, so every such DELETE answered 403 "Invalid
+// CSRF token" (and a PUT sent no token at all). A form or multipart step on
+// any other method sends the header beside its field for the same reason.
+func buildTestStepRequest(base string, step AppTestStep, method, path string, anon, useBearer bool) (*http.Request, error) {
 	var body io.Reader
 	contentType := ""
+	csrf := !anon && !useBearer
+	csrfHeader := false
+	formBodyRead := method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch
 
-	// Use Bearer auth if explicitly requested OR if we have a token but no cookies
-	// (set_auth switches to token-only auth)
-	useBearer := bearerToken != "" && (step.Bearer || len(cookies) == 0)
-
-	if step.NDJSON != nil {
+	switch {
+	case step.NDJSON != nil:
 		var lines []string
 		for _, obj := range step.NDJSON {
 			line, _ := json.Marshal(obj)
@@ -910,20 +1060,23 @@ func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*h
 		}
 		body = strings.NewReader(strings.Join(lines, "\n"))
 		contentType = "application/x-ndjson"
-	} else if step.JSONArray != nil {
+		csrfHeader = true
+	case step.JSONArray != nil:
 		data, _ := json.Marshal(step.JSONArray)
 		body = strings.NewReader(string(data))
 		contentType = "application/json"
-	} else if step.JSON != nil {
+		csrfHeader = true
+	case step.JSON != nil:
 		data, _ := json.Marshal(step.JSON)
 		body = strings.NewReader(string(data))
 		contentType = "application/json"
-	} else if step.Files != nil {
+		csrfHeader = true
+	case step.Files != nil:
 		// multipart/form-data, as a browser form with a file input sends it:
 		// the CSRF token and the data fields, then one part per file.
 		var buf bytes.Buffer
 		mw := multipart.NewWriter(&buf)
-		if !anon && !useBearer {
+		if csrf {
 			_ = mw.WriteField("_csrf", generateCSRFToken())
 		}
 		for _, k := range slices.Sorted(maps.Keys(step.Data)) {
@@ -938,10 +1091,10 @@ func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*h
 		_ = mw.Close()
 		body = &buf
 		contentType = mw.FormDataContentType()
-	} else if step.Data != nil {
+		csrfHeader = !formBodyRead
+	case step.Data != nil:
 		formData := url.Values{}
-		// Add CSRF unless anon or Bearer
-		if !anon && !useBearer {
+		if csrf {
 			formData.Set("_csrf", generateCSRFToken())
 		}
 		for k, v := range step.Data {
@@ -949,54 +1102,110 @@ func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*h
 		}
 		body = strings.NewReader(formData.Encode())
 		contentType = "application/x-www-form-urlencoded"
-	} else if method == "POST" || method == "PATCH" || method == "DELETE" {
-		// Add CSRF even without data (unless anon or Bearer)
-		if !anon && !useBearer {
-			formData := url.Values{"_csrf": {generateCSRFToken()}}
-			body = strings.NewReader(formData.Encode())
-			contentType = "application/x-www-form-urlencoded"
-		}
+		csrfHeader = !formBodyRead
+	default:
+		// No body: the token travels in the header for every method that
+		// changes something.
+		csrfHeader = method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 	}
 
 	req, err := http.NewRequest(method, base+path, body)
 	if err != nil {
-		return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("Request error: %s", err)}, nil
+		return nil, err
 	}
-
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	// A JSON or NDJSON body has no form field for the token, so a
-	// cookie-authenticated step sends it the way the browser SDK does, in
-	// X-CSRF-Token. Without it such a step could only reach a CSRF-checked
-	// route over Bearer, which skips CSRF, so a test never exercised what a
-	// signed-in page sends.
-	if !anon && !useBearer && (step.JSON != nil || step.JSONArray != nil || step.NDJSON != nil) {
+	if csrf && csrfHeader {
 		req.Header.Set("X-CSRF-Token", generateCSRFToken())
 	}
+	return req, nil
+}
 
-	// Auth: Bearer token or cookies (never both, never for anon)
-	if !anon {
-		if useBearer {
-			req.Header.Set("Authorization", "Bearer "+bearerToken)
-		} else {
-			for _, c := range cookies {
-				req.AddCookie(c)
+func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*http.Cookie, bearerToken string, anon bool, step AppTestStep) (AppTestStepResult, []byte) {
+	method, path, isRequest := testStepRequestLine(step)
+	if !isRequest {
+		if step.SQL != "" {
+			return executeSQLTestStep(app, step), nil
+		}
+		if step.Flush != "" {
+			return executeFlushStep(app, step), nil
+		}
+		// runSingleTest refuses such a test before its first step; a step
+		// with no action never becomes a request for the empty path.
+		return AppTestStepResult{Action: "step", Pass: false, Message: "this step has no action"}, nil
+	}
+
+	action := fmt.Sprintf("%s %s", method, path)
+
+	// Use Bearer auth if explicitly requested OR if we have a token but no cookies
+	// (set_auth switches to token-only auth)
+	useBearer := bearerToken != "" && (step.Bearer || len(cookies) == 0)
+
+	// One request, timed from before it is built until its body is read.
+	send := func() (AppTestStepResult, []byte, time.Duration, bool) {
+		stepStart := time.Now()
+		req, err := buildTestStepRequest(base, step, method, path, anon, useBearer)
+		if err != nil {
+			return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("Request error: %s", err)}, nil, 0, false
+		}
+
+		// Auth: Bearer token or cookies (never both, never for anon)
+		if !anon {
+			if useBearer {
+				req.Header.Set("Authorization", "Bearer "+bearerToken)
+			} else {
+				for _, c := range cookies {
+					req.AddCookie(c)
+				}
 			}
 		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("Request failed: %s", err)}, nil, 0, false
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+
+		elapsed := time.Since(stepStart)
+
+		// Run assertions
+		result := checkAssertions(action, resp, respBody, step.Expect, elapsed)
+		// onlySlow: the answer is the expected one and nothing but its time
+		// failed the step.
+		onlySlow := false
+		if !result.Pass && testStepOverMaxDuration(step.Expect, elapsed) {
+			timeless := step.Expect
+			timeless.MaxDuration = ""
+			onlySlow = checkAssertions(action, resp, respBody, timeless, elapsed).Pass
+		}
+		return result, respBody, elapsed, onlySlow
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("Request failed: %s", err)}, nil
+	var took []string
+	for {
+		result, respBody, elapsed, onlySlow := send()
+		took = append(took, elapsed.String())
+		if !onlySlow || len(took) >= step.DurationAttempts {
+			if onlySlow && len(took) > 1 {
+				maxDur, _ := time.ParseDuration(step.Expect.MaxDuration)
+				result.Message = fmt.Sprintf("Took %s in %d requests (every one over the bound), max allowed %s",
+					strings.Join(took, ", "), len(took), maxDur)
+			}
+			return result, respBody
+		}
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+}
 
-	elapsed := time.Since(stepStart)
-
-	// Run assertions
-	return checkAssertions(action, resp, respBody, step.Expect, elapsed), respBody
+// testStepOverMaxDuration reports whether a request took longer than the
+// step's `expect.max_duration` allows.
+func testStepOverMaxDuration(expect AppTestExpect, elapsed time.Duration) bool {
+	if expect.MaxDuration == "" {
+		return false
+	}
+	maxDur, err := time.ParseDuration(expect.MaxDuration)
+	return err == nil && elapsed > maxDur
 }
 
 func executeSQLTestStep(app *App, step AppTestStep) AppTestStepResult {
@@ -1174,13 +1383,11 @@ func checkAssertions(action string, resp *http.Response, body []byte, expect App
 	}
 
 	// Max duration
-	if expect.MaxDuration != "" {
-		maxDur, err := time.ParseDuration(expect.MaxDuration)
-		if err == nil && elapsed > maxDur {
-			return AppTestStepResult{
-				Action: action, Pass: false,
-				Message: fmt.Sprintf("Took %s, max allowed %s", elapsed, maxDur),
-			}
+	if testStepOverMaxDuration(expect, elapsed) {
+		maxDur, _ := time.ParseDuration(expect.MaxDuration)
+		return AppTestStepResult{
+			Action: action, Pass: false,
+			Message: fmt.Sprintf("Took %s, max allowed %s", elapsed, maxDur),
 		}
 	}
 

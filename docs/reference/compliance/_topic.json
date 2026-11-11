@@ -3,6 +3,7 @@
     "private_uploads",
     "read_audit",
     "workforce_reads",
+    "not_covered",
     "summary",
     "controls"
   ]

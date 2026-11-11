@@ -634,6 +634,12 @@ type FlowContext struct {
 	// the source expression resolves to Go `nil`.
 	NullParams map[string]bool
 	Stopped    bool // set by redirect/respond to halt pipeline
+	// respondFailure is set when a respond step could not produce its answer
+	// and answered the template_unresolved envelope in its place, without a
+	// step error (noteRespondFailure). respondFailureStep names that step. A
+	// transactional request flow rolls back on it (executeFlowHTTP).
+	respondFailure     error
+	respondFailureStep string
 	// errorResponse means an on_error handler produced the terminal HTTP
 	// response. Error remains set for diagnostics and transaction rollback.
 	errorResponse bool

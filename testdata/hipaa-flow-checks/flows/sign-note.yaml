@@ -1,0 +1,19 @@
+# flows/sign-note.yaml: the write and its audit row, in one transaction
+on:
+  request: { method: POST, path: /api/notes/:id/sign, auth: required, transaction: true }
+jobs:
+  sign_note:
+    steps:
+      - id: note
+        run: sql
+        with:
+          query: "UPDATE visit_notes SET signed_at = datetime('now') WHERE id = :id AND user_id = :user_id AND signed_at IS NULL RETURNING id, signed_at"
+        expect_rows: "=1"
+      - run: sql
+        with:
+          query: >
+            INSERT INTO _benmore_audit_log (action, table_name, row_id, user_id, user_email, new_values)
+            VALUES ('update', 'visit_notes', :id, :user_id, :user_email, json_object('signed_at', :signed_at))
+          params: { signed_at: "${{ steps.note.outputs.first.signed_at }}" }
+      - run: respond
+        with: { json: { id: "${{ steps.note.outputs.first.id }}", signed_at: "${{ steps.note.outputs.first.signed_at }}" } }

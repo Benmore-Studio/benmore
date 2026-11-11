@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -335,9 +337,10 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 	// Reverts are updates, including write policy, edit ACLs, locks, validators,
 	// protected columns, membership, before/after hooks, audit and broadcasts.
 	// Reuse the transaction pipeline rather than issuing a privileged raw UPDATE.
+	// The update writes only the columns the revert changes (revertChanges).
 	result := newFlowResponseBuffer()
 	executeCRUDTransaction(result, r, app, []transactionOp{{
-		Table: table, Action: "update", ID: id, Data: versionRow,
+		Table: table, Action: "update", ID: id, Data: revertChanges(app, session, table, id, versionRow),
 	}})
 	if result.status != http.StatusOK {
 		result.flushTo(w)
@@ -354,6 +357,57 @@ func handleRevert(w http.ResponseWriter, r *http.Request, app *App, table string
 		"owned_fields_kept":   skippedOwned,
 		"kept":                kept,
 	})
+}
+
+// revertChanges narrows a version's columns to the ones a revert changes:
+// those the update pipeline writes whose value in the version differs from
+// the row's current value. The update's before-hooks read the columns it
+// writes as {{_submitted}}, so a revert that sent every column of the version
+// looked like a request setting all of them, and a hook that refuses a
+// caller-set column ("set by the server") refused every revert of the table,
+// whatever the version changed. A column left out here is not written at
+// all, so a hook is told about every column whose value the revert changes;
+// one that changes after this read is left at its newer value.
+//
+// The current row is read like the version (same declared column types, same
+// decryption), so equal values compare equal; anything else counts as a
+// change. Columns the pipeline drops are not changes: protected ones
+// (protectedUpdateFields) and an encrypted value that is the caller's mask
+// or the decrypt-failure placeholder (maskedEchoFields). When nothing is
+// left, the version's columns are written as they are, as before: an update
+// needs a column to write, and that write still runs the pipeline's checks
+// and records the revert.
+func revertChanges(app *App, session *Session, table, id string, versionRow map[string]any) map[string]any {
+	rows, err := queryNativeRowsWith(app.DB, app, table,
+		fmt.Sprintf("SELECT * FROM main.%s WHERE id = ?", quoteIdent(table)), id)
+	if err != nil || len(rows) != 1 {
+		return versionRow
+	}
+	current := rows[0]
+	protected := protectedFields(protectedUpdateFields(app, table))
+	echoes := maskedEchoFields(app.DB, app, session, table, current, versionRow)
+	changes := make(map[string]any, len(versionRow))
+	for column, value := range versionRow {
+		if protected.has(column) || slices.Contains(echoes, column) {
+			continue
+		}
+		if now, ok := current[column]; !ok || !revertSameValue(now, value) {
+			changes[column] = value
+		}
+	}
+	if len(changes) == 0 {
+		return versionRow
+	}
+	return changes
+}
+
+// revertSameValue reports whether a version's value is the row's current one,
+// both as scanned from columns of the same declared type.
+func revertSameValue(current, version any) bool {
+	if versionedValueIsNull(current) || versionedValueIsNull(version) {
+		return versionedValueIsNull(current) && versionedValueIsNull(version)
+	}
+	return reflect.DeepEqual(current, version)
 }
 
 // revertSnapshotColumns splits the source table's non-key columns into those

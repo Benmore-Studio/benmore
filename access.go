@@ -738,14 +738,15 @@ func memberOfPredicate(app *App, table string, rule *memberOfRule, session *Sess
 		membershipLiveConds(app.Group, rule.Table, membership, appColumnChecker(app, rule.Table)), aclSQL)
 	args := append([]any{rule.userValue(session)}, aclArgs...)
 	if memberOfTenantKeyed(app, table) {
-		if !session.EffectiveHasGroup() {
+		tenantPred, tenantArgs, tenant := rowTenantClause(app, table, session)
+		if !tenant {
 			// A caller with no tenant (removed from their company, or never
 			// in one) gains nothing on a tenant-keyed table from membership
 			// rows, as with group scoping: only an explicit share counts.
 			return aclSQL, aclArgs
 		}
-		pred = fmt.Sprintf("(%s = ? AND %s)", quoteIdent(app.Group.Key), pred)
-		args = append([]any{session.EffectiveGroupID()}, args...)
+		pred = fmt.Sprintf("(%s AND %s)", tenantPred, pred)
+		args = append(tenantArgs, args...)
 	}
 	return pred, args
 }
@@ -993,7 +994,7 @@ func wsRoomPatternRefusal(pattern string) string {
 			return msg + fmt.Sprintf(" Write %q to restrict rooms named like %s42%s: the placeholder's value is the membership join value.", fixed, p.prefix, p.suffix)
 		}
 	}
-	return msg + " A pattern is a literal room name or holds one `:name` placeholder, whose value is the membership join value: \"room-:id\" restricts rooms named like room-42. A literal `:` may come only directly before the placeholder: \"chat::id\" restricts rooms named like chat:42. Use `-`, `.` or `_` for any other separator in the room name."
+	return msg + " A pattern is a literal room name or holds one `:name` placeholder, whose value is the membership join value: \"room-:id\" restricts rooms named like room-42. A literal `:` may come only directly before the placeholder: \"chat::id\" restricts rooms named like chat:42. Use `-` or `.` for any other separator in the room name (`_` works before the placeholder; directly after it a `_` is part of the placeholder's name)."
 }
 
 // errMemberOfUnverified: an email-keyed membership can't be founded for an
@@ -1235,10 +1236,10 @@ func EnforceCRUDAccess(w http.ResponseWriter, r *http.Request, app *App, table s
 		// REST-correct response is 200 []. Returning 404 here breaks
 		// onboarding boots that legitimately list before a group is
 		// established (the SPA can't decide where to route the user if
-		// list endpoints throw). handleList's per-row WHERE builder
-		// already handles "no group" by falling back to user_id scoping
-		// (or returning nothing on tables without user_id), so passing
-		// the gate is safe - the empty result emerges naturally.
+		// list endpoints throw). The per-row scope (rowScopeClause)
+		// already handles "no group": only rows shared with the caller
+		// and their own rows that carry no tenant, so passing the gate
+		// is safe - the empty result emerges naturally.
 		//
 		// Single-row reads (targetUserID != 0) and writes still fail
 		// here: those would either leak existence of rows the caller
@@ -1353,6 +1354,14 @@ func (a *AccessConfig) ReadAllowsBroaderRows(mode string) bool {
 //   - On a group-keyed table with an EFFECTIVE group, every predicate
 //     (owner, role tier, ACL grant, membership) is AND'd with
 //     `group_key = ?`: a record-level share never crosses tenants.
+//   - On a group-keyed table WITHOUT an effective group, the owner tier
+//     reaches only the caller's rows that carry no tenant
+//     (rowCarriesNoTenantSQL): a row with a tenant belongs to that tenant,
+//     and a member removed from it does not keep the rows they created.
+//     An explicit ACL grant still authorizes a row, and on the groups
+//     membership table the caller's own row stays in the owner tier.
+//     An action whose rule is DECLARED `self` is the exception: it keeps
+//     `(user_id = ? OR <acl>)` for a caller with no tenant.
 //   - table has neither + not bypass        → ("", nil, false): no columns to
 //     scope by (unscoped table - same as the historical inline behavior).
 //
@@ -1394,31 +1403,51 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 	// tenant clause around its WHOLE predicate - owner rows, role tiers and
 	// record-level ACL grants alike - so a share (or a stale owner row) from
 	// another tenant can never reach this caller.
-	tableIsGrouped := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-	tenant := tableIsGrouped && session.EffectiveHasGroup()
+	tableIsGrouped := memberOfTenantKeyed(app, table)
+	tenantPred, tenantArgs, tenant := rowTenantClause(app, table, session)
 	withTenant := func(pred string, pargs []any) (string, []any, bool) {
 		if !tenant {
 			return pred, pargs, false
 		}
-		return fmt.Sprintf("(%s = ? AND %s)", quoteIdent(app.Group.Key), pred),
-			append([]any{session.EffectiveGroupID()}, pargs...), false
+		return fmt.Sprintf("(%s AND %s)", tenantPred, pred),
+			append(append([]any{}, tenantArgs...), pargs...), false
+	}
+	// ownerTier is the owner predicate with its arguments. A caller with no
+	// effective tenant owns, on a group-keyed table, only rows that carry no
+	// tenant: there is no tenant clause to AND around the tier for them, and
+	// without this bound a member removed from a tenant kept reading (and
+	// under the owner-scoped modes editing, deleting and sharing) every
+	// tenant row they had created, other members' later edits included.
+	// One row with a tenant stays theirs: their own row of the groups
+	// membership table (ownMembershipRowSQL), so a member whose membership is
+	// switched off still sees it and may leave. What they may change on it is
+	// the membership gates' decision (groups_membership_manage.go,
+	// membershipActivationDenial), as before.
+	ownerTier, ownerArgs := "user_id = ?", []any{session.UserID}
+	if tableIsGrouped && !tenant {
+		ownerTier = "(user_id = ? AND " + rowCarriesNoTenantSQL(app) + ")"
+		if own, member, ok := ownMembershipRowSQL(app, table, session); ok {
+			ownerTier = "(user_id = ? AND (" + rowCarriesNoTenantSQL(app) + " OR " + own + "))"
+			ownerArgs = append(ownerArgs, member)
+		}
 	}
 	if roles, ok := ownerOrRoleFor(app, table, opForACLAction(aclAction)); ok {
 		if tenant && HasAnyRole(session, roles) {
 			// Role-holder sees their whole tenant.
-			return fmt.Sprintf("(%s = ?)", quoteIdent(app.Group.Key)), []any{session.EffectiveGroupID()}, false
+			return "(" + tenantPred + ")", tenantArgs, false
 		}
 		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
 		var parts []string
 		var sargs []any
 		if hasColumn(app, table, "user_id") {
-			parts = append(parts, "user_id = ?")
-			sargs = append(sargs, session.UserID)
+			parts = append(parts, ownerTier)
+			sargs = append(sargs, ownerArgs...)
 		}
 		// A role-holder on a genuinely un-grouped table sees every row. On a
 		// group-keyed table with NO effective group the role tier contributes
 		// nothing: `1=1` there would expose EVERY tenant's rows to a group-less
-		// role-holder. Fall back to owner-only (the user_id tier).
+		// role-holder. Fall back to the owner tier, which for that caller
+		// holds only their rows that carry no tenant.
 		//
 		// Only a GLOBALLY held role earns that: an un-grouped table has no
 		// tenant column, so a role held inside one tenant (the membership
@@ -1441,6 +1470,14 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 	// before a move, or while acting as a different group) stays out of
 	// scope. The IMPLICIT default for a user_id + tenant-key table is still
 	// tenant-wide (the group branch).
+	//
+	// A caller with NO tenant keeps the plain owner tier here, for the
+	// action whose rule is declared `self` (explicitSelfFor: the table's own
+	// key for the action, its `all:`, or the global `default:`): the builder
+	// wrote "the owner reaches their own row" for it, and apps declare it on
+	// a tenant-keyed table for rows a not-yet-member owns (a request to join
+	// a tenant that its requester tracks and withdraws). The bound above is
+	// for the modes where the tenant, not the builder's rule, decides.
 	if explicitSelfFor(app, table, opForACLAction(aclAction)) {
 		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
 		return withTenant(fmt.Sprintf("(user_id = ? OR %s)", aclSQL), append([]any{session.UserID}, aclArgs...))
@@ -1449,7 +1486,7 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 		// Group mode: every member of the tenant already reaches every tenant
 		// row, so a record-level grant adds nothing inside the tenant - and
 		// OR-ing it in unguarded let a share reach a user in ANOTHER tenant.
-		return fmt.Sprintf("(%s = ?)", quoteIdent(app.Group.Key)), []any{session.EffectiveGroupID()}, false
+		return "(" + tenantPred + ")", tenantArgs, false
 	}
 	// A role/permission on the tenant root scopes by tenant id even when
 	// bootstrap records its founder in user_id. Ownership of an old tenant
@@ -1459,16 +1496,63 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 	}
 	if hasColumn(app, table, "user_id") {
 		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
-		return fmt.Sprintf("(user_id = ? OR %s)", aclSQL),
-			append([]any{session.UserID}, aclArgs...), false
+		return fmt.Sprintf("(%s OR %s)", ownerTier, aclSQL),
+			append(ownerArgs, aclArgs...), false
 	}
-	if app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key) {
+	if tableIsGrouped {
 		// A group-keyed table is still scoped when the caller has no group.
 		// Only an explicit ACL grant can authorize a row in that case.
 		pred, args := aclFilter(table, sessionGrantEmail(session), aclAction)
 		return pred, args, false
 	}
 	return "", nil, false
+}
+
+// rowCarriesNoTenantSQL matches a row of a group-keyed table that belongs to
+// no tenant: its tenant key is NULL, empty or 0, the values a session without
+// a tenant holds (EffectiveHasGroup). Such a row is what a signed-in user
+// creates before joining or founding a tenant (the create injects the key
+// only from a session that has one), so its owner keeps it while tenant-less.
+// The '0' literal takes the column's affinity: it matches 0 in an integer key
+// and '0' in a text one.
+func rowCarriesNoTenantSQL(app *App) string {
+	key := quoteIdent(app.Group.Key)
+	return fmt.Sprintf("(%s IS NULL OR %s = '' OR %s = '0')", key, key, key)
+}
+
+// ownMembershipRowSQL matches, on the groups membership table, the rows that
+// name the session as the member: groups.user_field compared with the value
+// membership resolution uses (groupMemberValue: the user id, or the proven
+// address for an email-keyed table), the comparison membershipOwnRow makes.
+// ok=false on any other table, when the table lacks the column, or when the
+// session can hold no membership (an unproven address).
+func ownMembershipRowSQL(app *App, table string, session *Session) (pred string, member any, ok bool) {
+	g := app.Group
+	if g == nil || g.Table == "" || !identIs(table, g.Table) || !membershipIdentRe.MatchString(g.UserField) || !hasColumn(app, table, g.UserField) {
+		return "", nil, false
+	}
+	member, ok = groupMemberValue(g, session)
+	if !ok {
+		return "", nil, false
+	}
+	return quoteIdent(g.UserField) + " = ?", member, true
+}
+
+// rowTenantClause is the tenant clause of rowScopeClause on its own: on a
+// table that carries the groups: key, for a session with an EFFECTIVE
+// (act-as-aware) tenant, `<group key> = ?` bound to that tenant. ok is false
+// when the table has no tenant key or the session has no tenant; no tenant
+// clause applies then (rowScopeClause falls back to ownership and grants).
+//
+// rowScopeClause and memberOfPredicate AND it around what they return. A
+// surface that must stay inside the record's tenant without requiring access
+// to the row (who can be named approver of a record, approval_audience.go)
+// uses it directly instead of writing the comparison again.
+func rowTenantClause(app *App, table string, session *Session) (pred string, args []any, ok bool) {
+	if !memberOfTenantKeyed(app, table) || !session.EffectiveHasGroup() {
+		return "", nil, false
+	}
+	return quoteIdent(app.Group.Key) + " = ?", []any{session.EffectiveGroupID()}, true
 }
 
 // rowIDCanonical reports whether id is the one spelling of a row id of table

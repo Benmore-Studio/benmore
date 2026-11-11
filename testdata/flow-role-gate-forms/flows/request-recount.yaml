@@ -1,0 +1,23 @@
+# flows/request-recount.yaml - several roles in front of background work. A
+# `mode: async` flow answers 202 before its steps run, so a step cannot refuse
+# the caller: this synchronous flow checks the role, queues the worker and
+# answers 202 itself.
+on:
+  request:
+    method: POST
+    path: /api/request-recount
+    auth: required
+    transaction: true
+jobs:
+  request:
+    steps:
+      - if: ${{ user.role != 'warehouse' && user.role != 'manager' && user.role != 'admin' }}
+        run: respond
+        with: { status: 403, json: { error: forbidden } }
+      - id: queued
+        run: enqueue
+        with:
+          flow: recount-stock
+          with: { sku: "${{ params.sku }}", requested_by: "${{ user.id }}" }
+      - run: respond
+        with: { status: 202, json: { job_id: "${{ steps.queued.outputs.job_id }}" } }

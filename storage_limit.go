@@ -192,15 +192,22 @@ func authorizeStorageCeiling(action int, arg1, arg2, database string) int {
 }
 
 // restoreConnAuthorizer ends a caller's temporary authorizer (read-only
-// queries, app resets) and puts back the connection's default: the storage
-// ceiling guard when its database has a limit, none otherwise. Clearing the
-// authorizer with nil would let later app SQL on the pooled connection lift
-// the ceiling.
+// queries, app resets) and puts back the connection's default: the app SQL
+// scope, and the storage ceiling guard when its database has a limit. Clearing
+// the authorizer with nil would let later app SQL on the pooled connection
+// lift the ceiling or change framework objects.
 func restoreConnAuthorizer(conn *sqlite3.SQLiteConn) {
 	if conn == nil {
 		return
 	}
-	if effectiveDBStorageLimit(canonicalDBPath(conn.GetFilename("main"))) > 0 {
+	ceiling := effectiveDBStorageLimit(canonicalDBPath(conn.GetFilename("main"))) > 0
+	// A framework connection's default also carries the app SQL scope
+	// (app_sql_guard.go).
+	if c, ok := benmoreConnsByDriverConn.Load(conn); ok {
+		c.(*benmoreConn).installDefaultAuthorizer(ceiling)
+		return
+	}
+	if ceiling {
 		conn.RegisterAuthorizer(authorizeStorageCeiling)
 		return
 	}

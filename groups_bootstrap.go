@@ -274,6 +274,10 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		if respondStorageFull(w, app, err) {
 			return
 		}
+		// A missing parent the visibility check above does not cover.
+		if writeFKTargetDenial(w, foreignKeyConstraintDenial(tx, app, orgTable, submitted, err)) {
+			return
+		}
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "org insert failed: " + publicConstraintMessage(app, "bootstrap insert "+orgTable, err)})
 		return
 	}

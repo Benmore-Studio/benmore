@@ -388,14 +388,13 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// admin-only when the app declares any roles (otherwise the
 	// listing is empty anyway).
 	mux.HandleFunc("GET /api/_auth/roles", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
 		// Admin-only (matches the doc above): the full role catalogue + effective
 		// scopes is reconnaissance for in-tenant escalation (tells an attacker
 		// which role name to target). A regular member has no need for it.
 		// IsAdminConsole (rule 15b): a scoped token an admin minted for an
 		// integration carries only its scopes, not the admin console.
-		if !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		out := make([]map[string]any, 0)
@@ -522,14 +521,13 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// When omitted (or empty / null), the grant is GLOBAL - applies
 	// in every group context, identical to the v2.7.54 default.
 	mux.HandleFunc("POST /api/_auth/users/{id}/roles", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
 		// IsAdminConsole (rule 15b): an admin on an unscoped credential, so
 		// a token scoped to, say, contacts:read held by an admin can never
 		// widen its own or anyone else's access. The credential's scopes
 		// decide, not the role-derived session scopes (a roles: block that
 		// declares admin with narrow scopes narrows those).
-		if !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
+		session := adminConsoleSession(w, r, app, "admin with a full-access session required")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -659,9 +657,8 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// targeted by (user_id, role, group_id) - omitting the query
 	// param targets the GLOBAL grant (group_id IS NULL).
 	mux.HandleFunc("PATCH /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
+		session := adminConsoleSession(w, r, app, "admin with a full-access session required")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {
@@ -761,9 +758,8 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 	// "the last admin" because they don't grant cross-tenant authority -
 	// removing them can't lock the system out of admin.
 	mux.HandleFunc("DELETE /api/_auth/users/{id}/roles/{role}", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin with a full-access session required"})
+		session := adminConsoleSession(w, r, app, "admin with a full-access session required")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {

@@ -1,2 +1,3 @@
-POST /api/_presence/heartbeat   {slug, action: 'join'|'heartbeat'|'leave'}  → {ok: true, members: <count>, expires_in_s, heartbeat_s}
+POST /api/_presence/heartbeat   {slug, action: 'join'|'heartbeat'|'leave'}  → {ok: true, members: <count>, expires_in_s: 90, heartbeat_s: 20}
 GET  /api/_presence?slug=...    → {slug, count, members: [{user_id, joined_at, last_seen_at}]}
+`heartbeat_s` is the heartbeat interval the endpoint advises (bm.presence sends one every 18 s, just under it); a member is retired after `expires_in_s` without one. A `leave` from a caller who is not a member of the slug's `ws_rooms` room answers {ok: true, expires_in_s, heartbeat_s} with no `members`.

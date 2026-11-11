@@ -2,4 +2,5 @@
 const url = await bm.signedUrl(doc.file_url, { record: { table: 'documents', id: doc.id } });
 img.src = url;                       // valid 5 min (SDK default ttlSeconds: 300; audio/video default 4h so playback outlives it), authorized against doc's access policy
 // Custom TTL: bm.signedUrl(path, { ttlSeconds: 120, record: { table, id } })  (a bare number is the TTL)
+// ttlSeconds is whole seconds, at least 1, at most 21600 (6h; more gives 6h). 0, a negative number or a fraction throws (400 invalid_expires_in); it is never replaced by a default.
 // Public file: const u = await bm.signedUrl(publicUrl);   // no record needed

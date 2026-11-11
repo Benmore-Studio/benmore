@@ -434,8 +434,11 @@ export const query: {
   fetch<T = unknown>(key: unknown, fetcher: () => Promise<T> | T, opts?: QueryFetchOpts): Promise<T>;
   refetch<T = unknown>(key: unknown): Promise<T | undefined>;
   invalidate(match: unknown | ((rawKey: unknown, stableKey: string) => boolean), opts?: { refetch?: boolean }): string[];
-  tableKey(table: string, spec?: Record<string, unknown>): unknown[];
+  /** The key table(table, opts) caches under, for the same arguments: opts.key when given, else derived from the request. Pass it to subscribe/get/set/invalidate/mutate. */
+  tableKey(table: string, opts?: Omit<QuerySpec, "table"> & QueryFetchOpts): unknown;
+  /** Cached under opts.key when given: name one to subscribe to the result. */
   read<T = unknown>(spec: QuerySpec, opts?: QueryFetchOpts): Promise<T[]>;
+  /** Cached under tableKey(table, opts). */
   table<T = unknown>(table: string, opts?: Omit<QuerySpec, "table"> & QueryFetchOpts): Promise<T[]>;
   invalidateTable(table: string, opts?: { refetch?: boolean }): string[];
   mutate<T = unknown>(opts: QueryMutateOpts<T>): Promise<T>;

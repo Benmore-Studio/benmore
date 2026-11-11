@@ -155,6 +155,42 @@ an_admin_adds_a_member_with_a_role:
     - sql: "SELECT id FROM projects WHERE id = {{project_id}}"
       expect: { rows: 0 }
 
+# A signed-in account that belongs to no organisation has no tenant to bind:
+# the add-member flow answers the same 403 as any other non-admin.
+an_account_with_no_organisation_is_not_an_org_admin:
+  as_user: "lone@tenants.test"
+  users:
+    - "target@tenants.test"
+  steps:
+    - api: "POST /api/org/members"
+      json: { email: "target@tenants.test" }
+      expect:
+        status: 403
+        json: { error: not_org_admin }
+    - sql: "SELECT m.id FROM org_members m JOIN _benmore_users u ON u.id = m.user_id WHERE u.email IN ('target@tenants.test', 'lone@tenants.test')"
+      expect: { rows: 0 }
+
+# The flow adds any existing account without asking it, another
+# organisation's member included; that account can then switch into the new
+# organisation. An app that needs consent replaces the flow with an invitation.
+an_admin_can_add_a_member_of_another_organisation:
+  as_user: "ada@tenants.test"
+  users:
+    - "bea@tenants.test"
+  setup:
+    - sql: "INSERT INTO organizations (id, name) VALUES (700, 'Beta')"
+    - sql: "INSERT INTO org_members (org_id, user_id, member_role) SELECT 700, id, 'member' FROM _benmore_users WHERE email = 'bea@tenants.test'"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Alpha" }
+      save: { org_id: "group_id" }
+      expect: { status: 200 }
+    - api: "POST /api/org/members"
+      json: { email: "bea@tenants.test" }
+      expect: { status: 201 }
+    - sql: "SELECT m.id FROM org_members m JOIN _benmore_users u ON u.id = m.user_id WHERE u.email = 'bea@tenants.test' AND m.org_id IN (700, {{org_id}})"
+      expect: { rows: 2 }
+
 signed_out_callers_get_nothing:
   anon: true
   steps:

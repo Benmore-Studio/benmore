@@ -412,7 +412,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 	}
 	headers, headerErr := renderRespondHeaders(ctx, r)
 	if more := ctx.takeMissingRefs(); len(missing)+len(more) > 0 {
-		writeRespondUnresolved(ctx, append(missing, more...))
+		writeRespondUnresolved(ctx, step, append(missing, more...))
 		ctx.Stopped = true
 		return nil
 	}
@@ -494,6 +494,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 			ctx.Writer.Header().Set("Content-Type", "application/json")
 			ctx.Writer.WriteHeader(500)
 			json.NewEncoder(ctx.Writer).Encode(envelope)
+			ctx.noteRespondFailure(step, []string{key})
 			ctx.Stopped = true
 			return nil
 		}
@@ -512,7 +513,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 			return err
 		}
 		if missing := ctx.takeMissingRefs(); len(missing) > 0 {
-			writeRespondUnresolved(ctx, missing)
+			writeRespondUnresolved(ctx, step, missing)
 			ctx.Stopped = true
 			return nil
 		}
@@ -521,7 +522,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 		// Interpolate {{var}} placeholders in JSON values before encoding
 		resolved := interpolateJSONValues(r.JSON, ctx)
 		if missing := ctx.takeMissingRefs(); len(missing) > 0 {
-			writeRespondUnresolved(ctx, missing)
+			writeRespondUnresolved(ctx, step, missing)
 			ctx.Stopped = true
 			return nil
 		}
@@ -533,7 +534,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 	} else if r.Body != "" {
 		rendered := interpolateCtx(r.Body, ctx)
 		if missing := ctx.takeMissingRefs(); len(missing) > 0 {
-			writeRespondUnresolved(ctx, missing)
+			writeRespondUnresolved(ctx, step, missing)
 			ctx.Stopped = true
 			return nil
 		}
@@ -543,10 +544,14 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 			contentType = respondBodyContentType(r.Body, rendered)
 		}
 		write(contentType, []byte(rendered))
+	} else {
+		// No body: the status (with any headers) is the answer. This step
+		// used to write nothing and leave the run going, so a 403 guard
+		// written without a body let the steps after it run, and a flow
+		// that ended on `status: 204` committed and answered 500
+		// flow_no_response.
+		write(r.ContentType, nil)
 	}
-	// If we got here without writing, fall through to the global
-	// default-response path in executeFlow (which now emits a 500
-	// + flow_no_response diagnostic instead of "status: ok").
 	return nil
 }
 
@@ -595,7 +600,8 @@ func respondTemplateLiteral(template string) string {
 // provide automatically (e.g. an unresolved `${{ user.first_name }}`
 // when auth wasn't required on the route). The keys are listed only for a
 // development app (flowDiagnosticKeys); the field is omitted otherwise.
-func writeRespondUnresolved(ctx *FlowContext, missing []string) {
+func writeRespondUnresolved(ctx *FlowContext, step *FlowStep, missing []string) {
+	ctx.noteRespondFailure(step, missing)
 	envelope := map[string]any{
 		"error":           "template_unresolved",
 		"unresolved_refs": missing,
@@ -610,6 +616,20 @@ func writeRespondUnresolved(ctx *FlowContext, missing []string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(500)
 	_ = json.NewEncoder(w).Encode(envelope)
+}
+
+// noteRespondFailure records that a respond step answered template_unresolved
+// in place of its own answer. The step returns no error (the envelope is the
+// answer, and an on_error handler does not run for it), so without this
+// record the run looked successful: a `transaction: true` request flow
+// committed its order, stock and queued jobs behind a 500, and the caller's
+// retry wrote them again. executeFlowHTTP reads it to roll back.
+func (ctx *FlowContext) noteRespondFailure(step *FlowStep, missing []string) {
+	ctx.respondFailure = errors.New("template_unresolved: " + strings.Join(missing, ", "))
+	ctx.respondFailureStep = "respond"
+	if step != nil && step.Name != "" {
+		ctx.respondFailureStep = flowStepDisplayName(step.Name)
+	}
 }
 
 // recordRespondUnresolved keeps a template_unresolved halt server-side (the

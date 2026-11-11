@@ -1,0 +1,12 @@
+# The columns the response needs, by name.
+on:
+  request: { method: GET, path: /api/patient-card, auth: required }
+jobs:
+  patient_card:
+    steps:
+      - id: p
+        run: sql
+        with:
+          query: "SELECT id, name FROM patients WHERE user_id = :user_id"
+      - run: respond
+        with: { json: { patient: "${{ steps.p.outputs.first }}" } }

@@ -83,6 +83,8 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"hasWorkflowRole":                {[]string{"appMCPCommandHasWorkflowRole"}, "transition role guards, compared as the CRUD route compares them"},
 	"workflowRoleRequired":           {[]string{"workflowRoleRequired"}, "a refused transition names the roles it needs, as on the CRUD route"},
 	"whenHolds":                      {[]string{"evaluateWhen"}, "transition and hook when: conditions"},
+	"transitionEventRow":             {[]string{"transitionEventRow"}, "a transition's when: is judged over the same row on both paths: the stored row, old_<column> and the actor's session keys"},
+	"rowWithOldValues":               {nil, "plumbing: adds old_<column> to a transition's event row; a command's update rows carry the same before-image"},
 	"injectSessionContext":           {[]string{"injectSessionContext"}, "hook, validator and effect rows carry the trusted actor context"},
 	"markSubmittedFields":            {[]string{"markSubmittedFields"}, "{{_submitted}} for before-hooks and validators"},
 	"encryptedDefFor":                {[]string{"commandVerifiedTriggerFunction", "maskEncryptedFieldsWith"}, "encryption triggers run inside the command statement; reads use the shared per-row unmask policy through the command transaction"},
@@ -129,7 +131,7 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"ownerOrTenantReplaced":        {nil, "author-scoped: reports a request's replaced owner or tenant in X-Stripped-Fields; reviewed command SQL binds its own owner and tenant columns, so no request value is ever replaced"},
 	"cascadeSoftDelete":            {nil, "author-scoped: the reviewed apply SQL names every row it deletes"},
 	"cascadeSoftDeleteChildren":    {nil, "author-scoped: the reviewed apply SQL names every row it deletes"},
-	"execVersioned":                {nil, "commands cannot write a versioned table: the enrolled-table trigger closure refuses its history triggers, so there is no version to attribute"},
+	"execVersioned":                {[]string{"appMCPCommandAttributeVersions"}, "the verified history triggers record the versions inside the command statement; the versions an apply recorded are stamped with the approving actor in the command transaction"},
 	"SessionCanAccessTable":        {nil, "author-scoped: the reviewed apply SQL names every row it deletes; a CRUD cascade checks the child table's delete mode for the deleting caller"},
 	"ownedFieldChecker":            {nil, commandParityOwned},
 	"ownedFieldViolation":          {nil, commandParityOwned},
@@ -141,7 +143,7 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"checkStorageCap":              {nil, "the storage ceiling is enforced by the sqlite3_benmore driver on the command's own connection; this projects multipart upload size and commands cannot upload"},
 	"respondStorageFull":           {nil, "the storage ceiling is enforced by the sqlite3_benmore driver on the command's own connection"},
 	"isStorageFullError":           {nil, "the storage ceiling is enforced by the sqlite3_benmore driver on the command's own connection"},
-	"respondMediaAllowance":        {nil, "HTTP status mapping only (507 + used and limit bytes) for a multipart create whose file the account's media storage allowance refused; the allowance itself is enforced where the storage backend asks the router for an upload URL, so the one way a command stores a file, an approved pull (appMCPStorePulledFile, the same backend Save), meets the same refusal and its transfer job fails without storing"},
+	"writeUploadRefusal":           {nil, "HTTP status mapping only for a multipart create whose file was refused (413 size, 415 type, 507 + used and limit bytes for the account's media storage allowance); the allowance itself is enforced where the storage backend asks the router for an upload URL, so the one way a command stores a file, an approved pull (appMCPStorePulledFile, the same backend Save), meets the same refusal and its transfer job fails without storing"},
 	"respondDatabaseBusy":          {nil, "HTTP status mapping only (503 + Retry-After); a command attempt that hits a lock timeout fails retryable through the operation lifecycle"},
 	"answerIfRequestBodyTooLarge":  {nil, "HTTP status mapping only (413 + the limit) for a request body over its cap; command inputs arrive in the connector call and are bounded by the closed input schema"},
 	"writeBatchTooLarge":           {nil, "HTTP status mapping only (413 + the limit) for a batch or transaction naming more than maxBatchItems rows; a command's writes are its own reviewed SQL, bounded by the command's own limits"},
@@ -151,6 +153,9 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"parseFormBody":                {nil, "HTTP form decoding only (an urlencoded body cut by the body cap is reported, not read as no fields); command inputs arrive in the connector call, not as a form"},
 	"handleFileUploadAt":           {nil, "commands cannot upload; approved file pulls are transfer effects"},
 	"discardStoredUpload":          {nil, "removes files a refused HTTP multipart create stored; commands cannot upload, so they store none"},
+	"createTakesFileField":         {nil, "decides which file parts of an HTTP multipart create are stored; commands take no multipart body"},
+	"columnNamed":                  {nil, "names an unstored file part of an HTTP multipart create in X-Stripped-Fields; commands take no multipart body"},
+	"multipartRequest":             {nil, "picks the hint of an HTTP update that read no field from a multipart body; commands take no multipart body"},
 	"validateCSRF":                 {nil, "approval is a session-bound CSRF-checked POST; _commit is an authenticated connector call, not a cookie request"},
 	"isBearerAuth":                 {nil, "approval is a session-bound CSRF-checked POST; _commit is an authenticated connector call, not a cookie request"},
 	"Increment":                    {nil, "usage metering only, no enforcement; connector outcomes are counted by MCP telemetry"},
@@ -189,6 +194,7 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"safeIdent":                 {nil, commandParityPlumbing},
 	"lastDurableAdminUpdate":    {nil, "the last-admin guard protects _benmore_users rows (deactivation, role, verification); command SQL cannot write framework tables, so no command can remove the last admin"},
 	"refuseLastAdminRowDelete":  {nil, "the last-admin guard on deleting a _benmore_users row; command SQL cannot write framework tables, so no command can delete an account"},
+	"userIdentifierUpdate":      {nil, "the identifier guard on _benmore_users rows (another admin's sign-in address is refused, any other address change revokes the account's credentials); command SQL cannot write framework tables, so no command can change an account's identifier"},
 	"purgeRowKeyedState":        {nil, "framework bookkeeping after a generic CRUD hard delete (stale record shares and locks); command SQL cannot write framework tables, so a command's own hard delete leaves them, which matters only for keys without AUTOINCREMENT"},
 	"rowIDCanonical":            {nil, "author-scoped: a command addresses rows through its own reviewed SQL and typed inputs, not a request path id; framework lock/share state is never keyed by a command"},
 	"GetTableColumns":           {nil, commandParityPlumbing},
@@ -244,6 +250,9 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"serverErrorJSON":         {nil, commandParityPlumbing},
 	"serverErrorJSONBody":     {nil, commandParityPlumbing},
 	"writeUpdateRequestError": {nil, commandParityPlumbing},
+	// Names the column behind a FOREIGN KEY failure the database already
+	// raised: it shapes that refusal and refuses nothing itself.
+	"foreignKeyConstraintDenial": {nil, commandParityPlumbing},
 }
 
 // packageCalls parses the package's non-test sources and returns, for the named

@@ -9,6 +9,7 @@
     "auth",
     "approvals",
     "approver_identity",
+    "approver_tenant",
     "recovery",
     "decide_authority",
     "hint",

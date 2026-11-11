@@ -1,0 +1,29 @@
+on:
+  request:
+    method: POST
+    path: /api/tx-respond
+    auth: required
+    transaction: true
+jobs:
+  go:
+    steps:
+      - id: note
+        run: sql
+        with:
+          query: "INSERT INTO notes (title, body, user_id) VALUES ('tx-respond', :label, :user_id) RETURNING id"
+      - run: sql
+        with:
+          query: "INSERT INTO receipts (note_id, label) VALUES (:note_id, :label)"
+          params: { note_id: "${{ steps.note.outputs.id }}" }
+      - run: enqueue
+        with:
+          flow: worker
+          with: { note: "tx-respond-job" }
+      - run: notify
+        with:
+          user_id: ${{ user.id }}
+          title: "tx-respond"
+      - run: respond
+        with:
+          status: 201
+          json: { id: "${{ steps.note.outputs.id }}", ref: "${{ params.ref }}" }

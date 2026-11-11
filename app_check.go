@@ -50,6 +50,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -330,6 +331,11 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	findings = append(findings, flowInputBoundsWarnings(dir, writtenPath)...)
 	findings = append(findings, flowEventTableWarnings(dir, writtenPath)...)
 	findings = append(findings, flowTransactionalSendWarnings(dir, writtenPath)...)
+	// A `run: respond` with no `with:`: a 200 that ends the run.
+	findings = append(findings, bareRespondWarnings(dir, writtenPath)...)
+	// A `role:` gate that is not one role the app knows: it admits nobody
+	// but a global admin (validators_flow_role_gate.go).
+	findings = append(findings, flowRoleGateWarnings(dir, writtenPath)...)
 
 	// Layer 2.5: protected-column-name collisions (v2.7.164). A column
 	// named `role` / `password_hash` on an app table collides with the
@@ -352,6 +358,11 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	// says what to write instead (app_yaml_no_effect.go).
 	findings = append(findings, appYAMLNoEffectFindings(dir, writtenPath, liveDB)...)
 
+	// app.yaml keys and values the loader accepts and does not read: an
+	// unknown key in a section with a fixed set of keys, an unknown theme
+	// or mode (app_yaml_unread.go).
+	findings = append(findings, appYAMLUnreadFindings(dir, writtenPath, liveDB)...)
+
 	// Money-as-Float: a payments/payouts app storing currency as REAL is a
 	// rounding-bug waiting to happen. Warning - the column is legal.
 	findings = append(findings, moneyFloatWarnings(dir)...)
@@ -361,6 +372,11 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 
 	// Authorization shapes that widen access (validators_authz.go).
 	findings = append(findings, authzWarnings(dir)...)
+
+	// What `compliance: hipaa` leaves to a flow's or hook's own SQL: writes
+	// with no audit row, whole encrypted rows in a response
+	// (validators_hipaa_flows.go).
+	findings = append(findings, hipaaFlowFindings(dir, writtenPath)...)
 
 	// WebSockets to hosts the page's connect-src does not allow.
 	findings = append(findings, connectSrcWebSocketWarnings(dir)...)
@@ -397,6 +413,12 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 		for _, f := range live(dir) {
 			// The live layer re-reads env.yaml's delivery settings; report each once.
 			if f.Source == "environment" && hasFindingMessage(findings, "environment", f.Message) {
+				continue
+			}
+			// A ws_rooms rule the source layer already named.
+			if rule := wsRoomFindingRule(f.Message); rule != "" && slices.ContainsFunc(findings, func(have CheckFinding) bool {
+				return wsRoomFindingRule(have.Message) == rule
+			}) {
 				continue
 			}
 			findings = append(findings, f)
@@ -493,6 +515,11 @@ func checkLiveLayersWithDB(dir string, db *sql.DB, loadErr func(dir string) stri
 	// strands rows; this names rows stuck by any other route. Serving process
 	// only, on its own pool.
 	findings = append(findings, workflowStuckFindings(dir, db)...)
+
+	// Layer 2.99: ws_rooms rules whose membership table or column the live
+	// database does not have (validators_ws_rooms.go). The source layer
+	// cannot judge what a migration creates. Serving process only.
+	findings = append(findings, wsRoomLiveFindings(dir, db)...)
 
 	// Layer 3: app load. Catches schema errors, flow runtime
 	// rejections, etc. (the transition refusal above is reported once).

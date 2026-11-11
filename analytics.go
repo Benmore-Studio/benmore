@@ -348,9 +348,8 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 
 	// GET /api/_analytics/summary - aggregated stats for the dashboard
 	mux.HandleFunc("GET /api/_analytics/summary", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		// Only the parsed integer reaches the SQL text.
@@ -432,9 +431,8 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 
 	// POST /api/_analytics/funnel - create a funnel definition
 	mux.HandleFunc("POST /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !requireCSRF(w, r) {
@@ -461,9 +459,8 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 
 	// GET /api/_analytics/funnels - list + evaluate all funnels
 	mux.HandleFunc("GET /api/_analytics/funnels", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		// Only the parsed integer reaches the SQL text.
@@ -502,9 +499,8 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 
 	// DELETE /api/_analytics/funnel?id=X
 	mux.HandleFunc("DELETE /api/_analytics/funnel", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !requireCSRF(w, r) {
@@ -723,6 +719,14 @@ w.addEventListener('beforeunload',function(){send(Date.now()-t0,1);});
 // can add /privacy themselves and reference it from their own
 // footer. The security scan's GDPR check (security_scan.go) flags
 // missing /privacy as a warning so this gets surfaced.
+// analyticsConsentPrintStub stands in for AnalyticsCookieNotice in a printed
+// document (WrapLayoutForPrint). The banner publishes window.bmCookieConsent
+// and window.bmCookieSettings for page script; a page that calls them must
+// not stop with a TypeError when it is printed. Nobody has chosen anything in
+// the renderer, which is what the banner's own reader answers without a
+// consent cookie.
+const analyticsConsentPrintStub = `<script>window.bmCookieConsent=function(){return ''};window.bmCookieSettings=function(){};</script>`
+
 func AnalyticsCookieNotice(app *App) string {
 	text, link := analyticsNoticeCopy(app)
 	return `<div id="bm-cookie" role="region" aria-label="Cookie consent" style="display:none;position:fixed;bottom:16px;left:16px;z-index:99990;max-width:380px;padding:14px 16px;border-radius:10px;background:#18181b;border:1px solid #27272a;box-shadow:0 8px 24px rgba(0,0,0,0.3);font-family:system-ui,sans-serif;font-size:12px;color:#a1a1aa;line-height:1.5;">

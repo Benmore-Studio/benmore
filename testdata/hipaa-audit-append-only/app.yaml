@@ -1,0 +1,6 @@
+site_name: "hipaa audit append-only fixture"
+compliance: hipaa
+auth:
+  identifier: email
+frontend:
+  stack: html

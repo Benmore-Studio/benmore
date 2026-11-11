@@ -16,7 +16,7 @@
   "bm.aggregate(name)  /  bm.aggregates.all()  - materialized aggregates (admin only)",
   "bm.jobs.{status, wait}                   - async-flow job polling",
   "bm.notifications.{list, markRead, markAllRead, delete, onNew}  - in-app inbox",
-  "bm.upload(file, opts)                    - multipart upload",
+  "bm.upload(file, opts)                    - multipart upload to POST /api/_upload; opts = { kind?, filename? } (kind: 'private' for a private file, default a public one); resolves { path, url, filename, size } (api({at:'uploads'}) → sdk_upload)",
   "bm.audit.list(filter)                    - admin audit log",
   "bm.permissions.{share, revoke, list}     - per-row ACLs",
   "bm.signedUrl(path, opts)                 - time-limited URLs; opts = { ttlSeconds?, record: { table, id } } (record required for private CDN files) or a bare TTL number; default 300s (see api({at:'signed-urls'}))",

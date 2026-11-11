@@ -321,7 +321,7 @@ func appMCPCheckCommandSQLFunctions(readSource func(string) ([]byte, error), flo
 func commandTriggerOnlyCall(query string) string {
 	tokens := sqlTokenize(stripSQLComments(query))
 	for i := 0; i+1 < len(tokens); i++ {
-		if (tokens[i].kind == sqlTokWord || tokens[i].kind == sqlTokIdent) && tokens[i+1].kind == sqlTokPunct && tokens[i+1].text == "(" && commandVerifiedTriggerFunction(tokens[i].text) {
+		if (tokens[i].kind == sqlTokWord || tokens[i].kind == sqlTokIdent) && tokens[i+1].kind == sqlTokPunct && tokens[i+1].text == "(" && (commandVerifiedTriggerFunction(tokens[i].text) || commandHistoryTriggerFunction(tokens[i].text)) {
 			return tokens[i].text
 		}
 	}

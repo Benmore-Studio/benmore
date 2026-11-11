@@ -149,7 +149,11 @@ func authzWarnings(dir string) []CheckFinding {
 	for _, msg := range roleModeOwnerRowsWarnings(access, group, roles, models) {
 		warn(msg)
 	}
-	if msg := dynamicWSRoomWarning(dir, parseWSRooms(appYAML)); msg != "" {
+	wsRooms := parseWSRooms(appYAML)
+	for _, msg := range wsRoomRuleWarnings(dir, wsRooms) {
+		warn(msg)
+	}
+	if msg := dynamicWSRoomWarning(dir, wsRooms); msg != "" {
 		findings = append(findings, CheckFinding{Severity: "warning", Source: "security", File: "static/", Message: msg})
 	}
 	findings = append(findings, unmaskOwnerAliasWarnings(dir)...)
@@ -392,7 +396,10 @@ func tenantAdminRoleWarnings(access *AccessConfig, group *GroupConfig) []string 
 // memberOfSelfJoinWarnings flags a member-of membership table whose create
 // mode lets an ordinary user insert rows: they can add themselves to any
 // parent (POST /api/<membership> {room_id: X}) and read everything the
-// member-of rule protects.
+// member-of rule protects. The groups membership table is named only when the
+// app declared a create rule on it: left to its default the runtime refuses
+// such an insert, and the warning used to send its author to declare a rule
+// that replaces that safer default.
 func memberOfSelfJoinWarnings(access *AccessConfig, group *GroupConfig, models []PrismaModel) []string {
 	if access == nil {
 		return nil
@@ -407,6 +414,14 @@ func memberOfSelfJoinWarnings(access *AccessConfig, group *GroupConfig, models [
 	}
 	var out []string
 	for _, mt := range sortedSetKeys(membership) {
+		// The groups membership table left to its default is not open: its
+		// generic creates take a tenant admin (membershipManageGated). A rule
+		// declared on the table replaces that default and is judged below.
+		if group != nil && identIs(mt, group.Table) {
+			if _, declared := access.TableDeclaredModeFor(mt, OpWrite); !declared {
+				continue
+			}
+		}
 		hasUID, hasGroup := modelShape(models, mt, group)
 		mode := access.ModeFor(mt, OpWrite, hasUID, hasGroup)
 		if mode == "self" || mode == "everyone" || mode == "anon" {

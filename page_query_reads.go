@@ -108,7 +108,12 @@ func (q pinnedConnQuerier) QueryContext(ctx context.Context, query string, args 
 // queryPageRows runs one page query, recording its reads and applying the
 // policy to every row. The policy must be built before this: the connection is
 // held for the whole scan, so nothing in the row path may need another one.
-func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, query string, args ...any) ([]map[string]any, *pageQueryReads, error) {
+func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, guard *appSQLScope, query string, args ...any) ([]map[string]any, *pageQueryReads, error) {
+	// A page query is app-authored SQL (app_sql_guard.go). Its own authorizer
+	// below replaces the connection's default, so it applies the scope itself.
+	if err := guard.begin(query); err != nil {
+		return nil, nil, err
+	}
 	ctx, cancel := withQueryDeadline(parent)
 	defer cancel()
 	conn, err := db.Conn(ctx)
@@ -137,6 +142,9 @@ func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, 
 		// The connection's default authorizer keeps applying underneath.
 		limited := effectiveDBStorageLimit(canonicalDBPath(main)) > 0
 		sqlite.RegisterAuthorizer(func(action int, arg1, arg2, database string) int {
+			if guard.authorize(action, arg1, arg2, database) == sqlite3.SQLITE_DENY {
+				return sqlite3.SQLITE_DENY
+			}
 			if action == sqlite3.SQLITE_READ {
 				if r := recording.Load(); r != nil {
 					r.record(arg1, arg2)
@@ -161,7 +169,7 @@ func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, 
 	}()
 	rows, err := queryRowsWithKeyContextDecrypt(ctx, pinnedConnQuerier{ctx: ctx, conn: conn}, key, policy.rowDecryptor(reads), query, args...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, guard.end(err)
 	}
 	return rows, reads, nil
 }
@@ -226,7 +234,7 @@ func (p *pageQueryPolicy) class() string {
 // which a cached result needs to audit later renders and to be invalidated.
 // A failed query returns its error and audits nothing.
 func runPageQuery(parent context.Context, app *App, r *http.Request, session *Session, policy *pageQueryPolicy, query string, args ...any) ([]map[string]any, []string, error) {
-	rows, reads, err := queryPageRows(parent, app.DB, policy, query, args...)
+	rows, reads, err := queryPageRows(parent, app.DB, policy, &appSQLScope{hipaa: app.hipaa()}, query, args...)
 	if err != nil {
 		return nil, nil, err
 	}

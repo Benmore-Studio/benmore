@@ -513,9 +513,21 @@ func purgeAccountTx(c context.Context, app *App, tx *sql.Tx, uid int64, userCols
 			`UPDATE _benmore_read_audit SET client_ip=NULL WHERE user_id=? OR (?<>'' AND lower(trim(user_email))=?)`, uid, email, email); err != nil {
 			return err
 		}
-		_, err := purgeOptionalExec(tx, "_benmore_read_audit", []string{"user_id", "user_email"},
-			`UPDATE _benmore_read_audit SET user_email='' WHERE user_id=? OR (?<>'' AND lower(trim(user_email))=?)`, uid, email, email)
-		return err
+		if _, err := purgeOptionalExec(tx, "_benmore_read_audit", []string{"user_id", "user_email"},
+			`UPDATE _benmore_read_audit SET user_email='' WHERE user_id=? OR (?<>'' AND lower(trim(user_email))=?)`, uid, email, email); err != nil {
+			return err
+		}
+		// Reads the account made through support sessions keep its stable id
+		// and lose its address and client address, like the audit log's
+		// impersonator columns (a database from before them skips it).
+		cols, exists, err := purgeTableColumns(tx, "_benmore_read_audit")
+		if err != nil || !exists || !cols["impersonator_user_id"] || !cols["impersonator_email"] || !cols["client_ip"] {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE _benmore_read_audit SET impersonator_email='', client_ip=NULL WHERE impersonator_user_id=? OR (?<>'' AND lower(trim(impersonator_email))=?)`, uid, email, email); err != nil {
+			return fmt.Errorf("purge_current_user: mutate _benmore_read_audit: %w", err)
+		}
+		return nil
 	}); err != nil {
 		return 0, nil, err
 	}

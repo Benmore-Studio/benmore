@@ -1,0 +1,27 @@
+# flows/rename-org.yaml - for the tenant's own admins: the flow reads the
+# caller's membership row instead of gating on `role: admin`.
+on:
+  request:
+    method: POST
+    path: /api/org/rename
+    auth: required
+    inputs:
+      name: { type: text, required: true }
+jobs:
+  rename:
+    steps:
+      - id: me
+        run: sql
+        with:
+          query: "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'admin'"
+          params: { org: "${{ user.group_id || 0 }}" }
+      - if: ${{ !steps.me.outputs.rows }}
+        run: respond
+        with: { status: 403, json: { error: not_org_admin } }
+      - run: sql
+        expect_rows: "=1"
+        with:
+          query: "UPDATE organizations SET name = :name WHERE id = :org"
+          params: { org: "${{ user.group_id || 0 }}" }
+      - run: respond
+        with: { status: 200, json: { renamed: true } }

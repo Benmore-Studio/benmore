@@ -1495,9 +1495,8 @@ func LogAuditDB(db *sql.DB, action, table, rowID string, session *Session, oldRo
 // RegisterAuditAPI adds the audit trail query endpoint.
 func RegisterAuditAPI(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_audit", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpError(w, "admin required", http.StatusForbidden)
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 
@@ -1527,6 +1526,23 @@ func RegisterAuditAPI(mux appRouteRegistrar, app *App) {
 		if err != nil {
 			serverErrorJSON(w, r, app, "_audit", err, "query failed")
 			return
+		}
+		// The rows carry old and new values of the tables they name, so
+		// returning them is a read of each read-audited one, recorded like
+		// an admin-panel read (query_type audit_log; the row id when the
+		// request filtered on one). Under compliance: hipaa an event that
+		// cannot be written refuses the read.
+		audited := map[string]bool{}
+		for _, row := range rows {
+			table := valueText(row["table_name"])
+			if table == "" || audited[table] || !IsReadAudited(app, table) {
+				continue
+			}
+			audited[table] = true
+			if err := LogReadAccess(app, r, table, r.URL.Query().Get("row_id"), "audit_log", session); err != nil {
+				readAuditRefused(w, r, app, "_audit", err)
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")

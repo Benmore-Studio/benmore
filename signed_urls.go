@@ -149,16 +149,22 @@ func registerSignedURLRoutes(mux appRouteRegistrar, app *App) {
 		}
 
 		// Default 1 hour, or mediaPlaybackSignTTL for audio/video so a
-		// <video src> keeps playing past the hour (signedLinkTTL).
+		// <video src> keeps playing past the hour (signedLinkTTL). The
+		// default is for a request that names no lifetime. One that names a
+		// lifetime gets that lifetime (capped below) or a refusal, never the
+		// default: `expires_in=30s` read as "no value" used to mint a link
+		// that lived 120 times longer than asked.
 		var requested time.Duration
 		if ei := r.URL.Query().Get("expires_in"); ei != "" {
-			if seconds, err := strconv.Atoi(ei); err == nil && seconds > 0 {
-				// Bounded before multiplying so a huge value cannot wrap.
-				requested = oauthMaxSignedURLTTL
-				if int64(seconds) < int64(oauthMaxSignedURLTTL/time.Second) {
-					requested = time.Duration(seconds) * time.Second
-				}
+			d, err := requestedSignedLinkLifetime(ei)
+			if err != nil {
+				httpJSON(w, http.StatusBadRequest, withRefusalDocs(map[string]any{
+					"error": "expires_in must be " + signedLinkLifetimeForms + "; leave it out for the default lifetime",
+					"code":  "invalid_expires_in",
+				}, "invalid_expires_in"))
+				return
 			}
+			requested = d
 		}
 		expiresIn := signedLinkTTL(path, requested, time.Hour)
 

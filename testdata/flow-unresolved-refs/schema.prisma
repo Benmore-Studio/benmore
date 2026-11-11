@@ -6,3 +6,10 @@ model Note {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 }
+
+model Receipt {
+  id        Int      @id @default(autoincrement())
+  noteId    Int      @map("note_id")
+  label     String?
+  createdAt DateTime @default(now()) @map("created_at")
+}

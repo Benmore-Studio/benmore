@@ -99,8 +99,12 @@ type wsClient struct {
 	// canonical livestream pattern (authed host, anon viewers).
 	wsAnonShared  bool
 	subscriptions map[string]bool
-	rooms         map[string]bool // room ID -> joined
-	subMu         sync.RWMutex
+	// narrowed is set once a subscribe has named tables: named change events
+	// then arrive only for the tables in subscriptions, which may be none
+	// (every name was unknown). Unsubscribing from the last table clears it.
+	narrowed bool
+	rooms    map[string]bool // room ID -> joined
+	subMu    sync.RWMutex
 }
 
 // WSHub manages WebSocket connections.
@@ -119,8 +123,11 @@ type wsClientMsg struct {
 }
 
 type wsServerMsg struct {
-	Type    string          `json:"type"`
-	Table   string          `json:"table,omitempty"`
+	Type  string `json:"type"`
+	Table string `json:"table,omitempty"`
+	// Tables lists the names an error frame is about (a subscribe's unknown
+	// tables). Room refusals carry Room instead.
+	Tables  []string        `json:"tables,omitempty"`
 	Action  string          `json:"action,omitempty"`
 	Title   string          `json:"title,omitempty"`
 	Body    string          `json:"body,omitempty"`
@@ -338,7 +345,10 @@ func RegisterWebSocketRoutes(mux appRouteRegistrar, app *App) {
 		if needsAuth && !wsAnonymous {
 			session := getSession(app, r)
 			if session == nil {
-				http.Error(w, "authentication required", http.StatusUnauthorized)
+				// A held account gets its documented 403, never a socket.
+				if !accountHoldRefusal(w, r, app) {
+					http.Error(w, "authentication required", http.StatusUnauthorized)
+				}
 				return
 			}
 			userID = session.UserID
@@ -523,17 +533,43 @@ func wsReadLoop(client *wsClient, app *App) {
 
 			switch msg.Type {
 			case "subscribe":
+				// A subscribe that names no table (a missing or empty
+				// `tables`, as in a subscribe sent with `room:` by mistake)
+				// changes nothing.
+				if len(msg.Tables) == 0 {
+					break
+				}
+				known := wsSubscribableTables(app)
+				var unknown []string
 				client.subMu.Lock()
+				// The connection asked for these tables and no others, also
+				// when none of the names is one it can subscribe to: an
+				// unknown name must not leave every table's events on.
+				client.narrowed = true
 				for _, t := range msg.Tables {
-					if wsTableExists(app, t) {
+					if known[t] {
 						client.subscriptions[t] = true
+					} else {
+						unknown = append(unknown, t)
 					}
 				}
 				client.subMu.Unlock()
+				if frame := wsUnknownTablesFrame(unknown); frame != nil {
+					select {
+					case client.send <- frame:
+					default:
+					}
+				}
 			case "unsubscribe":
+				if len(msg.Tables) == 0 {
+					break
+				}
 				client.subMu.Lock()
 				for _, t := range msg.Tables {
 					delete(client.subscriptions, t)
+				}
+				if len(client.subscriptions) == 0 {
+					client.narrowed = false
 				}
 				client.subMu.Unlock()
 			case "join":
@@ -767,22 +803,66 @@ func BroadcastWSNotification(app *App, userID int64, title, body string) {
 	}
 }
 
+// wsClientSubscribed reports whether a named change event for table passes
+// the connection's subscription: every table until a subscribe has named
+// tables, then only the subscribed ones.
 func wsClientSubscribed(client *wsClient, table string) bool {
 	client.subMu.RLock()
 	defer client.subMu.RUnlock()
-	if len(client.subscriptions) == 0 {
+	if !client.narrowed {
 		return true
 	}
 	return client.subscriptions[table]
 }
 
-func wsTableExists(app *App, name string) bool {
-	for _, t := range app.Tables {
-		if t.Name == name {
-			return true
+// wsSubscribableTables is the set of names a subscribe may carry: the app's
+// schema tables and the two framework tables whose change events clients
+// listen for (the caller's notifications, presence). Subscribing authorizes
+// nothing; each event is still checked against the connection's credential.
+func wsSubscribableTables(app *App) map[string]bool {
+	names := map[string]bool{notificationsTable: true, presenceTable: true}
+	view := realtimePolicySnapshot(app)
+	if view == nil {
+		view = app
+	}
+	if view != nil {
+		for _, t := range view.Tables {
+			names[t.Name] = true
 		}
 	}
-	return false
+	return names
+}
+
+const (
+	wsUnknownTablesReported = 10 // names echoed in one error frame
+	wsUnknownTableNameShown = 64 // bytes of each echoed name
+)
+
+// wsUnknownTablesFrame is the error frame that answers a subscribe naming
+// tables the app does not have (nil when there are none). It echoes a bounded
+// part of what the client sent.
+func wsUnknownTablesFrame(unknown []string) []byte {
+	if len(unknown) == 0 {
+		return nil
+	}
+	total := len(unknown)
+	if total > wsUnknownTablesReported {
+		unknown = unknown[:wsUnknownTablesReported]
+	}
+	shown := make([]string, len(unknown))
+	for i, name := range unknown {
+		if len(name) > wsUnknownTableNameShown {
+			name = strings.ToValidUTF8(name[:wsUnknownTableNameShown], "")
+		}
+		shown[i] = name
+	}
+	body := "subscribe: unknown table " + strings.Join(shown, ", ")
+	if total > len(shown) {
+		body += fmt.Sprintf(" (and %d more)", total-len(shown))
+	}
+	body += "; no change events are sent for a table this app does not have"
+	frame, _ := json.Marshal(wsServerMsg{Type: "error", Tables: shown, Body: body})
+	return frame
 }
 
 // scopedRoomID namespaces a client-supplied room ID under the client's

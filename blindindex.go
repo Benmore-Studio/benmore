@@ -661,9 +661,8 @@ func backfillBlindIndexOne(app *App, table, col string, dryRun bool) (blindIndex
 // roadmap).
 func RegisterBlindIndexRoutes(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("POST /api/_internal/blind/backfill", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(app, r)
-		if session == nil || !session.IsAdminConsole() {
-			httpJSON(w, http.StatusForbidden, map[string]any{"error": "admin required"})
+		session := adminConsoleSession(w, r, app, "")
+		if session == nil {
 			return
 		}
 		if !isBearerAuth(r) && !validateCSRF(r) {

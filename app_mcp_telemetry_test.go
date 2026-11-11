@@ -152,7 +152,8 @@ func TestAppMCPTelemetryAggregatesAndOmitsCallData(t *testing.T) {
 		t.Fatalf("telemetry retention kept newest=%d oldest=%d: %v", newest, old, err)
 	}
 
-	if rec := crudScopeRequest(t, mux, http.MethodGet, "/api/_mcp/telemetry", "", nil); rec.Code != http.StatusForbidden {
+	// No credential is unauthenticated; a signed-in member is forbidden below.
+	if rec := crudScopeRequest(t, mux, http.MethodGet, "/api/_mcp/telemetry", "", nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("anonymous telemetry status=%d", rec.Code)
 	}
 	if _, err := app.DB.Exec("INSERT INTO _benmore_users (username,email,role,verified) VALUES ('telemetry-member','telemetry-member@example.com','user',1)"); err != nil {

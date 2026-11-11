@@ -189,7 +189,9 @@ func installVersioningForTableTx(tx *sql.Tx, table string, encrypted *EncryptedF
 			}
 		}
 	}
-	return nil
+	// The history triggers were just created again, which puts them ahead of
+	// an enrolled table's revision triggers (app_mcp_revision_order.go).
+	return reseatAppMCPRevisionTriggers(tx)
 }
 
 func versionHasColumn(cols []Column, name string) bool {
@@ -286,8 +288,9 @@ func versionUpdateWhen(unchanged, normalized []string, stamp, latestEnd string) 
 	return " WHEN NOT (" + content + " AND " + still + " AND (" + strings.Join(maintenance, " OR ") + "))"
 }
 
-// derived names the table's same-row computed columns; their recalculation
-// is storage maintenance (see the WHEN clause below).
+// reconcileVersionedTable creates or widens the table's history table and
+// installs its two history triggers. derived names the table's same-row
+// computed columns (versionTriggers).
 func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedFieldConfig, derived []string) error {
 	cols, err := mainTableColumnsWith(tx, table)
 	if err != nil {
@@ -306,9 +309,8 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 	if err != nil {
 		return err
 	}
-	var names, defs []string
+	var defs []string
 	for _, col := range cols {
-		names = append(names, quoteIdent(col.Name))
 		defs = append(defs, strings.TrimSpace(quoteIdent(col.Name)+" "+quoteDeclType(col.Type)))
 	}
 	if !exists {
@@ -332,6 +334,37 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS " + quoteIdent("idx_"+history+"_id_version") + " ON " + quoteIdent(history) + " (id, _version)"); err != nil {
 		return err
 	}
+	for _, trigger := range versionTriggers(table, cols, encrypted, derived) {
+		if _, err := tx.Exec(trigger.ddl); err != nil {
+			return err
+		}
+	}
+	// CREATE TRIGGER defers name/function resolution. Compile both programs now,
+	// without executing any app mutation, so a broken history never goes live.
+	for _, query := range []string{"EXPLAIN UPDATE " + quoteIdent(table) + " SET id=id WHERE 0", "EXPLAIN DELETE FROM " + quoteIdent(table) + " WHERE 0"} {
+		rows, err := tx.Query(query)
+		if err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// versionTrigger is one generated history trigger.
+type versionTrigger struct{ name, ddl string }
+
+// versionTriggers builds the table's two history triggers (update, delete)
+// from its columns as they are now. It is the one generator: a load installs
+// exactly this text (reconcileVersionedTable), and the connector's enrollment
+// check compares the stored triggers with it (appMCPVerifiedHistoryTriggers),
+// so a trigger that only carries the name is never taken for the framework's.
+// derived names the table's same-row computed columns; their recalculation
+// is storage maintenance (see the WHEN clause below).
+func versionTriggers(table string, cols []Column, encrypted *EncryptedFieldConfig, derived []string) []versionTrigger {
+	history := table + "_history"
 	encCols := map[string]string{}
 	blindCols := map[string]bool{}
 	aadTable := table
@@ -356,8 +389,9 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 	// left it alone, including the framework's own maintenance writes. It is
 	// judged separately below rather than as content.
 	stamp := ""
-	var oldRefs, unchanged, normalized []string
+	var names, oldRefs, unchanged, normalized []string
 	for _, col := range cols {
+		names = append(names, quoteIdent(col.Name))
 		old, next := "OLD."+quoteIdent(col.Name), "NEW."+quoteIdent(col.Name)
 		equal := old + " IS " + next
 		if aadColumn, ok := encCols[sqliteIdentifierFold(col.Name)]; ok {
@@ -402,6 +436,7 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 	}
 	validFrom := "benmore_history_start(" + previous("_valid_from") + ", " + previous("_valid_to") + ", " + sourceDate("OLD", "updated_at") + ", " + sourceDate("OLD", "created_at") + ")"
 	version := "(SELECT COALESCE(MAX(_version), 0) + 1 FROM " + quoteIdent(history) + " WHERE id = OLD.id)"
+	var triggers []versionTrigger
 	for _, op := range []string{"update", "delete"} {
 		candidate := "NULL"
 		if op == "update" {
@@ -415,23 +450,11 @@ func reconcileVersionedTable(tx *sql.Tx, table string, encrypted *EncryptedField
 		// MATERIALIZED prevents SQLite from evaluating the start clock twice
 		// when a table has no source/retained timestamps, including clock rollback.
 		boundary := "(WITH captured AS MATERIALIZED (SELECT " + validFrom + " AS start) SELECT start FROM captured) AS boundary"
-		ddl := "CREATE TRIGGER " + quoteIdent("_benmore_ver_"+table+"_"+op) + " BEFORE " + strings.ToUpper(op) + " ON " + quoteIdent(table) + " FOR EACH ROW" + when + " BEGIN INSERT INTO " + quoteIdent(history) + " (" + strings.Join(names, ", ") + ", _version, _valid_from, _valid_to, _change_type) SELECT " + strings.Join(oldRefs, ", ") + ", " + version + ", boundary.start, " + validTo + ", '" + op + "' FROM " + boundary + "; END"
-		if _, err := tx.Exec(ddl); err != nil {
-			return err
-		}
+		name := "_benmore_ver_" + table + "_" + op
+		ddl := "CREATE TRIGGER " + quoteIdent(name) + " BEFORE " + strings.ToUpper(op) + " ON " + quoteIdent(table) + " FOR EACH ROW" + when + " BEGIN INSERT INTO " + quoteIdent(history) + " (" + strings.Join(names, ", ") + ", _version, _valid_from, _valid_to, _change_type) SELECT " + strings.Join(oldRefs, ", ") + ", " + version + ", boundary.start, " + validTo + ", '" + op + "' FROM " + boundary + "; END"
+		triggers = append(triggers, versionTrigger{name: name, ddl: ddl})
 	}
-	// CREATE TRIGGER defers name/function resolution. Compile both programs now,
-	// without executing any app mutation, so a broken history never goes live.
-	for _, query := range []string{"EXPLAIN UPDATE " + quoteIdent(table) + " SET id=id WHERE 0", "EXPLAIN DELETE FROM " + quoteIdent(table) + " WHERE 0"} {
-		rows, err := tx.Query(query)
-		if err != nil {
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return triggers
 }
 
 func sealVersionedValue(value any, key []byte, source, column string) (any, error) {

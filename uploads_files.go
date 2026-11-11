@@ -35,7 +35,7 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 
 	mux.HandleFunc("POST /api/_files", func(w http.ResponseWriter, r *http.Request) {
 		if !app.FeatureEnabled("uploads") {
-			http.NotFound(w, r)
+			writeUploadsOff(w)
 			return
 		}
 		// Authenticate before taking one of the process's upload slots (the
@@ -80,10 +80,7 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 
 		path, err := HandleFileUpload(app, r, "file", "_files", 0, nil)
 		if err != nil {
-			if respondMediaAllowance(w, err) {
-				return
-			}
-			httpError(w, err.Error(), http.StatusBadRequest)
+			writeUploadRefusal(w, err)
 			return
 		}
 		if path == "" {

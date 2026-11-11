@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 )
 
@@ -142,9 +143,9 @@ func runServerNew() {
 		fmt.Fprintln(os.Stderr, "Usage: benmore new <dir>")
 		os.Exit(2)
 	}
-	dir := os.Args[2]
-	if _, err := os.Stat(dir); err == nil {
-		log.Fatalf("refusing to scaffold: %s already exists", dir)
+	dir, err := scaffoldTargetDir(os.Args[2])
+	if err != nil {
+		log.Fatalf("refusing to scaffold: %s", err)
 	}
 	if err := writeHTMLScaffoldFiles(dir, "", editionName == "framework"); err != nil {
 		log.Fatalf("scaffold failed: %s", err)
@@ -154,6 +155,22 @@ func runServerNew() {
 		absDir = dir
 	}
 	fmt.Print(scaffoldNextSteps(absDir))
+}
+
+// scaffoldTargetDir is the directory `benmore new <dir>` writes: one that does
+// not exist yet, or an empty one (`mkdir app && cd app && benmore new .` was
+// refused as "already exists"; a `git init` there does not fill it). An
+// existing directory comes back absolute: the app is named after the
+// directory, which `.` does not spell.
+func scaffoldTargetDir(dir string) (string, error) {
+	if _, err := os.Stat(dir); err != nil {
+		return dir, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || slices.ContainsFunc(entries, func(e os.DirEntry) bool { return e.Name() != ".git" && e.Name() != ".DS_Store" }) {
+		return "", fmt.Errorf("%s already exists and is not an empty directory", dir)
+	}
+	return filepath.Abs(dir)
 }
 
 // scaffoldNextSteps is what `benmore new` prints after it writes the app: the

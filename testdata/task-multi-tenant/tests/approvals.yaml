@@ -1,0 +1,89 @@
+# An approval request on a tenant's record stays in the tenant. Naming an
+# account of another organisation as approver is answered like naming an
+# address nobody holds: the request is stored, but that account is not
+# notified, does not list the request and cannot decide it. A member of the
+# record's organisation is asked and decides.
+
+an_approval_on_a_tenants_record_stays_in_the_tenant:
+  as_user: "fay@tenants.test"
+  users:
+    - "gus@tenants.test"
+    - "hal@tenants.test"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "First org" }
+      expect: { status: 200 }
+    - api: "POST /api/org/members"
+      json: { email: "gus@tenants.test" }
+      expect: { status: 201 }
+    - api: "POST /api/projects"
+      json: { name: "First org launch" }
+      save: { project_id: "id" }
+      expect: { status: 200 }
+    # hal is not a member of this organisation; nobody@ has no account.
+    - api: "POST /api/_approvals"
+      json: { table: "projects", row_id: "{{project_id}}", approver_email: "nobody@tenants.test", title: "Ask nobody" }
+      expect: { status: 200, json: { status: "pending" } }
+    - api: "POST /api/_approvals"
+      json: { table: "projects", row_id: "{{project_id}}", approver_email: "hal@tenants.test", title: "Ask across tenants" }
+      save: { cross: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - api: "POST /api/_approvals"
+      json: { table: "projects", row_id: "{{project_id}}", approver_email: "gus@tenants.test", title: "Ask a colleague" }
+      save: { inside: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    # The table name in another letter case is the same table.
+    - api: "POST /api/_approvals"
+      json: { table: "PROJECTS", row_id: "{{project_id}}", approver_email: "hal@tenants.test", title: "Ask in capitals" }
+      save: { capitals: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - sql: "SELECT id FROM _benmore_approvals WHERE id IN ({{cross}}, {{capitals}}) AND table_name = 'projects' AND approver_id IS NULL AND status = 'pending'"
+      expect: { rows: 2 }
+    - sql: "SELECT 1 AS quiet WHERE NOT EXISTS (SELECT 1 FROM _benmore_notifications WHERE user_id = (SELECT id FROM _benmore_users WHERE email = 'hal@tenants.test'))"
+      expect: { rows: 1 }
+    - sql: "SELECT n.id FROM _benmore_notifications n JOIN _benmore_users u ON u.id = n.user_id WHERE u.email = 'gus@tenants.test' AND n.title = 'Approval requested' AND n.body = 'Ask a colleague'"
+      expect: { rows: 1 }
+    # hal founds another organisation and looks for the request.
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: { email: "hal@tenants.test", password: "testpass123" }
+      save: { hal: "token" }
+      expect: { status: 200 }
+    - set_auth: "{{hal}}"
+    - api: "POST /api/_groups/create"
+      json: { name: "Second org" }
+      expect: { status: 200 }
+    - get: "/api/_approvals?mine=1"
+      expect:
+        status: 200
+        not_contains:
+          - "Ask across tenants"
+          - "Ask in capitals"
+    - get: "/api/_approvals"
+      expect:
+        status: 200
+        not_contains:
+          - "Ask across tenants"
+          - "fay@tenants.test"
+    - api: "POST /api/_approvals/{{cross}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 403 }
+    - api: "POST /api/_approvals/{{capitals}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM _benmore_approvals WHERE id IN ({{cross}}, {{capitals}}) AND status = 'pending'"
+      expect: { rows: 2 }
+    # gus, a member of the record's organisation, lists and decides.
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: { email: "gus@tenants.test", password: "testpass123" }
+      save: { gus: "token" }
+      expect: { status: 200 }
+    - set_auth: "{{gus}}"
+    - get: "/api/_approvals?mine=1"
+      expect: { status: 200, contains: "Ask a colleague" }
+    - api: "POST /api/_approvals/{{inside}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 200, json: { status: "approved" } }
+    - sql: "SELECT id FROM _benmore_approvals WHERE id = {{inside}} AND status = 'approved'"
+      expect: { rows: 1 }

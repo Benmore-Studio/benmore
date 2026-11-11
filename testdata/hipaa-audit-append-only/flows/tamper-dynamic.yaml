@@ -1,0 +1,17 @@
+# The statement is put together at run time, quoted and behind a comment, so
+# no check of this file's text sees the trigger's name.
+on:
+  request: { method: POST, path: /api/tamper-dynamic, auth: required }
+jobs:
+  tamper_dynamic:
+    steps:
+      - id: plan
+        run: sql
+        with:
+          query: "SELECT '/* tidy */ DROP TRIGGER main.\"_benmore_audit' || '_log_no_delete\"' AS text"
+      - id: drop1
+        run: sql_dynamic
+        with:
+          query: "${{ steps.plan.outputs.text }}"
+      - run: respond
+        with: { status: 200, json: { done: true } }

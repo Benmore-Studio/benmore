@@ -1,0 +1,41 @@
+# Flow SQL cannot drop the append-only triggers or rewrite audit rows; it can
+# still change the app's own tables and add an audit row.
+flow_sql_keeps_app_ddl_and_audit_inserts:
+  as_user: "audit@test.com"
+  steps:
+    - api: "POST /api/cache-setup"
+      expect:
+        status: 200
+    - sql: "SELECT 1 FROM my_cache WHERE k = 'a' AND v = 'b'"
+      expect:
+        rows: 1
+    # LIMIT 1: the other test of this file calls the same flow, the tests share
+    # one database and their order differs per run.
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'fixture' AND user_email = 'audit@test.com' LIMIT 1"
+      expect:
+        rows: 1
+
+flow_sql_cannot_drop_the_audit_trigger:
+  as_user: "audit@test.com"
+  steps:
+    - api: "POST /api/cache-setup"
+      expect:
+        status: 200
+    - api: "POST /api/tamper-droptrigger"
+      expect:
+        status: 500
+    - api: "POST /api/tamper-dynamic"
+      expect:
+        status: 500
+    - api: "POST /api/tamper-update"
+      expect:
+        status: 500
+    - sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = '_benmore_audit_log' AND name IN ('_benmore_audit_log_no_update', '_benmore_audit_log_no_delete', '_benmore_audit_log_no_overwrite')"
+      expect:
+        rows: 3
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE user_email = 'tampered@example.com'"
+      expect:
+        rows: 0
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE action = 'fixture' AND user_email = 'audit@test.com' LIMIT 1"
+      expect:
+        rows: 1

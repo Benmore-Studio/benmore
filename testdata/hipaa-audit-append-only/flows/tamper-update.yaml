@@ -1,0 +1,11 @@
+on:
+  request: { method: POST, path: /api/tamper-update, auth: required }
+jobs:
+  tamper_update:
+    steps:
+      - id: last
+        run: sql
+        with:
+          query: "WITH hit AS (SELECT id FROM _benmore_audit_log WHERE action = 'fixture') UPDATE main.\"_benmore_audit_log\" SET user_email = 'tampered@example.com' WHERE id IN (SELECT id FROM hit)"
+      - run: respond
+        with: { status: 200, json: { done: true } }

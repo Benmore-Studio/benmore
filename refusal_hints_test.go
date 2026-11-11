@@ -43,16 +43,17 @@ var runtimeHintBuilders = map[string][]string{
 // a tool's answer, a describe report, generated API documentation. A file
 // that starts writing one must be listed here or in runtimeHintFiles.
 var otherHintFiles = map[string]string{
-	"access_describe.go":     "the access report of describe_table",
-	"apidocs.go":             "the OpenAPI schema of the error envelope",
-	"api_topic_delivery.go":  "the topic reference's own answers",
-	"api_topic_search.go":    "the topic reference's own answers",
-	"mcp_tools_api.go":       "the topic reference",
-	"op_describe.go":         "describe tools",
-	"op_diag.go":             "diagnostic tools",
-	"op_probe.go":            "probe_route's answer",
-	"app_data_ops_errors.go": "decode_stack's answer",
-	"refusal_docs.go":        "reads a refusal's hint to choose its address",
+	"access_describe.go":        "the access report of describe_table",
+	"apidocs.go":                "the OpenAPI schema of the error envelope",
+	"api_topic_delivery.go":     "the topic reference's own answers",
+	"api_topic_search.go":       "the topic reference's own answers",
+	"mcp_tools_api.go":          "the topic reference",
+	"op_describe.go":            "describe tools",
+	"op_diag.go":                "diagnostic tools",
+	"op_probe.go":               "probe_route's answer",
+	"app_data_ops_errors.go":    "decode_stack's answer",
+	"refusal_docs.go":           "reads a refusal's hint to choose its address",
+	"no_production_instance.go": "the platform API's answer for a command aimed at a production that does not exist",
 }
 
 func runtimeHintTexts(t *testing.T) []runtimeHint {

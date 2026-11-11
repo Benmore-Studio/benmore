@@ -467,7 +467,7 @@ func fireBeforeHooksRows(db mutationQuerier, app *App, event string, table strin
 					return beforeHookFailure(db, fmt.Errorf("before-hook query is not read-only"))
 				}
 			}
-			rows, err := queryRowsWithAppMCP(db, sql, args...)
+			rows, err := queryRowsWithAppMCP(db, hookSQLText(db, app, sql), args...)
 			if err != nil {
 				// FAIL CLOSED. A before-hook is a gate (auth / business-rule
 				// enforcement). If it can't be evaluated - typo, bad column,
@@ -626,7 +626,7 @@ func fireHookListTxMode(tx mutationTx, app *App, event, table string, row map[st
 					return nil, err
 				}
 			}
-			if _, err := tx.Exec(sqlText, args...); err != nil {
+			if _, err := tx.Exec(hookSQLText(tx, app, sqlText), args...); err != nil {
 				return nil, fmt.Errorf("after-hook SQL failed: %w", err)
 			}
 			for _, target := range canonicalHookRefreshTargets(app, sqlText, table) {
@@ -644,6 +644,16 @@ func fireHookListTxMode(tx mutationTx, app *App, event, table string, row map[st
 		}
 	}
 	return refreshTables, nil
+}
+
+// hookSQLText marks hook SQL as app-authored for the driver call that runs it
+// (app_sql_guard.go). A connector command's private transaction is left as it
+// is: it runs under the command's own, stricter authorizer.
+func hookSQLText(db any, app *App, query string) string {
+	if bound, ok := db.(appMCPContextTx); ok && bound.private {
+		return query
+	}
+	return appSQL(app, query)
 }
 
 func canonicalHookRefreshTargets(app *App, executedSQL, primaryTable string) []string {
@@ -831,7 +841,7 @@ func executeHookResult(app *App, hook Hook, table string, row map[string]any) (e
 	// SQL - use parameterized interpolation to prevent injection from row data
 	if hook.SQL != "" {
 		sql, args := interpolateRowSafeForApp(hook.SQL, hookSQLInterpolationRow(row, ""), app)
-		if _, err := db.Exec(sql, args...); err != nil {
+		if _, err := db.Exec(appSQL(app, sql), args...); err != nil {
 			log.Printf("HOOK ERROR [sql] %s: %s", truncate(sql, 80), err)
 			reportHook("warning", "sql", "hook SQL failed", nil)
 			return errors.New("hook SQL failed")

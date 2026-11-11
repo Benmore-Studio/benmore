@@ -1,1 +1,1 @@
-GET /api/_audit?table=&user_id=&row_id=&action=  (admin only)
+GET /api/_audit?table=&user_id=&row_id=&action=  (admin only: the newest 100 matching rows, each with action, table_name, row_id, the actor and old_values / new_values. 401 `authentication required` without a valid credential; 403 `admin required` for a signed-in caller who is not an admin on an unscoped credential. Because the rows carry field values, the request is itself recorded in the read audit for every read-audited table whose rows it returned: query_type `audit_log`, see read_coverage)

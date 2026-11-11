@@ -953,9 +953,18 @@ func generateSEOTests(app *App) AppTestFile {
 
 // ===== Performance Tests =====
 
+// healthFastAttempts is how many times health_fast asks for /health before it
+// reports the endpoint as slow.
+const healthFastAttempts = 5
+
 func generatePerformanceTests(app *App) AppTestFile {
 	tests := make(map[string]AppTestCase)
 
+	// /health must stay cheap: 10 ms. The bound is on the fastest of a few
+	// requests (AppTestStep.DurationAttempts), because one request's wall
+	// clock also holds the machine's load at that moment (a race-detector
+	// build, other apps' tests, a compile): a single measurement failed
+	// correct apps there. A /health that is slow is slow every time.
 	tests["health_fast"] = AppTestCase{
 		Anon: true,
 		Steps: []AppTestStep{{
@@ -964,6 +973,7 @@ func generatePerformanceTests(app *App) AppTestFile {
 				Status:      200,
 				MaxDuration: "10ms",
 			},
+			DurationAttempts: healthFastAttempts,
 		}},
 	}
 

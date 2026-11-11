@@ -1,0 +1,6 @@
+# A before_update hook fired by a transition sees the target state in the state
+# column and the state it leaves in old_status.
+before_update:
+  requests:
+    - sql: "SELECT 'an ordered request needs a purchase order number' AS error"
+      when: "status = 'ordered' AND old_status = 'approved' AND coalesce(po_number, '') = ''"

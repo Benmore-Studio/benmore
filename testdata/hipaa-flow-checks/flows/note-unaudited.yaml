@@ -1,0 +1,13 @@
+# A flow's own SQL write is not in the audit log: `benmore check` warns here.
+on:
+  request: { method: POST, path: /api/note-unaudited, auth: required }
+jobs:
+  note_unaudited:
+    steps:
+      - id: note
+        run: sql
+        with:
+          query: "INSERT INTO visit_notes (body, user_id) VALUES (:body, :user_id) RETURNING id"
+          params: { body: "${{ params.body }}" }
+      - run: respond
+        with: { json: { id: "${{ steps.note.outputs.first.id }}" } }

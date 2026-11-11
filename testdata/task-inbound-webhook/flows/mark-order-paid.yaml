@@ -3,7 +3,7 @@ on:
   request:
     method: POST
     path: /api/orders/mark-paid
-    role: admin                     # the queue runs it; only an admin may call it directly
+    role: admin                     # the queue runs it; only a global admin may call it directly
 jobs:
   mark:
     steps:

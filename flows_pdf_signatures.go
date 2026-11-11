@@ -492,14 +492,30 @@ func execStepExtractText(ctx *FlowContext, step *FlowStep) error {
 // flow, at write time and when it runs.
 const extractTextTransactionMessage = "`run: extract_text` can't run in a `transaction: true` flow: the job or schedule holds the app's write lock for the whole transaction, and extraction can wait 10 minutes for its slot and take 10 more, so every other write would wait (the write-transaction watchdog ends it first). Extract in a flow without `transaction: true` and write the text with a following `run: sql`; if the write must be atomic with other writes, `run: enqueue` a transactional flow and pass it the text."
 
-// newExtractTextResult turns the extractor's blocks into the step's per-page
-// text, capped at extractTextOutputBytes in total.
+// newExtractTextResult turns the extractor's words into the step's per-page
+// text, capped at extractTextOutputBytes in total. The words stay in parser
+// (reading) order: words of one line are joined by a space, lines by a
+// newline, and blocks or paragraphs by a blank line.
 func newExtractTextResult(parsed appMCPPDFResult) extractTextResult {
-	lines := make([][]string, parsed.PageCount)
-	for _, block := range parsed.Blocks {
-		if block.Page >= 1 && block.Page <= len(lines) {
-			lines[block.Page-1] = append(lines[block.Page-1], block.Value)
+	texts := make([]strings.Builder, parsed.PageCount)
+	last := make([]*appMCPPDFBlock, parsed.PageCount)
+	for i := range parsed.Blocks {
+		word := &parsed.Blocks[i]
+		if word.Page < 1 || word.Page > len(texts) {
+			continue
 		}
+		text, prev := &texts[word.Page-1], last[word.Page-1]
+		switch {
+		case prev == nil:
+		case word.textBlock != prev.textBlock:
+			text.WriteString("\n\n")
+		case word.textLine != prev.textLine:
+			text.WriteByte('\n')
+		default:
+			text.WriteByte(' ')
+		}
+		text.WriteString(word.Value)
+		last[word.Page-1] = word
 	}
 	result := extractTextResult{
 		sha256: parsed.SHA256, parserVersion: parsed.ParserVersion, complete: parsed.Complete,
@@ -507,7 +523,7 @@ func newExtractTextResult(parsed appMCPPDFResult) extractTextResult {
 	}
 	budget := extractTextOutputBytes
 	for i := range result.pages {
-		text := strings.Join(lines[i], "\n")
+		text := texts[i].String()
 		if len(text) > budget {
 			text, result.truncated = strings.ToValidUTF8(text[:budget], ""), true
 		}

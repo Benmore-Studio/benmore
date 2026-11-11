@@ -89,7 +89,7 @@ func appMCPToolAllowed(app *App, tool *AppMCPTool, actor *Session) bool {
 		return SessionCanAccessTable(app, tool.Handler.Table, OpRead, actor)
 	case "flow.call":
 		flow := appMCPFlowSnapshot(app, tool.Handler.Flow)
-		return appMCPReadFlowPolicy(flow) == nil && (flow.Role == "" || HasAnyRole(actor, []string{flow.Role})) && len(flow.Permissions) > 0 && scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " "))
+		return appMCPReadFlowPolicy(flow) == nil && (flow.Role == "" || flowRoleAllowed(actor, flow.Role)) && len(flow.Permissions) > 0 && scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " "))
 	}
 	return false
 }

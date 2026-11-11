@@ -1,0 +1,11 @@
+model Request {
+  id              Int       @id @default(autoincrement())
+  title           String
+  amountCents     Int       @map("amount_cents")
+  escalationCount Int       @default(0) @map("escalation_count") // server-set
+  submittedAt     DateTime? @map("submitted_at")                 // server-set
+  userId          Int       @map("user_id")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at")
+  @@map("requests")
+}

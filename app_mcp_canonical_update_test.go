@@ -29,6 +29,10 @@ type appMCPCanonicalUpdateFixture struct {
 	now  time.Time
 }
 
+// canonicalUpdateFixtureAppConfig is appended to the fixture's app.yaml. The
+// fixture sets an environment variable, so its tests never run in parallel.
+var canonicalUpdateFixtureAppConfig string
+
 func newCanonicalUpdateFixture(t *testing.T, hook, page, validator string) appMCPCanonicalUpdateFixture {
 	return newCanonicalUpdateFixtureWithAutoMembership(t, hook, page, validator, false)
 }
@@ -98,6 +102,7 @@ access:
 	if autoMembership {
 		appConfig += "auto_memberships:\n  notes:\n    table: note_members\n    parent: note_id\n"
 	}
+	appConfig += canonicalUpdateFixtureAppConfig
 	writeTestFile(t, dir, "app.yaml", appConfig)
 	manifest := strings.Replace(appMCPUpdateManifestFixture(), "tools:\n  - name: notes_update_title", `tools:
   - name: list_notes

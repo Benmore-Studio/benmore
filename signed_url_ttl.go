@@ -14,6 +14,7 @@ package main
 // mediaPlaybackSignTTL unless the flow or caller asks for another lifetime.
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strconv"
@@ -64,6 +65,12 @@ func signedLinkTTL(p string, requested, fallback time.Duration) time.Duration {
 	return ttl
 }
 
+// errSignedLinkLifetimeTooLong is parseSignedLinkLifetime's error for a
+// readable lifetime above the cap. It is told apart from "cannot be read"
+// because a request may be answered with the cap (a shorter link than asked
+// is safe), never with a default.
+var errSignedLinkLifetimeTooLong = fmt.Errorf("must be at most %s", oauthMaxSignedURLTTL)
+
 // parseSignedLinkLifetime reads serve_file's `with.expires_in`: whole seconds
 // (a YAML number or a numeric string) or a Go duration ("90m", "2h"), between
 // one second and oauthMaxSignedURLTTL. It is a literal: a request value must
@@ -72,9 +79,13 @@ func parseSignedLinkLifetime(v any) (time.Duration, error) {
 	const shape = "must be whole seconds or a duration such as \"2h\""
 	maxSecs := int64(oauthMaxSignedURLTTL / time.Second)
 	seconds := func(n int64) (time.Duration, error) {
-		// Bounded before multiplying, so a huge number cannot wrap into range.
+		// Bounded on both sides before multiplying, so neither a huge number
+		// nor a hugely negative one can wrap into range.
+		if n < 1 {
+			return 0, fmt.Errorf("must be at least 1s")
+		}
 		if n > maxSecs {
-			return 0, fmt.Errorf("must be at most %s", oauthMaxSignedURLTTL)
+			return 0, errSignedLinkLifetimeTooLong
 		}
 		return time.Duration(n) * time.Second, nil
 	}
@@ -87,7 +98,7 @@ func parseSignedLinkLifetime(v any) (time.Duration, error) {
 		d, err = seconds(n)
 	case uint64:
 		if n > uint64(maxSecs) {
-			return 0, fmt.Errorf("must be at most %s", oauthMaxSignedURLTTL)
+			return 0, errSignedLinkLifetimeTooLong
 		}
 		d, err = seconds(int64(n))
 	case float64:
@@ -95,7 +106,7 @@ func parseSignedLinkLifetime(v any) (time.Duration, error) {
 			return 0, fmt.Errorf(shape)
 		}
 		if n > float64(maxSecs) {
-			return 0, fmt.Errorf("must be at most %s", oauthMaxSignedURLTTL)
+			return 0, errSignedLinkLifetimeTooLong
 		}
 		d, err = seconds(int64(n))
 	case string:
@@ -103,7 +114,10 @@ func parseSignedLinkLifetime(v any) (time.Duration, error) {
 		if strings.Contains(s, "{{") || strings.Contains(s, "${") {
 			return 0, fmt.Errorf("must be a literal, not a template: a request value may not choose how long a signed link lives")
 		}
-		if secs, perr := strconv.ParseInt(s, 10, 64); perr == nil {
+		// A whole number too large for an int64 is still a number: ParseInt
+		// reports it clamped to the nearest bound, which seconds() refuses as
+		// too long or too short.
+		if secs, perr := strconv.ParseInt(s, 10, 64); perr == nil || errors.Is(perr, strconv.ErrRange) {
 			d, err = seconds(secs)
 		} else if parsed, perr := time.ParseDuration(s); perr == nil {
 			d = parsed
@@ -120,9 +134,31 @@ func parseSignedLinkLifetime(v any) (time.Duration, error) {
 		return 0, fmt.Errorf("must be at least 1s")
 	}
 	if d > oauthMaxSignedURLTTL {
-		return 0, fmt.Errorf("must be at most %s", oauthMaxSignedURLTTL)
+		return 0, errSignedLinkLifetimeTooLong
 	}
 	return d, nil
+}
+
+// signedLinkLifetimeForms is how a caller-supplied lifetime may be written,
+// for the answer to a request that named one the runtime cannot read.
+const signedLinkLifetimeForms = "whole seconds (300) or a duration (\"90s\", \"2h\"), at least 1s; more than 6h gives 6h"
+
+// requestedSignedLinkLifetime reads the `expires_in` a caller sent to
+// GET /api/_signed_url, in the forms serve_file's `with.expires_in` takes
+// (parseSignedLinkLifetime). A lifetime above the cap is answered with the
+// cap; a duration's sub-second remainder is dropped. A value that cannot be
+// read, or is under one second, is an error and never the default lifetime:
+// the link is a bearer credential and must not outlive what the caller asked
+// for. The caller decides what an absent parameter means.
+func requestedSignedLinkLifetime(raw string) (time.Duration, error) {
+	d, err := parseSignedLinkLifetime(raw)
+	if errors.Is(err, errSignedLinkLifetimeTooLong) {
+		return oauthMaxSignedURLTTL, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return d.Truncate(time.Second), nil
 }
 
 // serveFileValueProblems checks a serve_file step's `with:` values the

@@ -2,6 +2,7 @@
   "keys": [
     "session_cache",
     "query_live",
+    "query_live_snippet",
     "query_cache",
     "table_results",
     "summary",

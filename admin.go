@@ -197,6 +197,10 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			notFoundHandler(app)(w, r)
 			return
 		}
+		// Audit and credential tables are shown, never written (admin_read_only.go).
+		if adminRefuseReadOnlyTable(w, table) {
+			return
+		}
 
 		switch {
 		case action == "create":
@@ -858,6 +862,10 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	// The create form still offers hidden columns (write-only); the list
 	// and its search neither show nor match them.
 	createCols := cols
+	// A command-owned column gets no input: a browser submits every input,
+	// blank ones included, and a create that names an owned column is refused
+	// (crud_owned_fields.go). The row takes the column's default.
+	owned := commandOwnedColumns(app, table)
 	cols = adminVisibleColumns(app, table, cols)
 
 	page := queryParamInt(r, "page", 1)
@@ -892,17 +900,26 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&total)
 
 	csrf := generateCSRFToken()
+	// A read-only table gets no create, edit or delete control.
+	readOnly := adminReadOnlyKind(table)
 
 	var sb strings.Builder
 
 	// Header with create button
+	createButton := `<button onclick="document.getElementById('admin-create').showModal()" style="padding:8px 16px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">+ Create</button>`
+	if readOnly != "" {
+		createButton = ""
+	}
 	sb.WriteString(fmt.Sprintf(`<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
 		<div>
 			<div style="font-size:1.25rem;font-weight:700;color:hsl(var(--foreground));">%s</div>
 			<div style="font-size:12px;color:hsl(var(--muted-foreground));margin-top:2px;">%d records &middot; %d columns</div>
 		</div>
-		<button onclick="document.getElementById('admin-create').showModal()" style="padding:8px 16px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">+ Create</button>
-	</div>`, html.EscapeString(strings.Title(table)), total, len(cols)))
+		%s
+	</div>`, html.EscapeString(strings.Title(table)), total, len(cols), createButton))
+	if readOnly != "" {
+		sb.WriteString(adminReadOnlyNote(table, readOnly))
+	}
 
 	// Search
 	sb.WriteString(fmt.Sprintf(`<form method="GET" action="/_admin/%s" style="margin-bottom:16px;">
@@ -929,6 +946,12 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 				val = val[:60] + "..."
 			}
 			sb.WriteString(fmt.Sprintf(`<td style="padding:8px 12px;color:hsl(var(--foreground));white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis;">%s</td>`, html.EscapeString(val)))
+		}
+		if readOnly != "" {
+			sb.WriteString(fmt.Sprintf(`<td style="padding:8px 12px;text-align:right;white-space:nowrap;">
+			<a href="/_admin/%s/%s" style="font-size:12px;color:hsl(var(--primary));text-decoration:none;">View</a>
+		</td></tr>`, table, id))
+			continue
 		}
 		sb.WriteString(fmt.Sprintf(`<td style="padding:8px 12px;text-align:right;white-space:nowrap;">
 			<a href="/_admin/%s/%s" style="font-size:12px;color:hsl(var(--primary));text-decoration:none;margin-right:12px;">Edit</a>
@@ -962,6 +985,12 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		sb.WriteString(`</div>`)
 	}
 
+	if readOnly != "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, adminShell(sb.String(), strings.Title(table), table, app, getSession(app, r)))
+		return
+	}
+
 	// Create modal
 	sb.WriteString(fmt.Sprintf(`<dialog id="admin-create" style="border:1px solid hsl(var(--border));border-radius:12px;background:hsl(var(--card));color:hsl(var(--foreground));box-shadow:0 20px 60px rgba(0,0,0,0.3);max-width:480px;width:100%%;padding:0;">
 		<div style="padding:20px 24px;border-bottom:1px solid hsl(var(--border));display:flex;align-items:center;justify-content:space-between;">
@@ -971,11 +1000,15 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		<div style="padding:20px 24px;"><form method="POST" action="/_admin/api/%s/create">
 		<input type="hidden" name="_csrf" value="%s">`, strings.Title(table), table, csrf))
 
+	userState := adminUserStateColumns(app, table, true)
 	for _, col := range createCols {
-		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "user_id" {
+		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "user_id" || userState.has(col.Name) {
 			continue
 		}
 		if col.Name == "password" || col.Name == "password_hash" {
+			continue
+		}
+		if _, isOwned := owned[sqliteIdentifierFold(col.Name)]; isOwned {
 			continue
 		}
 		inputType := "text"
@@ -1025,6 +1058,10 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	cols, _ := GetTableColumns(app.DB, table)
 	// A hidden column is left out of the form, so saving it keeps its value.
 	cols = adminVisibleColumns(app, table, cols)
+	// A command-owned column is shown, not submitted: saving the form would
+	// otherwise post its value back, and a blank input for a NULL column is a
+	// change, which generic CRUD refuses (crud_owned_fields.go).
+	owned := commandOwnedColumns(app, table)
 	csrf := generateCSRFToken()
 	userRole := ""
 
@@ -1036,25 +1073,40 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		<a href="/_admin/%s" style="padding:8px 16px;font-size:13px;border:1px solid hsl(var(--border));border-radius:6px;text-decoration:none;color:hsl(var(--foreground));background:hsl(var(--card));">Back to list</a>
 	</div>`, strings.Title(table), id, table))
 
-	// Edit form
-	sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">
+	// Edit form (a read-only table shows the same fields with no form to post)
+	readOnly := adminReadOnlyKind(table)
+	if readOnly != "" {
+		sb.WriteString(adminReadOnlyNote(table, readOnly))
+		sb.WriteString(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">`)
+	} else {
+		sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">
 		<form method="POST" action="/_admin/api/%s/update/%s">
 		<input type="hidden" name="_csrf" value="%s">`, table, id, csrf))
+	}
 
+	userState := adminUserStateColumns(app, table, false)
 	for _, col := range cols {
 		val := fmt.Sprintf("%v", row[col.Name])
 		if val == "<nil>" {
 			val = ""
 		}
 
-		if col.PK {
+		if col.PK || readOnly != "" {
 			sb.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px;">
 				<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">%s</label>
-				<input value="%v" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
-			</div>`, formatColName(col.Name), row[col.Name]))
+				<input value="%s" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
+			</div>`, formatColName(col.Name), html.EscapeString(val)))
 			continue
 		}
 		if col.Name == "password_hash" {
+			continue
+		}
+		if command, isOwned := owned[sqliteIdentifierFold(col.Name)]; isOwned {
+			sb.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px;">
+				<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">%s</label>
+				<input value="%s" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
+				<div style="font-size:11px;color:hsl(var(--muted-foreground));margin-top:4px;">Changed only by the %s command.</div>
+			</div>`, formatColName(col.Name), html.EscapeString(val), html.EscapeString(command)))
 			continue
 		}
 
@@ -1068,10 +1120,13 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		if strings.Contains(col.Name, "email") {
 			inputType = "email"
 		}
-		if col.Name == "role" && table == "_benmore_users" {
-			// role is protected on update, so this form only shows it; the
-			// role form below changes it through /_admin/set-role.
-			userRole = val
+		if userState.has(col.Name) {
+			// No update writes these columns of a user, so this form only
+			// shows them; the role form below changes role through
+			// /_admin/set-role.
+			if col.Name == "role" {
+				userRole = val
+			}
 			sb.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px;">
 				<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">%s</label>
 				<input value="%s" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
@@ -1085,7 +1140,11 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		</div>`, formatColName(col.Name), inputType, col.Name, html.EscapeString(val)))
 	}
 
-	sb.WriteString(`<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Save Changes</button></form></div>`)
+	if readOnly != "" {
+		sb.WriteString(`</div>`)
+	} else {
+		sb.WriteString(`<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Save Changes</button></form></div>`)
+	}
 	if table == "_benmore_users" {
 		sb.WriteString(adminGlobalRoleForm(app, id, userRole, csrf))
 	}
@@ -1148,6 +1207,13 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	fmt.Fprint(w, adminShell(sb.String(), fmt.Sprintf("%s #%s", strings.Title(table), id), table, app, session))
 }
 
+// adminReadOnlyNote is the line a read-only table's pages show in place of
+// their write controls.
+func adminReadOnlyNote(table, kind string) string {
+	return `<div style="margin-bottom:16px;padding:10px 14px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));">` +
+		html.EscapeString(adminReadOnlyMessage(table, kind)) + `</div>`
+}
+
 // adminVisibleColumns drops the columns no response may carry
 // (apiHiddenColumn: credential hashes, TOTP secrets and backup codes on
 // _benmore_users, secret- and token-named text columns, blind indexes) from
@@ -1170,6 +1236,26 @@ func adminVisibleColumns(app *App, table string, cols []Column) []Column {
 		}
 	}
 	return out
+}
+
+// adminUserStateColumns is the set of _benmore_users columns the panel's
+// user forms offer no input for, because no generic create (or update)
+// writes them: role, the password and its gates, the sign-in factor and the
+// rest of protectedCreateFields / protectedUpdateFields. Empty for every
+// other table, whose forms are unchanged.
+func adminUserStateColumns(app *App, table string, create bool) protectedFields {
+	if !identIs(table, "_benmore_users") {
+		return protectedFields{}
+	}
+	if !create {
+		return protectedFields(protectedUpdateFields(app, table))
+	}
+	p := protectedCreateFields(app, table)
+	if app.Group != nil {
+		// An admin's create may name the tenant (handleCreate).
+		delete(p, sqliteIdentifierFold(app.Group.Key))
+	}
+	return p
 }
 
 // adminGlobalRoleForm is the user page's primary-role form. It posts to

@@ -117,6 +117,65 @@ func asyncRespondWarnings(dir string) []CheckFinding {
 	return findings
 }
 
+// bareRespondProblem warns about a `run: respond` with no `with:` in a
+// synchronous request flow: it answers 200 and ends the run, so a stray one
+// in front of a refusal turns the refusal into a 200. Deployed files carry
+// it, so it is a warning when the file is written and in `benmore check` and
+// a log line when the file loads, never a refusal. (In an async flow a
+// respond is a no-op: asyncRespondWarnings.)
+const bareRespondProblem = "this `run: respond` has no `with:`, so it answers 200 with an empty body and ends the flow here; later steps do not run. Give it a `status:` (and a body), or delete it."
+
+// bareRespondSteps names each such step of a flow file, at every nesting
+// depth, jobs in name order.
+func bareRespondSteps(file FlowFileGHA) []string {
+	if file.On.Request == nil || flowRunsInBackground(file.On) {
+		return nil
+	}
+	var out []string
+	var walk func(job, path string, steps []FlowStepGHA)
+	walk = func(job, path string, steps []FlowStepGHA) {
+		for i, s := range steps {
+			here := fmt.Sprintf("%s[%d]", path, i)
+			if ghaStepRunType(s) == "respond" && len(s.With) == 0 {
+				where := fmt.Sprintf("job %q step %s", job, here)
+				if s.ID != "" {
+					where += fmt.Sprintf(" (%q)", s.ID)
+				}
+				out = append(out, where)
+			}
+			walk(job, here+".steps", s.Steps)
+			walk(job, here+".else", s.Else)
+			walk(job, here+".on_error", s.OnError)
+		}
+	}
+	for _, job := range slices.Sorted(maps.Keys(file.Jobs)) {
+		walk(job, "steps", file.Jobs[job].Steps)
+	}
+	return out
+}
+
+// bareRespondWarnings reports bareRespondSteps for the flow file just
+// written, or for every flow file on a full check.
+func bareRespondWarnings(dir, writtenPath string) []CheckFinding {
+	var findings []CheckFinding
+	for _, rel := range flowFilesFor(dir, writtenPath) {
+		data, err := readFileInRoot(dir, rel)
+		if err != nil {
+			continue
+		}
+		var file FlowFileGHA
+		if decodeConfigYAML(data, &file) != nil {
+			continue
+		}
+		name := filepath.ToSlash(rel)
+		for _, where := range bareRespondSteps(file) {
+			findings = append(findings, CheckFinding{Severity: "warning", Source: "flows", File: name,
+				Message: name + ": " + where + ": " + bareRespondProblem})
+		}
+	}
+	return findings
+}
+
 // upstreamStatusRespondSteps names each respond step whose status passes a
 // `run: api` step's `outputs.status` through: an upstream 502 or 504 then
 // reaches the caller as Cloudflare's "error code: 502" page on the hosted

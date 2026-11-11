@@ -1,0 +1,5 @@
+<page auth="required" title="Chart">
+<query sql="SELECT * FROM patients WHERE user_id = {{user_id}}" as="pts">
+{{#pts}}<p>chart-name={{name}} chart-ssn={{ssn}} chart-blind=[{{ssn_blind}}]</p>{{/pts}}
+</query>
+</page>

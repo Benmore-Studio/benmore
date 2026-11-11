@@ -3,6 +3,8 @@
     "summary",
     "primitive",
     "authorization",
+    "lifetime",
+    "revocation",
     "js_snippet",
     "gotcha"
   ]

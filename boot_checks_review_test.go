@@ -316,7 +316,15 @@ func TestMarkerStampWaitsForTimestampsToSettle(t *testing.T) {
 	mustExec(t, raw, "INSERT INTO authors (name) VALUES ('just now')")
 	raw.Close()
 	opened := openedIdentity(t, dir)
-	if err := writeCleanShutdownMarker(dir, time.Now(), opened, false); err == nil {
+	// The refusal must not depend on how quickly this machine got here from
+	// the write: with the tests' 30 ms window a busy runner arrives after the
+	// timestamps have already settled, and a marker is then correct. A minute
+	// is "moments ago" on any runner.
+	testWindow := cleanShutdownSettle
+	cleanShutdownSettle = time.Minute
+	err = writeCleanShutdownMarker(dir, time.Now(), opened, false)
+	cleanShutdownSettle = testWindow
+	if err == nil {
 		t.Fatal("a marker was stamped right after a write without waiting")
 	}
 	if err := writeCleanShutdownMarker(dir, time.Now(), opened, true); err != nil {

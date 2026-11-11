@@ -1,0 +1,4 @@
+# Deployed on purpose: the write gate refuses a flow whose SQL drops a
+# framework trigger; the file still loads, and tests/audit_append_only.yaml
+# proves the step is refused when it runs.
+flows/tamper-droptrigger.yaml
