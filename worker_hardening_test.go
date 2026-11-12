@@ -59,22 +59,7 @@ func TestFireFlowsForEventFallsBackInlineWhenPoolFull(t *testing.T) {
 	if cap(flowsEventSem) != flowsEventFanoutLimit || flowsEventFanoutLimit != 32 {
 		t.Fatalf("flows event semaphore cap = %d, want 32", cap(flowsEventSem))
 	}
-	for {
-		select {
-		case <-flowsEventSem:
-		default:
-			goto drained
-		}
-	}
-drained:
-	for i := 0; i < cap(flowsEventSem); i++ {
-		flowsEventSem <- struct{}{}
-	}
-	defer func() {
-		for i := 0; i < cap(flowsEventSem); i++ {
-			<-flowsEventSem
-		}
-	}()
+	holdEverySlot(t, flowsEventSem)
 
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "flows.db"))
 	if err != nil {

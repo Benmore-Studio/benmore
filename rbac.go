@@ -619,6 +619,15 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				}
 				return
 			}
+			if refused, err := refuseDemotingAnotherAdmin(tx, session, uid, dropsGlobalAdminGrant); err != nil {
+				serverErrorJSON(w, r, app, "roles grant", err, "grant failed")
+				return
+			} else if refused {
+				httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+					"error": adminDemotionProtectedCode, "message": adminDemotionRefusal,
+				}, adminDemotionProtectedCode))
+				return
+			}
 		}
 		_, err = tx.Exec(`
 			INSERT INTO _benmore_user_roles (user_id, role, group_id, granted_by, expires_at)
@@ -703,6 +712,15 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				} else {
 					serverErrorJSON(w, r, app, "roles update", err, "update failed")
 				}
+				return
+			}
+			if refused, err := refuseDemotingAnotherAdmin(tx, session, uid, dropsGlobalAdminGrant); err != nil {
+				serverErrorJSON(w, r, app, "roles update", err, "update failed")
+				return
+			} else if refused {
+				httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+					"error": adminDemotionProtectedCode, "message": adminDemotionRefusal,
+				}, adminDemotionProtectedCode))
 				return
 			}
 		}
@@ -794,6 +812,15 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				} else {
 					serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
 				}
+				return
+			}
+			if refused, err := refuseDemotingAnotherAdmin(tx, session, uid, dropsGlobalAdminGrant); err != nil {
+				serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
+				return
+			} else if refused {
+				httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+					"error": adminDemotionProtectedCode, "message": adminDemotionRefusal,
+				}, adminDemotionProtectedCode))
 				return
 			}
 		}

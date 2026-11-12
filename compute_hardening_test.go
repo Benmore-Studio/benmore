@@ -46,16 +46,12 @@ func TestComputeConcurrencyIsBounded(t *testing.T) {
 	if _, err := RunCompute(app, "one", "one", nil, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Occupy every slot, as abandoned timed-out goroutines would.
-	held := 0
-	for len(computeSlots) < cap(computeSlots) {
-		computeSlots <- struct{}{}
-		held++
-	}
+	// Occupy every slot, as abandoned timed-out goroutines would. The run
+	// above may still hold its own slot: a run hands back its result before
+	// it lets go of the slot.
+	release := holdEverySlot(t, computeSlots)
 	_, err := RunCompute(app, "one", "one", nil, 100*time.Millisecond)
-	for ; held > 0; held-- {
-		<-computeSlots
-	}
+	release()
 	if err == nil || !strings.Contains(err.Error(), "free compute slot") {
 		t.Fatalf("want slot-wait timeout, got %v", err)
 	}

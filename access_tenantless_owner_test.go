@@ -678,3 +678,26 @@ func TestRemovedMemberOwnTenantRowPerRule(t *testing.T) {
 		})
 	}
 }
+
+// describe states what rowScopeClause does for a caller with no tenant: the
+// owner tier reaches only owned rows that carry no tenant, plus, on the
+// membership table, the caller's own membership rows.
+func TestDescribeStatesTheTenantlessOwnerBound(t *testing.T) {
+	for _, tc := range []struct {
+		table, mode, want string
+	}{
+		{"docs", "", "a caller with no tenant reaches only rows they own (user_id) that carry no tenant"},
+		{"docs", "owner_or_role:manager", "rows the caller owns (user_id) in their tenant (with no tenant, only owned rows that carry no tenant)"},
+		{"team_members", "", "carry no tenant, and their own membership rows"},
+	} {
+		rules := map[string]map[AccessOp]string{}
+		if tc.mode != "" {
+			rules[tc.table] = docsRulesFor(tc.mode)
+		}
+		app, _ := tenantlessOwnerAppWithRules(t, rules)
+		effect, _ := describeTableAccess(app, tc.table)["read"]["effect"].(string)
+		if !strings.Contains(effect, tc.want) {
+			t.Errorf("%s %q: effect %q does not say %q", tc.table, tc.mode, effect, tc.want)
+		}
+	}
+}

@@ -17,7 +17,9 @@ import "net/http"
 //   - the credential tables: sessions, tokens, passkeys, reset and sign-in
 //     grants and the connector's stores are minted and revoked by the sign-in
 //     code, with hashing, expiry, audit rows and revocation of what depends on
-//     them. A row written by hand skips all of it.
+//     them. A row written by hand skips all of it;
+//   - the role grants: a hand-written grant skips the role API's checks (a
+//     declared role, the last admin, and no admin demoting another).
 //
 // The credential set is the restore path's own registry (restore_credentials.go),
 // which every credential-bearing framework table must join, so a new one is
@@ -26,6 +28,7 @@ import "net/http"
 const (
 	adminReadOnlyAudit      = "audit"
 	adminReadOnlyCredential = "credential"
+	adminReadOnlyGrants     = "grants"
 )
 
 // adminReadOnlyKind reports why the admin panel does not write table: "" for
@@ -42,6 +45,11 @@ func adminReadOnlyKind(table string) string {
 			return adminReadOnlyCredential
 		}
 	}
+	// Role grants: the role API (rbac.go) is their writer, with the declared-
+	// role, last-admin and other-admin checks a generic write skips.
+	if identIs(table, "_benmore_user_roles") {
+		return adminReadOnlyGrants
+	}
 	for _, name := range restoreMCPTables {
 		if identIs(table, name) {
 			return adminReadOnlyCredential
@@ -54,6 +62,9 @@ func adminReadOnlyKind(table string) string {
 func adminReadOnlyMessage(table, kind string) string {
 	if kind == adminReadOnlyAudit {
 		return table + " is an audit table: the admin panel shows it and never writes it. The framework writes its rows as the events happen; none can be added, edited or deleted here."
+	}
+	if kind == adminReadOnlyGrants {
+		return table + " holds role grants: the admin panel shows it and never writes it. Grant, extend and revoke roles with POST, PATCH and DELETE /api/_auth/users/<id>/roles/<role>, and change the primary role on the user's page."
 	}
 	return table + " holds sign-in credentials: the admin panel shows it and never writes it. Sessions, tokens, passkeys and reset grants are created and revoked through the sign-in and account endpoints."
 }

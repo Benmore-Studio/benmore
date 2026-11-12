@@ -15,6 +15,10 @@ repository's `CHANGELOG.md` records every change.
 
 ## Next release
 
+## 2.7.331 (2026-11-11)
+
+- **An admin can no longer take admin away from another admin, and the admin panel no longer edits role grants.** `POST /_admin/set-role` to a non-admin role, and revoking or putting an expiry on the global admin grant through `/api/_auth/users/<id>/roles`, answer 403 `admin_demotion_protected` when aimed at another admin; an admin steps down from their own account, and another admin is cut off by deactivating the account. Grants are made with the role API, not the panel's `_benmore_user_roles` table. `benmore docs auth.admin_panel_accounts`.
+
 ## 2.7.330 (2026-11-11)
 
 - **The admin panel no longer writes an account's sign-in factor, and changing a sign-in address there signs the account out.** `POST /_admin/api/_benmore_users/create` and `/update/<id>` drop `totp_secret`, `backup_codes`, `mfa_last_totp`, `mfa_last_totp_at` and `email_grandfathered` (named in `X-Stripped-Fields`), and the user forms have no input for them. Changing another admin's `email` (or the `auth.identifier` column) answers 403 `admin_identifier_protected`; changing any other account's, or your own, saves it and ends that account's sessions, API tokens and connector grants and cancels its unused reset links. `benmore docs auth.admin_panel_accounts`.

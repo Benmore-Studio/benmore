@@ -145,7 +145,9 @@ func TestAdminSetRoleRefusesUndeclaredRoles(t *testing.T) {
 	if audited != 0 {
 		t.Fatalf("refused role changes were audited as made: %d", audited)
 	}
-	for _, declared := range []string{"editor", "admin", "user"} {
+	// admin last: taking it away again is another admin's demotion, refused
+	// (TestNoAdminDemotesAnotherAdmin).
+	for _, declared := range []string{"editor", "user", "admin"} {
 		if w := setRole(declared); w.Code != http.StatusSeeOther || role() != declared {
 			t.Fatalf("set-role %q: %d %s, role now %q", declared, w.Code, w.Body.String(), role())
 		}
