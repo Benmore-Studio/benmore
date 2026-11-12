@@ -103,21 +103,8 @@ func refuseLastDurableAdmin(app *App, q rowQuerier, uid int64, change adminStand
 	if q == nil || uid <= 0 {
 		return nil
 	}
-	switch change {
-	case dropsPrimaryAdmin:
-		// A durable global grant keeps the account an admin.
-		var held int
-		err := q.QueryRow(`SELECT COUNT(*) FROM main._benmore_user_roles
-			WHERE user_id = ? AND role = 'admin' AND group_id IS NULL AND expires_at IS NULL`, uid).Scan(&held)
-		if err == nil && held > 0 {
-			return nil
-		}
-	case dropsGlobalAdminGrant:
-		// So does the primary role.
-		var role sql.NullString
-		if err := q.QueryRow(`SELECT role FROM main._benmore_users WHERE id = ?`, uid).Scan(&role); err == nil && role.String == "admin" {
-			return nil
-		}
+	if keepsDurableAdmin(q, uid, change) {
+		return nil
 	}
 	self, others, err := durableAdminCounts(app, q, uid)
 	if err != nil {
@@ -127,6 +114,49 @@ func refuseLastDurableAdmin(app *App, q rowQuerier, uid int64, change adminStand
 		return errLastDurableAdmin
 	}
 	return nil
+}
+
+// keepsDurableAdmin reports whether account uid stays a durable admin through
+// its other standing after change: a durable global grant beside the primary
+// role, or the primary role beside the grant.
+func keepsDurableAdmin(q rowQuerier, uid int64, change adminStandingChange) bool {
+	switch change {
+	case dropsPrimaryAdmin:
+		var held int
+		err := q.QueryRow(`SELECT COUNT(*) FROM main._benmore_user_roles
+			WHERE user_id = ? AND role = 'admin' AND group_id IS NULL AND expires_at IS NULL`, uid).Scan(&held)
+		return err == nil && held > 0
+	case dropsGlobalAdminGrant:
+		var role sql.NullString
+		err := q.QueryRow(`SELECT role FROM main._benmore_users WHERE id = ?`, uid).Scan(&role)
+		return err == nil && role.String == "admin"
+	}
+	return false
+}
+
+// adminDemotionProtectedCode is the stable code of refuseDemotingAnotherAdmin's
+// refusal.
+const adminDemotionProtectedCode = "admin_demotion_protected"
+
+// adminDemotionRefusal is its message.
+const adminDemotionRefusal = "cannot take admin away from another admin: an admin steps down only from their own account. " +
+	"To cut another admin off, deactivate the account (deactivated_at); nothing was changed."
+
+// refuseDemotingAnotherAdmin refuses a change by actor that ends, or puts an
+// expiry on, another account's global admin standing. An admin's sign-in
+// address cannot be changed by another admin (user_identifier_update.go); a
+// demotion first would lift that, so no admin demotes another. Run it in the
+// change's transaction, beside refuseLastDurableAdmin. A deactivated admin is
+// still an admin here: deactivation is how one admin cuts another off.
+func refuseDemotingAnotherAdmin(q rowQuerier, actor *Session, uid int64, change adminStandingChange) (refused bool, err error) {
+	if q == nil || uid <= 0 || (actor != nil && actor.UserID == uid) {
+		return false, nil
+	}
+	admin, err := accountHoldsGlobalAdmin(q, uid)
+	if err != nil || !admin {
+		return false, err
+	}
+	return !keepsDurableAdmin(q, uid, change), nil
 }
 
 // lastDurableAdminUpdate guards a generic update of a _benmore_users row (the

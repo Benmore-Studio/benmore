@@ -308,6 +308,7 @@ var refusalCodeIdentifiers = map[string]string{
 	"uploadsDisabledCode":           uploadsDisabledCode,
 	"mediaAllowanceCode":            mediaAllowanceCode,
 	"emailVerificationRequiredCode": emailVerificationRequiredCode,
+	"adminDemotionProtectedCode":    adminDemotionProtectedCode,
 }
 
 // runtimeErrorCodes finds the stable codes the source answers in `error` or

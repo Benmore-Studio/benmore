@@ -219,7 +219,10 @@ jobs:
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The mux is already built, so the job worker reads app.Flows.
+	app.mu.Lock()
 	app.Flows = append(app.Flows, flows...)
+	app.mu.Unlock()
 	invalidateStaticTreeVersion(app.Dir)
 	const longS = "%C5%BF"
 	for _, spelled := range []string{

@@ -222,16 +222,7 @@ func TestTSXCompileSingleflightAndSlots(t *testing.T) {
 	}
 
 	resetTSXCache()
-	held := 0
-	for len(tsxCompileSlots) < cap(tsxCompileSlots) {
-		tsxCompileSlots <- struct{}{}
-		held++
-	}
-	defer func() {
-		for ; held > 0; held-- {
-			<-tsxCompileSlots
-		}
-	}()
+	holdEverySlot(t, tsxCompileSlots)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := compileTSXEntry(ctx, src, root, true, ""); err == nil {

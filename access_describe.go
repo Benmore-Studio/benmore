@@ -120,7 +120,9 @@ func accessRowScope(app *App, table string, op AccessOp, mode string) accessRowS
 			return accessRowScopeInfo{Rows: "none", Effect: "owner_or_role: names no roles, so every caller but an admin is refused"}
 		}
 		var tiers []string
-		if hasUID {
+		if hasUID && grouped {
+			tiers = append(tiers, "rows the caller owns (user_id) in their tenant (with no tenant, only owned rows that carry no tenant)")
+		} else if hasUID {
 			tiers = append(tiers, "rows the caller owns (user_id)")
 		}
 		if grouped {
@@ -136,7 +138,11 @@ func accessRowScope(app *App, table string, op AccessOp, mode string) accessRowS
 	if grouped {
 		fallback := "only rows shared with them"
 		if hasUID {
-			fallback = "only rows they own (user_id)" + shares
+			fallback = "only rows they own (user_id) that carry no tenant"
+			if identIs(table, app.Group.Table) {
+				fallback += ", and their own membership rows"
+			}
+			fallback += shares
 		}
 		effect := fmt.Sprintf("every row of the caller's tenant (%s), whoever owns it; a caller with no tenant reaches %s", app.Group.Key, fallback)
 		if hasUID && mode == "self" {

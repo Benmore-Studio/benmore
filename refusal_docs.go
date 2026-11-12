@@ -531,9 +531,11 @@ var refusalDocs = map[string]docsRule{
 	"email_unverified":            {At: "scoping.email_keyed_grants"},
 	"api_token_limit":             {At: "auth.credential_limits"},
 	// The admin panel's write routes on a table it only shows.
-	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}}},
+	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}}},
 	// The admin panel's edit of another admin's sign-in identifier.
 	adminIdentifierProtectedCode: {At: "auth.admin_panel_accounts"},
+	// A role change that takes admin away from another admin.
+	adminDemotionProtectedCode: {At: "auth.admin_panel_accounts"},
 	// Other built-in routes.
 	"report_source_limit_exceeded": {At: "query.report_sources"},
 	"language_not_found":           {At: "i18n.endpoint"},

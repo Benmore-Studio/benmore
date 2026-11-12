@@ -54,12 +54,15 @@ func TestAdminToolsRunnerTreatsFormAsRequestInput(t *testing.T) {
 	uid, _ := res.LastInsertId()
 	sid := CreateSession(db, uid, "boss@example.com", "", time.Hour)
 
+	// The mux is already built, so the job worker reads app.Flows.
+	app.mu.Lock()
 	app.Flows = append(app.Flows,
 		Flow{Name: "retitle", Role: "admin", Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/admin/retitle"},
 			Steps: []FlowStep{{Name: "q", Type: "sql_dynamic", SQL: "UPDATE notes SET title = '{{label}}'"}}},
 		Flow{Name: "stamp", Role: "admin", Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/admin/stamp"},
 			Steps: []FlowStep{{Name: "s", Type: "sql", SQL: "INSERT INTO notes (title) VALUES ('group:' || COALESCE(:user_group_id, 'none'))"}}},
 	)
+	app.mu.Unlock()
 
 	loc := adminToolsRun(mux, sid, url.Values{"_flow_path": {"/api/admin/retitle"}, "label": {"x' || (SELECT email FROM _benmore_users) || '"}})
 	var titles []string
@@ -112,9 +115,11 @@ func TestAdminToolsRunnerRedactsFlowError(t *testing.T) {
 	uid, _ := res.LastInsertId()
 	sid := CreateSession(db, uid, "boss@example.com", "", time.Hour)
 	SetAppEnv(dir, "PARTNER_API_TOKEN", jobErrorRedactToken)
+	app.mu.Lock()
 	app.Flows = append(app.Flows, Flow{Name: "sync", Role: "admin", Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/admin/sync"},
 		Steps: []FlowStep{{Name: "call", Type: "api", API: &FlowAPICall{Method: "GET",
 			URL: "https://partner.invalid/status/404/{{env.PARTNER_API_TOKEN}}?key={{env.PARTNER_API_TOKEN}}"}}}})
+	app.mu.Unlock()
 
 	loc := adminToolsRun(mux, sid, url.Values{"_flow_path": {"/api/admin/sync"}})
 	u, err := url.Parse(loc)

@@ -261,6 +261,15 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 				}
 				return
 			}
+			if refused, err := refuseDemotingAnotherAdmin(tx, session, uid, dropsPrimaryAdmin); err != nil {
+				serverError(w, r, app, "set role", err, "Role change failed")
+				return
+			} else if refused {
+				httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+					"error": adminDemotionProtectedCode, "message": adminDemotionRefusal,
+				}, adminDemotionProtectedCode))
+				return
+			}
 		}
 		if err := SetUserRole(tx, uid, role); err != nil {
 			httpError(w, err.Error(), http.StatusBadRequest)
