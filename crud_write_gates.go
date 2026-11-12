@@ -66,12 +66,19 @@ var userSignInStateColumns = []string{
 }
 
 // protectedCreateFields is the mass-assignment set for a create on table:
-// framework identity columns, the tenant key, the in-tenant role field on the
+// framework identity columns, the timestamps the framework manages
+// (created_at, updated_at, and deleted_at, which only DELETE and restore
+// write: a create that stored it made a row already in the trash, absent
+// from every list), the tenant key, the in-tenant role field on the
 // membership table, the account's sign-in state on _benmore_users, and the
 // columns triggers derive: computed columns and blind-index siblings
 // (`<col>_blind`, the HMAC of an encrypted column).
+//
+// This is the one list. Updates (protectedUpdateFields), bulk import
+// (importableColumns), /api/_groups/create and the request descriptions
+// (requestWritable) all start from it.
 func protectedCreateFields(app *App, table string) protectedFields {
-	p := newProtectedFields("user_id", "created_at", "updated_at", "password_hash", "role", "password_change_required")
+	p := newProtectedFields("user_id", "created_at", "updated_at", "deleted_at", "password_hash", "role", "password_change_required")
 	if identIs(table, "_benmore_users") {
 		p.add(userSignInStateColumns...)
 	}

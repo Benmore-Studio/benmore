@@ -206,6 +206,11 @@ func parseAppConfigDocument(data []byte) (map[string]any, *BackupConfig, error) 
 		case string:
 		case map[string]any:
 			for op, mode := range rule {
+				// The sharing switch may be written true/false (a YAML
+				// boolean) as well as on/off; parseAccessConfig reads it.
+				if strings.ToLower(strings.TrimSpace(op)) == accessShareKey {
+					continue
+				}
 				if _, ok := mode.(string); !ok {
 					return nil, nil, fmt.Errorf("app.yaml: access.%s.%s must be a string", table, op)
 				}

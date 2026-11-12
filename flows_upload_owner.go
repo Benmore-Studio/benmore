@@ -19,7 +19,9 @@ package main
 //     a shared tenant, an anonymous share link, a cron or event flow.
 //     Anything else is refused before any byte is read, redirected or
 //     deleted.
-//   - without `record:`, the step still acts as before (the flow's SQL is
+//   - a PUBLIC file (delete_upload only) is deleted on the same proof and
+//     never without it: `record:` is required (flowPublicUploadOwnerRefusal).
+//   - without `record:`, a private file's step still acts as before (the flow's SQL is
 //     the gate) and only logs a file the caller did not upload. Enforcing
 //     the uploader rule there would refuse the common cross-user flows
 //     (staff opening a member's document, a driver viewing a customer's
@@ -80,13 +82,38 @@ func flowPrivateUploadOwnerRefusal(ctx *FlowContext, record *FlowUploadRecord, r
 		}
 		return ""
 	}
+	return uploadRecordRefusal(ctx, record, recordID, backend, logical, privateUploadOwnersTable)
+}
+
+// flowPublicUploadOwnerRefusal is the proof `run: delete_upload` needs before
+// it deletes the public upload at logical (uploads/...): the same `record:`
+// rule a private file gets, and never advisory. A public URL is no secret,
+// so the flow's own SQL cannot be the only gate: the step must name the row,
+// the row must reference the file, and it must belong to the uploader or the
+// uploader's tenant (an admin upload or a file with no uploader record still
+// passes). It returns "" when the file may be deleted, else why not.
+func flowPublicUploadOwnerRefusal(ctx *FlowContext, record *FlowUploadRecord, recordID string, backend StorageBackend, logical string) string {
+	if record == nil {
+		return "a public upload is deleted only with `record:` naming the row that owns it: add `with: { record: { table: <table>, id: <row id> } }` (api(at:\"uploads\") public_deletion)"
+	}
+	if ctx.App == nil || ctx.App.DB == nil {
+		return "upload ownership records are unavailable"
+	}
+	return uploadRecordRefusal(ctx, record, recordID, backend, logical, publicUploadOwnersTable)
+}
+
+// uploadRecordRefusal checks a step's `record:` against the upload at
+// logical: a table of this app and a row, the row references the file, and
+// the row vouches for the uploader recorded in owners.
+func uploadRecordRefusal(ctx *FlowContext, record *FlowUploadRecord, recordID string, backend StorageBackend, logical, owners string) string {
+	app := ctx.App
 	if !safeIdent(record.Table) || !appHasTable(app, record.Table) || recordID == "" {
 		return "`record:` must name a table of this app (`table:`) and a row (`id:`)"
 	}
 	if !recordReferencesPrivateUpload(app, backend, record.Table, recordID, logical) {
 		return "the `record:` row does not reference this file"
 	}
-	if !privateUploadVouched(app, ctx.Session, record.Table, recordID, key) {
+	if !uploadVouchedIn(app, ctx.Session, owners, record.Table, recordID, uploadRelPath(logical)) {
 		return "this record does not own the file: it was uploaded by someone the record doesn't belong to"
 	}
 	return ""
@@ -131,10 +158,10 @@ func logUnvouchedPrivateUpload(app *App, logical string) {
 	log.Printf("serve_file/delete_upload [%s]: acted on %s, a private file the caller did not upload, with no `record:` naming the row that owns it. A later release will refuse this: add `with: { record: { table: <table>, id: <row id> } }` (api(at:\"uploads\") private_ownership)", filepath.Base(app.Dir), logical)
 }
 
-// recordReferencesPrivateUpload reports whether table/id stores the private
-// upload at logical in some column, in any spelling the signed-URL checks
-// accept (recordReferencesLocalFile, recordReferencesFile) or as the object
-// URL of the app's own bucket.
+// recordReferencesPrivateUpload reports whether table/id stores the upload at
+// logical (private, or public for delete_upload) in some column, in any
+// spelling the signed-URL checks accept (recordReferencesLocalFile,
+// recordReferencesFile) or as the object URL of the app's own bucket.
 func recordReferencesPrivateUpload(app *App, backend StorageBackend, table, id, logical string) bool {
 	if recordReferencesLocalFile(app, table, id, logical) {
 		return true

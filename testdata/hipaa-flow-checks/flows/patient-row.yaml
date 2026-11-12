@@ -1,5 +1,6 @@
 # `SELECT *` hands the whole row to the response: the encrypted column in
-# clear and its blind-index column. `benmore check` warns here.
+# clear (its blind-index column is left out of the response). `benmore check`
+# warns here.
 on:
   request: { method: GET, path: /api/patient-row, auth: required }
 jobs:

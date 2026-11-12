@@ -14,7 +14,16 @@ import (
 
 func newTenantEncryptionFixture(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
-	app, mux := newTenantRoleFixture(t, "access:\n  companies: {read: everyone}\n  projects: {read: everyone}\n  brokers: {read: everyone}\n")
+	app := newTenantEncryptionApp(t)
+	return app, buildAppMux(app, true, "http://localhost")
+}
+
+// newTenantEncryptionApp is newTenantEncryptionFixture's app before any mux is
+// built (see newTenantRoleApp): the encrypted fields are declared first, so no
+// worker reads them while they are being set.
+func newTenantEncryptionApp(t *testing.T) *App {
+	t.Helper()
+	app := newTenantRoleApp(t, "access:\n  companies: {read: everyone}\n  projects: {read: everyone}\n  brokers: {read: everyone}\n")
 	key := testKeyBytes(0x35)
 	path := filepath.Join(app.Dir, "data.db")
 	RegisterDBEncryptionKey(path, key)
@@ -39,7 +48,7 @@ func newTenantEncryptionFixture(t *testing.T) (*App, *http.ServeMux) {
 			t.Fatal(err)
 		}
 	}
-	return app, mux
+	return app
 }
 
 func assertTenantEncryptedRead(t *testing.T, mux *http.ServeMux, sid, path string, wantPlain bool, value string) {

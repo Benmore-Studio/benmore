@@ -90,6 +90,13 @@ func accessRowScope(app *App, table string, op AccessOp, mode string) accessRowS
 	if grouped {
 		inTenant = fmt.Sprintf(", only inside the caller's own tenant (%s)", app.Group.Key)
 	}
+	// ownRows is the read a caller with no tenant keeps on the groups
+	// membership table (ownMembershipReadSQL): stated where rowScopeClause
+	// applies it, the member-of branch and the tenant default.
+	ownRows := ""
+	if op == OpRead && grouped && identIs(table, app.Group.Table) && membershipIdentRe.MatchString(app.Group.UserField) && hasColumn(app, table, app.Group.UserField) {
+		ownRows = fmt.Sprintf("the membership rows that name them (%s), active or not (read only: such a row gives no tenant and no tenant role)", app.Group.UserField)
+	}
 	switch {
 	case mode == "off":
 		return accessRowScopeInfo{Rows: "none", Effect: "this operation is off: the route answers 404 for every caller, admins included"}
@@ -110,9 +117,13 @@ func accessRowScope(app *App, table string, op AccessOp, mode string) accessRowS
 			return accessRowScopeInfo{Rows: "none", Effect: "the member-of rule is malformed or does not fit this table, so every caller but an admin is refused"}
 		}
 		local, _ := rule.joinTarget(app, table)
-		return accessRowScopeInfo{Rows: "member_of", Tenant: grouped, Effect: fmt.Sprintf(
+		effect := fmt.Sprintf(
 			"rows whose %s has a %s row (%s = it, %s = the caller)%s%s; user_id ownership plays no part",
-			local, rule.Table, rule.JoinCol, rule.UserCol, shares, inTenant)}
+			local, rule.Table, rule.JoinCol, rule.UserCol, shares, inTenant)
+		if ownRows != "" {
+			effect += "; a caller with no tenant reads only rows shared with them and " + ownRows
+		}
+		return accessRowScopeInfo{Rows: "member_of", Tenant: grouped, Effect: effect}
 	}
 	if strings.HasPrefix(mode, "owner_or_role:") {
 		roles := splitCommaList(strings.TrimPrefix(mode, "owner_or_role:"))
@@ -139,10 +150,14 @@ func accessRowScope(app *App, table string, op AccessOp, mode string) accessRowS
 		fallback := "only rows shared with them"
 		if hasUID {
 			fallback = "only rows they own (user_id) that carry no tenant"
-			if identIs(table, app.Group.Table) {
+			if ownRows != "" {
+				fallback += ", and " + ownRows
+			} else if identIs(table, app.Group.Table) {
 				fallback += ", and their own membership rows"
 			}
 			fallback += shares
+		} else if ownRows != "" {
+			fallback = "only " + ownRows + shares
 		}
 		effect := fmt.Sprintf("every row of the caller's tenant (%s), whoever owns it; a caller with no tenant reaches %s", app.Group.Key, fallback)
 		if hasUID && mode == "self" {

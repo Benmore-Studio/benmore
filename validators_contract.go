@@ -559,6 +559,7 @@ func accessOpKeyViolation(table, op string) string {
 		"app.yaml: access.%s.%s is not an access operation - the rule is never read, so that operation silently keeps the table's broader fallback (`all:`, then `default:`, then the implicit self/group/admin default).\n\n"+
 			"Operations: read, write (creates: POST /api/<table>, batch create, ingest, import), update, delete, all (fallback for any op not listed). "+
 			"Note that update and delete do NOT inherit from write - declare each, or use `all:`.\n"+
+			"Record sharing is a switch beside them: `share: off` (or `on`).\n"+
 			"Common fabrications: `create:`/`insert:` (use write), `list:`/`get:` (use read), `edit:`/`patch:` (use update), `remove:` (use delete).",
 		table, op)
 }

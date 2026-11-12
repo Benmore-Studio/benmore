@@ -200,7 +200,7 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 	if inUploads {
 		// Resolve symlinks: a link under uploads/ must not serve bytes from
 		// outside it (another tenant's tree, env.yaml). Same rule as static.
-		if file, ok := openServableFile(uploadsRoot, fullPath); ok {
+		if file, ok := openStoredUpload(uploadsRoot, fullPath); ok {
 			localExists = true
 			localFile = file
 			defer file.Close()
@@ -233,6 +233,15 @@ func execStepServeFile(ctx *FlowContext, step *FlowStep) error {
 		logical, err := privateUploadReadPath(ctx.App, backend, untrimmed)
 		if err != nil {
 			log.Printf("serve_file [%s]: refused a private upload reference that is not in its stored form: %v", filepath.Base(ctx.App.Dir), err)
+			httpError(ctx.Writer, "Not found", http.StatusNotFound)
+			ctx.Stopped = true
+			return nil
+		}
+		// On local disk a reference that opens no stored file (missing, or
+		// another spelling of a stored name: openStoredUpload) is not found
+		// before the uploader rule is asked, which would read the respelled
+		// reference as a file with no uploader record.
+		if _, local := backend.(*LocalStorage); local && !localExists {
 			httpError(ctx.Writer, "Not found", http.StatusNotFound)
 			ctx.Stopped = true
 			return nil
@@ -375,9 +384,16 @@ func execStepDeleteUpload(ctx *FlowContext, step *FlowStep) error {
 		return nil
 	}
 	// The reference must also be the caller's (or the record's) to delete,
-	// as for serve_file (flows_upload_owner.go).
-	return deletePrivateUploadAuthorized(ctx.App, target, func(backend StorageBackend, logical string) error {
-		if why := flowPrivateUploadOwnerRefusal(ctx, step.UploadRecord, recordID, backend, logical); why != "" {
+	// as for serve_file (flows_upload_owner.go). A public file is deleted
+	// only on that proof: `record:` is required for it.
+	return deleteUploadAuthorized(ctx.App, target, func(backend StorageBackend, logical string, public bool) error {
+		why := ""
+		if public {
+			why = flowPublicUploadOwnerRefusal(ctx, step.UploadRecord, recordID, backend, logical)
+		} else {
+			why = flowPrivateUploadOwnerRefusal(ctx, step.UploadRecord, recordID, backend, logical)
+		}
+		if why != "" {
 			return fmt.Errorf("delete_upload refused: %s", why)
 		}
 		return nil
@@ -395,6 +411,9 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 	if r == nil {
 		return nil
 	}
+	// The response leaves out the app's declared blind-index columns; the
+	// step outputs it is built from keep them (flows_respond_blind_index.go).
+	defer beginFlowResponse(ctx)()
 	// Public flows may also read a signed-in caller's identity. Cookie
 	// authentication does not keep max-age/Expires responses out of shared
 	// caches. Protect both success and error responses, regardless of the
@@ -461,6 +480,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 				ctxVal, ok = flowDataValue(ctx, key)
 			}
 			if ok {
+				ctxVal = flowResponseValue(ctx, ctxVal)
 				if r.ContentType == "" {
 					body, err := marshalRespondJSON(ctxVal)
 					if err != nil {
@@ -507,7 +527,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 	// emit a 500 with a structured `template_unresolved` envelope
 	// instead of the half-broken success response.
 	if r.JSONArray != nil {
-		resolved := resolveJSONValue(r.JSONArray, ctx)
+		resolved := flowResponseValue(ctx, resolveJSONValue(r.JSONArray, ctx))
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(resolved); err != nil {
 			return err
@@ -520,7 +540,7 @@ func execStepRespond(ctx *FlowContext, step *FlowStep) error {
 		write(jsonType, buf.Bytes())
 	} else if r.JSON != nil {
 		// Interpolate {{var}} placeholders in JSON values before encoding
-		resolved := interpolateJSONValues(r.JSON, ctx)
+		resolved := flowResponseValue(ctx, interpolateJSONValues(r.JSON, ctx))
 		if missing := ctx.takeMissingRefs(); len(missing) > 0 {
 			writeRespondUnresolved(ctx, step, missing)
 			ctx.Stopped = true

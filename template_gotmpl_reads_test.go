@@ -26,11 +26,23 @@ func legacyQueryRows(t *testing.T, mux *http.ServeMux, route, actor string) []ma
 	return reportFixtureRows(t, ssrGet(mux, route, actor))
 }
 
+const legacyQueryBaseURL = "https://report.example.invalid"
+
 func legacyQueryFixture(t *testing.T, pages map[string]string) (*App, *http.ServeMux) {
 	t.Helper()
-	app, _ := newTenantEncryptionFixture(t)
+	app := legacyQueryApp(t, pages)
+	return app, buildAppMux(app, false, legacyQueryBaseURL)
+}
+
+// legacyQueryApp is legacyQueryFixture's app with its pages loaded and no mux
+// built yet. A test that changes the app's configuration (pages, unmask roles,
+// dev mode) does it on this app and builds the mux afterwards: the workers a
+// mux starts read that configuration, so it must not change under them.
+func legacyQueryApp(t *testing.T, pages map[string]string) *App {
+	t.Helper()
+	app := newTenantEncryptionApp(t)
 	ssrLoadPages(t, app, pages)
-	return app, buildAppMux(app, false, "https://report.example.invalid")
+	return app
 }
 
 func assertMasked(t *testing.T, what string, value any, plaintext string) {
@@ -85,7 +97,17 @@ func TestGotmplQueriesMaskLikeNativeQuery(t *testing.T) {
 		t.Fatalf("global admin: %v", rows)
 	}
 
-	app.Encrypted.Fields["projects"][0].Roles = []string{"auditor"}
+	// The same page in an app that declares other unmask roles.
+	declaring := func(roles []string) (*App, *http.ServeMux, string) {
+		t.Helper()
+		app := legacyQueryApp(t, map[string]string{
+			"legacy.html": legacyQueryPage("", "SELECT private_note FROM projects ORDER BY id"),
+		})
+		app.Encrypted.Fields["projects"][0].Roles = roles
+		viewer, _ := tenantMember(t, app, "viewer@example.com", "user", 1, "viewer")
+		return app, buildAppMux(app, false, legacyQueryBaseURL), viewer
+	}
+	app, mux, viewer = declaring([]string{"auditor"})
 	auditor := createCrudScopeSession(t, app, "auditor@example.com", "auditor", "", "")
 	rows = legacyQueryRows(t, mux, "/legacy", auditor)
 	if rows[0]["private_note"] != "acme-private-note" {
@@ -95,7 +117,7 @@ func TestGotmplQueriesMaskLikeNativeQuery(t *testing.T) {
 	assertMasked(t, "no unmask role", rows[0]["private_note"], "acme-private-note")
 
 	// A field declared without roles stays readable by every reader.
-	app.Encrypted.Fields["projects"][0].Roles = nil
+	_, mux, viewer = declaring(nil)
 	if rows = legacyQueryRows(t, mux, "/legacy", viewer); rows[0]["private_note"] != "acme-private-note" {
 		t.Fatalf("no unmask roles declared: %v", rows[0])
 	}
@@ -178,7 +200,7 @@ func TestGotmplQueriesCiphertextProvenance(t *testing.T) {
 // user_id itself; authored SQL cannot be rewritten, so only provable shapes
 // count and anything else stays masked.
 func TestGotmplQueriesOwnerUnmaskNeedsProvenRowIdentity(t *testing.T) {
-	app, mux := legacyQueryFixture(t, map[string]string{
+	app := legacyQueryApp(t, map[string]string{
 		"projected.html": legacyQueryPage("", "SELECT user_id, private_note FROM projects ORDER BY id"),
 		"star.html":      legacyQueryPage("", "SELECT * FROM projects ORDER BY id"),
 		"qualified.html": legacyQueryPage("", "SELECT p.user_id, p.private_note FROM projects AS p ORDER BY p.id"),
@@ -200,6 +222,7 @@ func TestGotmplQueriesOwnerUnmaskNeedsProvenRowIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	mux := buildAppMux(app, false, legacyQueryBaseURL)
 	for _, route := range []string{"/projected", "/star", "/qualified"} {
 		rows := legacyQueryRows(t, mux, route, owner)
 		if rows[0]["private_note"] != "acme-private-note" {
@@ -260,8 +283,7 @@ func TestGotmplQueriesStripHiddenColumns(t *testing.T) {
 }
 
 func TestGotmplQueriesWriteReadAudit(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
-	ssrLoadPages(t, app, map[string]string{
+	app := legacyQueryApp(t, map[string]string{
 		"join.html":   legacyQueryPage("", "SELECT p.name, c.name AS company FROM projects p JOIN companies c ON c.id = p.company_id"),
 		"count.html":  legacyQueryPage("", "SELECT COUNT(*) AS n FROM projects"),
 		"view.html":   legacyQueryPage("", "SELECT id FROM project_ids"),
@@ -271,7 +293,7 @@ func TestGotmplQueriesWriteReadAudit(t *testing.T) {
 	crudScopeMustExec(t, app.DB, "CREATE VIEW project_ids AS SELECT id FROM projects")
 	app.Design = &DesignConfig{Auth: map[string]string{"read_audit": "projects,companies"}}
 	InitReadAudit(app, false)
-	mux := buildAppMux(app, false, "https://report.example.invalid")
+	mux := buildAppMux(app, false, legacyQueryBaseURL)
 	viewer, uid := tenantMember(t, app, "viewer@example.com", "user", 1, "viewer")
 
 	count := func(table string) int {
@@ -355,8 +377,10 @@ func TestGotmplFailedQueryIsAVisibleError(t *testing.T) {
 	assertGeneric(rec)
 
 	// Dev keeps its detailed message.
-	app.DevMode = true
-	if w := ssrGet(buildAppMux(app, true, "http://localhost"), "/bad", viewer); w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "nope") {
+	dev := legacyQueryApp(t, map[string]string{"bad.html": page})
+	dev.DevMode = true
+	devViewer, _ := tenantMember(t, dev, "viewer@example.com", "user", 1, "viewer")
+	if w := ssrGet(buildAppMux(dev, true, "http://localhost"), "/bad", devViewer); w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "nope") {
 		t.Fatalf("dev answer lost its detail: %d %s", w.Code, w.Body.String())
 	}
 }

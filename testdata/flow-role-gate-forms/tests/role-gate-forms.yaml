@@ -1,32 +1,89 @@
 # Each test writes rows under its own sku and counts only those: the tests of
 # this file share one database and run in any order.
 
-# `role: "warehouse,manager"` is one role name nobody holds.
-a_comma_list_does_not_admit_the_first_listed_role:
+# `role: [warehouse, manager]` and `role: "warehouse, manager"` admit a caller
+# who holds either role, and each caller's flows.json lists the flows it may call.
+a_role_list_admits_the_first_listed_role:
   as_user: "wendy@gates.test"
   as_role: "warehouse"
   steps:
     - api: "POST /api/receive-stock"
       json: { sku: "LIST-1" }
       expect:
-        status: 403
-        json: { error: Forbidden }
-    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-1'"
-      expect: { rows: 0 }
+        status: 201
+        json: { received: true }
+    - api: "POST /api/return-stock"
+      json: { sku: "LIST-1" }
+      expect:
+        status: 201
+        json: { returned: true }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-1' AND kind IN ('receive', 'return') AND moved_by = {{user_id}}"
+      expect: { rows: 2 }
+    - get: "/_internal/flows.json"
+      expect:
+        status: 200
+        contains:
+          - "/api/receive-stock"
+          - "/api/return-stock"
+        not_contains: "/api/internal/recount-stock"
 
-a_comma_list_does_not_admit_the_second_listed_role:
+a_role_list_admits_the_second_listed_role:
   as_user: "mona@gates.test"
   as_role: "manager"
   steps:
     - api: "POST /api/receive-stock"
       json: { sku: "LIST-4" }
       expect:
+        status: 201
+        json: { received: true }
+    - api: "POST /api/return-stock"
+      json: { sku: "LIST-4" }
+      expect: { status: 201 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-4' AND kind IN ('receive', 'return') AND moved_by = {{user_id}}"
+      expect: { rows: 2 }
+    - get: "/_internal/flows.json"
+      expect:
+        status: 200
+        contains:
+          - "/api/receive-stock"
+          - "/api/return-stock"
+
+a_role_list_admits_a_role_held_by_a_grant:
+  as_user: "greg@gates.test"
+  setup:
+    - sql: "INSERT INTO _benmore_user_roles (user_id, role) VALUES ({{user_id}}, 'manager')"
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-5" }
+      expect: { status: 201 }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-5' AND kind = 'receive' AND moved_by = {{user_id}}"
+      expect: { rows: 1 }
+
+a_role_list_refuses_an_account_with_neither_role:
+  as_user: "cody@gates.test"
+  as_role: "clerk"
+  steps:
+    - api: "POST /api/receive-stock"
+      json: { sku: "LIST-6" }
+      expect:
         status: 403
         json: { error: Forbidden }
-    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-4'"
+    - api: "POST /api/return-stock"
+      json: { sku: "LIST-6" }
+      expect:
+        status: 403
+        json: { error: Forbidden }
+    - sql: "SELECT id FROM stock_moves WHERE sku = 'LIST-6'"
       expect: { rows: 0 }
+    - get: "/_internal/flows.json"
+      expect:
+        status: 200
+        contains: "/api/pick-stock"
+        not_contains:
+          - "/api/receive-stock"
+          - "/api/return-stock"
 
-a_comma_list_admits_a_global_admin:
+a_role_list_admits_a_global_admin:
   as_user: "root@gates.test"
   as_role: "admin"
   steps:
@@ -42,6 +99,9 @@ a_signed_out_caller_of_a_role_gated_flow_is_asked_to_sign_in:
   anon: true
   steps:
     - api: "POST /api/receive-stock"
+      json: { sku: "LIST-3" }
+      expect: { status: 401 }
+    - api: "POST /api/return-stock"
       json: { sku: "LIST-3" }
       expect: { status: 401 }
     - api: "POST /api/pick-stock"

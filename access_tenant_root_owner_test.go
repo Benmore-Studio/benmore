@@ -18,7 +18,7 @@ const tenantRootOwnerRoleYAML = `access:
 
 func tenantRootOwnerFixture(t *testing.T, config string) (*App, *http.ServeMux) {
 	t.Helper()
-	app, _ := newTenantRoleFixture(t, config)
+	app := newTenantRoleApp(t, config)
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN user_id INTEGER")
 	cols, err := GetTableColumns(app.DB, "companies")
 	if err != nil {

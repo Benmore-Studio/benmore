@@ -12,7 +12,11 @@ import (
 
 // The badge and live hints belong to the same personal inbox as the REST API.
 // A delegation for an unrelated table must not recover the unread count or
-// infer new inbox activity through either alternative read surface.
+// infer new inbox activity through either alternative read surface. A page is
+// never rendered for a scoped credential (page_scoped_credentials.go), so the
+// badge reaches only an unscoped one: a sign-in page answers a scoped
+// credential 403 whatever its scopes name, _notifications:read included, and
+// a page with no gate renders for it without the badge, as for nobody.
 func TestNotificationBadgeAndLiveHintsHonorCredentialScopes(t *testing.T) {
 	app := ssrTestApp(t)
 	owner := createCrudScopeSession(t, app, "badge-owner@example.com", "user", "", "")
@@ -23,7 +27,10 @@ func TestNotificationBadgeAndLiveHintsHonorCredentialScopes(t *testing.T) {
 	for i := 0; i < 7; i++ {
 		auditExec(t, app.DB, "INSERT INTO _benmore_notifications(user_id,title) VALUES(?,?)", uid, "private-title")
 	}
-	ssrLoadPages(t, app, map[string]string{"badge.html": "---\nengine: gotmpl\nauth: required\n---\n<output id=\"badge\">{{toJson .notification_count}}</output>"})
+	ssrLoadPages(t, app, map[string]string{
+		"badge.html":     "---\nengine: gotmpl\nauth: required\n---\n<output id=\"badge\">{{toJson .notification_count}}</output>",
+		"openbadge.html": "---\nengine: gotmpl\n---\n<output id=\"badge\">{{toJson .notification_count}}</output>",
+	})
 	mux := buildAppMux(app, false, "https://badge.example.invalid")
 	for _, tc := range []struct {
 		name, scope string
@@ -44,19 +51,38 @@ func TestNotificationBadgeAndLiveHintsHonorCredentialScopes(t *testing.T) {
 					credential = authzSession(t, app, uid, "badge-owner@example.com", tc.scope)
 				}
 				w := ssrGet(mux, "/api/_notifications/count", credential)
-				wantStatus, wantBadge := http.StatusForbidden, "null"
+				wantStatus := http.StatusForbidden
 				if tc.read {
-					wantStatus, wantBadge = http.StatusOK, "7"
+					wantStatus = http.StatusOK
 				}
 				if w.Code != wantStatus {
 					t.Fatalf("REST scope control = %d, want %d", w.Code, wantStatus)
 				}
+				// Only the unscoped credential is a page's viewer.
+				unscoped := tc.scope == "*"
 				w = ssrGet(mux, "/badge", credential)
-				if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `<output id="badge">`+wantBadge+`</output>`) {
-					t.Errorf("badge = %d %s; want %s", w.Code, w.Body.String(), wantBadge)
+				if unscoped {
+					if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `<output id="badge">7</output>`) {
+						t.Errorf("badge = %d %s; want 7", w.Code, w.Body.String())
+					}
+				} else if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"error":"`+scopedCredentialPageCode+`"`) || strings.Contains(w.Body.String(), `<output id="badge">`) {
+					t.Errorf("badge = %d %s; want the scoped-credential page refusal and no badge", w.Code, w.Body.String())
 				}
 				if !strings.Contains(w.Header().Get("Cache-Control"), "no-store") {
 					t.Error("personal badge is cacheable")
+				}
+				// A page with no gate: the badge key is absent for every
+				// scoped credential, also one that may read the inbox.
+				wantOpen := "null"
+				if unscoped {
+					wantOpen = "7"
+				}
+				w = ssrGet(mux, "/openbadge", credential)
+				if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `<output id="badge">`+wantOpen+`</output>`) {
+					t.Errorf("ungated badge = %d %s; want %s", w.Code, w.Body.String(), wantOpen)
+				}
+				if !strings.Contains(w.Header().Get("Cache-Control"), "no-store") {
+					t.Error("ungated badge page is cacheable")
 				}
 				subscriber := subscribeFlowRealtime(t, app, credential)
 				other := subscribeFlowRealtime(t, app, peer)

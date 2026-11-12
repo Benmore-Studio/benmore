@@ -647,8 +647,9 @@ func (e *memberOfUpdateError) Error() string { return "not found or not authoriz
 // them, so both protected[name] and protectedFields.has(name) refuse a column
 // declared USER_ID as surely as user_id.
 func protectedUpdateFields(app *App, table string) map[string]bool {
+	// deleted_at comes with the create set; restore mode lifts it (txUpdateMode).
 	protected := protectedCreateFields(app, table)
-	protected.add("id", "deleted_at")
+	protected.add("id")
 	protected.add(workflowProtectedFields(app, table)...)
 	// With groups.role_field, a membership row's identity column carries the
 	// in-tenant role: re-pointing it hands that role to whoever the new value
@@ -746,6 +747,9 @@ func applyCanonicalUpdateTxContextMode(ctx context.Context, tx *sql.Tx, app *App
 	}); d != nil {
 		return nil, nil, nil, &memberOfUpdateError{denial: d}
 	}
+	// An emptied deactivated_at on a _benmore_users row is stored as NULL,
+	// the only value that reads as active (user_deactivation.go).
+	normalizeUserDeactivationValue(table, values)
 	// An edit of a _benmore_users row that changes a sign-in identifier is
 	// refused for another admin's account and otherwise ends the account's
 	// credentials first, in this transaction (user_identifier_update.go).

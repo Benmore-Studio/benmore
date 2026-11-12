@@ -599,12 +599,12 @@ func flatDataForCtx(ctx *FlowContext) map[string]any {
 	env := flowEnvSnapshot(ctx)
 	ctx.flatCache.mu.Lock()
 	defer ctx.flatCache.mu.Unlock()
-	if flat, ok := ctx.flatCache.lookup(ctx.Data, env); ok {
-		return flat
+	flat, ok := ctx.flatCache.lookup(ctx.Data, env)
+	if !ok {
+		flat = buildFlatDataForCtx(ctx, env)
+		ctx.flatCache.store(ctx.Data, env, flat)
 	}
-	flat := buildFlatDataForCtx(ctx, env)
-	ctx.flatCache.store(ctx.Data, env, flat)
-	return flat
+	return ctx.flowResponseFlat(flat)
 }
 
 func buildFlatDataForCtx(ctx *FlowContext, env map[string]string) map[string]any {

@@ -462,7 +462,7 @@ func readAppMCPArtifact(app *App, ref string, limit int64) ([]byte, error) {
 	switch store := backend.(type) {
 	case *LocalStorage:
 		root := filepath.Join(store.Dir, "uploads")
-		f, ok := openServableFile(root, filepath.Join(store.Dir, filepath.FromSlash(logical)))
+		f, ok := openStoredUpload(root, filepath.Join(store.Dir, filepath.FromSlash(logical)))
 		if !ok {
 			return nil, os.ErrNotExist
 		}

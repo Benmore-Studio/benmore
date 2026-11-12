@@ -227,6 +227,17 @@ func validateAppYAML(content string) string {
 			case map[string]any:
 				for _, op := range slices.Sorted(maps.Keys(val)) {
 					mode := val[op]
+					// `share:` is the record-sharing switch, not an operation
+					// with a mode (access.go recordSharingEnabled).
+					if strings.ToLower(strings.TrimSpace(op)) == accessShareKey {
+						if mode == nil || strings.TrimSpace(anyToString(mode)) == "" {
+							return fmt.Sprintf("app.yaml: access.%s.share is empty, so the switch is not set. Write `share: off` to turn record sharing off for %s, or `share: on`.", tableName, tableName)
+						}
+						if _, ok := accessShareSwitch(anyToString(mode)); !ok {
+							return fmt.Sprintf("app.yaml: access.%s.share takes on or off (true/false and yes/no mean the same), and %s is neither, so record sharing is OFF for %s. It is a switch, not an access mode: who may share a row stays its owner or an admin.", tableName, writtenValue(mode), tableName)
+						}
+						continue
+					}
 					if msg := accessOpKeyViolation(tableName, op); msg != "" {
 						return msg
 					}

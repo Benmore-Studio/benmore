@@ -10,6 +10,7 @@
     "revert_kept",
     "changed_by",
     "summary",
+    "history_table",
     "maintenance_writes",
     "retention",
     "snapshot_scope",

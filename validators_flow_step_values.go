@@ -207,7 +207,7 @@ func flowRequestSignedIn(req *FlowRequestTrigger) bool {
 	// An optional flow answers signed-in callers too, so a shared cache
 	// must not store its responses either.
 	auth := normalizeFlowAuth(req.Auth, "")
-	return auth == "required" || auth == "optional" || strings.TrimSpace(req.Role) != "" || len(req.Permissions) > 0
+	return auth == "required" || auth == "optional" || strings.TrimSpace(string(req.Role)) != "" || len(req.Permissions) > 0
 }
 
 // flowStepValueProblemsOf checks one step's `with:` values.

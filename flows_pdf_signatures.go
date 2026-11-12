@@ -298,7 +298,7 @@ func readAppPrivateStorageContext(ctx *FlowContext, requestCtx context.Context, 
 	if local, ok := backend.(*LocalStorage); ok {
 		root := filepath.Join(local.Dir, "uploads")
 		target := filepath.Join(local.Dir, filepath.FromSlash(logical))
-		file, ok := openServableFile(root, target)
+		file, ok := openStoredUpload(root, target)
 		if !ok {
 			return nil, logical, os.ErrNotExist
 		}

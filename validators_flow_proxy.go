@@ -102,7 +102,7 @@ func flowRequestAnonymous(req *FlowRequestTrigger) bool {
 	if req == nil {
 		return false
 	}
-	return normalizeFlowAuth(req.Auth, "") != "required" && strings.TrimSpace(req.Role) == "" && len(req.Permissions) == 0
+	return normalizeFlowAuth(req.Auth, "") != "required" && strings.TrimSpace(string(req.Role)) == "" && len(req.Permissions) == 0
 }
 
 // proxyStepProblem checks one proxy step's values in its request flow; ""

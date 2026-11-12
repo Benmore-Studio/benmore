@@ -189,6 +189,8 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"nativeRowDecryptor":             {nil, "same decision as queryNativeRowsWith, whose decoder it is"},
 	"queryRowsWithKeyContextDecrypt": {nil, "same decision as queryNativeRowsWith, whose query it is"},
 
+	"normalizeUserDeactivationValue": {nil, "stores an emptied deactivated_at of a _benmore_users row as NULL (only NULL reads as active); command SQL cannot write framework tables, so no command writes that column"},
+
 	"FormatValidationErrors":    {nil, commandParityPlumbing},
 	"copyRow":                   {nil, commandParityPlumbing},
 	"safeIdent":                 {nil, commandParityPlumbing},

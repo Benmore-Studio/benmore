@@ -56,7 +56,9 @@ func TestAppMCPFailedFirstBootRetriesAsFresh(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, dir, "schema.sql", "CREATE TABLE notes (id INTEGER PRIMARY KEY);")
 	writeTestFile(t, dir, "mcp.yaml", appMCPManifestFixture())
-	writeTestFile(t, dir, "migrations/001.sql", "ALTER TABLE nope ADD COLUMN extra TEXT;")
+	// A failure a new database does not skip (a statement that only names a
+	// table the schema lacks is skipped there, migrate_new_database.go).
+	writeTestFile(t, dir, "migrations/001.sql", "INSERT INTO notes (id) VALUES (1), (1);")
 	reviewAppMCPFixture(t, dir)
 	if app, err := loadApp(dir); err == nil {
 		app.Shutdown()

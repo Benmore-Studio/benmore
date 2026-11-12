@@ -36,9 +36,10 @@ flow_writes_its_own_audit_row:
       expect: { rows: 1 }
 
 # The API masks the encrypted column and never returns the blind index; a
-# flow that responds with a `SELECT *` row returns both, a flow that names its
-# columns returns neither.
-flow_select_star_returns_clear_value_and_blind_index:
+# flow that responds with a `SELECT *` row returns the clear value and every
+# other column but not the blind index, a flow that names its columns returns
+# neither.
+flow_select_star_returns_clear_value_without_blind_index:
   as_user: "row@test.com"
   steps:
     - api: "POST /api/patients"
@@ -56,7 +57,8 @@ flow_select_star_returns_clear_value_and_blind_index:
         status: 200
         contains:
           - '"ssn":"111-22-3333"'
-          - '"ssn_blind":"'
+          - '"name":"Pat Row"'
+        not_contains: "ssn_blind"
     - get: "/api/patient-card"
       expect:
         status: 200
@@ -73,14 +75,18 @@ flow_select_star_returns_clear_value_and_blind_index:
           - "chart-blind=[]"
         not_contains: "111-22-3333"
 
-# A token's scopes narrow the generated API. A page's queries and a flow that
-# declares no permissions: run as the token's account.
-scoped_token_reads_a_page_and_a_flow:
+# A token's scopes narrow the generated API. A page that requires sign-in, and
+# its PDF, refuse a scoped token before the page's query runs; the account's
+# own sign-in opens the page. A flow that declares no permissions: runs as the
+# token's account.
+scoped_token_is_refused_by_a_page_and_runs_a_flow:
   as_user: "scoped@test.com"
   steps:
     - api: "POST /api/patients"
       json: { name: "Pat Scoped", ssn: "444-55-6666" }
       expect: { status: 200 }
+    - get: "/chart"
+      expect: { status: 200, contains: "chart-name=Pat Scoped" }
     - api: "POST /api/_auth/api-tokens"
       json: { name: "notes only", scopes: "visit_notes:read" }
       save: { tok: "token" }
@@ -89,7 +95,17 @@ scoped_token_reads_a_page_and_a_flow:
     - get: "/api/patients"
       expect: { status: 403, contains: "scope denied" }
     - get: "/chart"
-      expect: { status: 200, contains: "chart-name=Pat Scoped" }
+      expect:
+        status: 403
+        contains:
+          - '"error":"scoped_credential_page"'
+          - '"docs":"auth.credential_limits"'
+        not_contains: "Pat Scoped"
+    - get: "/pdf/chart"
+      expect:
+        status: 403
+        contains: '"error":"scoped_credential_page"'
+        not_contains: "Pat Scoped"
     - get: "/api/patient-card"
       expect: { status: 200, contains: "Pat Scoped" }
 

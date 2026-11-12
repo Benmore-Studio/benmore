@@ -58,8 +58,10 @@ func TestHIPAAFlowChecksWarnOnTheFixture(t *testing.T) {
 			t.Errorf("%s: docs %q, want %q", file, f.Docs, w.docs)
 		}
 	}
-	if msg := got["flows/patient-row.yaml"].Message; !strings.Contains(msg, "ssn") || !strings.Contains(msg, "ssn_blind") {
-		t.Errorf("the whole-row warning does not name the encrypted column and its blind index: %q", msg)
+	// The response leaves the blind index out, so the warning names the
+	// clear column only.
+	if msg := got["flows/patient-row.yaml"].Message; !strings.Contains(msg, "column ssn in clear") || strings.Contains(msg, "ssn_blind") {
+		t.Errorf("the whole-row warning does not name exactly the encrypted column: %q", msg)
 	}
 	for _, silent := range []string{"flows/sign-note.yaml", "flows/patient-card.yaml"} {
 		if f, ok := got[silent]; ok {
@@ -240,10 +242,13 @@ func TestHIPAAWholeRowFlowResponses(t *testing.T) {
 			if len(problems) != 1 {
 				t.Fatalf("got %q, want one problem\n%s", problems, c.steps)
 			}
-			for _, has := range []string{`job "j"`, `step "p"`, "from patients", "balance, ssn", "ssn_blind"} {
+			for _, has := range []string{`job "j"`, `step "p"`, "from patients", "balance, ssn"} {
 				if !strings.Contains(problems[0], has) {
 					t.Errorf("%q does not contain %q", problems[0], has)
 				}
+			}
+			if strings.Contains(problems[0], "ssn_blind") {
+				t.Errorf("%q names the blind index, which the response leaves out", problems[0])
 			}
 		})
 	}

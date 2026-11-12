@@ -126,6 +126,10 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	// pool cleanly (db_clean_shutdown.go); so does serve's boot check, whose
 	// load runs just before the start-up load in the same process.
 	app.markCleanOnClose = opts.startup || (opts.checkOnly && serveBootCheckActive.Load())
+	// Read before the schema step builds anything: a database with no
+	// application table and no applied migration is new in this load, and its
+	// migration files meet it as one (migrate_new_database.go).
+	newDatabase := migrationDatabaseIsNew(db)
 	// The schema cookie at open: any DDL this load runs bumps it, which is how
 	// the schema step below knows whether it changed anything.
 	schemaVersionAtOpen, schemaVersionErr := sqliteSchemaVersion(db)
@@ -376,7 +380,11 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 		return nil, fmt.Errorf("notifications: %w", err)
 	}
 	trace.phase("user_migrations")
-	if err := config.runUserMigrations(withLoadSnapshots(context.Background(), loadSnaps), db, dir, opts.checkOnly); err != nil {
+	migrationCtx := withLoadSnapshots(context.Background(), loadSnaps)
+	if newDatabase {
+		migrationCtx = withMigrationNewDatabase(migrationCtx, db)
+	}
+	if err := config.runUserMigrations(migrationCtx, db, dir, opts.checkOnly); err != nil {
 		return nil, fmt.Errorf("user migration: %w", err)
 	}
 	if freshMCPDatabase {

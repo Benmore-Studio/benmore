@@ -4,7 +4,7 @@ on:
     method: POST
     path: /api/posts/:id/publish
     # auth: required           # sign-in required; a flow is public without it (public_flows)
-    # role: finance            # ONE role name, sign-in implied; several roles: role_gate
+    # role: finance            # sign-in implied; [finance, manager] admits any of them (role_gate)
     # transaction: true        # every SQL step commits together, or none does (transaction)
     # mode: async              # opt-in: enqueue + return job_id immediately
     # max_attempts: 3          # async/enqueued jobs: re-run the flow after a transient failure (topic async-flows → retries)

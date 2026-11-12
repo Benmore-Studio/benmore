@@ -292,7 +292,9 @@ func TestDeleteUploadFailureStopsFlowAndRollsBackSQL(t *testing.T) {
 	if err == nil {
 		t.Fatal("executeFlowJob unexpectedly succeeded")
 	}
-	if !strings.Contains(err.Error(), "only uploads/private") {
+	// A public reference with no `record:` proof is refused, like any other
+	// delete_upload failure: the flow stops and the transaction rolls back.
+	if !strings.Contains(err.Error(), "delete_upload refused") || !strings.Contains(err.Error(), "record:") {
 		t.Fatalf("flow continued past delete failure: %v", err)
 	}
 	var count int

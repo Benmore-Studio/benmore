@@ -16,7 +16,9 @@ package main
 // The guard used to count every unexpired admin grant and every admin row,
 // so the only durable admin could step down beside a two-minute grant and
 // the app had no admin once it lapsed. Operator paths (delete_app_user,
-// benmore users) are not guarded: the operator can always make a new admin.
+// deactivate_app_user, benmore users) are not guarded: the operator can
+// always make a new admin. deactivate_app_user says so in its result when
+// the account was the last one.
 
 import (
 	"database/sql"

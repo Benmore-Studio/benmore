@@ -16,7 +16,7 @@ import (
 // account rows. The peer owns no documents and cannot read the encrypted note.
 func shareRecipientFixture(t *testing.T, peerEmail string) (*App, *http.ServeMux, string, string) {
 	t.Helper()
-	app, _ := newTenantRoleFixture(t, "access:\n  documents:\n    read: self\n    write: self\n    update: self\n    delete: self\n")
+	app := newTenantRoleApp(t, "access:\n  documents:\n    read: self\n    write: self\n    update: self\n    delete: self\n")
 	mustExec(t, app.DB, `CREATE TABLE documents(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, user_id INTEGER, title TEXT, private_note TEXT)`)
 	path := filepath.Join(app.Dir, "data.db")
 	RegisterDBEncryptionKey(path, testKeyBytes(0x46))

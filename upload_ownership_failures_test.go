@@ -33,10 +33,10 @@ func TestPulledFileRefusesOwnershipWriteFailure(t *testing.T) {
 }
 
 func TestPrivateUploadOwnerNeedsDatabaseAndKeepsExistingOwner(t *testing.T) {
-	if err := recordPrivateUploadOwner(&App{}, nil, "uploads/private/fixture.pdf"); err == nil {
+	if err := recordUploadOwner(&App{}, nil, "uploads/private/fixture.pdf"); err == nil {
 		t.Fatal("private ownership accepted without a database")
 	}
-	if err := recordPrivateUploadOwner(nil, nil, "uploads/public/fixture.pdf"); err != nil {
+	if err := recordUploadOwner(nil, nil, "uploads/public/fixture.pdf"); err != nil {
 		t.Fatalf("public upload unexpectedly needs ownership: %v", err)
 	}
 	dir := t.TempDir()

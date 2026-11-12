@@ -1,0 +1,30 @@
+// An app after a type change made the documented way: the text field
+// `amount` gave way to `amountCents`, and the migrations/ file that copied
+// the values and dropped the old column is still in the source. A database
+// built from this schema never had `amount`.
+
+model Order {
+  id          Int    @id @default(autoincrement())
+  userId      Int    @map("user_id")
+  name        String
+  amountCents Int?   @map("amount_cents")
+
+  @@map("orders")
+}
+
+model OrderEvent {
+  id      Int    @id @default(autoincrement())
+  userId  Int    @map("user_id")
+  orderId Int    @map("order_id")
+  kind    String
+
+  @@map("order_events")
+}
+
+model Currency {
+  id   Int    @id @default(autoincrement())
+  code String @unique
+  name String
+
+  @@map("currencies")
+}

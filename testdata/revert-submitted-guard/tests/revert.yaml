@@ -64,3 +64,70 @@ a_revert_to_a_version_taken_after_the_server_write_succeeds:
       expect: { status: 422, contains: "set by the server" }
     - sql: "SELECT id FROM requests WHERE id = 8103 AND escalation_count = 3"
       expect: { rows: 1 }
+
+# The admin panel shows the table's stored versions (requests_history) and
+# never writes them: a version that is forged, rewritten or deleted there
+# would be what the versions API lists and what a revert restores. The table
+# itself stays writable in the panel, and the revert still works.
+admin_panel_never_writes_version_history:
+  as_user: "paneladmin@revert.test"
+  as_role: "admin"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, user_id) VALUES (8104, 'Monitor', 30000, {{user_id}})"
+  steps:
+    - api: "PATCH /api/requests/8104"       # version 1 holds 'Monitor'
+      json: { title: "Monitor (27 inch)" }
+      expect: { status: 200 }
+    - api: "POST /_admin/api/requests_history/update/8104"
+      data:
+        title: "panel-rewritten-version"
+      expect:
+        status: 403
+        json:
+          error: admin_table_read_only
+          table: requests_history
+          docs: versioning.history_table
+    - api: "POST /_admin/api/requests_history/delete/8104"
+      expect:
+        status: 403
+        json:
+          error: admin_table_read_only
+    - api: "POST /_admin/api/requests_history/create"
+      data:
+        id: "8104"
+        title: "panel-forged-version"
+        amount_cents: "1"
+        user_id: "1"
+        _version: "7"
+        _valid_from: "2020-01-01 00:00:00"
+        _change_type: "update"
+      expect:
+        status: 403
+        json:
+          error: admin_table_read_only
+    - sql: "SELECT 1 WHERE (SELECT COUNT(*) FROM requests_history WHERE id = 8104) = 1 AND EXISTS (SELECT 1 FROM requests_history WHERE id = 8104 AND _version = 1 AND title = 'Monitor')"
+      expect: { rows: 1 }
+    - get: "/_admin/requests_history"
+      expect:
+        status: 200
+        contains: "never writes it"
+        not_contains:
+          - "/_admin/api/requests_history"
+          - "admin-create"
+    - get: "/_admin/requests"
+      expect:
+        status: 200
+        contains: "/_admin/api/requests/"
+        not_contains: "never writes it"
+    - get: "/api/requests/8104/versions/1"
+      expect:
+        status: 200
+        contains: "Monitor"
+        not_contains: "27 inch"
+    - api: "POST /api/requests/8104/revert/1"
+      json: {}
+      expect:
+        status: 200
+        json: { status: reverted }
+    - sql: "SELECT id FROM requests WHERE id = 8104 AND title = 'Monitor'"
+      expect: { rows: 1 }

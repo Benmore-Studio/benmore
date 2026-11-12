@@ -19,7 +19,7 @@ import (
 
 func queryTagFixture(t *testing.T, pages map[string]string) (*App, *http.ServeMux) {
 	t.Helper()
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	ssrLoadPages(t, app, pages)
 	clearQueryCacheForTest(t)
 	return app, buildAppMux(app, false, "https://report.example.invalid")
@@ -272,7 +272,7 @@ func TestQueryTagStripsHiddenColumns(t *testing.T) {
 // Every render reads the data, including one served from the cache, so each
 // is read-audited for the viewer; a failed query is not.
 func TestQueryTagWritesReadAudit(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	ssrLoadPages(t, app, map[string]string{
 		"join.html":   queryTagList(`sql="SELECT p.name, c.name AS company FROM projects p JOIN companies c ON c.id = p.company_id" cache="5m"`, "name"),
 		"short.html":  queryTagList(`from="projects" pick="name"`, "name"),

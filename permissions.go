@@ -100,9 +100,14 @@ func canShareResource(app *App, table string, id string, session *Session) bool 
 			return true
 		}
 	}
-	// Check if user has admin permission on the resource
-	return hasPermission(app.DB, table, id, sessionGrantEmail(session), "admin")
+	// Check if user has admin permission on the resource. With record sharing
+	// off for the table no grant is in force, an admin grant included.
+	return recordSharingEnabled(app, table) && hasPermission(app.DB, table, id, sessionGrantEmail(session), "admin")
 }
+
+// sharingDisabledCode is the stable `error` value of a share refused because
+// record sharing is off for the table (features.sharing, access.<table>.share).
+const sharingDisabledCode = "sharing_disabled"
 
 // aclFilter returns a parameterized SQL subquery for a required action.
 // All grants include view; edit/admin permit edits; delete/admin permit deletes.
@@ -193,6 +198,16 @@ func handleShare(w http.ResponseWriter, r *http.Request, app *App, table string)
 
 	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+		return
+	}
+
+	// The switch is the app's configuration, read before the row: the answer
+	// is the same for every id, so it says nothing about which rows exist.
+	if !recordSharingEnabled(app, table) {
+		writeTableRefusal(w, app, table, session, http.StatusForbidden, withRefusalDocs(map[string]any{
+			"error":   sharingDisabledCode,
+			"message": fmt.Sprintf("record sharing is turned off for %s (features.sharing or access.%s.share in app.yaml): nothing was shared", table, table),
+		}, sharingDisabledCode))
 		return
 	}
 
@@ -328,11 +343,20 @@ func handleListPermissions(w http.ResponseWriter, r *http.Request, app *App, tab
 		return
 	}
 
-	httpJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"resource_type": table,
 		"resource_id":   id,
 		"permissions":   rows,
-	})
+	}
+	// With sharing off the grants stay stored and give no access: the list
+	// says so, and the owner can still revoke them before it is turned on.
+	if !recordSharingEnabled(app, table) {
+		out["sharing"] = "off"
+		for _, row := range rows {
+			row["active"] = false
+		}
+	}
+	httpJSON(w, http.StatusOK, out)
 }
 
 func handleRevokePermission(w http.ResponseWriter, r *http.Request, app *App, table string) {

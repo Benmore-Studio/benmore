@@ -57,13 +57,15 @@ func TestGotmplParamBindWithoutValueIsNull(t *testing.T) {
 // render outside the page's own route such as /pdf/...). A name that is
 // neither a framework bind nor a route parameter stays unbound.
 func TestGotmplPathValueBindWithoutValueIsNull(t *testing.T) {
-	app, _ := legacyQueryFixture(t, nil)
+	// The page is set before the mux is built: the context graph rebuild a
+	// mux starts reads app.Pages.
+	app := legacyQueryApp(t, nil)
 	const route = "/projects/:company"
 	source := legacyQueryPage("", "SELECT id FROM projects WHERE (:company IS NULL OR company_id = :company) ORDER BY id")
 	page := &Page{Route: route, File: "projects.html"}
 	setPageAttrsFromSource(page, source)
 	app.Pages = map[string]*Page{route: page}
-	mux := buildAppMux(app, false, "https://report.example.invalid")
+	mux := buildAppMux(app, false, legacyQueryBaseURL)
 
 	// Opened through its own route, the path value binds.
 	if got := gotmplRowIDs(legacyQueryRows(t, mux, "/projects/2", "")); got != "2" {

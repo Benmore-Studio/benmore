@@ -350,6 +350,11 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	// ENCRYPTION_KEY): source checks pass them, the reload refuses them.
 	findings = append(findings, appMCPCommandKeyFindings(dir, writtenPath, liveDB)...)
 
+	// Command flows whose SQL matches rows with no predicate tied to the
+	// caller: a command is not checked against the table's access rule
+	// (app_mcp_command_caller_predicate.go). Advice, not a refusal.
+	findings = append(findings, appMCPCommandCallerPredicateFindings(dir, writtenPath, liveDB)...)
+
 	// A retention.yaml keyed by table name has never run: a warning with
 	// the corrected file, not a refusal (retention_document.go).
 	findings = append(findings, retentionLegacyFindings(dir)...)
