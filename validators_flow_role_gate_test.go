@@ -37,19 +37,22 @@ func roleGateWarnings(t *testing.T, report CheckReport, file string) []string {
 	return out
 }
 
-// A flow's role gate is one role name. A comma or space separated list is
-// read as one name nobody holds, so the flow answers 403 to everyone but a
-// global admin; deployed files carry such gates, so the write is accepted and
-// the post-write check, `benmore check` and the load log say what it means.
-func TestFlowRoleListIsWarnedAbout(t *testing.T) {
+// A flow's role gate names one role or several, separated by commas: no
+// warning. A space does not separate names, so `role: warehouse manager` is
+// one name nobody holds; the write is accepted and the post-write check,
+// `benmore check` and the load log say what it means.
+func TestFlowRoleWithASpaceIsWarnedAboutAndAListIsNot(t *testing.T) {
 	for name, tc := range map[string]struct {
 		roleLine string
 		warned   bool
 	}{
-		"comma list":           {`role: "warehouse,manager"`, true},
-		"comma list, unquoted": {`role: finance,admin`, true},
-		"comma and space":      {`role: "warehouse, manager"`, true},
 		"space separated":      {`role: warehouse manager`, true},
+		"a spaced name listed": {`role: [warehouse manager, clerk]`, true},
+		"comma list":           {`role: "warehouse,manager"`, false},
+		"comma list, unquoted": {`role: finance,admin`, false},
+		"comma and space":      {`role: "warehouse, manager"`, false},
+		"YAML list":            {`role: [warehouse, manager]`, false},
+		"block list":           {"role:\n      - warehouse\n      - manager", false},
 		"one role":             {`role: warehouse`, false},
 		"one role, padded":     {`role: " warehouse "`, false},
 		"admin":                {`role: admin`, false},
@@ -61,7 +64,7 @@ func TestFlowRoleListIsWarnedAbout(t *testing.T) {
 			writeTestFile(t, dir, "schema.prisma", roleGateSchema)
 			flow := roleGateFlow(tc.roleLine)
 			if msg := ValidateOnWriteIn(dir, "flows/receive-stock.yaml", flow); msg != "" {
-				t.Fatalf("the write gate refuses a flow shape deployed apps carry: %s", msg)
+				t.Fatalf("the write gate refuses the flow: %s", msg)
 			}
 			writeTestFile(t, dir, "flows/receive-stock.yaml", flow)
 			for where, report := range map[string]CheckReport{
@@ -71,14 +74,14 @@ func TestFlowRoleListIsWarnedAbout(t *testing.T) {
 				got := roleGateWarnings(t, report, "flows/receive-stock.yaml")
 				if !tc.warned {
 					if len(got) != 0 {
-						t.Errorf("%s warns about a single role: %q", where, got)
+						t.Errorf("%s warns about role names separated by commas: %q", where, got)
 					}
 					continue
 				}
 				if len(got) != 1 {
 					t.Fatalf("%s: %d role warnings, want 1: %q", where, len(got), got)
 				}
-				for _, want := range []string{"flows/receive-stock.yaml: ", "exactly one role", "everyone but a global admin", "`auth: required`", "status: 403"} {
+				for _, want := range []string{"flows/receive-stock.yaml: ", `"warehouse manager"`, "ONE role name with a space in it", "separated by commas", "nobody but a global admin", "`role: \"warehouse, manager\"`"} {
 					if !strings.Contains(got[0], want) {
 						t.Errorf("%s: the warning lacks %q: %s", where, want, got[0])
 					}
@@ -94,29 +97,54 @@ func TestFlowRoleListIsWarnedAbout(t *testing.T) {
 	}
 }
 
-// A YAML list (or map) under `role:` was refused with the YAML decoder's own
-// words and the address of a key that never mentions `role`. It is refused
-// with what the gate takes and the key that says so.
-func TestFlowRoleYAMLListIsRefusedInWords(t *testing.T) {
-	for name, roleLine := range map[string]string{
-		"flow list":  `role: [warehouse, manager]`,
-		"block list": "role:\n      - warehouse\n      - manager",
-		"map":        `role: { any: [warehouse, manager] }`,
+// Each name of a list is checked like a single one: a name the app declares
+// nowhere is named in the warning, and `admin` beside a tenant role is the
+// global admin.
+func TestFlowRoleListNamesAreCheckedOneByOne(t *testing.T) {
+	const roles = "roles:\n  warehouse: [notes:read, notes:write]\n  manager: [notes:read, notes:write]\n  user: [notes:read]\n"
+	const groups = "groups:\n  table: org_members\n  key: org_id\n  user_field: user_id\n  role_field: member_role\n  bootstrap:\n    org_table: organizations\n    founding_role: admin\n"
+	for name, tc := range map[string]struct {
+		app, role string
+		wants     []string
+		lacks     []string
+	}{
+		"every name declared":    {"site_name: r\n" + roles, "[warehouse, manager, admin, user]", nil, nil},
+		"two typos in a list":    {"site_name: r\n" + roles, "[warehouse, wharehouse, clrek]", []string{`lists "wharehouse", "clrek"`, "matched exactly", "admits nobody"}, []string{`"warehouse"`}},
+		"no roles block":         {"site_name: r\n", "[warehouse, wharehouse]", nil, nil},
+		"admin beside a tenant":  {"site_name: r\n" + groups, "[admin, finance]", []string{"names `admin`", "only a global admin", "does NOT pass the gate by that role", "member_role IN ('admin', 'finance')", "${{ user.group_id || 0 }}"}, nil},
+		"a list without admin":   {"site_name: r\n" + groups, "[finance, auditor]", nil, nil},
+		"admin and a typo":       {"site_name: r\n" + roles + groups, "[admin, clrek]", []string{"names `admin`", `lists "clrek"`}, nil},
+		"string form, same rule": {"site_name: r\n" + roles, `"warehouse, clrek"`, []string{`lists "clrek"`}, nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeTestFile(t, dir, "app.yaml", "site_name: roles\n")
+			writeTestFile(t, dir, "app.yaml", tc.app)
 			writeTestFile(t, dir, "schema.prisma", roleGateSchema)
-			msg := ValidateOnWriteIn(dir, "flows/receive-stock.yaml", roleGateFlow(roleLine))
-			if msg == "" {
-				t.Fatal("a role list is accepted: the flow parser cannot read it")
-			}
-			if strings.Contains(msg, "unmarshal") || strings.Contains(msg, "!!") {
-				t.Errorf("the refusal quotes the YAML decoder: %s", msg)
-			}
-			for _, want := range []string{"on.request.role", "exactly one role", "`auth: required`", `docs: api(at:"flows.role_gate")`} {
-				if !strings.Contains(msg, want) {
-					t.Errorf("the refusal lacks %q: %s", want, msg)
+			writeTestFile(t, dir, "flows/receive-stock.yaml", roleGateFlow("role: "+tc.role))
+			for where, report := range map[string]CheckReport{
+				"the post-write check of the flow file": RunSourceCheck(dir, "flows/receive-stock.yaml"),
+				"the post-write check of app.yaml":      RunSourceCheck(dir, "app.yaml"),
+				"benmore check":                         RunSourceCheck(dir, ""),
+			} {
+				got := roleGateWarnings(t, report, "flows/receive-stock.yaml")
+				if len(tc.wants) == 0 {
+					if len(got) != 0 {
+						t.Errorf("%s warns: %q", where, got)
+					}
+					continue
+				}
+				if len(got) != 1 {
+					t.Fatalf("%s: %d role warnings, want 1: %q", where, len(got), got)
+				}
+				for _, want := range tc.wants {
+					if !strings.Contains(got[0], want) {
+						t.Errorf("%s: the warning lacks %q: %s", where, want, got[0])
+					}
+				}
+				for _, not := range tc.lacks {
+					if strings.Contains(got[0], not) {
+						t.Errorf("%s: the warning names %s, a declared role: %s", where, not, got[0])
+					}
 				}
 			}
 		})
@@ -236,24 +264,25 @@ func TestFlowRoleGateProblemsAreLoggedAtLoad(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, dir, "app.yaml", "site_name: r\nroles:\n  warehouse: [notes:read]\n  user: [notes:read]\ngroups:\n  table: org_members\n  key: org_id\n  user_field: user_id\n  role_field: member_role\n  bootstrap:\n    org_table: organizations\n    founding_role: admin\n")
 	writeTestFile(t, dir, "schema.prisma", roleGateSchema)
-	writeTestFile(t, dir, "flows/a-list.yaml", strings.Replace(roleGateFlow(`role: "warehouse,manager"`), "/api/receive-stock", "/api/a", 1))
+	writeTestFile(t, dir, "flows/a-spaced.yaml", strings.Replace(roleGateFlow(`role: warehouse manager`), "/api/receive-stock", "/api/a", 1))
 	writeTestFile(t, dir, "flows/b-typo.yaml", strings.Replace(roleGateFlow(`role: wharehouse`), "/api/receive-stock", "/api/b", 1))
 	writeTestFile(t, dir, "flows/c-admin.yaml", strings.Replace(roleGateFlow(`role: admin`), "/api/receive-stock", "/api/c", 1))
 	writeTestFile(t, dir, "flows/d-fine.yaml", strings.Replace(roleGateFlow(`role: warehouse`), "/api/receive-stock", "/api/d", 1))
+	writeTestFile(t, dir, "flows/e-list.yaml", strings.Replace(roleGateFlow(`role: [warehouse, user]`), "/api/receive-stock", "/api/e", 1))
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 	flows, err := loadFlowsChecked(dir, true)
 	log.SetOutput(os.Stderr)
-	if err != nil || len(flows) != 4 {
+	if err != nil || len(flows) != 5 {
 		t.Fatalf("loaded %d flows, err %v: a warned-about gate must not stop a deployed file from loading", len(flows), err)
 	}
 	logged := buf.String()
 	for file, want := range map[string]string{
-		"flows/a-list.yaml":  "exactly one role",
-		"flows/b-typo.yaml":  "matched exactly",
-		"flows/c-admin.yaml": "only a global admin",
+		"flows/a-spaced.yaml": "ONE role name with a space in it",
+		"flows/b-typo.yaml":   "matched exactly",
+		"flows/c-admin.yaml":  "only a global admin",
 	} {
 		found := false
 		for _, line := range strings.Split(logged, "\n") {
@@ -265,7 +294,7 @@ func TestFlowRoleGateProblemsAreLoggedAtLoad(t *testing.T) {
 			t.Errorf("the load log has no role-gate WARNING for %s (%q):\n%s", file, want, logged)
 		}
 	}
-	if strings.Contains(logged, "flows/d-fine.yaml") {
+	if strings.Contains(logged, "flows/d-fine.yaml") || strings.Contains(logged, "flows/e-list.yaml") {
 		t.Errorf("the load log names a flow with a sound gate:\n%s", logged)
 	}
 }
@@ -273,21 +302,22 @@ func TestFlowRoleGateProblemsAreLoggedAtLoad(t *testing.T) {
 // The two fixture apps behind api(at:"flows.role_gate"), as the write gate
 // and their own tests judge them.
 //
-// flow-role-gate-forms: what a comma list does at run time, and the forms the
-// key gives for several roles (an `if:` on the account's role, a SQL step
-// that counts grants, a synchronous gate in front of queued work).
+// flow-role-gate-forms: a gate that names several roles, as a YAML list and
+// as a comma-separated string, beside flows that refuse in a step (an `if:`
+// on the account's role, a SQL step that counts grants, a synchronous gate in
+// front of queued work). Nothing in it is warned about.
 //
 // flow-role-admin-gate: a tenant app whose founder holds the tenant role
 // admin. Its `role: admin` worker flow is warned about (tenant admins do not
-// pass), and its flows that read the membership row are the forms the warning
-// and the key give, one role and several.
+// pass), and its flows that read the membership row are the form the warning
+// and the key give.
 func TestFlowRoleGateFixtures(t *testing.T) {
 	for name, tc := range map[string]struct {
 		file, warning, shows string
-		tests                int
+		warnings, tests      int
 	}{
-		"flow-role-gate-forms": {"flows/receive-stock.yaml", "exactly one role", "user.role != 'warehouse' && user.role != 'manager' && user.role != 'admin'", 13},
-		"flow-role-admin-gate": {"flows/log-activity.yaml", "only a global admin", "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'admin'", 7},
+		"flow-role-gate-forms": {"", "", "", 0, 15},
+		"flow-role-admin-gate": {"flows/log-activity.yaml", "only a global admin", "SELECT id FROM org_members WHERE org_id = :org AND user_id = :user_id AND member_role = 'admin'", 1, 7},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := configGapFixtureDir(t, name)
@@ -305,8 +335,8 @@ func TestFlowRoleGateFixtures(t *testing.T) {
 					t.Errorf("%s (%s, %s): %s", f.File, f.Severity, f.Source, f.Message)
 				}
 			}
-			if warned != 1 {
-				t.Errorf("%d role-gate warnings, want 1 on %s", warned, tc.file)
+			if warned != tc.warnings {
+				t.Errorf("%d role-gate warnings, want %d", warned, tc.warnings)
 			}
 			app, err := loadApp(dir)
 			if err != nil {

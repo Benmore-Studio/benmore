@@ -21,6 +21,7 @@
     "restore_encryption_key",
     "restore_code_mismatch",
     "database_restore",
+    "restore_audit_rows",
     "archive_deploy",
     "lifecycle_coordination",
     "startup_checks",

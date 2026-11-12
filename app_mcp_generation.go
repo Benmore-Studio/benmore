@@ -416,6 +416,12 @@ func realtimePolicyViewFromAppLocked(app *App) *App {
 			}
 			copyAccess.rules[table] = copyRules
 		}
+		if app.Access.share != nil {
+			copyAccess.share = make(map[string]bool, len(app.Access.share))
+			for table, on := range app.Access.share {
+				copyAccess.share[table] = on
+			}
+		}
 		access = copyAccess
 	}
 	joins := make(JoinMap, len(app.JoinMap))

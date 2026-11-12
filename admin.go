@@ -197,8 +197,10 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			notFoundHandler(app)(w, r)
 			return
 		}
-		// Audit and credential tables are shown, never written (admin_read_only.go).
-		if adminRefuseReadOnlyTable(w, table) {
+		// A table admin.yaml hides is not written, and framework tables other
+		// than _benmore_users and version history are shown, never written
+		// (admin_read_only.go).
+		if adminRefuseTableWrite(w, r, app, table) {
 			return
 		}
 
@@ -910,7 +912,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 
 	csrf := generateCSRFToken()
 	// A read-only table gets no create, edit or delete control.
-	readOnly := adminReadOnlyKind(table)
+	readOnly := adminPanelReadOnlyKind(app, table)
 
 	var sb strings.Builder
 
@@ -1011,7 +1013,9 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 
 	userState := adminUserStateColumns(app, table, true)
 	for _, col := range createCols {
-		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || col.Name == "user_id" || userState.has(col.Name) {
+		// deleted_at: a create never stores it (protectedCreateFields), so an
+		// input for it would be a value thrown away.
+		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || identIs(col.Name, "deleted_at") || col.Name == "user_id" || userState.has(col.Name) {
 			continue
 		}
 		if col.Name == "password" || col.Name == "password_hash" {
@@ -1083,7 +1087,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	</div>`, strings.Title(table), id, table))
 
 	// Edit form (a read-only table shows the same fields with no form to post)
-	readOnly := adminReadOnlyKind(table)
+	readOnly := adminPanelReadOnlyKind(app, table)
 	if readOnly != "" {
 		sb.WriteString(adminReadOnlyNote(table, readOnly))
 		sb.WriteString(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">`)

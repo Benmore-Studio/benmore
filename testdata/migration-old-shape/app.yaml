@@ -1,0 +1,3 @@
+site_name: "migration-old-shape"
+auth:
+  identifier: email

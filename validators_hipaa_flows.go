@@ -14,14 +14,15 @@ package main
 //     (hipaaUnauditedWriteProblems), a hooks.yaml hook when no hook of the same
 //     event and table does (hipaaUnauditedHookProblems).
 //   - a SQL step's rows are decrypted for the flow and are not masked for the
-//     caller, and `SELECT *` also returns the `<col>_blind` HMAC, which every
-//     generated response strips. A respond step is named when it returns a
-//     step's rows whole and that step selects `*` from a table with encrypted
-//     columns (hipaaWholeRowResponseProblems).
+//     caller. A respond step is named when it returns a step's rows whole and
+//     that step selects `*` from a table with encrypted columns
+//     (hipaaWholeRowResponseProblems). The `<col>_blind` HMAC such a query
+//     also returns is left out of the response (flows_respond_blind_index.go),
+//     so the message names the clear columns only.
 //
-// Both are warnings and neither is refused: deployed flows do both, and a
-// flow may need the blind column for a lookup. The written tables come from
-// sqlWriteTargets, the lexer every other SQL check uses.
+// Both are warnings and neither is refused: deployed flows do both. The
+// written tables come from sqlWriteTargets, the lexer every other SQL check
+// uses.
 
 import (
 	"fmt"
@@ -276,21 +277,14 @@ func hipaaWholeRowResponseProblems(file FlowFileGHA, enc *EncryptedFieldConfig) 
 
 // hipaaWholeRowProblem is the message for one respond step and source step.
 func hipaaWholeRowProblem(job, where, step string, tables []string, enc *EncryptedFieldConfig) string {
-	var columns, blind []string
+	var columns []string
 	for _, table := range tables {
 		for _, def := range enc.Fields[table] {
 			columns = appendFoldUnique(columns, def.Column)
-			if def.BlindIndex {
-				blind = appendFoldUnique(blind, def.Column+blindColSuffix)
-			}
 		}
 	}
 	slices.Sort(columns)
-	slices.Sort(blind)
 	carries := "the encrypted " + pluralWord(len(columns), "column") + " " + strings.Join(columns, ", ") + " in clear"
-	if len(blind) > 0 {
-		carries += " and the blind-index " + pluralWord(len(blind), "column") + " " + strings.Join(blind, ", ")
-	}
 	return fmt.Sprintf("job %q step %s responds with whole rows of step %q, whose query selects `*` from %s. A flow's SQL result is not masked for the caller: this response carries %s to everyone the flow answers, whatever the unmask roles are. Select the columns the response needs by name.",
 		job, where, step, strings.Join(tables, ", "), carries)
 }

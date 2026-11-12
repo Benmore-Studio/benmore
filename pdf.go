@@ -135,7 +135,9 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	// client's address bucket (never RemoteAddr: its port changes with every
 	// connection, and behind the router the peer is loopback).
 	rateLimitKey := appLimiterKey(app, "pdf", clientRateBucket(rateLimitClientHost(r)))
-	session := getSession(app, r)
+	// The page's viewer, as servePage resolves it: a scoped credential is
+	// nobody here (page_scoped_credentials.go).
+	session, scoped := pageCaller(app, r)
 	if session != nil {
 		rateLimitKey = appLimiterKey(app, "pdf", fmt.Sprintf("user:%d", session.UserID))
 	}
@@ -155,6 +157,13 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	page, ok := app.Pages[pagePath]
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+
+	// A page that requires sign-in is not printed for a scoped credential,
+	// as its route does not render for one.
+	if scoped && pageRequiresSignIn(page) {
+		refuseScopedCredentialPage(w)
 		return
 	}
 
@@ -217,7 +226,7 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 	ctx := &RenderContext{
 		Data:    make(map[string]any),
 		User:    session,
-		Request: r,
+		Request: pageRenderRequest(r, scoped),
 		App:     app,
 		Page:    page,
 	}

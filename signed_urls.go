@@ -266,6 +266,13 @@ func registerSignedURLRoutes(mux appRouteRegistrar, app *App) {
 		}
 		// An alias must never obtain a less restrictive signature than its
 		// resolved source. Local signed paths are canonical, without symlinks.
+		// Nor is another spelling of a stored name: a disk that folds letter
+		// case resolves it to the same file, past the private folder's name
+		// and the uploader record, which are matched on the spelling given.
+		if !localUploadStoredAs(app.Dir, "uploads/"+localRel) {
+			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "use the canonical upload path"})
+			return
+		}
 		root := filepath.Join(app.Dir, "uploads")
 		if resolved, ok := resolveServableFile(root, filepath.Join(root, localRel)); ok {
 			realRoot, err := filepath.EvalSymlinks(root)

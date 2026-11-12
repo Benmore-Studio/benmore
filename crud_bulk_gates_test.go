@@ -23,6 +23,13 @@ func newGateApp(t *testing.T, schema ...string) *App {
 	t.Helper()
 	app, cleanup := newTestApp(t)
 	t.Cleanup(cleanup)
+	prepareGateApp(t, app, schema...)
+	return app
+}
+
+// prepareGateApp gives an app with an open database what newGateApp provides.
+func prepareGateApp(t *testing.T, app *App, schema ...string) {
+	t.Helper()
 	EnsureSessionsTable(app.DB)
 	if err := EnsureUsersTable(app.DB); err != nil {
 		t.Fatalf("EnsureUsersTable: %v", err)
@@ -34,7 +41,6 @@ func newGateApp(t *testing.T, schema ...string) *App {
 		mustExec(t, app.DB, q)
 	}
 	reloadGateSchema(t, app)
-	return app
 }
 
 func reloadGateSchema(t *testing.T, app *App) {

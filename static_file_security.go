@@ -82,6 +82,23 @@ func (f *servableFile) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // those aliases it walks each canonical component using pinned directory
 // handles, refusing substitutions with symlinks or nonregular files.
 func openServableFile(root, target string) (*servableFile, bool) {
+	return openServableFileSpelled(root, target, false)
+}
+
+// openStoredUpload is openServableFile for a file under an app's uploads/
+// directory, which is reached by a reference: every path component below root
+// must also be the stored name of its directory entry, byte for byte
+// (treeDir.storedAs). On a disk that folds letter case or Unicode
+// normalization another spelling opens the same file, but everything decided
+// from the reference (the uploader record, the private folder name, a signed
+// link) was decided for the spelling given. Such a reference names no stored
+// file, on that disk as on a case-sensitive one or in an object store. Every
+// read of an upload from a reference goes through here.
+func openStoredUpload(root, target string) (*servableFile, bool) {
+	return openServableFileSpelled(root, target, true)
+}
+
+func openServableFileSpelled(root, target string, storedSpelling bool) (*servableFile, bool) {
 	rootAbs, err := filepath.Abs(filepath.Clean(root))
 	if err != nil {
 		return nil, false
@@ -118,13 +135,28 @@ func openServableFile(root, target string) (*servableFile, bool) {
 		return nil, false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
+	// The spelling is judged on the pinned directory the component is then
+	// opened from, so the entry compared is the entry read.
+	spelled := func(part string) bool {
+		if !storedSpelling {
+			return true
+		}
+		stored, err := dir.storedAs(part)
+		return err == nil && stored
+	}
 	for _, part := range parts[:len(parts)-1] {
+		if !spelled(part) {
+			return nil, false
+		}
 		next, err := dir.openDir(part)
 		if err != nil {
 			return nil, false
 		}
 		dir.Close()
 		dir = next
+	}
+	if !spelled(parts[len(parts)-1]) {
+		return nil, false
 	}
 	f, info, err := dir.openRegular(parts[len(parts)-1])
 	if err != nil {

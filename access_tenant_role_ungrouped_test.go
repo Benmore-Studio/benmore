@@ -17,6 +17,17 @@ import (
 // projects is group-keyed.
 func newTenantRoleFixture(t *testing.T, access string) (*App, *http.ServeMux) {
 	t.Helper()
+	app := newTenantRoleApp(t, access)
+	return app, buildAppMux(app, true, "http://localhost")
+}
+
+// newTenantRoleApp is newTenantRoleFixture's app before any mux is built.
+// Building a mux starts workers that read the app's configuration (the context
+// graph rebuild reads pages, roles, encrypted fields and more, without a
+// lock), so a test that changes the configuration starts here, changes it and
+// builds its mux last.
+func newTenantRoleApp(t *testing.T, access string) *App {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
@@ -58,7 +69,7 @@ func newTenantRoleFixture(t *testing.T, access string) (*App, *http.ServeMux) {
 		app.Tables = append(app.Tables, Table{Name: name, Columns: cols})
 	}
 	t.Cleanup(app.Shutdown)
-	return app, buildAppMux(app, true, "http://localhost")
+	return app
 }
 
 // tenantMember creates a verified user with primary role `role`, a live

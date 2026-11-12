@@ -72,13 +72,19 @@ func parseAdminConfig(data []byte) *AdminConfig {
 }
 
 // IsTableHidden returns true if the table should be omitted from the admin.
-// Returns false if AdminConfig is nil or the table has no entry.
+// Returns false if AdminConfig is nil or the table has no entry. Names compare
+// as SQLite compares them: the table comes from a URL, and /_admin/Vault is
+// the table admin.yaml hides as vault.
 func (a *AdminConfig) IsTableHidden(table string) bool {
 	if a == nil {
 		return false
 	}
-	cfg, ok := a.Tables[table]
-	return ok && cfg.Hidden
+	for name, cfg := range a.Tables {
+		if cfg.Hidden && identIs(name, table) {
+			return true
+		}
+	}
+	return false
 }
 
 // VisibleColumns returns the column allowlist for a table, or nil if no

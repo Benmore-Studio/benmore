@@ -4,7 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"runtime"
+	"slices"
 	"sort"
 	"syscall"
 )
@@ -57,6 +60,109 @@ func (d *treeDir) names() ([]string, error) {
 }
 
 func (d *treeDir) lstat(name string) (os.FileInfo, error) { return d.root.Lstat(name) }
+
+// storedAs reports whether the directory holds an entry whose name is name
+// byte for byte. Opening name proves less: a disk that folds letter case, or
+// that treats two Unicode normalizations of a name as one, opens another
+// spelling as the same entry, and a record keyed by the stored spelling is
+// then never found for it. Nothing is lower-cased or normalized here.
+//
+// The directory's own listing is the comparison (lists). Two lstats decide
+// the common case without it (entryStoredAs).
+func (d *treeDir) storedAs(name string) (bool, error) {
+	return entryStoredAs(name, d.root.Lstat, func() (bool, error) { return d.lists(name) })
+}
+
+// lists reports whether name is among the entry names the directory returns,
+// compared as bytes.
+func (d *treeDir) lists(name string) (bool, error) {
+	f, err := d.root.Open(".")
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	for {
+		names, err := f.Readdirnames(512)
+		if slices.Contains(names, name) {
+			return true, nil
+		}
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+}
+
+// entryStoredAs decides storedAs for a directory read through lstat, asking
+// listed (the full listing) only when two lstats cannot settle it. A large
+// uploads folder on a case-sensitive disk would otherwise be listed for
+// every file served.
+//
+// The shortcut holds for a disk that matches a name byte for byte, or after
+// folding letter case, or after canonical Unicode normalization, or both.
+// Each step under that model:
+//
+//   - name does not exist: no entry answers to it in any spelling, so it is
+//     not stored.
+//   - name is ASCII with a letter, and its case-swapped spelling does not
+//     exist: a directory that folds case would have opened the swapped
+//     spelling as the very entry name opened, so this one does not fold case
+//     for the name. What is left is normalization, and name is ASCII: an
+//     entry spelled otherwise could only normalize onto it through a code
+//     point whose canonical form is ASCII. There are three (the Kelvin sign
+//     onto K, the Greek question mark onto ;, the Greek varia onto `), and a
+//     name holding one of those characters is left to the listing
+//     (caseSwappedASCII). So the entry is spelled name.
+//   - the swapped spelling exists as another file: a folding directory holds
+//     one entry per folded name, so two files mean two entries and no
+//     folding; the same argument then applies.
+//   - the swapped spelling is the same file: a folding disk, or a hard link
+//     under the other name. The lstats cannot tell these apart: list.
+//
+// Everything else is listed: a name with a byte outside ASCII
+// (normalization), a name with no letter (nothing to swap, so nothing shows
+// whether the directory folds), any other lstat error, and every name on
+// Windows, whose path handling also drops trailing dots and spaces and knows
+// short names, which no case probe sees. A disk set to compatibility
+// normalization and case-sensitive matching is outside the model.
+func entryStoredAs(name string, lstat func(string) (os.FileInfo, error), listed func() (bool, error)) (bool, error) {
+	seen, err := lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	swapped, ok := caseSwappedASCII(name)
+	if err != nil || !ok || runtime.GOOS == "windows" {
+		return listed()
+	}
+	other, err := lstat(swapped)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && !os.SameFile(seen, other)) {
+		return true, nil
+	}
+	return listed()
+}
+
+// caseSwappedASCII returns name with the case of every ASCII letter swapped.
+// ok is false when the swap proves nothing: name has a byte outside ASCII,
+// has no letter, or holds K, ; or ` (the three ASCII characters another code
+// point normalizes onto; see entryStoredAs).
+func caseSwappedASCII(name string) (swapped string, ok bool) {
+	b := []byte(name)
+	for i, c := range b {
+		switch {
+		case c >= 0x80 || c == 'K' || c == ';' || c == '`':
+			return "", false
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+			b[i] = c ^ 0x20
+			ok = true
+		}
+	}
+	if !ok {
+		return "", false
+	}
+	return string(b), true
+}
 
 // openDir opens the child directory name: a real directory entry of this
 // one, never the target of a link.

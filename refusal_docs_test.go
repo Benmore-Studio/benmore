@@ -306,9 +306,11 @@ func TestCheckFindingSourcesHaveAnAddress(t *testing.T) {
 // with instead of a literal.
 var refusalCodeIdentifiers = map[string]string{
 	"uploadsDisabledCode":           uploadsDisabledCode,
+	"sharingDisabledCode":           sharingDisabledCode,
 	"mediaAllowanceCode":            mediaAllowanceCode,
 	"emailVerificationRequiredCode": emailVerificationRequiredCode,
 	"adminDemotionProtectedCode":    adminDemotionProtectedCode,
+	"scopedCredentialPageCode":      scopedCredentialPageCode,
 }
 
 // runtimeErrorCodes finds the stable codes the source answers in `error` or

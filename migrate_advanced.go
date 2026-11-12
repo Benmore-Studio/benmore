@@ -425,25 +425,44 @@ func migrationStatementAlreadyApplied(q sqlQuerier, stmt string, err error) (str
 // drop whose target the database does not hold.
 const migrationSkippedAsDrop = "a drop of what this database does not hold"
 
-// migrationSkippedDrop is a drop statement of a migration file that was
-// skipped because the database does not hold what it names. Skipping is right
-// for a database built after the column left the schema, and it is also what
-// happens to a drop whose name is misspelt, which used to fail loudly: so
-// every run that can answer someone (the write's dry run, a promote's and a
-// restore's) hands these back as warnings.
+// migrationSkippedDrop is a statement of a migration file that was skipped
+// because the database does not hold what it names.
+//
+// A drop (Statement 0): skipping is right for a database built after the
+// column left the schema, and it is also what happens to a drop whose name is
+// misspelt, which used to fail loudly.
+//
+// Any other statement, on a database that is new in this load (Statement is
+// its place in the file, from 1; migrate_new_database.go): right for a file
+// written for a shape the schema has since left, and also what a misspelt
+// name gets there.
+//
+// So every run that can answer someone (the write's dry run, a promote's and
+// a restore's) hands these back as warnings, and a load logs them.
 type migrationSkippedDrop struct {
 	File    string `json:"file"`
 	Kind    string `json:"kind"`    // column, table or index
-	Missing string `json:"missing"` // table.column, table or index name
+	Missing string `json:"missing"` // table.column, column, table or index name
+	// Statement and Verb are set for a statement that is not a drop: its
+	// place in the file's statements and its leading keyword.
+	Statement int    `json:"statement,omitempty"`
+	Verb      string `json:"verb,omitempty"`
 }
 
 // warning is the line a builder reads.
 func (d migrationSkippedDrop) warning() string {
+	if d.Statement > 0 {
+		what := fmt.Sprintf("statement %d", d.Statement)
+		if d.Verb != "" {
+			what += " (" + d.Verb + ")"
+		}
+		return fmt.Sprintf("migrations/%s: %s names `%s`, a %s the current schema does not have, so this new database skips the statement and runs the rest of the file (the file still counts as applied; a database that has the %s runs the statement). If the name is misspelt, the statement did nothing here.", d.File, what, d.Missing, d.Kind, d.Kind)
+	}
 	return fmt.Sprintf("migrations/%s: this drop names `%s`, which this database does not have, so the statement is skipped (the file still counts as applied). If the name is misspelt, the %s it was meant to drop is still there.", d.File, d.Missing, d.Kind)
 }
 
-// migrationSkipLog collects the skipped drops of one run. File is the file
-// whose statements are running.
+// migrationSkipLog collects the skipped statements of one run. File is the
+// file whose statements are running.
 type migrationSkipLog struct {
 	File  string
 	drops []migrationSkippedDrop
@@ -452,22 +471,43 @@ type migrationSkipLog struct {
 type migrationSkipLogKey struct{}
 
 // withMigrationSkipLog returns a context whose migration statements record
-// the drops they skip.
+// what they skip. A context that already has a log keeps it.
 func withMigrationSkipLog(ctx context.Context) (context.Context, *migrationSkipLog) {
+	if l, _ := ctx.Value(migrationSkipLogKey{}).(*migrationSkipLog); l != nil {
+		return ctx, l
+	}
 	l := &migrationSkipLog{}
 	return context.WithValue(ctx, migrationSkipLogKey{}, l), l
 }
 
+// add records d, under the running file when d names none. A statement a run
+// executes twice is one entry.
+func (l *migrationSkipLog) add(d migrationSkippedDrop) migrationSkippedDrop {
+	if l == nil {
+		return d
+	}
+	if d.File == "" {
+		d.File = l.File
+	}
+	if len(l.drops) >= migrationSkippedDropMax {
+		return d
+	}
+	for _, have := range l.drops {
+		if have == d {
+			return d
+		}
+	}
+	l.drops = append(l.drops, d)
+	return d
+}
+
 // noteMigrationSkip records stmt, skipped as what, in ctx's log when it has
-// one and the skip is a drop. A statement a run executes twice is one entry.
+// one and the skip is a drop.
 func noteMigrationSkip(ctx context.Context, file, stmt, what string) {
 	l, _ := ctx.Value(migrationSkipLogKey{}).(*migrationSkipLog)
 	drop, ok := parseMigrationPureDrop(stmt)
-	if l == nil || what != migrationSkippedAsDrop || !ok || len(l.drops) >= migrationSkippedDropMax {
+	if l == nil || what != migrationSkippedAsDrop || !ok {
 		return
-	}
-	if file == "" {
-		file = l.File
 	}
 	d := migrationSkippedDrop{File: file, Kind: "table", Missing: drop.table}
 	switch {
@@ -476,16 +516,15 @@ func noteMigrationSkip(ctx context.Context, file, stmt, what string) {
 	case drop.column != "":
 		d.Kind, d.Missing = "column", drop.table+"."+drop.column
 	}
-	for _, have := range l.drops {
-		if have == d {
-			return
-		}
-	}
-	l.drops = append(l.drops, d)
+	l.add(d)
 }
 
-// migrationSkippedDropMax bounds the skipped drops one run reports.
+// migrationSkippedDropMax bounds the skipped statements one run reports.
 const migrationSkippedDropMax = 20
+
+// migrationSkippedStatementMax bounds the statement position a report
+// carries.
+const migrationSkippedStatementMax = 1_000_000
 
 // migrationPureDrop is a statement that is exactly one drop in the main
 // schema and nothing else: of a column (table and column), a table (table) or
@@ -685,11 +724,13 @@ func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) erro
 	// Decided once, before anything in the file runs
 	// (migration_framework_guard.go).
 	hipaa := migrationUnderHIPAA(ctx, tx)
+	position := 0 // of the statement in the file, from 1
 	for _, stmt := range splitStatements(upSQL) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
 		}
+		position++
 		// SQLite itself checks UNIQUE in this transaction. A separate GROUP BY
 		// preflight treats NULL as duplicate, misses partial/collated semantics,
 		// and cannot see a dedupe performed by preceding migration statements.
@@ -719,6 +760,13 @@ func runMigrationStatementsTx(ctx context.Context, tx *sql.Tx, data []byte) erro
 				noteMigrationSkip(ctx, "", stmt, what)
 				continue
 			}
+			// A database that is new in this load never had what an older
+			// file names (migrate_new_database.go).
+			if skipped, ok := migrationStatementStaleOnNewDatabase(ctx, tx, stmt, position, err); ok {
+				l, _ := ctx.Value(migrationSkipLogKey{}).(*migrationSkipLog)
+				log.Printf("  WARNING: %s", l.add(skipped).warning())
+				continue
+			}
 			return &migrationStatementError{stmt, fmt.Errorf("migration %s: %w", truncate(stmt, 60), err)}
 		}
 	}
@@ -743,6 +791,8 @@ func runMigrationsCtx(ctx context.Context, db *sql.DB, dir string, beforeApply f
 }
 func runMigrationsCtxFromSources(ctx context.Context, db *sql.DB, dir string, beforeApply func() error, captured map[string][]byte) error {
 	ctx = withMigrationAppDir(ctx, dir, readFileInRoot)
+	// What the files skip is logged under the file's name.
+	ctx, skips := withMigrationSkipLog(ctx)
 	names, err := migrationSourceNames(dir, captured)
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
@@ -785,6 +835,7 @@ func runMigrationsCtxFromSources(ctx context.Context, db *sql.DB, dir string, be
 			beforeApply = nil
 		}
 
+		skips.File = n
 		data, err := readMigrationSource(dir, n, captured)
 		if err == nil {
 			// A file that drops data gets the line a destructive generated

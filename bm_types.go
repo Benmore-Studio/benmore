@@ -236,6 +236,8 @@ export interface RecordPermissionGrant {
   permission: string;
   granted_at: string;
   expires_at: string | null;
+  /** Present (false) only while record sharing is turned off for the table: the grant is stored and gives no access. */
+  active?: false;
 }
 
 interface BaseTableClient<Row> {
@@ -752,7 +754,7 @@ export interface RoomClient {
       expires_at?: string,
     ): Promise<void>;
     revoke(table: TableName, id: number | string, email: string): Promise<void>;
-    list(table: TableName, id: number | string): Promise<{ permissions: RecordPermissionGrant[] | null; resource_id: string; resource_type: string }>;
+    list(table: TableName, id: number | string): Promise<{ permissions: RecordPermissionGrant[] | null; resource_id: string; resource_type: string; sharing?: 'off' }>;
   };
 
   // ── signedUrl (time-limited file URL) ────────────────────────────────

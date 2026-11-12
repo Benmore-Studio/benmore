@@ -428,6 +428,7 @@ func parseFeaturesConfig(m map[string]any) *FeaturesConfig {
 	fc.Feedback = parseBoolFeature("feedback")
 	fc.Analytics = parseBoolFeature("analytics")
 	fc.AccountSettings = parseBoolFeature("account_settings")
+	fc.Sharing = parseBoolFeature("sharing")
 	fc.WSAnonymous = parseBoolFeature("ws_anonymous")
 
 	// Parse docs visibility: "public" (default) or "auth" (requires login)

@@ -134,10 +134,13 @@ func TestReportSourcesPreserveFailureStatusAndTokenScopes(t *testing.T) {
 		"unknown.html": reportFixturePage("    table: missing", ""),
 	})
 	mux := buildAppMux(app, false, "https://report.example.invalid")
+	// A scoped token is nobody on a page (page_scoped_credentials.go): the
+	// source answers it as it answers a caller with no credential, and its
+	// scopes are never what a page's source is read with.
 	for _, tc := range []struct {
 		route, actor string
 		code         int
-	}{{"/report", "", 401}, {"/report", limited, 403}, {"/invalid", owner, 400}, {"/unknown", owner, 404}} {
+	}{{"/report", "", 401}, {"/report", limited, 401}, {"/invalid", owner, 400}, {"/unknown", owner, 404}} {
 		w := ssrGet(mux, tc.route, tc.actor)
 		if w.Code != tc.code || strings.Contains(w.Body.String(), `<pre id="report">`) {
 			t.Fatalf("%s: status %d want %d: %s", tc.route, w.Code, tc.code, w.Body.String())
@@ -198,7 +201,7 @@ sources:
 }
 
 func TestReportSourcesTenantEncryptionHiddenFieldsAndAudit(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	reviewer, reviewerID := tenantMember(t, app, "report-reviewer@example.com", "user", 1, "company_admin")
 	viewer, _ := tenantMember(t, app, "report-viewer@example.com", "user", 1, "viewer")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN api_key TEXT")
@@ -268,7 +271,7 @@ func TestReportSourcesTenantEncryptionHiddenFieldsAndAudit(t *testing.T) {
 }
 
 func TestReportSourcesTenantRowsAndActAs(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	app.Access = accessFromYAML(t, "access:\n  projects: {read: group}\n")
 	member, _ := tenantMember(t, app, "report-group@example.com", "user", 1, "company_admin")
 	stepped := createCrudScopeSession(t, app, "report-stepped@example.com", "admin", "2", "1")
@@ -293,7 +296,7 @@ func TestReportSourcesTenantRowsAndActAs(t *testing.T) {
 }
 
 func TestReportSourcesOwnerEncryptedProjection(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	owner, ownerID := tenantMember(t, app, "encrypted-owner@example.com", "user", 1, "viewer")
 	peer, peerID := tenantMember(t, app, "encrypted-peer@example.com", "user", 2, "viewer")
 	app.Encrypted.Fields["projects"][0].Roles = []string{"owner"}

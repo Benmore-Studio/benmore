@@ -410,6 +410,7 @@ var checkSourceDocs = map[string]docsRule{
 	"mcp_connector": {At: "connector.command_encryption_key", When: []docsWhen{
 		{"revision ledger row missing", "connector.revision_trigger_order"},
 		{"removes", "connector.destructive_schema"},
+		{"has no predicate tied to the caller", "connector.caller_predicate"}, // appMCPCommandCallerPredicateDocs
 	}},
 	"compliance": {At: "audit.flow_writes", When: []docsWhen{
 		{"responds with whole rows of step", "encryption.flow_results"},
@@ -486,6 +487,7 @@ const (
 	refusalPromoteUpgrade = "upgrade_required"        // promote on a plan without publishing
 	refusalPlanChangeUse  = "plan_change_use"         // 409, a plan the account's use does not fit
 	refusalConnectorError = "connector_error"         // a failed connector tool call; narrowed by its error_code
+	refusalActAsReason    = "act_as_reason"           // a probe as an app user of a hipaa app with no reason
 )
 
 // refusalDocs is the address of a runtime refusal: by the stable code its
@@ -510,6 +512,7 @@ var refusalDocs = map[string]docsRule{
 	refusalNoFields:          {At: "scoping.how", When: []docsWhen{{"changes only through a transition", "workflows.transition_writes"}, {"the admin panel never writes", "auth.admin_panel_accounts"}}},
 	"field_owned_by_command": {At: "scoping.command_owned_fields"},
 	uploadsDisabledCode:      {At: "uploads.feature_gate"},
+	sharingDisabledCode:      {At: "permissions.sharing_switch"},
 	"storage_limit":          {At: "recovery.storage_limit"},
 	mediaAllowanceCode:       {At: "uploads.storage_allowance"},
 	refusalWorkflowRole:      {At: "workflows.transition_roles"},
@@ -530,8 +533,10 @@ var refusalDocs = map[string]docsRule{
 	emailVerificationRequiredCode: {At: "auth.account_state_signin"},
 	"email_unverified":            {At: "scoping.email_keyed_grants"},
 	"api_token_limit":             {At: "auth.credential_limits"},
+	// A scoped credential on a page that requires sign-in, or on its PDF.
+	scopedCredentialPageCode: {At: "auth.credential_limits"},
 	// The admin panel's write routes on a table it only shows.
-	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}}},
+	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}, {"is a framework table", "auth.admin_panel_accounts"}, {"is a version history table", "versioning.history_table"}}},
 	// The admin panel's edit of another admin's sign-in identifier.
 	adminIdentifierProtectedCode: {At: "auth.admin_panel_accounts"},
 	// A role change that takes admin away from another admin.
@@ -551,6 +556,9 @@ var refusalDocs = map[string]docsRule{
 		{"collaborator", "collaborators.plans"},
 		{"media storage", "uploads.storage_allowance"},
 	}},
+	// probe_route `as` / `benmore probe --as` on a compliance: hipaa app
+	// with no stated reason.
+	refusalActAsReason: {At: "compliance.workforce_reads"},
 	// The app's MCP connector: _meta.docs of a failed tool call, by its
 	// error_code (appMCPErrorCodes).
 	refusalConnectorError: {At: "connector.connector_errors", When: []docsWhen{

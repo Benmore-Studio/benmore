@@ -451,7 +451,7 @@ List query params: `?orderBy=col:desc&limit=N&page=N&per_page=N&cursor=X&where[c
 require `X-CSRF-Token` for cookie sessions; Bearer-auth requests don't.
 
 Protected fields (`user_id`, `role`, `password_hash`, `created_at`,
-`updated_at`) are **stripped from any client body** - the server sets them.
+`updated_at`, `deleted_at`) are **stripped from any client body** - the server sets them.
 Dropped fields are listed in the `X-Stripped-Fields` response header.
 
 ## Auth, access & server logic
@@ -485,7 +485,10 @@ Dropped fields are listed in the `X-Stripped-Fields` response header.
   replace it at next sign-in unless you pass `--no-change-required`.
   CLI creation refuses an existing email without resetting credentials or
   changing its role. `benmore users <app> list --all --env dev` includes
-  deactivated accounts for provisioning checks. Stdin accepts up to 64 KiB and
+  deactivated accounts for provisioning checks. Cut an account off with
+  `benmore users <app> deactivate <email>` and let it back in with
+  `benmore users <app> reactivate <email>`; nothing is deleted
+  (`api(at:"auth")` → `account_state_signin`). Stdin accepts up to 64 KiB and
   removes only trailing CR/LF. In the browser,
   `bm.auth.signUp({ email, password })` posts to
   `/signup`; there is no `/api/auth/signup`. Passwords need at least 8
@@ -597,7 +600,8 @@ save hook upload the same set pull hands back: a hidden directory outside
 the workspace, `deploy` prints how many files it left there, and `sync-status`
 lists them as `kept_local`, not as drift. Keep scratch files and credentials in
 such a directory or outside the app directory, and source the app needs in a
-plain one (`.gitignore` does not decide what is uploaded).
+plain one (`.gitignore` does not decide what is uploaded; `deploy` warns after
+uploading a file the root `.gitignore` excludes, see `api(at:"sync-status.excludes")`).
 
 Feature packs are the clone mechanism for reusable app pieces:
 

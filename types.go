@@ -560,6 +560,7 @@ type FeaturesConfig struct {
 	Feedback        *bool `yaml:"feedback"`         // visitor feedback widget + API WITHOUT the testing posture (no demo gate); survives publish so live apps can collect feedback (default: false, opt-in)
 	Analytics       *bool `yaml:"analytics"`        // per-app analytics beacon + cookie tracking (default: true)
 	AccountSettings *bool `yaml:"account_settings"` // optional account self-service controls (default: true)
+	Sharing         *bool `yaml:"sharing"`          // record sharing (/share grants) on every table (default: true); a table's access.<table>.share overrides it (recordSharingEnabled)
 
 	// WSAnonymous, when true, drops the auth gate on /ws and /sse/events.
 	// Default false - authed apps require a session as before. Opt-in for
@@ -604,6 +605,8 @@ func (f *FeaturesConfig) IsEnabled(name string) bool {
 		return f == nil || f.Analytics == nil || *f.Analytics
 	case "account_settings":
 		return f == nil || f.AccountSettings == nil || *f.AccountSettings
+	case "sharing":
+		return f == nil || f.Sharing == nil || *f.Sharing
 	default:
 		return true
 	}

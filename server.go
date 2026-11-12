@@ -256,6 +256,8 @@ func reloadAppConfigStaged(app *App, config *runtimeConfig, nextEnv map[string]s
 	// with `[locks] cleanup error: file is not a database` while
 	// returning 5xx on every write path. Agents had no escape hatch
 	// because no CLI command shells out to `systemctl restart`.
+	// Read before the schema step, as a start does (migrate_new_database.go).
+	newDatabase := migrationDatabaseIsNew(app.DB)
 	tables, deferredDDL, err := config.loadSchema(context.Background(), app.DB, app.Dir, false)
 	if err != nil {
 		if isDBHandleWedged(err) {
@@ -289,7 +291,11 @@ func reloadAppConfigStaged(app *App, config *runtimeConfig, nextEnv map[string]s
 	// per-app process (never router-side); the schema-diff migrate above only
 	// handles column adds, not arbitrary SQL. Keep the old handler and workers
 	// when a migration fails; do not advertise a completed reload.
-	if err := config.runUserMigrations(context.Background(), app.DB, app.Dir, false); err != nil {
+	migrationCtx := context.Background()
+	if newDatabase {
+		migrationCtx = withMigrationNewDatabase(migrationCtx, app.DB)
+	}
+	if err := config.runUserMigrations(migrationCtx, app.DB, app.Dir, false); err != nil {
 		return fmt.Errorf("user migration: %w", err)
 	}
 	joinMap, err := buildJoinMapChecked(app.DB)
@@ -1195,7 +1201,7 @@ func serveUploadAsset(w http.ResponseWriter, r *http.Request, app *App, dev bool
 	}
 	// Resolve symlinks and confirm containment within uploads/ (filepath.Clean
 	// alone does not catch a symlink inside uploads/ pointing elsewhere).
-	file, ok := openServableFile(uploadsRoot, fullPath)
+	file, ok := openStoredUpload(uploadsRoot, fullPath)
 	if !ok {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
@@ -1994,7 +2000,14 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 	// that enables dev diagnostics. Source activation belongs to validated
 	// reloads; rereading here would replace shared state after gate checks.
 
-	session := getSession(app, r)
+	// A scoped credential is never a page's viewer (page_scoped_credentials.go):
+	// a page that requires sign-in refuses it, here as on the route's gate,
+	// and any other page renders as for an anonymous caller.
+	session, scoped := pageCaller(app, r)
+	if scoped && pageRequiresSignIn(page) {
+		refuseScopedCredentialPage(w)
+		return
+	}
 	if session != nil {
 		Increment(app, meterScope(session), "page_views")
 	}
@@ -2017,7 +2030,7 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 	ctx := &RenderContext{
 		Data:    make(map[string]any),
 		User:    session,
-		Request: r,
+		Request: pageRenderRequest(r, scoped),
 		App:     app,
 		Page:    page,
 	}
@@ -2400,10 +2413,11 @@ func registerAppPageRoutes(mux appRouteRegistrar, app *App, dev bool) []string {
 				}
 			}()
 			if p.Auth == "required" || p.Require != "" {
-				mux.HandleFunc(pattern, AuthMiddleware(app, p, handler))
-			} else {
-				mux.HandleFunc(pattern, handler)
+				handler = AuthMiddleware(app, p, handler)
 			}
+			// Outermost: a scoped credential is refused before the page's
+			// own gates answer (page_scoped_credentials.go).
+			mux.HandleFunc(pattern, scopedCredentialPageGate(app, p, handler))
 			registered = append(registered, pattern)
 		}()
 	}

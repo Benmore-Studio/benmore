@@ -1,0 +1,13 @@
+# flows/return-stock.yaml - the same gate written as a comma-separated string.
+on:
+  request:
+    method: POST
+    path: /api/return-stock
+    role: "warehouse, manager"
+jobs:
+  return:
+    steps:
+      - run: sql
+        with: { query: "INSERT INTO stock_moves (sku, kind, moved_by) VALUES (:sku, 'return', :user_id)" }
+      - run: respond
+        with: { status: 201, json: { returned: true } }

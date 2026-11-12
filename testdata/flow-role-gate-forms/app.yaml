@@ -1,7 +1,8 @@
-# A flow's `role:` gate takes ONE role name. This app shows what a comma list
-# does (it admits nobody but a global admin) and the three ways to let several
-# roles in: an `if:` on the account's own role, a SQL step that also counts
-# role grants, and a synchronous gate in front of queued work.
+# A flow's `role:` gate names one role or several, as a YAML list or a
+# comma-separated string, and admits a caller who holds any of them. The other
+# flows refuse in a step instead: an `if:` on the account's own role, a SQL
+# step that also counts role grants, and a synchronous gate in front of queued
+# work.
 site_name: "Flow role gate forms"
 auth:
   identifier: email

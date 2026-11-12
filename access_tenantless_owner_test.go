@@ -489,9 +489,9 @@ func TestTenantlessMemberReachesOnlyOwnMembershipRow(t *testing.T) {
 
 // An email-keyed membership table names the member by address, and its
 // user_id (when it has one) is whoever created the row. A caller with no
-// tenant reaches a row only when both say it is theirs, compared the way
-// membership resolution compares: a proven address. Rows they created about
-// other members stay with the tenant.
+// tenant reads the rows that name them, compared the way membership
+// resolution compares: a proven address. Rows they created about other
+// members stay with the tenant.
 func TestTenantlessMemberOwnMembershipRowEmailKeyed(t *testing.T) {
 	app, mux := tenantlessOwnerAppWithRules(t, map[string]map[AccessOp]string{})
 	crudScopeMustExec(t, app.DB, `ALTER TABLE team_members ADD COLUMN email TEXT`)
@@ -511,11 +511,18 @@ func TestTenantlessMemberOwnMembershipRowEmailKeyed(t *testing.T) {
 	} {
 		crudScopeMustExec(t, app.DB, stmt)
 	}
-	// Row 2 names her and is hers. Row 3 she created about someone else;
-	// row 4 names her but was never in her reach (another user's user_id).
-	assertListedIDs(t, mux, sam, "/api/team_members", []int{2})
-	for id, want := range map[int]int{1: 404, 2: 200, 3: 404, 4: 404, 5: 404} {
+	// Rows 2 and 4 name her (row 4 was written by another user, in another
+	// team). Row 3 she created about someone else.
+	assertListedIDs(t, mux, sam, "/api/team_members", []int{2, 4})
+	for id, want := range map[int]int{1: 404, 2: 200, 3: 404, 4: 200, 5: 404} {
 		assertStatus(t, mux, http.MethodGet, fmt.Sprintf("/api/team_members/%d", id), sam, nil, want)
+	}
+	assertStatus(t, mux, http.MethodGet, "/api/team_members/4/lock", sam, nil, http.StatusOK)
+	// Reading row 4 is all she may do with it: its user_id is not hers.
+	assertStatus(t, mux, http.MethodPatch, "/api/team_members/4", sam, map[string]any{"note": "changed"}, http.StatusNotFound)
+	assertStatus(t, mux, http.MethodDelete, "/api/team_members/4", sam, nil, http.StatusNotFound)
+	if n := tenantlessCount(t, app, `SELECT COUNT(*) FROM team_members WHERE id = 4 AND note IS NULL`); n != 1 {
+		t.Fatal("she changed a membership row another user wrote")
 	}
 	// An address the account has not proven names nobody.
 	assertListedIDs(t, mux, uma, "/api/team_members", []int{})
@@ -688,7 +695,7 @@ func TestDescribeStatesTheTenantlessOwnerBound(t *testing.T) {
 	}{
 		{"docs", "", "a caller with no tenant reaches only rows they own (user_id) that carry no tenant"},
 		{"docs", "owner_or_role:manager", "rows the caller owns (user_id) in their tenant (with no tenant, only owned rows that carry no tenant)"},
-		{"team_members", "", "carry no tenant, and their own membership rows"},
+		{"team_members", "", "carry no tenant, and the membership rows that name them (user_id), active or not"},
 	} {
 		rules := map[string]map[AccessOp]string{}
 		if tc.mode != "" {

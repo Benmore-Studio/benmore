@@ -567,14 +567,91 @@ func privateUploadKeyAfterPrefix(key string) (string, error) {
 	return privateLogicalUploadPath(key)
 }
 
-func deletePrivateUpload(app *App, raw string) error {
-	return deletePrivateUploadAuthorized(app, raw, nil)
+// publicLogicalUploadPath accepts a public upload's logical path in its one
+// canonical form: uploads/<segments>, at most one leading slash, no empty,
+// dot or dot-dot segment, no backslash, NUL, query, fragment or
+// percent-encoding (the form the presign broker's delete takes,
+// brokerPublicDeletePath), and no folder named private in any letter case: a
+// case-insensitive disk opens uploads/PRIVATE/x as the private file
+// uploads/private/x, which only the private rule may delete.
+func publicLogicalUploadPath(raw string) (string, error) {
+	logical, ok := brokerPublicDeletePath(raw)
+	if !ok || isPrivateUploadPath(strings.ToLower(logical)) {
+		return "", fmt.Errorf("delete upload: not a canonical reference to an upload of this app (uploads/<path>, or the URL the upload returned)")
+	}
+	return logical, nil
 }
 
-// deletePrivateUploadAuthorized deletes the private upload raw names once
-// authorize (when set) accepts the backend and the logical path the
-// reference resolved to; its error stops the delete before any I/O.
-func deletePrivateUploadAuthorized(app *App, raw string, authorize func(backend StorageBackend, logical string) error) error {
+// publicUploadPath is privateUploadPath for the public tier: it proves a
+// stored reference names a public file under this app's own prefix on the
+// selected backend and returns the logical uploads/... key passed to
+// StorageBackend. The URL forms are compared on the raw text, so the stored
+// spelling is the only one accepted.
+func publicUploadPath(app *App, backend StorageBackend, raw string) (string, error) {
+	if !strings.Contains(raw, "://") {
+		return publicLogicalUploadPath(raw)
+	}
+	if strings.ContainsAny(raw, "\\\x00?#%") {
+		return "", fmt.Errorf("delete upload: invalid upload URL")
+	}
+	var key string
+	switch store := backend.(type) {
+	case *CDNStorage:
+		u, err := neturl.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host != store.CDNDomain || u.User != nil {
+			return "", fmt.Errorf("delete upload: URL is not this app's configured CDN")
+		}
+		var ok bool
+		if key, ok = strings.CutPrefix(raw, "https://"+store.CDNDomain+"/public/"+appMediaPrefix(app)+"/"); !ok {
+			return "", fmt.Errorf("delete upload: CDN URL is outside this app's own prefix")
+		}
+	case *S3Storage:
+		var ok bool
+		if key, ok = strings.CutPrefix(raw, store.objectURL("")); !ok {
+			return "", fmt.Errorf("delete upload: URL is not this app's configured S3 bucket")
+		}
+	default:
+		return "", fmt.Errorf("delete upload: URL references are unsupported by the selected backend")
+	}
+	// The prefix ends in a slash: a key starting with another is a doubled
+	// slash, a second spelling of the stored URL (privateUploadKeyAfterPrefix).
+	if strings.HasPrefix(key, "/") {
+		return "", fmt.Errorf("delete upload: invalid upload URL")
+	}
+	return publicLogicalUploadPath(key)
+}
+
+// localUploadStoredAs reports whether logical is the spelling under which the
+// file is stored in dir, or names nothing at all (deleting a missing file
+// succeeds). A case-insensitive disk opens uploads/Avatars/A.PNG as
+// uploads/avatars/a.png, but the uploader record is keyed by the stored
+// spelling, so another spelling would reach the file past its record. It is
+// the delete and signing side of the rule reads apply in openStoredUpload:
+// names are compared byte for byte, never lower-cased or normalized.
+func localUploadStoredAs(dir, logical string) bool {
+	current := dir
+	for _, part := range strings.Split(logical, "/") {
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return os.IsNotExist(err)
+		}
+		stored := false
+		for _, entry := range entries {
+			if entry.Name() == part {
+				stored = true
+				break
+			}
+		}
+		current = filepath.Join(current, part)
+		if !stored {
+			_, err := os.Lstat(current)
+			return os.IsNotExist(err)
+		}
+	}
+	return true
+}
+
+func deletePrivateUpload(app *App, raw string) error {
 	backend := storageBackendForApp(app)
 	if backend == nil {
 		return fmt.Errorf("delete upload: storage backend unavailable")
@@ -583,10 +660,57 @@ func deletePrivateUploadAuthorized(app *App, raw string, authorize func(backend 
 	if err != nil {
 		return err
 	}
-	if authorize != nil {
-		if err := authorize(backend, path); err != nil {
-			return err
+	if err := localUploadSpellingRefusal(backend, path); err != nil {
+		return err
+	}
+	if err := backend.Delete(path); err != nil {
+		return fmt.Errorf("delete upload %q: %w", path, err)
+	}
+	return nil
+}
+
+// localUploadSpellingRefusal refuses a delete on local disk through a
+// reference that is not the stored spelling of an existing file, private or
+// public (localUploadStoredAs). It runs before the uploader rule is asked: a
+// respelled private reference finds no uploader record, which reads as a file
+// from before uploaders were recorded.
+func localUploadSpellingRefusal(backend StorageBackend, logical string) error {
+	if local, ok := backend.(*LocalStorage); ok && !localUploadStoredAs(local.Dir, logical) {
+		return fmt.Errorf("delete upload: the reference is not spelled as the file is stored")
+	}
+	return nil
+}
+
+// deleteUploadAuthorized deletes the upload raw names, private or public,
+// once authorize accepts the backend, the logical path the reference resolved
+// to and its tier; its error stops the delete before any storage I/O. A
+// reference that is neither this app's private upload (privateUploadPath) nor
+// its public one (publicUploadPath) is refused before authorize is asked.
+func deleteUploadAuthorized(app *App, raw string, authorize func(backend StorageBackend, logical string, public bool) error) error {
+	backend := storageBackendForApp(app)
+	if backend == nil {
+		return fmt.Errorf("delete upload: storage backend unavailable")
+	}
+	public := false
+	path, err := privateUploadPath(app, backend, raw)
+	if err != nil {
+		publicPath, publicErr := publicUploadPath(app, backend, raw)
+		switch {
+		case publicErr == nil:
+			path, public, err = publicPath, true, nil
+		case !isPrivateUploadPath(strings.ToLower(raw)):
+			// Not a private-tier reference: the public rule says why.
+			err = publicErr
 		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := localUploadSpellingRefusal(backend, path); err != nil {
+		return err
+	}
+	if err := authorize(backend, path, public); err != nil {
+		return err
 	}
 	if err := backend.Delete(path); err != nil {
 		return fmt.Errorf("delete upload %q: %w", path, err)
@@ -757,8 +881,9 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 	// Record ownership before storing private bytes. A failed DB write must
 	// not leave a new file looking like an unowned legacy upload. If storage
 	// fails later, retain this harmless reservation: a remote failure may
-	// have persisted bytes even when it returned an error.
-	if err := recordPrivateUploadOwner(app, r, destPath); err != nil {
+	// have persisted bytes even when it returned an error. A public file's
+	// uploader is recorded too, best effort (recordUploadOwner).
+	if err := recordUploadOwner(app, r, destPath); err != nil {
 		return "", "", fmt.Errorf("record upload owner: %w", err)
 	}
 
@@ -910,7 +1035,11 @@ func discardStoredUpload(app *App, destPath string) {
 		return
 	}
 	if app != nil && app.DB != nil {
-		if _, err := app.DB.Exec(`DELETE FROM _benmore_upload_owners WHERE path = ?`, uploadRelPath(destPath)); err != nil && !strings.Contains(err.Error(), "no such table") {
+		owners := publicUploadOwnersTable
+		if isPrivateUploadPath(destPath) {
+			owners = privateUploadOwnersTable
+		}
+		if _, err := app.DB.Exec(`DELETE FROM `+owners+` WHERE path = ?`, uploadRelPath(destPath)); err != nil && !strings.Contains(err.Error(), "no such table") {
 			log.Printf("discard refused upload %s ownership: %v", destPath, err)
 		}
 	}

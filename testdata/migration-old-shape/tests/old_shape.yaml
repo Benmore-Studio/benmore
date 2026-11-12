@@ -1,0 +1,37 @@
+# The database these tests run on is built from the current schema and then
+# runs every file in migrations/. 0005 was written when orders still had the
+# text column `amount`: its copy names a column this database never had, and
+# the app used to fail to load here. Run: benmore test <dir> --app
+
+# The trigger 0006 creates is in the new database and fires.
+trigger_from_a_migration_file_fires:
+  as_user: "orders@oldshape.test"
+  steps:
+    - api: "POST /api/orders"
+      json: {name: "trigger probe", amount_cents: 1250}
+      save: {order: "id"}
+      expect: {status: 200}
+    - get: "/api/orders/{{order}}"
+      expect:
+        status: 200
+        json:
+          name: "trigger probe"
+          amount_cents: 1250
+    - sql: "SELECT id FROM order_events WHERE order_id = {{order}} AND kind = 'created'"
+      expect: {rows: 1}
+
+# The row 0006 seeds is there, once.
+seed_row_from_a_migration_file_is_there:
+  as_user: "seed@oldshape.test"
+  steps:
+    - sql: "SELECT id FROM currencies WHERE code = 'USD' AND name = 'US dollar'"
+      expect: {rows: 1}
+
+# The column 0005 copies from and drops was never created.
+old_column_is_not_in_the_new_database:
+  as_user: "columns@oldshape.test"
+  steps:
+    - sql: "SELECT name FROM pragma_table_info('orders') WHERE name = 'amount'"
+      expect: {rows: 0}
+    - sql: "SELECT name FROM pragma_table_info('orders') WHERE name = 'amount_cents' AND type = 'INTEGER'"
+      expect: {rows: 1}

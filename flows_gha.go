@@ -110,12 +110,13 @@ type FlowEventTrigger struct {
 // used to live as "trigger: METHOD /path" + auth/role/transaction/verify
 // on the old shape, just split into named fields for clarity.
 type FlowRequestTrigger struct {
-	Method      string   `yaml:"method"`
-	Path        string   `yaml:"path"`
-	Auth        string   `yaml:"auth"`
-	Role        string   `yaml:"role"`
-	Permissions []string `yaml:"permissions"`
-	Transaction bool     `yaml:"transaction"`
+	Method string `yaml:"method"`
+	Path   string `yaml:"path"`
+	Auth   string `yaml:"auth"`
+	// Role is one role name or an any-of list of them (flows_role_gate.go).
+	Role        flowRoleYAML `yaml:"role"`
+	Permissions []string     `yaml:"permissions"`
+	Transaction bool         `yaml:"transaction"`
 	// StrictJSON makes this HTTP route accept only one bounded JSON object
 	// with unambiguous keys before any flow step runs.
 	StrictJSON yaml.Node `yaml:"strict_json"`
@@ -477,7 +478,7 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 		secret = file.On.Request.Secret
 		transaction = file.On.Request.Transaction
 		auth = normalizeFlowAuth(file.On.Request.Auth, path)
-		role = file.On.Request.Role
+		role = canonicalFlowRole(string(file.On.Request.Role))
 		permissions = file.On.Request.Permissions
 		async = strings.EqualFold(strings.TrimSpace(file.On.Request.Mode), "async")
 		rateLimit = parseRateLimit(file.On.Request.RateLimit)

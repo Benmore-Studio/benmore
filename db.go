@@ -1309,6 +1309,10 @@ func EnsureAuditLogTable(db *sql.DB) {
 	// actually acted. Zero / empty for every other row.
 	db.Exec("ALTER TABLE _benmore_audit_log ADD COLUMN impersonator_user_id INTEGER DEFAULT 0")
 	db.Exec("ALTER TABLE _benmore_audit_log ADD COLUMN impersonator_email TEXT DEFAULT ''")
+	// Set on a row a database restore copied from the database it replaced:
+	// the time of that restore (restore_credentials_audit.go). NULL for every
+	// row written in place.
+	db.Exec("ALTER TABLE _benmore_audit_log ADD COLUMN " + auditRestoreCarriedColumn + " DATETIME")
 	// The audit log only grows, and every reader filtered or counted it with
 	// a full scan: per-record history (versioning, admin row view) by
 	// (table_name, row_id), a user's trail by user_id newest first, and the

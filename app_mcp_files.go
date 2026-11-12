@@ -1103,7 +1103,7 @@ func appMCPReadPrivateUpload(ctx context.Context, app *App, logical string, maxB
 	}
 	root := filepath.Join(app.Dir, "uploads")
 	target := filepath.Join(app.Dir, filepath.FromSlash(logical))
-	if f, ok := openServableFile(root, target); ok {
+	if f, ok := openStoredUpload(root, target); ok {
 		defer f.Close()
 		data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 		if err != nil {

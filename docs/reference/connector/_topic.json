@@ -13,6 +13,7 @@
     "connector_commands",
     "connector_command_sql",
     "dependency_shape",
+    "caller_predicate",
     "command_encryption_key",
     "connector_approval",
     "review_page_state",

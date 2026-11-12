@@ -1,0 +1,60 @@
+# A create never stores deleted_at: the row is created live and its owner's
+# list returns it. Only DELETE soft-deletes a row and only restore brings it
+# back. Each test counts only the rows it names.
+single_create_drops_deleted_at:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/folders"
+      json: {name: "born-single", deleted_at: "2020-02-02 02:02:02"}
+      save: {folder_id: "id"}
+      expect:
+        status: 200
+        headers: {X-Stripped-Fields: "deleted_at"}
+    - sql: "SELECT id FROM folders WHERE name = 'born-single' AND deleted_at IS NULL"
+      expect: {rows: 1}
+    - get: "/api/folders/{{folder_id}}"
+      expect: {status: 200, contains: "born-single"}
+    - api: "DELETE /api/folders/{{folder_id}}"
+      json: {}
+      expect: {status: 200}
+    - sql: "SELECT id FROM folders WHERE name = 'born-single' AND deleted_at IS NOT NULL"
+      expect: {rows: 1}
+    - get: "/api/folders/{{folder_id}}"
+      expect: {status: 404}
+    - api: "POST /api/folders/{{folder_id}}/restore"
+      json: {}
+      expect: {status: 200}
+    - sql: "SELECT id FROM folders WHERE name = 'born-single' AND deleted_at IS NULL"
+      expect: {rows: 1}
+
+batch_create_drops_deleted_at:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/folders/batch"
+      json_array:
+        - {name: "born-batch-a", deleted_at: "2020-02-02 02:02:02"}
+        - {name: "born-batch-b", deleted_at: "2020-02-02 02:02:02"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM folders WHERE name IN ('born-batch-a', 'born-batch-b') AND deleted_at IS NULL"
+      expect: {rows: 2}
+
+ingest_create_drops_deleted_at:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/folders/ingest"
+      ndjson:
+        - {name: "born-ingest", deleted_at: "2020-02-02 02:02:02"}
+      expect: {status: 200}
+    - sql: "SELECT id FROM folders WHERE name = 'born-ingest' AND deleted_at IS NULL"
+      expect: {rows: 1}
+
+transaction_create_drops_deleted_at:
+  as_user: "owner@test.com"
+  steps:
+    - api: "POST /api/_transaction"
+      json:
+        operations:
+          - {table: "folders", action: "insert", data: {name: "born-transaction", deleted_at: "2020-02-02 02:02:02"}}
+      expect: {status: 200}
+    - sql: "SELECT id FROM folders WHERE name = 'born-transaction' AND deleted_at IS NULL"
+      expect: {rows: 1}

@@ -131,8 +131,8 @@ func importRunning(app *App) bool { return importFlagFor(app).Load() }
 // importableColumns returns the columns a bulk import may write: every
 // column except the primary key and the mass-assignment-protected set.
 // The protected set is auto-CRUD create's (protectedCreateFields: owner,
-// timestamps, credentials, in-tenant role field, computed columns) plus
-// deleted_at and workflow state columns, matched case-insensitively.
+// timestamps including deleted_at, credentials, in-tenant role field,
+// computed columns) plus workflow state columns, matched case-insensitively.
 //
 // The tenant key IS importable: only a platform admin (not stepped in) or
 // the owner token can import, and auto-CRUD create honors an explicit tenant
@@ -146,7 +146,6 @@ func importableColumns(db *sql.DB, table string, app *App) ([]Column, error) {
 		return nil, err
 	}
 	protected := protectedCreateFields(app, table)
-	protected.add("deleted_at")
 	if app != nil {
 		protected.add(workflowProtectedFields(app, table)...)
 	}

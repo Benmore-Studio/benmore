@@ -821,10 +821,11 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 			httpError(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		// The role is matched against every role the session holds (the
-		// primary column, grants in _benmore_user_roles, the tenant
-		// membership role), except that `role: admin` admits only a global
-		// admin (flowRoleAllowed, flows_role_gate.go).
+		// Each role the gate names is matched against every role the
+		// session holds (the primary column, grants in _benmore_user_roles,
+		// the tenant membership role), and one match admits the caller;
+		// `admin` admits only a global admin (flowRoleAllowed,
+		// flows_role_gate.go).
 		if flow.Role != "" && !flowRoleAllowed(session, flow.Role) {
 			httpError(w, "Forbidden", http.StatusForbidden)
 			return

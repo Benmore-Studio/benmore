@@ -1,6 +1,6 @@
-# flows/close-period.yaml - several tenant roles: a flow's `role:` gate takes
-# one name, so the flow reads the caller's membership row and lists the roles
-# that pass.
+# flows/close-period.yaml - several tenant roles, the tenant's own admins
+# among them: `admin` in a flow's `role:` gate is the global admin, so the flow
+# reads the caller's membership row and lists the roles that pass.
 on:
   request:
     method: POST

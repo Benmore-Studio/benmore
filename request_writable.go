@@ -77,13 +77,7 @@ func (w requestWritable) column(col Column, mode requestWriteMode) bool {
 	if mode == requestUpdate {
 		return !w.updateDrops.has(col.Name)
 	}
-	switch {
-	case identIs(col.Name, "deleted_at"):
-		// The one place this is narrower than the create path, which stores a
-		// deleted_at it is sent: the column belongs to delete and restore,
-		// and no form or generated client should offer it.
-		return false
-	case identIs(col.Name, w.tenantKey):
+	if identIs(col.Name, w.tenantKey) {
 		return w.tenantKeyOnCreate
 	}
 	return !w.createDrops.has(col.Name) && !w.state.has(col.Name)

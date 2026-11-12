@@ -1065,7 +1065,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 		}
 	}
 	if flow.Role != "" && !flowRoleAllowed(actor, flow.Role) {
-		return nil, fmt.Errorf("the account this job was queued for no longer holds role %q; not run", flow.Role)
+		return nil, fmt.Errorf("the account this job was queued for no longer holds a role the flow requires (%s); not run", flow.Role)
 	}
 	if len(flow.Permissions) > 0 && !scopesWithin(actor.Scopes, strings.Join(flow.Permissions, " ")) {
 		return nil, fmt.Errorf("the account this job was queued for no longer holds the flow's permissions; not run")

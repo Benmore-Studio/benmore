@@ -207,7 +207,7 @@ func parseLegacyFlowsYAML(data []byte) ([]Flow, error) {
 		if err := checkConvertedSteps(steps); err != nil {
 			return nil, fmt.Errorf("flow %s: %w", name, err)
 		}
-		flows = append(flows, Flow{Name: name, Trigger: parseTrigger(f.Trigger), Verify: f.Verify, Secret: f.Secret, Transaction: f.Transaction, Auth: normalizeFlowAuth(f.Auth, name), Role: f.Role, Permissions: f.Permissions, Steps: steps})
+		flows = append(flows, Flow{Name: name, Trigger: parseTrigger(f.Trigger), Verify: f.Verify, Secret: f.Secret, Transaction: f.Transaction, Auth: normalizeFlowAuth(f.Auth, name), Role: canonicalFlowRole(f.Role), Permissions: f.Permissions, Steps: steps})
 	}
 	return flows, nil
 }

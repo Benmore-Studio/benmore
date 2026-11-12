@@ -51,7 +51,9 @@ package main
 // rows replace the snapshot's) or restoreMCPTables (connector stores).
 //
 // The same transaction settles the work the snapshot has queued, so a restore
-// does not run jobs and scheduled tasks a second time (restore_queue.go).
+// does not run jobs and scheduled tasks a second time (restore_queue.go), and
+// copies the audit rows that record the credential changes made since the
+// snapshot (restore_credentials_audit.go).
 
 import (
 	"context"
@@ -95,6 +97,11 @@ type restoreCredentialSummary struct {
 	// snapshot had queued (restore_queue.go). nil for a refresh-dev copy,
 	// whose whole queue is held instead (holdRefreshedQueue).
 	Queue *restoreQueueSummary `json:"queue,omitempty"`
+	// AuditRows reports the audit rows of account, role and credential events
+	// newer than the snapshot that were copied from the live database
+	// (restore_credentials_audit.go). nil for a refresh-dev copy: another
+	// instance's database has no history of this one.
+	AuditRows *restoreAuditRowsSummary `json:"audit_rows,omitempty"`
 }
 
 // restoreUserIdentityColumns are login identifiers: whoever holds one live
@@ -258,6 +265,17 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		if summary.Queue, err = carryForwardRestoreQueue(ctx, tx, livePath, live != nil); err != nil {
 			return nil, fmt.Errorf("queued work: %w", err)
 		}
+		// The record of the credential changes carried above.
+		skipped := ""
+		switch summary.Mode {
+		case restoreCredentialsUnreadable:
+			skipped = restoreAuditSkippedUnreadable
+		case restoreCredentialsNoLive:
+			skipped = restoreAuditSkippedNoLive
+		}
+		if summary.AuditRows, err = carryForwardRestoreAudit(ctx, tx, livePath, skipped); err != nil {
+			return nil, fmt.Errorf("audit rows: %w", err)
+		}
 	}
 	values, err := json.Marshal(summary)
 	if err != nil {
@@ -283,6 +301,9 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		action, summary.Mode, summary.UsersMatched, summary.UsersUpdated, summary.UsersSnapshotOnly, summary.Kept, summary.Removed)
 	if q := summary.Queue; q != nil {
 		log.Printf("%s: queued work in the snapshot: %v already finished live and kept finished, %v held (not run again), %v left to run", action, q.Finished, q.Held, q.Waiting)
+	}
+	if a := summary.AuditRows; a != nil {
+		log.Printf("%s: %d audit rows of account and credential events newer than the snapshot copied from the live database%s", action, a.Carried, a.note())
 	}
 	return summary, nil
 }

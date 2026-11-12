@@ -621,10 +621,9 @@ func TestManagedTimestampWritePathsStoreFrameworkSpellings(t *testing.T) {
 		t.Errorf("restore left created_at %q -> %q, deleted_at %v, updated_at %q", created, after, deleted, updated)
 	}
 
-	// deleted_at on create is not asserted here: a create accepts it from the
-	// request and stores it as sent (reported with this change, not altered by
-	// it). It does not matter to sorting, since a list returns only rows
-	// whose deleted_at is NULL.
+	// A create drops deleted_at like the other two
+	// (TestCreateNeverStoresDeletedAt). It does not matter to sorting, since a
+	// list returns only rows whose deleted_at is NULL.
 
 	// Bulk import (Mode A) cannot carry any of the three columns.
 	importable, err := importableColumns(app.DB, "notes", app)

@@ -1107,9 +1107,10 @@ func validateFlowsYAML(content string) string {
 	// Probe into the GHA-shaped struct. The file is well-formed GHA when
 	// `on:` and `jobs:` are TOP-LEVEL keys (not nested under a flow
 	// name). Anything else gets a specific, fixable error.
-	// A role list would fail the typed decode below with the decoder's own
-	// words (validators_flow_role_gate.go).
-	if msg := flowRoleListViolation(probe); msg != "" {
+	// A role value that names no role would fail the typed decode below with
+	// the decoder's own words, or load as a gate only a global admin passes
+	// (validators_flow_role_gate.go).
+	if msg := flowRoleFormViolation(probe); msg != "" {
 		return msg
 	}
 	var ghaFile FlowFileGHA

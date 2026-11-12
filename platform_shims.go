@@ -219,3 +219,8 @@ func dashboardUsesRouterIdentity(app *App) bool { return false }
 // dashboardFlowWriteRefusal refuses a dashboard flow's write to credential
 // tables the platform router owns. No platform → nothing is refused.
 func dashboardFlowWriteRefusal(app *App, query string) error { return nil }
+
+// platformPageSession reports the embedded dashboard's browser session, which
+// a page still renders for although it carries a scope marker
+// (page_scoped_credentials.go). No platform → no such session.
+func platformPageSession(app *App, session *Session) bool { return false }

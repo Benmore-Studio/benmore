@@ -119,7 +119,7 @@ func TestRecordingMaskInputsReadsEverySpelling(t *testing.T) {
 // `ws_anonymous: {enabled: no}` opened /ws and /sse/events to anonymous
 // clients: any mapping counted as "on".
 func TestFeatureSwitchWrittenAsAMappingReadsEnabled(t *testing.T) {
-	switches := []string{"admin", "uploads", "exports", "sse", "ws", "docs", "testing", "feedback", "analytics", "account_settings"}
+	switches := []string{"admin", "uploads", "exports", "sse", "ws", "docs", "testing", "feedback", "analytics", "account_settings", "sharing"}
 	features := func(value string) *App {
 		var b strings.Builder
 		b.WriteString("site_name: x\nfeatures:\n")

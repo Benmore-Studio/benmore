@@ -139,6 +139,18 @@ func TestReloadBootstrapsNotificationsBeforeUserMigrations(t *testing.T) {
 
 func TestNotificationBootstrapDoesNotHideUnrelatedMigrationFailure(t *testing.T) {
 	dir := t.TempDir()
+	// On a database that already holds the app's tables: one that is new in
+	// the load skips a statement that only names a table the schema lacks
+	// (migrate_new_database.go).
+	writeTestFile(t, dir, "schema.sql", "CREATE TABLE notes (id INTEGER PRIMARY KEY);")
+	first, err := loadApp(dir)
+	if err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if _, err := first.DB.Exec(`DROP TABLE IF EXISTS _benmore_notifications`); err != nil {
+		t.Fatal(err)
+	}
+	first.Shutdown()
 	writeTestFile(t, dir, "migrations/0999_missing_dependency.sql", `-- UP --
 DELETE FROM unrelated_missing_table;
 -- DOWN --

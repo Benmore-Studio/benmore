@@ -4,82 +4,68 @@ package main
 
 // What a flow's `on.request.role` says, checked against what the gate reads.
 //
-// The gate (flowRoleAllowed, flows_role_gate.go) takes ONE role name and
-// matches it exactly. Access modes take `role:a,b` and workflow transitions
-// take `role: [a, b]`, so builders write both forms on a flow too:
+// The gate (flowRoleAllowed, flows_role_gate.go) takes one role name or an
+// any-of list of them, as a comma-separated string or a YAML list, like an
+// access `role:a,b` mode and a workflow transition's `role:`.
 //
-//   - `role: "warehouse,manager"` is one name nobody holds: the flow answers
-//     403 to everyone but a global admin, and the write, `benmore check` and
-//     the load all accepted it without a word;
-//   - `role: [warehouse, manager]` does not decode into the trigger and was
-//     refused with the YAML decoder's own error;
-//   - with roles: declared, a misspelled name is held by nobody either;
-//   - `role: admin` admits only a global admin, which surprises an app whose
-//     tenant members hold a role named admin.
+//   - A value that names no role or holds an empty name (`role: []`,
+//     `role: "warehouse,"`) is refused when the file is written
+//     (flowRoleFormViolation). A deployed file that carries one keeps loading
+//     and admits only a global admin, with a warning.
+//   - `role: warehouse manager` is ONE name with a space in it: names are
+//     separated by commas. Nobody holds it; a warning.
+//   - With roles: declared, a misspelled name is held by nobody; a warning.
+//   - `admin`, alone or in a list, admits only a global admin, which
+//     surprises an app whose tenant members hold a role named admin; a
+//     warning.
 //
-// The list is refused in words (it never loaded). The other three are
-// warnings from the post-write check and `benmore check`
-// (flowRoleGateWarnings) and a WARNING line when the app loads the file
-// (loadFlowsCheckedFromSourcesSkipping): deployed flow files carry them, and
-// making the comma form mean any-of would open flows that are admin-only
-// today.
+// The warnings come from the post-write check and `benmore check`
+// (flowRoleGateWarnings) and as a WARNING line when the app loads the file
+// (loadFlowsCheckedFromSourcesSkipping).
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 )
 
-// flowRoleListViolation refuses an `on.request.role` written as a YAML list
-// or map, before the typed decode would answer with "cannot unmarshal !!seq
-// into string". probe is the file decoded as plain YAML.
-func flowRoleListViolation(probe any) string {
+// flowRoleFormViolation refuses an `on.request.role` that names no role or
+// holds an empty name, and one that is not a name or a list of names, before
+// the typed decode would answer in the YAML decoder's words. probe is the
+// file decoded as plain YAML.
+func flowRoleFormViolation(probe any) string {
 	root, _ := probe.(map[string]any)
 	on, _ := root["on"].(map[string]any)
 	request, _ := on["request"].(map[string]any)
-	var names []string
+	problem := ""
 	switch role := request["role"].(type) {
+	case string:
+		if _, ok := flowRoleNames(role); role != "" && !ok {
+			problem = fmt.Sprintf("%q holds an empty role name", role)
+		}
 	case []any:
+		if len(role) == 0 {
+			problem = "is an empty list, which names no role"
+		}
 		for _, item := range role {
-			if name, ok := item.(string); ok {
-				names = append(names, name)
+			name, isText := item.(string)
+			if _, ok := flowRoleNames(name); !isText || !ok {
+				problem = "is a list that holds something other than a role name, or an empty one"
 			}
 		}
 	case map[string]any:
-	default:
+		problem = "is a YAML map"
+	}
+	if problem == "" {
 		return ""
 	}
-	return "flows.yaml: on.request.role is a YAML list or map, and a flow's role gate takes exactly one role name, matched exactly (`role: warehouse`). It has no any-of form. " + flowSeveralRolesFix(names)
+	return "flows.yaml: on.request.role " + problem + ". Write one role name (`role: warehouse`), a comma-separated list (`role: \"warehouse, manager\"`) or a YAML list (`role: [warehouse, manager]`): a caller who holds any of the roles passes, and so does a global admin. Drop the key for a flow without a role gate."
 }
 
-// flowRoleNameRe is a role name that can be shown inside a quoted condition.
+// flowRoleNameRe is a role name that can be shown inside a quoted SQL value.
 var flowRoleNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
-
-// flowSeveralRolesFix says what to write when several roles should pass,
-// with the builder's own role names in the example when they can be quoted.
-func flowSeveralRolesFix(names []string) string {
-	example := []string{"warehouse", "manager"}
-	var own []string
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if flowRoleNameRe.MatchString(name) && !strings.EqualFold(name, "admin") && !slices.Contains(own, name) {
-			own = append(own, name)
-		}
-	}
-	if len(own) > 0 {
-		example = own
-	}
-	conds := make([]string, 0, len(example)+1)
-	for _, name := range append(example, "admin") {
-		conds = append(conds, "user.role != '"+name+"'")
-	}
-	single := example[0]
-	return fmt.Sprintf("A global admin passes every role gate, so for one role plus admins write that role alone (`role: %s`). For several roles, write `auth: required` and refuse in the first step: `if: ${{ %s }}` with `run: respond` and `with: { status: 403, json: { error: forbidden } }` checks the account's own role; a tenant role or a role grant is checked with a SQL step, and a `mode: async` flow is gated by a synchronous flow that queues it (api(at:\"flows.role_gate\")).",
-		single, strings.Join(conds, " && "))
-}
 
 // flowRoleGateContext is what the app's other files say about roles, as far
 // as a flow's gate depends on it.
@@ -178,8 +164,8 @@ func flowRoleGateContextFor(dir string) *flowRoleGateContext {
 }
 
 // flowRoleGateProblem is what is wrong with a flow's `role:` as its gate
-// reads it, "" when it names one role the app knows. c may be nil: only the
-// shape is judged then.
+// reads it, "" when every name in it is a role the app knows. c may be nil:
+// only the shape is judged then.
 func flowRoleGateProblem(role string, c *flowRoleGateContext) string {
 	if problem := flowRoleShapeProblem(role); problem != "" {
 		return problem
@@ -187,48 +173,77 @@ func flowRoleGateProblem(role string, c *flowRoleGateContext) string {
 	return flowRoleNameProblem(role, c)
 }
 
-// flowRoleShapeProblem names a `role:` that is not one name. It depends on
-// the flow file alone.
+// flowRoleShapeProblem names a `role:` the gate cannot read as role names: an
+// empty name (refused at write time, so this is a deployed file) or a name
+// with a space in it. It depends on the flow file alone.
 func flowRoleShapeProblem(role string) string {
-	role = strings.TrimSpace(role)
-	names := strings.FieldsFunc(role, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' })
-	if role == "" || (len(names) == 1 && names[0] == role) {
+	if strings.TrimSpace(role) == "" {
 		return ""
 	}
-	return fmt.Sprintf("on.request.role %q is read as ONE role name: a flow's role gate takes exactly one role, matched exactly, and has no any-of form. Nobody holds a role of that name, so the flow answers 403 to everyone but a global admin. %s",
-		role, flowSeveralRolesFix(names))
+	names, ok := flowRoleNames(role)
+	if !ok {
+		return fmt.Sprintf("on.request.role %q holds an empty role name, so the gate admits only a global admin. Write the roles that may call the flow separated by commas (`role: \"warehouse, manager\"`) or as a YAML list (`role: [warehouse, manager]`): a caller who holds any of them passes. See api(at:\"flows.role_gate\").", role)
+	}
+	for _, name := range names {
+		if words := strings.Fields(name); len(words) > 1 {
+			return fmt.Sprintf("on.request.role names %q, ONE role name with a space in it: role names are separated by commas, not spaces. Nobody holds a role of that name, so it admits nobody but a global admin. For any of several roles write `role: \"%s\"`. See api(at:\"flows.role_gate\").", name, strings.Join(words, ", "))
+		}
+	}
+	return ""
 }
 
-// flowRoleNameProblem names a single-name `role:` that the rest of the app
-// makes surprising: `admin` where tenant members hold a role of that name,
-// or a name nothing declares when roles: is declared. It depends on app.yaml,
-// schema.prisma and workflows.yaml.
+// flowRoleNameProblem names what the rest of the app makes surprising about
+// the role names of a well-formed `role:`: `admin` where tenant members hold
+// a role of that name, or a name nothing declares when roles: is declared.
+// It depends on app.yaml, schema.prisma and workflows.yaml.
 func flowRoleNameProblem(role string, c *flowRoleGateContext) string {
-	role = strings.TrimSpace(role)
-	if role == "" || c == nil || flowRoleShapeProblem(role) != "" {
+	names, ok := flowRoleNames(role)
+	if c == nil || !ok || flowRoleShapeProblem(role) != "" {
 		return ""
 	}
-	if strings.EqualFold(role, "admin") {
-		if c.tenantAdmin == "" {
-			return ""
+	var problems, unknown []string
+	admin := false
+	for _, name := range names {
+		switch {
+		case strings.EqualFold(name, "admin"):
+			admin = true
+		case c.rolesDeclared && !c.named[name]:
+			unknown = append(unknown, fmt.Sprintf("%q", name))
 		}
+	}
+	if admin && c.tenantAdmin != "" {
 		g := c.group
 		who := ":user_id"
 		if emailKeyedColumn(g.UserField) {
 			who = ":user_email"
 		}
-		return fmt.Sprintf("on.request.role is `admin`, which only a global admin passes (the account's own role is admin, or it holds an admin grant for no tenant). A tenant member of this app can hold a role named admin (%s), and a tenant admin does NOT pass this gate. If the tenant's own admins should call this flow, write `auth: required` and check the caller's membership row in the first step: `SELECT id FROM %s WHERE %s = :org AND %s = %s AND %s = 'admin'` with `params: { org: \"${{ user.group_id || 0 }}\" }`, then `if: ${{ !steps.<id>.outputs.rows }}` with `run: respond` and `status: 403`; or give the tenant role a name of its own (org_admin) and gate the flow on that name. If only the app's global admin should call it (a worker flow the queue runs), leave it as it is. See api(at:\"flows.role_gate\").",
-			c.tenantAdmin, g.Table, g.Key, g.UserField, who, g.RoleField)
+		is, pass, match := "is", "this gate", "= 'admin'"
+		if len(names) > 1 {
+			tenantRoles := []string{"'admin'"}
+			for _, name := range names {
+				if !strings.EqualFold(name, "admin") && flowRoleNameRe.MatchString(name) {
+					tenantRoles = append(tenantRoles, "'"+name+"'")
+				}
+			}
+			is, pass, match = "names", "the gate by that role", "IN ("+strings.Join(tenantRoles, ", ")+")"
+		}
+		problems = append(problems, fmt.Sprintf("on.request.role %s `admin`, which only a global admin passes (the account's own role is admin, or it holds an admin grant for no tenant). A tenant member of this app can hold a role named admin (%s), and a tenant admin does NOT pass %s. If the tenant's own admins should call this flow, write `auth: required` and check the caller's membership row in the first step: `SELECT id FROM %s WHERE %s = :org AND %s = %s AND %s %s` with `params: { org: \"${{ user.group_id || 0 }}\" }`, then `if: ${{ !steps.<id>.outputs.rows }}` with `run: respond` and `status: 403`; or give the tenant role a name of its own (org_admin) and gate the flow on that name. If only the app's global admin should call it (a worker flow the queue runs), leave it as it is. See api(at:\"flows.role_gate\").",
+			is, c.tenantAdmin, pass, g.Table, g.Key, g.UserField, who, g.RoleField, match))
 	}
-	if !c.rolesDeclared || c.named[role] {
-		return ""
+	if len(unknown) > 0 {
+		note := ""
+		if c.group != nil && c.group.RoleField != "" {
+			note = fmt.Sprintf(" If it is an in-tenant role that exists only as data in %s.%s, ignore this warning.", c.group.Table, c.group.RoleField)
+		}
+		if len(names) == 1 {
+			problems = append(problems, fmt.Sprintf("on.request.role %s is not a role this app names: app.yaml declares roles: and it is not one of them, and no groups.bootstrap.founding_role, access role: or owner_or_role: mode or workflow transition names it (admin and user are built in). The gate is matched exactly, letter case included, so if it is a typo nobody holds it and the flow answers 403 to everyone but a global admin.%s See api(at:\"flows.role_gate\").",
+				unknown[0], note))
+		} else {
+			problems = append(problems, fmt.Sprintf("on.request.role lists %s, and the app names no such role anywhere else: not under app.yaml roles:, not as groups.bootstrap.founding_role, in an access role: or owner_or_role: mode or on a workflow transition (admin and user are built in). Each name is matched exactly, letter case included, so a misspelled name is held by nobody and admits nobody.%s See api(at:\"flows.role_gate\").",
+				strings.Join(unknown, ", "), note))
+		}
 	}
-	note := ""
-	if c.group != nil && c.group.RoleField != "" {
-		note = fmt.Sprintf(" If it is an in-tenant role that exists only as data in %s.%s, ignore this warning.", c.group.Table, c.group.RoleField)
-	}
-	return fmt.Sprintf("on.request.role %q is not a role this app names: app.yaml declares roles: and it is not one of them, and no groups.bootstrap.founding_role, access role: or owner_or_role: mode or workflow transition names it (admin and user are built in). The gate is matched exactly, letter case included, so if it is a typo nobody holds it and the flow answers 403 to everyone but a global admin.%s See api(at:\"flows.role_gate\").",
-		role, note)
+	return strings.Join(problems, " ")
 }
 
 // flowRoleGateWarnings reports flowRoleGateProblem for the flow file just
@@ -249,13 +264,13 @@ func flowRoleGateWarnings(dir, writtenPath string) []CheckFinding {
 			continue
 		}
 		var file FlowFileGHA
-		if decodeConfigYAML(data, &file) != nil || file.Jobs == nil || file.On.Request == nil || strings.TrimSpace(file.On.Request.Role) == "" {
+		if decodeConfigYAML(data, &file) != nil || file.Jobs == nil || file.On.Request == nil || strings.TrimSpace(string(file.On.Request.Role)) == "" {
 			continue
 		}
 		if c == nil {
 			c = flowRoleGateContextFor(dir)
 		}
-		if problem := problemOf(file.On.Request.Role, c); problem != "" {
+		if problem := problemOf(string(file.On.Request.Role), c); problem != "" {
 			name := filepath.ToSlash(rel)
 			findings = append(findings, CheckFinding{Severity: "warning", Source: "flows", File: name, Message: name + ": " + problem})
 		}

@@ -89,6 +89,10 @@ type AccessConfig struct {
 	// one no role grants any permission, so `perm:` modes fail closed
 	// instead of reading the unrestricted empty scope set as "granted".
 	rolesDeclared bool
+	// share is the record-sharing switch a table (or `default`) declares as
+	// `share: on|off`. It is a switch, not an access mode, so it is kept out
+	// of rules: everything that walks rules reads modes. Lowercased keys.
+	share map[string]bool
 }
 
 // ModeFor returns the effective access mode for (table, op), applying
@@ -725,7 +729,7 @@ func memberOfPredicate(app *App, table string, rule *memberOfRule, session *Sess
 	if !ok {
 		return "0", nil // misdeclared: no row is in scope
 	}
-	aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
+	aclSQL, aclArgs := recordGrantFilter(app, table, session, aclAction)
 	// Only live membership rows count (groups_membership.go). The membership
 	// table is aliased: when it is also the protected table (a roster scoped
 	// by its own membership), an unaliased inner name would shadow the outer
@@ -1132,6 +1136,7 @@ func parseAccessConfig(data []byte) (*AccessConfig, error) {
 		return nil, nil
 	}
 	rules := make(map[string]map[AccessOp]string)
+	share := make(map[string]bool)
 	for i := 0; i < len(raw.Access.Content); i += 2 {
 		keyNode := raw.Access.Content[i]
 		valNode := raw.Access.Content[i+1]
@@ -1153,6 +1158,20 @@ func parseAccessConfig(data []byte) (*AccessConfig, error) {
 			for j := 0; j < len(valNode.Content); j += 2 {
 				opKey := valNode.Content[j]
 				opVal := valNode.Content[j+1]
+				if opKey.Kind == yaml.ScalarNode && strings.ToLower(strings.TrimSpace(opKey.Value)) == accessShareKey {
+					// A value that is no spelling of on or off (a mapping
+					// and a list included) turns sharing off: off is the
+					// narrower reading, and the write gate refuses such a
+					// value. A key left empty is not set.
+					switch {
+					case opVal.Kind != yaml.ScalarNode:
+						share[table] = false
+					case opVal.Tag != "!!null" && strings.TrimSpace(opVal.Value) != "":
+						on, _ := accessShareSwitch(opVal.Value)
+						share[table] = on
+					}
+					continue
+				}
 				if opKey.Kind != yaml.ScalarNode || opVal.Kind != yaml.ScalarNode {
 					continue
 				}
@@ -1164,10 +1183,57 @@ func parseAccessConfig(data []byte) (*AccessConfig, error) {
 			}
 		}
 	}
-	if len(rules) == 0 {
+	if len(rules) == 0 && len(share) == 0 {
 		return nil, nil
 	}
-	return &AccessConfig{rules: rules, rolesDeclared: parseRolesConfig(data) != nil}, nil
+	return &AccessConfig{rules: rules, share: share, rolesDeclared: parseRolesConfig(data) != nil}, nil
+}
+
+// accessShareKey is the per-table key of the record-sharing switch under
+// access: (`access.<table>.share: off`).
+const accessShareKey = "share"
+
+// accessShareSwitch reads a `share:` value: on/off and the spellings every
+// app.yaml switch takes (true/false, yes/no, 1/0). ok is false for anything
+// else, and on is then false.
+func accessShareSwitch(value string) (on, ok bool) {
+	if strings.TrimSpace(value) == "" {
+		return false, false
+	}
+	canon, known := canonicalAuthFlag(value)
+	return known && canon == "true", known
+}
+
+// recordSharingEnabled reports whether record grants (permissions.go) are in
+// force on table: the table's own `access.<table>.share`, else
+// `access.default.share`, else `features.sharing`, else on. It is the one
+// reading of the switch: the share endpoint refuses new grants while it is
+// off (handleShare), and recordGrantFilter leaves existing grants out of the
+// canonical row scope, so turning the switch back on restores them.
+func recordSharingEnabled(app *App, table string) bool {
+	if app == nil {
+		return true
+	}
+	if a := app.Access; a != nil {
+		if on, declared := a.share[strings.ToLower(table)]; declared {
+			return on
+		}
+		if on, declared := a.share["default"]; declared {
+			return on
+		}
+	}
+	return app.FeatureEnabled("sharing")
+}
+
+// recordGrantFilter is the grant branch of rowScopeClause and
+// memberOfPredicate: aclFilter for the session's proven address, or `0` (no
+// row) while record sharing is off for the table. Every per-row surface gets
+// its grant predicate here, never from aclFilter directly.
+func recordGrantFilter(app *App, table string, session *Session, aclAction string) (string, []any) {
+	if !recordSharingEnabled(app, table) {
+		return "0", nil
+	}
+	return aclFilter(table, sessionGrantEmail(session), aclAction)
 }
 
 // EnforceCRUDAccess is the coarse gate every auto-CRUD handler calls
@@ -1362,8 +1428,16 @@ func (a *AccessConfig) ReadAllowsBroaderRows(mode string) bool {
 //     membership table the caller's own row stays in the owner tier.
 //     An action whose rule is DECLARED `self` is the exception: it keeps
 //     `(user_id = ? OR <acl>)` for a caller with no tenant.
+//   - On the groups membership table, a caller with no effective tenant
+//     READS the rows that name them as the member (ownMembershipReadSQL),
+//     whatever the row's user_id: `(<the above> OR <user field> = ?)`,
+//     under the rules where a live member reads the roster through the
+//     tenant (the default tail and member-of). View only.
 //   - table has neither + not bypass        → ("", nil, false): no columns to
 //     scope by (unscoped table - same as the historical inline behavior).
+//   - Every `<acl>` above is recordGrantFilter: with record sharing off for
+//     the table (features.sharing, access.<table>.share) it is `0`, so a
+//     stored grant reaches no row on any surface until sharing is on again.
 //
 // Every per-row read/write/delete path (CRUD, batch, versioning, includes,
 // workflow transitions, locks, signed-URL authorization) routes through this
@@ -1379,13 +1453,30 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 		// already ran). No owner/group identity → nothing to scope by here.
 		return "", nil, false
 	}
+	// ownRead adds the one read a caller with no tenant keeps on the groups
+	// membership table: the rows that name them as the member, live or not
+	// (ownMembershipReadSQL). It is a no-op for every other table, caller
+	// and action. Only the branches where a LIVE member reads the roster
+	// through the tenant call it (member-of and the default tail), so a
+	// switched-off member never reads more than a live one: under a declared
+	// `self` or `owner_or_role:` the owner tier decides for both.
+	ownRead := func(pred string, pargs []any) (string, []any, bool) {
+		own, member, ok := ownMembershipReadSQL(app, table, session, aclAction)
+		if !ok {
+			return pred, pargs, false
+		}
+		return "(" + pred + " OR " + own + ")", append(append([]any{}, pargs...), member), false
+	}
 	// member-of mode REPLACES owner/group scoping for the governed op:
 	// the whole point is that members see each other's rows. The tenant
 	// clause is still AND'd inside memberOfPredicate when the table is
 	// group-keyed, so membership never crosses tenants.
 	if rule := memberOfFor(app, table, opForACLAction(aclAction)); rule != nil {
 		pred, args := memberOfPredicate(app, table, rule, session, aclAction)
-		return pred, args, false
+		if _, fits := rule.joinTarget(app, table); !fits {
+			return pred, args, false // misdeclared: no row is in scope
+		}
+		return ownRead(pred, args)
 	}
 	// Tiered mode `owner_or_role:<roles>` - the ONE declaration that expresses
 	// "owner sees own, manager sees group, admin sees all" without a hand-rolled
@@ -1436,7 +1527,7 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 			// Role-holder sees their whole tenant.
 			return "(" + tenantPred + ")", tenantArgs, false
 		}
-		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
+		aclSQL, aclArgs := recordGrantFilter(app, table, session, aclAction)
 		var parts []string
 		var sargs []any
 		if hasColumn(app, table, "user_id") {
@@ -1479,7 +1570,7 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 	// a tenant that its requester tracks and withdraws). The bound above is
 	// for the modes where the tenant, not the builder's rule, decides.
 	if explicitSelfFor(app, table, opForACLAction(aclAction)) {
-		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
+		aclSQL, aclArgs := recordGrantFilter(app, table, session, aclAction)
 		return withTenant(fmt.Sprintf("(user_id = ? OR %s)", aclSQL), append([]any{session.UserID}, aclArgs...))
 	}
 	if tenant {
@@ -1495,15 +1586,15 @@ func rowScopeClause(app *App, table string, session *Session, aclAction string) 
 		return pred, pargs, false
 	}
 	if hasColumn(app, table, "user_id") {
-		aclSQL, aclArgs := aclFilter(table, sessionGrantEmail(session), aclAction)
-		return fmt.Sprintf("(%s OR %s)", ownerTier, aclSQL),
-			append(ownerArgs, aclArgs...), false
+		aclSQL, aclArgs := recordGrantFilter(app, table, session, aclAction)
+		return ownRead(fmt.Sprintf("(%s OR %s)", ownerTier, aclSQL), append(ownerArgs, aclArgs...))
 	}
 	if tableIsGrouped {
 		// A group-keyed table is still scoped when the caller has no group.
-		// Only an explicit ACL grant can authorize a row in that case.
-		pred, args := aclFilter(table, sessionGrantEmail(session), aclAction)
-		return pred, args, false
+		// Only an explicit ACL grant can authorize a row in that case, and
+		// on the membership table the rows that name the caller (read only).
+		pred, args := recordGrantFilter(app, table, session, aclAction)
+		return ownRead(pred, args)
 	}
 	return "", nil, false
 }
@@ -1536,6 +1627,27 @@ func ownMembershipRowSQL(app *App, table string, session *Session) (pred string,
 		return "", nil, false
 	}
 	return quoteIdent(g.UserField) + " = ?", member, true
+}
+
+// ownMembershipReadSQL is the read a caller with NO effective tenant keeps on
+// the groups membership table: the rows whose groups.user_field names them
+// (ownMembershipRowSQL), whichever tenant the row names, whether or not it is
+// active and whoever created it. A member whose only membership is switched
+// off through groups.active_field lists it this way (the row an "your access
+// was switched off" screen shows); a roster keyed by its own member column
+// has no user_id of theirs for the owner tier to match.
+//
+// ok is false for every action but "view", on every other table and for a
+// caller who has a tenant (a live member, an admin stepped into one): they
+// read the roster of that tenant and nothing is added. The read confers
+// nothing: tenant resolution and the membership role still count only live
+// rows (membershipLiveConds), so the caller stays without a tenant and
+// without a tenant role, and no other table's scope looks at this row.
+func ownMembershipReadSQL(app *App, table string, session *Session, aclAction string) (pred string, member any, ok bool) {
+	if aclAction != "view" || !memberOfTenantKeyed(app, table) || session.EffectiveHasGroup() {
+		return "", nil, false
+	}
+	return ownMembershipRowSQL(app, table, session)
 }
 
 // rowTenantClause is the tenant clause of rowScopeClause on its own: on a

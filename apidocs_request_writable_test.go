@@ -224,12 +224,6 @@ func TestSchemaDescriptorWritableMatchesCreateAndPatch(t *testing.T) {
 				key := table + "." + col.Name
 				onCreate, onPatch := createAccepts(c.token, table, col), patchAccepts(c.token, table, col)
 				writable[c.name+" "+key] = described[col.Name]
-				if col.Name == "deleted_at" {
-					// A create still stores a deleted_at it is sent (the row is
-					// born in the trash); the descriptor and the spec keep it
-					// out all the same: delete and restore own that column.
-					onCreate = false
-				}
 				anyCreate[key] = anyCreate[key] || onCreate
 				anyPatch[key] = anyPatch[key] || onPatch
 				if described[col.Name] != onCreate {

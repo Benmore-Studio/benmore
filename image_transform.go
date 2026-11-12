@@ -232,7 +232,7 @@ func RegisterImageTransformRoute(mux appRouteRegistrar, app *App) {
 			httpError(w, "source not found", http.StatusNotFound)
 			return
 		}
-		f, ok := openServableFile(uploadsRoot, filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
+		f, ok := openStoredUpload(uploadsRoot, filepath.Join(app.Dir, strings.TrimPrefix(src, "/")))
 		if !ok {
 			httpError(w, "source not found", http.StatusNotFound)
 			return

@@ -342,19 +342,7 @@ func appMCPFirstBootMarker(dir string) string {
 // migrations may run before the manifest is checked against the result.
 // An unreadable catalog is treated as not fresh (the strict path).
 func appMCPDatabaseIsFresh(db *sql.DB) bool {
-	var tables int
-	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_benmore\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").Scan(&tables); err != nil || tables > 0 {
-		return false
-	}
-	var ledger int
-	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_benmore_migrations'").Scan(&ledger); err != nil {
-		return false
-	}
-	if ledger == 0 {
-		return true
-	}
-	var applied int
-	return db.QueryRow("SELECT count(*) FROM _benmore_migrations").Scan(&applied) == nil && applied == 0
+	return migrationDatabaseIsNew(db)
 }
 
 // Include pending CREATE TABLE inventory in canonical application order.

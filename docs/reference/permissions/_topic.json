@@ -5,6 +5,7 @@
     "share_dialog",
     "grant_actions",
     "sharing_authority",
+    "sharing_switch",
     "recipient_resolution",
     "share_expiry",
     "list_shape",

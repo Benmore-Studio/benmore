@@ -1,11 +1,10 @@
-# flows/receive-stock.yaml - the form that does NOT work: the whole text is
-# read as one role name nobody holds, so only a global admin passes. The write
-# is accepted with a warning that says so.
+# flows/receive-stock.yaml - a role gate that names several roles: a caller
+# who holds any of them passes, and so does a global admin.
 on:
   request:
     method: POST
     path: /api/receive-stock
-    role: "warehouse,manager"
+    role: [warehouse, manager]
 jobs:
   receive:
     steps:

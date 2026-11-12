@@ -29,7 +29,7 @@ type Flow struct {
 	VerifyConfig *FlowVerify
 	Transaction  bool     // wrap all SQL steps in BEGIN/COMMIT
 	Auth         string   // "required" to require login
-	Role         string   // required role (e.g. "admin")
+	Role         string   // required role (e.g. "admin"), or several joined with ",": any of them (flowRoleAllowed)
 	Permissions  []string // reviewed scope requirements, also enforced for direct HTTP
 	// Async, when true, makes an HTTP-triggered flow enqueue itself onto
 	// the background job worker instead of running inline. The HTTP
@@ -157,11 +157,11 @@ type FlowStep struct {
 	// Proxy streams an outside service's answer to the caller as the
 	// terminal response (`run: proxy`, flows_proxy.go).
 	Proxy *FlowProxy
-	// DeleteUpload is an interpolated stored private-upload reference for the
-	// server-only run: delete_upload step.
+	// DeleteUpload is an interpolated stored upload reference (private, or
+	// public with `record:`) for the server-only run: delete_upload step.
 	DeleteUpload string
 	// UploadRecord is the `with.record` of a serve_file or delete_upload
-	// step: the row that owns the private file (flows_upload_owner.go).
+	// step: the row that owns the file (flows_upload_owner.go).
 	UploadRecord *FlowUploadRecord
 	// InspectPrivateUpload reads a bounded app-owned PDF or PNG in the
 	// isolated parser and returns a server-derived hash and dimensions.
@@ -215,7 +215,8 @@ type FlowServeFile struct {
 }
 
 // FlowUploadRecord names the row that owns the private upload a
-// `run: serve_file` or `run: delete_upload` step reads or deletes:
+// `run: serve_file` or `run: delete_upload` step reads or deletes, or the
+// public upload a delete_upload step deletes:
 //
 //   - run: serve_file
 //     with:
@@ -699,6 +700,10 @@ type FlowContext struct {
 	command *appMCPCommandExecution
 	// flatCache memoizes flatDataForCtx until Data or env changes.
 	flatCache flowFlatCache
+	// response is set while a respond step renders for the caller: text it
+	// renders reads lists and objects without the app's declared blind-index
+	// columns (flows_respond_blind_index.go). Guarded by flatCache.mu.
+	response flowResponseView
 	// lazyShadow holds request fields named like a set key, loop variable
 	// or unnamed parse output that are still readable by their bare name
 	// (flows.go, shadowStepNamedRequestKeys). Shared with on_error contexts.

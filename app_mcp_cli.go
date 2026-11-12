@@ -37,8 +37,10 @@ type appMCPInspection struct {
 	Inventory        []appMCPInventoryEntry `json:"inventory"`
 	ReviewedTools    []map[string]any       `json:"reviewed_tools,omitempty"`
 	Unmeasured       []string               `json:"unmeasured"`
-	// Warnings name requirements the source meets but this environment does
-	// not (they do not fail the check: a hosted restart can supply them).
+	// Warnings do not fail the check. They name requirements the source meets
+	// but this environment does not (a hosted restart can supply them), and
+	// commands whose SQL has no predicate tied to the caller
+	// (app_mcp_command_caller_predicate.go).
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -279,6 +281,9 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 		return nil, err
 	}
 	tables := eligibleCRUDTables(definitions)
+	// Advice, never a refusal: review, check and inspect list a command whose
+	// SQL matches rows with no caller binding under `warnings`.
+	callerWarnings := appMCPCommandCallerPredicateWarnings(config.flows, config.hooks, config.workflows)
 	pages := config.pages
 	if pages == nil {
 		pages, _, err = LoadPages(dir)
@@ -286,7 +291,7 @@ func inspectAppMCPSourceStaged(dir string, config *runtimeConfig) (report *appMC
 			return nil, fmt.Errorf("cannot inspect app pages")
 		}
 	}
-	report = &appMCPInspection{ValidationScope: "checked source configuration and reviewed native bindings", Version: 1, SourceValid: true, ConnectorEnabled: config.mcp != nil, Inventory: []appMCPInventoryEntry{}, Unmeasured: []string{"physical_database_and_pending_migrations", "environment_dependent_routes", "current_grant_role_tenant_authority", "host_client_acceptance"}}
+	report = &appMCPInspection{ValidationScope: "checked source configuration and reviewed native bindings", Version: 1, SourceValid: true, ConnectorEnabled: config.mcp != nil, Inventory: []appMCPInventoryEntry{}, Unmeasured: []string{"physical_database_and_pending_migrations", "environment_dependent_routes", "current_grant_role_tenant_authority", "host_client_acceptance"}, Warnings: callerWarnings}
 	if config.mcp != nil {
 		report.ContractDigest = config.mcp.ContractDigest
 		report.ExecutionDigest = config.mcp.ExecutionDigest

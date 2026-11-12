@@ -12,7 +12,7 @@ import (
 // sharing panel uses. Existing tenant fixtures provide only synthetic identities.
 func sharedDocumentFixture(t *testing.T, permission, expiry string) (*App, *http.ServeMux, string, string, string) {
 	t.Helper()
-	app, _ := newTenantRoleFixture(t, "access:\n  documents:\n    read: self\n    write: self\n    update: self\n    delete: self\n")
+	app := newTenantRoleApp(t, "access:\n  documents:\n    read: self\n    write: self\n    update: self\n    delete: self\n")
 	mustExec(t, app.DB, `CREATE TABLE documents(id INTEGER PRIMARY KEY AUTOINCREMENT,company_id INTEGER,user_id INTEGER,title TEXT,deleted_at TEXT)`)
 	refreshTableColumns(t, app, "documents")
 	mux := buildAppMux(app, true, "http://localhost")
