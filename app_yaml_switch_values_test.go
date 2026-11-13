@@ -169,7 +169,6 @@ func TestFeatureSwitchWrittenAsAMappingReadsEnabled(t *testing.T) {
 // write gate (apps may carry one) and warned about by the post-write check
 // of app.yaml and by `benmore check`, with what it leaves the app with.
 func TestAppYAMLSwitchValuesNotReadAsWrittenWarn(t *testing.T) {
-	const provider = "oauth:\n  custom:\n    auth_url: https://identity.example.com/authorize\n    token_url: https://identity.example.com/token\n    userinfo_url: https://identity.example.com/userinfo\n"
 	for _, c := range []struct {
 		name, yaml string
 		want       []string
@@ -186,14 +185,6 @@ func TestAppYAMLSwitchValuesNotReadAsWrittenWarn(t *testing.T) {
 				"app.yaml: `features.uploads` takes true or false (yes/no and on/off mean the same), and of the mapping written here only `enabled:` is read, so the switch is off and its other keys have no effect. Write `uploads: true` or `uploads: false`.",
 				"app.yaml: `features.ws_anonymous` takes true or false (yes/no and on/off mean the same), and of the mapping written here only `enabled:` is read, so the switch is off and its other keys have no effect. Write `ws_anonymous: true` or `ws_anonymous: false`.",
 			}},
-		{"an identifier in another case", "site_name: \"Unread\"\nauth:\n  identifier: Username\n",
-			[]string{"app.yaml: `auth.identifier` takes email, username or phone, and `Username` is none of them, so accounts sign in by email. Did you mean `username`?"}},
-		{"an identifier that is none", "site_name: \"Unread\"\nauth:\n  identifier: mobile\n",
-			[]string{"app.yaml: `auth.identifier` takes email, username or phone, and `mobile` is none of them, so accounts sign in by email."}},
-		{"trust_email written yes", unreadBaseYAML + provider + "    trust_email: yes\n",
-			[]string{"app.yaml: `oauth.custom.trust_email` takes true or false, and `yes` is read as false, so the provider's addresses are not trusted. Write `true` when the provider verifies every address it returns."}},
-		{"trust_email written 1", unreadBaseYAML + provider + "    trust_email: 1\n",
-			[]string{"app.yaml: `oauth.custom.trust_email` takes true or false, and `1` is read as false, so the provider's addresses are not trusted. Write `true` when the provider verifies every address it returns."}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			afterWrite, check := unreadWarningsOf(t, c.yaml)
@@ -210,12 +201,8 @@ func TestAppYAMLSwitchValuesNotReadAsWrittenWarn(t *testing.T) {
 // What each warning says is what the loaders do: the value named in a
 // warning leaves the app in the state the warning states.
 func TestAppYAMLSwitchWarningsStateWhatTheLoaderDoes(t *testing.T) {
-	app := loadSwitchApp(t, "site_name: x\nauth:\n  identifier: Username\nrecording:\n  enabled: disabled\n  mask_inputs: [password]\n"+
-		"features:\n  uploads: {enabled: no, max_mb: 5}\n  testing: {banner: amber}\n  ws_anonymous: {rooms: lobby}\n"+
-		"oauth:\n  custom:\n    auth_url: https://identity.example.com/authorize\n    token_url: https://identity.example.com/token\n    userinfo_url: https://identity.example.com/userinfo\n    trust_email: yes\n", true)
-	if got := authIdentifier(app); got != "email" {
-		t.Errorf("auth.identifier: Username signs in by %s; the warning says email", got)
-	}
+	app := loadSwitchApp(t, "site_name: x\nrecording:\n  enabled: disabled\n  mask_inputs: [password]\n"+
+		"features:\n  uploads: {enabled: no, max_mb: 5}\n  testing: {banner: amber}\n  ws_anonymous: {rooms: lobby}\n", true)
 	if script, _ := recorderServed(app); !strings.Contains(script, "var maskInputs = true;") {
 		t.Error("recording.enabled: disabled with mask_inputs: [password]: the warnings say the recorder stays on with typed values masked")
 	}
@@ -223,9 +210,6 @@ func TestAppYAMLSwitchWarningsStateWhatTheLoaderDoes(t *testing.T) {
 	if features.IsEnabled("uploads") || !features.IsEnabled("testing") || broadcastAllowAnon(app) {
 		t.Errorf("the warnings say uploads off, testing on, ws_anonymous off; got uploads %v, testing %v, ws_anonymous %v",
 			features.IsEnabled("uploads"), features.IsEnabled("testing"), broadcastAllowAnon(app))
-	}
-	if provider, loaded := oauthProvidersForApp(app.Dir)["custom"]; !loaded || provider.TrustEmail {
-		t.Errorf("oauth.custom.trust_email: yes: the warning says the addresses are not trusted; provider %+v", provider)
 	}
 }
 
@@ -241,8 +225,9 @@ func TestAppYAMLSwitchValuesReadAsWrittenAreNotReported(t *testing.T) {
 	}
 	for _, clean := range []string{
 		"auth:\n  identifier: email\n", "auth:\n  identifier: username\n", "auth:\n  identifier: phone\n", "auth:\n  identifier: \"\"\n", "auth:\n  identifier:\n", "auth:\n  otp: true\n",
+		"auth:\n  identifier: Username\n", "auth:\n  identifier: \" PHONE \"\n",
 		"features:\n  admin: false\n  uploads: no\n  docs: auth\n  testing: \"on\"\n  ws_anonymous: yes\n",
-		"oauth:\n  custom:\n    trust_email: true\n  other:\n    trust_email: \"True\"\n  third:\n    trust_email: no\n  fourth:\n    trust_email: \"false\"\n  fifth:\n    trust_email:\n  sixth: {}\n",
+		"oauth:\n  custom:\n    trust_email: true\n  other:\n    trust_email: \"True\"\n  third:\n    trust_email: no\n  fourth:\n    trust_email: \"false\"\n  fifth:\n    trust_email:\n  sixth: {}\n  seventh:\n    trust_email: yes\n  eighth:\n    trust_email: 1\n  ninth:\n    trust_email: \"On\"\n",
 	} {
 		if got := appYAMLUnreadWarnings(clean); len(got) != 0 {
 			t.Errorf("%q is reported: %q", clean, got)
@@ -252,18 +237,177 @@ func TestAppYAMLSwitchValuesReadAsWrittenAreNotReported(t *testing.T) {
 
 // Each warning carries the address of the key that documents the switch.
 func TestAppYAMLSwitchWarningsCarryTheirDocs(t *testing.T) {
-	dir := noEffectDir(t, "site_name: \"Unread\"\nauth:\n  identifier: Username\nrecording:\n  enabled: disabled\nfeatures:\n  uploads: {enabled: no}\noauth:\n  custom:\n    trust_email: yes\n")
+	dir := noEffectDir(t, "site_name: \"Unread\"\nrecording:\n  enabled: disabled\nfeatures:\n  uploads: {enabled: no}\n")
 	got := map[string]string{}
 	for _, f := range RunSourceCheck(dir, "app.yaml").Findings {
 		if f.Source == "config" {
 			got[strings.SplitN(strings.TrimPrefix(f.Message, "app.yaml: "), " ", 2)[0]] = f.Docs
 		}
 	}
-	want := map[string]string{"`auth.identifier`": "auth.app_yaml_flags", "`recording.enabled`": "frontend.ssr_session_recording",
-		"`features.uploads`": "recovery.configuration_loading", "`oauth.custom.trust_email`": "oauth.configuration_notes"}
+	want := map[string]string{"`recording.enabled`": "frontend.ssr_session_recording", "`features.uploads`": "recovery.configuration_loading"}
 	for subject, at := range want {
 		if got[subject] != at {
 			t.Errorf("%s: docs %q, want %q (all: %v)", subject, got[subject], at, got)
 		}
+	}
+}
+
+// `auth.identifier` is read whatever its letter case and surrounding space.
+// `identifier: Username` used to mean email sign-in, because the value was
+// compared to the lower-case words; the write gate accepts every spelling it
+// reads, and nothing warns about one.
+func TestAuthIdentifierReadsEveryLetterCase(t *testing.T) {
+	for written, want := range map[string]string{
+		"email": "email", "Email": "email", "EMAIL": "email", `" email"`: "email",
+		"username": "username", "Username": "username", "USERNAME": "username", `" username "`: "username", `"UserName"`: "username",
+		"phone": "phone", "Phone": "phone", "PHONE": "phone", `"Phone "`: "phone",
+		`""`: "email", `"  "`: "email",
+	} {
+		yaml := "site_name: x\nauth:\n  identifier: " + written + "\n"
+		app := loadSwitchApp(t, yaml, false)
+		if got := authIdentifier(app); got != want {
+			t.Errorf("auth.identifier: %s signs in by %s, want %s", written, got, want)
+		}
+		// Code that reads the loaded value itself sees the same word.
+		if got := app.Design.Auth["identifier"]; strings.TrimSpace(got) != "" && got != want {
+			t.Errorf("auth.identifier: %s is loaded as %q, want %q", written, got, want)
+		}
+		if msg := ValidateOnWrite("app.yaml", yaml); msg != "" {
+			t.Errorf("auth.identifier: %s is refused at write time: %s", written, msg)
+		}
+		if got := appYAMLUnreadWarnings(yaml); len(got) != 0 {
+			t.Errorf("auth.identifier: %s is warned about: %q", written, got)
+		}
+	}
+	if got := authIdentifier(loadSwitchApp(t, "site_name: x\n", false)); got != "email" {
+		t.Errorf("the default changed: no auth section signs in by %s", got)
+	}
+}
+
+// An app that writes `identifier: Username` signs its accounts in by
+// username: the name is accepted and the address is not a sign-in name.
+func TestSignInByUsernameWhenIdentifierIsCapitalised(t *testing.T) {
+	app, _, call := tokenAuthFixture(t, "ada@example.com", fixturePassword, "198.51.100.71")
+	writeTestFile(t, app.Dir, "app.yaml", "site_name: x\nauth:\n  identifier: Username\n")
+	app.Design = LoadAppConfigYAML(app.Dir)
+	if app.Design == nil {
+		t.Fatal("app.yaml did not load")
+	}
+	if w := call(map[string]string{"email": "ada", "password": fixturePassword}); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"token"`) {
+		t.Fatalf("sign-in by username: %d %s", w.Code, w.Body.String())
+	}
+	if w := call(map[string]string{"email": "ada@example.com", "password": fixturePassword}); w.Code != http.StatusUnauthorized {
+		t.Fatalf("sign-in by address on a username app: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// appYAMLRefusal is what the write gate and `benmore check` answer for an
+// app.yaml: the gate's message, and the error finding with its docs address.
+func appYAMLRefusal(t *testing.T, appYAML string) (gate string, finding CheckFinding) {
+	t.Helper()
+	dir := noEffectDir(t, appYAML)
+	for _, f := range RunSourceCheck(dir, "").Findings {
+		if f.Severity == "error" && f.File == "app.yaml" {
+			finding = f
+			break
+		}
+	}
+	return ValidateOnWriteIn(dir, "app.yaml", appYAML), finding
+}
+
+// A value that is no identifier cannot mean what is written: the write gate
+// and `benmore check` refuse it and name the three it takes, and an app that
+// carries one keeps signing in by email. (A list or a mapping there is no
+// scalar: the load of app.yaml refuses the file.)
+func TestUnknownAuthIdentifierIsRefusedAtWriteTime(t *testing.T) {
+	for written, hint := range map[string]string{
+		"mobile": "", "usernme": " Did you mean `username`?", "user_name": " Did you mean `username`?",
+		"7": "", "true": "", `"phone number"`: " Did you mean `phone`?",
+	} {
+		yaml := "site_name: \"Unread\"\nauth:\n  identifier: " + written + "\n"
+		gate, finding := appYAMLRefusal(t, yaml)
+		for _, want := range []string{"app.yaml: auth.identifier", "is not a sign-in identifier", "email (the default), username or phone", "accounts sign in by email"} {
+			if !strings.Contains(gate, want) {
+				t.Errorf("auth.identifier: %s: the write gate says %q, without %q", written, gate, want)
+			}
+		}
+		if strings.Contains(gate, "Did you mean") != (hint != "") || !strings.Contains(gate, hint) {
+			t.Errorf("auth.identifier: %s: the write gate says %q, want the hint %q", written, gate, hint)
+		}
+		if !strings.Contains(finding.Message, "is not a sign-in identifier") || finding.Docs != "auth.app_yaml_flags" {
+			t.Errorf("auth.identifier: %s: benmore check reports %+v", written, finding)
+		}
+		if got := authIdentifier(loadSwitchApp(t, yaml, false)); got != "email" {
+			t.Errorf("auth.identifier: %s signs in by %s; the refusal says email", written, got)
+		}
+	}
+}
+
+const trustEmailProvider = "site_name: \"Unread\"\noauth:\n  custom:\n    auth_url: https://identity.example.com/authorize\n    token_url: https://identity.example.com/token\n    userinfo_url: https://identity.example.com/userinfo\n"
+
+// trustedWithoutClaim reports whether a sign-in through the app's custom
+// provider counts an address as proven when the provider sends no
+// email_verified claim: what `trust_email` decides.
+func trustedWithoutClaim(t *testing.T, appYAML string) bool {
+	t.Helper()
+	dir := t.TempDir()
+	writeTestFile(t, dir, "app.yaml", appYAML)
+	provider, loaded := oauthProvidersForApp(dir)["custom"]
+	if !loaded {
+		t.Fatalf("the custom provider did not load:\n%s", appYAML)
+	}
+	return oauthEmailVerified(&provider, "custom", map[string]any{"email": "someone@example.com"})
+}
+
+// `oauth.<name>.trust_email` is read like every other switch: each spelling
+// of yes gives the trust, each spelling of no (and leaving it out) withholds
+// it. `trust_email: yes` used to be read as false.
+func TestTrustEmailReadsEverySpelling(t *testing.T) {
+	for _, v := range switchOnSpellings {
+		yaml := trustEmailProvider + "    trust_email: " + v + "\n"
+		if !trustedWithoutClaim(t, yaml) {
+			t.Errorf("trust_email: %s: the provider's addresses are not trusted", v)
+		}
+		if msg := ValidateOnWrite("app.yaml", yaml); msg != "" {
+			t.Errorf("trust_email: %s is refused at write time: %s", v, msg)
+		}
+	}
+	for _, v := range append(slices.Clone(switchOffSpellings), `""`, "", "~", "null") {
+		yaml := trustEmailProvider + "    trust_email: " + v + "\n"
+		if trustedWithoutClaim(t, yaml) {
+			t.Errorf("trust_email: %s: the provider's addresses are trusted", v)
+		}
+		if msg := ValidateOnWrite("app.yaml", yaml); msg != "" {
+			t.Errorf("trust_email: %s is refused at write time: %s", v, msg)
+		}
+	}
+	if trustedWithoutClaim(t, trustEmailProvider) {
+		t.Error("the default changed: a provider without trust_email is trusted")
+	}
+}
+
+// A value that is no spelling of true or false gives no trust, and the write
+// gate and `benmore check` refuse it: trust is never read out of a value
+// that does not say so.
+func TestUnknownTrustEmailFailsClosedAndIsRefusedAtWriteTime(t *testing.T) {
+	for _, v := range []string{"sometimes", "verified", "truthy", "[true]", "{enabled: true}", "2", "1.0", "-1", `"true dat"`} {
+		yaml := trustEmailProvider + "    trust_email: " + v + "\n"
+		if trustedWithoutClaim(t, yaml) {
+			t.Errorf("trust_email: %s: the provider's addresses are trusted", v)
+		}
+		gate, finding := appYAMLRefusal(t, yaml)
+		for _, want := range []string{"app.yaml: oauth.custom.trust_email", "is not a boolean", "yes/no, on/off and 1/0", "addresses are not trusted"} {
+			if !strings.Contains(gate, want) {
+				t.Errorf("trust_email: %s: the write gate says %q, without %q", v, gate, want)
+			}
+		}
+		if !strings.Contains(finding.Message, "oauth.custom.trust_email") || finding.Docs != "oauth.configuration_notes" {
+			t.Errorf("trust_email: %s: benmore check reports %+v", v, finding)
+		}
+	}
+	// One unreadable value among several providers is named by its own provider.
+	two := trustEmailProvider + "    trust_email: yes\n  other:\n    auth_url: https://other.example.com/authorize\n    trust_email: maybe\n"
+	if gate, _ := appYAMLRefusal(t, two); !strings.Contains(gate, "app.yaml: oauth.other.trust_email") {
+		t.Errorf("the write gate says %q, want it to name oauth.other.trust_email", gate)
 	}
 }

@@ -65,6 +65,16 @@
     "when": "a rate limit refused the request: a flow's `rate_limit` (this body, naming its window), the app-wide per-user/IP limiter, the ingest limit. Branch on the status, not the text, and wait for the Retry-After header when the answer has one"
   },
   {
+    "status": 503,
+    "body": {
+      "error": "database_busy",
+      "message": "the database is busy, retry shortly",
+      "request_id": "3f9c2a1b7d4e5f60",
+      "docs": "recovery.write_lock"
+    },
+    "when": "the request could not get the database's write lock within the busy timeout (see api({at:'recovery'}) write_lock). Every built-in /api/ route answers it (auto-CRUD create, update, singleton upsert, delete, restore, batch and ingest, /api/_transaction, /api/_groups/create, workflow transitions, record locks, share and revoke, role grants, ...), and so does a flow whose SQL step, transaction begin or commit, or async enqueue met it. The answer has a `Retry-After: 1` header and an `X-Request-Id` header, and nothing the request tried to write was kept (a flow's earlier outbound calls and sends are not undone): send the same request again after Retry-After seconds. It is load, not a server error: branch on the status or on `error`. A flow without `transaction: true` that had already written before the busy statement answers 500 flow_no_response with `reason: the database was busy` instead, because its earlier writes are committed and sending it again would repeat them"
+  },
+  {
     "status": 507,
     "body": {
       "error": "storage cap reached",

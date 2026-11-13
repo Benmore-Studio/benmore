@@ -168,15 +168,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	var id int64
 	var hash string
 	var email string
-	var deactivatedAt string
+	var deactivated bool
 	// Look up user by configured identifier, also fetch email for session
 	// creation. Email matches case-insensitively so legacy rows stored with
 	// uppercase (pre-normalization) keep working.
-	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(deactivated_at, '') FROM _benmore_users WHERE %s = ?", identifier)
+	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), "+accountDeactivatedSQL("")+" FROM _benmore_users WHERE %s = ?", identifier)
 	if identifier == "email" {
 		query += " COLLATE NOCASE"
 	}
-	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email, &deactivatedAt)
+	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email, &deactivated)
 	if err != nil {
 		burnPasswordCheck(password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, loginValue, false)
@@ -194,7 +194,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	// attempt. It used to stop before the password check with "Credentials
 	// changed", which told anyone without the password that the address
 	// belongs to a deactivated account.
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil || deactivatedAt != "" {
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil || deactivated {
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
@@ -1025,12 +1025,13 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	identifier := authIdentifier(app)
 	var userID int64
 	var pending int
-	var hash, email, deactivatedAt string
-	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(password_change_required,0), COALESCE(deactivated_at, '') FROM _benmore_users WHERE %s = ?", identifier)
+	var hash, email string
+	var deactivated bool
+	query := fmt.Sprintf("SELECT id, password_hash, COALESCE(email, ''), COALESCE(password_change_required,0), "+accountDeactivatedSQL("")+" FROM _benmore_users WHERE %s = ?", identifier)
 	if identifier == "email" {
 		query += " COLLATE NOCASE"
 	}
-	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending, &deactivatedAt)
+	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending, &deactivated)
 	if err != nil {
 		burnPasswordCheck(body.Password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, body.Email, false)
@@ -1051,7 +1052,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// A deactivated account is refused exactly like a wrong password, as
 	// /login does. It used to get a token (and a session row, a last_login_at
 	// bump and user hooks) that every later request refused.
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil || deactivatedAt != "" {
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil || deactivated {
 		recordLoginAttempt(app.DB, body.Email, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
 		httpError(w, "invalid credentials", http.StatusUnauthorized)

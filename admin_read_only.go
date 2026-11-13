@@ -37,6 +37,9 @@ import (
 // under the guards of crud_write_gates.go, user_identifier_update.go and
 // last_admin_guard.go.
 //
+// A table the engine owns carries no prefix either: a virtual table and its
+// shadow tables (adminEngineOwnedTable).
+//
 // One framework table carries no prefix: <table>_history, the stored versions
 // of a table app.yaml versions. Its writers are the table's history triggers
 // and the retention sweep. A row written by hand there is a version that
@@ -51,6 +54,7 @@ const (
 	adminReadOnlyGrants     = "grants"
 	adminReadOnlyFramework  = "framework"
 	adminReadOnlyHistory    = "history"
+	adminReadOnlyIndex      = "index"
 )
 
 // frameworkTablePrefix starts the name of every table the framework owns.
@@ -99,8 +103,8 @@ func adminReadOnlyKind(table string) string {
 const versionHistorySuffix = "_history"
 
 // adminPanelReadOnlyKind reports why the admin panel does not write table:
-// the name rule (adminReadOnlyKind), then version history. "" for a table it
-// writes.
+// the name rule (adminReadOnlyKind), then version history, then the engine's
+// own tables (adminEngineOwnedTable). "" for a table it writes.
 func adminPanelReadOnlyKind(app *App, table string) string {
 	if kind := adminReadOnlyKind(table); kind != "" {
 		return kind
@@ -108,7 +112,32 @@ func adminPanelReadOnlyKind(app *App, table string) string {
 	if adminVersionHistoryTable(app, table) {
 		return adminReadOnlyHistory
 	}
+	if adminEngineOwnedTable(app, table) {
+		return adminReadOnlyIndex
+	}
 	return ""
+}
+
+// adminEngineOwnedTable reports whether table is a virtual table or a shadow
+// table of one: a full-text index (<table>_fts) and the tables SQLite keeps
+// its records in (_data, _idx, _docsize, _config, _content). Their writer is
+// the engine, as the indexed table's rows change. Two of an FTS5 index's
+// shadow tables have an id column, so the panel's generic create, update and
+// delete went through on them: the index's own records were replaced, and
+// every later insert into the indexed table failed.
+//
+// The engine says which tables these are (PRAGMA table_list: type virtual or
+// shadow), never the name: an app may own a table named notes_fts_data. A
+// table list that cannot be read leaves the table read-only.
+func adminEngineOwnedTable(app *App, table string) bool {
+	if app == nil || app.DB == nil {
+		return true
+	}
+	// The type is compared in the statement: no row means the engine does
+	// not own the table (or there is none of that name).
+	var owned int
+	err := app.DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_list WHERE schema = 'main' AND name = ? COLLATE NOCASE AND type IN ('virtual', 'shadow')`, table).Scan(&owned)
+	return err != nil || owned > 0
 }
 
 // adminVersionHistoryTable reports whether table holds stored versions. The
@@ -157,17 +186,79 @@ func adminReadOnlyMessage(table, kind string) string {
 	if kind == adminReadOnlyHistory {
 		return table + " is a version history table: the admin panel shows it and never writes it. Its rows are the earlier states of a versioned table's rows, recorded as they are replaced; none can be added, edited or deleted here. Read them with GET /api/<table>/<id>/versions and restore one with POST /api/<table>/<id>/revert/<version>."
 	}
+	if kind == adminReadOnlyIndex {
+		return table + " is a search index table: the admin panel shows it and never writes it. SQLite keeps its rows as the rows of the indexed table change; none can be added, edited or deleted here."
+	}
 	if kind == adminReadOnlyGrants {
 		return table + " holds role grants: the admin panel shows it and never writes it. Grant, extend and revoke roles with POST, PATCH and DELETE /api/_auth/users/<id>/roles/<role>, and change the primary role on the user's page."
 	}
 	return table + " holds sign-in credentials: the admin panel shows it and never writes it. Sessions, tokens, passkeys and reset grants are created and revoked through the sign-in and account endpoints."
 }
 
+// The framework tables the panel reads outside their own pages: the
+// dashboard's tiles and lists, the page header, the search index and the
+// Feedback page. Each of those reads is skipped while admin.yaml hides its
+// table (AdminConfig.IsTableHidden), like the table's own pages.
+const (
+	adminUsersTable    = "_benmore_users"
+	adminSessionsTable = "_benmore_sessions"
+	adminUsageTable    = "_benmore_usage"
+	adminAuditTable    = "_benmore_audit_log"
+	adminFeedbackTable = "_benmore_feedback"
+)
+
+// adminTableHidden reports whether the panel leaves table out: admin.yaml
+// hides it (IsTableHidden, names compared as SQLite compares them), or it
+// holds the stored versions of a table admin.yaml hides (<table>_history,
+// which shows that table's earlier rows). Every panel page and write route
+// that takes its table from the URL asks this.
+func adminTableHidden(app *App, table string) bool {
+	hidden := app.adminConfig()
+	if hidden.IsTableHidden(table) {
+		return true
+	}
+	folded := sqliteIdentifierFold(table)
+	if !strings.HasSuffix(folded, versionHistorySuffix) || !hidden.IsTableHidden(strings.TrimSuffix(folded, versionHistorySuffix)) {
+		return false
+	}
+	return adminVersionHistoryTable(app, table)
+}
+
+// adminHiddenRowsClause is the condition that leaves the rows about a hidden
+// table out of a framework table's panel pages, with its arguments, or ""
+// when there is nothing to leave out. The framework's own tables keep rows
+// about an app table and name it in a `table_name` column: the audit log (the
+// old and new values of every change), the read audit, locks, custom fields,
+// imports. The condition applies to a table whose name carries the framework
+// prefix and which has that column; an app table's own column of that name
+// is the app's data.
+func adminHiddenRowsClause(app *App, table string, cols []Column) (string, []any) {
+	if !strings.HasPrefix(sqliteIdentifierFold(table), frameworkTablePrefix) {
+		return "", nil
+	}
+	names := app.adminConfig().HiddenTables()
+	if len(names) == 0 {
+		return "", nil
+	}
+	for _, col := range cols {
+		if identIs(col.Name, "table_name") {
+			// NOCASE folds the letters SQLite folds in a table name.
+			args := make([]any, len(names))
+			for i, name := range names {
+				args[i] = name
+			}
+			column := quoteColumn(table, col.Name)
+			return "(" + column + " IS NULL OR " + column + " COLLATE NOCASE NOT IN (?" + strings.Repeat(", ?", len(names)-1) + "))", args
+		}
+	}
+	return "", nil
+}
+
 // adminRefuseTableWrite answers a panel write the panel does not make and
 // reports whether it did: a table admin.yaml hides gets the not-found
 // answer its pages get, and a read-only table the 403 that names its writer.
 func adminRefuseTableWrite(w http.ResponseWriter, r *http.Request, app *App, table string) bool {
-	if app.adminConfig().IsTableHidden(table) {
+	if adminTableHidden(app, table) {
 		notFoundHandler(app)(w, r)
 		return true
 	}

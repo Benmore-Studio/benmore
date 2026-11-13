@@ -23,6 +23,7 @@ func TestEmailChangeRequestThrottledPerRecipient(t *testing.T) {
 	app, cleanup := newTestApp(t)
 	defer cleanup()
 	EnsureUsersTable(app.DB)
+	mustExec(t, app.DB, `INSERT INTO _benmore_users (id, username, email, verified) VALUES (1, 'one', 'one@example.com', 1), (2, 'two', 'two@example.com', 1)`)
 	app.Design = &DesignConfig{Auth: map[string]string{}, SEO: map[string]string{"url": "https://app.real"}}
 	r := httptest.NewRequest(http.MethodPatch, "/api/_auth/profile", nil)
 

@@ -284,7 +284,17 @@ func reloadAppConfigStaged(app *App, config *runtimeConfig, nextEnv map[string]s
 	if err := ApplyDeferredDDL(app.DB, deferredDDL); err != nil {
 		return err
 	}
-	if err := EnsureNotificationsTableChecked(app.DB); err != nil {
+	// As a start: the framework tables a migration file may name are there
+	// before the first one, for the configuration this reload brings (a
+	// reload that adds sign-in creates its tables here, not when its routes
+	// are registered).
+	migrationPages := config.pages
+	if migrationPages == nil {
+		app.mu.RLock()
+		migrationPages = app.Pages
+		app.mu.RUnlock()
+	}
+	if err := ensureFrameworkTablesBeforeMigrations(app.DB, config.design, migrationPages, signInConfigured(config.design, migrationPages)); err != nil {
 		return fmt.Errorf("notifications: %w", err)
 	}
 	// Apply user migrations/*.sql shipped by this deploy. This runs in the

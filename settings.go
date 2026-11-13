@@ -314,7 +314,7 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		// random lookup.
 		var deactivatedAt sql.NullString
 		err = app.DB.QueryRow("SELECT deactivated_at FROM _benmore_users WHERE id = ?", id).Scan(&deactivatedAt)
-		if err != nil || (deactivatedAt.Valid && deactivatedAt.String != "") {
+		if err != nil || accountDeactivated(deactivatedAt) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "user not found"})
 			return
 		}
@@ -805,7 +805,7 @@ func userDirectoryMode(app *App) string {
 //	"role:a,b"  - a caller holding a listed role GLOBALLY (or an admin) sees
 //	              everyone; anyone else sees only themselves
 func buildUserListQuery(app *App, session *Session, mode string, limit, offset int) (string, []any, bool) {
-	deactivatedClause := "(deactivated_at IS NULL OR deactivated_at = '')"
+	deactivatedClause := accountActiveSQL("")
 	isAdmin := session != nil && session.IsAdmin()
 
 	// role:<roles> is `admin` with a wider set of roles. The mode was accepted
@@ -849,7 +849,7 @@ func buildUserListQuery(app *App, session *Session, mode string, limit, offset i
 		// matched to accounts (userDirectoryMemberMatch). Names come from
 		// app.yaml and are written as quoted identifiers.
 		q := fmt.Sprintf(
-			"SELECT u.id FROM _benmore_users u WHERE EXISTS (SELECT 1 FROM %s m WHERE m.%s = ?%s AND %s) AND (u.deactivated_at IS NULL OR u.deactivated_at = '') ORDER BY u.id LIMIT ? OFFSET ?",
+			"SELECT u.id FROM _benmore_users u WHERE EXISTS (SELECT 1 FROM %s m WHERE m.%s = ?%s AND %s) AND "+accountActiveSQL("u")+" ORDER BY u.id LIMIT ? OFFSET ?",
 			quoteIdent(app.Group.Table), quoteIdent(app.Group.Key),
 			membershipLiveConds(app.Group, app.Group.Table, "m", dbColumnChecker(app.DB, app.Group.Table)),
 			userDirectoryMemberMatch(app.Group, "u", "m"),

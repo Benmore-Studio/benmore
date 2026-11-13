@@ -40,6 +40,21 @@ func appMCPConnectorWithheldNotice(dir string) string {
 		"If it doesn't, delete mcp.yaml (`benmore delete-file mcp.yaml`)." + appMCPUnpulledSourcesNote(dir, manifest)
 }
 
+// appMCPStaleReviewWarning is what a check (serve's start-up check, check_app,
+// the check after a write, `benmore test`) reports for an mcp.yaml whose
+// review no longer binds the source. The instruction is the one the
+// scaffolded AGENTS.md gives for the edition (scaffoldEditionSections).
+func appMCPStaleReviewWarning() string {
+	next := "push the reviewed files together"
+	if editionName == "framework" {
+		next = "reload (SIGHUP) or restart the service"
+	}
+	return "mcp.yaml: the connector review is stale (reviewed contract or execution digest mismatch): mcp.yaml or a file the app loads or serves changed after the review. " +
+		"The app runs; only its MCP connector stays off until the source is reviewed again. " +
+		"After reviewing the source changes run `benmore mcp review <appdir> --reviewed` and `benmore mcp check <appdir>`, then " + next + ". " +
+		"If the app serves no connector, delete mcp.yaml instead."
+}
+
 // appMCPUnpulledSourcesNote names the reviewed source files a pulled
 // workspace never holds, so a review made there can't match the server.
 func appMCPUnpulledSourcesNote(dir string, m *AppMCPManifest) string {

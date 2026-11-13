@@ -56,6 +56,9 @@ func RebuildContextGraph(app *App) {
 	if app == nil || app.DB == nil {
 		return
 	}
+	// The rebuild runs in a worker beside reloads: everything below reads the
+	// configuration from this view, never from the live app.
+	app = contextGraphSource(app)
 	EnsureContextGraphTables(app.DB)
 
 	tx, err := app.DB.BeginTx(withLongWriteTx(context.Background(), "context graph rebuild"), nil)
@@ -106,6 +109,25 @@ func RebuildContextGraph(app *App) {
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("  context graph: commit failed: %s", err)
+	}
+}
+
+// contextGraphSource is the configuration one rebuild reads, taken under the
+// lock a reload publishes with. A reload replaces each of these objects whole
+// and never edits a published one, so the rebuild works from this view with
+// no lock held during its database work, and one graph is built from one
+// configuration. MCP and sourceFiles are what the sections parsed on demand
+// (aggregates, retention) are read from in a reviewed app.
+func contextGraphSource(app *App) *App {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return &App{
+		Dir: app.Dir, DB: app.DB,
+		Pages: app.Pages, Partials: app.Partials,
+		Hooks: app.Hooks, Flows: app.Flows, Workflows: app.Workflows,
+		Computed: app.Computed, Encrypted: app.Encrypted, Validators: app.Validators,
+		Roles: app.Roles, Group: app.Group,
+		MCP: app.MCP, sourceFiles: app.sourceFiles,
 	}
 }
 

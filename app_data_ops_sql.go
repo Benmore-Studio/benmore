@@ -94,6 +94,9 @@ func appDataQuery(ctx context.Context, c *appDataOpCall) (any, error) {
 	default:
 		return nil, appDataFail("bad_request", "gate must be query_db or console")
 	}
+	if readOnlyNamedJoinOnFrameworkTable(query) {
+		return nil, appDataFail("rejected", "%s", readOnlyNamedJoinRefusal)
+	}
 	hipaa := c.App.hipaa()
 	if hipaa {
 		// The router applies the same rule (hipaa_data_reads.go); this holds it
@@ -105,7 +108,7 @@ func appDataQuery(ctx context.Context, c *appDataOpCall) (any, error) {
 			return nil, appDataFail("bad_request", "this app is compliance: hipaa: a reason (1-500 characters) is required to read its data")
 		}
 	}
-	rows, cols, truncated, err := queryReadOnlyRowsCols(ctx, c.App.DB, query, args.Limit)
+	rows, cols, truncated, err := queryReadOnlyAuthoredRows(ctx, c.App, query, args.Limit)
 	if err != nil {
 		return nil, appDataQueryError(ctx, err)
 	}

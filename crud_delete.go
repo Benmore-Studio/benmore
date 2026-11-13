@@ -130,6 +130,8 @@ func handleDelete(w http.ResponseWriter, r *http.Request, app *App, table string
 			httpError(w, fmt.Sprintf("Cannot delete: other records reference this %s. Delete those first.", table), http.StatusConflict)
 		} else if respondStorageFull(w, app, err) {
 			// A soft delete is an UPDATE and can need a page; a hard delete never does.
+		} else if respondDatabaseBusy(w, r, table+" delete", err) {
+			// Not a bad request: the same delete succeeds once the lock is free.
 		} else {
 			httpError(w, "Delete failed", http.StatusBadRequest)
 		}

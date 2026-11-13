@@ -31,8 +31,12 @@ func execStepSMS(ctx *FlowContext, step *FlowStep) error {
 	if step.SMS == nil {
 		return fmt.Errorf("sms step has no config")
 	}
+	// The text leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	textBuilt := beginFlowResponse(ctx)
 	to := strings.TrimSpace(interpolateCtx(step.SMS.To, ctx))
 	body := interpolateCtx(step.SMS.Body, ctx)
+	textBuilt()
 
 	if to == "" {
 		return fmt.Errorf("`run: sms` has an empty `to:` after interpolation (template %q) - check the ${{ }} ref resolves and the upstream step has an `id:`", step.SMS.To)

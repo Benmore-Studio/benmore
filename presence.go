@@ -102,6 +102,12 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 		if action == "" {
 			action = "heartbeat"
 		}
+		// A scoped credential is present only in a room whose membership
+		// table its scopes allow writing (scoped_credential_routes.go).
+		if err := presenceScopeError(app, session, slug, "write"); err != nil {
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
+			return
+		}
 		// A slug is a room name: declared ws_rooms rules decide who may be
 		// present in it, as they do for bm.room and bm.broadcast. Leaving
 		// stays open so a member removed mid-session can still clear its row.
@@ -169,6 +175,10 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 		slug := strings.TrimSpace(r.URL.Query().Get("slug"))
 		if slug == "" || !presenceSlugUsable(slug) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug query param required (no NUL)"})
+			return
+		}
+		if err := presenceScopeError(app, session, slug, "read"); err != nil {
+			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
 		if !roomMembershipAllowed(app, session, session.UserID, slug) {

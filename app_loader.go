@@ -376,7 +376,9 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	app.I18n = config.i18n
 
 	// Run migration files (migrations/ directory), with a pre-migration backup.
-	if err := EnsureNotificationsTableChecked(db); err != nil {
+	// The framework tables a file may name are there before the first one
+	// (framework_tables_before_migrations.go).
+	if err := ensureFrameworkTablesBeforeMigrations(db, config.design, config.pages, signInConfigured(config.design, config.pages)); err != nil {
 		return nil, fmt.Errorf("notifications: %w", err)
 	}
 	trace.phase("user_migrations")

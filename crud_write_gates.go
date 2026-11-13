@@ -361,8 +361,8 @@ func (e *mutationValidationError) Unwrap() error { return e.err }
 var errNoValidFields = errors.New("no valid fields")
 
 // mutationErrorResponse maps an error from the shared create/delete pipeline
-// onto a status and client-safe message. Command-owned and storage-full
-// errors have their own responders, which callers run first.
+// onto a status and client-safe message. Command-owned, storage-full and
+// database-busy errors have their own responders, which callers run first.
 func mutationErrorResponse(app *App, context string, err error) (int, string) {
 	var fkErr *fkTargetError
 	var validationErr *mutationValidationError
@@ -380,7 +380,9 @@ func mutationErrorResponse(app *App, context string, err error) (int, string) {
 	case errors.Is(err, errNoValidFields):
 		return http.StatusBadRequest, errNoValidFields.Error()
 	case isDatabaseBusyError(err):
-		return http.StatusServiceUnavailable, "the database is busy, retry shortly"
+		// For a caller with no request to answer; an HTTP route has answered
+		// through respondDatabaseBusy before it gets here.
+		return http.StatusServiceUnavailable, databaseBusyMessage
 	}
 	return http.StatusBadRequest, publicConstraintMessage(app, context, err)
 }

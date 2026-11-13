@@ -146,6 +146,9 @@ func TestRestoreCarriesLiveCredentialsForward(t *testing.T) {
 	credExec(t, db, `DELETE FROM _benmore_sessions WHERE user_id = 3`)
 	credExec(t, db, `DELETE FROM _benmore_users WHERE id = 3`)
 	credExec(t, db, `INSERT INTO _benmore_users (id, username, email, password_hash, verified, created_at) VALUES (5, 'erin', 'carol@x.test', ?, 1, '2026-08-01 10:00:00')`, erinHashLive)
+	// dave's row holds the empty string an old admin-panel save left there:
+	// a deactivated account (accountDeactivated), stored as it is.
+	credExec(t, db, `UPDATE _benmore_users SET deactivated_at = '' WHERE id = 4`)
 	// dave confirms a new email that a deleted account used to hold.
 	credExec(t, db, `DELETE FROM _benmore_email_changes`)
 	credExec(t, db, `UPDATE _benmore_users SET email = 'gina@x.test' WHERE id = 4`)
@@ -225,6 +228,14 @@ func TestRestoreCarriesLiveCredentialsForward(t *testing.T) {
 	}
 	if n := credCount(t, got, `SELECT password_change_required FROM _benmore_users WHERE id = 2`); n != 1 {
 		t.Fatal("bob's password-change requirement was rolled back")
+	}
+	// A stored empty string is carried over as stored, never turned into
+	// NULL (which would reactivate the account) or into a timestamp.
+	if v := credString(t, got, `SELECT typeof(deactivated_at) || ':' || quote(deactivated_at) FROM _benmore_users WHERE id = 4`); v != "text:''" {
+		t.Fatalf("dave's stored empty deactivation came back as %q", v)
+	}
+	if n := credCount(t, got, `SELECT count(*) FROM _benmore_users WHERE id = 4 AND `+accountDeactivatedSQL("")); n != 1 {
+		t.Fatal("the restore reactivated an account whose live row was deactivated")
 	}
 	// carol's restored account answers to her email's current credentials.
 	if h := credString(t, got, `SELECT password_hash FROM _benmore_users WHERE id = 3`); h != erinHashLive {

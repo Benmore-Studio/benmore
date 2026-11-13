@@ -311,6 +311,7 @@ var refusalCodeIdentifiers = map[string]string{
 	"emailVerificationRequiredCode": emailVerificationRequiredCode,
 	"adminDemotionProtectedCode":    adminDemotionProtectedCode,
 	"scopedCredentialPageCode":      scopedCredentialPageCode,
+	"databaseBusyCode":              databaseBusyCode,
 }
 
 // runtimeErrorCodes finds the stable codes the source answers in `error` or

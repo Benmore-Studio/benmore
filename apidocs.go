@@ -766,6 +766,9 @@ func generateRichSchema(app *App, session *Session) map[string]any {
 			"ops":    ops,
 			"capabilities": map[string]bool{
 				"soft_delete": hasColumn(app, table, "deleted_at"),
+				// Always present, so a client can tell "sharing is off" from
+				// a descriptor that does not report the switch.
+				"sharing": recordSharingEnabled(app, table),
 			},
 		}
 		var children []map[string]string

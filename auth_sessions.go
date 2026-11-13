@@ -617,7 +617,7 @@ func loadStoredSessionChecked(db mutationQuerier, strict bool, ids ...string) (*
 		return nil, fmt.Errorf("read session: %w", err)
 	}
 	// Block deactivated users at session resolution - no further processing
-	if deactivatedAt.Valid && deactivatedAt.String != "" {
+	if accountDeactivated(deactivatedAt) {
 		return nil, nil
 	}
 	// A support impersonation session acts on the authority of the admin who
@@ -700,7 +700,7 @@ func impersonatorStillAdmin(db mutationQuerier, adminID int64, strict bool) (boo
 	}
 	var role string
 	err := db.QueryRow(`SELECT COALESCE(role, 'user') FROM `+prefix+`_benmore_users
-		WHERE id = ? AND COALESCE(deactivated_at, '') = '' AND COALESCE(password_change_required, 0) = 0`, adminID).Scan(&role)
+		WHERE id = ? AND `+accountActiveSQL("")+` AND COALESCE(password_change_required, 0) = 0`, adminID).Scan(&role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

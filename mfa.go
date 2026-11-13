@@ -212,6 +212,7 @@ func EnsureMFAColumns(db *sql.DB) {
 // RegisterMFARoutes sets up MFA setup, verification, and disable endpoints.
 func RegisterMFARoutes(mux appRouteRegistrar, app *App) {
 	EnsureMFAColumns(app.DB)
+	EnsureAuditLogTable(app.DB) // factor changes audit in their own transaction
 	// Seal TOTP secrets written before at-rest encryption (or before the
 	// app had a durable key). Reads accept both forms, so a failure here
 	// only delays sealing to the next use.
@@ -248,7 +249,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		// active for the user, a stolen token can't be used to reset it -
 		// the user must disable from a real session first.
 		var existing string
-		if err := app.DB.QueryRow("SELECT COALESCE(totp_secret, '') FROM _benmore_users WHERE id = ? AND deactivated_at IS NULL", userID).Scan(&existing); err != nil {
+		if err := app.DB.QueryRow("SELECT COALESCE(totp_secret, '') FROM _benmore_users WHERE id = ? AND "+accountActiveSQL(""), userID).Scan(&existing); err != nil {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "account unavailable"})
 			return
 		}
@@ -321,7 +322,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 				return
 			}
 		}
-		res, err := tx.Exec("UPDATE _benmore_users SET totp_secret = ?, backup_codes = ? WHERE id = ? AND COALESCE(totp_secret, '') = ? AND deactivated_at IS NULL",
+		res, err := tx.Exec("UPDATE _benmore_users SET totp_secret = ?, backup_codes = ? WHERE id = ? AND COALESCE(totp_secret, '') = ? AND "+accountActiveSQL(""),
 			totpPendingPrefix+sealed, string(codesJSON), userID, existing)
 		if err != nil {
 			serverErrorJSON(w, r, app, "mfa setup", err, "MFA setup could not be saved")
@@ -329,6 +330,13 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		}
 		if n, err := res.RowsAffected(); err != nil || n != 1 {
 			httpJSON(w, http.StatusConflict, map[string]any{"error": "MFA enrollment changed; reload and try again"})
+			return
+		}
+		// The codes are a way in once the factor is active: their issue is
+		// recorded with them, by count.
+		if err := auditAccountEvent(tx, app, accountAuditMFACodesGenerated, strconv.FormatInt(userID, 10),
+			&Session{UserID: userID, Email: email}, nil, map[string]any{"factor": "totp", "count": len(backupCodes)}); err != nil {
+			serverErrorJSON(w, r, app, "mfa setup", err, "MFA setup could not be saved")
 			return
 		}
 		if err := tx.Commit(); err != nil {
@@ -436,7 +444,7 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		// code that just established this factor could sign in or remove it a
 		// second time. A replacement factor starts with its own watermark.
 		res, err := tx.Exec(`UPDATE _benmore_users SET totp_secret = ?, mfa_setup_nonce=lower(hex(randomblob(16))),
-			mfa_last_totp = ?, mfa_last_totp_at = ? WHERE id = ? AND totp_secret = ? AND deactivated_at IS NULL`,
+			mfa_last_totp = ?, mfa_last_totp_at = ? WHERE id = ? AND totp_secret = ? AND `+accountActiveSQL(""),
 			active, "s:"+strconv.FormatUint(step, 10), verifiedAt.UTC().Format(time.RFC3339), userID, secretRaw)
 		if err != nil {
 			serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
@@ -468,6 +476,11 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 				serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
 				return
 			}
+		}
+		if err := auditAccountEvent(tx, app, accountAuditMFAEnrolled, strconv.FormatInt(userID, 10),
+			&Session{UserID: userID, Email: email}, nil, map[string]any{"factor": "totp"}); err != nil {
+			serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
+			return
 		}
 		if err := tx.Commit(); err != nil {
 			serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
@@ -574,6 +587,9 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 		// A pending OTP continuation may already have passed this factor.
 		// Removing it cancels those unfinished sign-ins in the same commit.
 		if _, err = tx.Exec("DELETE FROM _benmore_signin_challenges WHERE user_id=?", session.UserID); err == nil {
+			err = auditAccountEvent(tx, app, accountAuditMFARemoved, strconv.FormatInt(session.UserID, 10), session, map[string]any{"factor": "totp"}, nil)
+		}
+		if err == nil {
 			err = tx.Commit()
 		}
 		if err != nil {
@@ -738,7 +754,14 @@ func mfaLockKey(userID int64) string {
 // `mfa_last_totp` ("s:<step>") and a code for that step or an earlier one
 // is refused, so a code can't be replayed inside the drift window.
 func ValidateMFACode(db *sql.DB, userID int64, code string) bool {
-	return validateMFACodeWith(db, userID, code)
+	// One transaction: a spent backup code and its audit row are written
+	// together or not at all.
+	tx, err := signInWriteTx(db)
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback()
+	return validateMFACodeWith(tx, userID, code) && tx.Commit() == nil
 }
 
 func validateMFACodeWith(db mutationTx, userID int64, code string) bool {
@@ -771,6 +794,17 @@ func validateMFACodeWith(db mutationTx, userID int64, code string) bool {
 			n, _ := res.RowsAffected()
 			if n != 1 {
 				return false // Another request consumed this code first.
+			}
+			// Recorded where the code is spent: every caller holds a
+			// transaction, so a row that cannot be written leaves the code
+			// unspent and the step refused.
+			actor, err := accountAuditSelf(db, userID)
+			if err == nil {
+				err = auditAccountEvent(db, nil, accountAuditMFABackupCodeUsed, strconv.FormatInt(userID, 10), actor, nil, map[string]any{"remaining": len(remaining)})
+			}
+			if err != nil {
+				log.Printf("MFA: backup code of user %d refused: %v", userID, err)
+				return false
 			}
 			log.Printf("MFA: backup code used for user %d (%d remaining)", userID, len(remaining))
 			return true

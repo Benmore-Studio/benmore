@@ -4,8 +4,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -485,27 +487,69 @@ func TestFilesUploadAuthenticatesBeforeTakingASlot(t *testing.T) {
 }
 
 // A write that times out waiting for the database lock is not a bad request:
-// it answers 503 with Retry-After so clients retry, instead of the redacted
-// 400 "the write was rejected" a constraint failure gets.
+// it answers 503 with Retry-After and the database_busy code so clients
+// retry, instead of the redacted 400 "the write was rejected" a constraint
+// failure gets. The classifier reads SQLite's result code, through any
+// wrapping; the text "database is locked" alone (an upstream error, a
+// trigger's RAISE) is not a busy database.
 func TestDatabaseBusyWriteAnswers503(t *testing.T) {
 	for name, err := range map[string]error{
-		"busy":   sqlite3.Error{Code: sqlite3.ErrBusy},
-		"locked": sqlite3.Error{Code: sqlite3.ErrLocked},
-		"text":   errors.New("database is locked"),
+		"busy":    sqlite3.Error{Code: sqlite3.ErrBusy},
+		"locked":  sqlite3.Error{Code: sqlite3.ErrLocked},
+		"wrapped": fmt.Errorf("sql: %w", sqlite3.Error{Code: sqlite3.ErrBusy, ExtendedCode: sqlite3.ErrBusySnapshot}),
 	} {
 		if status, _ := mutationErrorResponse(&App{}, "insert t", err); status != http.StatusServiceUnavailable {
 			t.Errorf("%s: mutationErrorResponse status = %d, want 503", name, status)
 		}
 		w := httptest.NewRecorder()
-		if !respondDatabaseBusy(w, err) || w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+		slot := &requestLogSlot{}
+		r := httptest.NewRequest("POST", "https://app.example.com/api/t", nil)
+		r = r.WithContext(context.WithValue(r.Context(), requestLogErrorKey{}, slot))
+		if !respondDatabaseBusy(w, r, "t create", err) || w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" {
 			t.Errorf("%s: respondDatabaseBusy = %d Retry-After=%q", name, w.Code, w.Header().Get("Retry-After"))
 		}
+		body := decodeJSONAnswer(t, w)
+		if body["error"] != "database_busy" || body["message"] != "the database is busy, retry shortly" || body["docs"] != "recovery.write_lock" {
+			t.Errorf("%s: body %v", name, body)
+		}
+		// The request log row keeps the cause under the answer's request id;
+		// no stack and no error export are kept, as for a fault.
+		detail, id := slot.read()
+		if id == "" || id != body["request_id"] || id != w.Header().Get(requestIDHeader) {
+			t.Errorf("%s: request log id %q, request_id %v, X-Request-Id %q", name, id, body["request_id"], w.Header().Get(requestIDHeader))
+		}
+		if !strings.HasPrefix(detail, "[t create] ") || !strings.Contains(detail, "database") {
+			t.Errorf("%s: request log error %q", name, detail)
+		}
+		if len(slot.pcs) != 0 || slot.exportError != "" {
+			t.Errorf("%s: a busy answer kept a stack (%d frames) or an error export (%q)", name, len(slot.pcs), slot.exportError)
+		}
 	}
-	unique := errors.New("UNIQUE constraint failed: users.email")
-	if status, _ := mutationErrorResponse(&App{}, "insert t", unique); status != http.StatusBadRequest {
-		t.Errorf("constraint failure status = %d, want 400", status)
+	// The shared server-error answers give it for a route under /api/ only:
+	// a page, a form post or the admin panel keeps its own 500.
+	busy := sqlite3.Error{Code: sqlite3.ErrBusy}
+	for path, want := range map[string]int{"/api/t": http.StatusServiceUnavailable, "/settings/profile": http.StatusInternalServerError} {
+		for name, answer := range map[string]func(http.ResponseWriter, *http.Request){
+			"serverError":     func(w http.ResponseWriter, r *http.Request) { serverError(w, r, &App{}, "t", busy, "Save failed") },
+			"serverErrorJSON": func(w http.ResponseWriter, r *http.Request) { serverErrorJSON(w, r, &App{}, "t", busy, "save failed") },
+		} {
+			w := httptest.NewRecorder()
+			captureLog(t, func() { answer(w, httptest.NewRequest("POST", "https://app.example.com"+path, nil)) })
+			if w.Code != want || (want == http.StatusServiceUnavailable) != (w.Header().Get("Retry-After") == "1") {
+				t.Errorf("%s on %s: %d Retry-After=%q, want %d", name, path, w.Code, w.Header().Get("Retry-After"), want)
+			}
+		}
 	}
-	if respondDatabaseBusy(httptest.NewRecorder(), unique) {
-		t.Error("a constraint failure was answered as busy")
+	for name, err := range map[string]error{
+		"constraint": errors.New("UNIQUE constraint failed: users.email"),
+		"text only":  errors.New("database is locked"),
+		"full":       sqlite3.Error{Code: sqlite3.ErrFull},
+	} {
+		if status, _ := mutationErrorResponse(&App{}, "insert t", err); status != http.StatusBadRequest {
+			t.Errorf("%s: mutationErrorResponse status = %d, want 400", name, status)
+		}
+		if respondDatabaseBusy(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/t", nil), "t create", err) {
+			t.Errorf("%s was answered as a busy database", name)
+		}
 	}
 }

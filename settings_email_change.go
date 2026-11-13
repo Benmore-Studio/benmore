@@ -114,6 +114,7 @@ func requestEmailChange(app *App, r *http.Request, userID int64, newEmail string
 		return errors.New(reason)
 	}
 	ensureEmailChangesTable(app.DB)
+	EnsureAuditLogTable(app.DB) // rare path; the request is audited in its transaction
 	if emailTakenByOther(app.DB, newEmail, userID) {
 		return errEmailInUse
 	}
@@ -131,11 +132,7 @@ func requestEmailChange(app *App, r *http.Request, userID int64, newEmail string
 		return errEmailChangeThrottled
 	}
 	token := generateToken(32)
-	if _, err := app.DB.Exec("DELETE FROM _benmore_email_changes WHERE user_id = ?", userID); err != nil {
-		return &emailChangeFailure{"could not start the email change", err}
-	}
-	if _, err := app.DB.Exec("INSERT INTO _benmore_email_changes (user_id, new_email, token_hash, expires_at) VALUES (?, ?, ?, ?)",
-		userID, newEmail, hashResetToken(token), time.Now().Add(emailChangeTTL).UTC().Format(time.RFC3339)); err != nil {
+	if err := storePendingEmailChange(app, userID, newEmail, token); err != nil {
 		return &emailChangeFailure{"could not start the email change", err}
 	}
 	link := fmt.Sprintf("%s/settings/confirm-email?token=%s", linkBase, token)
@@ -154,6 +151,35 @@ func requestEmailChange(app *App, r *http.Request, userID int64, newEmail string
 	return nil
 }
 
+// storePendingEmailChange replaces the account's pending change with one for
+// newEmail and writes the request's audit row, in one transaction. The row
+// stands for the request the account made (its password was just checked): it
+// is kept when the confirmation mail then fails and the pending change is
+// withdrawn. The link's token is not a value of the row.
+func storePendingEmailChange(app *App, userID int64, newEmail, token string) error {
+	tx, err := app.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM _benmore_email_changes WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO _benmore_email_changes (user_id, new_email, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+		userID, newEmail, hashResetToken(token), time.Now().Add(emailChangeTTL).UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	actor, err := accountAuditSelf(tx, userID)
+	if err != nil {
+		return err
+	}
+	if err := auditAccountEvent(tx, app, accountAuditEmailChangeRequest, strconv.FormatInt(userID, 10), actor,
+		map[string]any{"email": actor.Email}, map[string]any{"requested_email": newEmail}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // confirmEmailChange applies a pending change for a valid, unexpired token.
 // Returns the user id and old/new addresses.
 func confirmEmailChange(app *App, token string) (int64, string, string, error) {
@@ -162,6 +188,7 @@ func confirmEmailChange(app *App, token string) (int64, string, string, error) {
 		return 0, "", "", errEmailChangeUnsupported
 	}
 	ensureEmailChangesTable(app.DB)
+	EnsureAuditLogTable(app.DB) // rare path; the change is audited in its transaction
 	if token == "" {
 		return 0, "", "", errors.New("missing token")
 	}
@@ -221,7 +248,19 @@ func confirmEmailChange(app *App, token string) (int64, string, string, error) {
 	if err := revokePasswordCredentials(tx, userID); err != nil {
 		return 0, "", "", errors.New("could not update the email")
 	}
+	// Recorded under the address the account held when it confirmed, with
+	// both addresses as values; the address read before the transaction is
+	// only what the caller mails.
+	actor, err := accountAuditSelf(tx, userID)
+	if err != nil {
+		return 0, "", "", errors.New("could not update the email")
+	}
 	if _, err := tx.Exec("UPDATE _benmore_users SET email = ?"+setVerified+" WHERE id = ?", newEmail, userID); err != nil {
+		return 0, "", "", errors.New("could not update the email")
+	}
+	if err := auditAccountEvent(tx, app, accountAuditEmailChanged, strconv.FormatInt(userID, 10), actor,
+		map[string]any{"email": actor.Email}, map[string]any{"email": newEmail}); err != nil {
+		log.Printf("auth: email change of account %d not applied: %v", userID, err)
 		return 0, "", "", errors.New("could not update the email")
 	}
 	if err := tx.Commit(); err != nil {

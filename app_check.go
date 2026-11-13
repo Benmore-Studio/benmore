@@ -68,9 +68,12 @@ var piiColumnRe = regexp.MustCompile(`(^|[^a-z])(email|phone|mobile|address|ssn|
 // findings shouldn't block but should surface in tool responses.
 type CheckFinding struct {
 	Severity string `json:"severity"` // "error" | "warning"
-	Source   string `json:"source"`   // which validator produced this ("syntax" | "cross_file" | "app_load" | "drift")
-	File     string `json:"file,omitempty"`
-	Message  string `json:"message"`
+	// Source names the layer that produced the finding: "syntax" (the write
+	// gate's per-file validators refuse the file as written), "mcp_review" (a
+	// stale connector review), "cross_file", "app_load", "drift", ...
+	Source  string `json:"source"`
+	File    string `json:"file,omitempty"`
+	Message string `json:"message"`
 	// Docs is the address of the reference key that states the rule the
 	// finding reports ("flows.step_keys"): read it with api(at:"<docs>") or
 	// `benmore api <app> <docs>`. Empty for a finding no key covers
@@ -184,17 +187,6 @@ func cronFlowRefFindingsAfterWrite(dir, writtenPath string, liveDB bool) []Check
 // warnings, which name no single file; `benmore check` reports everything.
 func writeRelevantFindings(writtenPath string, findings []CheckFinding) []CheckFinding {
 	written := filepath.ToSlash(filepath.Clean(writtenPath))
-	// A stale mcp.yaml review only turns the connector off (the app keeps
-	// serving; the write response's mcp_connector_withheld says so). Writing
-	// another file must not answer ok:false because of it: every scaffolded
-	// app ships a reviewed mcp.yaml, so its first schema push did.
-	if written != "mcp.yaml" {
-		for i, f := range findings {
-			if staleMCPReviewFinding(f) {
-				findings[i].Severity = "warning"
-			}
-		}
-	}
 	// A retention.yaml the app already carries with a policy that does not
 	// run is not this write's doing: its own write and `benmore check`
 	// refuse it, a write of another file reports it as a warning. (A file
@@ -225,10 +217,10 @@ func writeRelevantFindings(writtenPath string, findings []CheckFinding) []CheckF
 	return kept
 }
 
-// staleMCPReviewFinding reports whether f is the error a stale mcp.yaml review
-// raises (its digests no longer match the source). It turns only the app's MCP
-// connector off, so a write of any other file - and the CLI's check after a push
-// batch - reads it as a warning.
+// staleMCPReviewFinding reports whether f is the error a server from before
+// the mcp_review warning reports for a stale mcp.yaml review (its digests no
+// longer match the source). It turns only the app's MCP connector off, so the
+// CLI's check after a push batch does not count it as an error.
 func staleMCPReviewFinding(f CheckFinding) bool {
 	return f.Severity == "error" && f.File == "mcp.yaml" && strings.Contains(f.Message, "digest mismatch")
 }
@@ -280,7 +272,18 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	// any future cross-file syntactic check the context it needs.
 	for _, fileCheck := range sourceCheckFiles(dir, writtenPath, liveDB) {
 		// Flow routes are checked app-wide below, once, instead of per file.
-		if verdict, _ := writeGateVerdict(dir, fileCheck.relPath, fileCheck.content, false, false, nil); verdict.Message != "" {
+		verdict, _ := writeGateVerdict(dir, fileCheck.relPath, fileCheck.content, false, false, nil)
+		if verdict.StaleReview != "" {
+			// Not a refusal of the file: the connector is off until the
+			// source is reviewed again, and nothing else is affected.
+			findings = append(findings, CheckFinding{
+				Severity: "warning",
+				Source:   "mcp_review",
+				File:     fileCheck.relPath,
+				Message:  verdict.StaleReview,
+			})
+		}
+		if verdict.Message != "" {
 			findings = append(findings, CheckFinding{
 				Severity: "error",
 				Source:   "syntax",
@@ -331,8 +334,9 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	findings = append(findings, flowInputBoundsWarnings(dir, writtenPath)...)
 	findings = append(findings, flowEventTableWarnings(dir, writtenPath)...)
 	findings = append(findings, flowTransactionalSendWarnings(dir, writtenPath)...)
-	// A `run: respond` with no `with:`: a 200 that ends the run.
-	findings = append(findings, bareRespondWarnings(dir, writtenPath)...)
+	// A `run: respond` that answers something other than it reads as: no
+	// `with:` (a 200 that ends the run), two bodies, a body that is not text.
+	findings = append(findings, respondShapeWarnings(dir, writtenPath)...)
 	// A `role:` gate that is not one role the app knows: it admits nobody
 	// but a global admin (validators_flow_role_gate.go).
 	findings = append(findings, flowRoleGateWarnings(dir, writtenPath)...)
@@ -650,16 +654,33 @@ func serveBootCheck(dir string) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, FormatReport(report))
+	fmt.Fprint(os.Stderr, serveBootCheckOutcome(report))
+}
+
+// serveBootCheckOutcome is the line that closes serve's boot check.
+func serveBootCheckOutcome(report CheckReport) string {
 	if report.Errors > 0 {
-		outcome := "the app will boot, but these would be rejected by `benmore push` / the platform write gate"
+		outcome := "these would be rejected by `benmore push` / the platform write gate, and the app starts only if its own load accepts them"
 		for _, f := range report.Findings {
 			if f.Severity == "error" && f.Source == "app_load" {
 				outcome = "the app_load error stops the app from starting until it is fixed"
 				break
 			}
 		}
-		fmt.Fprintf(os.Stderr, "⚠ %d error(s) above - %s.\n\n", report.Errors, outcome)
+		return fmt.Sprintf("⚠ %d error(s) above - %s.\n\n", report.Errors, outcome)
 	}
+	if report.Warnings == 0 {
+		return ""
+	}
+	// Warnings refuse nothing: say so, and what is off meanwhile.
+	off := ""
+	for _, f := range report.Findings {
+		if f.Source == "mcp_review" {
+			off = " Its MCP connector stays off until mcp.yaml is reviewed again."
+			break
+		}
+	}
+	return fmt.Sprintf("%d warning(s) above - the app starts and runs; `benmore push` and the platform write gate refuse none of them.%s\n\n", report.Warnings, off)
 }
 
 // protectedColumnWarnings scans schema.prisma for column names that

@@ -486,8 +486,7 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 		JOIN _benmore_users u ON u.id=c.user_id
 		LEFT JOIN _benmore_oauth_clients cl ON cl.client_id = c.client_id
 		WHERE c.code = ? AND COALESCE(u.password_change_required,0)=0
-		AND COALESCE(u.deactivated_at,'')=''
-	`, hashAPIToken(code)).Scan(&rowID, &userID, &storedClient, &storedRedirect, &challenge, &scopes, &storedResource, &expiresAtStr, &clientName)
+		AND `+accountActiveSQL("u"), hashAPIToken(code)).Scan(&rowID, &userID, &storedClient, &storedRedirect, &challenge, &scopes, &storedResource, &expiresAtStr, &clientName)
 	if err != nil {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
 		return
@@ -534,7 +533,8 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 	rawToken := "bma_" + generateToken(32)
 	grantScope := appOAuthGrantScope(scopes)
 	expiresAt := time.Now().Add(appOAuthTokenTTL).UTC().Format(time.RFC3339)
-	stored, err := insertAPITokenWithinCap(tx, userID, "oauth: "+clientName, hashToken(rawToken), grantScope, expiresAt)
+	tokenHash := hashToken(rawToken)
+	stored, err := insertAPITokenWithinCap(tx, userID, "oauth: "+clientName, tokenHash, grantScope, expiresAt)
 	if err != nil {
 		serverErrorCode(w, r, app, "oauth token", err, "server_error")
 		return
@@ -543,6 +543,16 @@ func appOAuthToken(w http.ResponseWriter, r *http.Request, app *App) {
 		// The account is at its API-token cap. The code stays spent.
 		_ = tx.Commit()
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "access_denied", "error_description": apiTokenCapMessage})
+		return
+	}
+	// A token issued to a client the account approved is a token of the
+	// account like one it mints itself, and is recorded the same way.
+	actor, err := accountAuditSelf(tx, userID)
+	if err == nil {
+		err = auditAPITokenCreated(tx, app, actor, tokenHash, "oauth: "+clientName, grantScope, &expiresAt)
+	}
+	if err != nil {
+		serverErrorCode(w, r, app, "oauth token", err, "server_error")
 		return
 	}
 	if err := tx.Commit(); err != nil {

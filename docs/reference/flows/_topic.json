@@ -67,6 +67,7 @@
     "gotchas_outbound_calls",
     "gotchas_bodies",
     "respond_headers",
+    "respond_bodies",
     "trigger_event",
     "trigger_schedule",
     "inputs",

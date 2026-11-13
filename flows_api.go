@@ -71,6 +71,9 @@ func buildAPIRequestURL(ctx *FlowContext, api *FlowAPICall, literalQuery map[str
 		if _, ok := literalQuery[k]; ok {
 			continue
 		}
+		if flowResponseDropsKey(ctx, k) {
+			continue
+		}
 		parts = append(parts, neturl.QueryEscape(k)+"="+neturl.QueryEscape(interpolateCtx(v, ctx)))
 	}
 	for k, v := range literalQuery {
@@ -93,6 +96,9 @@ func buildAPIRequestURL(ctx *FlowContext, api *FlowAPICall, literalQuery map[str
 func apiFormBody(ctx *FlowContext, form map[string]string) []byte {
 	values := make(neturl.Values, len(form))
 	for k, v := range form {
+		if flowResponseDropsKey(ctx, k) {
+			continue
+		}
 		val := interpolateCtx(v, ctx)
 		// A value written as one `{{x | urlencode}}` was encoded by the
 		// author (the only way a + or & arrived intact before bodies were
@@ -120,7 +126,7 @@ func apiTextBody(ctx *FlowContext, template string) []byte {
 		}
 		switch v.(type) {
 		case map[string]any, []any, []map[string]any:
-			if b, err := json.Marshal(v); found && err == nil {
+			if b, err := json.Marshal(flowResponseValue(ctx, v)); found && err == nil {
 				return b
 			}
 		}
@@ -172,6 +178,11 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 	if err := requestContext.Err(); err != nil {
 		return err
 	}
+	// The request leaves out the app's declared blind-index columns, from
+	// its URL to its signature; the response is stored and judged as it
+	// arrives (flows_respond_blind_index.go).
+	requestBuilt := beginFlowResponse(ctx)
+	defer requestBuilt()
 	url, err := buildAPIRequestURL(ctx, api, literalQuery)
 	if err != nil {
 		return err
@@ -283,6 +294,7 @@ func execAPIRequestWithClient(ctx *FlowContext, step *FlowStep, api *FlowAPICall
 	if err := flowOutboundMissingRefs(ctx, "api"); err != nil {
 		return err
 	}
+	requestBuilt()
 	if client == nil {
 		// The client's own limit is the step's allowance, so it never ends
 		// a call before the run's time limit would (that cut is not the
@@ -356,16 +368,16 @@ func apiRequestBody(ctx *FlowContext, api *FlowAPICall) (body []byte, hasBody bo
 		// Recursively resolve string leaves (ctx interpolation) while keeping
 		// nested arrays/objects intact, then marshal the whole structure.
 		// interpolateJSONValues is the same resolver respond bodies use. #94.
-		body, _ = json.Marshal(interpolateJSONValues(api.JSON, ctx))
+		body, _ = json.Marshal(flowResponseValue(ctx, interpolateJSONValues(api.JSON, ctx)))
 	case api.JSONArray != nil:
 		// A list body (`json:` or `body:` written as a list), resolved the
 		// same way element by element.
-		body, _ = json.Marshal(resolveJSONValue(api.JSONArray, ctx))
+		body, _ = json.Marshal(flowResponseValue(ctx, resolveJSONValue(api.JSONArray, ctx)))
 	case api.JSONRef != "":
 		// The referenced value itself, as JSON: a step's object or list, or
 		// JSON text, which is sent as the value it encodes. An unresolved
 		// reference fails the step before anything is sent.
-		if body, err = json.Marshal(resolveJSONValue(api.JSONRef, ctx)); err != nil {
+		if body, err = json.Marshal(flowResponseValue(ctx, resolveJSONValue(api.JSONRef, ctx))); err != nil {
 			return nil, false, "", fmt.Errorf("json body: %w", err)
 		}
 	case api.Form != nil:
@@ -676,6 +688,9 @@ func (ctx *FlowContext) dataWithoutSecrets() map[string]any {
 }
 
 func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
+	// What the step posts leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	defer beginFlowResponse(ctx)()
 	// The body may carry env secrets, written in or derived through an
 	// earlier step; that decides whether request input may choose the host
 	// (flows_api_url.go). A JSON payload counts leaf by leaf.
@@ -698,7 +713,7 @@ func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
 	// A value that does not resolve stops the step before anything is sent.
 	var body string
 	if step.WebhookJSON != nil {
-		data, err := json.Marshal(resolveJSONValue(step.WebhookJSON, ctx))
+		data, err := json.Marshal(flowResponseValue(ctx, resolveJSONValue(step.WebhookJSON, ctx)))
 		if err != nil {
 			return fmt.Errorf("webhook: payload: %w", err)
 		}
@@ -725,7 +740,7 @@ func execStepWebhook(ctx *FlowContext, step *FlowStep) error {
 				return fmt.Errorf("webhook: the URL takes request input %q, so the step must set `body:`; with no body it would send the whole flow context there", key)
 			}
 		}
-		data, _ := json.Marshal(ctx.dataWithoutSecrets())
+		data, _ := json.Marshal(flowResponseContext(ctx, ctx.dataWithoutSecrets()))
 		body = string(data)
 	}
 

@@ -88,6 +88,13 @@ func TestPasskeyRegisterAndSignIn(t *testing.T) {
 	if code, out := signedIn.do(passkeyRegister(app), "POST", "/api/_auth/passkeys/register", cred, csrf); code != http.StatusOK {
 		t.Fatalf("register: %d %v", code, out)
 	}
+	// Recorded with the passkey, once, by the account that added it.
+	var added int
+	app.DB.QueryRow(`SELECT COUNT(*) FROM _benmore_audit_log a JOIN _benmore_passkeys p ON a.row_id = CAST(p.id AS TEXT)
+		WHERE a.action = 'passkey_added' AND a.table_name = '_benmore_passkeys' AND a.user_id = ? AND a.user_email = 'ada@example.com' AND a.new_values = '{"name":"Laptop"}'`, uid).Scan(&added)
+	if added != 1 {
+		t.Fatalf("%d passkey_added audit rows for the new passkey, want 1", added)
+	}
 	backup := filepath.Join(app.Dir, "before-passkey-removal.db")
 	if err := sqliteVacuumInto(filepath.Join(app.Dir, "data.db"), backup); err != nil {
 		t.Fatal(err)
@@ -224,6 +231,11 @@ func TestPasskeyRegisterAndSignIn(t *testing.T) {
 	}
 	if code, _ := signIn(); code != http.StatusUnauthorized {
 		t.Fatalf("a removed passkey still signed in: %d", code)
+	}
+	var removed int
+	app.DB.QueryRow(`SELECT COUNT(*) FROM _benmore_audit_log WHERE action = 'passkey_removed' AND table_name = '_benmore_passkeys' AND row_id = ? AND user_id = ?`, jsonNumberString(id), uid).Scan(&removed)
+	if removed != 1 {
+		t.Fatalf("%d passkey_removed audit rows for the removed passkey, want 1", removed)
 	}
 	// Restoring the snapshot must not revive the passkey deleted after it was made.
 	if err := app.DB.Close(); err != nil {

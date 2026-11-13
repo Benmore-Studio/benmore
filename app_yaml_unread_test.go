@@ -162,7 +162,7 @@ func TestAppYAMLReadKeysAndValuesAreNotReported(t *testing.T) {
 		for _, key := range slices.Sorted(maps.Keys(section.Keys)) {
 			value := "\"x\""
 			if section.Section == "recording" || key == "trust_email" {
-				value = "true" // a switch: a value that is neither true nor false has its own warning
+				value = "true" // a switch: a value that is neither true nor false has its own warning or refusal
 			}
 			b.WriteString(indent + key + ": " + value + "\n")
 		}

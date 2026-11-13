@@ -1,4 +1,4 @@
 [
-  "benmore verify [dir] [--app NAME] [--quick|--release] [--json]",
-  "benmore ship [dir] --promote   # interactive terminal required; release verification, then explicit production confirmation"
+  "benmore verify [dir] [--app NAME] [--quick|--release] [--json] [--reason \"why\"]   # --reason goes with every journey that signs in as a user; an app with compliance: hipaa requires it for such journeys (api(at:\"compliance.workforce_reads\"))",
+  "benmore ship [dir] --promote [--reason \"why\"]   # interactive terminal required; release verification (with the same --reason), then explicit production confirmation"
 ]

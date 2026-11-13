@@ -154,6 +154,22 @@ func (l *flowWriteLog) markUntenanted(e flowWriteEntry) {
 	l.untenanted[e] = true
 }
 
+// keptOutsideTransaction reports a write the run made outside a transaction:
+// it is committed whatever becomes of the run. Read before take empties the log.
+func (l *flowWriteLog) keptOutsideTransaction() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, e := range l.order {
+		if !e.inTx {
+			return true
+		}
+	}
+	return false
+}
+
 // flowReturnedTenantCap bounds the per-tenant events one run sends for one
 // table and action.
 const flowReturnedTenantCap = 256
@@ -447,8 +463,12 @@ func execStepBroadcast(ctx *FlowContext, step *FlowStep) error {
 	if !b.HasPayload {
 		return fmt.Errorf("broadcast step requires `with.payload`")
 	}
+	// The message leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	messageBuilt := beginFlowResponse(ctx)
 	room := strings.TrimSpace(interpolateCtx(b.Room, ctx))
-	payload := resolveJSONValue(b.Payload, ctx)
+	payload := flowResponseValue(ctx, resolveJSONValue(b.Payload, ctx))
+	messageBuilt()
 	// An unresolved ref must not reach room members: return before sending
 	// and let the dispatcher report the refs (executeStep, flows_steps.go).
 	ctx.DataMu.Lock()

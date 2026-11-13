@@ -149,12 +149,9 @@ func oauthProvidersForApp(dir string) map[string]OAuthProvider {
 		if v, ok := cfg["scopes"].(string); ok {
 			provider.Scopes = strings.Fields(v)
 		}
-		switch v := cfg["trust_email"].(type) {
-		case bool:
-			provider.TrustEmail = v
-		case string:
-			provider.TrustEmail = strings.EqualFold(strings.TrimSpace(v), "true")
-		}
+		// Every spelling of true gives the trust; a value that is neither
+		// true nor false gives none (the write gate refuses it).
+		provider.TrustEmail, _ = trustEmailSetting(cfg["trust_email"])
 		// Security: warn if OAuth endpoints are not HTTPS (tokens leak in transit)
 		for _, u := range []string{provider.AuthURL, provider.TokenURL, provider.UserInfoURL} {
 			if u != "" && !strings.HasPrefix(u, "https://") {
@@ -517,6 +514,10 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 		authRedirect(w, r, app.Paths.Login, "This sign-in provider didn't confirm your email address, so it can't open an existing account. Sign in another way.")
 		return
 	}
+	if errors.Is(ferr, errOAuthAccountDeactivated) {
+		refuseDeactivatedProviderSignIn(w, r, app, email, provider.Name)
+		return
+	}
 	if ferr != nil {
 		serverError(w, r, app, "oauth "+name, fmt.Errorf("OAuth user creation failed: %w", ferr), "Authentication failed")
 		return
@@ -595,6 +596,7 @@ func oauthPlatformProof(app *App, email string, emailVerified bool, cliPort stri
 func oauthFindOrCreateUser(app *App, email, displayName string, emailVerified bool) (int64, error) {
 	var userID int64
 	var verified, grandfathered int
+	var deactivated bool
 	// Case-insensitive, like password login and recovery (auth_recovery.go):
 	// providers return whatever case the person typed at them, and an exact
 	// match would provision a second account beside Alice@x for alice@x
@@ -606,13 +608,20 @@ func oauthFindOrCreateUser(app *App, email, displayName string, emailVerified bo
 	if !validAuthEmail(email) {
 		return 0, errOAuthInvalidEmail
 	}
-	err := app.DB.QueryRow("SELECT id, COALESCE(verified, 0), COALESCE(email_grandfathered, 0) FROM _benmore_users WHERE email = ? COLLATE NOCASE ORDER BY id LIMIT 1", email).Scan(&userID, &verified, &grandfathered)
+	err := app.DB.QueryRow("SELECT id, COALESCE(verified, 0), COALESCE(email_grandfathered, 0), "+accountDeactivatedSQL("")+" FROM _benmore_users WHERE email = ? COLLATE NOCASE ORDER BY id LIMIT 1", email).Scan(&userID, &verified, &grandfathered, &deactivated)
 	if err == nil {
 		// Linking by email hands over an existing account: only an address
 		// the provider proved may do that. A provider that merely echoes an
 		// address would let anyone sign in as any registered user.
 		if !emailVerified {
 			return 0, errOAuthUnverifiedLink
+		}
+		// A deactivated account gets no session by any sign-in method, and
+		// none of the writes below (claiming or verifying the account, the
+		// caller's stored provider tokens). Asked after the proof above, so
+		// an unproven address learns nothing about the account.
+		if deactivated {
+			return 0, errOAuthAccountDeactivated
 		}
 		if verified == 0 {
 			// A grandfathered account predates the verification rule and
@@ -671,6 +680,18 @@ var errOAuthInvalidEmail = errors.New("oauth: provider returned a malformed emai
 // errOAuthUnverifiedLink refuses to link a provider identity whose email the
 // provider did not verify to an existing account with that email.
 var errOAuthUnverifiedLink = errors.New("oauth: provider did not verify the email of an existing account")
+
+// errOAuthAccountDeactivated refuses a provider sign-in to a deactivated
+// account (accountDeactivatedSQL): its session would be refused at once.
+var errOAuthAccountDeactivated = errors.New("oauth: the account is deactivated")
+
+// refuseDeactivatedProviderSignIn answers a provider sign-in to a deactivated
+// account as password sign-in answers one: back to the sign-in page with the
+// message a wrong password gets, and no session.
+func refuseDeactivatedProviderSignIn(w http.ResponseWriter, r *http.Request, app *App, email, provider string) {
+	log.Printf("OAuth login rejected for %s: the account is deactivated (provider %s)", logAddressRef(email), provider)
+	authRedirect(w, r, app.Paths.Login, "Invalid credentials")
+}
 
 var errAuthSignupDisabled = errors.New("auth: self-service signup is disabled")
 

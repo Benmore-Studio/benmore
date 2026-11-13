@@ -84,7 +84,8 @@ func TestWriteCheckStaleMCPReviewIsAWarning(t *testing.T) {
 	if f, ok := stale(write); !ok || f.Severity != "warning" || write.Errors != 0 {
 		t.Fatalf("schema write: stale review %+v present=%v errors=%d", f, ok, write.Errors)
 	}
-	if f, ok := stale(runCheck(dir, "", false)); !ok || f.Severity != "error" {
-		t.Fatalf("benmore check must keep reporting the stale review as an error: %+v %v", f, ok)
+	// The whole-app check agrees: it is a warning of its own class there too.
+	if f, ok := stale(runCheck(dir, "", false)); !ok || f.Severity != "warning" || f.Source != "mcp_review" {
+		t.Fatalf("the source check must report the stale review as an mcp_review warning: %+v %v", f, ok)
 	}
 }

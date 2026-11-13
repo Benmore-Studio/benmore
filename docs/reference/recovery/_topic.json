@@ -22,6 +22,7 @@
     "restore_code_mismatch",
     "database_restore",
     "restore_audit_rows",
+    "restore_roles",
     "archive_deploy",
     "lifecycle_coordination",
     "startup_checks",

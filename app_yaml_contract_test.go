@@ -67,6 +67,9 @@ func TestAppYAMLAcceptsEveryRuntimeAuthKey(t *testing.T) {
 		if key == "session_duration" {
 			value = "7d" // a duration or whole days, checked at write time
 		}
+		if key == "identifier" {
+			value = "username" // one of three words, checked at write time
+		}
 		if msg := validateAppYAML("site_name: x\nauth:\n  " + key + ": \"" + value + "\"\n"); strings.Contains(msg, "auth."+key) {
 			t.Errorf("auth.%s refused: %s", key, msg)
 		}

@@ -25,6 +25,10 @@ package main
 //     sessions or tokens. A login identifier of theirs that now belongs to a
 //     live account is cleared.
 //   - Login-attempt lockout state is the live state.
+//   - Roles are never above the live ones (restore_roles.go): a primary role
+//     or role grant taken away since the snapshot stays taken away, and an
+//     account deleted since comes back with the default role and no grants.
+//     An account the live database never held keeps the snapshot's roles.
 //   - MCP connector grants, their access/refresh credentials and pending
 //     authorizations (_benmore_mcp_*) are the live rows, wholesale
 //     (carryForwardMCPGrants): a revoked grant stays revoked, a used refresh
@@ -37,9 +41,9 @@ package main
 //
 // If the live database cannot be read (the usual reason for a restore is a
 // damaged one) or does not exist, nothing is known to be live: every session,
-// token and grant in the snapshot is deleted and account credentials stay as
-// the snapshot has them; MCP grants are marked revoked and their credentials
-// and authorizations deleted. The summary says which mode ran.
+// token and grant in the snapshot is deleted and account credentials and
+// roles stay as the snapshot has them; MCP grants are marked revoked and their
+// credentials and authorizations deleted. The summary says which mode ran.
 //
 // refresh-dev's copy of production gets that last mode before it leaves the
 // helper's private directory (revokeCopiedCredentials): dev is a different
@@ -102,6 +106,9 @@ type restoreCredentialSummary struct {
 	// (restore_credentials_audit.go). nil for a refresh-dev copy: another
 	// instance's database has no history of this one.
 	AuditRows *restoreAuditRowsSummary `json:"audit_rows,omitempty"`
+	// Roles reports what happened to primary roles and role grants
+	// (restore_roles.go). nil for a refresh-dev copy, which keeps its own.
+	Roles *restoreRoleSummary `json:"roles,omitempty"`
 }
 
 // restoreUserIdentityColumns are login identifiers: whoever holds one live
@@ -265,7 +272,6 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		if summary.Queue, err = carryForwardRestoreQueue(ctx, tx, livePath, live != nil); err != nil {
 			return nil, fmt.Errorf("queued work: %w", err)
 		}
-		// The record of the credential changes carried above.
 		skipped := ""
 		switch summary.Mode {
 		case restoreCredentialsUnreadable:
@@ -273,6 +279,12 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		case restoreCredentialsNoLive:
 			skipped = restoreAuditSkippedNoLive
 		}
+		// Authorization follows the credentials: no role comes back that the
+		// live database no longer holds.
+		if summary.Roles, err = carryForwardRestoreRoles(ctx, tx, live, pairs, skipped); err != nil {
+			return nil, fmt.Errorf("roles: %w", err)
+		}
+		// The record of the credential changes carried above.
 		if summary.AuditRows, err = carryForwardRestoreAudit(ctx, tx, livePath, skipped); err != nil {
 			return nil, fmt.Errorf("audit rows: %w", err)
 		}
@@ -301,6 +313,9 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		action, summary.Mode, summary.UsersMatched, summary.UsersUpdated, summary.UsersSnapshotOnly, summary.Kept, summary.Removed)
 	if q := summary.Queue; q != nil {
 		log.Printf("%s: queued work in the snapshot: %v already finished live and kept finished, %v held (not run again), %v left to run", action, q.Finished, q.Held, q.Waiting)
+	}
+	if r := summary.Roles; r != nil {
+		log.Printf("%s: %s", action, r.logLine())
 	}
 	if a := summary.AuditRows; a != nil {
 		log.Printf("%s: %d audit rows of account and credential events newer than the snapshot copied from the live database%s", action, a.Carried, a.note())
@@ -347,6 +362,9 @@ func readLiveCredentialState(ctx context.Context, livePath string) (map[string]*
 	if err := read("_benmore_users", restoreUserColumns()); err != nil {
 		return nil, err
 	}
+	if err := read(restoreRoleGrantsTable, nil); err != nil {
+		return nil, err
+	}
 	for _, spec := range restoreGrantTables {
 		if err := read(spec.name, nil); err != nil {
 			return nil, err
@@ -368,12 +386,14 @@ func readLiveCredentialState(ctx context.Context, livePath string) (map[string]*
 	if err := read(mcpArtifactsTable, nil); err != nil {
 		return nil, err
 	}
+	readLiveAccountEvidence(ctx, conn, state)
 	return state, nil
 }
 
-// restoreUserColumns are the account columns the carry-forward reads.
+// restoreUserColumns are the account columns the carry-forward reads. The
+// primary role is read for carryForwardRestoreRoles and never copied as it is.
 func restoreUserColumns() []string {
-	cols := []string{"id", "created_at"}
+	cols := []string{"id", "created_at", restoreRoleColumn}
 	cols = append(cols, restoreUserIdentityColumns...)
 	return append(cols, restoreUserCredentialColumns...)
 }

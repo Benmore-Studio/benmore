@@ -255,17 +255,34 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 		}
 		// The answer is what the DELETE did: it used to be "revoked" for a
 		// write that failed and for one that removed nothing.
-		res, err := app.DB.Exec("DELETE FROM _benmore_sessions WHERE id = ? AND user_id = ?", realID, session.UserID)
+		// The audit row is written with the delete. It names the session by
+		// the id the list shows, never by its stored key.
+		tx, err := app.DB.Begin()
+		if err != nil {
+			serverErrorJSON(w, r, app, "sessions", err, "revoke failed")
+			return
+		}
+		defer tx.Rollback()
+		res, err := tx.Exec("DELETE FROM _benmore_sessions WHERE id = ? AND user_id = ?", realID, session.UserID)
+		if err != nil {
+			serverErrorJSON(w, r, app, "sessions", err, "revoke failed")
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			// Listed a moment ago, gone now: it ended some other way.
+			invalidateRequestSession(r)
+			httpJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+			return
+		}
+		err = auditAccountEvent(tx, app, accountAuditSessionRevoked, targetHash, session, nil, map[string]any{"current": realID == session.ID})
+		if err == nil {
+			err = tx.Commit()
+		}
 		if err != nil {
 			serverErrorJSON(w, r, app, "sessions", err, "revoke failed")
 			return
 		}
 		invalidateRequestSession(r) // the revoked session may be this one
-		if n, err := res.RowsAffected(); err != nil || n == 0 {
-			// Listed a moment ago, gone now: it ended some other way.
-			httpJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
-			return
-		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": "revoked"})
 	})
 
@@ -748,7 +765,7 @@ func supportSessionOfBlockedCustomer(app *App, cookieValue string) (string, bool
 	var id string
 	err := app.DB.QueryRow(`SELECT s.id FROM _benmore_sessions s JOIN _benmore_users u ON u.id = s.user_id
 		WHERE s.id = ? AND COALESCE(s.is_impersonation, 0) = 1 AND datetime(s.expires_at) > datetime('now')
-		  AND (COALESCE(u.deactivated_at, '') <> '' OR COALESCE(u.password_change_required, 0) = 1)`, key).Scan(&id)
+		  AND (`+accountDeactivatedSQL("u")+` OR COALESCE(u.password_change_required, 0) = 1)`, key).Scan(&id)
 	if err != nil || id == "" {
 		return "", false
 	}

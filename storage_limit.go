@@ -296,32 +296,6 @@ func respondStorageFull(w http.ResponseWriter, app *App, err error) bool {
 	return true
 }
 
-// isDatabaseBusyError reports a write that could not get the database lock in
-// time (SQLITE_BUSY/SQLITE_LOCKED). The request itself was fine, so it must
-// not be reported as a 400 the client won't retry.
-func isDatabaseBusyError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var se sqlite3.Error
-	if errors.As(err, &se) {
-		return se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
-}
-
-// respondDatabaseBusy answers 503 with Retry-After for a lock timeout and
-// reports whether it did.
-func respondDatabaseBusy(w http.ResponseWriter, err error) bool {
-	if !isDatabaseBusyError(err) {
-		return false
-	}
-	w.Header().Set("Retry-After", "1")
-	httpJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "the database is busy, retry shortly"})
-	return true
-}
-
 // storageFullMessage is the one-line form for non-HTTP callers (MCP tools,
 // import state).
 func storageFullMessage(app *App) string {

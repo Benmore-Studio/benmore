@@ -212,11 +212,12 @@ var migrationSkipVerbs = map[string]bool{
 //   - nothing in it is the framework's or SQLite's (migrationReservedName):
 //     not the missing table, not the table of the missing column, and no
 //     other name the statement uses. Those tables are not something the
-//     schema lost. The start creates several of them after the migration
-//     files (password resets, role grants, the audit log), so a trigger on
-//     one or a statement that reads or writes one fails here although it ran
-//     on every database that already existed; skipping it would bring a new
-//     instance up without what the file put there. SQLite names one missing
+//     schema lost. The ones a file has a reason to name exist before the
+//     files (framework_tables_before_migrations.go); one that is missing here
+//     is a table this app does not get (a sign-in table of an app without
+//     sign-in) or one the start creates later, and skipping the statement
+//     would bring a new instance up without what the file put there, where
+//     an existing database has it. SQLite names one missing
 //     object per error, so a statement that also names a lost app column is
 //     judged by its names, not by which of the two SQLite met first.
 func (n *migrationNewDatabase) staleStatement(q sqlQuerier, stmt string, err error) (kind, missing string, ok bool) {

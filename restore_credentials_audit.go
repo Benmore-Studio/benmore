@@ -17,7 +17,9 @@ package main
 //     (restoreAuditTables). Every framework writer of an account, role or
 //     credential event names one of them: password_change,
 //     required_password_change, password_reset, the unverified-account claims,
-//     role_changed and the role_* grant events, the passkey_* events,
+//     role_changed and the role_* grant events, the passkey_* events, the
+//     account security events of account_audit.go (factor, backup code,
+//     address, API token, session),
 //     account_purge, impersonate, the act-as and tooling session events, the
 //     connector grant and credential events, what the admin panel and operator
 //     SQL write to those tables, and earlier restore_credentials rows. Rows of

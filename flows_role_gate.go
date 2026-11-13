@@ -123,3 +123,23 @@ func flowRoleAllowed(session *Session, role string) bool {
 	}
 	return false
 }
+
+// flowRoleNamesAdmin reports whether a flow's role gate names the app's
+// global admin: `admin` in any letter case, alone or in an any-of list. That
+// is the reading flowRoleAllowed gives the name. A gate that names other
+// roles only admits a global admin as well (IsAdmin passes every gate), but
+// it is not an admin flow: the admin panel's Tools page lists the flows
+// written for the admin, not every flow an admin could call. Text
+// flowRoleNames does not accept names no role.
+func flowRoleNamesAdmin(role string) bool {
+	names, ok := flowRoleNames(role)
+	if !ok {
+		return false
+	}
+	for _, name := range names {
+		if strings.EqualFold(name, "admin") {
+			return true
+		}
+	}
+	return false
+}

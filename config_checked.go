@@ -342,6 +342,16 @@ type appMCPReviewStaleError struct{ err error }
 func (e *appMCPReviewStaleError) Error() string { return e.err.Error() }
 func (e *appMCPReviewStaleError) Unwrap() error { return e.err }
 
+// appMCPReviewDigestStale reports whether err is a review whose digests no
+// longer match the source: nothing in the source is wrong, it has only to be
+// reviewed again. A command flow the runtime cannot compile also withholds
+// the connector, and is an error in that flow.
+func appMCPReviewDigestStale(err error) bool {
+	var stale *appMCPReviewStaleError
+	var compile *appMCPCommandCompileError
+	return errors.As(err, &stale) && !errors.As(err, &compile)
+}
+
 // Stage fallible configuration before opening/migrating a DB or retiring the
 // previous worker generation. Strict: a stale mcp.yaml review is an error.
 // Checks and review use this; startup and reload use loadServedRuntimeConfig.

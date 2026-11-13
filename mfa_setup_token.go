@@ -32,7 +32,7 @@ func mfaSetupAccountState(app *App, q mfaSetupQuerier, userID int64, issuedFor s
 	// Missing migration/trigger state must fail closed, including callers that
 	// predate checked startup migrations and ignored EnsureUsersTable's error.
 	err = q.QueryRow(`SELECT COALESCE(email,''), COALESCE(password_hash,''), COALESCE(created_at,''), COALESCE(password_change_required,0), COALESCE(mfa_setup_nonce,'')
-		FROM main._benmore_users WHERE id=? AND COALESCE(deactivated_at,'')=''
+		FROM main._benmore_users WHERE id=? AND `+accountActiveSQL("")+`
 		AND (SELECT COUNT(*) FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='_benmore_users'
 			AND name IN ('_benmore_mfa_setup_nonce_insert','_benmore_mfa_setup_nonce_reset'))=2`, userID).Scan(&email, &passwordHash, &created, &passwordChangeRequired, &nonce)
 	if err != nil || !validMFASetupNonce(nonce) || !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(issuedFor)) {

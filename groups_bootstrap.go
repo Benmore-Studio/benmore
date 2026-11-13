@@ -271,7 +271,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 	res, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		quoteIdent(orgTable), strings.Join(quoteIdents(writeFields), ", "), placeholders), writeArgs...)
 	if err != nil {
-		if respondStorageFull(w, app, err) {
+		if respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, "_groups create", err) {
 			return
 		}
 		// A missing parent the visibility check above does not cover.
@@ -327,7 +327,7 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		_, err = tx.Exec(memberSQL, mArgs...)
 	}
 	if err != nil {
-		if respondStorageFull(w, app, err) {
+		if respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, "_groups create", err) {
 			return
 		}
 		httpJSON(w, http.StatusBadRequest, map[string]any{
