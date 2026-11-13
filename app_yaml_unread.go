@@ -149,6 +149,14 @@ func appYAMLUnreadWarnings(content string) []string {
 			// An entry written as a string or a list (a role's scopes) has
 			// no keys.
 			entry, _ := body[name].(map[string]any)
+			if section.Section == "oauth" {
+				// The whole entry is skipped: one warning says so,
+				// instead of one per key that would be read elsewhere.
+				if msg := oauthBuiltInEntryWarning(name, body[name]); msg != "" {
+					out = append(out, msg)
+					continue
+				}
+			}
 			out = append(out, section.unreadKeys(section.Section+"."+name, entry)...)
 		}
 	}
@@ -221,4 +229,16 @@ func writeContentWarnings(path, content string) CheckReport {
 	}
 	findings = withFindingDocs(findings)
 	return CheckReport{Findings: findings, Warnings: len(findings)}
+}
+
+// dryRunChecksAfterSave is what a dry run of a write says about the checks
+// it did not run ("" for a path that has none of them): the warnings that
+// compare the file with the rest of the app read the app from disk, so they
+// come with the saved write and `benmore check`. Without it an accepted dry
+// run with no warnings read as "nothing to report".
+func dryRunChecksAfterSave(path string) string {
+	if cleanWritePath(path) != "app.yaml" {
+		return ""
+	}
+	return "This dry run judged app.yaml on its own. The warnings that compare it with the rest of the app (the tables and columns that access:, ws_rooms: and roles: name, and what the schema and the other files make of its settings) are not part of it: they come with the saved write (benmore push) and with `benmore check`."
 }

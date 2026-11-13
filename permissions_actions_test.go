@@ -105,7 +105,9 @@ func TestPermissionActionDenials(t *testing.T) {
 				// this test changes policy; the grant must be created while edits
 				// are still allowed by the ordinary sharing-authority gate.
 				realtimeFlush()
-				app.Access.rules["documents"][OpUpdate] = "off"
+				mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+					app.Access.rules["documents"][OpUpdate] = "off"
+				})
 			}
 			assertStatus(t, mux, http.MethodPatch, "/api/documents/1", peer, map[string]any{"title": "forbidden"}, want)
 			if got := gateScalar(t, app, `SELECT title FROM documents WHERE id=1`); got != "Private evidence" {

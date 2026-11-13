@@ -137,6 +137,9 @@ func appDataQueryError(ctx context.Context, err error) *appDataError {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return &appDataError{Code: "timeout", Message: err.Error()}
 	}
+	if errors.Is(err, errReadOnlyNamedJoinView) {
+		return appDataFail("rejected", "%s", err.Error())
+	}
 	return &appDataError{Code: "query_failed", Message: err.Error()}
 }
 

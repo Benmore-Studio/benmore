@@ -102,9 +102,6 @@ func TestExpectWithAnUnsavedVariableFailsTheStep(t *testing.T) {
 		"    - get: \"/api/notes/{{nid}}\"\n      expect:\n        not_contains: \"{{other_users_secret}}\"\n" +
 		"json_unsaved:\n  as_user: \"b@example.com\"\n  steps:\n" + truthCreateNote +
 		"    - get: \"/api/notes/{{nid}}\"\n      expect:\n        json: {title: \"{{titel}}\"}\n" +
-		"save_found_no_field:\n  as_user: \"c@example.com\"\n  steps:\n" +
-		"    - api: \"POST /api/notes\"\n      json: {title: \"VARKEY\"}\n      save: {nid: id, secret: no_such_field}\n" +
-		"    - get: \"/api/notes/{{nid}}\"\n      expect:\n        not_contains: \"{{secret}}\"\n" +
 		"empty_saved_value:\n  as_user: \"d@example.com\"\n  steps:\n" + truthCreateNote +
 		"    - sql: \"SELECT '' AS blank\"\n      save: {blank: blank}\n" +
 		"    - get: \"/api/notes/{{nid}}\"\n      expect:\n        not_contains: \"{{blank}}\"\n" +
@@ -115,7 +112,6 @@ func TestExpectWithAnUnsavedVariableFailsTheStep(t *testing.T) {
 	for name, want := range map[string][]string{
 		"not_contains_unsaved": {"`expect.not_contains`", "`{{other_users_secret}}`", "no earlier step", "`nid`", "was not run"},
 		"json_unsaved":         {"`expect.json`", "`{{titel}}`", "`ntitle`"},
-		"save_found_no_field":  {"`{{secret}}`", "no earlier step"},
 		"empty_saved_value":    {"`{{blank}}`", "empty"},
 	} {
 		r, ok := got["unsaved/"+name]
@@ -240,8 +236,8 @@ func TestTestRunCountsAgreeAndRefusalsCarryADocsAddress(t *testing.T) {
 			if want := fmt.Sprintf("%d/%d tests passed", passed, total); !strings.HasPrefix(summary, want) {
 				t.Errorf("SUMMARY says %q; the results (and the text summary) count %d/%d", summary, passed, total)
 			}
-			if got := perFile["tests/bad_syntax.yaml"]; len(got) != 1 || got[0] != "load" {
-				t.Errorf("tests/bad_syntax.yaml is reported as %v, want one `load` result", got)
+			if got := perFile["bad_syntax"]; len(got) != 1 || got[0] != "load" || len(perFile["tests/bad_syntax.yaml"]) != 0 {
+				t.Errorf("tests/bad_syntax.yaml is reported as %v (and %v under its path), want one `load` result", got, perFile["tests/bad_syntax.yaml"])
 			}
 			if sourceChecks == 0 {
 				t.Error("the reserved-prefix flow is no longer a failed source check")

@@ -2,29 +2,34 @@
 
 package main
 
-// What `compliance: hipaa` leaves to SQL the app writes itself, reported as
-// warnings by `benmore check` and by the check that follows a write.
+// What an app's own SQL does outside the generated API's controls, reported
+// as warnings by `benmore check` and by the check that follows a write.
 //
-// The hipaa controls cover the generated API. Two things a flow or hook does
-// with its own SQL sit outside them, and neither showed anywhere:
+// The audit log and the encrypted-field masks cover the generated API. Two
+// things a flow, hook or scheduled job does with its own SQL sit outside
+// them, and neither showed anywhere:
 //
 //   - a write (INSERT/UPDATE/DELETE of an app table) leaves no row in
-//     _benmore_audit_log; only the mutation pipeline records one. A job is
-//     named when it writes an app table and no step of it inserts an audit row
-//     (hipaaUnauditedWriteProblems), a hooks.yaml hook when no hook of the same
-//     event and table does (hipaaUnauditedHookProblems).
+//     _benmore_audit_log; only the mutation pipeline records one. Under
+//     `compliance: hipaa` a flow job is named when it writes an app table and
+//     no step of it inserts an audit row (hipaaUnauditedWriteProblems), a
+//     hooks.yaml hook when no hook of the same event and table does
+//     (hipaaUnauditedHookProblems), and a cron.yaml job with inline steps
+//     when none of them does (hipaaUnauditedCronProblems).
 //   - a SQL step's rows are decrypted for the flow and are not masked for the
 //     caller. A respond step is named when it returns a step's rows whole and
 //     that step selects `*` from a table with encrypted columns
-//     (hipaaWholeRowResponseProblems). The `<col>_blind` HMAC such a query
-//     also returns is left out of the response (flows_respond_blind_index.go),
-//     so the message names the clear columns only.
+//     (hipaaWholeRowResponseProblems), in every app with encrypted fields:
+//     the masks are not hipaa's. The `<col>_blind` HMAC such a query also
+//     returns is left out of the response (flows_respond_blind_index.go), so
+//     the message names the clear columns only.
 //
 // Both are warnings and neither is refused: deployed flows do both. The
 // written tables come from sqlWriteTargets, the lexer every other SQL check
 // uses.
 
 import (
+	"bytes"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -36,34 +41,40 @@ import (
 // auditLogTable is the table a flow inserts its own audit row into.
 const auditLogTable = "_benmore_audit_log"
 
-// hipaaFlowFindings reports both checks for a `compliance: hipaa` app: for the
-// flow file or hooks.yaml just written, or for every flow file and hooks.yaml
-// on a full check and after a write other files depend on (app.yaml is where
-// hipaa is switched on). An app without the key gets none.
+// hipaaFlowFindings reports both checks: for the flow file, hooks.yaml or
+// cron.yaml just written, or for all of them on a full check and after a
+// write other files depend on (app.yaml is where hipaa is switched on). The
+// audit advice is for a `compliance: hipaa` app (source compliance); the
+// whole-row warning for any app with encrypted fields (source encryption).
 func hipaaFlowFindings(dir, writtenPath string) []CheckFinding {
 	if dir == "" {
 		return nil
 	}
+	written := strings.ToLower(appRelativeFile(dir, writtenPath))
 	flowWrite := writtenPath != "" && (filepath.Base(writtenPath) == "flows.yaml" || isFlowsSubdirFile(writtenPath))
-	hooksWrite := writtenPath != "" && strings.EqualFold(appRelativeFile(dir, writtenPath), "hooks.yaml")
-	if writtenPath != "" && !flowWrite && !hooksWrite && !writeAffectsOtherFiles(writtenPath) {
+	hooksWrite := writtenPath != "" && written == "hooks.yaml"
+	cronWrite := writtenPath != "" && written == "cron.yaml"
+	if writtenPath != "" && !flowWrite && !hooksWrite && !cronWrite && !writeAffectsOtherFiles(writtenPath) {
 		return nil
 	}
 	appYAML := readAppFileOrNil(dir, "app.yaml")
-	if hipaa, err := appYAMLDeclaresHIPAA(appYAML); err != nil || !hipaa {
+	hipaa, err := appYAMLDeclaresHIPAA(appYAML)
+	hipaa = hipaa && err == nil
+	enc := parseEncryptedFieldsConfig(readAppFileOrNil(dir, "encrypted.yaml"), appYAML)
+	if !hipaa && (enc == nil || len(enc.Fields) == 0) {
 		return nil
 	}
 	var findings []CheckFinding
-	warn := func(file, problem string) {
-		// refusal_docs.go maps the source to the keys that state the two rules.
-		findings = append(findings, CheckFinding{Severity: "warning", Source: "compliance", File: file, Message: file + ": " + problem})
+	// refusal_docs.go maps each source to the key that states its rule.
+	warn := func(f CheckFinding) {
+		f.Severity, f.Message = "warning", f.File+": "+f.Message
+		findings = append(findings, f)
 	}
-	if !hooksWrite {
+	if !hooksWrite && !cronWrite {
 		files := []string{writtenPath}
 		if !flowWrite {
 			files = flowFilesFor(dir, "")
 		}
-		enc := parseEncryptedFieldsConfig(readAppFileOrNil(dir, "encrypted.yaml"), appYAML)
 		for _, rel := range files {
 			data, err := readFileInRoot(dir, rel)
 			// An approved command's writes are recorded by its own sealed
@@ -71,24 +82,40 @@ func hipaaFlowFindings(dir, writtenPath string) []CheckFinding {
 			if err != nil || commandDeclarationPresent(string(data)) {
 				continue
 			}
+			// Without hipaa only the whole-row check runs, and a file with
+			// no `*` cannot raise it: an app with hundreds of flows is not
+			// decoded whole for it.
+			if !hipaa && !bytes.Contains(data, []byte("*")) {
+				continue
+			}
 			var file FlowFileGHA
 			if decodeConfigYAML(data, &file) != nil || file.Jobs == nil {
 				continue
 			}
 			name := filepath.ToSlash(rel)
-			for _, problem := range hipaaUnauditedWriteProblems(file) {
-				warn(name, problem)
+			if hipaa {
+				for _, problem := range hipaaUnauditedWriteProblems(file) {
+					warn(CheckFinding{Source: "compliance", File: name, Message: problem})
+				}
 			}
 			for _, problem := range hipaaWholeRowResponseProblems(file, enc) {
-				warn(name, problem)
+				warn(CheckFinding{Source: "encryption", File: name, Message: problem})
 			}
 		}
 	}
-	if !flowWrite {
+	if hipaa && !flowWrite && !cronWrite {
 		var hooks HooksYAML
 		if data := readAppFileOrNil(dir, "hooks.yaml"); data != nil && decodeConfigYAML(data, &hooks) == nil {
 			for _, problem := range hipaaUnauditedHookProblems(hooks) {
-				warn("hooks.yaml", problem)
+				warn(CheckFinding{Source: "compliance", File: "hooks.yaml", Message: problem})
+			}
+		}
+	}
+	if hipaa && !flowWrite && !hooksWrite {
+		// A file that does not parse is the write gate's to report.
+		if cron, err := parseCronYAML(readAppFileOrNil(dir, "cron.yaml")); err == nil {
+			for _, problem := range hipaaUnauditedCronProblems(cron) {
+				warn(CheckFinding{Source: "compliance", File: "cron.yaml", Message: problem})
 			}
 		}
 	}
@@ -184,6 +211,45 @@ func hipaaUnauditedHookProblems(hooks HooksYAML) []string {
 				problems = append(problems, fmt.Sprintf("%s hook on %s writes %s with its own SQL and inserts no row into %s. %s Add a `sql:` entry under the same event and table that records it: %s.",
 					section.name, table, strings.Join(written, ", "), auditLogTable, hipaaUnauditedWriteRule, hipaaAuditRowColumns))
 			}
+		}
+	}
+	return problems
+}
+
+// hipaaCronAuditAdvice ends the message for a cron.yaml job. A schedule has
+// no signed-in caller, so the row names its actor as a literal.
+const hipaaCronAuditAdvice = "Add a `sql:` step to the job that records it (a job written as one `sql:` line becomes `run:` with two `sql:` steps): `INSERT INTO _benmore_audit_log (action, table_name, row_id, user_email, new_values) VALUES (...)`, with the actor written as a literal such as 'system:%s' (a schedule has no signed-in user) and the values of encrypted columns left out of new_values."
+
+// hipaaUnauditedCronProblems names each cron.yaml job whose inline SQL (its
+// `sql:` line, or the `sql:` steps of its `run:`/`steps:` list at any depth)
+// writes an app table while none of it inserts into _benmore_audit_log. A job
+// that names a flow runs that flow's steps, which the flow file's own check
+// covers. Jobs in file order (name order for the named-job shape).
+func hipaaUnauditedCronProblems(cfg *CronConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	var problems []string
+	for _, job := range cfg.Jobs {
+		var written []string
+		audited := false
+		var walk func(steps []FlowStep)
+		walk = func(steps []FlowStep) {
+			for _, s := range steps {
+				if s.SQL != "" {
+					tables, insertsAudit := hipaaSQLWrites(s.SQL)
+					written = appendFoldUnique(written, tables...)
+					audited = audited || insertsAudit
+				}
+				walk(s.Steps)
+				walk(s.ElseSteps)
+				walk(s.OnError)
+			}
+		}
+		walk(job.Steps)
+		if len(written) > 0 && !audited {
+			problems = append(problems, fmt.Sprintf("job %q writes %s with its own SQL and inserts no row into %s. %s "+hipaaCronAuditAdvice,
+				job.ID, strings.Join(written, ", "), auditLogTable, hipaaUnauditedWriteRule, job.ID))
 		}
 	}
 	return problems

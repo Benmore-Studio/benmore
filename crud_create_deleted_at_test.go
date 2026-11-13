@@ -31,10 +31,7 @@ import (
 func softDeleteCreateFixture(t *testing.T) (*App, *http.ServeMux, string, string) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	app := &App{Dir: dir, DB: db}
 	t.Cleanup(app.Shutdown)
 	prepareGateApp(t, app,

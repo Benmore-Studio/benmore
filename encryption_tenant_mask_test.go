@@ -91,7 +91,9 @@ func TestEncryptedUnmaskTenantRoleBoundToRow(t *testing.T) {
 	// No tenant metadata means no tenant-derived unmask, including public
 	// ungrouped tables. An explicit shared catalog retains its role contract.
 	assertTenantEncryptedRead(t, mux, sid, "/api/brokers/1", false, "acme-private-note")
-	app.Group.Shared = []string{"brokers"}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Group.Shared = []string{"brokers"}
+	})
 	assertTenantEncryptedRead(t, mux, sid, "/api/brokers/1", true, "acme-private-note")
 }
 
@@ -184,9 +186,11 @@ func TestEncryptedTenantBlindFiltersAndQueryScope(t *testing.T) {
 	}
 	// Mixed owner + tenant grants are a union: outside-tenant owner rows
 	// remain searchable exactly where explicit self unmask authorizes them.
-	def := app.Encrypted.Fields["projects"][0]
-	def.Roles = append(def.Roles, "self")
-	app.Encrypted.Fields["projects"][0] = def
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		def := app.Encrypted.Fields["projects"][0]
+		def.Roles = append(def.Roles, "self")
+		app.Encrypted.Fields["projects"][0] = def
+	})
 	if _, err := app.DB.Exec("UPDATE projects SET user_id=? WHERE id=2", uid); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +218,7 @@ func TestEncryptedUnmaskMissingDBFailsClosed(t *testing.T) {
 }
 
 func TestEncryptedUnmaskGlobalGrantOnTransactionAndUngroupedConnector(t *testing.T) {
-	app, _ := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	sid, uid := tenantMember(t, app, "global@example.com", "user", 1, "viewer")
 	if _, err := app.DB.Exec("INSERT INTO _benmore_user_roles (user_id,role) VALUES (?,'company_admin')", uid); err != nil {
 		t.Fatal(err)

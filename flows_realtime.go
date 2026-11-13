@@ -63,7 +63,28 @@ type flowWriteLog struct {
 	committed []func()
 	// reads are read-audit events of the run's transactional SQL, written
 	// once the transaction has ended, committed or not (flushFlowTxReadAudit).
-	reads []readAuditEntry
+	// sealed are the ones a hipaa run wrote inside its transaction
+	// (sealFlowTxReadAudit): durable only if it commits.
+	reads, sealed []readAuditEntry
+}
+
+// sealReads records the events written through the run's transaction.
+func (l *flowWriteLog) sealReads(entries []readAuditEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sealed = entries
+}
+
+// settleSealedReads ends the sealed events with their transaction: committed,
+// they are stored; otherwise they went with the rollback and are queued again
+// for the write after it.
+func (l *flowWriteLog) settleSealedReads(committed bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !committed {
+		l.reads = append(l.sealed, l.reads...)
+	}
+	l.sealed = nil
 }
 
 func (l *flowWriteLog) addReads(entries []readAuditEntry) {
@@ -236,11 +257,12 @@ func flowReturnedTenants(ctx *FlowContext, table string, rows []map[string]any) 
 	requestInput := len(ctx.RequestKeys) > 0
 	ctx.DataMu.Unlock()
 	app := ctx.App
-	if requestInput || app.Group == nil || app.Group.Key == "" {
+	group := app.groupConfig()
+	if requestInput || group == nil || group.Key == "" {
 		return nil
 	}
 	name, ok := flowAnnounceableTables(app)[strings.ToLower(table)]
-	if !ok || !hasColumn(app, name, app.Group.Key) {
+	if !ok || !hasColumn(app, name, group.Key) {
 		return nil
 	}
 	seen := map[string]bool{}
@@ -248,7 +270,7 @@ func flowReturnedTenants(ctx *FlowContext, table string, rows []map[string]any) 
 	for _, row := range rows {
 		found := false
 		for col, v := range row {
-			if !strings.EqualFold(col, app.Group.Key) {
+			if !strings.EqualFold(col, group.Key) {
 				continue
 			}
 			found = true
@@ -282,11 +304,13 @@ func sqlMayWrite(query string) bool {
 // the run durably wrote. committed reports whether the run's transaction (if
 // it had one) committed. Only app schema tables are announced - never
 // _benmore_*, sqlite_* or full-text shadow tables. It first writes the run's
-// deferred read-audit events, whether or not the transaction committed.
+// deferred read-audit events, whether or not the transaction committed
+// (those a hipaa run committed with its transaction are already stored).
 func announceFlowWrites(ctx *FlowContext, committed bool) {
 	if ctx == nil || ctx.App == nil || ctx.Writes == nil {
 		return
 	}
+	ctx.Writes.settleSealedReads(committed)
 	flushFlowTxReadAudit(ctx)
 	for _, fn := range ctx.Writes.takeCommitted(committed) {
 		fn()
@@ -373,8 +397,8 @@ func sessionlessWriteScope(ctx *FlowContext, table string) (groupID string, user
 		}
 	}
 	tenant := ""
-	if app.Group != nil && app.Group.Key != "" {
-		for _, key := range []string{"_group_id", app.Group.Key} {
+	if group := app.groupConfig(); group != nil && group.Key != "" {
+		for _, key := range []string{"_group_id", group.Key} {
 			if g := trusted(key); g != "" && g != "0" {
 				tenant = g
 				break
@@ -393,9 +417,10 @@ func sessionlessWriteScope(ctx *FlowContext, table string) (groupID string, user
 // mode decides the rest (realtimeAudienceFor).
 func triggeredWriteScope(app *App, table, tenant, owner string) (groupID string, userID int64, public bool) {
 	hasUID := hasColumn(app, table, "user_id")
-	grouped := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-	if app.Access != nil {
-		if mode := app.Access.ModeFor(table, "read", hasUID, grouped); mode == "anon" || mode == "everyone" {
+	group := app.groupConfig()
+	grouped := group != nil && group.Key != "" && hasColumn(app, table, group.Key)
+	if access := app.accessConfig(); access != nil {
+		if mode := access.ModeFor(table, "read", hasUID, grouped); mode == "anon" || mode == "everyone" {
 			return "", 0, true
 		}
 	}

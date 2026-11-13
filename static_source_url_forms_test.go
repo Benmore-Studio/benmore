@@ -220,9 +220,11 @@ jobs:
 		t.Fatal(err)
 	}
 	// The mux is already built, so the job worker reads app.Flows.
-	app.mu.Lock()
-	app.Flows = append(app.Flows, flows...)
-	app.mu.Unlock()
+	mux = rebuildTestMux(t, app, false, "https://fixture.example.com", func() {
+		app.mu.Lock()
+		app.Flows = append(app.Flows, flows...)
+		app.mu.Unlock()
+	})
 	invalidateStaticTreeVersion(app.Dir)
 	const longS = "%C5%BF"
 	for _, spelled := range []string{
@@ -420,10 +422,12 @@ func TestReviewedAppRefusesSourceAtTheRootLikeStatic(t *testing.T) {
 // naming one there serves the generated worker instead.
 func TestServiceWorkerNeverServesAComputeModule(t *testing.T) {
 	app, _ := sourceFormsApp(t)
+	quiesceTestApp(t, app)
 	app.Design = &DesignConfig{PWA: map[string]string{"service_worker": "/static/server/plain.js"}, SEO: map[string]string{"site_name": "X"}}
 	if body, _ := serveSW(t, app); strings.Contains(body, "MARKER") || body != GenerateServiceWorker(app) {
 		t.Errorf("/sw.js served the compute module:\n%s", body)
 	}
+	quiesceTestApp(t, app)
 	app.Design.PWA["service_worker"] = "/static/assets/x.js"
 	if body, _ := serveSW(t, app); !strings.Contains(body, "ordinary-asset-js") {
 		t.Errorf("/sw.js did not serve the app's own worker:\n%s", body)

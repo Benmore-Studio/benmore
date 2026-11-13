@@ -95,8 +95,10 @@ func encryptedComputeProblems(src loadRefSource) []encryptedComputeProblem {
 	fromFile := parseEncryptedFieldsConfig(encData, nil)
 	encrypted := map[string]map[string]string{}
 	declaredIn := map[string]string{}
+	declaredAs := map[string]string{}
 	for table, defs := range enc.Fields {
 		t := sqliteIdentifierFold(table)
+		declaredAs[t] = table
 		if encrypted[t] == nil {
 			encrypted[t] = map[string]string{}
 		}
@@ -142,6 +144,21 @@ func encryptedComputeProblems(src loadRefSource) []encryptedComputeProblem {
 			})
 		}
 	}
+	// The reads above are the authorizer's, and a join by column name is not
+	// reported to it (sql_named_join.go): such a join on an encrypted table
+	// is a problem of its own, whatever else the field reads.
+	namedJoin := func(file, id, label, text string) {
+		name := sqlNamedJoinTouches(text, func(name string) bool { return declaredAs[sqliteIdentifierFold(name)] != "" })
+		if name == "" {
+			return
+		}
+		t := sqliteIdentifierFold(name)
+		out = append(out, encryptedComputeProblem{
+			file:    file,
+			key:     id + ":named-join:" + t,
+			message: fmt.Sprintf("%s: %s joins by column name (USING or NATURAL) in a statement that names %s, which %s encrypts. Which columns such a join reads cannot be checked: write the join with ON.", file, label, declaredAs[t], declaredIn[t]),
+		})
+	}
 	if computed != nil {
 		for _, table := range slices.Sorted(maps.Keys(computed.Fields)) {
 			for _, column := range slices.Sorted(maps.Keys(computed.Fields[table])) {
@@ -153,10 +170,12 @@ func encryptedComputeProblems(src loadRefSource) []encryptedComputeProblem {
 				if cf.Expr != "" {
 					reads := compiler.exprReads(cf.Table, cf.Column, encryptedComputeAnalysisSQL(cf.Expr))
 					report("computed.yaml", "computed-expr:"+field, fmt.Sprintf("%s.%s (expr)", cf.Table, cf.Column), reads, cf.Table, cf.Column)
+					namedJoin("computed.yaml", "computed-expr:"+field, fmt.Sprintf("%s.%s (expr)", cf.Table, cf.Column), cf.Expr)
 				}
 				if cf.SQL != "" && len(cf.Triggers) > 0 {
 					reads := compiler.statementReads(encryptedComputeAnalysisSQL(cf.SQL))
 					report("computed.yaml", "computed-sql:"+field, fmt.Sprintf("%s.%s (sql)", cf.Table, cf.Column), reads, "", "")
+					namedJoin("computed.yaml", "computed-sql:"+field, fmt.Sprintf("%s.%s (sql)", cf.Table, cf.Column), cf.SQL)
 				}
 			}
 		}
@@ -164,6 +183,7 @@ func encryptedComputeProblems(src loadRefSource) []encryptedComputeProblem {
 	for _, name := range slices.Sorted(maps.Keys(aggregates)) {
 		reads := compiler.statementReads(encryptedComputeAnalysisSQL(aggregates[name]))
 		report("app.yaml", "aggregate:"+name, "aggregate "+name, reads, "", "")
+		namedJoin("app.yaml", "aggregate:"+name, "aggregate "+name, aggregates[name])
 	}
 	return out
 }

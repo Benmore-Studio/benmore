@@ -27,7 +27,7 @@ import (
 var crudWritePipeline = []string{
 	"requireAPIAuth", "requireAPIAuthForOp", "handleCreate", "handleUpdate", "handleRestore", "handleDelete", "handleSingletonUpdate",
 	"handleBatchCreate", "handleBatchUpdate", "handleBatchDelete", "handleStreamingIngest",
-	"executeCRUDTransaction", "txInsert", "txUpdate", "txUpdateMode", "txDelete", "validateTxMutation",
+	"executeCRUDTransaction", "txInsert", "txUpdate", "txUpdateMode", "txDelete", "validateTxMutation", "validateTxUpdate",
 	"applyCanonicalUpdateTxContextMode", "handleTransition", "cascadeSoftDelete",
 	"txInsertWithPlan", "newInsertPlan", "txDeleteRow", "validateTxMutationRules", "protectedUpdateFields",
 	"cascadeSoftDeleteChildren", "transitionEffectsTx",
@@ -85,6 +85,8 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"whenHolds":                      {[]string{"evaluateWhen"}, "transition and hook when: conditions"},
 	"transitionEventRow":             {[]string{"transitionEventRow"}, "a transition's when: is judged over the same row on both paths: the stored row, old_<column> and the actor's session keys"},
 	"rowWithOldValues":               {nil, "plumbing: adds old_<column> to a transition's event row; a command's update rows carry the same before-image"},
+	"withPreviousValues":             {[]string{"withPreviousValues"}, "a before_update hook reads old_<column> from the pre-write row on both paths, in when: and in its SQL placeholders"},
+	"workflowTransitionDenialFor":    {[]string{"appMCPCommandScopes"}, "the transition route's table-level gates (write scope, the update rule; a command-owned state column moves only through its command): the declared write permissions must be held by the grant and the actor's current role"},
 	"injectSessionContext":           {[]string{"injectSessionContext"}, "hook, validator and effect rows carry the trusted actor context"},
 	"markSubmittedFields":            {[]string{"markSubmittedFields"}, "{{_submitted}} for before-hooks and validators"},
 	"encryptedDefFor":                {[]string{"commandVerifiedTriggerFunction", "maskEncryptedFieldsWith"}, "encryption triggers run inside the command statement; reads use the shared per-row unmask policy through the command transaction"},
@@ -110,6 +112,7 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"memberOfAutoJoins":              {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
 	"memberOfRepointDenialWith":      {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
 	"rowScopeClause":                 {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
+	"workflowRowQuery":               {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
 	"canAccessRowScoped":             {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
 	"txAuthorizedRow":                {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
 	"txAuthorizedRowMode":            {[]string{"appMCPCompareCommandDependencies"}, commandParityAuthored},
@@ -155,7 +158,9 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"discardStoredUpload":          {nil, "removes files a refused HTTP multipart create stored; commands cannot upload, so they store none"},
 	"createTakesFileField":         {nil, "decides which file parts of an HTTP multipart create are stored; commands take no multipart body"},
 	"columnNamed":                  {nil, "names an unstored file part of an HTTP multipart create in X-Stripped-Fields; commands take no multipart body"},
-	"multipartRequest":             {nil, "picks the hint of an HTTP update that read no field from a multipart body; commands take no multipart body"},
+	"multipartRequest":             {nil, "tells an HTTP update that its body is multipart (read by readMultipartTextFields, and the hint when it carried no text field); commands take no multipart body"},
+	"readMultipartTextFields":      {nil, "HTTP multipart decoding only (text fields into the form for every credential, file parts read past and never stored); command inputs arrive in the connector call, not as a form"},
+	"answerMultipartReadError":     {nil, "HTTP status mapping only (413 + the limit, or 400) for a multipart body that could not be read; commands take no multipart body"},
 	"validateCSRF":                 {nil, "approval is a session-bound CSRF-checked POST; _commit is an authenticated connector call, not a cookie request"},
 	"isBearerAuth":                 {nil, "approval is a session-bound CSRF-checked POST; _commit is an authenticated connector call, not a cookie request"},
 	"Increment":                    {nil, "usage metering only, no enforcement; connector outcomes are counted by MCP telemetry"},
@@ -182,6 +187,7 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	"newInsertPlan":                     {nil, commandParityPipeline},
 	"validateTxMutation":                {nil, commandParityPipeline},
 	"validateTxMutationRules":           {nil, commandParityPipeline},
+	"validateTxUpdate":                  {nil, commandParityPipeline},
 
 	// queryNativeRowsWith's parts: NDJSON ingest reads each row back for its
 	// audit entry with the database key resolved once per request.
@@ -255,6 +261,9 @@ var crudGuardCommandParity = map[string]commandParityRule{
 	// Names the column behind a FOREIGN KEY failure the database already
 	// raised: it shapes that refusal and refuses nothing itself.
 	"foreignKeyConstraintDenial": {nil, commandParityPlumbing},
+	// Admin panel rules on the generic handlers (admin_read_only.go, user_identifier_update.go).
+	"userAddressRefusal":         {nil, "the address rule for a _benmore_users row made through the admin panel (sign-up's validator and the auth.domain gate); command SQL cannot write framework tables, so no command stores an account's address"},
+	"adminRefusedReadOnlyColumn": {nil, "admin.yaml read-only columns constrain the admin panel's own write route only (a request it marked); /api/<table>, flows and commands are the app's writes and are not limited by a panel setting"},
 }
 
 // packageCalls parses the package's non-test sources and returns, for the named

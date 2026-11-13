@@ -1382,10 +1382,7 @@ func auditValuesParam(values string) any {
 // that don't have an *App in scope (the retention worker logs only
 // metadata - counts, TTLs - so no encryption is needed).
 func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, newRow map[string]any) {
-	var config *EncryptedFieldConfig
-	if app != nil {
-		config = app.Encrypted
-	}
+	config := app.encryptedConfig()
 	var auditKey []byte
 	if app != nil && config != nil {
 		auditKey = cryptoKeyForQuerier(app.DB)
@@ -1414,10 +1411,7 @@ func LogAudit(app *App, action, table, rowID string, session *Session, oldRow, n
 // caller can roll back the mutation.
 func LogAuditTx(tx mutationTx, app *App, action, table, rowID string, session *Session, oldRow, newRow map[string]any) error {
 	var key []byte
-	var config *EncryptedFieldConfig
-	if app != nil {
-		config = app.Encrypted
-	}
+	config := app.encryptedConfig()
 	if config != nil {
 		var err error
 		key, err = cryptoKeyForQuerierMainChecked(tx)
@@ -1590,6 +1584,11 @@ func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": delegatedIdentityRefusal})
 			return
 		}
+		// Nor is it a table's data: a credential scoped for an integration
+		// would start receiving the account's notifications on its device.
+		if !requireAccountManagement(w, session) {
+			return
+		}
 		// Cookie sessions need CSRF: the JSON body is decoded whatever the
 		// content type, so a plain cross-site POST could otherwise register
 		// a device token on the visitor's account. Bearer (native) is exempt.
@@ -1628,6 +1627,9 @@ func registerDeviceRoutes(mux appRouteRegistrar, app *App) {
 		// every one).
 		if delegatedIdentitySession(app, session) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": delegatedIdentityRefusal})
+			return
+		}
+		if !requireAccountManagement(w, session) {
 			return
 		}
 		if !requireCSRF(w, r) {

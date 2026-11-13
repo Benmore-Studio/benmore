@@ -23,6 +23,10 @@ package main
 //
 // The same holds for the configured auth.identifier (phone, username) where
 // that, not the address, signs the account in.
+//
+// An admin's own address is not changed here at all (the email-change flow
+// proves the password and the new inbox), and an address written to any
+// account passes sign-up's rules (userAddressRefusal).
 
 import (
 	"database/sql"
@@ -30,10 +34,40 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // adminIdentifierProtectedCode is the refusal's stable code.
 const adminIdentifierProtectedCode = "admin_identifier_protected"
+
+// adminOwnEmailProtectedCode refuses an admin's edit of their own address.
+const adminOwnEmailProtectedCode = "admin_own_email_protected"
+
+// adminEmailRefusedCode refuses an address sign-up would not take.
+const adminEmailRefusedCode = "admin_email_refused"
+
+// userAddressRefusal judges an address a generic write is about to store on
+// a _benmore_users row by the rules sign-up applies: one plain mailbox
+// (validAuthEmail: a list, a display name or an invisible character made a
+// second mailbox ride along with every link mailed to the account), in a
+// domain auth.domain / auth.allow_emails admit. The value is judged as it
+// would be stored. No address (the column cleared) is not judged; nil when
+// the write may go on.
+func userAddressRefusal(app *App, table, address string) *updateRequestError {
+	if !identIs(table, "_benmore_users") || address == "" {
+		return nil
+	}
+	reason := ""
+	if !validAuthEmail(address) {
+		reason = "Enter a valid email address: one plain mailbox, with no spaces, list or display name."
+	} else if allowed, why := emailAllowedForApp(app, address); !allowed {
+		reason = strings.TrimSuffix(why, ".") + "."
+	}
+	if reason == "" {
+		return nil
+	}
+	return &updateRequestError{status: http.StatusUnprocessableEntity, code: adminEmailRefusedCode, message: reason + " Nothing was saved."}
+}
 
 // userSignInIdentifierColumns are the _benmore_users columns that select or
 // recover an account in this app: the address always, and the configured
@@ -62,7 +96,7 @@ func userIdentifierUpdate(tx *sql.Tx, q rowQuerier, app *App, actor *Session, ta
 	if err != nil || uid <= 0 {
 		return nil
 	}
-	changed := ""
+	changed, changedTo := "", ""
 	for _, col := range userSignInIdentifierColumns(app) {
 		submitted, ok := values[col]
 		if !ok {
@@ -81,7 +115,7 @@ func userIdentifierUpdate(tx *sql.Tx, q rowQuerier, app *App, actor *Session, ta
 			return updateInternalError(err)
 		}
 		if next != stored {
-			changed = col
+			changed, changedTo = col, next
 			break
 		}
 	}
@@ -100,6 +134,21 @@ func userIdentifierUpdate(tx *sql.Tx, q rowQuerier, app *App, actor *Session, ta
 				message: fmt.Sprintf("cannot change another admin's %s here: it signs that account in and receives its reset links and sign-in codes. "+
 					"That admin changes it from their own account; nothing was saved.", changed),
 			}
+		}
+	} else if changed == "email" {
+		// The caller's own address: the email-change flow asks for the
+		// current password and a link opened from the new inbox. Saved here
+		// it took neither, so a borrowed admin session moved the account.
+		return &updateRequestError{
+			status: http.StatusForbidden,
+			code:   adminOwnEmailProtectedCode,
+			message: "your own email is not changed in the admin panel: change it from your account settings (POST /settings/profile, or PATCH /api/_auth/profile with email and current_password), " +
+				"which checks your password and confirms the new inbox. Nothing was saved.",
+		}
+	}
+	if changed == "email" {
+		if refusal := userAddressRefusal(app, table, changedTo); refusal != nil {
+			return refusal
 		}
 	}
 	if err := revokePasswordCredentials(tx, uid); err != nil {

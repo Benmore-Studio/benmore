@@ -579,8 +579,8 @@ func wsReadLoop(client *wsClient, app *App) {
 				// joined, so gating here covers sends too. Rooms with no
 				// matching pattern keep the historical scope-bucket-only
 				// behavior.
-				if !wsRoomAuthorized(app, client, msg.Room) {
-					denied, _ := json.Marshal(wsServerMsg{Type: "error", Room: msg.Room, Body: "not a member of this room"})
+				if refusal := wsRoomRefusal(app, client, msg.Room); refusal != "" {
+					denied, _ := json.Marshal(wsServerMsg{Type: "error", Room: msg.Room, Body: refusal})
 					select {
 					case client.send <- denied:
 					default:
@@ -636,6 +636,18 @@ func wsReadLoop(client *wsClient, app *App) {
 				if !joined {
 					break
 				}
+				// Joining asked a scoped credential for the room's read
+				// scope; sending is a write (scoped_credential_routes.go).
+				if session, valid := client.principal.current(); valid {
+					if err := roomScopeError(app, session, msg.Room, "write"); err != nil {
+						denied, _ := json.Marshal(wsServerMsg{Type: "error", Room: msg.Room, Body: err.Error()})
+						select {
+						case client.send <- denied:
+						default:
+						}
+						break
+					}
+				}
 				broadcastToRoom(client, msg.Room, "message", msg.Payload)
 			case "ping":
 				pong, _ := json.Marshal(wsServerMsg{Type: "pong"})
@@ -661,11 +673,26 @@ func wsReadLoop(client *wsClient, app *App) {
 // pattern - and apps with no ws_rooms block - are authorized as
 // before. Admins bypass, matching CRUD scoping.
 func wsRoomAuthorized(app *App, client *wsClient, room string) bool {
+	return wsRoomRefusal(app, client, room) == ""
+}
+
+// wsRoomRefusal is why client may not be in room, "" when it may. A scoped
+// credential needs the read scope of the room's membership table before
+// membership is looked at (roomScopeError), on a join and on every message
+// relayed to it afterwards.
+func wsRoomRefusal(app *App, client *wsClient, room string) string {
+	const notMember = "not a member of this room"
 	session, valid := client.principal.current()
 	if !valid {
-		return false
+		return notMember
 	}
-	return roomMembershipAllowed(app, session, client.userID, room)
+	if err := roomScopeError(app, session, room, "read"); err != nil {
+		return err.Error()
+	}
+	if !roomMembershipAllowed(app, session, client.userID, room) {
+		return notMember
+	}
+	return ""
 }
 
 // roomMembershipAllowed applies the app's ws_rooms rules to a named room for

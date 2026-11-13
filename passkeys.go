@@ -659,8 +659,23 @@ func passkeyLogin(app *App) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		var (
+			pkID, userID int64
+			publicKey    []byte
+			signCount    int64
+			storedHandle string
+		)
+		var signInTx *sql.Tx
 		fail := func() {
+			// The failure and its audit row are written through the pool:
+			// end the sign-in's own transaction first, so they do not wait
+			// on the writer it holds.
+			if signInTx != nil {
+				signInTx.Rollback()
+			}
 			recordLoginAttempt(app.DB, ipKey, false)
+			// The account is named once the presented credential is found.
+			auditSignInRefused(app, "passkey", "invalid_passkey", userID, "")
 			passkeyJSONError(w, http.StatusUnauthorized, errPasskeySignIn.Error())
 		}
 		rawID, err := b64url(body.RawID)
@@ -671,12 +686,6 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			fail()
 			return
 		}
-		var (
-			pkID, userID int64
-			publicKey    []byte
-			signCount    int64
-			storedHandle string
-		)
 		if err := app.DB.QueryRow(`SELECT id, user_id, public_key, sign_count, COALESCE(user_handle, '') FROM _benmore_passkeys WHERE credential_id = ?`,
 			b64urlEncode(rawID)).Scan(&pkID, &userID, &publicKey, &signCount, &storedHandle); err != nil {
 			fail()
@@ -739,6 +748,7 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
+		signInTx = tx
 		requireVerified := 0
 		if app.Design != nil && app.Design.Auth["require_verified"] == "true" {
 			requireVerified = 1
@@ -773,7 +783,10 @@ func passkeyLogin(app *App) http.HandlerFunc {
 				return
 			}
 			if !needsEnrollment {
-				if sessionID, err = createSignInSessionTx(tx, userID, email, groupID, app.SessionDuration); err != nil {
+				if sessionID, err = createSignInSessionTx(tx, userID, email, groupID, app.SessionDuration); err == nil {
+					err = auditSignIn(tx, app, "passkey", userID, email)
+				}
+				if err != nil {
 					fail()
 					return
 				}

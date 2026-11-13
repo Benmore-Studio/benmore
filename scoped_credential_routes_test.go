@@ -38,6 +38,13 @@ func newScopedRoutesFixture(t *testing.T) *scopedRoutesFixture {
 
 func newScopedRoutesFixtureWith(t *testing.T, roles *RolesConfig) *scopedRoutesFixture {
 	t.Helper()
+	return newScopedRoutesFixtureConfigured(t, roles, nil)
+}
+
+// newScopedRoutesFixtureConfigured lets a test finish configuring the app
+// (features, a tenant key) before the mux and its workers exist.
+func newScopedRoutesFixtureConfigured(t *testing.T, roles *RolesConfig, configure func(*App)) *scopedRoutesFixture {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
@@ -100,6 +107,9 @@ func newScopedRoutesFixtureWith(t *testing.T, roles *RolesConfig) *scopedRoutesF
 			}
 			u.creds["token "+scopes] = secret
 		}
+	}
+	if configure != nil {
+		configure(app)
 	}
 	// Everything is configured before the mux (and its workers) exists.
 	f.mux = buildAppMux(app, false, "https://fixture.example.com")

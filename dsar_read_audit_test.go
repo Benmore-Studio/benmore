@@ -13,9 +13,12 @@ import (
 // per audited table in the export, query_type my_data. It recorded none, so
 // a full export of an audited table left no trace in /api/_audit/reads.
 func TestMyDataExportWritesReadAudit(t *testing.T) {
-	app, mux := newCrudScopeTestApp(t)
+	app := newCrudScopeApp(t)
 	EnsureAuditLogTable(app.DB)
 	app.Design = &DesignConfig{Auth: map[string]string{"read_audit": "notes"}}
+	// An app with an auth section has its sign-in routes, as a loaded app does.
+	app.Paths = DiscoverAuthPaths(nil)
+	mux := buildAppMux(app, true, "http://localhost")
 	InitReadAudit(app, false)
 	// notes rows 1 and 2 belong to user ids 1 and 2; this caller is user 1.
 	owner := createCrudScopeSession(t, app, "exporter@example.com", "user", "", "")

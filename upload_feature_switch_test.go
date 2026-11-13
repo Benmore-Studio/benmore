@@ -257,10 +257,13 @@ func TestOtherWritePathsStoreNoFile(t *testing.T) {
 // step refuses while uploads are off: no ownership row, no bytes.
 func TestUploadsSwitchOffRefusesPulledFile(t *testing.T) {
 	app := newGateApp(t)
+	// The ownership row names its user, and the served database settings
+	// enforce that reference.
+	uid, _ := gateUser(t, app, "puller@uploads.invalid")
 	path := "uploads/private/mcp/" + strings.Repeat("d", 64) + ".pdf"
 	content := []byte("%PDF-1.7 fixture")
 	store := func() error {
-		return appMCPStorePulledFile(app, Session{UserID: 42}, path, content, "application/pdf", hashBytesSHA256(content), "fixture_source", "fixture-id", "rev-1")
+		return appMCPStorePulledFile(app, Session{UserID: uid}, path, content, "application/pdf", hashBytesSHA256(content), "fixture_source", "fixture-id", "rev-1")
 	}
 	setUploadsFeature(app, false)
 	if err := store(); err == nil || !strings.Contains(err.Error(), "features.uploads: false") {

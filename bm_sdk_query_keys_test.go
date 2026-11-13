@@ -137,3 +137,27 @@ query.table('team_cards', opts);
 	roomRun(t, vm, `rowVersion = 2; emit({ table: 'team_cards', action: 'insert' }); advance(50);`)
 	roomWant(t, vm, `{last: versions(snaps).pop(), invalidated: query.invalidateTable('team_cards')}`, `{"last":2,"invalidated":["board"]}`)
 }
+
+// table(t, { background: true }) marks the read as polling (it does not count
+// as activity for auth.idle_timeout), like fetch and refetch. It used to be
+// treated as part of the query: sent to the server in the request, made part
+// of the cache key, and never applied, so the read counted as activity and a
+// subscriber to the same read without the option watched another entry.
+func TestBMQueryTableBackgroundIsAClientOption(t *testing.T) {
+	vm := bmQueryVM(t)
+	roomRun(t, vm, `
+var backgroundRuns = 0;
+inBackground = function (fn) { backgroundRuns++; return fn(); };
+var spec = { where: { team_id: 7 } };
+var snaps = [];
+query.subscribe(query.tableKey('team_cards', spec), function (s) { snaps.push(s); });
+query.table('team_cards', { where: { team_id: 7 }, background: true });
+`)
+	roomWant(t, vm, `{sent: posts.map(function (p) { return p.spec; }), background: backgroundRuns, rendered: versions(snaps).pop()}`,
+		`{"sent":[{"where":{"team_id":7},"table":"team_cards"}],"background":1,"rendered":1}`)
+	roomWant(t, vm, `query.key(query.tableKey('team_cards', { where: { team_id: 7 }, background: true }))`,
+		`"[\"query\",{\"table\":\"team_cards\",\"where\":{\"team_id\":7}}]"`)
+	// Without the option the read is ordinary activity.
+	roomRun(t, vm, `query.table('team_cards', { where: { team_id: 7 }, force: true });`)
+	roomWant(t, vm, `{reads: posts.length, background: backgroundRuns}`, `{"reads":2,"background":1}`)
+}

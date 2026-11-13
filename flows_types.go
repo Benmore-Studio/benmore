@@ -559,8 +559,9 @@ type FlowRespondHeader struct {
 
 // FlowContext holds execution state for a flow run.
 type FlowContext struct {
-	// readAuditErr: under compliance: hipaa, the post-transaction read-audit
-	// write failed (flushFlowTxReadAudit); the HTTP owner must not release rows.
+	// readAuditErr: under compliance: hipaa, a read-audit write of the run's
+	// transaction failed, inside it (sealFlowTxReadAudit) or after it ended
+	// (flushFlowTxReadAudit); the HTTP owner must not release rows.
 	readAuditErr error
 	App          *App
 	Request      *http.Request

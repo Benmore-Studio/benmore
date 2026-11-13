@@ -30,26 +30,25 @@ func formFlagTrue(v string) bool {
 // only, which left API tokens, OAuth tokens, passkeys and role grants
 // pointing at a reusable id. The app's last usable durable admin gets
 // errLastDurableAdmin and nothing is deleted.
-func deleteOwnAccount(app *App, session *Session) error {
-	email, err := purgeOwnAccount(app, session)
+//
+// No app flow runs here, so once the erasure committed the private files the
+// account uploaded are removed as the operator delete removes them, unless
+// the app has an erasure flow of its own, which decides instead
+// (removeOwnAccountUploads); the outcome is returned for the answer.
+func deleteOwnAccount(ctx context.Context, app *App, session *Session) (ownAccountUploads, error) {
+	email, err := purgeOwnAccountWith(app, session, nil)
 	if err != nil {
-		return err
+		return ownAccountUploads{}, err
 	}
 	platformAccountDeleted(app, email)
-	return nil
+	return removeOwnAccountUploads(ctx, app, session.UserID), nil
 }
 
-// purgeOwnAccount is deleteOwnAccount without the platform step: it erases
-// the signed-in account in the app's own database and returns the address it
-// had. The hosted dashboard's Delete account calls it, then deletes the
-// control-plane account itself (platform_account_delete_dashboard.go).
-func purgeOwnAccount(app *App, session *Session) (string, error) {
-	return purgeOwnAccountWith(app, session, nil)
-}
-
-// purgeOwnAccountWith is purgeOwnAccount with an extra step run in the same
+// purgeOwnAccountWith erases the signed-in account in the app's own database
+// and returns the address it had, with an extra step run in the same
 // transaction once the row is a tombstone (the dashboard also empties its
-// own profile columns).
+// own profile columns). The caller removes the account's uploads afterwards
+// (removeOwnAccountUploads).
 func purgeOwnAccountWith(app *App, session *Session, extra func(tx *sql.Tx, userCols map[string]bool) error) (string, error) {
 	if app == nil || app.DB == nil || session == nil || session.UserID <= 0 {
 		return "", errors.New("no account")

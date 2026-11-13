@@ -3,11 +3,9 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,10 +18,7 @@ import (
 func shortWordSearchApp(t *testing.T) (mux *http.ServeMux, alice string) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, note TEXT, share_token TEXT, deleted_at DATETIME)`)
 	tables := []Table{{

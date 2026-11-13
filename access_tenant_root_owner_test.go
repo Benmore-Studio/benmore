@@ -109,7 +109,9 @@ func TestTenantRootOwnerColumnPreservesSelfAndViewer(t *testing.T) {
 	setTenantRootOwner(t, app, 2, uid)
 	assertListIDs(t, mux, viewer, "/api/companies", []float64{1})
 	assertStatus(t, mux, http.MethodPatch, "/api/companies/1", viewer, map[string]any{"name": "viewer-write"}, http.StatusForbidden)
-	app.Access = accessFromYAML(t, "access:\n  companies: self\n")
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access = accessFromYAML(t, "access:\n  companies: self\n")
+	})
 	assertListIDs(t, mux, viewer, "/api/companies", []float64{2})
 	assertStatus(t, mux, http.MethodGet, "/api/companies/1", viewer, nil, http.StatusNotFound)
 }

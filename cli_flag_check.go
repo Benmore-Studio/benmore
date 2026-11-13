@@ -203,6 +203,40 @@ func (s cliFlagSpec) check(args []string) ([]string, error) {
 	return out, nil
 }
 
+// cliFlagValueRefusal, when set, refuses the value given to one of cmd's
+// declared value flags. The hosted CLI sets it for --env (cli_flag_specs.go).
+var cliFlagValueRefusal func(cmd, flag, value string) error
+
+// eachFlagValue calls visit with every declared value flag in args and its
+// value, in order, up to a `--`, and returns the first error. args have
+// passed check, so each such flag has a value.
+func (s cliFlagSpec) eachFlagValue(args []string, visit func(flag, value string) error) error {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return nil
+		}
+		if !cliFlagToken(a) {
+			continue
+		}
+		name, value, hasValue := strings.Cut(a, "=")
+		if !s.valueFlags[name] {
+			continue
+		}
+		if !hasValue {
+			if i+1 >= len(args) {
+				return nil
+			}
+			i++
+			value = args[i]
+		}
+		if err := visit(name, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // positionals returns the arguments that are not flags, in order: the spec
 // tells a value flag's argument from a positional, so `<app> --env prod <x>`,
 // `--env=prod <app> <x>` and `<app> <x> --env prod` all give [<app>, <x>].
@@ -404,6 +438,9 @@ func cliPreflight(cmd string, args []string, stdout, stderr io.Writer) (out []st
 		return args, 0, false
 	}
 	out, err := spec.check(args)
+	if err == nil && cliFlagValueRefusal != nil {
+		err = spec.eachFlagValue(args, func(flag, value string) error { return cliFlagValueRefusal(cmd, flag, value) })
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "benmore %s: %s\n", cmd, err)
 		if names := spec.names(); len(names) > 0 {

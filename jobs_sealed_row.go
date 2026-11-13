@@ -40,11 +40,12 @@ func jobSealedRowColumn(table, key string) string { return table + "." + key }
 // jobRowSealedKeys lists the row keys holding an encrypted.yaml column of
 // table, or its old_ delta, with a non-null value.
 func jobRowSealedKeys(app *App, table string, row map[string]any) []string {
-	if app == nil || app.Encrypted == nil || table == "" || len(row) == 0 {
+	encrypted := app.encryptedConfig()
+	if encrypted == nil || table == "" || len(row) == 0 {
 		return nil
 	}
 	var cols []string
-	for name, defs := range app.Encrypted.Fields {
+	for name, defs := range encrypted.Fields {
 		if !strings.EqualFold(name, table) {
 			continue
 		}

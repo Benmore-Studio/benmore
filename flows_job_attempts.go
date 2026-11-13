@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"syscall"
 
@@ -58,17 +57,17 @@ func flowMaxAttemptsViolation(req *FlowRequestTrigger) string {
 // flowLoadedMaxAttempts is the run count a deployed file's
 // `on.request.max_attempts` gives: absent means one; a value out of range
 // (refused at write time) is clamped and logged so the file keeps loading.
-func flowLoadedMaxAttempts(raw *int, where string) int {
+func flowLoadedMaxAttempts(raw *int, where string, warn flowLoadWarn) int {
 	if raw == nil {
 		return 1
 	}
 	n := *raw
 	switch {
 	case n < 1:
-		log.Printf("WARNING: %s: on.request.max_attempts %d is under 1; its jobs run once", where, n)
+		warn.printf("WARNING: %s: on.request.max_attempts %d is under 1; its jobs run once", where, n)
 		return 1
 	case n > flowJobMaxAttemptsCap:
-		log.Printf("WARNING: %s: on.request.max_attempts %d is over the maximum %d; its jobs run at most %d times", where, n, flowJobMaxAttemptsCap, flowJobMaxAttemptsCap)
+		warn.printf("WARNING: %s: on.request.max_attempts %d is over the maximum %d; its jobs run at most %d times", where, n, flowJobMaxAttemptsCap, flowJobMaxAttemptsCap)
 		return flowJobMaxAttemptsCap
 	}
 	return n

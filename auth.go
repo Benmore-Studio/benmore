@@ -363,10 +363,6 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 		// Create impersonation session with 1-hour TTL (shorter than normal sessions)
 		groupID := ResolveGroupID(app.DB, app.Group, email)
 		impersonationDuration := 1 * time.Hour
-		impersonatedSessionID := CreateSession(app.DB, body.UserID, email, groupID, impersonationDuration)
-
-		AttachSessionContext(app.DB, impersonatedSessionID, r)
-
 		// Mark session as impersonation AND record the originating admin
 		// session id (H-13). end-impersonation will require the presented
 		// admin_token to equal this exact session - not merely "some valid
@@ -376,34 +372,48 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 		// the originating admin session is gone. Without the marker the
 		// session must not be handed out: its actions would read as the
 		// target's alone.
-		if impersonatedSessionID == "" {
-			serverErrorJSON(w, r, app, "impersonation", errors.New("the impersonation session could not be created"), "could not start impersonation")
-			return
-		}
-		if _, err := app.DB.Exec("UPDATE _benmore_sessions SET is_impersonation = 1, impersonator_session_id = ?, impersonator_user_id = ?, impersonator_email = ?, started_by_session_id = ? WHERE id = ?",
-			adminSessionID, session.UserID, session.Email, startedBy, sessionStorageKey(impersonatedSessionID)); err != nil {
-			DeleteSessionFromDB(app.DB, impersonatedSessionID)
+		// The session row, its marker and the audit row of who impersonated
+		// whom commit together: a support session whose audit row cannot be
+		// written is never created.
+		tx, err := app.DB.Begin()
+		if err != nil {
 			serverErrorJSON(w, r, app, "impersonation", err, "could not start impersonation")
 			return
 		}
-		// An UPDATE that matches no row is not an error, so read the marker
-		// back: a session row that does not carry it (and the admin's id) is
-		// deleted, never handed out as an ordinary session as the target.
-		var marked int
-		if err := app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id = ? AND is_impersonation = 1 AND impersonator_user_id = ?",
-			sessionStorageKey(impersonatedSessionID), session.UserID).Scan(&marked); err != nil || marked != 1 {
-			if err == nil {
+		defer tx.Rollback()
+		impersonatedSessionID, err := createSessionWith(tx, body.UserID, email, groupID, impersonationDuration)
+		if err == nil && impersonatedSessionID == "" {
+			err = errors.New("the impersonation session could not be created")
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE _benmore_sessions SET is_impersonation = 1, impersonator_session_id = ?, impersonator_user_id = ?, impersonator_email = ?, started_by_session_id = ? WHERE id = ?",
+				adminSessionID, session.UserID, session.Email, startedBy, sessionStorageKey(impersonatedSessionID))
+		}
+		if err == nil {
+			// An UPDATE that matches no row is not an error, so read the
+			// marker back: a session row that does not carry it (and the
+			// admin's id) is rolled back, never handed out as an ordinary
+			// session as the target.
+			var marked int
+			err = tx.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE id = ? AND is_impersonation = 1 AND impersonator_user_id = ?",
+				sessionStorageKey(impersonatedSessionID), session.UserID).Scan(&marked)
+			if err == nil && marked != 1 {
 				err = errors.New("the impersonation session row does not carry its marker")
 			}
-			DeleteSessionFromDB(app.DB, impersonatedSessionID)
+		}
+		if err == nil {
+			err = auditAccountEvent(tx, app, accountAuditImpersonate, fmt.Sprintf("%d", body.UserID),
+				session, nil, map[string]any{"impersonated_by": session.Email, "target_user": email})
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
 			serverErrorJSON(w, r, app, "impersonation", err, "could not start impersonation")
 			return
 		}
+		AttachSessionContext(app.DB, impersonatedSessionID, r)
 		invalidateRequestSession(r)
-
-		// Audit: log who impersonated whom
-		LogAudit(app, "impersonate", "_benmore_users", fmt.Sprintf("%d", body.UserID),
-			session, nil, map[string]any{"impersonated_by": session.Email, "target_user": email})
 
 		// Set the impersonation session cookie server-side (replaces admin
 		// session), under the name sign-in used: named by the request's
@@ -618,7 +628,15 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			// the UPDATE matches nothing: answering "acting_as"
 			// then left the caller with its cross-tenant bypass while it
 			// believed it was scoped to one tenant.
-			res, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = ? WHERE id = ?", target, session.ID)
+			// The audit row is written with the step-in: one whose row
+			// cannot be written does not happen.
+			tx, err := app.DB.Begin()
+			if err != nil {
+				serverErrorJSON(w, r, app, "act_as", err, "failed to set act_as")
+				return
+			}
+			defer tx.Rollback()
+			res, err := tx.Exec("UPDATE _benmore_sessions SET acting_as_group = ? WHERE id = ?", target, session.ID)
 			if err != nil {
 				serverErrorJSON(w, r, app, "act_as", err, "failed to set act_as")
 				return
@@ -627,10 +645,17 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				httpJSON(w, http.StatusBadRequest, map[string]any{"error": "step-in needs a sign-in session: an API token can't hold it (sign in, or exchange the password at POST /api/_auth/token for a session token)"})
 				return
 			}
+			err = auditAccountEvent(tx, app, accountAuditActAsStart, session.ID, session, nil,
+				map[string]any{"target_group_id": target, "admin_email": session.Email})
+			if err == nil {
+				err = tx.Commit()
+			}
+			if err != nil {
+				serverErrorJSON(w, r, app, "act_as", err, "failed to set act_as")
+				return
+			}
 			invalidateRequestSession(r)
 			log.Printf("act_as: admin user_id=%d stepped into group_id=%s", session.UserID, target)
-			LogAudit(app, "act_as_start", "_benmore_sessions", session.ID, session, nil,
-				map[string]any{"target_group_id": target, "admin_email": session.Email})
 			httpJSON(w, http.StatusOK, map[string]any{
 				"status":          "acting_as",
 				"acting_as_group": target,
@@ -671,7 +696,15 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 			// The audit row and "cleared" follow the UPDATE's result: they
 			// used to be written for a failed write, leaving a session that
 			// was told it had left the tenant still scoped to it.
-			res, err := app.DB.Exec("UPDATE _benmore_sessions SET acting_as_group = '' WHERE id = ?", session.ID)
+			// The audit row commits with the UPDATE; when it cannot be
+			// written the session stays scoped to the tenant and says so.
+			tx, err := app.DB.Begin()
+			if err != nil {
+				serverErrorJSON(w, r, app, "act_as", err, "failed to clear act_as")
+				return
+			}
+			defer tx.Rollback()
+			res, err := tx.Exec("UPDATE _benmore_sessions SET acting_as_group = '' WHERE id = ?", session.ID)
 			if err != nil {
 				serverErrorJSON(w, r, app, "act_as", err, "failed to clear act_as")
 				return
@@ -683,9 +716,16 @@ func registerAuthRoutes(mux appRouteRegistrar, app *App) {
 				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 				return
 			}
-			log.Printf("act_as: user_id=%d exited group_id=%s", session.UserID, prev)
-			LogAudit(app, "act_as_end", "_benmore_sessions", session.ID, session, nil,
+			err = auditAccountEvent(tx, app, accountAuditActAsEnd, session.ID, session, nil,
 				map[string]any{"prior_group_id": prev, "user_email": session.Email})
+			if err == nil {
+				err = tx.Commit()
+			}
+			if err != nil {
+				serverErrorJSON(w, r, app, "act_as", err, "failed to clear act_as")
+				return
+			}
+			log.Printf("act_as: user_id=%d exited group_id=%s", session.UserID, prev)
 			httpJSON(w, http.StatusOK, map[string]any{"status": "cleared"})
 		})
 	}

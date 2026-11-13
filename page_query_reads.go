@@ -108,7 +108,7 @@ func (q pinnedConnQuerier) QueryContext(ctx context.Context, query string, args 
 // queryPageRows runs one page query, recording its reads and applying the
 // policy to every row. The policy must be built before this: the connection is
 // held for the whole scan, so nothing in the row path may need another one.
-func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, guard *appSQLScope, query string, args ...any) ([]map[string]any, *pageQueryReads, error) {
+func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, guard *appSQLScope, protected func(name string) bool, query string, args ...any) ([]map[string]any, *pageQueryReads, error) {
 	// A page query is app-authored SQL (app_sql_guard.go). Its own authorizer
 	// below replaces the connection's default, so it applies the scope itself.
 	if err := guard.begin(query); err != nil {
@@ -121,6 +121,22 @@ func queryPageRows(parent context.Context, db *sql.DB, policy *pageQueryPolicy, 
 		return nil, nil, err
 	}
 	defer conn.Close()
+	// What the statement read is SQLite's answer, and a join by column name is
+	// not reported (sql_named_join.go), in the statement or in a view it reads.
+	// The views are read on this connection, before its reads are recorded.
+	if protected != nil {
+		views, err := sqlViewTexts(ctx, conn)
+		if err != nil {
+			return nil, nil, err
+		}
+		if name, viaView := sqlNamedJoinTouchesIn(sqlTextsRead(query, views), protected); name != "" {
+			objects := name + " (a framework table, or a table with encrypted fields, hidden columns or read auditing)"
+			if viaView {
+				return nil, nil, &appSQLRefusedError{reason: sqlNamedJoinViewRefusal("a page query", objects)}
+			}
+			return nil, nil, &appSQLRefusedError{reason: sqlNamedJoinRefusal("a page query", objects)}
+		}
+	}
 
 	reads := &pageQueryReads{}
 	// The driver keeps a registered callback until the connection closes, so
@@ -234,7 +250,8 @@ func (p *pageQueryPolicy) class() string {
 // which a cached result needs to audit later renders and to be invalidated.
 // A failed query returns its error and audits nothing.
 func runPageQuery(parent context.Context, app *App, r *http.Request, session *Session, policy *pageQueryPolicy, query string, args ...any) ([]map[string]any, []string, error) {
-	rows, reads, err := queryPageRows(parent, app.DB, policy, &appSQLScope{hipaa: app.hipaa()}, query, args...)
+	protected := func(name string) bool { return pageQueryReadMatters(app, name) }
+	rows, reads, err := queryPageRows(parent, app.DB, policy, &appSQLScope{hipaa: app.hipaa()}, protected, query, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -244,6 +261,43 @@ func runPageQuery(parent context.Context, app *App, r *http.Request, session *Se
 		return nil, nil, err
 	}
 	return rows, tables, nil
+}
+
+// pageQueryReadMatters reports a table whose reads this boundary acts on: a
+// framework table, and an app table with an encrypted field (its version
+// history too), a hidden column or read auditing. Which tables and columns a
+// statement read is SQLite's answer, and a join by column name is not reported
+// (sql_named_join.go): the read audit missed the table, a hidden column came
+// back, and a field decrypted in the SQL kept its value for a viewer the field
+// is masked for. A page query that holds such a join and names such a table is
+// refused, and so is one that reads a view whose text does; one over other
+// tables runs as before.
+func pageQueryReadMatters(app *App, name string) bool {
+	if sqlNamesFrameworkTable(name) {
+		return true
+	}
+	folded := sqliteIdentifierFold(name)
+	if app.Encrypted != nil {
+		for table := range app.Encrypted.Fields {
+			if folded == sqliteIdentifierFold(table) || folded == sqliteIdentifierFold(table+versionHistorySuffix) {
+				return true
+			}
+		}
+	}
+	for _, table := range app.Tables {
+		if folded != sqliteIdentifierFold(table.Name) {
+			continue
+		}
+		if IsReadAudited(app, table.Name) {
+			return true
+		}
+		for _, column := range table.Columns {
+			if apiHiddenColumn(app, table.Name, column.Name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // queryContext is the request's context, so a client that leaves cancels its

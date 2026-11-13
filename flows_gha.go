@@ -373,7 +373,27 @@ func loadOneGHAFile(path string) []Flow {
 	return flows
 }
 
+// flowLoadWarn receives the problems a deployed flow file loads with: what the
+// write gate warns about or refuses, and a file already on the server keeps
+// loading with. The load that will serve the app collects them and logs each
+// once (runtimeConfig.flowWarnings). Every other reader of the flow files
+// passes nil: the checks, which report the same problems as findings, and the
+// describe, inventory and scan tools. One start read the files three times
+// and one check twice, and each read logged every line again.
+type flowLoadWarn func(format string, args ...any)
+
+func (w flowLoadWarn) printf(format string, args ...any) {
+	if w != nil {
+		w(format, args...)
+	}
+}
+
+// parseGHAFlowFile parses one flow file and logs what it loads with.
 func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
+	return parseGHAFlowFileWarn(path, data, log.Printf)
+}
+
+func parseGHAFlowFileWarn(path string, data []byte, warn flowLoadWarn) ([]Flow, error) {
 	// Named command declarations have stricter raw-node admission than this
 	// compatibility decoder can provide. loadFlowsCheckedFromSources routes
 	// them through the command compiler before reaching the ordinary GHA parser.
@@ -398,23 +418,23 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	}
 	// Refused at write time; a deployed file keeps its lenient reading.
 	for _, problem := range flowTriggerProblems(file) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// A step id that is an identity name: accepted with a warning at write
 	// time; the caller's values win over its outputs.
 	for _, problem := range ghaIdentityStepIDWarnings(string(data)) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// Also refused at write time. A deployed file still loads, and the log
 	// names each expect_rows that is not the assertion its author wrote.
 	for _, problem := range flowExpectRowsProblems(string(data), file) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// Step keys the step's type does not read: refused at write time too,
 	// except those deployed apps carry, which only this log names.
 	refusedKeys, ignoredKeys := flowStepKeyProblems(string(data), file)
 	for _, problem := range append(refusedKeys, ignoredKeys...) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// Step values that cannot be sent as written (a refused response
 	// header, two bodies): refused at write time, dropped here with a log.
@@ -422,19 +442,19 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	// still runs, and is a warning at write time.
 	valueProblems, transactionalSends := flowStepValueFindings(file)
 	for _, problem := range append(valueProblems, transactionalSends...) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// A respond that answers something other than it reads as (no `with:`,
 	// two bodies, a body YAML does not read as text): a warning at write
 	// time too.
 	for _, problem := range respondShapeProblems(file) {
-		log.Printf("WARNING: %s: %s", path, problem)
+		warn.printf("WARNING: %s: %s", path, problem)
 	}
 	// Bounds declared on an input that is not a number are not checked: a
 	// warning at write time, since deployed files carry them.
 	if file.On.Request != nil {
 		for _, problem := range flowInputBoundsProblems(file.On.Request.Inputs) {
-			log.Printf("WARNING: %s: %s", path, problem)
+			warn.printf("WARNING: %s: %s", path, problem)
 		}
 	}
 	// Build the FlowTrigger from whichever `on:` shape was set.
@@ -483,20 +503,20 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 		}
 		secret = file.On.Request.Secret
 		transaction = file.On.Request.Transaction
-		auth = normalizeFlowAuth(file.On.Request.Auth, path)
+		auth = normalizeFlowAuth(file.On.Request.Auth, path, warn)
 		role = canonicalFlowRole(string(file.On.Request.Role))
 		permissions = file.On.Request.Permissions
 		async = strings.EqualFold(strings.TrimSpace(file.On.Request.Mode), "async")
 		rateLimit = parseRateLimit(file.On.Request.RateLimit)
-		maxAttempts = flowLoadedMaxAttempts(file.On.Request.MaxAttempts, path)
+		maxAttempts = flowLoadedMaxAttempts(file.On.Request.MaxAttempts, path, warn)
 		// Refused at write time when unreadable or out of range; a deployed
 		// file keeps the default limit (or the maximum) and logs it.
 		if d, err := parseFlowRequestTimeout(file.On.Request.Timeout); err != nil {
-			log.Printf("WARNING: %s: on.request.timeout %q: %s; using the default %s", path, file.On.Request.Timeout, err, flowTimeoutDefault)
+			warn.printf("WARNING: %s: on.request.timeout %q: %s; using the default %s", path, file.On.Request.Timeout, err, flowTimeoutDefault)
 		} else {
 			timeout = d
 			if max := flowRequestTimeoutMax(); d > max {
-				log.Printf("WARNING: %s: on.request.timeout %s is over the maximum %s; the flow runs with %s", path, d, max, max)
+				warn.printf("WARNING: %s: on.request.timeout %s is over the maximum %s; the flow runs with %s", path, d, max, max)
 			}
 		}
 		if verifyConfig != nil {
@@ -564,7 +584,7 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 // session only when one happened to be present. Anything that isn't an
 // explicit opt-out now requires sign-in, the same rule pages follow
 // (normalizePageAuth).
-func normalizeFlowAuth(auth, where string) string {
+func normalizeFlowAuth(auth, where string, warn flowLoadWarn) string {
 	// `auth: optional` (flows only): a signed-in caller gets the full
 	// identity of an auth-required flow, an anonymous one is let through.
 	if strings.EqualFold(strings.TrimSpace(auth), "optional") {
@@ -572,7 +592,7 @@ func normalizeFlowAuth(auth, where string) string {
 	}
 	norm, known := canonicalAuthValue(auth)
 	if !known {
-		log.Printf("WARNING flow %s: unknown auth=%q; treating it as auth: required", where, auth)
+		warn.printf("WARNING flow %s: unknown auth=%q; treating it as auth: required", where, auth)
 	}
 	return norm
 }

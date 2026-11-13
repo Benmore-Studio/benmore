@@ -4,6 +4,7 @@ package main
 
 import (
 	"maps"
+	neturl "net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -18,8 +19,9 @@ import (
 // Every response the framework builds strips it. A flow's `SELECT *`,
 // `t.*` or `RETURNING *` returned it in the step's rows, and a respond step
 // that passed the rows on sent it to every caller of the flow; a webhook,
-// api, email, sms, broadcast or notify step handed the rows sent it to
-// whoever receives those.
+// api, proxy, email, sms, broadcast, ws or notify step handed the rows sent
+// it to whoever receives those, and a redirect put it in the caller's
+// address bar.
 //
 // The step's rows are left alone: the steps of the flow read and bind the
 // value as before. What changes is what a respond step writes and what one
@@ -36,7 +38,15 @@ import (
 //     reference to `steps.x.outputs.first.<col>_blind` still resolves;
 //   - a form field or query parameter the step names like one is not sent
 //     (flowResponseDropsKey), and the whole flow context a webhook with no
-//     body posts loses them too (flowResponseContext).
+//     body posts loses them too (flowResponseContext);
+//   - a redirect target built from step values loses the query parameters
+//     named like one (flowResponseURL).
+//
+// A hooks.yaml delivery (webhook, email, sms, notify, ws) is rendered from
+// one event row, column by column: it reads the row without those keys and
+// their `old_` deltas (hookDeliveryRow), so a `{{<col>_blind}}` placeholder
+// is left as written, like a reference to a column the table does not have.
+// Hook SQL and `when:` read the row itself.
 //
 // A column that only ends in `_blind`, a blind value selected under another
 // name, and a single value referenced on its own under another key are the
@@ -46,11 +56,12 @@ import (
 // flowResponseBlindKeys is the lowercased set of `<col>_blind` names the app's
 // encrypted config declares, over every table.
 func flowResponseBlindKeys(app *App) map[string]bool {
-	if app == nil || app.Encrypted == nil {
+	encrypted := app.encryptedConfig()
+	if encrypted == nil {
 		return nil
 	}
 	var hidden map[string]bool
-	for table := range app.Encrypted.Fields {
+	for table := range encrypted.Fields {
 		for _, col := range blindIndexSiblingColumns(app, table) {
 			if hidden == nil {
 				hidden = map[string]bool{}
@@ -137,7 +148,8 @@ type flowResponseView struct {
 // for the caller, or what a delivery step sends) until the returned function
 // runs. It does nothing for an app with no blind index. Every step that
 // sends step data out calls it around the point where it builds what it
-// sends: respond, webhook, api, email, sms, broadcast, notify.
+// sends: respond, redirect, webhook, api, proxy, email, sms, broadcast, ws,
+// notify.
 func beginFlowResponse(ctx *FlowContext) (end func()) {
 	hidden := flowResponseBlindKeys(ctx.App)
 	if len(hidden) == 0 {
@@ -215,4 +227,63 @@ func flowResponseContext(ctx *FlowContext, data map[string]any) map[string]any {
 		}
 	}
 	return data
+}
+
+// flowResponseURL is a URL rendered from step values as a step may send the
+// caller to it: a query parameter named like a declared blind column is left
+// out. Every other byte of the URL is kept as rendered.
+func flowResponseURL(ctx *FlowContext, target string) string {
+	if ctx == nil || len(ctx.response.hidden) == 0 {
+		return target
+	}
+	start := strings.IndexByte(target, '?')
+	end := len(target)
+	if hash := strings.IndexByte(target, '#'); hash >= 0 {
+		end = hash
+	}
+	if start < 0 || start > end {
+		return target
+	}
+	pairs := strings.Split(target[start+1:end], "&")
+	kept := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		key, _, _ := strings.Cut(pair, "=")
+		if name, err := neturl.QueryUnescape(key); err == nil && flowResponseBlindKey(name, ctx.response.hidden) {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	switch len(kept) {
+	case len(pairs):
+		return target
+	case 0:
+		return target[:start] + target[end:]
+	}
+	return target[:start+1] + strings.Join(kept, "&") + target[end:]
+}
+
+// hookDeliveryRow is the event row as a hooks.yaml delivery reads it:
+// without the declared blind columns and the `old_<col>_blind` deltas an
+// update event carries. row is not modified; an app with no blind index gets
+// row itself.
+func hookDeliveryRow(app *App, row map[string]any) map[string]any {
+	hidden := flowResponseBlindKeys(app)
+	if len(hidden) == 0 {
+		return row
+	}
+	var sent map[string]any
+	for key := range row {
+		column, _ := strings.CutPrefix(key, "old_")
+		if !flowResponseBlindKey(key, hidden) && !flowResponseBlindKey(column, hidden) {
+			continue
+		}
+		if sent == nil {
+			sent = maps.Clone(row)
+		}
+		delete(sent, key)
+	}
+	if sent == nil {
+		return row
+	}
+	return sent
 }

@@ -160,8 +160,19 @@ func claimUnverifiedAccountAs(app *App, userID int64, email, action string) erro
 		return err
 	}
 	if mfaCols == 2 {
+		// The factor the registrant enrolled goes with the claim, and its
+		// removal gets a row of its own, naming the claim as the reason.
+		enrolled, err := accountMFAEnrolled(tx, userID)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec("UPDATE _benmore_users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?", userID); err != nil {
 			return err
+		}
+		if enrolled {
+			if err := auditMFARemovedBy(tx, app, userID, email, action); err != nil {
+				return err
+			}
 		}
 	}
 	if err := revokePasswordCredentials(tx, userID); err != nil {

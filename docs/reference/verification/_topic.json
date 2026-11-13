@@ -8,6 +8,7 @@
     "test_json_csrf",
     "test_workspace_copy",
     "yaml_resource_limits",
+    "yaml_syntax",
     "failure_report",
     "summary",
     "test_keys",

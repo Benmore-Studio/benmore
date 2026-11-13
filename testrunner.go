@@ -40,7 +40,7 @@ type AppTestFile struct {
 type AppTestCase struct {
 	Setup  []AppTestSetup `yaml:"setup"`
 	Steps  []AppTestStep  `yaml:"steps"`
-	Users  []string       `yaml:"users"` // pre-create these users before running steps (for multi-actor tests)
+	Users  []AppTestUser  `yaml:"users"` // pre-create these users before running steps (for multi-actor tests)
 	AsUser string         `yaml:"as_user"`
 	AsRole string         `yaml:"as_role"` // "admin" to create user with admin role (default: "user")
 	Anon   bool           `yaml:"anon"`    // true = no auth, no CSRF injection
@@ -160,6 +160,9 @@ type AppTestResult struct {
 	Message  string              `json:"message,omitempty"`
 	Duration string              `json:"duration,omitempty"`
 	Steps    []AppTestStepResult `json:"steps,omitempty"`
+	// Warnings are what the test did that its author may not have meant and
+	// that does not fail it (unsavedStepVarWarning).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // AppTestStepResult is the result of one step within a test.
@@ -267,12 +270,27 @@ func printTestResults(results []AppTestResult, asJSON bool) {
 		fmt.Println(string(b))
 		return
 	}
+	writeTestResults(os.Stdout, results)
+}
+
+// writeTestResults writes the text form of a run: the counts, then a line for
+// each result with what failed and what it warns about under it.
+func writeTestResults(w io.Writer, results []AppTestResult) {
 	total, passed := testResultCounts(results)
+	counts := fmt.Sprintf("test: %d/%d passed", passed, total)
 	if skipped := testResultSkipped(results); skipped > 0 {
-		fmt.Printf("test: %d/%d passed, %d skipped\n", passed, total, skipped)
-	} else {
-		fmt.Printf("test: %d/%d passed\n", passed, total)
+		counts += fmt.Sprintf(", %d skipped", skipped)
 	}
+	warnings := 0
+	for _, r := range results {
+		warnings += len(r.Warnings)
+	}
+	if warnings == 1 {
+		counts += ", 1 warning"
+	} else if warnings > 1 {
+		counts += fmt.Sprintf(", %d warnings", warnings)
+	}
+	fmt.Fprintln(w, counts)
 	for _, r := range results {
 		if r.File == "SUMMARY" && r.Test == "TOTAL" {
 			continue
@@ -286,22 +304,25 @@ func printTestResults(results []AppTestResult, asJSON bool) {
 			label = r.File + "/" + r.Test
 		}
 		if r.Skipped {
-			fmt.Printf("SKIP %s\n  %s\n", label, r.Message)
+			fmt.Fprintf(w, "SKIP %s\n  %s\n", label, r.Message)
 			continue
 		}
 		if r.Duration != "" {
-			fmt.Printf("%s %s (%s)\n", status, label, r.Duration)
+			fmt.Fprintf(w, "%s %s (%s)\n", status, label, r.Duration)
 		} else {
-			fmt.Printf("%s %s\n", status, label)
+			fmt.Fprintf(w, "%s %s\n", status, label)
 		}
 		if !r.Pass && r.Message != "" {
-			fmt.Printf("  %s\n", r.Message)
+			fmt.Fprintf(w, "  %s\n", r.Message)
 		}
 		for _, step := range r.Steps {
 			if step.Pass {
 				continue
 			}
-			fmt.Printf("  - %s: %s\n", step.Action, step.Message)
+			fmt.Fprintf(w, "  - %s: %s\n", step.Action, step.Message)
+		}
+		for _, warning := range r.Warnings {
+			fmt.Fprintf(w, "  WARNING: %s\n", warning)
 		}
 	}
 }
@@ -375,7 +396,8 @@ func loadTestFilesFromDisk(dir string) ([]AppTestFile, []AppTestResult) {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, []AppTestResult{unloadedTestFile("tests/", "cannot read the tests directory: "+fileErrorReason(err))}
+		return nil, []AppTestResult{{File: "tests/", Test: "load", Pass: false,
+			Message: withDocsLine("cannot read the tests directory: "+fileErrorReason(err), testFileLoadDocs)}}
 	}
 
 	var testFiles []AppTestFile
@@ -397,7 +419,7 @@ func loadTestFilesFromDisk(dir string) ([]AppTestFile, []AppTestResult) {
 		}
 
 		// A refused test's reason names its file: the result carries only the
-		// file's name without the directory and extension.
+		// file's name without the directory and extension (appTestFileName).
 		for testName, tc := range tests {
 			if tc.Problem != "" {
 				tc.Problem = rel + ": " + tc.Problem
@@ -405,8 +427,7 @@ func loadTestFilesFromDisk(dir string) ([]AppTestFile, []AppTestResult) {
 			}
 		}
 
-		name := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), ".yaml"), ".yml")
-		testFiles = append(testFiles, AppTestFile{Name: name, Tests: tests})
+		testFiles = append(testFiles, AppTestFile{Name: appTestFileName(rel), Tests: tests})
 	}
 
 	return testFiles, unloaded
@@ -419,10 +440,20 @@ func isAppTestFile(rel string) bool {
 	return path.Dir(rel) == "tests" && (strings.HasSuffix(rel, ".yaml") || strings.HasSuffix(rel, ".yml"))
 }
 
+// appTestFileName is how every result names the test file at the
+// app-relative path rel: the file's name without the directory and the
+// extension (tests/notes.yaml: notes). A file that did not load was named by
+// its path, so one run named its test files two ways.
+func appTestFileName(rel string) string {
+	name := path.Base(filepath.ToSlash(rel))
+	return strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
+}
+
 // unloadedTestFile is the failed result for a tests/ file that was not run.
-// File is the app-relative path, as for a source-check result.
+// Its message starts with the file's path, as the reason of a test that is
+// not run does.
 func unloadedTestFile(rel, problem string) AppTestResult {
-	return AppTestResult{File: rel, Test: "load", Pass: false, Message: withDocsLine(problem, testFileLoadDocs)}
+	return AppTestResult{File: appTestFileName(rel), Test: "load", Pass: false, Message: withDocsLine(rel+": "+problem, testFileLoadDocs)}
 }
 
 // Where the runner's own refusals are documented, as `benmore check` names
@@ -461,6 +492,7 @@ var appTestDecodeWords = strings.NewReplacer(
 	"[]main.AppTestStep", "a list of steps",
 	"main.AppTestStep", "a step (a mapping)",
 	"main.AppTestExpect", "an `expect:` mapping",
+	"[]main.AppTestUser", "a list of users",
 	"[]map[string]interface {}", "a list of mappings",
 	"map[string]interface {}", "a mapping",
 	"map[string]string", "a mapping of text values",
@@ -705,9 +737,15 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 	// up by email. They used to be created after it: a seed row owned by one
 	// (`(SELECT id FROM _benmore_users WHERE email = ...)`) got NULL.
 	userTokens := map[string]string{}
-	for _, email := range tc.Users {
-		if _, token, _ := loginTestUser(app, email, "user"); token != "" {
-			userTokens[testUserTokenVar(email)] = token
+	for _, user := range tc.Users {
+		// An entry that names a role gives the account that role, also when
+		// an earlier test of the run created it with another.
+		role := "user"
+		if user.Role != "" {
+			role = user.Role
+		}
+		if _, token, _ := loginTestUserAs(app, user.Email, role, user.Role != ""); token != "" {
+			userTokens[testUserTokenVar(user.Email)] = token
 		}
 	}
 
@@ -754,6 +792,9 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 		// `expect` is read from the step as written: a value another field
 		// received is never scanned for a second variable.
 		expect, expectProblem := substituteExpectVars(step.Expect, vars)
+		if warning := unsavedStepVarWarning(i+1, step, vars); warning != "" {
+			result.Warnings = append(result.Warnings, warning)
+		}
 		step = substituteVars(step, vars)
 		step.Expect = expect
 
@@ -773,6 +814,13 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 				}
 				anon = false
 			}
+			if len(step.Save) > 0 {
+				problem := withDocsLine(testSaveEntries(step.Save)+" saved nothing: a `set_auth:` step has no response to save from", testVariablesDocs)
+				result.Steps = append(result.Steps, AppTestStepResult{Action: "set_auth", Pass: false, Message: problem})
+				result.Pass = false
+				result.Message = fmt.Sprintf("Step %d failed: %s", i+1, problem)
+				break
+			}
 			result.Steps = append(result.Steps, AppTestStepResult{Action: "set_auth", Pass: true})
 			continue
 		}
@@ -784,14 +832,15 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 			break
 		}
 
-		stepResult, responseData := executeTestStepWithCapture(app, base, client, cookies, bearerToken, anon, step)
+		stepResult, response := executeTestStepWithCapture(app, base, client, cookies, bearerToken, anon, step)
 
-		// Extract save variables from response data
-		if responseData != nil && len(step.Save) > 0 {
-			for varName, fieldName := range step.Save {
-				if val, ok := responseData[fieldName]; ok && val != nil {
-					vars[varName] = fmt.Sprintf("%v", val)
-				}
+		// A step that passed saves its `save:` entries; one that saves
+		// nothing fails the step (saveTestStepVars). A step that failed
+		// reports its own failure.
+		if stepResult.Pass && len(step.Save) > 0 {
+			if problem := saveTestStepVars(step, response, vars); problem != "" {
+				stepResult.Pass = false
+				stepResult.Message = problem
 			}
 		}
 		result.Steps = append(result.Steps, stepResult)
@@ -806,30 +855,175 @@ func runSingleTest(app *App, base, fileName, testName string, tc AppTestCase) Ap
 	return result
 }
 
-// executeTestStepWithCapture runs a step and returns the response data as a map
-// for the step loop to extract save variables from.
-func executeTestStepWithCapture(app *App, base string, client *http.Client, cookies []*http.Cookie, bearerToken string, anon bool, step AppTestStep) (AppTestStepResult, map[string]any) {
-	// SQL steps
+// testStepResponse is what a step answered, for its `save:` entries: the
+// fields of a JSON object response or of the first row of an SQL step. With
+// no fields, NoFields says why.
+type testStepResponse struct {
+	Fields   map[string]any
+	NoFields string
+	Row      bool // the fields are the columns of a row
+}
+
+// executeTestStepWithCapture runs a step and returns its result and what it
+// answered, for the step loop to save variables from.
+func executeTestStepWithCapture(app *App, base string, client *http.Client, cookies []*http.Cookie, bearerToken string, anon bool, step AppTestStep) (AppTestStepResult, testStepResponse) {
+	// An SQL step saves from the first row its statement returns: a SELECT,
+	// or a write with RETURNING. The statement runs once.
 	if step.SQL != "" {
-		sqlResult := executeSQLTestStep(app, step)
-		upper := strings.TrimSpace(strings.ToUpper(step.SQL))
-		if strings.HasPrefix(upper, "SELECT") {
-			rows, err := QueryRows(app.DB, step.SQL)
-			if err == nil && len(rows) > 0 {
-				return sqlResult, rows[0]
-			}
+		sqlResult, rows := executeSQLTestStep(app, step)
+		if len(rows) == 0 {
+			return sqlResult, testStepResponse{NoFields: "the statement returned no rows"}
 		}
-		return sqlResult, nil
+		return sqlResult, testStepResponse{Fields: rows[0], Row: true}
+	}
+	if _, _, isRequest := testStepRequestLine(step); !isRequest {
+		result, _ := executeTestStepRaw(app, base, client, cookies, bearerToken, anon, step)
+		return result, testStepResponse{NoFields: "a `" + strings.SplitN(testStepLabel(step), ":", 2)[0] + ":` step has no response to save from"}
 	}
 
 	result, body := executeTestStepRaw(app, base, client, cookies, bearerToken, anon, step)
-	if len(body) > 0 {
-		var parsed map[string]any
-		if err := json.Unmarshal(body, &parsed); err == nil {
-			return result, parsed
+	const notObject = "the response is not a JSON object "
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return result, testStepResponse{NoFields: notObject + "(its body is empty)"}
+	}
+	var parsed any
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return result, testStepResponse{NoFields: notObject + "(its body is not JSON: " + truncate(string(trimmed), 80) + ")"}
+	}
+	switch val := parsed.(type) {
+	case map[string]any:
+		return result, testStepResponse{Fields: val}
+	case []any:
+		return result, testStepResponse{NoFields: notObject + "(it is a JSON array)"}
+	}
+	return result, testStepResponse{NoFields: notObject + "(it is the JSON value " + truncate(string(trimmed), 80) + ")"}
+}
+
+// testSaveEntries writes `save:` entries as a test file holds them, in name
+// order.
+func testSaveEntries(save map[string]string) string {
+	parts := make([]string, 0, len(save))
+	for _, name := range slices.Sorted(maps.Keys(save)) {
+		parts = append(parts, name+": "+save[name])
+	}
+	return "`save: {" + strings.Join(parts, ", ") + "}`"
+}
+
+// saveTestStepVars saves the `save:` entries of a step that passed into vars
+// and returns why one saved nothing, "" when every entry saved a value: the
+// response has no fields, lacks the field, or holds null there. Such an entry
+// used to save nothing without a word, and the `{{name}}` of a later step was
+// sent as written: `get: "/api/notes/{{id}}"` with `expect: {status: 404}`
+// passed whatever the app answers for a real id. The entries that found a
+// value are saved either way.
+func saveTestStepVars(step AppTestStep, response testStepResponse, vars map[string]string) string {
+	problem := ""
+	for _, name := range slices.Sorted(maps.Keys(step.Save)) {
+		field := step.Save[name]
+		value, present := response.Fields[field]
+		if present && value != nil {
+			vars[name] = fmt.Sprintf("%v", value)
+			continue
+		}
+		if problem != "" {
+			continue
+		}
+		entry, what, has := "`save: {"+name+": "+field+"}`", "field", "the response"
+		if response.Row {
+			what, has = "column", "the first row"
+		}
+		switch {
+		case response.Fields == nil:
+			problem = entry + " saved nothing: " + response.NoFields
+		case present:
+			problem = fmt.Sprintf("%s saved nothing: `%s` is null in %s", entry, field, has)
+		default:
+			keys := slices.Sorted(maps.Keys(response.Fields))
+			const shown = 30
+			list := codeList(keys[:min(shown, len(keys))])
+			if more := len(keys) - shown; more > 0 {
+				list += fmt.Sprintf(" and %d more", more)
+			}
+			if list == "" {
+				list = "none"
+			}
+			problem = fmt.Sprintf("%s saved nothing: %s has no %s `%s` (it has: %s)", entry, has, what, field, list)
+		}
+		if !response.Row {
+			problem += ". `save` takes a top-level field of a JSON object response"
+		}
+		problem += fmt.Sprintf(". A later `{{%s}}` would be sent as written, and a check of that step could pass for the wrong reason", name)
+	}
+	return withDocsLine(problem, testVariablesDocs)
+}
+
+// unsavedStepVarWarning is the warning for step n (as written, before its
+// variables are read) when it holds a `{{name}}` outside `expect` that
+// nothing saved, "" when it holds none. The text is sent as written: a path
+// with the braces in it names nothing, so `expect: {status: 404}` after it
+// passes whatever the app's rules are. A warning and not a failure, because a
+// test may send template text on purpose. As in `expect`, only letters,
+// digits, `_` and `-` between the braces make a name.
+func unsavedStepVarWarning(n int, step AppTestStep, vars map[string]string) string {
+	var found, names []string
+	scan := func(place string, texts ...string) {
+		var refs []string
+		for _, text := range texts {
+			for _, ref := range testVarRef.FindAllStringSubmatch(text, -1) {
+				if _, saved := vars[ref[1]]; saved || !testVarName.MatchString(ref[1]) || slices.Contains(refs, "`"+ref[0]+"`") {
+					continue
+				}
+				refs = append(refs, "`"+ref[0]+"`")
+				if !slices.Contains(names, ref[1]) {
+					names = append(names, ref[1])
+				}
+			}
+		}
+		if len(refs) > 0 {
+			sort.Strings(refs)
+			found = append(found, strings.Join(refs, ", ")+" in "+place)
 		}
 	}
-	return result, nil
+	var body []string
+	var collect func(v any)
+	collect = func(v any) {
+		switch val := v.(type) {
+		case string:
+			body = append(body, val)
+		case map[string]any:
+			for _, item := range val {
+				collect(item)
+			}
+		case []any:
+			for _, item := range val {
+				collect(item)
+			}
+		}
+	}
+	collect(step.Data)
+	collect(step.JSON)
+	collect(step.JSONArray)
+	for _, line := range step.NDJSON {
+		collect(line)
+	}
+	for _, part := range step.Files {
+		body = append(body, part.Name, part.Content)
+	}
+	scan("the path", step.API, step.Get, step.Post)
+	scan("the SQL", step.SQL)
+	scan("`set_auth`", step.SetAuth)
+	scan("the body", body...)
+	if len(found) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	known := "nothing is saved yet"
+	if len(vars) > 0 {
+		known = "saved so far: " + codeList(slices.Sorted(maps.Keys(vars)))
+	}
+	return withDocsLine(fmt.Sprintf("step %d: %s was sent as written, because no earlier step of this test saved %s (%s). A check of the step can then pass for the wrong reason: a path that holds the braces answers 404 whatever the app's access rules are. Text the test means to send needs no change",
+		n, strings.Join(found, " and "), codeList(names), known), testVariablesDocs)
 }
 
 // testVarRef is a `{{name}}` reference: two braces around text that holds no
@@ -954,7 +1148,7 @@ func substituteExpectVars(expect AppTestExpect, vars map[string]string) (AppTest
 			if len(vars) > 0 {
 				known = "saved so far: " + codeList(slices.Sorted(maps.Keys(vars)))
 			}
-			problem = fmt.Sprintf("`expect.%s` reads `%s`, but no earlier step of this test saved `%s` (%s), so the step was not run: compared as written, the check would prove nothing. A `save:` entry saves nothing when the response has no such field or it is null. Braces that are text and not a variable: leave the pair open (`{{%s`)", key, ref[0], ref[1], known, ref[1])
+			problem = fmt.Sprintf("`expect.%s` reads `%s`, but no earlier step of this test saved `%s` (%s), so the step was not run: compared as written, the check would prove nothing. Braces that are text and not a variable: leave the pair open (`{{%s`)", key, ref[0], ref[1], known, ref[1])
 		}
 		out := replaceTestVars(text, vars)
 		if needsText && out == "" && text != "" && problem == "" {
@@ -1126,7 +1320,8 @@ func executeTestStepRaw(app *App, base string, client *http.Client, cookies []*h
 	method, path, isRequest := testStepRequestLine(step)
 	if !isRequest {
 		if step.SQL != "" {
-			return executeSQLTestStep(app, step), nil
+			result, _ := executeSQLTestStep(app, step)
+			return result, nil
 		}
 		if step.Flush != "" {
 			return executeFlushStep(app, step), nil
@@ -1208,12 +1403,14 @@ func testStepOverMaxDuration(expect AppTestExpect, elapsed time.Duration) bool {
 	return err == nil && elapsed > maxDur
 }
 
-func executeSQLTestStep(app *App, step AppTestStep) AppTestStepResult {
+// executeSQLTestStep runs an SQL step once and returns its result and the
+// rows the statement returned.
+func executeSQLTestStep(app *App, step AppTestStep) (AppTestStepResult, []map[string]any) {
 	action := fmt.Sprintf("SQL: %s", truncate(step.SQL, 60))
 
 	rows, err := QueryRows(app.DB, step.SQL)
 	if err != nil {
-		return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("SQL error: %s%s", err, auditStepSQLHint(step.SQL, err))}
+		return AppTestStepResult{Action: action, Pass: false, Message: fmt.Sprintf("SQL error: %s%s", err, auditStepSQLHint(step.SQL, err))}, nil
 	}
 
 	// Check row count expectation
@@ -1222,11 +1419,11 @@ func executeSQLTestStep(app *App, step AppTestStep) AppTestStepResult {
 			return AppTestStepResult{
 				Action: action, Pass: false,
 				Message: fmt.Sprintf("Expected %d rows, got %d", *step.Expect.Rows, len(rows)),
-			}
+			}, rows
 		}
 	}
 
-	return AppTestStepResult{Action: action, Pass: true}
+	return AppTestStepResult{Action: action, Pass: true}, rows
 }
 
 func executeFlushStep(app *App, step AppTestStep) AppTestStepResult {
@@ -1438,12 +1635,22 @@ func jsonLookup(data any, path string) any {
 }
 
 // loginTestUser creates a test user with the given role and returns cookies, bearer token, and user ID.
+// An account that exists keeps the role it has.
 func loginTestUser(app *App, email string, role string) ([]*http.Cookie, string, int64) {
+	return loginTestUserAs(app, email, role, false)
+}
+
+// loginTestUserAs is loginTestUser; with setRole an account that already
+// exists is given the role too (a `users:` entry that names one).
+func loginTestUserAs(app *App, email string, role string, setRole bool) ([]*http.Cookie, string, int64) {
 	EnsureUsersTable(app.DB)
 	EnsureSessionsTable(app.DB)
 
 	var id int64
 	err := app.DB.QueryRow("SELECT id FROM _benmore_users WHERE email = ?", email).Scan(&id)
+	if err == nil && setRole {
+		app.DB.Exec("UPDATE _benmore_users SET role = ? WHERE id = ? AND role IS NOT ?", role, id, role)
+	}
 	if err != nil {
 		hash, _ := generateBcryptHash([]byte("testpass123"))
 		username := GenerateUniqueUsername(app.DB, strings.Split(email, "@")[0], 0)

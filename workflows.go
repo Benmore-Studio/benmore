@@ -19,7 +19,7 @@ import (
 // RegisterWorkflows sets up transition API endpoints and starts timeout checkers.
 func RegisterWorkflows(mux appRouteRegistrar, app *App) {
 	registerWorkflows(mux, app)
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range app.workflowConfig().Workflows {
 		if len(wf.Timeouts) > 0 {
 			startWorkflowTimeoutChecker(app, wf)
 			log.Printf("  workflow-timeout: %s (%d states with timeouts)", wf.Name, len(wf.Timeouts))
@@ -59,7 +59,7 @@ func workflowSameTableError(raw map[string]WorkflowYAML) error {
 }
 
 func registerWorkflows(mux appRouteRegistrar, app *App) {
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range app.workflowConfig().Workflows {
 		w := wf // capture
 
 		// The schema's spelling, plus the one workflows.yaml used when it
@@ -92,16 +92,23 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		return
 	}
 
-	// 2. Scope enforcement
-	if err := checkScope(session, wf.Table, "write"); err != nil {
-		httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
+	// 2. The table-level gates, decided by the predicate the available-moves
+	// list answers from (workflowTransitionDenialFor), so the list never
+	// offers a move this route refuses.
+	denial := workflowTransitionDenialFor(app, wf, session)
+	if denial == transitionScopeDenied {
+		httpJSON(w, http.StatusForbidden, scopeDeniedBody(checkScope(session, wf.Table, "write")))
 		return
 	}
 	// A transition is an update of the state column, so it obeys the
 	// table's declarative update mode (admin/off/role:…) exactly like
 	// PATCH does; row scope alone let any user move rows on tables whose
-	// implicit mode is admin.
+	// implicit mode is admin. EnforceCRUDAccess writes that rule's answer.
 	if !EnforceCRUDAccess(w, r, app, wf.Table, OpUpdate, 0) {
+		return
+	}
+	if denial == transitionAccessDenied {
+		writeUnmatchedAPINotFound(w)
 		return
 	}
 
@@ -112,8 +119,8 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 	}
 
 	// A command-owned state column moves only through its command.
-	if v := ownedFieldViolation(app, wf.Table, wf.Field); v != nil {
-		writeOwnedFieldRefusal(w, v)
+	if denial == transitionOwnedDenied {
+		writeOwnedFieldRefusal(w, ownedFieldViolation(app, wf.Table, wf.Field))
 		return
 	}
 
@@ -146,21 +153,9 @@ func handleTransition(w http.ResponseWriter, r *http.Request, app *App, wf *Work
 		return
 	}
 
-	// 5. Fetch current row (with scoping)
-	readSQL := "SELECT * FROM " + quoteIdent(wf.Table) + " WHERE id = ?"
-	readArgs := []any{id}
-
-	// Soft delete filter
-	if hasColumn(app, wf.Table, "deleted_at") {
-		readSQL += " AND deleted_at IS NULL"
-	}
-
-	// Scoping - canonical rowScopeClause (act-as aware + ACL). A transition
-	// is a write, so authorize against "edit".
-	if pred, pargs, bypass := rowScopeClause(app, wf.Table, session, "edit"); !bypass && pred != "" {
-		readSQL += " AND " + pred
-		readArgs = append(readArgs, pargs...)
-	}
+	// 5. Fetch current row (with scoping). A transition is a write, so the
+	// row is read under the "edit" scope.
+	readSQL, readArgs := workflowRowQuery(app, wf, session, id, "edit")
 
 	rows, err := queryNativeRowsWith(app.DB, app, wf.Table, readSQL, readArgs...)
 	if err != nil || len(rows) == 0 {
@@ -357,15 +352,7 @@ func handleAvailableTransitions(w http.ResponseWriter, r *http.Request, app *App
 	}
 
 	// Fetch row (with scoping)
-	readSQL := "SELECT * FROM " + quoteIdent(wf.Table) + " WHERE id = ?"
-	readArgs := []any{id}
-	if hasColumn(app, wf.Table, "deleted_at") {
-		readSQL += " AND deleted_at IS NULL"
-	}
-	if pred, pargs, bypass := rowScopeClause(app, wf.Table, session, "view"); !bypass && pred != "" {
-		readSQL += " AND " + pred
-		readArgs = append(readArgs, pargs...)
-	}
+	readSQL, readArgs := workflowRowQuery(app, wf, session, id, "view")
 
 	rows, err := queryNativeRowsWith(app.DB, app, wf.Table, readSQL, readArgs...)
 	if err != nil || len(rows) == 0 {
@@ -394,19 +381,87 @@ type workflowMove struct {
 	Role string // the transition's role list, "" when it has none
 }
 
+// workflowTransitionDenial is the table-level reason POST
+// /api/<table>/{id}/transition refuses a caller before it looks at the row.
+type workflowTransitionDenial int
+
+const (
+	transitionAdmitted     workflowTransitionDenial = iota
+	transitionScopeDenied                           // the credential or role has no write scope on the table
+	transitionAccessDenied                          // the table's update rule refuses the caller
+	transitionOwnedDenied                           // the state column is command-owned
+)
+
+// workflowTransitionDenialFor decides the table-level gates of a transition
+// for session, in the order the route answers them: write scope, the table's
+// update rule (a transition is an update of the state column), then a
+// command-owned state column. The transition route refuses on what it returns
+// and the available-moves list offers nothing unless it admits the caller, so
+// the two cannot drift.
+func workflowTransitionDenialFor(app *App, wf *Workflow, session *Session) workflowTransitionDenial {
+	if session == nil {
+		return transitionAccessDenied
+	}
+	if checkScope(session, wf.Table, "write") != nil {
+		return transitionScopeDenied
+	}
+	hasUID := hasColumn(app, wf.Table, "user_id")
+	hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, wf.Table, app.Group.Key)
+	if mode := app.Access.ModeFor(wf.Table, OpUpdate, hasUID, hasGroupKey); mode == "off" || !tableModeAllowed(app, wf.Table, OpUpdate, mode, session, 0) {
+		return transitionAccessDenied
+	}
+	if ownedFieldViolation(app, wf.Table, wf.Field) != nil {
+		return transitionOwnedDenied
+	}
+	return transitionAdmitted
+}
+
+// workflowRowQuery is the SELECT a workflow route reads row id with: live
+// rows only, inside session's row scope for aclAction ("edit" for the row a
+// transition moves, "view" for the state the moves list reports).
+func workflowRowQuery(app *App, wf *Workflow, session *Session, id, aclAction string) (string, []any) {
+	query := "SELECT * FROM " + quoteIdent(wf.Table) + " WHERE id = ?"
+	args := []any{id}
+	if hasColumn(app, wf.Table, "deleted_at") {
+		query += " AND deleted_at IS NULL"
+	}
+	// Canonical rowScopeClause (act-as aware + ACL).
+	if pred, pargs, bypass := rowScopeClause(app, wf.Table, session, aclAction); !bypass && pred != "" {
+		query += " AND " + pred
+		args = append(args, pargs...)
+	}
+	return query, args
+}
+
 // availableWorkflowMoves lists, sorted by target, the transitions session may
-// make from the state row is in: the ones whose `role:` it holds and whose
-// `when:` holds for it, judged over the row handleTransition judges it over
-// (transitionEventRow). A condition that cannot be evaluated is not met, as on
-// the transition route. A command-owned state column moves only through its
-// command (the route answers 403 field_owned_by_command), so nothing is listed
-// for it. GET /api/<table>/{id}/transitions and the SSR <transitions> tag both
-// answer from here; row is the full row as the caller may read it.
+// make from the state row is in: the ones POST .../transition would accept
+// from this caller for this row. The caller passes the route's table-level
+// gates (workflowTransitionDenialFor: write scope, the update rule, no
+// command-owned state column, for which the route answers 403
+// field_owned_by_command), the row is inside the caller's edit scope (read
+// with the route's own query, workflowRowQuery), the caller holds the
+// transition's `role:` and its `when:` holds, judged over the row
+// handleTransition judges it over (transitionEventRow). A condition that
+// cannot be evaluated is not met, as on the transition route. GET
+// /api/<table>/{id}/transitions and the SSR <transitions> tag both answer
+// from here; row is the full row as the caller may read it.
 func availableWorkflowMoves(app *App, wf *Workflow, session *Session, row map[string]any) []workflowMove {
-	if session == nil || ownedFieldViolation(app, wf.Table, wf.Field) != nil {
+	targets := wf.Transitions[valueText(row[wf.Field])]
+	if len(targets) == 0 || workflowTransitionDenialFor(app, wf, session) != transitionAdmitted {
 		return nil
 	}
-	targets := wf.Transitions[valueText(row[wf.Field])]
+	// The row the route would move. Where the edit scope is the view scope
+	// the caller's row is that row already.
+	id := valueText(row["id"])
+	viewSQL, viewArgs := workflowRowQuery(app, wf, session, id, "view")
+	if editSQL, editArgs := workflowRowQuery(app, wf, session, id, "edit"); editSQL != viewSQL || !slices.Equal(argTexts(editArgs), argTexts(viewArgs)) {
+		editable, err := queryNativeRowsWith(app.DB, app, wf.Table, editSQL, editArgs...)
+		if err != nil || len(editable) != 1 {
+			return nil
+		}
+		row = editable[0]
+		targets = wf.Transitions[valueText(row[wf.Field])]
+	}
 	var eventRow map[string]any
 	var moves []workflowMove
 	for _, to := range slices.Sorted(maps.Keys(targets)) {
@@ -429,6 +484,16 @@ func availableWorkflowMoves(app *App, wf *Workflow, session *Session, row map[st
 		moves = append(moves, move)
 	}
 	return moves
+}
+
+// argTexts spells each query argument with its type, for comparing two
+// argument lists.
+func argTexts(args []any) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = fmt.Sprintf("%T:%v", a, a)
+	}
+	return out
 }
 
 // rowWithOldValues returns row with old_<column> added for every column of
@@ -468,8 +533,10 @@ func transitionEventRow(row, before map[string]any, actor *Session) map[string]a
 // an access `role:` mode. A listed role passes for a platform admin, through
 // the _benmore_users.role hierarchy (hasRole), as the caller's membership role
 // in the effective tenant (resolveAppRole), or through a role grant counted as
-// the access mode counts it (workflowRoleFromGrant). A `role:` that names no
-// role admits only a platform admin.
+// the access mode counts it (workflowRoleFromGrant). `admin` on a table the
+// tenant does not bound is the global admin only, never the membership role
+// (workflowMembershipRoleAllowed). A `role:` that names no role admits only a
+// platform admin.
 func hasWorkflowRole(app *App, session *Session, table, requiredRole string) bool {
 	if requiredRole == "" {
 		return true
@@ -483,9 +550,11 @@ func hasWorkflowRole(app *App, session *Session, table, requiredRole string) boo
 	}
 	// App-level role from the group membership table, then the platform
 	// role hierarchy, for each listed role.
-	appRole := resolveAppRole(app, session)
+	if workflowMembershipRoleAllowed(app, table, roles, resolveAppRole(app, session)) {
+		return true
+	}
 	for _, role := range roles {
-		if appRole == role || hasRole(session.Role, role) {
+		if hasRole(session.Role, role) {
 			return true
 		}
 	}
@@ -501,7 +570,7 @@ func workflowRoleFromGrant(app *App, table string, session *Session, roles []str
 	if app == nil || session == nil || len(roles) == 0 || !HasAnyRole(session, roles) {
 		return false
 	}
-	if app.Group == nil || app.Group.Key == "" || hasColumn(app, table, app.Group.Key) || groupSharedTable(app, table) {
+	if workflowTenantBound(app, table) {
 		return true
 	}
 	tier, args, ok := globalRoleTier(session, roles)
@@ -526,10 +595,11 @@ func copyRow(row map[string]any) map[string]any {
 
 // GetWorkflowForTable returns the workflow definition for a table, if any.
 func GetWorkflowForTable(app *App, table string) *Workflow {
-	if app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return nil
 	}
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if identIs(wf.Table, table) {
 			return wf
 		}
@@ -984,10 +1054,11 @@ func httpJSON(w http.ResponseWriter, status int, data any) {
 // path (single, batch, ingest, transaction) uses it. A nil value is a JSON
 // null the caller sent and is dropped too.
 func workflowCreateStateRefused(app *App, table, col string, value any) bool {
-	if app == nil || app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return false
 	}
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if identIs(wf.Table, table) && identIs(wf.Field, col) {
 			// An explicit null is not a state either: a nullable column would
 			// store NULL, a row no transition leaves.
@@ -1003,10 +1074,11 @@ func workflowCreateStateRefused(app *App, table, col string, value any) bool {
 // depends on the column default (a nullable column stored NULL, a NOT NULL one
 // an empty string: a state no transition leaves).
 func workflowCreateInitial(app *App, table, col string) (string, bool) {
-	if app == nil || app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return "", false
 	}
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if wf != nil && wf.Initial != "" && identIs(wf.Table, table) && identIs(wf.Field, col) {
 			return wf.Initial, true
 		}
@@ -1017,11 +1089,12 @@ func workflowCreateInitial(app *App, table, col string) (string, bool) {
 // withWorkflowInitial returns data with every workflow state column of table
 // set to its initial state (data itself is not modified).
 func withWorkflowInitial(app *App, table string, data map[string]any) map[string]any {
-	if app == nil || app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return data
 	}
 	var out map[string]any
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if wf == nil || wf.Initial == "" || !identIs(wf.Table, table) {
 			continue
 		}
@@ -1131,11 +1204,12 @@ func canonicalizeWorkflowTableNames(cfg *WorkflowConfig, names []string) {
 }
 
 func workflowProtectedFields(app *App, table string) []string {
-	if app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return nil
 	}
 	var fields []string
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if identIs(wf.Table, table) {
 			fields = append(fields, wf.Field)
 		}

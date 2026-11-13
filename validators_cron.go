@@ -41,6 +41,17 @@ var cronStepKeyHints = map[string]string{
 	"params":      "(not available in inline cron steps; put the step in a flows.yaml flow and reference it with `flow:`)",
 }
 
+// cronSQLProblems is the write-time finding a flow file's SQL step gets, for
+// the `sql:` of a cron job or of one of its inline steps: DDL on a framework
+// object, which the runtime refuses each time the job runs (app_sql_guard.go).
+func cronSQLProblems(at string, entry map[string]any) []string {
+	query, _ := entry["sql"].(string)
+	if problem := appSQLFrameworkDDLProblem(query); problem != "" {
+		return []string{fmt.Sprintf("cron.yaml %s.sql: %s", at, problem)}
+	}
+	return nil
+}
+
 // cronStepProblems checks one inline step list, recursing into nested ones.
 func cronStepProblems(where string, raw any) []string {
 	list, _ := raw.([]any)
@@ -48,6 +59,7 @@ func cronStepProblems(where string, raw any) []string {
 	for i, item := range list {
 		step, _ := item.(map[string]any)
 		at := fmt.Sprintf("%s[%d]", where, i)
+		problems = append(problems, cronSQLProblems(at, step)...)
 		for _, key := range sortedWhenKeys(step) {
 			if !cronStepKeys[key] {
 				msg := fmt.Sprintf("cron.yaml %s: unknown step key %q; the scheduler ignores it", at, key)
@@ -100,7 +112,8 @@ var cronKeyHints = map[string]string{
 	"description": "(use a YAML comment)",
 }
 
-// cronShapeProblems lists cron.yaml job keys the loader ignores.
+// cronShapeProblems lists cron.yaml job keys the loader ignores, and job SQL
+// the runtime refuses (cronSQLProblems).
 func cronShapeProblems(content string) []string {
 	var shape map[string]any
 	if err := decodeConfigYAML([]byte(content), &shape); err != nil || len(shape) == 0 {
@@ -108,6 +121,7 @@ func cronShapeProblems(content string) []string {
 	}
 	var problems []string
 	check := func(where string, entry map[string]any, valid map[string]bool) {
+		problems = append(problems, cronSQLProblems(where, entry)...)
 		for _, nested := range []string{"run", "steps"} {
 			problems = append(problems, cronStepProblems(where+"."+nested, entry[nested])...)
 		}

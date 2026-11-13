@@ -29,6 +29,8 @@ package main
 //     or role grant taken away since the snapshot stays taken away, and an
 //     account deleted since comes back with the default role and no grants.
 //     An account the live database never held keeps the snapshot's roles.
+//   - Record shares follow the same rule (restore_record_grants.go): a share
+//     revoked, lowered or expired since the snapshot stays that way.
 //   - MCP connector grants, their access/refresh credentials and pending
 //     authorizations (_benmore_mcp_*) are the live rows, wholesale
 //     (carryForwardMCPGrants): a revoked grant stays revoked, a used refresh
@@ -109,6 +111,9 @@ type restoreCredentialSummary struct {
 	// Roles reports what happened to primary roles and role grants
 	// (restore_roles.go). nil for a refresh-dev copy, which keeps its own.
 	Roles *restoreRoleSummary `json:"roles,omitempty"`
+	// RecordGrants reports what happened to record-level grants
+	// (restore_record_grants.go). nil for a refresh-dev copy.
+	RecordGrants *restoreRecordGrantSummary `json:"record_grants,omitempty"`
 }
 
 // restoreUserIdentityColumns are login identifiers: whoever holds one live
@@ -181,9 +186,10 @@ func (t *credTable) get(i int, col string) any {
 
 // carryForwardRestoreCredentials rewrites the credential state of the restore
 // candidate at candidatePath from the live database at livePath. The caller
-// has stopped every writer of the live database. actor names who restored,
-// for the audit row.
-func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath, actor string) (*restoreCredentialSummary, error) {
+// has stopped every writer of the live database. appDir is the app directory
+// the restored database serves (its app.yaml says whether an admin must have
+// a verified email to sign in). actor names who restored, for the audit row.
+func carryForwardRestoreCredentials(ctx context.Context, appDir, livePath, candidatePath, actor string) (*restoreCredentialSummary, error) {
 	summary := &restoreCredentialSummary{Mode: restoreCredentialsCarried, Kept: map[string]int{}, Removed: map[string]int{}}
 	live, err := readLiveCredentialState(ctx, livePath)
 	if err != nil && ctx.Err() != nil {
@@ -197,7 +203,7 @@ func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath
 		summary.Mode, summary.LiveError, live = restoreCredentialsUnreadable, err.Error(), nil
 		log.Printf("restore: live database unreadable (%v); revoking every restored session, token and grant", err)
 	}
-	return rewriteCandidateCredentials(ctx, live, livePath, candidatePath, "restore_credentials", actor, summary)
+	return rewriteCandidateCredentials(ctx, live, appDir, livePath, candidatePath, "restore_credentials", actor, summary)
 }
 
 // revokeCopiedCredentials revokes every credential in candidatePath, a copy
@@ -214,13 +220,13 @@ func carryForwardRestoreCredentials(ctx context.Context, livePath, candidatePath
 // One refresh_credentials audit row in the copy records the counts.
 func revokeCopiedCredentials(ctx context.Context, candidatePath, actor string) (*restoreCredentialSummary, error) {
 	summary := &restoreCredentialSummary{Mode: restoreCredentialsCopyRevoked, Kept: map[string]int{}, Removed: map[string]int{}}
-	return rewriteCandidateCredentials(ctx, nil, "", candidatePath, "refresh_credentials", actor, summary)
+	return rewriteCandidateCredentials(ctx, nil, "", "", candidatePath, "refresh_credentials", actor, summary)
 }
 
 // rewriteCandidateCredentials applies live (nil: nothing is live) to the
 // candidate's credential state in one transaction, with one audit row named
 // action.
-func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable, livePath, candidatePath, action, actor string, summary *restoreCredentialSummary) (*restoreCredentialSummary, error) {
+func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable, appDir, livePath, candidatePath, action, actor string, summary *restoreCredentialSummary) (*restoreCredentialSummary, error) {
 	// The maintenance driver: app triggers still compile, the storage
 	// ceiling does not apply, and DELETE journaling keeps every change in
 	// the one file that gets installed.
@@ -281,8 +287,11 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		}
 		// Authorization follows the credentials: no role comes back that the
 		// live database no longer holds.
-		if summary.Roles, err = carryForwardRestoreRoles(ctx, tx, live, pairs, skipped); err != nil {
+		if summary.Roles, err = carryForwardRestoreRoles(ctx, tx, live, pairs, skipped, restoreVerifiedSetting(appDir)); err != nil {
 			return nil, fmt.Errorf("roles: %w", err)
+		}
+		if summary.RecordGrants, err = carryForwardRestoreRecordGrants(ctx, tx, live, livePath, pairs, skipped); err != nil {
+			return nil, fmt.Errorf("record grants: %w", err)
 		}
 		// The record of the credential changes carried above.
 		if summary.AuditRows, err = carryForwardRestoreAudit(ctx, tx, livePath, skipped); err != nil {
@@ -315,6 +324,9 @@ func rewriteCandidateCredentials(ctx context.Context, live map[string]*credTable
 		log.Printf("%s: queued work in the snapshot: %v already finished live and kept finished, %v held (not run again), %v left to run", action, q.Finished, q.Held, q.Waiting)
 	}
 	if r := summary.Roles; r != nil {
+		log.Printf("%s: %s", action, r.logLine())
+	}
+	if r := summary.RecordGrants; r != nil {
 		log.Printf("%s: %s", action, r.logLine())
 	}
 	if a := summary.AuditRows; a != nil {
@@ -362,8 +374,10 @@ func readLiveCredentialState(ctx context.Context, livePath string) (map[string]*
 	if err := read("_benmore_users", restoreUserColumns()); err != nil {
 		return nil, err
 	}
-	if err := read(restoreRoleGrantsTable, nil); err != nil {
-		return nil, err
+	for _, name := range []string{restoreRoleGrantsTable, restoreRecordGrantsTable} {
+		if err := read(name, nil); err != nil {
+			return nil, err
+		}
 	}
 	for _, spec := range restoreGrantTables {
 		if err := read(spec.name, nil); err != nil {

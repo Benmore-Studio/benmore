@@ -413,7 +413,7 @@ func TestAppMCPArtifactAccountPurgeDeletesStoredBytesAfterCommit(t *testing.T) {
 	// Self-service delete takes the same path (the platform operator delete is
 	// covered in mcp_tools_user_delete_test.go).
 	app, artifact = purgeArtifactFixture(t, "self@example.com")
-	if err := deleteOwnAccount(app, &Session{UserID: 1, Email: "self@example.com"}); err != nil {
+	if _, err := deleteOwnAccount(context.Background(), app, &Session{UserID: 1, Email: "self@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 	if artifactBytesExist(t, app, artifact) {

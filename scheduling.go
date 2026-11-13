@@ -380,17 +380,18 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			return
 		}
 		id, _ := res.LastInsertId()
-		// An account outside the record's tenant is not bound or notified:
-		// the request is stored and answered like one naming an address
-		// nobody holds, which says nothing about the account.
+		// An account outside the record's tenant (for a label, the
+		// requester's) is not bound or notified: the request is stored and
+		// answered like one naming an address nobody holds, which says
+		// nothing about the account.
 		if approverID.Valid {
-			bound, err := approvalBindApprover(app, id, approverID.Int64, b.Table, string(b.RowID))
+			bound, err := approvalBindApprover(app, id, approverID.Int64, b.Table, string(b.RowID), session.EffectiveGroupID())
 			if err != nil {
 				serverErrorJSON(w, r, app, "_approvals", err, "request failed")
 				return
 			}
 			if bound {
-				CreateNotification(app.DB, approverID.Int64, "Approval requested", b.Title, "info", "")
+				CreateNotification(app.DB, approverID.Int64, "Approval requested", approvalNotificationText(b.Title), "info", "")
 			}
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"id": id, "status": "pending"})
@@ -431,15 +432,18 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// An approval addressed by email belongs to a verified address, and
 		// one on a tenant's record to an account of that tenant
 		// (approvalApproverSQL, the same test /decide applies).
+		// A requester lists their request while what it names admits them
+		// (approvalRequesterSQL): not after they have left the record's tenant.
 		assigned, assignedArgs := approvalApproverSQL(app, session)
 		if !session.IsAdminBypass() {
+			requested, requestedArgs := approvalRequesterSQL(app, session)
 			if t != "" && rid != "" && canAccessRow(app, t, rid, session) {
-				q += " AND (table_name = ? OR requested_by = ? OR " + assigned + ")"
+				q += " AND (table_name = ? OR " + requested + " OR " + assigned + ")"
 				args = append(args, t)
 			} else {
-				q += " AND (requested_by = ? OR " + assigned + ")"
+				q += " AND (" + requested + " OR " + assigned + ")"
 			}
-			args = append(append(args, session.UserID), assignedArgs...)
+			args = append(append(args, requestedArgs...), assignedArgs...)
 		}
 		// "mine" = pending approvals assigned to me (to act on).
 		if r.URL.Query().Get("mine") == "1" {
@@ -550,7 +554,10 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusConflict, map[string]any{"error": "approval already " + current, "status": current})
 			return
 		}
-		CreateNotification(app.DB, requestedBy, "Approval "+b.Decision, title, map[string]string{"approved": "success", "rejected": "warning"}[b.Decision], "")
+		// The decision is the tenant's: a requester who has left it is not told.
+		if approvalNotifiesRequester(app, id) {
+			CreateNotification(app.DB, requestedBy, "Approval "+b.Decision, approvalNotificationText(title), map[string]string{"approved": "success", "rejected": "warning"}[b.Decision], "")
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": b.Decision})
 	})
 }

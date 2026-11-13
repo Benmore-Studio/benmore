@@ -186,10 +186,11 @@ func Broadcast(app *App, table, action string, session *Session) {
 	// any subscriber. Treat as unscoped so every connected client gets
 	// the full event with row data, matching what they'd see by
 	// re-fetching anyway.
-	if app != nil && app.Access != nil {
+	if access := app.accessConfig(); access != nil {
 		hasUID := hasColumn(app, table, "user_id")
-		hasGroupKey := app.Group != nil && app.Group.Key != "" && hasColumn(app, table, app.Group.Key)
-		readMode := app.Access.ModeFor(table, "read", hasUID, hasGroupKey)
+		group := app.groupConfig()
+		hasGroupKey := group != nil && group.Key != "" && hasColumn(app, table, group.Key)
+		readMode := access.ModeFor(table, "read", hasUID, hasGroupKey)
 		if readMode == "anon" || readMode == "everyone" {
 			groupID = ""
 			userID = 0

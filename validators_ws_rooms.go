@@ -13,7 +13,8 @@ package main
 //     a deployed pattern guards today, such as a_42); the check says how the
 //     pattern is read and names the pattern for rooms a_<value>-b.
 //   - A membership table or column the app does not have. The membership
-//     query fails, so every join of a matching room is refused.
+//     query fails, so every join of a matching room is refused. A member-of
+//     rule in access: is judged the same way (memberOfReferenceWarnings).
 //
 // `benmore check` and the post-write check report both from the app's sources
 // (authzWarnings); the load logs the second from the live database
@@ -31,8 +32,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -91,7 +94,8 @@ type wsRoomSchemaView struct {
 
 // wsRoomReferenceWarnings names each rule whose membership table, join column
 // or user column the view does not have. A literal pattern (no placeholder)
-// never reads its join column, so only its table and user column are checked.
+// never reads its join column, so a join column the table lacks refuses
+// nobody there: its warning says the name is not read and the rule works.
 func wsRoomReferenceWarnings(rules []WSRoomRule, view wsRoomSchemaView) []string {
 	const effect = "Every join of a room this pattern matches is refused for everyone but admins (\"not a member of this room\") until the rule names"
 	var out []string
@@ -110,20 +114,28 @@ func wsRoomReferenceWarnings(rules []WSRoomRule, view wsRoomSchemaView) []string
 			continue
 		}
 		var missing []string
-		if _, p := wsRoomPlaceholderName(wr.Pattern); p.param && view.missingColumn(rule.Table, rule.JoinCol) {
-			missing = append(missing, rule.Table+"."+rule.JoinCol)
+		unreadJoin := false
+		if view.missingColumn(rule.Table, rule.JoinCol) {
+			if _, p := wsRoomPlaceholderName(wr.Pattern); p.param {
+				missing = append(missing, rule.Table+"."+rule.JoinCol)
+			} else {
+				unreadJoin = true
+			}
 		}
 		if view.missingColumn(rule.Table, rule.UserCol) {
 			missing = append(missing, rule.Table+"."+rule.UserCol)
-		}
-		if len(missing) == 0 {
-			continue
 		}
 		known := ""
 		if cols := view.columnList(rule.Table); cols != "" {
 			known = fmt.Sprintf(" (%s columns: %s)", rule.Table, cols)
 		}
-		out = append(out, fmt.Sprintf("%s names %s, which the table does not have%s. %s existing columns.", at, strings.Join(missing, " and "), known, effect))
+		switch {
+		case len(missing) > 0:
+			out = append(out, fmt.Sprintf("%s names %s, which the table does not have%s. %s existing columns.", at, strings.Join(missing, " and "), known, effect))
+		case unreadJoin:
+			out = append(out, fmt.Sprintf("%s names %s.%s, which the table does not have%s. The pattern has no placeholder, so its join column is never read: a user with any row in %s joins the room, and the rule works as written. Name a column the table has: a placeholder added to the pattern later is checked against this column, and with this name every join would be refused.",
+				at, rule.Table, rule.JoinCol, known, rule.Table))
+		}
 	}
 	return out
 }
@@ -142,12 +154,23 @@ func wsRoomRuleWarnings(dir string, rules []WSRoomRule) []string {
 			out = append(out, msg)
 		}
 	}
-	schema := readLoadRefSchema(loadRefSource{dir: dir})
-	if schema == nil {
+	view, ok := sourceMembershipSchemaView(dir)
+	if !ok {
 		return out
 	}
+	return append(out, wsRoomReferenceWarnings(rules, view)...)
+}
+
+// sourceMembershipSchemaView is the app's tables and columns as its sources
+// declare them, for judging the membership table a ws_rooms or member-of rule
+// names. ok is false without a readable schema.
+func sourceMembershipSchemaView(dir string) (view wsRoomSchemaView, ok bool) {
+	schema := readLoadRefSchema(loadRefSource{dir: dir})
+	if schema == nil {
+		return view, false
+	}
 	created := sourceCreatedRelations(dir)
-	return append(out, wsRoomReferenceWarnings(rules, wsRoomSchemaView{
+	return wsRoomSchemaView{
 		hasTable: func(table string) bool {
 			return created[sqliteIdentifierFold(table)] || schema.hasTable(table)
 		},
@@ -158,7 +181,69 @@ func wsRoomRuleWarnings(dir string, rules []WSRoomRule) []string {
 		},
 		tableList:  schema.tableList,
 		columnList: schema.columnList,
-	})...)
+	}, true
+}
+
+// memberOfReferenceWarnings names each member-of rule of access: whose
+// membership table, join column or user column the app's sources do not
+// have: the membership query cannot run, so every request the rule gates
+// fails. One warning per table and rule, with the operations it is written
+// for. The write gate accepts such a file (the table may arrive with the
+// next schema write), and until now nothing said so.
+func memberOfReferenceWarnings(dir string, access *AccessConfig) []string {
+	if access == nil {
+		return nil
+	}
+	view, ok := sourceMembershipSchemaView(dir)
+	if !ok {
+		return nil
+	}
+	const effect = "The membership query cannot run, so every request this rule gates fails for everyone but admins until the rule names"
+	var out []string
+	for _, table := range slices.Sorted(maps.Keys(access.rules)) {
+		ops := access.rules[table]
+		byMode := map[string][]string{}
+		for _, op := range []AccessOp{OpRead, OpWrite, OpUpdate, OpDelete, "all"} {
+			if mode, set := ops[op]; set && parseMemberOf(mode) != nil {
+				byMode[mode] = append(byMode[mode], string(op))
+			}
+		}
+		for _, mode := range slices.Sorted(maps.Keys(byMode)) {
+			rule := parseMemberOf(mode)
+			join := rule.JoinCol
+			if rule.Parent {
+				join += "=id"
+			}
+			at := "app.yaml: access." + table
+			if written := byMode[mode]; !slices.Contains(written, "all") {
+				at += " (" + strings.Join(written, ", ") + ")"
+			}
+			at += fmt.Sprintf(" = member-of:%s(%s, %s)", rule.Table, join, rule.UserCol)
+			if !view.hasTable(rule.Table) {
+				known := ""
+				if view.tableList != "" {
+					known = " (tables: " + view.tableList + ")"
+				}
+				out = append(out, fmt.Sprintf("%s names membership table %s, which the app does not have%s. %s an existing table.", at, rule.Table, known, effect))
+				continue
+			}
+			var missing []string
+			for _, col := range []string{rule.JoinCol, rule.UserCol} {
+				if view.missingColumn(rule.Table, col) {
+					missing = append(missing, rule.Table+"."+col)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			known := ""
+			if cols := view.columnList(rule.Table); cols != "" {
+				known = fmt.Sprintf(" (%s columns: %s)", rule.Table, cols)
+			}
+			out = append(out, fmt.Sprintf("%s names %s, which the table does not have%s. %s existing columns.", at, strings.Join(missing, " and "), known, effect))
+		}
+	}
+	return out
 }
 
 // sourceCreatedRelations are the tables and views (folded names) that the

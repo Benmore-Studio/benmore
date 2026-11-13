@@ -309,10 +309,7 @@ func TestDeepOffsetPaginationIsRefused(t *testing.T) {
 
 	// Through the list endpoint: a 400 with guidance, not a table walk.
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT)`)
 	app := &App{

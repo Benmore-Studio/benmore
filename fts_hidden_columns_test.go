@@ -3,9 +3,7 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -16,10 +14,7 @@ import (
 // character) at a time. Search now matches only returned columns.
 func TestFTSSearchSkipsHiddenColumns(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, share_token TEXT)`)
 	crudScopeMustExec(t, db, `CREATE TABLE vaults (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, api_secret TEXT)`)

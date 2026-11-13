@@ -14,8 +14,8 @@ import (
 // Never use this to infer the provenance of arbitrary authored SQL or aliases.
 func nativeRowDecryptor(app *App, table string) rowDecryptFunc {
 	var defs []EncryptedFieldDef
-	if app != nil && app.Encrypted != nil && table != "" {
-		for source, fields := range app.Encrypted.Fields {
+	if encrypted := app.encryptedConfig(); encrypted != nil && table != "" {
+		for source, fields := range encrypted.Fields {
 			if strings.EqualFold(source, table) {
 				table, defs = source, fields
 				break

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -139,6 +140,7 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 				guard := &txCommitGuard{tx: tx}
 				defer guard.rollbackUnlessHandled()
 				executeSteps(ctx, targetFlow.Steps)
+				sealFlowTxReadAudit(ctx)
 				committed := false
 				if ctx.Error != nil {
 					tx.Rollback()
@@ -211,6 +213,9 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 
+		// The handlers apply admin.yaml's read-only columns to a panel write
+		// (adminRefusedReadOnlyColumn).
+		r = adminPanelWrite(r)
 		switch {
 		case action == "create":
 			handleCreate(w, r, app, table)
@@ -230,6 +235,11 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 		r.ParseForm()
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF token", http.StatusForbidden)
+			return
+		}
+		// The role is a column of the users table: hidden or read-only in
+		// admin.yaml, the table has no panel write, this one included.
+		if adminRefuseTableWrite(w, r, app, adminUsersTable) {
 			return
 		}
 		userID := r.FormValue("user_id")
@@ -284,13 +294,17 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			httpError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := tx.Commit(); err != nil {
+		// A primary-role change is a grant like any other: its audit row is
+		// written with it, and a row that cannot be written refuses it.
+		err = auditAccountEvent(tx, app, accountAuditRoleChanged, strconv.FormatInt(uid, 10), session,
+			map[string]any{"role": oldRole}, map[string]any{"role": newRole})
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
 			serverError(w, r, app, "set role", err, "Role change failed")
 			return
 		}
-		// A primary-role change is a grant like any other: audit it.
-		LogAudit(app, "role_changed", "_benmore_users", strconv.FormatInt(uid, 10), session,
-			map[string]any{"role": oldRole}, map[string]any{"role": newRole})
 		if isHTMX(r) {
 			w.Header().Set("HX-Refresh", "true")
 			return
@@ -939,10 +953,12 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		notFoundHandler(app)(w, r)
 		return
 	}
-	// The create form still offers hidden columns (write-only); the list
-	// and its search neither show nor match them.
-	createCols := cols
-	cols = adminVisibleColumns(app, table, cols)
+	// admin.yaml `columns:` chooses the columns of the list and of the create
+	// form. The create form still offers hidden columns (write-only); the
+	// list and its search neither show nor match them.
+	allCols := cols
+	createCols := adminConfiguredColumns(app, table, cols)
+	cols = adminVisibleColumns(app, table, createCols)
 
 	page := queryParamInt(r, "page", 1)
 	perPage := 50
@@ -952,7 +968,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	// Build query. A framework table's rows about a table admin.yaml hides
 	// are neither listed nor counted.
 	query := "SELECT * FROM " + quoteIdent(table)
-	hiddenRows, hiddenArgs := adminHiddenRowsClause(app, table, createCols)
+	hiddenRows, hiddenArgs := adminHiddenRowsClause(app, table, allCols)
 	var where []string
 	var args []any
 	if hiddenRows != "" {
@@ -960,8 +976,10 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		args = append(args, hiddenArgs...)
 	}
 	if search != "" {
-		var conditions []string
-		for _, col := range cols {
+		// No column to search (admin.yaml names none that exists) matches
+		// no row.
+		conditions := []string{"0"}
+		for _, col := range adminSearchColumns(app, table, allCols, cols) {
 			conditions = append(conditions, quoteColumn(table, col.Name)+" LIKE ?")
 			args = append(args, "%"+search+"%")
 		}
@@ -973,6 +991,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	query += fmt.Sprintf(" ORDER BY id DESC LIMIT %d OFFSET %d", perPage, offset)
 
 	rows, rowsErr := queryNativeRowsWith(app.DB, app, table, query, args...)
+	rows = adminShownRows(app, table, rows)
 	if rowsErr != nil {
 		rows = nil
 	} else if IsReadAudited(app, table) {
@@ -1099,7 +1118,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	// command-owned column, crud_owned_fields.go).
 	writable := requestWritableFor(app, table, getSession(app, r))
 	for _, col := range createCols {
-		if !writable.column(col, requestCreate) {
+		if !writable.column(col, requestCreate) || app.adminConfig().IsReadonly(table, col.Name) {
 			continue
 		}
 		if col.Name == "password" || col.Name == "password_hash" {
@@ -1149,21 +1168,29 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		notFoundHandler(app)(w, r)
 		return
 	}
-	row := rows[0]
+	row := adminShownRows(app, table, rows)[0]
 	if IsReadAudited(app, table) {
 		if err := LogReadAccess(app, r, table, id, "admin_read", getSession(app, r)); err != nil {
 			serverError(w, r, app, "admin "+table, err, "Read audit unavailable")
 			return
 		}
 	}
-	// A hidden column is left out of the form, so saving it keeps its value.
-	cols = adminVisibleColumns(app, table, cols)
+	// A hidden column is left out of the form, so saving it keeps its value;
+	// so is one admin.yaml `columns:` does not name.
+	cols = adminVisibleColumns(app, table, adminConfiguredColumns(app, table, cols))
 	// A command-owned column is shown, not submitted: saving the form would
 	// otherwise post its value back, and a blank input for a NULL column is a
 	// change, which generic CRUD refuses (crud_owned_fields.go).
 	owned := commandOwnedColumns(app, table)
 	csrf := generateCSRFToken()
+	// The role form below shows the account's role, whichever columns the
+	// page lists.
 	userRole := ""
+	if role, ok := row["role"]; ok && role != nil && identIs(table, adminUsersTable) {
+		userRole = fmt.Sprintf("%v", role)
+	}
+	// admin.yaml `readonly: [column, ...]`: shown, never written here.
+	configReadOnly := func(col Column) bool { return app.adminConfig().IsReadonly(table, col.Name) }
 
 	var sb strings.Builder
 
@@ -1183,7 +1210,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	editable := 0
 	if readOnly == "" {
 		for _, col := range cols {
-			if col.Name != "password_hash" && writable.column(col, requestUpdate) {
+			if col.Name != "password_hash" && writable.column(col, requestUpdate) && !configReadOnly(col) {
 				editable++
 			}
 		}
@@ -1237,14 +1264,12 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		if strings.Contains(col.Name, "email") {
 			inputType = "email"
 		}
-		if !writable.column(col, requestUpdate) {
+		if !writable.column(col, requestUpdate) || configReadOnly(col) {
 			// No update writes this column (a computed column, a workflow's
 			// state, the tenant key, the owner, the timestamps, a user's
-			// sign-in state), so this form only shows it; the role form
-			// below changes a user's role through /_admin/set-role.
-			if col.Name == "role" {
-				userRole = val
-			}
+			// sign-in state, a column admin.yaml makes read-only), so this
+			// form only shows it; the role form below changes a user's role
+			// through /_admin/set-role.
 			sb.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px;">
 				<label style="display:block;font-size:12px;font-weight:500;color:hsl(var(--muted-foreground));margin-bottom:4px;">%s</label>
 				<input value="%s" disabled style="width:100%%;height:36px;padding:0 12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));font-size:13px;">
@@ -1263,7 +1288,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	} else {
 		sb.WriteString(`<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Save Changes</button></form></div>`)
 	}
-	if table == "_benmore_users" {
+	if identIs(table, adminUsersTable) && readOnly == "" {
 		sb.WriteString(adminGlobalRoleForm(app, id, userRole, csrf))
 	}
 
@@ -1279,6 +1304,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 			continue
 		}
 		related, err := queryNativeRowsWith(app.DB, app, otherTable, "SELECT * FROM "+quoteIdent(otherTable)+" WHERE "+quoteColumn(otherTable, fkCol)+" = ? LIMIT 20", id)
+		related = adminShownRows(app, otherTable, related)
 		if err != nil {
 			sb.WriteString(`<div style="margin-top:24px;"><table style="width:100%;border-collapse:collapse;font-size:12px;">` + adminReadFailedRow(1, "related "+otherTable, err) + `</table></div>`)
 			continue
@@ -1287,7 +1313,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 			continue
 		}
 		relCols, _ := GetTableColumns(app.DB, otherTable)
-		relCols = adminVisibleColumns(app, otherTable, relCols)
+		relCols = adminVisibleColumns(app, otherTable, adminConfiguredColumns(app, otherTable, relCols))
 
 		sb.WriteString(fmt.Sprintf(`<div style="margin-top:24px;">
 			<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));margin-bottom:8px;">Related %s (%d)</div>
@@ -1355,6 +1381,44 @@ func adminVisibleColumns(app *App, table string, cols []Column) []Column {
 		}
 	}
 	return out
+}
+
+// adminNamedColumns returns the columns of cols that names lists, in the
+// order of names. A name that is no column of the table is skipped.
+func adminNamedColumns(cols []Column, names []string) []Column {
+	out := make([]Column, 0, len(names))
+	for _, name := range names {
+		for _, c := range cols {
+			if identIs(c.Name, name) && !slices.ContainsFunc(out, func(have Column) bool { return have.Name == c.Name }) {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// adminConfiguredColumns returns the columns admin.yaml's `columns:` gives a
+// table's pages and forms, in its order, or cols when it names none.
+func adminConfiguredColumns(app *App, table string, cols []Column) []Column {
+	if names := app.adminConfig().VisibleColumns(table); len(names) > 0 {
+		return adminNamedColumns(cols, names)
+	}
+	return cols
+}
+
+// adminSearchColumns returns the columns a list page's search matches:
+// those admin.yaml's `search:` names (never a column no response carries),
+// or the columns the page shows. A job's payload is never matched: the page
+// shows it redacted (adminShownRows), and a match on the stored text would
+// say what the redaction hides.
+func adminSearchColumns(app *App, table string, all, shown []Column) []Column {
+	if names := app.adminConfig().SearchColumns(table); len(names) > 0 {
+		shown = adminNamedColumns(adminVisibleColumns(app, table, all), names)
+	}
+	if !identIs(table, adminJobsTable) {
+		return shown
+	}
+	return slices.DeleteFunc(slices.Clone(shown), func(c Column) bool { return identIs(c.Name, "payload") })
 }
 
 // adminGlobalRoleForm is the user page's primary-role form. It posts to

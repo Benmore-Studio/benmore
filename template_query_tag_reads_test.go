@@ -143,7 +143,9 @@ func TestQueryTagCacheIsKeyedByUnmaskClass(t *testing.T) {
 	assertQueryTagMasked(t, "viewer after tenant admins", queryTagBody(t, mux, "/tenant", viewer), "acme-private-note", "globex-private-note")
 
 	// An owner unmask carries the owner, so owners never share an entry.
-	app.Encrypted.Fields["projects"][0].Roles = []string{"owner"}
+	mux = rebuildTestMux(t, app, false, "https://report.example.invalid", func() {
+		app.Encrypted.Fields["projects"][0].Roles = []string{"owner"}
+	})
 	crudScopeMustExec(t, app.DB, fmt.Sprintf("UPDATE projects SET user_id = CASE id WHEN 1 THEN %d ELSE %d END", acmeAdminID, globexAdminID))
 	body = queryTagBody(t, mux, "/own", acmeAdmin)
 	assertQueryTagPlain(t, "owner of row 1", body, "acme-private-note")
@@ -199,7 +201,9 @@ func TestQueryTagOwnerUnmaskNeedsBoundViewer(t *testing.T) {
 	})
 	owner, ownerID := tenantMember(t, app, "owner@example.com", "user", 1, "viewer")
 	_, peerID := tenantMember(t, app, "peer@example.com", "user", 2, "viewer")
-	app.Encrypted.Fields["projects"][0].Roles = []string{"owner"}
+	mux = rebuildTestMux(t, app, false, "https://report.example.invalid", func() {
+		app.Encrypted.Fields["projects"][0].Roles = []string{"owner"}
+	})
 	crudScopeMustExec(t, app.DB, fmt.Sprintf("UPDATE projects SET user_id = CASE id WHEN 1 THEN %d ELSE %d END", ownerID, peerID))
 	for _, route := range []string{"/uid", "/cur", "/owned", "/scoped"} {
 		body := queryTagBody(t, mux, route, owner)

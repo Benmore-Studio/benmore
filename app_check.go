@@ -168,12 +168,12 @@ func cronFlowRefFindingsAfterWrite(dir, writtenPath string, liveDB bool) []Check
 	var findings []CheckFinding
 	for _, m := range cronFlowRefMissing(dir, cfg) {
 		if m.flow == stem {
-			findings = append(findings, CheckFinding{Severity: "error", Source: "syntax", File: "cron.yaml", Message: m.message})
+			findings = append(findings, CheckFinding{Severity: "error", Source: "syntax", File: "cron.yaml", Message: m.message, Docs: gateRuleDocs[gateCron].At})
 			continue
 		}
 		// Filed under the written path: a push shows only its own file's
 		// warnings (writeRelevantFindings), and the message names cron.yaml.
-		findings = append(findings, CheckFinding{Severity: "warning", Source: "syntax", File: filepath.ToSlash(writtenPath), Message: m.message})
+		findings = append(findings, CheckFinding{Severity: "warning", Source: "syntax", File: filepath.ToSlash(writtenPath), Message: m.message, Docs: gateRuleDocs[gateCron].At})
 	}
 	return findings
 }
@@ -334,12 +334,18 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	findings = append(findings, flowInputBoundsWarnings(dir, writtenPath)...)
 	findings = append(findings, flowEventTableWarnings(dir, writtenPath)...)
 	findings = append(findings, flowTransactionalSendWarnings(dir, writtenPath)...)
+	// Page queries and hook SQL that join a protected table by column name:
+	// refused when they run (validators_named_join.go).
+	findings = append(findings, namedJoinWarnings(dir, writtenPath)...)
 	// A `run: respond` that answers something other than it reads as: no
 	// `with:` (a 200 that ends the run), two bodies, a body that is not text.
 	findings = append(findings, respondShapeWarnings(dir, writtenPath)...)
 	// A `role:` gate that is not one role the app knows: it admits nobody
 	// but a global admin (validators_flow_role_gate.go).
 	findings = append(findings, flowRoleGateWarnings(dir, writtenPath)...)
+	// `admin` on a workflow transition, a page gate or a role section that
+	// the app's tenant admins do not pass (validators_role_admin_gate.go).
+	findings = append(findings, roleAdminGateWarnings(dir, writtenPath)...)
 
 	// Layer 2.5: protected-column-name collisions (v2.7.164). A column
 	// named `role` / `password_hash` on an app table collides with the
@@ -382,9 +388,10 @@ func runCheckWithLive(dir, writtenPath string, liveDB bool, live func(dir string
 	// Authorization shapes that widen access (validators_authz.go).
 	findings = append(findings, authzWarnings(dir)...)
 
-	// What `compliance: hipaa` leaves to a flow's or hook's own SQL: writes
-	// with no audit row, whole encrypted rows in a response
-	// (validators_hipaa_flows.go).
+	// What an app's own SQL does outside the generated API's controls:
+	// under `compliance: hipaa` a flow, hook or cron job that writes with no
+	// audit row; in any app with encrypted fields a flow that answers with
+	// whole encrypted rows (validators_hipaa_flows.go).
 	findings = append(findings, hipaaFlowFindings(dir, writtenPath)...)
 
 	// WebSockets to hosts the page's connect-src does not allow.
@@ -831,7 +838,9 @@ func piiExposureWarningsChecked(dir string) ([]CheckFinding, error) {
 
 // redirectWarnings runs the advisory flow-file warners - ghaRedirectWarnings
 // (validators_write.go), ghaStepShadowWarnings (validators_step_shadow.go),
-// ghaPrivateUploadRecordWarnings (flows_upload_owner.go) and
+// ghaPrivateUploadRecordWarnings and ghaPublicDeleteRecordWarnings
+// (flows_upload_owner.go), ghaPurgeKeepsUploadsWarnings
+// (account_delete_uploads.go) and
 // ghaMissingRequestValueWarnings (validators_flow_ignored_values.go)
 // - over flows.yaml and every flows/*.yaml file the runtime loads.
 func redirectWarnings(dir string) []CheckFinding {
@@ -859,6 +868,12 @@ func redirectWarnings(dir string) []CheckFinding {
 		// serve_file / delete_upload without `record:` where no caller
 		// signs in: every user upload is refused (flows_upload_owner.go).
 		msgs = append(msgs, ghaPrivateUploadRecordWarnings(string(data))...)
+		// delete_upload without `record:` that a public upload stops at
+		// run time (flows_upload_owner.go).
+		msgs = append(msgs, ghaPublicDeleteRecordWarnings(string(data))...)
+		// A purge_current_user flow that removes none of the person's
+		// files (account_delete_uploads.go).
+		msgs = append(msgs, ghaPurgeKeepsUploadsWarnings(string(data))...)
 		// An optional request field with no fallback where a missing value
 		// is compared, or sent, as its placeholder text
 		// (validators_flow_ignored_values.go).
@@ -930,6 +945,7 @@ func walkAppFilesIn(root *os.Root) []fileCheck {
 		"computed.yaml",
 		"encrypted.yaml",
 		"retention.yaml",
+		"admin.yaml",
 	}
 	var out []fileCheck
 	for _, rel := range candidates {

@@ -281,8 +281,11 @@ func registerAnalyticsRoutes(mux appRouteRegistrar, app *App) {
 
 		// Resolve auth before holding a database transaction: session lookup can
 		// need another connection, including when the pool has a single slot.
+		// The visitor is tied to the account only for a full sign-in: a
+		// credential narrowed to some tables counts as a signed-out visitor
+		// (scoped_credential_routes.go).
 		var userID int64
-		if sess := getSession(app, r); sess != nil {
+		if sess := getSession(app, r); sess != nil && !scopedCredential(sess) {
 			userID = sess.UserID
 		}
 		err := func() error {
@@ -798,13 +801,14 @@ const analyticsDefaultNotice = "We use a cookie to measure how this site is used
 // accepts a same-origin path or an https URL only.
 func analyticsNoticeCopy(app *App) (text, link string) {
 	text = html.EscapeString(analyticsDefaultNotice)
-	if app == nil || app.Design == nil {
+	design := app.designConfig()
+	if design == nil {
 		return text, ""
 	}
-	if custom := strings.TrimSpace(app.Design.SEO["cookie_notice"]); custom != "" {
+	if custom := strings.TrimSpace(design.SEO["cookie_notice"]); custom != "" {
 		text = html.EscapeString(custom)
 	}
-	if u := strings.TrimSpace(app.Design.SEO["privacy_url"]); analyticsNoticeLinkOK(u) {
+	if u := strings.TrimSpace(design.SEO["privacy_url"]); analyticsNoticeLinkOK(u) {
 		link = ` <a href="` + html.EscapeString(u) + `" style="color:inherit;text-decoration:underline;">Privacy policy</a>`
 	}
 	return text, link

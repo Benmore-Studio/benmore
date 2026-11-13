@@ -40,12 +40,12 @@ access:
 
 func newTenantPermFixture(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
-	app, mux := newTenantRoleFixture(t, tenantPermYAML)
+	app := newTenantRoleApp(t, tenantPermYAML)
 	app.Roles = parseRolesConfig([]byte(tenantPermYAML))
 	if app.Roles == nil {
 		t.Fatal("fixture: roles did not parse")
 	}
-	return app, mux
+	return app, buildAppMux(app, true, "http://localhost")
 }
 
 // A permission granted only by a role held inside a tenant (the membership
@@ -99,9 +99,11 @@ func TestTenantRolePermissionDoesNotPassPermGateOnUngroupedTable(t *testing.T) {
 	assertStatus(t, mux, http.MethodPost, "/api/brokers", global, map[string]any{"name": "by-global"}, http.StatusOK)
 
 	// groups.shared keeps counting tenant-held permissions, as for role:.
-	app.mu.Lock()
-	app.Group.Shared = []string{"brokers"}
-	app.mu.Unlock()
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.mu.Lock()
+		app.Group.Shared = []string{"brokers"}
+		app.mu.Unlock()
+	})
 	assertStatus(t, mux, http.MethodGet, "/api/brokers/1", member, nil, http.StatusOK)
 }
 

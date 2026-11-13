@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -137,7 +138,6 @@ func TestValidationLoadInterruptsRunawayMigration(t *testing.T) {
 func TestValidationLoadInterruptsRunawayAdoptedMigration(t *testing.T) {
 	dir := checkLoadFixture(t)
 	old := checkMigrationTimeout
-	checkMigrationTimeout = 300 * time.Millisecond
 	t.Cleanup(func() { checkMigrationTimeout = old })
 	v1 := "model Note {\n id Int @id @default(autoincrement())\n body String\n}\n"
 	v2 := "model Note {\n id Int @id @default(autoincrement())\n body String\n tag String @default(\"\")\n}\n"
@@ -155,13 +155,27 @@ func TestValidationLoadInterruptsRunawayAdoptedMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	done := make(chan string, 1)
-	go func() { done <- tryLoadApp(dir) }()
+	// The limit is wall-clock time for the whole schema step, and what runs
+	// before the adopted file (the pre-migration copy of this 20 MB database)
+	// takes real time on a busy machine. When the limit runs out before the
+	// file's first statement the load fails without naming the file, which
+	// shows nothing about the file yet: the load is repeated with twice the
+	// limit. The file's statement never ends, so the first limit that reaches
+	// it must end in the file's own time-limit error.
 	var msg string
-	select {
-	case msg = <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("validation load never returned: a router core is pinned by an adopted migration file")
+	for limit := 300 * time.Millisecond; ; limit *= 2 {
+		checkMigrationTimeout = limit
+		done := make(chan string, 1)
+		go func() { done <- tryLoadApp(dir) }()
+		select {
+		case msg = <-done:
+		case <-time.After(limit + 15*time.Second):
+			t.Fatal("validation load never returned: a router core is pinned by an adopted migration file")
+		}
+		if limit >= 20*time.Second || !strings.Contains(msg, context.DeadlineExceeded.Error()) || strings.Contains(msg, "0002_20260101T000000Z_add_tag.sql") {
+			break
+		}
+		t.Logf("the %s limit ran out before the adopted file started (%s); trying twice the limit", limit, msg)
 	}
 	if !strings.Contains(msg, "0002_20260101T000000Z_add_tag.sql did not finish") {
 		t.Fatalf("load error = %q, want the adopted file's time limit", msg)

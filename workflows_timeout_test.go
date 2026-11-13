@@ -25,6 +25,26 @@ func newWorkflowTimeoutApp(t *testing.T) (*App, *Workflow) {
 		Timeouts:     map[string]WorkflowTimeout{"shipped": {After: time.Second, To: "delivered"}},
 	}
 	app.Workflows = &WorkflowConfig{Workflows: map[string]*Workflow{"orders": wf}}
+	// The failure waits and resume positions are kept per process, and the
+	// waits are capped: once tests of earlier runs in this process have filled
+	// the map, each new failure evicts another row's wait and that row is
+	// tried again in the same test. Each app takes its own entries with it.
+	t.Cleanup(func() {
+		workflowTimeoutBackoff.mu.Lock()
+		for k := range workflowTimeoutBackoff.m {
+			if k.dir == app.Dir {
+				delete(workflowTimeoutBackoff.m, k)
+			}
+		}
+		workflowTimeoutBackoff.mu.Unlock()
+		workflowTimeoutResume.mu.Lock()
+		for k := range workflowTimeoutResume.m {
+			if k.dir == app.Dir {
+				delete(workflowTimeoutResume.m, k)
+			}
+		}
+		workflowTimeoutResume.mu.Unlock()
+	})
 	return app, wf
 }
 

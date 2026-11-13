@@ -264,10 +264,11 @@ func (app *App) Shutdown() {
 // feature when Design was nil, which silently auto-enabled the testing
 // banner on every fresh `benmore serve` app even with no `features:` block.
 func (app *App) FeatureEnabled(name string) bool {
-	if app.Design == nil {
+	design := app.designConfig()
+	if design == nil {
 		return (*FeaturesConfig)(nil).IsEnabled(name)
 	}
-	return app.Design.Features.IsEnabled(name)
+	return design.Features.IsEnabled(name)
 }
 
 // FeedbackWidgetEnabled reports whether the visitor feedback widget + its

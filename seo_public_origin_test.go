@@ -60,6 +60,7 @@ func TestSEOFilesUseTheAppsOwnFilesAndPublicOrigin(t *testing.T) {
 	}
 
 	// A configured seo.url still wins.
+	quiesceTestApp(t, app2)
 	app2.Design.SEO = map[string]string{"url": "https://configured.example.test/"}
 	if robots := get(t, app2, "/robots.txt", "www.example.test"); !strings.Contains(robots, "Sitemap: https://configured.example.test/sitemap.xml") {
 		t.Fatalf("seo.url ignored: %q", robots)

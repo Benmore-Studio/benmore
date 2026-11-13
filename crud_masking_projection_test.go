@@ -10,11 +10,12 @@ import (
 )
 
 func TestCRUDTenantMaskingPreservesProjectedReads(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  companies:\n    read: everyone\n  projects:\n    read: everyone\n")
+	app := newTenantRoleApp(t, "access:\n  companies:\n    read: everyone\n  projects:\n    read: everyone\n")
 	app.Encrypted = &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{
 		"companies": {{Column: "name", Roles: []string{"company_admin"}}},
 		"projects":  {{Column: "name", Roles: []string{"company_admin"}}},
 	}}
+	mux := buildAppMux(app, true, "http://localhost")
 	sid, _ := tenantMember(t, app, "projection@example.test", "user", 1, "company_admin")
 	for _, table := range []string{"companies", "projects"} {
 		crudScopeMustExec(t, app.DB, "UPDATE "+table+" SET name=CASE id WHEN 1 THEN 'own-tenant-value' ELSE 'other-tenant-value' END")

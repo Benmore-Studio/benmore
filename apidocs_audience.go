@@ -123,17 +123,26 @@ func (v docsViewer) pruneOpenAPIPaths(app *App, table string, paths map[string]a
 	}
 }
 
-// showsPage mirrors the page gates servePage applies: role= (any-of),
-// auth="required" and require= need a signed-in caller.
-func (v docsViewer) showsPage(p *Page) bool {
-	if v.full {
+// showsPage reports whether the page route would serve p to this caller, by
+// the route's own gates: a page that requires sign-in (auth, role= or
+// require=) needs a signed-in caller on a credential pages accept (a scoped
+// credential is refused, scopedCredentialPageGate), role= is judged by
+// pageRoleAllowed (roles held globally and the built-in hierarchy, never a
+// tenant role) and require= against the account's own fields
+// (RequireMiddleware).
+func (v docsViewer) showsPage(app *App, p *Page) bool {
+	if v.full || !pageRequiresSignIn(p) {
 		return true
 	}
-	if role := pageRole(p); role != "" && role != "public" {
-		return v.session != nil && HasAnyRole(v.session, splitCommaList(role))
+	if v.session == nil || (scopedCredential(v.session) && !platformPageSession(app, v.session)) {
+		return false
 	}
-	if p.Auth == "required" || p.Require != "" {
-		return v.session != nil
+	if role := pageRole(p); role != "" && role != "public" && !pageRoleAllowed(app, v.session, role) {
+		return false
+	}
+	if p.Require != "" {
+		fields := LoadUserFields(app.DB, v.session.UserID)
+		return fields != nil && checkRequireFields(p.Require, fields)
 	}
 	return true
 }

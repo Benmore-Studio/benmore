@@ -16,6 +16,7 @@ func TestSDUIShareDialogNativeLoadErrors(t *testing.T) {
 		t.Skip("node not installed; skipping component integration")
 	}
 	app, _, owner, reader := permissionRevokeFixture(t)
+	quiesceTestApp(t, app)
 	// Auth routes are part of this fixture so revocation uses the native logout handler.
 	app.Pages = map[string]*Page{"/": {Auth: "required", RawHTML: "fixture"}}
 	app.Paths = DiscoverAuthPaths(app.Pages)

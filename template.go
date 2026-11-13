@@ -387,7 +387,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 	content = stripPageTag(content)
 
 	// 2. Expand includes
-	content = processIncludesWithReader(content, app.Partials, app.Dir, app.readAppInclude)
+	content = processIncludesWithReader(content, app.partialSources(), app.Dir, app.readAppInclude)
 
 	// 2b. Resolve {{env.X}} variables from env.yaml
 	content = InterpolateEnv(content, app.Dir)
@@ -424,7 +424,7 @@ func RenderTemplate(app *App, page *Page, ctx *RenderContext) (string, error) {
 	content = ExpandFetchTagsAsync(content, app, ctx)
 
 	// 3c. Expand <transitions> tags - render workflow transition buttons
-	if app.Workflows != nil {
+	if app.workflowConfig() != nil {
 		content = expandTransitionTags(content, app, ctx)
 	}
 
@@ -446,7 +446,7 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 		layoutPath := fmt.Sprintf("layouts/%s.html", ctx.Page.Layout)
 		if layoutData, err := app.readSourceFile(layoutPath); err == nil {
 			layoutHTML := string(layoutData)
-			layoutHTML = processIncludesWithReader(layoutHTML, app.Partials, app.Dir, app.readAppInclude)
+			layoutHTML = processIncludesWithReader(layoutHTML, app.partialSources(), app.Dir, app.readAppInclude)
 			content = renderLayout(layoutHTML, content, ctx.Data)
 		}
 	} else if ctx.Page != nil {
@@ -455,7 +455,7 @@ func finalizeRender(app *App, page *Page, ctx *RenderContext, content string) st
 		// still get the app's design-system styling (CSS variables, component
 		// classes, fonts) without boilerplate in every file.
 		if kitData, err := app.readSourceFile("partials/kit.html"); err == nil {
-			kitHTML := processIncludesWithReader(string(kitData), app.Partials, app.Dir, app.readAppInclude)
+			kitHTML := processIncludesWithReader(string(kitData), app.partialSources(), app.Dir, app.readAppInclude)
 			content = kitHTML + "\n" + content
 		}
 	}
@@ -994,44 +994,16 @@ func renderMustacheCtx(template string, data map[string]any, c *htmlCtx) string 
 					name := strings.TrimSpace(tag[1:])
 
 					// Role section: {{#role "admin"}}...{{/role}} - server-side role check.
-					// `requiredRole` may now be a comma-separated list of roles
+					// `requiredRole` may be a comma-separated list of roles
 					// (`{{#role "editor,reviewer"}}`); the section renders if the
-					// caller holds ANY of them. This mirrors the access mode
-					// `role:editor,reviewer` so SSR-gated UI and CRUD-layer auth
-					// share one semantic.
+					// caller holds ANY of them (roleSectionOpen).
 					if strings.HasPrefix(name, `role "`) || strings.HasPrefix(name, `role '`) {
 						requiredRole := strings.Trim(name[5:], `"' `)
 						closeTag := "{{/role}}"
 						closeIdx := strings.Index(template[nextI:], closeTag)
 						if closeIdx >= 0 {
 							inner := template[nextI : nextI+closeIdx]
-							userRole, _ := data["user_role"].(string)
-							appRole, _ := data["user_app_role"].(string)
-							rolesAll, _ := data["user_roles"].(string)
-							held := map[string]bool{}
-							if userRole != "" {
-								held[userRole] = true
-							}
-							if appRole != "" {
-								held[appRole] = true
-							}
-							for _, r := range strings.Split(rolesAll, ",") {
-								if t := strings.TrimSpace(r); t != "" {
-									held[t] = true
-								}
-							}
-							match := false
-							for _, want := range strings.Split(requiredRole, ",") {
-								want = strings.TrimSpace(want)
-								if want == "" {
-									continue
-								}
-								if held[want] || held["admin"] {
-									match = true
-									break
-								}
-							}
-							if match {
+							if roleSectionOpen(requiredRole, data) {
 								write(renderMustacheCtx(inner, data, c.clone()))
 							}
 							i = nextI + closeIdx + len(closeTag)
@@ -1703,7 +1675,8 @@ func expandTransitionTags(content string, app *App, ctx *RenderContext) string {
 		}
 
 		// The moves this viewer may make now, as GET .../transitions lists
-		// them: role, `when:` and a command-owned state column all count.
+		// them: only what the transition route would accept for this row
+		// (availableWorkflowMoves).
 		if len(wf.Transitions[valueText(row[0][wf.Field])]) == 0 {
 			return "" // no transitions available from this state
 		}

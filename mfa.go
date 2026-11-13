@@ -468,6 +468,9 @@ func registerMFARoutes(mux appRouteRegistrar, app *App) {
 			// they earn the full session here. Mirrors the post-MFA
 			// session-creation in handleLogin/handleTokenAuth.
 			token, err = createSignInSessionTx(tx, userID, email, groupID, app.SessionDuration)
+			if err == nil {
+				err = auditSignIn(tx, app, "mfa_enrollment", userID, email)
+			}
 			if err != nil {
 				serverErrorJSON(w, r, app, "mfa verify", err, "MFA verification could not be saved")
 				return
@@ -671,6 +674,7 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 		if !validateMFACodeWith(tx, userID, code) {
 			tx.Rollback()
 			recordLoginAttempt(app.DB, mfaKey, false)
+			auditSignInRefused(app, "totp", "invalid_code", userID, email)
 			authRedirect(w, r, mfaPath, "Invalid MFA code")
 			return
 		}
@@ -680,6 +684,9 @@ func RegisterMFALoginRoute(mux appRouteRegistrar, app *App) {
 				otpCode, otpToken, err = prepareLoginOTPTx(app, tx, userID, email, otpKey, challenge.Binding)
 			} else {
 				sessionID, err = createSignInSessionTx(tx, userID, email, groupID, app.SessionDuration)
+				if err == nil {
+					err = auditSignIn(tx, app, "totp", userID, email)
+				}
 			}
 		}
 		if err == nil {

@@ -149,8 +149,7 @@ func TestAppMCPCapturedStaticAssetsDenyLateEmptyAndMetadataSources(t *testing.T)
 
 	// An initialized empty capture and a missing capture both fail closed.
 	writeTestFile(t, app.Dir, "static/late.js", "late")
-	app.sourceFiles = map[string][]byte{}
-	for _, sources := range []map[string][]byte{app.sourceFiles, nil} {
+	for _, sources := range []map[string][]byte{{}, nil} {
 		app.mu.Lock()
 		app.sourceFiles = sources
 		app.mu.Unlock()

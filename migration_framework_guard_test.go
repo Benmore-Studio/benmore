@@ -222,10 +222,10 @@ CREATE TABLE _benmore_app_cache (k TEXT PRIMARY KEY);
 	}
 }
 
-// Under hipaa, flow SQL cannot create a trigger whose body would update,
-// delete or replace audit rows when a later write fires it: that write is the
-// framework's own and runs outside the app SQL scope. A trigger that adds an
-// audit row is fine, and so is any trigger of an app that is not hipaa.
+// Under hipaa, flow SQL cannot create a trigger whose body would write audit
+// rows when a later write fires it: that write is the framework's own and
+// runs outside the app SQL scope. Any trigger of an app that is not hipaa is
+// fine.
 func TestAppSQLCannotCreateATriggerThatRewritesAuditRows(t *testing.T) {
 	bodies := map[string]string{
 		"insert or replace": `INSERT OR REPLACE INTO _benmore_audit_log (id, action, table_name) VALUES (1, 'x', 'y')`,
@@ -240,7 +240,7 @@ func TestAppSQLCannotCreateATriggerThatRewritesAuditRows(t *testing.T) {
 			before := appSQLGuardSchema(t, app)
 			stmt := "CREATE TRIGGER notes_audit AFTER INSERT ON notes BEGIN\n  INSERT INTO notes (body) VALUES ('copy');\n  " + body + ";\nEND"
 			rr, err := runExpectRowsFlow(t, app, expectRowsFlow("", sqlStepYAML("s", "sql", stmt)))
-			if err == nil || rr.Code != http.StatusInternalServerError || !strings.Contains(err.Error(), "may not create a trigger that updates, deletes or replaces its rows") {
+			if err == nil || rr.Code != http.StatusInternalServerError || !strings.Contains(err.Error(), "may not create a trigger that writes to it") {
 				t.Fatalf("flow answered %d (err %v), want the trigger refused", rr.Code, err)
 			}
 			if after := appSQLGuardSchema(t, app); after != before {
@@ -248,25 +248,19 @@ func TestAppSQLCannotCreateATriggerThatRewritesAuditRows(t *testing.T) {
 			}
 		})
 	}
-	adds := "CREATE TRIGGER notes_audit AFTER INSERT ON notes BEGIN\n  INSERT INTO _benmore_audit_log (action, table_name, row_id) VALUES ('note', 'notes', NEW.id);\nEND"
-	app := appSQLGuardApp(t, true)
-	steps := sqlStepYAML("a", "sql", adds) + sqlStepYAML("b", "sql", `INSERT INTO notes (body) VALUES ('x')`)
-	if rr, err := runExpectRowsFlow(t, app, expectRowsFlow("", steps)); err != nil || rr.Code != http.StatusOK {
-		t.Fatalf("a trigger that adds an audit row answered %d (err %v), want 200", rr.Code, err)
-	}
-	if got := appSQLGuardText(t, app, `SELECT COUNT(*) FROM _benmore_audit_log WHERE action = 'note'`); got != "1" {
-		t.Errorf("audit rows added by the trigger = %s, want 1", got)
-	}
+	// An app that is not hipaa keeps its triggers, one that adds an audit row
+	// included.
+	adds := "CREATE TRIGGER notes_added AFTER INSERT ON notes BEGIN\n  INSERT INTO _benmore_audit_log (action, table_name, row_id) VALUES ('note', 'notes', NEW.id);\nEND"
 	plain := appSQLGuardApp(t, false)
 	rewrites := "CREATE TRIGGER notes_audit AFTER INSERT ON notes BEGIN\n  " + bodies["update"] + ";\nEND"
-	if rr, err := runExpectRowsFlow(t, plain, expectRowsFlow("", sqlStepYAML("s", "sql", rewrites))); err != nil || rr.Code != http.StatusOK {
-		t.Fatalf("the trigger on a non-hipaa app answered %d (err %v), want 200", rr.Code, err)
+	if rr, err := runExpectRowsFlow(t, plain, expectRowsFlow("", sqlStepYAML("s", "sql", rewrites)+sqlStepYAML("a", "sql", adds))); err != nil || rr.Code != http.StatusOK {
+		t.Fatalf("the triggers on a non-hipaa app answered %d (err %v), want 200", rr.Code, err)
 	}
 
 	for text, want := range map[string]string{
 		`CREATE TRIGGER t AFTER UPDATE OF body ON notes BEGIN SELECT 1; END`:                                                                                                                 "",
 		`CREATE TRIGGER t AFTER INSERT ON notes BEGIN SELECT 'UPDATE _benmore_audit_log SET x = 1'; END`:                                                                                     "",
-		`CREATE TRIGGER t AFTER INSERT ON notes BEGIN INSERT INTO notes (body) VALUES ('x') ON CONFLICT DO UPDATE SET body = 'y'; INSERT INTO _benmore_audit_log (action) VALUES ('a'); END`: "",
+		`CREATE TRIGGER t AFTER INSERT ON notes BEGIN INSERT INTO notes (body) VALUES ('x') ON CONFLICT DO UPDATE SET body = 'y'; INSERT INTO _benmore_audit_log (action) VALUES ('a'); END`: "_benmore_audit_log",
 		`CREATE TRIGGER t AFTER INSERT ON notes BEGIN UPDATE notes SET body = (SELECT action FROM _benmore_audit_log); END`:                                                                  "",
 		`CREATE TRIGGER t AFTER INSERT ON notes BEGIN SELECT CASE WHEN 1 THEN 2 END; DELETE /* x */ FROM "_benmore_read_audit"; END`:                                                         "_benmore_read_audit",
 		`CREATE TEMP TRIGGER t AFTER INSERT ON notes WHEN CASE WHEN 1 THEN 1 END BEGIN UPDATE main._benmore_audit_log SET action = 'x'; END`:                                                 "_benmore_audit_log",

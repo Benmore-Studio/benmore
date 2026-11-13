@@ -247,6 +247,9 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 		ctx.Data["user_email"] = session.Email
 		ctx.Data["user_id"] = session.UserID
 		ctx.Data["user_role"] = session.Role
+		if session.IsAdmin() {
+			ctx.Data[roleSectionGlobalAdminKey] = true
+		}
 		if session.HasGroup() {
 			ctx.Data["user_group_id"] = session.GroupID
 		}
@@ -269,25 +272,31 @@ func handlePDFRender(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
-	// Inject CSRF tokens (for form display consistency)
-	content = InjectCSRF(content)
-
 	title := page.Title
 	if title == "" {
 		title = pageDefaultTitle(page.Route)
 	}
 
-	// The print shell: the page, without what the browser shell adds for a
-	// person looking at it (consent banner, feedback widget, analytics,
-	// live-update and reload clients, service worker).
-	fullHTML := WrapLayoutForPrint(content, title, app, session, page)
+	var fullHTML []byte
+	if page.Engine == "raw" {
+		// The author's whole document, as a browser is served it: wrapped in
+		// the shell it was a document inside a document.
+		fullHTML = rawPageDocument(content, app)
+	} else {
+		// Inject CSRF tokens (for form display consistency)
+		content = InjectCSRF(content)
+		// The print shell: the page, without what the browser shell adds for
+		// a person looking at it (consent banner, feedback widget, analytics,
+		// live-update and reload clients, service worker).
+		fullHTML = []byte(WrapLayoutForPrint(content, title, app, session, page))
+	}
 
 	// Render inside the sandbox (pdf_sandbox.go): the document is served
 	// from an isolated http origin and every request Chrome makes goes
 	// through a proxy that serves only this document and tunnels HTTPS only
 	// to the hosts the page CSP names.
 	csp, hosts := pdfPolicy(app)
-	sandbox, err := newPDFSandbox([]byte(fullHTML), csp, hosts)
+	sandbox, err := newPDFSandbox(fullHTML, csp, hosts)
 	if err != nil {
 		log.Printf("PDF ERROR: sandbox: %s", err.Error())
 		pdfServerError(w, r, app, http.StatusInternalServerError, fmt.Errorf("sandbox: %w", err), "")

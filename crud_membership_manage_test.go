@@ -33,7 +33,7 @@ func membershipCount(t *testing.T, app *App, where string, args ...any) int {
 // table, managing memberships now takes a tenant admin; a member may still
 // leave.
 func TestMembershipTableWritesNeedTenantAdmin(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  projects: role:company_admin\n")
+	app := newTenantRoleApp(t, "access:\n  projects: role:company_admin\n")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE company_members ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 	app.Group.ActiveField = "active"
 	for i := range app.Tables {
@@ -45,6 +45,7 @@ func TestMembershipTableWritesNeedTenantAdmin(t *testing.T) {
 			app.Tables[i].Columns = cols
 		}
 	}
+	mux := buildAppMux(app, true, "http://localhost")
 	adminSID, _ := tenantMember(t, app, "lead@example.com", "user", 1, "company_admin")
 	memberSID, _ := tenantMember(t, app, "member@example.com", "user", 1, "viewer")
 	peerSID, _ := tenantMember(t, app, "peer@example.com", "user", 1, "viewer")
@@ -107,7 +108,7 @@ func TestMembershipTableWritesNeedTenantAdmin(t *testing.T) {
 
 // A member's own row is still not theirs to edit: only leaving is open.
 func TestMembershipOwnRowUpdateIsLeaveOnly(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  projects: role:company_admin\n")
+	app := newTenantRoleApp(t, "access:\n  projects: role:company_admin\n")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE company_members ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE company_members ADD COLUMN can_approve INTEGER NOT NULL DEFAULT 0")
 	app.Group.ActiveField = "active"
@@ -120,6 +121,7 @@ func TestMembershipOwnRowUpdateIsLeaveOnly(t *testing.T) {
 			app.Tables[i].Columns = cols
 		}
 	}
+	mux := buildAppMux(app, true, "http://localhost")
 	memberSID, _ := tenantMember(t, app, "member@example.com", "user", 1, "viewer")
 	row := membershipRowID(t, app, "member@example.com")
 	crudScopeRequest(t, mux, http.MethodPatch, fmt.Sprintf("/api/company_members/%d", row), memberSID, map[string]any{"can_approve": 1})
@@ -154,7 +156,7 @@ func TestMembershipTableDeclaredRuleIsUntouched(t *testing.T) {
 // Without a tenant role to go by (no groups.role_field / founding_role), the
 // tenant admin is whoever owns the tenant's org row.
 func TestMembershipTableCreatorManagesWithoutTenantRoles(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  projects: group\n")
+	app := newTenantRoleApp(t, "access:\n  projects: group\n")
 	app.Group.RoleField = ""
 	app.Group.Bootstrap.FoundingRole = ""
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN user_id INTEGER")
@@ -167,6 +169,7 @@ func TestMembershipTableCreatorManagesWithoutTenantRoles(t *testing.T) {
 			app.Tables[i].Columns = cols
 		}
 	}
+	mux := buildAppMux(app, true, "http://localhost")
 	founderSID, founderID := tenantMember(t, app, "founder@example.com", "user", 1, "")
 	memberSID, _ := tenantMember(t, app, "member@example.com", "user", 1, "")
 	crudScopeMustExec(t, app.DB, fmt.Sprintf("UPDATE companies SET user_id = %d WHERE id = 1", founderID))

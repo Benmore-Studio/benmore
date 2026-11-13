@@ -9,11 +9,13 @@ import (
 	"testing"
 )
 
-// hipaaFlowCheckFindings is the compliance layer's part of a check report.
+// hipaaFlowCheckFindings is the part of a check report this layer writes: the
+// audit advice of a hipaa app (source compliance) and the whole-row warning
+// of any app with encrypted fields (source encryption).
 func hipaaFlowCheckFindings(rpt CheckReport) []CheckFinding {
 	var out []CheckFinding
 	for _, f := range rpt.Findings {
-		if f.Source == "compliance" {
+		if f.Source == "compliance" || f.Source == "encryption" {
 			out = append(out, f)
 		}
 	}
@@ -73,8 +75,18 @@ func TestHIPAAFlowChecksWarnOnTheFixture(t *testing.T) {
 	}
 }
 
-// The same files without `compliance: hipaa` raise nothing.
+// The same files without `compliance: hipaa` get no audit advice. (The
+// whole-row warning stays: TestWholeRowFlowResponseWarnsWithoutHIPAA.)
 func TestHIPAAFlowChecksAreSilentWithoutHIPAA(t *testing.T) {
+	compliance := func(rpt CheckReport) []CheckFinding {
+		var out []CheckFinding
+		for _, f := range rpt.Findings {
+			if f.Source == "compliance" {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
 	dir := configGapFixtureDir(t, "hipaa-flow-checks")
 	appYAML, err := os.ReadFile(filepath.Join(dir, "app.yaml"))
 	if err != nil {
@@ -85,7 +97,7 @@ func TestHIPAAFlowChecksAreSilentWithoutHIPAA(t *testing.T) {
 		t.Fatal("the fixture's app.yaml does not set compliance: hipaa")
 	}
 	writeTestFile(t, dir, "app.yaml", plain)
-	if got := hipaaFlowCheckFindings(RunSourceCheck(dir, "")); len(got) != 0 {
+	if got := compliance(RunSourceCheck(dir, "")); len(got) != 0 {
 		t.Fatalf("an app without compliance: hipaa is warned: %v", got)
 	}
 	if got := hipaaFlowCheckFindings(RunSourceCheck(dir, "flows/note-unaudited.yaml")); len(got) != 0 {

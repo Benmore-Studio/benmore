@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -62,6 +63,9 @@ func appMCPReadFlowPolicy(flow *Flow) error {
 			case "sql":
 				if !isReadOnlyQuery(step.SQL) {
 					return fmt.Errorf("connector flow SQL must be one read-only statement")
+				}
+				if readOnlyNamedJoinOnFrameworkTable(step.SQL) {
+					return errors.New(connectorNamedJoinRefusal)
 				}
 			case "sql_dynamic", "compute", "set", "parse", "respond", "if", "for_each":
 			default:
@@ -122,6 +126,21 @@ func appMCPFlowStepGuard(ctx *FlowContext, step *FlowStep) error {
 		return errAppMCPGrantDenied
 	}
 	return appMCPReadFlowPolicy(&Flow{Trigger: FlowTrigger{Type: "http"}, Steps: []FlowStep{*step}})
+}
+
+// connectorNamedJoinRefusal: a connector read flow's SQL runs under the
+// read-only authorizer, which a join by column name is not reported to
+// (sql_named_join.go). The policy refuses the authored text; the SQL steps
+// refuse the statement they are about to run (sql_dynamic's rendered text).
+var connectorNamedJoinRefusal = sqlNamedJoinRefusal("connector SQL", "a framework table (_benmore_*)")
+
+// connectorViewError words readOnlyViewTexts' refusal for a connector read
+// flow: a view the statement reads joins a framework table by column name.
+func connectorViewError(err error) error {
+	if errors.Is(err, errReadOnlyNamedJoinView) {
+		return errors.New(sqlNamedJoinViewRefusal("connector SQL", "a framework table (_benmore_*)"))
+	}
+	return err
 }
 
 // Transaction control belongs to the canonical flow lifecycle. Authored SQL

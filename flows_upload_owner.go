@@ -279,3 +279,64 @@ func ghaPrivateUploadRecordWarnings(content string) []string {
 	}
 	return out
 }
+
+// ghaPublicDeleteRecordWarnings flags `run: delete_upload` steps with no
+// `record:` that a public upload would stop: the step deletes a public file
+// only on the proof `record:` gives (flowPublicUploadOwnerRefusal) and fails
+// the flow otherwise, which nothing said before the flow ran. A path that
+// names a public upload in its own text is certain to be refused. A path
+// that is only a template may resolve to either tier, so a signed-in flow
+// gets the conditional form; a flow with no signed-in caller already gets
+// ghaPrivateUploadRecordWarnings for the same step. Advisory.
+func ghaPublicDeleteRecordWarnings(content string) []string {
+	var file FlowFileGHA
+	if err := yamlUnmarshal([]byte(content), &file); err != nil || file.Jobs == nil {
+		return nil
+	}
+	signedIn := flowRequestSignedIn(file.On.Request)
+	const fix = "Add `record: { table: <table>, id: \"${{ steps.<lookup>.outputs.id }}\" }` naming the row the file belongs to (api(at:\"uploads\") -> public_deletion)."
+	var out []string
+	var walk func(job string, steps []FlowStepGHA)
+	walk = func(job string, steps []FlowStepGHA) {
+		for _, s := range steps {
+			if _, named := s.With["record"]; ghaStepRunType(s) == "delete_upload" && !named {
+				label := s.ID
+				if label == "" {
+					label = "delete_upload"
+				}
+				path, _ := s.With["path"].(string)
+				switch {
+				case strings.HasPrefix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(path)), "/"), "uploads/private/"):
+					// Names the private tier: the public rule never applies.
+				case deleteUploadPathNamesPublic(path):
+					out = append(out, fmt.Sprintf(
+						"job %q step %q (`run: delete_upload`) names a public upload (%q) and has no `record:`. A public upload is deleted only with `record:` naming the row that owns it, so this step is refused when it runs and the flow fails. %s",
+						job, label, strings.TrimSpace(path), fix))
+				case signedIn:
+					out = append(out, fmt.Sprintf(
+						"job %q step %q (`run: delete_upload`) has no `record:`. If the reference it resolves is a public upload (any folder but `private`), the step is refused when it runs and the flow fails: a public upload is deleted only with `record:` naming the row that owns it. %s Ignore this if the step only ever deletes private files.",
+						job, label, fix))
+				}
+			}
+			walk(job, s.Steps)
+			walk(job, s.Else)
+			walk(job, s.OnError)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(file.Jobs)) {
+		walk(name, file.Jobs[name].Steps)
+	}
+	return out
+}
+
+// deleteUploadPathNamesPublic reports a delete_upload `path:` whose own text
+// starts in a public uploads folder: `uploads/<folder>/...` with any folder
+// but `private` (a folder spelled Private is refused by both rules).
+func deleteUploadPathNamesPublic(path string) bool {
+	p := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(path)), "/")
+	rest, ok := strings.CutPrefix(p, "uploads/")
+	if !ok || rest == "" || strings.HasPrefix(rest, "{{") || strings.HasPrefix(rest, "${{") {
+		return false
+	}
+	return !isPrivateUploadPath(p)
+}

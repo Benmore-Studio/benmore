@@ -111,6 +111,11 @@ not open app data, enable access or approve an operation. Check/inspect remain
 read-only and require a sealed manifest. Local success does not prove the
 physical database, host authority directory, current grant or a real client.
 
+`mcp review` and `mcp check` print the whole inspection document as JSON (every
+route, flow and source file of the app; scripts read it). To read the result
+yourself add `--summary`: the verdict, both digests, the reviewed tools, the
+inventory as counts and every warning, in a few lines.
+
 Review edits only its own top-level keys (`contract_digest`,
 `execution_digest`, `execution_sources`) and keeps the rest of `mcp.yaml` as you
 wrote it: integers, quoting, comments and indentation. Reviewing a reviewed
@@ -476,8 +481,9 @@ capability is any identifier, and one permission must be a declared write table'
 `:write` or a capability's `:write`. The actor and the connector grant must both
 hold the scope. Command SQL bindings may also use `${{ user.role }}` (the actor's
 global framework role string, not a tenant membership role) and
-`${{ user.is_admin }}` (1 for a global admin, else 0; no admin bypass) in prepare
-and apply SQL only, bound from the live actor of that phase. Both are sealed when the operation is
+`${{ user.is_admin }}` (1 for a global admin, else 0; no admin bypass) in the SQL
+bindings of any phase (prepare, apply, readback), bound from the live actor of that
+phase; `${{ user.email }}` binds in apply SQL only. Both are sealed when the operation is
 prepared; if the role or admin flag changes before approve or commit the
 operation is refused and must be prepared again.
 
@@ -1135,7 +1141,7 @@ instance before claiming app acceptance.
 | `field ... not found` | Use the complete example; the schema rejects unknown keys and misplaced digests. |
 | Unsupported handler kind/operation | Use `native` + `table.list`/`table.read`/`flow.call`; commands use `flow` + `command`. |
 | Reviewed digest mismatch, a check warns `mcp_review` on `mcp.yaml`, or a write answers `mcp_connector_withheld` / push warns "this app's MCP connector is off" | Source changed or differs from the server. The app keeps serving the change, but its connector stays off until you reconcile, review again and deploy all reviewed files; if the app serves no connector, delete `mcp.yaml` instead. Deploy never deletes server files: a deploy of `mcp.yaml` that would leave a file you deleted locally, or a migration the server wrote, on the server is blocked and names the file (`benmore delete-file <path>` or `benmore pull`, then review again). |
-| Inserts into an enrolled table fail with `write rejected (insert <table>): revision ledger row missing` after a reload, or `mcp status` shows `revision_enrollment: out_of_order` | Another trigger on the table (an encrypted, computed or blind-index field) fires before the connector's revision triggers. Every load puts the revision triggers first again; run `benmore mcp enable <app> --writes` or reload to reorder them (nothing is re-approved). |
+| Inserts into an enrolled table fail with `write rejected (insert <table>): revision ledger row missing` after a reload, or `mcp status` shows `revision_enrollment: out_of_order` | Another trigger on the table (an encrypted or computed field) fires before the connector's revision triggers. Every load puts the revision triggers first again; run `benmore mcp enable <app> --writes` or reload to reorder them (nothing is re-approved). |
 | `revision enrollment universe changed; explicit repair is required`, or `mcp status` shows `revision_enrollment: changed` | The reviewed commands now read or write a different set of tables. Run `benmore mcp enable <app> --writes`: it re-enrolls for the new set. |
 | Review names an excluded path such as `static/.env`, `flows/.git/` or `static/data.db-wal` | Remove or rename the protected file or directory outside `static/` and `flows/`, then review again. Ordinary non-MCP pushes retain the CLI's existing write-time normalization. |
 | MCP push, `write_file` or `edit_file` says source needs normalization | Apply the suggested normalization, review the resulting source, then push or write again; MCP delivery and the write tools never change reviewed bytes. |

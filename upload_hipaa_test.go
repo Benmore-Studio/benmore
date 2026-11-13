@@ -17,7 +17,9 @@ import (
 func TestHIPAAUploadsArePrivate(t *testing.T) {
 	app, mux, cleanup := signedURLApp(t)
 	defer cleanup()
-	app.Design = &DesignConfig{Compliance: complianceHIPAA}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Design = &DesignConfig{Compliance: complianceHIPAA}
+	})
 	user := createCrudScopeSession(t, app, "nurse@example.com", "user", "", "")
 
 	// /api/_upload with no kind defaults to private.
@@ -66,7 +68,9 @@ func TestHIPAAUploadsArePrivate(t *testing.T) {
 	}
 
 	// Outside hipaa the folders stay as they were.
-	app.Design = &DesignConfig{}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Design = &DesignConfig{}
+	})
 	if p := uploadedPath(t, uploadAs(t, mux, user, "avatars", "a.png", []byte("\x89PNG\r\n"))); !strings.HasPrefix(p, "/uploads/avatars/") {
 		t.Fatalf("non-hipaa public kind stored at %q", p)
 	}

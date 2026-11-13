@@ -1,7 +1,7 @@
 import bm from './bm.js';
 
 let failures = 0, version = 1, hold = null;
-const counts = new Map(), connections = [];
+const counts = new Map(), connections = [], sent = [];
 const ok = (value, message) => { if (!value) { failures++; console.error('FAIL:', message); } };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const response = data => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => JSON.stringify(data) });
@@ -15,6 +15,7 @@ globalThis.fetch = async (path, init) => {
   if (path === '/api/_query') {
     const spec = JSON.parse(init.body), table = spec.table;
     counts.set(table, (counts.get(table) || 0) + 1);
+    sent.push({ spec, background: new Headers(init.headers).get('X-Benmore-Background') });
     const result = response({ rows: [{ table, version }] });
     if (hold) { const pending = hold; hold = null; await pending.promise; }
     return result;
@@ -77,6 +78,18 @@ await section('a tableKey subscriber renders the table read and its live refetch
   ok(count('cards') === 2 && rendered.at(-1) === 2, 'live change did not reach the tableKey subscriber');
   ok(bm.query.key(bm.query.tableKey('cards', spec)) === bm.query.key(['query', { ...spec, table: 'cards' }]), 'table() no longer shares the default key of read()');
   stop();
+});
+
+await section('background on a table read marks the request and is not part of it or of its key', async () => {
+  const spec = { where: { team_id: 7 } };
+  sent.length = 0;
+  await bm.query.table('polls', { ...spec, background: true });
+  ok(sent.length === 1 && sent[0].background === '1', 'table(t, { background: true }) was not sent as a background request');
+  ok(!('background' in sent[0].spec) && JSON.stringify(sent[0].spec) === JSON.stringify({ ...spec, table: 'polls' }), 'background was sent to the server in the query: ' + JSON.stringify(sent[0]?.spec));
+  ok(bm.query.key(bm.query.tableKey('polls', { ...spec, background: true })) === bm.query.key(bm.query.tableKey('polls', spec)), 'background changed the cache key of a table read');
+  ok(bm.query.get(bm.query.tableKey('polls', spec))?.[0]?.table === 'polls', 'a background table read was cached under another key than the same read without it');
+  await bm.query.table('polls', { ...spec, force: true });
+  ok(sent.length === 2 && sent[1].background === null, 'a table read without background was sent as a background request');
 });
 
 await section('session reset cancels queued generic invalidation', async () => {

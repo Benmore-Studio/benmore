@@ -42,7 +42,6 @@ func TestAdminToolsRunnerTreatsFormAsRequestInput(t *testing.T) {
 	app := &App{Dir: dir, DB: db, SessionDuration: time.Hour, Stop: make(chan struct{}),
 		Tables: []Table{{Name: "notes", Columns: []Column{{Name: "id"}, {Name: "title"}}}}}
 	t.Cleanup(app.Shutdown)
-	mux := buildAppMux(app, true, "http://localhost")
 	if err := EnsureUsersTable(db); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +53,6 @@ func TestAdminToolsRunnerTreatsFormAsRequestInput(t *testing.T) {
 	uid, _ := res.LastInsertId()
 	sid := CreateSession(db, uid, "boss@example.com", "", time.Hour)
 
-	// The mux is already built, so the job worker reads app.Flows.
 	app.mu.Lock()
 	app.Flows = append(app.Flows,
 		Flow{Name: "retitle", Role: "admin", Trigger: FlowTrigger{Type: "http", Method: "POST", Path: "/api/admin/retitle"},
@@ -63,6 +61,7 @@ func TestAdminToolsRunnerTreatsFormAsRequestInput(t *testing.T) {
 			Steps: []FlowStep{{Name: "s", Type: "sql", SQL: "INSERT INTO notes (title) VALUES ('group:' || COALESCE(:user_group_id, 'none'))"}}},
 	)
 	app.mu.Unlock()
+	mux := buildAppMux(app, true, "http://localhost")
 
 	loc := adminToolsRun(mux, sid, url.Values{"_flow_path": {"/api/admin/retitle"}, "label": {"x' || (SELECT email FROM _benmore_users) || '"}})
 	var titles []string
@@ -103,7 +102,6 @@ func TestAdminToolsRunnerRedactsFlowError(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	app := &App{Dir: dir, DB: db, SessionDuration: time.Hour, Stop: make(chan struct{})}
 	t.Cleanup(app.Shutdown)
-	mux := buildAppMux(app, true, "http://localhost")
 	if err := EnsureUsersTable(db); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +118,7 @@ func TestAdminToolsRunnerRedactsFlowError(t *testing.T) {
 		Steps: []FlowStep{{Name: "call", Type: "api", API: &FlowAPICall{Method: "GET",
 			URL: "https://partner.invalid/status/404/{{env.PARTNER_API_TOKEN}}?key={{env.PARTNER_API_TOKEN}}"}}}})
 	app.mu.Unlock()
+	mux := buildAppMux(app, true, "http://localhost")
 
 	loc := adminToolsRun(mux, sid, url.Values{"_flow_path": {"/api/admin/sync"}})
 	u, err := url.Parse(loc)

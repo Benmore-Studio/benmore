@@ -94,6 +94,7 @@ var knownAuthKeys = map[string]bool{
 	"require_mfa_for_roles": true, // comma-separated roles that must enroll MFA before a session is issued
 	"mfa_setup_redirect":    true, // form-login redirect target when enrollment is required (default /mfa-setup)
 	"read_audit_sync":       true,
+	"sign_in_audit":         true, // opt-in sign_in / sign_in_refused audit rows (signin_audit.go)
 	// Read by the runtime but missing here, so the write gate refused a
 	// documented key (read_audit: api(at:"audit")).
 	"read_audit":                  true, // '*' or comma-separated tables (read_audit.go IsReadAudited)
@@ -118,7 +119,7 @@ var deadAuthKeys = map[string]string{
 // authFlagKeys are the auth keys the runtime reads as booleans (compared to
 // "true"). designFromAppYAML canonicalizes the usual spellings; anything
 // else can never switch the flag on, so the write gate refuses it.
-var authFlagKeys = []string{"require_verified", "verify_email", "otp", "oauth_only", "read_audit_sync", "passkeys", "signup", "password_reset", "api_tokens"}
+var authFlagKeys = []string{"require_verified", "verify_email", "otp", "oauth_only", "read_audit_sync", "sign_in_audit", "passkeys", "signup", "password_reset", "api_tokens"}
 
 // validateAppYAML scans app.yaml for fabricated top-level and auth.* keys
 // that the framework doesn't recognize. Returns the first violation's
@@ -331,6 +332,12 @@ func validateAppYAML(content string) string {
 	}
 
 	if msg := trustEmailAppYAMLProblem(doc); msg != "" {
+		return msg
+	}
+	if msg := autoMembershipEntryProblem(doc); msg != "" {
+		return msg
+	}
+	if msg := navThemeAppYAMLProblem(doc); msg != "" {
 		return msg
 	}
 	if msg := appYAMLSectionKeyViolation(doc); msg != "" {

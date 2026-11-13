@@ -77,6 +77,15 @@ func queryReadOnlyRowsSealed(ctx context.Context, db *sql.DB, query string, limi
 		return nil, nil, false, err
 	}
 	defer closeConn()
+	// A view the statement reads is compiled with it, on this connection.
+	texts, err := readOnlyViewTexts(ctx, conn, query)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if reads != nil {
+		// The schema read above was compiled under the recording authorizer.
+		reads.selects, reads.unrecorded = 0, sqlNamedFullJoinIn(texts)
+	}
 
 	start := time.Now()
 	rows, err := conn.QueryContext(ctx, query, args...)

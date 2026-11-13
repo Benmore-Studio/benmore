@@ -3,10 +3,8 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -23,10 +21,7 @@ import (
 // test holds the `?page=` branch to the same answer.
 func TestPagedTotal_HonorsWhereFilters(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 	defer db.Close()
 	mustExec(t, db, `CREATE TABLE docs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, project_id INTEGER, filename TEXT)`)
 	mustExec(t, db, `INSERT INTO docs (user_id, project_id, filename) VALUES (1, 60, 'a.pdf'), (1, 60, 'b.pdf'), (1, 99, 'c.pdf')`)
@@ -80,10 +75,7 @@ func TestPagedTotal_HonorsWhereFilters(t *testing.T) {
 
 func TestPagedMetadataMatchesDefaultAndCappedPageSize(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 	defer db.Close()
 	mustExec(t, db, `CREATE TABLE docs (id INTEGER PRIMARY KEY, filename TEXT)`)
 	mustExec(t, db, `WITH RECURSIVE rows(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM rows WHERE id<501) INSERT INTO docs SELECT id, printf('doc-%03d.pdf', id) FROM rows`)

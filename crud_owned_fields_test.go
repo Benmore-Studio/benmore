@@ -35,12 +35,13 @@ type ownedFieldFixture struct {
 func newOwnedFieldFixture(t *testing.T, owns string) *ownedFieldFixture {
 	t.Helper()
 	app, sid, _ := newCommandProviderTaskFixtureWithPolicies(t, ownedTaskFlow(owns), "")
-	f := &ownedFieldFixture{app: app, sid: sid, mux: buildAppMux(app, true, "http://localhost")}
+	f := &ownedFieldFixture{app: app, sid: sid}
 	f.user = createCrudScopeSession(t, app, "editor2@example.com", "editor", "17", "")
 	f.admin = createCrudScopeSession(t, app, "boss@example.com", "admin", "17", "")
 	// The fixture only defines the editor role; give admin the same table scopes so
 	// the refusal under test is ownership, not a missing scope.
 	app.Roles.Roles["admin"] = RoleDef{Scopes: "tasks:read tasks:write activities:read activities:write"}
+	f.mux = buildAppMux(app, true, "http://localhost")
 	for _, email := range []string{"editor2@example.com", "boss@example.com"} {
 		if _, err := app.DB.Exec(`INSERT INTO members(org_id,email,user_id) SELECT '17',email,id FROM _benmore_users WHERE email=?`, email); err != nil {
 			t.Fatal(err)

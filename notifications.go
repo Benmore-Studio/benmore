@@ -144,10 +144,12 @@ func insertNotification(ctx context.Context, exec notificationExec, userID int64
 
 // announceNotification sends the recipient's live streams the insert event
 // for _benmore_notifications. Only the recipient hears it
-// (realtimePrincipal.canRead), whoever caused it.
+// (realtimePrincipal.canRead), whoever caused it. It takes the path table
+// events take (BroadcastScopedDirect): in cluster mode the event is published
+// for every instance's poller, since the recipient's stream may be connected
+// to another instance than the one that stored the row.
 func announceNotification(db *sql.DB, userID int64, notifType, title string) {
-	// Broadcast via SSE to the target user only
-	BroadcastChangeScoped(&App{DB: db}, notificationsTable, "insert", "", userID)
+	BroadcastScopedDirect(&App{DB: db}, notificationsTable, "insert", "", userID)
 
 	log.Printf("NOTIFICATION [%s] user=%d title=%q", notifType, userID, truncateNotif(title, 60))
 }

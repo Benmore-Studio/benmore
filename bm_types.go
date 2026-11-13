@@ -639,7 +639,7 @@ export interface RoomClient {
     /** @deprecated Alias for staleTime; prefer staleTime. */
     staleMs?: number;
     force?: boolean;
-    /** The fetcher's requests are polling (X-Benmore-Background: 1), not activity for auth.idle_timeout. */
+    /** The fetcher's requests are polling (X-Benmore-Background: 1), not activity for auth.idle_timeout. On table() and read() it is not part of the request or the cache key. */
     background?: boolean;
     live?: boolean;
   }
@@ -763,10 +763,11 @@ export interface RoomClient {
   // access policy (roles, perms, scopes, group/owner/ACL), not just a logged-in
   // session. Public/local files don't need it. Default lifetime 300s;
   // audio/video default to 4h so playback does not outlive the link (max 6h).
+  // ttlSeconds is whole seconds (120) or a duration string ('90s', '2h').
   //   await bm.signedUrl(doc.file_url, { record: { table: 'documents', id: doc.id } })
   export function signedUrl(
     path: string,
-    opts?: number | { ttlSeconds?: number; record?: { table: string; id: string | number } }
+    opts?: number | { ttlSeconds?: number | string; record?: { table: string; id: string | number } }
   ): Promise<string>;
 
   // ── t (i18n; keys are statically typed from i18n/*.yaml) ─────────────

@@ -139,6 +139,11 @@ func RegisterUsageAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 			return
 		}
+		// The counters are the account's (or its tenant's), across every
+		// table: no scope a narrowed credential holds names them.
+		if !requireAccountManagement(w, session) {
+			return
+		}
 
 		FlushUsage(app) // ensure current data for this app only
 		scope := meterScope(session)

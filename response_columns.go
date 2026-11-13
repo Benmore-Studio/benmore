@@ -37,12 +37,12 @@ import "strings"
 // name.
 func apiHiddenColumn(app *App, table, column string) bool {
 	if base, ok := strings.CutSuffix(column, blindColSuffix); ok && base != "" {
-		if app != nil && (BlindIndexColumnsForTable(app.Encrypted, table)[base] || hasColumn(app, table, base)) {
+		if app != nil && (BlindIndexColumnsForTable(app.encryptedConfig(), table)[base] || hasColumn(app, table, base)) {
 			return true
 		}
 	}
-	if app != nil && app.Encrypted != nil {
-		for _, def := range app.Encrypted.Fields[table] {
+	if encrypted := app.encryptedConfig(); encrypted != nil {
+		for _, def := range encrypted.Fields[table] {
 			if def.Column == column && len(def.Roles) > 0 {
 				return false
 			}
@@ -62,7 +62,7 @@ func appSecretColumn(app *App, table, column string) bool {
 		return false
 	}
 	if app != nil {
-		for _, t := range app.Tables {
+		for _, t := range app.tableList() {
 			if t.Name != table {
 				continue
 			}

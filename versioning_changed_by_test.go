@@ -16,6 +16,10 @@ import (
 func changedByFixture(t *testing.T) (*App, *http.ServeMux, string, int64) {
 	t.Helper()
 	app, _ := newCrudScopeTestApp(t)
+	// That mux is wanted for the framework tables it creates; the routes under
+	// test are registered below. Its workers end here, so the configuration
+	// this fixture and its tests set is not written under them.
+	quiesceTestApp(t, app)
 	mustExec(t, app.DB, `ALTER TABLE notes ADD COLUMN status TEXT DEFAULT 'draft'`)
 	mustExec(t, app.DB, `INSERT INTO notes (user_id, title) VALUES (1, 'third')`)
 	refreshTableColumns(t, app, "notes")

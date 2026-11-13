@@ -3,9 +3,7 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -15,10 +13,7 @@ import (
 // a secret one character at a time from the match/no-match answer.
 func TestHiddenColumnsAreNotFilterOrSortOracles(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE links (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, share_token TEXT)`)
 	crudScopeMustExec(t, db, `INSERT INTO links (user_id, name, share_token) VALUES (1, 'a', 'aaa-secret'), (1, 'b', 'zzz-secret')`)

@@ -177,14 +177,17 @@ func TestTenantRoleOnTenantRootReachesOnlyOwnTenantRow(t *testing.T) {
 // un-grouped table still counts only global roles. The list also parses and
 // validates from app.yaml.
 func TestGroupsSharedTableKeepsTenantRoles(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  brokers: role:clinic_staff\n  projects: role:clinic_staff\n")
+	app := newTenantRoleApp(t, "access:\n  brokers: role:clinic_staff\n  projects: role:clinic_staff\n")
 	app.Group.Shared = []string{"Brokers"}
+	mux := buildAppMux(app, true, "http://localhost")
 	member, _ := tenantMember(t, app, "member@example.com", "user", 2, "clinic_staff")
 	assertStatus(t, mux, http.MethodGet, "/api/brokers/1", member, nil, http.StatusOK)
 	if s := getSession(app, authzReq("GET", "/", member, "")); !SessionCanAccessTable(app, "brokers", OpRead, s) {
 		t.Fatal("a tenant role must pass the role: gate of a groups.shared table")
 	}
-	app.Group.Shared = nil
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Group.Shared = nil
+	})
 	assertStatus(t, mux, http.MethodGet, "/api/brokers/1", member, nil, http.StatusNotFound)
 
 	gc := parseGroupConfig([]byte("groups:\n  table: m\n  key: k\n  user_field: email\n  shared: [brokers, \"bad name\"]\n"))

@@ -121,6 +121,10 @@ func canonicalSwitchValues(section, keys map[string]string) {
 // featureSwitchValue reads one features: switch; nil (the feature's default)
 // for a value that is no switch at all, which the write gate refuses.
 //
+// A bare 0 or 1 is the number YAML makes of it and is read like the text: it
+// used to be no switch at all, so `admin: 0` in a file edited by hand left
+// the admin panel on.
+//
 // Text that is no spelling of true or false ("auth", "public") counts as on,
 // and so does a mapping without an `enabled:` that says, as both always
 // have. ws_anonymous is the exception: it opens a gate, so it needs a value
@@ -140,10 +144,56 @@ func featureSwitchValue(key string, v any) *bool {
 		return &value
 	case string:
 		return said(value)
+	case int, int64, uint64:
+		if _, known := canonicalAuthFlag(anyToString(value)); known {
+			return said(anyToString(value))
+		}
 	case map[string]any:
 		return said(anyToString(value["enabled"]))
 	}
 	return nil
+}
+
+// featureSwitchAppYAMLProblem is the write gate's and `benmore check`'s
+// refusal of a features: value that is no switch: text that is no spelling of
+// true or false, a number other than 0 or 1, a list, and a mapping whose
+// `enabled:` is one of those. A mapping is read by its `enabled:` key alone,
+// so one without the key (or with it left empty) stays accepted and warned
+// about (appYAMLSwitchWarnings).
+func featureSwitchAppYAMLProblem(key string, v any) string {
+	docs := ""
+	if key == "docs" {
+		docs = "; docs also takes `auth` (sign-in required) or `public`"
+	}
+	const spellings = "Use true or false (yes/no, on/off and 1/0 are read the same way)"
+	isSwitch := func(v any) bool {
+		switch value := v.(type) {
+		case bool:
+			return true
+		case string, int, int64, uint64:
+			_, ok := canonicalAuthFlag(anyToString(value))
+			return ok
+		}
+		return false
+	}
+	switch value := v.(type) {
+	case string:
+		if isSwitch(value) || (key == "docs" && (value == "auth" || value == "public")) {
+			return ""
+		}
+		return fmt.Sprintf("app.yaml: features.%s = %q is not a switch value. %s%s.", key, value, spellings, docs)
+	case map[string]any:
+		enabled, set := value["enabled"]
+		if !set || enabled == nil || isSwitch(enabled) {
+			return ""
+		}
+		return fmt.Sprintf("app.yaml: features.%s.enabled = %s is not a switch value, so the mapping does not say whether the feature is on. %s, written as `%s: true` or `%s: false`: of a mapping only `enabled:` is read.",
+			key, writtenValue(enabled), spellings, key, key)
+	}
+	if isSwitch(v) {
+		return ""
+	}
+	return fmt.Sprintf("app.yaml: features.%s must be true or false, got %v. %s%s.", key, v, spellings, docs)
 }
 
 // writtenValue names a value in a warning: by its shape when it is not a scalar.

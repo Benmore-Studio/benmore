@@ -122,8 +122,10 @@ const (
 	gateValidatorsYAML gateRule = "validators_yaml"
 	gateComputedYAML   gateRule = "computed_yaml"
 	gateRetentionYAML  gateRule = "retention_yaml"
+	gateAdminYAML      gateRule = "admin_yaml"
 	gateFrameworkTable gateRule = "framework_table_config"
 	gateYAMLSyntax     gateRule = "yaml_syntax"
+	gateTestYAMLSyntax gateRule = "test_file_yaml_syntax"
 	// write_file and edit_file, after the per-file validators.
 	gateSourceReview     gateRule = "reviewed_source_rewrite"
 	gateSchemaDrop       gateRule = "schema_drop"
@@ -267,6 +269,8 @@ var gateRuleDocs = map[gateRule]docsRule{
 		{"app.yaml: auth.signup_rate_limit", "auth.signup_limits"},
 		{"app.yaml: auth.", "auth.app_yaml_flags"},
 		{"app.yaml: oauth.", "oauth.configuration_notes"},
+		{"app.yaml: auto_memberships.", "auto_memberships.verifying"},
+		{"app.yaml: nav.theme", "ssr.appearance"},
 		{"app.yaml: csp.", "csp.gotchas"},
 		{"app.yaml: groups.", "scoping.tenant_bootstrap"},
 		{"app.yaml: encrypted", "encryption.yaml_shape"},
@@ -283,10 +287,14 @@ var gateRuleDocs = map[gateRule]docsRule{
 	gateValidatorsYAML: {At: "schema.cross_field_validators"},
 	gateComputedYAML:   {At: "computed.declare", When: []docsWhen{{"a framework table", "schema.framework_tables"}}},
 	gateRetentionYAML:  {At: "retention.keys"},
+	gateAdminYAML:      {At: "auth.admin_panel_config"},
 	gateFrameworkTable: {At: "schema.framework_tables"},
 	// A file no validator owns (tests/*.yaml, verify.yaml, a data file): the
 	// YAML parser's own message, with its line, is the whole rule.
-	gateYAMLSyntax: {Exempt: "a YAML syntax error in a file no validator owns; the parser's message is the rule"},
+	// A YAML syntax error in a file no validator owns; a test file has its
+	// own key (validators_write.go picks the rule by the path).
+	gateYAMLSyntax:     {At: "verification.yaml_syntax"},
+	gateTestYAMLSyntax: {At: "verification.test_file_load"},
 
 	gateSourceReview:     {At: "connector.connector_source_review"},
 	gateSchemaDrop:       {At: "schema.removed_models", When: []docsWhen{{"applies a new migration file", "schema.migration_file_drops"}}},
@@ -366,15 +374,18 @@ func newGateVerdict(issues []string, rules map[int]gateRule, rename func(string)
 
 // checkSourceDocs is the address of a check finding, by the `source` that
 // names the layer that raised it. "syntax" is the write gate's own layer:
-// its findings carry the address of their rule (gateRuleDocs), and the entry
-// here covers the one syntax finding raised outside it.
+// each of its findings carries the address of its own rule (gateRuleDocs), so
+// the layer has none to add. It had `cron.contract`, for the one syntax
+// finding raised outside the gate, and every gate finding whose rule named no
+// key (a YAML syntax error in a test file) was sent there.
 var checkSourceDocs = map[string]docsRule{
-	"syntax":     {At: "cron.contract"}, // cron.yaml naming a flow a write removed (cronFlowRefFindingsAfterWrite)
+	"syntax":     {Exempt: "the write gate's layer: a finding carries the address of its own rule (gateRuleDocs)"},
 	"tests":      {At: "verification.test_file_load"},
 	"cross_file": {At: "schema.config_references", When: []docsWhen{{"app.yaml: access.", "access.modes"}}},
 	// An app.yaml key or value that is accepted and has no effect
 	// (app_yaml_no_effect.go, app_yaml_unread.go).
 	"config": {At: "frontend.site_identity", When: []docsWhen{
+		{"named after a built-in provider", "oauth.configuration_notes"},
 		{"is not a key the framework reads", "recovery.configuration_loading"},
 		{"is not a value the framework knows", "ssr.appearance"},
 		{"takes text", "recovery.configuration_loading"},
@@ -410,6 +421,7 @@ var checkSourceDocs = map[string]docsRule{
 		{"unique constraint", "scoping.tenant_unique_constraints"},
 		{"is the groups membership table", "scoping.tenant_unique_constraints"},
 		{"member-of membership table", "access.member_of"},
+		{" = member-of:", "access.member_of"},
 		{"groups.role_field", "scoping.tenant_roles"},
 		{"holds the tenant role", "scoping.tenant_roles"},
 		{"app.yaml: roles:", "rbac.gotchas"},
@@ -422,8 +434,13 @@ var checkSourceDocs = map[string]docsRule{
 	}},
 	// An mcp.yaml whose review no longer binds the source (connector off).
 	"mcp_review": {At: "connector.stale_review"},
-	"compliance": {At: "audit.flow_writes", When: []docsWhen{
-		{"responds with whole rows of step", "encryption.flow_results"},
+	// validators_hipaa_flows.go: an app's own SQL writing with no audit row
+	// (hipaa apps), and a flow answering with a whole row of a table with
+	// encrypted fields (any app).
+	"compliance": {At: "audit.flow_writes"},
+	"encryption": {At: "encryption.flow_results"},
+	"named_join": {At: "encryption.authored_page_queries", When: []docsWhen{
+		{"hooks.yaml", "connector.connector_hooks_effects"},
 	}},
 	"retention":          {At: "retention.keys"},
 	"pwa":                {At: "mobile.pwa"},
@@ -547,9 +564,15 @@ var refusalDocs = map[string]docsRule{
 	// A scoped credential on a page that requires sign-in, or on its PDF.
 	scopedCredentialPageCode: {At: "auth.credential_limits"},
 	// The admin panel's write routes on a table it only shows.
-	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}, {"is a framework table", "auth.admin_panel_accounts"}, {"is a version history table", "versioning.history_table"}, {"is a search index table", "auth.admin_panel_tables"}}},
+	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}, {"is a framework table", "auth.admin_panel_accounts"}, {"is a version history table", "versioning.history_table"}, {"is a search index table", "auth.admin_panel_tables"}, {"is read-only in admin.yaml", "auth.admin_panel_config"}}},
+	// A panel write naming a column admin.yaml makes read-only.
+	"admin_column_read_only": {At: "auth.admin_panel_config"},
 	// The admin panel's edit of another admin's sign-in identifier.
 	adminIdentifierProtectedCode: {At: "auth.admin_panel_accounts"},
+	// The admin panel's edit of the caller's own address, and an address
+	// sign-up would refuse.
+	adminOwnEmailProtectedCode: {At: "auth.email_change"},
+	adminEmailRefusedCode:      {At: "auth.admin_panel_accounts"},
 	// A role change that takes admin away from another admin.
 	adminDemotionProtectedCode: {At: "auth.admin_panel_accounts"},
 	// Other built-in routes.

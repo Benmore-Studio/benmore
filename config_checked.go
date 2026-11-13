@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,6 +301,10 @@ func parseBackupConfig(raw map[string]any) (*BackupConfig, error) {
 }
 
 type runtimeConfig struct {
+	// flowWarnings are the lines the flow files load with (flowLoadWarn), in
+	// file order. A start and a reload log them (logFlowWarnings); a check
+	// load reports the same problems as findings and logs none.
+	flowWarnings      []string
 	templateEnvSource []byte // private env.yaml snapshot; excluded from reviewed source digests
 	i18n              *I18n
 	wsRooms           []WSRoomRule
@@ -459,6 +464,14 @@ func (c *runtimeConfig) reviewRefusal(dir string) error {
 	return appMCPCheckCommandSQLFunctions(func(name string) ([]byte, error) { return c.schemaSource(dir, name) }, c.flows, c.mcp)
 }
 
+// logFlowWarnings writes the flow files' load warnings to the app log, each
+// once, for the load that serves the app.
+func (c *runtimeConfig) logFlowWarnings() {
+	for _, line := range c.flowWarnings {
+		log.Print(line)
+	}
+}
+
 // appMCPToolProblemsNotice is the load-log and upgrade-check line for the
 // tools a served load keeps although review would refuse them.
 func appMCPToolProblemsNotice(problem string) string {
@@ -527,7 +540,9 @@ func stageRuntimeConfig(dir string, data []byte, withheld bool) (*runtimeConfig,
 	if err != nil {
 		return nil, err
 	}
-	c.flows, err = loadFlowsCheckedFromSourcesSkipping(dir, true, captured, withheld)
+	c.flows, err = loadFlowsCheckedFromSourcesSkipping(dir, true, captured, withheld, func(format string, args ...any) {
+		c.flowWarnings = append(c.flowWarnings, fmt.Sprintf(format, args...))
+	})
 	var compileErr *appMCPCommandCompileError
 	if errors.As(err, &compileErr) {
 		// A command the runtime no longer compiles disables only the connector.

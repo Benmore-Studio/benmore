@@ -172,6 +172,15 @@ func TestCrudScopeBehavior_OwnerAndAnonIsolation(t *testing.T) {
 
 func newCrudScopeTestApp(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
+	app := newCrudScopeApp(t)
+	return app, buildAppMux(app, true, "http://localhost")
+}
+
+// newCrudScopeApp is newCrudScopeTestApp's app before any mux is built. A
+// mux starts workers that read the app's configuration, so a test that
+// changes the configuration starts here, changes it and builds its mux last.
+func newCrudScopeApp(t *testing.T) *App {
+	t.Helper()
 	dir := t.TempDir()
 	// Open the database the way production does (WAL, busy timeout, BEGIN
 	// IMMEDIATE): the app's background writers share it, and a default DSN
@@ -204,7 +213,7 @@ func newCrudScopeTestApp(t *testing.T) (*App, *http.ServeMux) {
 	// buildAppMux starts background workers. Stop them before the database
 	// and temporary directory are removed, matching the real app lifecycle.
 	t.Cleanup(app.Shutdown)
-	return app, buildAppMux(app, true, "http://localhost")
+	return app
 }
 
 func createCrudScopeSession(t *testing.T, app *App, email, role, groupID, actingAsGroup string) string {

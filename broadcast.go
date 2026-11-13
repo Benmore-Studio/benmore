@@ -138,6 +138,11 @@ func broadcastPublish(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "must be signed in to publish"})
 		return
 	}
+	// A slug is a room name: a scoped credential publishes only to a room
+	// whose membership table its scopes write (scoped_credential_routes.go).
+	if !requireRoomScope(w, app, session, strings.TrimSpace(r.FormValue("slug")), "write") {
+		return
+	}
 
 	cfg := resolveSFUConfig(app)
 	if !cfg.ok {
@@ -239,6 +244,10 @@ func broadcastSubscribe(w http.ResponseWriter, r *http.Request, app *App) {
 	if session != nil {
 		viewerID = session.UserID
 	}
+	// Watching is a read of the room.
+	if !requireRoomScope(w, app, session, strings.TrimSpace(r.FormValue("slug")), "read") {
+		return
+	}
 	if !roomMembershipAllowed(app, session, viewerID, strings.TrimSpace(r.FormValue("slug"))) {
 		httpJSON(w, http.StatusForbidden, map[string]any{"error": "not a member of this room"})
 		return
@@ -310,6 +319,9 @@ func broadcastStop(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required"})
 		return
 	}
+	if !requireRoomScope(w, app, session, slug, "write") {
+		return
+	}
 	// Owner-or-admin only - a viewer can't kill a publisher's stream.
 	key, found := broadcastRowKey(app, session, slug)
 	if !found {
@@ -351,6 +363,9 @@ func broadcastHeartbeat(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug required"})
 		return
 	}
+	if !requireRoomScope(w, app, session, slug, "write") {
+		return
+	}
 	// COALESCE fills the tenant of a row published before the column existed.
 	// The bare slug also matches a row published before tenant slug keys.
 	res, err := app.DB.Exec(`UPDATE _benmore_broadcasts SET last_seen_at = CURRENT_TIMESTAMP,
@@ -380,6 +395,11 @@ func broadcastStats(w http.ResponseWriter, r *http.Request, app *App) {
 	// streams either.
 	notLive := map[string]any{"live": false, "viewers": 0}
 	session := getSession(app, r)
+	// A scoped credential is refused by its scopes alone, before the slug is
+	// looked up, so the refusal says nothing about what is live.
+	if !requireRoomScope(w, app, session, slug, "read") {
+		return
+	}
 	var viewerID int64
 	if session != nil {
 		viewerID = session.UserID

@@ -227,7 +227,7 @@ func unknownKeyInHints(m map[string]any, known map[string]bool, where string, hi
 // runtime cannot honor as written.
 func flowTriggerValueViolation(file FlowFileGHA) string {
 	if req := file.On.Request; req != nil {
-		if _, known := canonicalAuthValue(req.Auth); !known && normalizeFlowAuth(req.Auth, "") != "optional" {
+		if _, known := canonicalAuthValue(req.Auth); !known && normalizeFlowAuth(req.Auth, "", nil) != "optional" {
 			return fmt.Sprintf(
 				"flows.yaml: on.request.auth %q is not a recognized value.\n\n"+
 					"Use `auth: required` (a signed-in session is required; `${{ user.* }}` binds from it), `auth: optional` (anyone may call; a signed-in caller's `${{ user.* }}` binds, an anonymous caller's identity is null) or `auth: none` (public; omitting auth: is the same). `true`/`yes`/`on` mean required and `false`/`no`/`off`/`public` mean none. An unrecognized value is treated as `required` at runtime, so say which one you mean.",
@@ -614,22 +614,8 @@ func appYAMLSectionKeyViolation(doc map[string]any) string {
 			if !featureKeys[k] {
 				return fmt.Sprintf("app.yaml: features.%s is not a feature switch, so it has no effect. Switches: %s.", k, sortedKeyList(featureKeys))
 			}
-			switch v := f[k].(type) {
-			case bool, map[string]any:
-			case string:
-				if _, ok := canonicalAuthFlag(v); ok {
-					continue
-				}
-				if k == "docs" && (v == "auth" || v == "public") {
-					continue
-				}
-				extra := ""
-				if k == "docs" {
-					extra = "; docs also takes `auth` (sign-in required) or `public`"
-				}
-				return fmt.Sprintf("app.yaml: features.%s = %q is not a switch value. Use true or false (yes/no and on/off are read the same way)%s.", k, v, extra)
-			default:
-				return fmt.Sprintf("app.yaml: features.%s must be true or false, got %v.", k, v)
+			if msg := featureSwitchAppYAMLProblem(k, f[k]); msg != "" {
+				return msg
 			}
 		}
 	}

@@ -371,7 +371,11 @@ func registerManagedOAuthRoutes(mux appRouteRegistrar, app *App, byoConfigured m
 			return
 		}
 		groupID := ResolveGroupID(app.DB, app.Group, a.Email)
-		sessionID := createSignInSession(app.DB, userID, a.Email, groupID, app.SessionDuration)
+		sessionID := createAuditedSignInSession(app, "oauth", userID, a.Email, groupID)
+		if sessionID == "" {
+			serverError(w, r, app, "managed oauth", errors.New("the sign-in session could not be created"), "authentication failed")
+			return
+		}
 		http.SetCookie(w, sessionCookie(sessionID, app.DevMode, app.SessionDuration))
 
 		redirectTo := "/"

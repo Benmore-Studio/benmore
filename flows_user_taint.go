@@ -67,10 +67,7 @@ func flowUserProfileKeys(ctx *FlowContext) []string {
 		cols = append(cols, col)
 	}
 	ctx.DataMu.Unlock()
-	var group *GroupConfig
-	if ctx.App != nil {
-		group = ctx.App.Group
-	}
+	group := ctx.App.groupConfig()
 	var keys []string
 	for _, col := range cols {
 		if col != "" && !flowUserColumnServerOwned(col, group) {

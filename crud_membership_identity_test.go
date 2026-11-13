@@ -55,9 +55,11 @@ func TestMembershipIdentityNotRepointableThroughCRUD(t *testing.T) {
 
 	// Without groups.role_field the identity column carries no role and
 	// stays editable as before.
-	app.mu.Lock()
-	app.Group.RoleField = ""
-	app.mu.Unlock()
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.mu.Lock()
+		app.Group.RoleField = ""
+		app.mu.Unlock()
+	})
 	assertStatus(t, mux, http.MethodPatch, path, memberSID, map[string]any{"email": "renamed@example.com"}, http.StatusOK)
 	if err := app.DB.QueryRow("SELECT email FROM company_members WHERE id = ?", adminRow).Scan(&email); err != nil || email != "renamed@example.com" {
 		t.Fatalf("without role_field the identity column should stay editable: email=%q err=%v", email, err)

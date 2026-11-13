@@ -5,9 +5,11 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -242,6 +244,7 @@ func refreshOAuthToken(tokenURL, clientID, clientSecret, refreshToken string) (o
 // RegisterOAuthTokensAPI sets up endpoints for managing stored OAuth tokens.
 func RegisterOAuthTokensAPI(mux appRouteRegistrar, app *App) {
 	EnsureOAuthTokensTable(app.DB)
+	EnsureAuditLogTable(app.DB) // a disconnect is refused without its audit row
 	registerOAuthTokensAPI(mux, app)
 }
 
@@ -281,20 +284,32 @@ func registerOAuthTokensAPI(mux appRouteRegistrar, app *App) {
 			return
 		}
 		provider := r.PathValue("provider")
-		result, err := app.DB.Exec(
-			"DELETE FROM _benmore_oauth_tokens WHERE user_id = ? AND provider = ?",
-			session.UserID, provider)
+		// The audit row is written with the delete: it names the provider
+		// and the scopes the stored tokens carried, never a token.
+		tx, err := app.DB.Begin()
 		if err != nil {
 			serverErrorJSON(w, r, app, "oauth tokens", err, "disconnect failed")
 			return
 		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			serverErrorJSON(w, r, app, "oauth tokens", err, "disconnect failed")
-			return
-		}
-		if affected == 0 {
+		defer tx.Rollback()
+		var tokenID int64
+		var scopes string
+		err = tx.QueryRow(
+			"DELETE FROM _benmore_oauth_tokens WHERE user_id = ? AND provider = ? RETURNING id, COALESCE(scopes, '')",
+			session.UserID, provider).Scan(&tokenID, &scopes)
+		if errors.Is(err, sql.ErrNoRows) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "provider not connected"})
+			return
+		}
+		if err == nil {
+			err = auditAccountEvent(tx, app, accountAuditOAuthDisconnected, strconv.FormatInt(tokenID, 10), session,
+				map[string]any{"provider": provider, "scopes": scopes}, nil)
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			serverErrorJSON(w, r, app, "oauth tokens", err, "disconnect failed")
 			return
 		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": "disconnected"})

@@ -3,9 +3,7 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -28,10 +26,7 @@ func TestCRUDReadOmitsBlindIndexColumns(t *testing.T) {
 	t.Cleanup(func() { appEncryptionKey = oldKey })
 
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, email TEXT)`)
 	cfg := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{

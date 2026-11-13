@@ -152,6 +152,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	// Brute force check (per-account). Stops a focused attack on one user.
 	defer lockAttempt(loginValue)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, loginValue) {
+		auditSignInLockedOut(app, "password", "locked", loginValue)
 		authRedirect(w, r, app.Paths.Login, "Too many failed attempts. Try again in 15 minutes.")
 		return
 	}
@@ -161,6 +162,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	// configured (see platform_shims.clientIP).
 	loginIP := clientIP(r)
 	if authIsIPLocked(app.DB, loginIP) {
+		auditSignInLockedOut(app, "password", "network_locked", loginValue)
 		authRedirect(w, r, app.Paths.Login, "Too many failed attempts from this network. Try again in 15 minutes.")
 		return
 	}
@@ -178,9 +180,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	err := app.DB.QueryRow(query, loginValue).Scan(&id, &hash, &email, &deactivated)
 	if err != nil {
+		// A lookup the database could not serve says nothing about the
+		// credentials: 503, never "Invalid credentials" (database_busy.go).
+		if respondDatabaseBusyText(w, r, "sign-in", err) {
+			return
+		}
 		burnPasswordCheck(password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
+		auditSignInRefused(app, "password", "invalid_credentials", 0, loginValue)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
 		return
 	}
@@ -197,7 +205,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil || deactivated {
 		recordLoginAttempt(app.DB, loginValue, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false) // per-IP counter (LOWER)
+		auditSignInRefused(app, "password", "invalid_credentials", id, email)
 		authRedirect(w, r, app.Paths.Login, "Invalid credentials")
+		return
+	}
+	if respondDatabaseBusyText(w, r, "sign-in", stateErr) {
 		return
 	}
 	if stateErr != nil || !hmac.Equal([]byte(hash), []byte(proofHash)) {
@@ -270,6 +282,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request, app *App) {
 	groupID := ResolveGroupID(app.DB, app.Group, email)
 	sessionID, err := createPasswordSignInSession(app, id, email, groupID, proofBinding)
 	if err != nil {
+		// The session row could not be written: the credentials were right
+		// and did not change.
+		if respondDatabaseBusyText(w, r, "sign-in", err) {
+			return
+		}
 		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
 		return
 	}
@@ -318,6 +335,9 @@ func startLoginOTP(w http.ResponseWriter, r *http.Request, app *App, id int64, e
 	}
 	code, token, err := prepareLoginOTP(app, id, email, loginValue, binding)
 	if err != nil {
+		if respondDatabaseBusyText(w, r, "sign-in code", err) {
+			return false
+		}
 		authRedirect(w, r, app.Paths.Login, "Credentials changed. Sign in again.")
 		return false
 	}
@@ -523,6 +543,7 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 			return
 		}
 		recordLoginAttempt(app.DB, otpLockKey, false)
+		auditSignInRefused(app, "otp", "invalid_code", id, email)
 		authRedirect(w, r, otpPath, fmt.Sprintf("Invalid code. %d attempts remaining.", 5-attempts))
 		return
 	}
@@ -546,6 +567,9 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request, app *App) {
 			}
 		} else {
 			sessionID, err = createSignInSessionTx(tx, id, email, groupID, app.SessionDuration)
+			if err == nil {
+				err = auditSignIn(tx, app, "otp", id, email)
+			}
 		}
 	}
 	if err == nil {
@@ -776,6 +800,9 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 		strings.Join(fields, ", "), strings.Join(placeholders, ", "))
 	result, err := app.DB.Exec(insertSQL, values...)
 	if err != nil {
+		if respondDatabaseBusyText(w, r, "sign-up", err) {
+			return
+		}
 		recordLoginAttempt(app.DB, email, false)
 		if strings.Contains(err.Error(), "UNIQUE") {
 			authRedirect(w, r, app.Paths.Signup, "An account with that email already exists")
@@ -906,7 +933,7 @@ func handleSignup(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 
 	groupID := ResolveGroupID(app.DB, app.Group, email)
-	sessionID := createSignInSession(app.DB, id, email, groupID, app.SessionDuration)
+	sessionID := createAuditedSignInSession(app, "signup", id, email, groupID)
 
 	AttachSessionContext(app.DB, sessionID, r)
 
@@ -939,7 +966,11 @@ func handleLogout(w http.ResponseWriter, r *http.Request, app *App) {
 	// The session this request authenticates with: the cookie, or a Bearer
 	// session token (persistent API tokens are revoked on their own route).
 	if id := authRawSessionID(r); id != "" {
-		DeleteSessionFromDB(app.DB, id)
+		// A session the database could not delete is still live: 503 with
+		// the cookie kept, never "signed out".
+		if respondDatabaseBusyText(w, r, "sign-out", deleteSessionFromDB(app.DB, id)) {
+			return
+		}
 	}
 	invalidateRequestSession(r)
 	clearSessionCookies(w, app.DevMode)
@@ -1010,6 +1041,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// Check brute force lockout
 	defer lockAttempt(body.Email)() // serialize this account's check→verify→record (lockout race)
 	if isAccountLocked(app.DB, body.Email) {
+		auditSignInLockedOut(app, "token_exchange", "locked", body.Email)
 		httpError(w, "too many attempts, try again later", http.StatusTooManyRequests)
 		return
 	}
@@ -1018,6 +1050,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	// network lock the interactive form applies.
 	loginIP := clientIP(r)
 	if authIsIPLocked(app.DB, loginIP) {
+		auditSignInLockedOut(app, "token_exchange", "network_locked", body.Email)
 		httpError(w, "too many failed attempts from this network, try again later", http.StatusTooManyRequests)
 		return
 	}
@@ -1033,9 +1066,13 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	err := app.DB.QueryRow(query, body.Email).Scan(&userID, &hash, &email, &pending, &deactivated)
 	if err != nil {
+		if respondDatabaseBusy(w, r, "token sign-in", err) {
+			return
+		}
 		burnPasswordCheck(body.Password) // same cost as a wrong password: no timing oracle for account existence
 		recordLoginAttempt(app.DB, body.Email, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
+		auditSignInRefused(app, "token_exchange", "invalid_credentials", 0, body.Email)
 		httpError(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -1055,6 +1092,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil || deactivated {
 		recordLoginAttempt(app.DB, body.Email, false)
 		recordLoginAttempt(app.DB, authIPLockKey(loginIP), false)
+		auditSignInRefused(app, "token_exchange", "invalid_credentials", userID, email)
 		httpError(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -1110,6 +1148,7 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		token, badCode, err = tokenExchangeSessionTx(app, userID, email, groupID, body.Scopes, proofBinding, body.MFACode)
 		if badCode {
 			recordLoginAttempt(app.DB, mfaKey, false)
+			auditSignInRefused(app, "token_exchange", "invalid_code", userID, email)
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid MFA code"})
 			return
 		}
@@ -1149,6 +1188,9 @@ func handleTokenAuth(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	if err != nil || token == "" {
+		if respondDatabaseBusy(w, r, "token sign-in", err) {
+			return
+		}
 		httpJSON(w, http.StatusInternalServerError, map[string]any{"error": "session could not be created"})
 		return
 	}

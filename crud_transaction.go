@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -550,7 +551,7 @@ func txInsertWithPlan(tx *sql.Tx, app *App, table string, data map[string]any, s
 		before[f] = values[i]
 	}
 	markSubmittedFields(before, submitted)
-	if err := validateTxMutationRules(tx, app, "insert", table, before, session, plan.rules); err != nil {
+	if err := validateTxMutationRules(tx, app, "insert", table, before, nil, session, plan.rules); err != nil {
 		var metadataErr *validationMetadataError
 		if errors.As(err, &metadataErr) {
 			return nil, err
@@ -608,6 +609,9 @@ type updateRequestError struct {
 	// noFields: nothing submitted was a writable column (the 400 "No fields
 	// to update"), so a single-row PATCH can name what it dropped and why.
 	noFields bool
+	// foreignKey: a database constraint failure answered as the foreign-key
+	// refusal (cause is the driver's error, not a *fkTargetError).
+	foreignKey bool
 }
 
 func (e *updateRequestError) Error() string { return e.message }
@@ -629,7 +633,20 @@ func writeUpdateRequestError(w http.ResponseWriter, r *http.Request, app *App, w
 		httpJSON(w, e.status, withRefusalDocs(map[string]any{"error": e.code, "message": e.message}, e.code))
 		return
 	}
-	httpJSON(w, e.status, map[string]any{"error": e.message})
+	body := map[string]any{"error": e.message}
+	if e.status == http.StatusUnprocessableEntity && updateForeignKeyRefusal(e) {
+		// The same body a create answers (writeFKTargetDenial).
+		withRefusalDocs(body, refusalForeignKey)
+	}
+	httpJSON(w, e.status, body)
+}
+
+// updateForeignKeyRefusal reports the 422 of a foreign key that names a
+// parent the caller cannot read: the visibility check's own error, or the
+// database's constraint failure turned into the same sentence.
+func updateForeignKeyRefusal(e *updateRequestError) bool {
+	var fkErr *fkTargetError
+	return errors.As(e.cause, &fkErr) || e.foreignKey
 }
 
 func updateInternalError(err error) error {
@@ -886,6 +903,9 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 
 	var submitted []string
 	changed := make(map[string]any)
+	// The row as stored, before the change is merged into it: what the
+	// before_update hooks read as old_<column>.
+	stored := maps.Clone(before)
 	for k, v := range data {
 		if !protected.has(k) && validCols[k] {
 			if current, ok := before[k]; !ok || current == nil || valueText(current) != valueText(v) {
@@ -922,7 +942,7 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 	// The row here is the current row merged with the change, so the
 	// submitted-field list comes from the change alone.
 	markSubmittedFields(before, submitted)
-	if err := validateTxMutation(tx, app, "update", table, before, session); err != nil {
+	if err := validateTxUpdate(tx, app, table, before, stored, session); err != nil {
 		var metadataErr *validationMetadataError
 		if errors.As(err, &metadataErr) {
 			return updateInternalError(err)
@@ -981,7 +1001,7 @@ func txUpdateMode(tx mutationTx, app *App, table string, id string, data map[str
 			// A re-point to a missing parent the visibility check above does
 			// not cover answers as one to a forbidden parent does.
 			if fkErr := foreignKeyConstraintDenial(tx, app, table, parents, err); fkErr != nil {
-				return &updateRequestError{status: http.StatusUnprocessableEntity, message: fkErr.Error(), cause: err}
+				return &updateRequestError{status: http.StatusUnprocessableEntity, message: fkErr.Error(), cause: err, foreignKey: true}
 			}
 			return &updateRequestError{status: http.StatusBadRequest, message: publicConstraintMessage(app, "update "+table, err), cause: err}
 		}
@@ -1135,12 +1155,24 @@ func validateTxMutation(tx mutationTx, app *App, event, table string, row map[st
 			return err
 		}
 	}
-	return validateTxMutationRules(tx, app, event, table, row, session, rules)
+	return validateTxMutationRules(tx, app, event, table, row, nil, session, rules)
+}
+
+// validateTxUpdate is validateTxMutation for an update: row is the stored row
+// merged with the change and stored the row before it, which the
+// before_update hooks read as old_<column> (withPreviousValues).
+func validateTxUpdate(tx mutationTx, app *App, table string, row, stored map[string]any, session *Session) error {
+	rules, err := ExtractValidationRulesWith(app, table, tx)
+	if err != nil {
+		return err
+	}
+	return validateTxMutationRules(tx, app, "update", table, row, stored, session, rules)
 }
 
 // validateTxMutationRules is validateTxMutation with the :validate rules
-// already extracted (bulk paths extract them once per request).
-func validateTxMutationRules(tx mutationTx, app *App, event, table string, row map[string]any, session *Session, rules map[string]string) error {
+// already extracted (bulk paths extract them once per request). stored is the
+// row before an update, nil for the other events.
+func validateTxMutationRules(tx mutationTx, app *App, event, table string, row, stored map[string]any, session *Session, rules map[string]string) error {
 	injectSessionContext(row, session)
 	if event != "delete" {
 		r := &http.Request{Form: make(url.Values)}
@@ -1156,8 +1188,8 @@ func validateTxMutationRules(tx mutationTx, app *App, event, table string, row m
 	}
 	if event == "update" {
 		// Hook SQL sees what the request sent, not the stored row it was
-		// merged into (submittedHookRow).
-		return fireBeforeHooksRows(tx, app, event, table, row, submittedHookRow(row, session))
+		// merged into (submittedHookRow). Both views carry old_<column>.
+		return fireBeforeHooksRows(tx, app, event, table, withPreviousValues(row, stored), withPreviousValues(submittedHookRow(row, session), stored))
 	}
 	return fireBeforeHooksWith(tx, app, event, table, row)
 }

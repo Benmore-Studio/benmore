@@ -34,12 +34,14 @@
     "admin_actions_on_others",
     "admin_panel_accounts",
     "admin_panel_tables",
+    "admin_panel_config",
     "recovery_hardening",
     "step_pages",
     "summary",
     "endpoints",
     "js_snippet",
     "gotchas",
-    "account_erasure"
+    "account_erasure",
+    "account_erasure_files"
   ]
 }

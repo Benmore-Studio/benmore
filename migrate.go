@@ -1195,7 +1195,7 @@ func swapInBackupWithLease(dir, backupPath string, cause error, lease *appMCPAut
 	// An older backup must not revive credentials revoked since it was taken.
 	// The moved-aside original is the live state; when it is unreadable every
 	// restored session, token and grant is revoked instead.
-	if _, err := carryForwardRestoreCredentials(context.Background(), corruptDest, dbPath, "auto-recovery"); err != nil {
+	if _, err := carryForwardRestoreCredentials(context.Background(), dir, corruptDest, dbPath, "auto-recovery"); err != nil {
 		_ = os.Remove(dbPath)
 		_ = os.Remove(dbPath + "-journal")
 		_ = os.Rename(corruptDest, dbPath)
@@ -1404,7 +1404,7 @@ func restoreDatabase(dir string, backupPath string) error {
 	}
 	defer cleanup()
 	// The data rolls back; sign-in state stays what it is now.
-	if _, err := carryForwardRestoreCredentials(ctx, filepath.Join(dir, "data.db"), candidate, "local restore"); err != nil {
+	if _, err := carryForwardRestoreCredentials(ctx, dir, filepath.Join(dir, "data.db"), candidate, "local restore"); err != nil {
 		return fmt.Errorf("carry live credentials into the restored database: %w", err)
 	}
 	_, err = installRestoreSnapshotWithLease(dir, candidate, lease)

@@ -94,7 +94,7 @@ func holdLoadLog() func(failed bool) {
 func testRunResults(results []AppTestResult) []AppTestResult {
 	notYAML := map[string]bool{}
 	for _, r := range results {
-		if r.Test == "load" && strings.HasPrefix(r.Message, appTestFileNotLoaded+appTestFileNotYAML) {
+		if r.Test == "load" && strings.Contains(r.Message, ": "+appTestFileNotLoaded+appTestFileNotYAML) {
 			notYAML[r.File] = true
 		}
 	}
@@ -105,7 +105,9 @@ func testRunResults(results []AppTestResult) []AppTestResult {
 			summarized = true
 			continue
 		}
-		if notYAML[r.File] && strings.HasPrefix(r.Test, sourceCheckTestPrefix) {
+		// The source check names the file by its path, the `load` result by
+		// its test-file name (appTestFileName).
+		if strings.HasPrefix(r.Test, sourceCheckTestPrefix) && isAppTestFile(r.File) && notYAML[appTestFileName(r.File)] {
 			continue
 		}
 		out = append(out, r)

@@ -87,3 +87,92 @@ an_approval_on_a_tenants_record_stays_in_the_tenant:
       expect: { status: 200, json: { status: "approved" } }
     - sql: "SELECT id FROM _benmore_approvals WHERE id = {{inside}} AND status = 'approved'"
       expect: { rows: 1 }
+
+# The organisation's own row has no tenant column (its id is the tenant), and
+# a free-form label names no record at all. Both stay in the tenant too: the
+# approver of the organisation row is one of its members, the approver of a
+# label is in the requester's organisation.
+an_approval_on_the_organisation_or_a_label_stays_in_the_tenant:
+  as_user: "ida@tenants.test"
+  users:
+    - "jon@tenants.test"
+    - "kim@tenants.test"
+  steps:
+    - api: "POST /api/_groups/create"
+      json: { name: "Third org" }
+      save: { org_id: "group_id" }
+      expect: { status: 200 }
+    - api: "POST /api/org/members"
+      json: { email: "jon@tenants.test" }
+      expect: { status: 201 }
+    # kim is not a member of this organisation.
+    - api: "POST /api/_approvals"
+      json: { table: "organizations", row_id: "{{org_id}}", approver_email: "kim@tenants.test", title: "Rename, ask outside" }
+      save: { org_cross: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - api: "POST /api/_approvals"
+      json: { table: "organizations", row_id: "{{org_id}}", approver_email: "jon@tenants.test", title: "Rename, ask inside" }
+      save: { org_inside: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - api: "POST /api/_approvals"
+      json: { table: "third-org-expense", row_id: "Q3-17", approver_email: "kim@tenants.test", title: "Claim, ask outside" }
+      save: { label_cross: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - api: "POST /api/_approvals"
+      json: { table: "third-org-expense", row_id: "Q3-17", approver_email: "jon@tenants.test", title: "Claim, ask inside" }
+      save: { label_inside: "id" }
+      expect: { status: 200, json: { status: "pending" } }
+    - sql: "SELECT id FROM _benmore_approvals WHERE id IN ({{org_cross}}, {{label_cross}}) AND approver_id IS NULL AND status = 'pending'"
+      expect: { rows: 2 }
+    - sql: "SELECT 1 AS quiet WHERE NOT EXISTS (SELECT 1 FROM _benmore_notifications WHERE user_id = (SELECT id FROM _benmore_users WHERE email = 'kim@tenants.test'))"
+      expect: { rows: 1 }
+    - sql: "SELECT n.id FROM _benmore_notifications n JOIN _benmore_users u ON u.id = n.user_id WHERE u.email = 'jon@tenants.test' AND n.title = 'Approval requested' AND n.body IN ('Rename, ask inside', 'Claim, ask inside')"
+      expect: { rows: 2 }
+    # kim founds another organisation and looks for the requests.
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: { email: "kim@tenants.test", password: "testpass123" }
+      save: { kim: "token" }
+      expect: { status: 200 }
+    - set_auth: "{{kim}}"
+    - api: "POST /api/_groups/create"
+      json: { name: "Fourth org" }
+      expect: { status: 200 }
+    - get: "/api/_approvals"
+      expect:
+        status: 200
+        not_contains:
+          - "ask outside"
+          - "ida@tenants.test"
+    - api: "POST /api/_approvals/{{org_cross}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 403 }
+    - api: "POST /api/_approvals/{{label_cross}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 403 }
+    - sql: "SELECT id FROM _benmore_approvals WHERE id IN ({{org_cross}}, {{label_cross}}) AND status = 'pending'"
+      expect: { rows: 2 }
+    # jon, a member of the organisation, lists and decides both.
+    - set_auth: "none"
+    - api: "POST /api/_auth/token"
+      json: { email: "jon@tenants.test", password: "testpass123" }
+      save: { jon: "token" }
+      expect: { status: 200 }
+    - set_auth: "{{jon}}"
+    - get: "/api/_approvals?mine=1"
+      expect:
+        status: 200
+        contains:
+          - "Rename, ask inside"
+          - "Claim, ask inside"
+    - api: "POST /api/_approvals/{{org_inside}}/decide"
+      json: { decision: "approved" }
+      expect: { status: 200, json: { status: "approved" } }
+    - api: "POST /api/_approvals/{{label_inside}}/decide"
+      json: { decision: "rejected" }
+      expect: { status: 200, json: { status: "rejected" } }
+    - sql: "SELECT id FROM _benmore_approvals WHERE (id = {{org_inside}} AND status = 'approved') OR (id = {{label_inside}} AND status = 'rejected')"
+      expect: { rows: 2 }
+    # The requester was told both decisions.
+    - sql: "SELECT n.id FROM _benmore_notifications n JOIN _benmore_users u ON u.id = n.user_id WHERE u.email = 'ida@tenants.test' AND n.title IN ('Approval approved', 'Approval rejected') AND n.body IN ('Rename, ask inside', 'Claim, ask inside')"
+      expect: { rows: 2 }

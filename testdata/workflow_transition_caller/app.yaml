@@ -10,3 +10,8 @@ access:
     write: everyone
     update: owner_or_role:approver    # a transition is an update of the row
     delete: admin
+  notices:
+    read: owner_or_role:approver      # an approver reads every notice
+    write: everyone
+    update: self                      # only its author changes it
+    delete: admin

@@ -203,6 +203,7 @@ func reloadAppConfig(app *App) error {
 	for _, problem := range config.mcpToolProblems {
 		log.Printf("  WARNING: MCP %s", appMCPToolProblemsNotice(problem))
 	}
+	config.logFlowWarnings()
 	nextEnv, err := config.stageEnvironment(app.Dir)
 	if err != nil {
 		return fmt.Errorf("environment: %w", err)
@@ -1612,12 +1613,12 @@ func applySecurityHeaders(w http.ResponseWriter, r *http.Request, dev bool, app 
 	if own := realtimeConnectSources(r); own != "" {
 		connectSrc += " " + own
 	}
-	if app != nil && app.Design != nil {
+	if design := app.designConfig(); design != nil {
 		pick := func(directive string) string {
-			if v := app.Design.CSP[directive]; v != "" {
+			if v := design.CSP[directive]; v != "" {
 				return v
 			}
-			return app.Design.SEO[directive]
+			return design.SEO[directive]
 		}
 		// frame_ancestors WIDENS who may iframe this app. Unlike the
 		// *-src directives it extends the framing allowlist rather than a
@@ -1676,8 +1677,8 @@ func applySecurityHeaders(w http.ResponseWriter, r *http.Request, dev bool, app 
 	// Permissions-Policy: default restrictive, but allow apps to declare needed permissions
 	// Apps set permissions_policy in seo: to override (e.g., "camera=*, microphone=*")
 	permPolicy := "geolocation=(), payment=()"
-	if app != nil && app.Design != nil {
-		if v := app.Design.SEO["permissions_policy"]; v != "" {
+	if design := app.designConfig(); design != nil {
+		if v := design.SEO["permissions_policy"]; v != "" {
 			permPolicy = v
 		}
 	}
@@ -1770,12 +1771,12 @@ func pageCSPDirectives(app *App) map[string]string {
 	//     frame_src:  "https://www.google.com"
 	//     style_src:  "https://api.mapbox.com"
 	//     font_src:   "https://fonts.gstatic.com"
-	if app != nil && app.Design != nil {
+	if design := app.designConfig(); design != nil {
 		pick := func(directive string) string {
-			if v := app.Design.CSP[directive]; v != "" {
+			if v := design.CSP[directive]; v != "" {
 				return v
 			}
-			return app.Design.SEO[directive]
+			return design.SEO[directive]
 		}
 		if v := pick("frame_src"); v != "" {
 			frameSrc += " " + v
@@ -2079,6 +2080,9 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 		// Multi-role: comma-separated list for the SSR `{{#role}}` block
 		// and for `{{user_roles}}` lookups inside `<page require>` checks.
 		ctx.Data["user_roles"] = strings.Join(session.Roles, ",")
+		if session.IsAdmin() {
+			ctx.Data[roleSectionGlobalAdminKey] = true
+		}
 		if session.HasGroup() {
 			ctx.Data["user_group_id"] = session.GroupID
 		}
@@ -2151,13 +2155,9 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 	// template (bm.mount, /_internal/bm.js, etc.) will load nothing,
 	// which is the correct outcome for a stripped framework.
 	if page.Engine == "raw" {
-		html := injectCSRFMeta([]byte(content))
-		html = injectCSRFFormFields(html, "")
-		html = versionStaticAssets(html, app)
-		html = versionBmInternal(html)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store, must-revalidate")
-		w.Write(html)
+		w.Write(rawPageDocument(content, app))
 		return
 	}
 
@@ -2176,6 +2176,17 @@ func servePage(w http.ResponseWriter, r *http.Request, app *App, page *Page, dev
 	// loop never produces phantom "but I just changed it" bugs.
 	w.Header().Set("Cache-Control", "no-store, must-revalidate")
 	w.Write([]byte(html))
+}
+
+// rawPageDocument is an `engine: raw` page as it is served: the author's own
+// document with the CSRF meta tag and form fields and versioned asset
+// addresses, never wrapped in the page shell. A browser (servePage) and the
+// PDF renderer (handlePDFRender) get the same document.
+func rawPageDocument(content string, app *App) []byte {
+	html := injectCSRFMeta([]byte(content))
+	html = injectCSRFFormFields(html, "")
+	html = versionStaticAssets(html, app)
+	return versionBmInternal(html)
 }
 
 // matchRoleRedirect checks a redirect spec like "admin:/admin,user:/dashboard,*:/home"

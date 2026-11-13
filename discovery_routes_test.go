@@ -115,7 +115,9 @@ func TestLLMsWellKnownAliasMatchesCanonical(t *testing.T) {
 
 	for _, visibility := range []string{"public", "auth"} {
 		t.Run(visibility, func(t *testing.T) {
-			app.Design = &DesignConfig{Features: &FeaturesConfig{DocsVisibility: visibility}}
+			mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+				app.Design = &DesignConfig{Features: &FeaturesConfig{DocsVisibility: visibility}}
+			})
 			want := recordDiscoveryRoute(mux, "/llms.txt")
 			got := recordDiscoveryRoute(mux, "/.well-known/llms.txt")
 			assertSameDiscoveryResponse(t, got, want)

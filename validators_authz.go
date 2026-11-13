@@ -133,6 +133,9 @@ func authzWarnings(dir string) []CheckFinding {
 	for _, msg := range memberOfSelfJoinWarnings(access, group, models) {
 		warn(msg)
 	}
+	for _, msg := range memberOfReferenceWarnings(dir, access) {
+		warn(msg)
+	}
 	for _, msg := range groupKeyedBroadReadWarnings(access, group, models) {
 		warn(msg)
 	}

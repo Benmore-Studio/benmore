@@ -15,12 +15,19 @@ import (
 // That is ONE reading, and these three helpers are its only spelling. Every
 // place that asks "may this account act?" uses them: each sign-in method,
 // the session and API-token lookups, the stored actors of jobs and scheduled
-// tasks, the last-admin guard, the user directory. Spelling it locally is
-// how the readings drifted apart: `COALESCE(deactivated_at, '') = ''` took
-// the empty string for active while the session lookup, which reads the
-// column raw (the driver hands a DATETIME column's unparseable text over as
-// a zero time), refused it, so such an account signed in and its new
-// session was refused on the next request.
+// tasks, the last-admin guard, the user directory, and the router's readers
+// of the dashboard's own accounts (its session cookie, the account guard
+// behind CLI and MCP tokens, device sign-in, operator suspension). Spelling
+// it locally is how the readings drifted apart:
+// `COALESCE(deactivated_at, '') = ''` took the empty string for active while
+// the session lookup, which reads the column raw (the driver hands a
+// DATETIME column's unparseable text over as a zero time), refused it, so
+// such an account signed in and its new session was refused on the next
+// request.
+//
+// One place asks a different question and keeps its own test: the account
+// purge claim (account_purge.go) takes every row that is not a tombstone
+// yet, an empty-string row included, so such an account can still be erased.
 //
 // Nothing here rewrites a stored value: a row holding the empty string stays
 // deactivated until it is written again (emptying the field in the panel,

@@ -24,10 +24,20 @@ package main
 //
 // Only completed changes are recorded. A refused attempt (a wrong code or
 // password, a request the account may not make) writes nothing here.
+//
+// Role changes, role grants, support sessions and act-as were recorded
+// before these, by a best-effort insert made after the change had committed:
+// a failed insert left a new admin, or an admin inside a customer's account,
+// with no row. They are written here too, under the action names and values
+// they always had, so each is refused when its row cannot be written.
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -43,6 +53,15 @@ const (
 	accountAuditPasskeyAdded       = "passkey_added"
 	accountAuditPasskeyRemoved     = "passkey_removed"
 	accountAuditPasskeysRemovedAll = "passkeys_removed_all"
+	accountAuditOAuthDisconnected  = "oauth_provider_disconnected"
+	accountAuditRoleChanged        = "role_changed"
+	accountAuditRoleGranted        = "role_granted"
+	accountAuditRoleExpiryUpdated  = "role_expiry_updated"
+	accountAuditRoleRevoked        = "role_revoked"
+	accountAuditRoleExpired        = "role_expired"
+	accountAuditImpersonate        = "impersonate"
+	accountAuditActAsStart         = "act_as_start"
+	accountAuditActAsEnd           = "act_as_end"
 )
 
 // accountAuditEventTables is every action auditAccountEvent writes and the
@@ -64,6 +83,17 @@ var accountAuditEventTables = map[string]string{
 	accountAuditPasskeyAdded:       "_benmore_passkeys",
 	accountAuditPasskeyRemoved:     "_benmore_passkeys",
 	accountAuditPasskeysRemovedAll: "_benmore_passkeys",
+	accountAuditOAuthDisconnected:  "_benmore_oauth_tokens",
+	accountAuditRoleChanged:        "_benmore_users",
+	accountAuditRoleGranted:        "_benmore_user_roles",
+	accountAuditRoleExpiryUpdated:  "_benmore_user_roles",
+	accountAuditRoleRevoked:        "_benmore_user_roles",
+	accountAuditRoleExpired:        "_benmore_user_roles",
+	accountAuditImpersonate:        "_benmore_users",
+	accountAuditActAsStart:         "_benmore_sessions",
+	accountAuditActAsEnd:           "_benmore_sessions",
+	accountAuditSignIn:             "_benmore_users",
+	accountAuditSignInRefused:      "_benmore_users",
 }
 
 // auditAccountEvent writes the audit row of one account security event
@@ -105,4 +135,29 @@ func accountAuditSelf(q rowQuerier, userID int64) (*Session, error) {
 		return nil, fmt.Errorf("audit: read account %d: %w", userID, err)
 	}
 	return actor, nil
+}
+
+// accountMFAEnrolled reports whether the account holds an active second
+// factor. An enrollment that was started and never verified is none: it
+// signs nobody in, and dropping it removes no factor.
+func accountMFAEnrolled(q rowQuerier, userID int64) (bool, error) {
+	var secret sql.NullString
+	err := q.QueryRow("SELECT totp_secret FROM _benmore_users WHERE id = ?", userID).Scan(&secret)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("audit: read second factor of account %d: %w", userID, err)
+	}
+	return secret.String != "" && !strings.HasPrefix(secret.String, totpPendingPrefix), nil
+}
+
+// auditMFARemovedBy records the active second factor an account lost as part
+// of another change (a password reset or a claim of an unverified account),
+// through that change's transaction. reason is the action of the change, so
+// the row can be read on its own: before this the factor's removal was only
+// implied by the reset's or the claim's row.
+func auditMFARemovedBy(tx sqlExecutor, app *App, userID int64, email, reason string) error {
+	return auditAccountEvent(tx, app, accountAuditMFARemoved, strconv.FormatInt(userID, 10),
+		&Session{UserID: userID, Email: email}, map[string]any{"factor": "totp"}, map[string]any{"reason": reason})
 }

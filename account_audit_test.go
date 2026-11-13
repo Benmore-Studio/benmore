@@ -37,6 +37,13 @@ type accountAuditFixture struct {
 
 func newAccountAuditFixture(t *testing.T, hipaa bool) *accountAuditFixture {
 	t.Helper()
+	return newAccountAuditFixtureWith(t, hipaa, nil)
+}
+
+// newAccountAuditFixtureWith runs configure on the app before its first
+// route is registered.
+func newAccountAuditFixtureWith(t *testing.T, hipaa bool, configure func(*App)) *accountAuditFixture {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
@@ -49,6 +56,9 @@ func newAccountAuditFixture(t *testing.T, hipaa bool) *accountAuditFixture {
 		app.Design.Compliance = complianceHIPAA
 	}
 	t.Cleanup(app.Shutdown)
+	if configure != nil {
+		configure(app)
+	}
 	mux := http.NewServeMux()
 	RegisterAuthRoutes(mux, app)
 	RegisterMFARoutes(mux, app)

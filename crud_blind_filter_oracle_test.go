@@ -3,10 +3,8 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -27,10 +25,7 @@ func TestBlindIndexFilter_RefusedForMaskedCallers(t *testing.T) {
 	t.Cleanup(func() { appEncryptionKey = oldKey })
 
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE patients (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ssn TEXT)`)
 	crudScopeMustExec(t, db, `CREATE TABLE journals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, secret TEXT)`)
@@ -107,10 +102,7 @@ func TestEncryptedColumnListParamsRefusedWhenUnanswerable(t *testing.T) {
 	}
 	t.Cleanup(func() { appEncryptionKey = oldKey })
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE payroll (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ssn TEXT, salary INTEGER, note TEXT)`)
 	cfg := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{

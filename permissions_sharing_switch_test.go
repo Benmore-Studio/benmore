@@ -170,7 +170,9 @@ func TestRecordSharingOffRefusesGrantsAndIgnoresExistingOnes(t *testing.T) {
 			app, mux := sharingSwitchApp(t, on)
 			u := sharingSwitchSeed(t, app, mux)
 
-			sharingSwitchConfig(t, app, off)
+			mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+				sharingSwitchConfig(t, app, off)
+			})
 
 			// (1) No grant is created or changed, on any table.
 			assertSharingRefused(t, app, mux, u.owner, "/api/docs/1/share", map[string]any{"email": "new@example.com", "permission": "view"})
@@ -227,7 +229,9 @@ func TestRecordSharingOffRefusesGrantsAndIgnoresExistingOnes(t *testing.T) {
 			assertStatus(t, mux, http.MethodDelete, "/api/tasks/1/permissions/"+url.PathEscape("outsider@example.com"), u.owner, nil, http.StatusOK)
 
 			// Turning it back on restores the grants that are still stored.
-			sharingSwitchConfig(t, app, on)
+			mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+				sharingSwitchConfig(t, app, on)
+			})
 			if rec := crudScopeRequest(t, mux, http.MethodGet, "/api/docs/1", u.outsider, nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "owner-secret") {
 				t.Fatalf("sharing back on, grantee read: %d %s", rec.Code, rec.Body.String())
 			}
@@ -251,7 +255,9 @@ func TestRecordSharingSwitchPerTable(t *testing.T) {
 	u := sharingSwitchSeed(t, app, mux)
 
 	for _, spelling := range []string{"off", "false", "no", "OFF"} {
-		sharingSwitchConfig(t, app, sharingSwitchBase+"access:\n  docs:\n    all: self\n    share: "+spelling+"\n")
+		mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+			sharingSwitchConfig(t, app, sharingSwitchBase+"access:\n  docs:\n    all: self\n    share: "+spelling+"\n")
+		})
 		assertStatus(t, mux, http.MethodGet, "/api/docs/1", u.outsider, nil, http.StatusNotFound)
 		assertStatus(t, mux, http.MethodGet, "/api/docs/1/versions", u.outsider, nil, http.StatusNotFound)
 		assertSharingRefused(t, app, mux, u.owner, "/api/docs/1/share", map[string]any{"email": "new@example.com", "permission": "view"})
@@ -263,14 +269,18 @@ func TestRecordSharingSwitchPerTable(t *testing.T) {
 	}
 
 	// Off for the app, on for docs.
-	sharingSwitchConfig(t, app, sharingSwitchBase+"features:\n  sharing: off\naccess:\n  docs:\n    all: self\n    share: on\n")
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		sharingSwitchConfig(t, app, sharingSwitchBase+"features:\n  sharing: off\naccess:\n  docs:\n    all: self\n    share: on\n")
+	})
 	assertStatus(t, mux, http.MethodGet, "/api/docs/1", u.outsider, nil, http.StatusOK)
 	assertStatus(t, mux, http.MethodGet, "/api/tasks/1", u.outsider, nil, http.StatusNotFound)
 	assertSharingRefused(t, app, mux, u.owner, "/api/tasks/1/share", map[string]any{"email": "new@example.com", "permission": "view"})
 	assertStatus(t, mux, http.MethodPost, "/api/docs/1/share", u.owner, map[string]any{"email": "new@example.com", "permission": "view"}, http.StatusOK)
 
 	// A caller who may not read the table learns nothing from the refusal.
-	sharingSwitchConfig(t, app, sharingSwitchBase+"access:\n  docs:\n    all: admin\n    share: off\n")
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		sharingSwitchConfig(t, app, sharingSwitchBase+"access:\n  docs:\n    all: admin\n    share: off\n")
+	})
 	rec := crudScopeRequest(t, mux, http.MethodPost, "/api/docs/1/share", u.outsider, map[string]any{"email": "new@example.com", "permission": "view"})
 	if rec.Code != http.StatusNotFound || rec.Body.String() != unmatchedAPINotFoundBody {
 		t.Fatalf("share on an unreadable table with sharing off: %d %s, want the unmatched-path answer", rec.Code, rec.Body.String())

@@ -629,6 +629,12 @@ func execStepProxy(ctx *FlowContext, step *FlowStep) error {
 		return ctx.timeLimitError(quoteForHint(step.Name))
 	}
 
+	// The request leaves out the app's declared blind-index columns, from
+	// its URL to its headers, and so does the file name the caller is given
+	// (flows_respond_blind_index.go). The upstream's answer is streamed as
+	// it arrives.
+	requestBuilt := beginFlowResponse(ctx)
+	defer requestBuilt()
 	target, err := interpolateAuthoredHostURL(p.Request.URL, ctx, p.PathSlashes)
 	if err != nil {
 		return err
@@ -677,6 +683,7 @@ func execStepProxy(ctx *FlowContext, step *FlowStep) error {
 		// once the upstream named it (proxyDownloadName).
 		filename = proxySafeFilename(interpolateCtx(p.Filename, ctx))
 	}
+	requestBuilt()
 	// Nothing is sent with a value missing.
 	if err := flowOutboundMissingRefs(ctx, "proxy"); err != nil {
 		return err

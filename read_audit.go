@@ -218,9 +218,46 @@ func writeReadAuditEntries(app *App, buffer *readAuditBuffer, entries []readAudi
 	return nil
 }
 
+// sealFlowTxReadAudit writes, under compliance: hipaa, the read events a
+// transactional flow collected (auditFlowSQLRead) through the flow's own
+// transaction. Every transaction owner calls it once the steps have run and
+// before it commits, so a run that succeeds commits its writes and their read
+// events together. Written after the commit, a failed audit write withheld
+// the answer (5xx) while the run's writes stayed committed: the caller was
+// told the request failed, sent it again and wrote twice.
+//
+// A failed write fails the run (ctx.Error, ctx.readAuditErr): its owner rolls
+// back and no row is released. The events stay queued for
+// flushFlowTxReadAudit, which records them once the transaction has ended:
+// after this failure, after a failed COMMIT (announceFlowWrites puts them
+// back), and for a run that failed before reaching here, since the read
+// happened either way. Outside hipaa nothing is written here: a failed audit
+// write never fails a run there.
+func sealFlowTxReadAudit(ctx *FlowContext) {
+	if ctx == nil || ctx.App == nil || ctx.Tx == nil || ctx.Error != nil || ctx.Writes == nil || !ctx.App.hipaa() {
+		return
+	}
+	entries := ctx.Writes.takeReads()
+	if len(entries) == 0 {
+		return
+	}
+	ctx.transactionMutex().Lock()
+	err := insertReadAuditEntries(ctx.Tx, entries)
+	ctx.transactionMutex().Unlock()
+	if err != nil {
+		ctx.Writes.addReads(entries)
+		ctx.readAuditErr = fmt.Errorf("read audit write failed: %w", err)
+		ctx.Error = ctx.readAuditErr
+		log.Printf("READ AUDIT (compliance: hipaa): %d read events of a transactional flow could not be written in its transaction, which is rolled back: %v", len(entries), err)
+		return
+	}
+	ctx.Writes.sealReads(entries)
+}
+
 // flushFlowTxReadAudit writes the read events a transactional flow collected
-// (auditFlowSQLRead), once its transaction has committed or rolled back: a
-// read happened either way, and the rows may already have left the app (a
+// (auditFlowSQLRead) and its transaction did not commit
+// (sealFlowTxReadAudit), once that transaction has committed or rolled back:
+// a read happened either way, and the rows may already have left the app (a
 // `run: api` step before the failure). Called from announceFlowWrites, which
 // every transaction owner calls after Commit/Rollback has returned, so the
 // write never waits on the flow's own lock and never rolls back with it.
@@ -287,17 +324,26 @@ func (rab *readAuditBuffer) write(pending []readAuditEntry) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := insertReadAuditEntries(tx, pending); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertReadAuditEntries stores read events through tx: the buffer's own
+// transaction, or a hipaa flow's (sealFlowTxReadAudit).
+func insertReadAuditEntries(tx *sql.Tx, entries []readAuditEntry) error {
 	stmt, err := tx.Prepare(readAuditInsertSQL)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-	for _, e := range pending {
+	for _, e := range entries {
 		if _, err := stmt.Exec(e.Table, e.RowID, e.QueryType, e.UserID, e.Email, e.IP, e.ImpersonatorID, e.ImpersonatorEmail); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // auditFlowSQLRead records a flow `run: sql` / `sql_dynamic` statement that
@@ -333,7 +379,9 @@ func auditFlowSQLRead(ctx *FlowContext, query string) error {
 	if ctx.Tx != nil {
 		// The transaction holds the write lock, and an event written through
 		// it would roll back with a failed run although the read happened:
-		// write it once the transaction has ended (flushFlowTxReadAudit).
+		// it is written with the commit of a hipaa run that succeeds
+		// (sealFlowTxReadAudit), otherwise once the transaction has ended
+		// (flushFlowTxReadAudit).
 		if ctx.Writes == nil {
 			ctx.Writes = newFlowWriteLog()
 		}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -354,7 +355,7 @@ func injectSessionContext(row map[string]any, session *Session) {
 // FireUserHooks fires hooks for _benmore_users mutations (signup, login, profile update, etc.).
 // Called from auth handlers to make the users table hookable like any other table.
 func FireUserHooks(app *App, event string, userID int64) {
-	if app.Hooks == nil {
+	if app.hookConfig() == nil {
 		return
 	}
 	// Load current user fields as the "row" for hook interpolation
@@ -416,21 +417,40 @@ func submittedHookRow(row map[string]any, session *Session) map[string]any {
 	return out
 }
 
+// withPreviousValues returns a copy of a before_update hook row with
+// old_<column> added for every column of stored, the row as it was read
+// before the change (no further query). A generic update's hooks get them in
+// `when:` and as SQL placeholders, as a workflow transition's hooks do
+// (transitionEventRow). A column of the table that is itself named old_<x>
+// keeps its own meaning: neither its value in row nor its absence from the
+// submitted-field view (submittedHookRow) is replaced by the previous x.
+func withPreviousValues(row, stored map[string]any) map[string]any {
+	out := make(map[string]any, len(row)+len(stored))
+	maps.Copy(out, row)
+	for k, v := range stored {
+		if _, column := stored["old_"+k]; !column {
+			out["old_"+k] = v
+		}
+	}
+	return out
+}
+
 // fireBeforeHooksRows runs the before-hooks with `when:` judged over row and
 // the hook SQL's placeholders resolved against sqlRow.
 func fireBeforeHooksRows(db mutationQuerier, app *App, event string, table string, row, sqlRow map[string]any) error {
-	if app.Hooks == nil {
+	config := app.hookConfig()
+	if config == nil {
 		return nil
 	}
 
 	var hooks []Hook
 	switch event {
 	case "insert":
-		hooks = app.Hooks.BeforeInsert[table]
+		hooks = config.BeforeInsert[table]
 	case "update":
-		hooks = app.Hooks.BeforeUpdate[table]
+		hooks = config.BeforeUpdate[table]
 	case "delete":
-		hooks = app.Hooks.BeforeDelete[table]
+		hooks = config.BeforeDelete[table]
 	}
 
 	for _, hook := range hooks {
@@ -515,18 +535,19 @@ func translateRaiseAbort(sqlText string) string {
 
 // FireHooks executes all hooks for a given event.
 func FireHooks(app *App, event string, table string, row map[string]any) {
-	if app.Hooks == nil {
+	config := app.hookConfig()
+	if config == nil {
 		return
 	}
 
 	var hooks []Hook
 	switch event {
 	case "insert":
-		hooks = app.Hooks.OnInsert[table]
+		hooks = config.OnInsert[table]
 	case "update":
-		hooks = app.Hooks.OnUpdate[table]
+		hooks = config.OnUpdate[table]
 	case "delete":
-		hooks = app.Hooks.OnDelete[table]
+		hooks = config.OnDelete[table]
 	}
 
 	for _, hook := range hooks {
@@ -572,16 +593,17 @@ func enqueueRowEffectsTx(tx mutationTx, app *App, event, table string, hookRow, 
 
 // afterHooksFor is the table's on_insert/on_update/on_delete hooks.
 func afterHooksFor(app *App, event, table string) []Hook {
-	if app.Hooks == nil {
+	config := app.hookConfig()
+	if config == nil {
 		return nil
 	}
 	switch event {
 	case "insert":
-		return app.Hooks.OnInsert[table]
+		return config.OnInsert[table]
 	case "update":
-		return app.Hooks.OnUpdate[table]
+		return config.OnUpdate[table]
 	case "delete":
-		return app.Hooks.OnDelete[table]
+		return config.OnDelete[table]
 	}
 	return nil
 }
@@ -658,6 +680,7 @@ func hookSQLText(db any, app *App, query string) string {
 
 func canonicalHookRefreshTargets(app *App, executedSQL, primaryTable string) []string {
 	targets, _ := sqlWriteTargets(executedSQL)
+	tables := app.tableList()
 	seen := make(map[string]bool, len(targets))
 	var refresh []string
 	for _, target := range targets {
@@ -667,7 +690,7 @@ func canonicalHookRefreshTargets(app *App, executedSQL, primaryTable string) []s
 			continue
 		}
 		canonicalName := ""
-		for _, appTable := range app.Tables {
+		for _, appTable := range tables {
 			if sqliteIdentifierFold(appTable.Name) == folded {
 				canonicalName = appTable.Name
 				break
@@ -770,6 +793,10 @@ func executeHook(app *App, hook Hook, table string, row map[string]any) {
 // log-only behavior through executeHook.
 func executeHookResult(app *App, hook Hook, table string, row map[string]any) (err error) {
 	db, appDir := app.DB, app.Dir
+	// What a delivery sends is rendered from the row without the app's
+	// declared blind-index columns; hook SQL reads the row itself
+	// (flows_respond_blind_index.go).
+	sent := hookDeliveryRow(app, row)
 	reportHook := func(level, kind, message string, frames []errorFrame) {
 		ev := errorEvent{Source: "server", Kind: "hook", Level: level, Type: "hook_" + kind, Message: message, Handled: true, Frames: frames, Tags: map[string]string{"hook": kind, "table": table, "event": hook.reportEvent}}
 		if level == "fatal" {
@@ -805,9 +832,9 @@ func executeHookResult(app *App, hook Hook, table string, row map[string]any) (e
 			return errors.New("hook webhook blocked: private URL")
 		}
 
-		body := interpolateRowJSONForApp(hook.Body, row, app)
+		body := interpolateRowJSONForApp(hook.Body, sent, app)
 		if body == "" {
-			body = hookDefaultBody(app, table, row)
+			body = hookDefaultBody(app, table, sent)
 		}
 
 		// Circuit breaker: skip if endpoint is known-dead
@@ -854,12 +881,12 @@ func executeHookResult(app *App, hook Hook, table string, row map[string]any) (e
 	// values are mustache-interpolated into both subject + body.
 	if hook.Email != nil {
 		// Part by part: a row value is one recipient (email_recipients.go).
-		to, toErr := hookEmailRecipients(hook.Email.To, row, appDir)
-		subject := interpolateRow(hook.Email.Subject, row, appDir)
+		to, toErr := hookEmailRecipients(hook.Email.To, sent, appDir)
+		subject := interpolateRow(hook.Email.Subject, sent, appDir)
 		if toErr != nil {
 			log.Printf("HOOK [email] send failed: %s", toErr)
 			note(errors.New("hook email was not sent"))
-		} else if err := SendEmail(appDir, to, subject, hookEmailBody(hook.Email, row, appDir)); err != nil {
+		} else if err := SendEmail(appDir, to, subject, hookEmailBody(hook.Email, sent, appDir)); err != nil {
 			log.Printf("HOOK [email] send failed: %s", logSendErrorRecipients(err, to))
 			note(errors.New("hook email was not sent"))
 		} else {
@@ -872,8 +899,8 @@ func executeHookResult(app *App, hook Hook, table string, row map[string]any) (e
 	// interpolation means the template referenced a column that isn't on
 	// the row: say so instead of handing an empty string to the provider.
 	if hook.SMS != nil {
-		to := interpolateRow(hook.SMS.To, row, appDir)
-		body := interpolateRow(hook.SMS.Body, row, appDir)
+		to := interpolateRow(hook.SMS.To, sent, appDir)
+		body := interpolateRow(hook.SMS.Body, sent, appDir)
 		switch {
 		case to == "":
 			log.Printf("HOOK [sms] skipped: `to` resolved empty from template %q - check the column exists on the row", hook.SMS.To)
@@ -893,23 +920,23 @@ func executeHookResult(app *App, hook Hook, table string, row map[string]any) (e
 
 	// Notification
 	if hook.Notify != nil {
-		if err := executeNotifyHook(db, hook.Notify, row, appDir); err != nil {
+		if err := executeNotifyHook(db, hook.Notify, sent, appDir); err != nil {
 			note(err)
 		}
 	}
 
 	// WebSocket broadcast
 	if hook.WS != nil && hook.WS.Room != "" {
-		room := interpolateRow(hook.WS.Room, row, appDir)
+		room := interpolateRow(hook.WS.Room, sent, appDir)
 		payload := hook.WS.Payload
 		if payload == "" {
 			payload = hookDefaultWSPayload(table)
 		} else {
-			payload = interpolateRowJSONWithEnv(payload, row, nil, appDir)
+			payload = interpolateRowJSONWithEnv(payload, sent, nil, appDir)
 		}
 		groupID := ""
-		if app.Group != nil && app.Group.Key != "" {
-			if v := row[app.Group.Key]; v != nil {
+		if group := app.groupConfig(); group != nil && group.Key != "" {
+			if v := row[group.Key]; v != nil {
 				groupID = valueText(v)
 			}
 		}

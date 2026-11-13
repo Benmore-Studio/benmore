@@ -28,14 +28,17 @@ type supportReadFixture struct {
 
 func newSupportReadFixture(t *testing.T) *supportReadFixture {
 	t.Helper()
-	app, mux := newCrudScopeTestApp(t)
-	f := &supportReadFixture{app: app, mux: mux, adminEmail: "admin@example.com", member: "member@example.com", noteID: "50"}
+	app := newCrudScopeApp(t)
+	f := &supportReadFixture{app: app, adminEmail: "admin@example.com", member: "member@example.com", noteID: "50"}
 	if err := EnsureUsersTable(app.DB); err != nil {
 		t.Fatal(err)
 	}
 	EnsureSessionsTable(app.DB)
 	EnsureAuditLogTable(app.DB)
 	app.Design = &DesignConfig{Auth: map[string]string{"read_audit": "*"}}
+	// An app with an auth section has its sign-in routes, as a loaded app does.
+	app.Paths = DiscoverAuthPaths(nil)
+	f.mux = buildAppMux(app, true, "http://localhost")
 	InitReadAudit(app, true)
 	hash, _ := bcrypt.GenerateFromPassword([]byte(fixturePassword), bcrypt.MinCost)
 	seed := func(email, role string) int64 {
@@ -54,7 +57,6 @@ func newSupportReadFixture(t *testing.T) *supportReadFixture {
 	f.adminSID = CreateSession(app.DB, f.adminID, f.adminEmail, "", time.Hour)
 	f.memberSID = CreateSession(app.DB, f.memberID, f.member, "", time.Hour)
 
-	app.Paths = DiscoverAuthPaths(nil)
 	auth := http.NewServeMux()
 	RegisterAuthRoutes(auth, app)
 	body, _ := json.Marshal(map[string]any{"user_id": f.memberID, "password": fixturePassword})

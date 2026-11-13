@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -26,6 +27,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 	if !rowIDCanonical(app, table, id) {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": errUpdateTarget.Error()})
 		return
+	}
+	// A multipart body is read here, before the CSRF check, so that it reads
+	// the same for every credential: the check parses a form to find its
+	// token and a Bearer request skips the check, so a cookie request used to
+	// apply the body's text fields and a Bearer request read none of them.
+	var fileParts []string
+	if multipartRequest(r) {
+		var err error
+		if fileParts, err = readMultipartTextFields(r); err != nil {
+			answerMultipartReadError(w, err)
+			return
+		}
 	}
 	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
@@ -47,9 +60,10 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		_ = json.NewEncoder(w).Encode(lockErrorResponse(app.DevMode, lockedBy))
 		return
 	}
-	// validateCSRF has already parsed a form body for a cookie request (it
-	// reads the token with FormValue); a Bearer request skips it, so this is
-	// its first parse. Either way parseFormBody reports a body cut by the cap.
+	// validateCSRF has already parsed an urlencoded body for a cookie request
+	// (it reads the token with FormValue); a Bearer request skips it, so this
+	// is its first parse. Either way parseFormBody reports a body cut by the
+	// cap. A multipart body was read above.
 	if err := parseFormBody(r); err != nil {
 		if !answerIfRequestBodyTooLarge(w, err) {
 			httpError(w, "Bad request", http.StatusBadRequest)
@@ -68,6 +82,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 		expected = r.FormValue("_expected_updated_at")
 	}
 	delete(fields, "_expected_updated_at")
+	// An admin.yaml read-only column named by an admin panel update
+	// (admin_read_only.go).
+	if adminRefusedReadOnlyColumn(w, r, app, table, slices.Collect(maps.Keys(fields))) {
+		return
+	}
 	var stripped []string
 	if cols, err := GetTableColumns(app.DB, table); err == nil {
 		names := make([]string, 0, len(fields))
@@ -75,6 +94,9 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 			names = append(names, k)
 		}
 		setIgnoredFieldsHeader(w, r, names, cols)
+		// An update never stores a file: a file part is named with the
+		// fields it did not use, whether or not a column has its name.
+		addIgnoredFields(w, fileParts)
 		stripped = updateStrippedFields(app, table, id, session, fields, cols)
 		if len(stripped) > 0 {
 			w.Header().Set("X-Stripped-Fields", strings.Join(stripped, ","))
@@ -127,8 +149,8 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 			return
 		}
 		if errors.As(err, &requestErr) && requestErr.noFields && multipartRequest(r) {
-			// No field was read from a multipart body: say the body type is
-			// the reason, not the field names.
+			// A multipart body with no text field to write (file parts
+			// only): say what an update does with such a body.
 			httpJSON(w, http.StatusBadRequest, withRefusalDocs(map[string]any{
 				"error": requestErr.message,
 				"hint":  multipartUpdateHint,
@@ -179,15 +201,14 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, app *App, table string
 }
 
 // refusalMultipartUpdate names, in refusal_docs.go, the 400 of an update
-// that read no field from a multipart body.
+// whose multipart body carried no text field to write.
 const refusalMultipartUpdate = "multipart_update"
 
 // multipartUpdateHint is what that 400 says to send instead. An update
-// never stores a file part, and a request with an API token or Bearer
-// session reads no field of a multipart body at all, so `-F name=x` on a
-// PATCH answered a bare "No fields to update" that pointed at the field
-// names.
-const multipartUpdateHint = "this PATCH has a multipart/form-data body, and an update reads no field from one and never stores a file part: send the fields as JSON or as a URL-encoded form. To change a file column, upload the file first (POST /api/_upload) and send the reference it returns as the column's value"
+// applies the text fields of a multipart body and never stores a file part,
+// so a body of file parts only answered a bare "No fields to update" that
+// pointed at the field names.
+const multipartUpdateHint = "this PATCH has a multipart/form-data body with no text field to write: an update applies the text fields of a multipart body and never stores a file part. To change a file column, upload the file first (POST /api/_upload) and send the reference it returns as the column's value"
 
 // multipartRequest reports a request whose body is multipart/form-data.
 func multipartRequest(r *http.Request) bool {
@@ -270,10 +291,11 @@ func strippedUpdateHint(app *App, table, id string, stripped []string) string {
 // workflowForStateColumn returns the workflow whose state column on table is
 // col, or nil.
 func workflowForStateColumn(app *App, table, col string) *Workflow {
-	if app == nil || app.Workflows == nil {
+	config := app.workflowConfig()
+	if config == nil {
 		return nil
 	}
-	for _, wf := range app.Workflows.Workflows {
+	for _, wf := range config.Workflows {
 		if wf != nil && wf.Table == table && identIs(wf.Field, col) {
 			return wf
 		}

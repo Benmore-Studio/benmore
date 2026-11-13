@@ -24,9 +24,10 @@ package main
 //   GET  /api/_presence?slug=...
 //       returns: { slug, members: [{ user_id, joined_at, last_seen }], count }
 //
-// SSE: every join/leave/sweep-expiry fires `{table:"_benmore_presence",
-// action:"insert"|"delete"}` to signed-in streams (a join or leave only
-// within the caller's tenant in an app with groups:) so clients re-fetch.
+// SSE: every join, every leave or sweep-expiry that removed a row fires
+// `{table:"_benmore_presence", action:"insert"|"delete"}` to signed-in
+// streams (a join or leave only within the caller's tenant in an app with
+// groups:) so clients re-fetch.
 
 import (
 	"database/sql"
@@ -104,7 +105,7 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 		}
 		// A scoped credential is present only in a room whose membership
 		// table its scopes allow writing (scoped_credential_routes.go).
-		if err := presenceScopeError(app, session, slug, "write"); err != nil {
+		if err := roomScopeError(app, session, slug, "write"); err != nil {
 			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}
@@ -142,12 +143,18 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 				return
 			}
 		case "leave":
-			_, err := app.DB.Exec(`DELETE FROM _benmore_presence WHERE slug = ? AND user_id = ?`, key, session.UserID)
+			res, err := app.DB.Exec(`DELETE FROM _benmore_presence WHERE slug = ? AND user_id = ?`, key, session.UserID)
 			if err != nil {
 				serverErrorJSON(w, r, app, "presence", err, "db error")
 				return
 			}
-			BroadcastScopedDirect(app, presenceTable, "delete", presenceTenant(app, session), 0)
+			// Only a leave that removed the caller's row changed the room. A
+			// caller who was never present (one the room refuses included,
+			// since leaving stays open) raises nothing, so it cannot make its
+			// tenant's streams re-fetch at will.
+			if n, _ := res.RowsAffected(); n > 0 {
+				BroadcastScopedDirect(app, presenceTable, "delete", presenceTenant(app, session), 0)
+			}
 		default:
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "action must be join | heartbeat | leave"})
 			return
@@ -177,7 +184,7 @@ func RegisterPresenceRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "slug query param required (no NUL)"})
 			return
 		}
-		if err := presenceScopeError(app, session, slug, "read"); err != nil {
+		if err := roomScopeError(app, session, slug, "read"); err != nil {
 			httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
 			return
 		}

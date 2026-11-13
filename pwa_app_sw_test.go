@@ -145,6 +145,7 @@ func TestServiceWorkerOptInServesReviewedCapturedSource(t *testing.T) {
 		t.Fatalf("reviewed app served %q at /sw.js, want the captured reviewed worker", body)
 	}
 	for _, v := range []string{"/static/late.js", "/static/../flows/helper.js", "../flows/helper.js"} {
+		quiesceTestApp(t, app)
 		app.Design.PWA["service_worker"] = v
 		if body := get(); body != GenerateServiceWorker(app) {
 			t.Fatalf("service_worker=%q on a reviewed app served %q, want the generated worker", v, body)

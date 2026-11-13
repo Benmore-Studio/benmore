@@ -67,6 +67,10 @@ type appMCPCommandCapability struct {
 	// Live foreign keys by folded parent table (foreignKeyChildScanReads),
 	// loaded on the first apply write.
 	foreignKeyChildren map[string]map[string]bool
+	// The database's view texts as this transaction first read them
+	// (commandViewTexts).
+	viewTexts     map[string][]string
+	viewTextsRead bool
 }
 
 type appMCPCommandComputeKey struct{}

@@ -75,6 +75,15 @@ func handleGroupBootstrap(w http.ResponseWriter, r *http.Request, app *App) {
 		httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 		return
 	}
+	// A multipart body is read before the CSRF check so that its text fields
+	// are read for every credential (readMultipartTextFields); no file part
+	// is stored here.
+	if multipartRequest(r) {
+		if _, err := readMultipartTextFields(r); err != nil {
+			answerMultipartReadError(w, err)
+			return
+		}
+	}
 	if !isBearerAuth(r) && !validateCSRF(r) {
 		httpError(w, "Invalid CSRF token", http.StatusForbidden)
 		return

@@ -303,23 +303,23 @@ func jsonNumber(n int64) string {
 	return string(b)
 }
 
-// A PATCH never stores a file, and with a Bearer credential it reads no
-// field of a multipart body: the answer was 400 "No fields to update",
-// which sent the builder to their field names. It says the body type is the
-// reason and what to send instead.
+// A PATCH never stores a file. A multipart PATCH of file parts only answered
+// 400 "No fields to update", which sent the builder to their field names; it
+// says what an update does with a multipart body and what to send instead.
+// (multipart_fields_test.go covers the text fields, for every credential.)
 func TestMultipartPatchSaysWhatToSend(t *testing.T) {
 	app := newGateApp(t, docsTable)
 	uid, sid := gateUser(t, app, "owner@example.com")
 	mustExecArgs(t, app.DB, "INSERT INTO docs (id, user_id, title, attachment) VALUES (1, ?, 'first', '')", uid)
 
 	w := httptest.NewRecorder()
-	handleUpdate(w, uploadRequest(t, "PATCH", "/api/docs/1", sid, map[string]string{"title": "renamed"}, uploadPart{"attachment", "scan.png", pngBytes}), app, "docs")
+	handleUpdate(w, uploadRequest(t, "PATCH", "/api/docs/1", sid, nil, uploadPart{"attachment", "scan.png", pngBytes}), app, "docs")
 	body := answerJSON(t, w)
 	if w.Code != http.StatusBadRequest || body["error"] != "No fields to update" {
 		t.Fatalf("multipart PATCH: %d %s, want 400 No fields to update", w.Code, w.Body.String())
 	}
 	hint, _ := body["hint"].(string)
-	for _, want := range []string{"multipart", "JSON", "/api/_upload"} {
+	for _, want := range []string{"multipart", "text field", "/api/_upload"} {
 		if !strings.Contains(hint, want) {
 			t.Errorf("hint %q does not mention %s", hint, want)
 		}
@@ -338,28 +338,6 @@ func TestMultipartPatchSaysWhatToSend(t *testing.T) {
 	w = gateCall(app, handleUpdate, "docs", "PATCH", "/api/docs/1", "application/json", `{}`, sid)
 	if body := answerJSON(t, w); w.Code != http.StatusBadRequest || body["hint"] != nil {
 		t.Errorf("empty JSON PATCH: %d %s, want the plain 400", w.Code, w.Body.String())
-	}
-}
-
-// A browser form sent as FormData with the session cookie is a multipart
-// PATCH whose text fields are applied (the CSRF check reads the form). That
-// keeps working; its file parts are not stored.
-func TestMultipartPatchWithCookieStillAppliesFields(t *testing.T) {
-	app := newGateApp(t, docsTable)
-	uid, sid := gateUser(t, app, "owner@example.com")
-	mustExecArgs(t, app.DB, "INSERT INTO docs (id, user_id, title, attachment) VALUES (1, ?, 'first', '')", uid)
-	r := uploadRequest(t, "PATCH", "/api/docs/1", "", map[string]string{"title": "renamed", "_csrf": authMintCSRFToken(sid)}, uploadPart{"attachment", "scan.png", pngBytes})
-	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sid})
-	w := httptest.NewRecorder()
-	handleUpdate(w, r, app, "docs")
-	if w.Code != http.StatusOK {
-		t.Fatalf("cookie multipart PATCH: %d %s", w.Code, w.Body.String())
-	}
-	if got := gateScalar(t, app, "SELECT title || '|' || COALESCE(attachment, '') FROM docs WHERE id = 1"); got != "renamed|" {
-		t.Errorf("row = %q, want the title changed and no file", got)
-	}
-	if left := everyStoredUpload(t, app); len(left) != 0 {
-		t.Errorf("the PATCH stored %v", left)
 	}
 }
 

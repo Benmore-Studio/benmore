@@ -5,6 +5,7 @@
     "new_app_workflow",
     "manifest_authoring",
     "connector_source_review",
+    "check_summary",
     "stale_review",
     "review_serialization",
     "destructive_schema",

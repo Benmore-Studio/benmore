@@ -73,7 +73,8 @@ func TestBenmoreTestFailsOnATestFileItCannotLoad(t *testing.T) {
 				ran[r.File+"/"+r.Test] = r.Pass
 			}
 			for _, f := range unloadableTestFiles {
-				r, ok := byFile["tests/"+f.name]
+				// Named as the file's tests would be; the path is in the message.
+				r, ok := byFile[appTestFileName(f.name)]
 				if !ok {
 					t.Errorf("tests/%s was dropped: no result names it", f.name)
 					continue
@@ -81,8 +82,8 @@ func TestBenmoreTestFailsOnATestFileItCannotLoad(t *testing.T) {
 				if r.Pass || r.Skipped {
 					t.Errorf("tests/%s is reported as %+v, want a failed result", f.name, r)
 				}
-				if !strings.Contains(r.Message, f.want) {
-					t.Errorf("tests/%s: message %q does not say %q", f.name, r.Message, f.want)
+				if !strings.Contains(r.Message, f.want) || !strings.HasPrefix(r.Message, "tests/"+f.name+": ") {
+					t.Errorf("tests/%s: message %q does not start with the path and say %q", f.name, r.Message, f.want)
 				}
 				// Builder-facing text: no Go type names from the decoder.
 				for _, internal := range []string{"main.", "interface {}", "!!seq", "!!str", "!!map"} {
@@ -160,7 +161,7 @@ func TestBenmoreTestAppModeWithOnlyAnUnloadableFile(t *testing.T) {
 	}
 	named := false
 	for _, r := range results {
-		if r.File == "tests/broken.yaml" && r.Test == "load" && !r.Pass {
+		if r.File == "broken" && r.Test == "load" && !r.Pass && strings.HasPrefix(r.Message, "tests/broken.yaml: ") {
 			named = true
 		}
 	}
@@ -236,10 +237,12 @@ func TestFixtureAppTestFilesLoadOrAreExpectedNotTo(t *testing.T) {
 	}
 	expectedSomewhere := false
 	for _, tests := range apps {
+		// A line of expected-failures.txt is the file name of a result: a
+		// test file without the directory and the extension.
 		expected := map[string]bool{}
 		if listed, err := os.ReadFile(filepath.Join(tests, "expected-failures.txt")); err == nil {
 			for _, line := range strings.Split(string(listed), "\n") {
-				if line = strings.TrimSpace(line); isAppTestFile(line) {
+				if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
 					expected[line] = true
 				}
 			}
@@ -252,8 +255,12 @@ func TestFixtureAppTestFilesLoadOrAreExpectedNotTo(t *testing.T) {
 			delete(expected, r.File)
 			expectedSomewhere = true
 		}
-		for file := range expected {
-			t.Errorf("%s: %s is listed as a file that must not load, but it loads", filepath.Dir(tests), file)
+		// The other fixtures list tests that fail once loaded; this one lists
+		// only files that must not load.
+		if filepath.Base(filepath.Dir(tests)) == "test-file-not-loaded" {
+			for file := range expected {
+				t.Errorf("%s: %s is listed as a file that must not load, but it loads", filepath.Dir(tests), file)
+			}
 		}
 	}
 	if !expectedSomewhere {

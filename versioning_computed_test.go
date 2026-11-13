@@ -30,6 +30,10 @@ const computedVersionSchema = `model Product {
 func computedVersionFixture(t *testing.T, computed bool) (*App, *http.ServeMux, string) {
 	t.Helper()
 	app, _ := newCrudScopeTestApp(t)
+	// That mux is wanted for the framework tables it creates; the routes under
+	// test are registered below. Its workers end here, so the configuration
+	// this fixture and its tests set is not written under them.
+	quiesceTestApp(t, app)
 	models, err := ParsePrismaSchema(computedVersionSchema)
 	if err != nil {
 		t.Fatal(err)

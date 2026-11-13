@@ -31,20 +31,26 @@ package main
 //     keeps the snapshot's role and grants. Sessions can be issued again;
 //     role assignments are the app's data and cannot be rebuilt. Counted.
 //
-// The app must keep an admin who can sign in (last_admin_guard.go). When the
-// rule leaves none, accounts that are durable admins NOW keep that standing
+// The app must keep an admin who can sign in, counted as the last-admin guard
+// counts (durableAdminWhere, with the app's auth.require_verified read from
+// the app.yaml beside the database: restoreVerifiedSetting). When the rule
+// leaves none, accounts that are durable admins NOW keep that standing
 // (nobody gets back a role that was taken away); when the snapshot holds no
 // such account either, the snapshot's own admin roles and global admin grants
 // are kept, revoked ones included. Both are counted, named in the summary's
-// warning and logged.
+// warning and logged. An app.yaml that cannot be read leaves the setting
+// unknown: only verified admins then count, so an admin who can sign in
+// either way is kept, but a revoked admin role comes back only when the app
+// has no admin under either reading.
 //
 // With no readable live database nothing says what was revoked: roles stay as
 // the snapshot has them and the summary says why. refresh-dev's copy keeps its
 // roles too (dev holds no role state for production's accounts).
 //
-// Not covered: roles an app keeps in its own tables (a membership table's
-// role column) and record-level grants (_benmore_permissions) roll back with
-// the data.
+// Record-level grants (_benmore_permissions) follow the same never-revive
+// rule in restore_record_grants.go. Not covered, on purpose: membership-table
+// rows and the roles an app keeps in them (groups.role_field) are the app's
+// data and roll back with it.
 
 import (
 	"context"
@@ -54,6 +60,52 @@ import (
 	"strconv"
 	"strings"
 )
+
+// restoreVerifiedUnknown is restoreRoleSummary.RequireVerified when app.yaml
+// could not be read.
+const restoreVerifiedUnknown = "unknown"
+
+// restoreVerifiedRule is the app's auth.require_verified as a restore knows it.
+type restoreVerifiedRule struct {
+	required bool
+	known    bool
+	reason   string // why it is not known
+}
+
+// restoreVerifiedSetting reads auth.require_verified from the app.yaml in
+// appDir, the way the runtime loads it. Every restore path has the app
+// directory (the hosted one runs in the instance's own helper). No app.yaml
+// is the runtime's "not required". One that cannot be read or parsed leaves
+// the setting unknown.
+func restoreVerifiedSetting(appDir string) restoreVerifiedRule {
+	if appDir == "" {
+		return restoreVerifiedRule{reason: "no app directory"}
+	}
+	data, err := readOptionalConfig(appDir, "app.yaml")
+	if err != nil {
+		return restoreVerifiedRule{reason: err.Error()}
+	}
+	raw, _, err := parseAppConfigDocument(data)
+	if err != nil {
+		return restoreVerifiedRule{reason: err.Error()}
+	}
+	rule := restoreVerifiedRule{known: true}
+	if raw != nil {
+		rule.required = appRequiresVerified(&App{Design: designFromAppYAML(raw)})
+	}
+	return rule
+}
+
+// label is the rule in the summary: "" when verification is not required.
+func (v restoreVerifiedRule) label() string {
+	switch {
+	case !v.known:
+		return restoreVerifiedUnknown
+	case v.required:
+		return "true"
+	}
+	return ""
+}
 
 const (
 	restoreRoleGrantsTable = "_benmore_user_roles"
@@ -101,8 +153,12 @@ type restoreRoleSummary struct {
 	AdminsKeptCount int    `json:"admins_kept_count,omitempty"`
 	// UsableAdmins: accounts in the restored database that are admins with no
 	// expiry and can sign in.
-	UsableAdmins int    `json:"usable_admins"`
-	Warning      string `json:"warning,omitempty"`
+	UsableAdmins int `json:"usable_admins"`
+	// RequireVerified: "true" when the app's auth.require_verified is on (an
+	// admin with an unverified email is then no usable admin), "unknown" when
+	// app.yaml could not be read (only verified admins are counted).
+	RequireVerified string `json:"require_verified,omitempty"`
+	Warning         string `json:"warning,omitempty"`
 }
 
 // restoreRoleName is a stored primary role as the guards read it: the exact
@@ -215,11 +271,12 @@ func liveAccountEvidence(live map[string]*credTable) func(id int64) bool {
 
 // carryForwardRestoreRoles applies the live role state to the candidate.
 // skipped names why there is no live state ("" when live is set).
-func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*credTable, pairs map[int64]int64, skipped string) (*restoreRoleSummary, error) {
+func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*credTable, pairs map[int64]int64, skipped string, verified restoreVerifiedRule) (*restoreRoleSummary, error) {
 	summary := &restoreRoleSummary{Skipped: skipped}
 	if live == nil {
 		return summary, nil
 	}
+	summary.RequireVerified = verified.label()
 	users, err := readCredTable(ctx, tx, "_benmore_users", true, []string{"id", restoreRoleColumn})
 	if err != nil || users == nil || !users.has["id"] {
 		return summary, err
@@ -339,9 +396,7 @@ func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*
 			// expiry; and whether that expiry is the earlier of the two.
 			var current, earlier bool
 			if match >= 0 {
-				le, se := lg.get(match, "expires_at"), grants.get(i, "expires_at")
-				if err := tx.QueryRowContext(ctx, `SELECT COALESCE(? IS NULL OR datetime(?) > datetime('now'), 0),
-					COALESCE(? IS NOT NULL AND (? IS NULL OR datetime(?) < datetime(?)), 0)`, le, le, le, se, le, se).Scan(&current, &earlier); err != nil {
+				if current, earlier, err = restoreLiveExpiry(ctx, tx, lg.get(match, "expires_at"), grants.get(i, "expires_at")); err != nil {
 					return nil, err
 				}
 			}
@@ -369,10 +424,12 @@ func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*
 		}
 	}
 
-	usable := func() (n int, err error) {
-		err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_users u WHERE "+restoreUsableAdminWhere(users, grants)).Scan(&n)
+	count := func(requireVerified bool) (n int, err error) {
+		err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM _benmore_users u WHERE "+restoreUsableAdminWhere(users, grants, requireVerified)).Scan(&n)
 		return n, err
 	}
+	// With the setting unknown only an admin who can sign in either way counts.
+	usable := func() (int, error) { return count(verified.required || !verified.known) }
 	if summary.UsableAdmins, err = usable(); err != nil || summary.UsableAdmins > 0 {
 		return summary, err
 	}
@@ -424,9 +481,19 @@ func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*
 		}
 	}
 
+	// The setting is unknown and no admin has a verified email: when the app
+	// has an admin under the reading that the setting is off, nothing that was
+	// taken away comes back on a guess.
+	unverifiedOnly := 0
+	if summary.UsableAdmins == 0 && !verified.known {
+		if unverifiedOnly, err = count(false); err != nil {
+			return nil, err
+		}
+	}
+
 	// 2. No current admin is in the snapshot: its own admins keep their
 	// standing, revoked ones included. Locking the app out is worse.
-	if summary.UsableAdmins == 0 {
+	if summary.UsableAdmins == 0 && unverifiedOnly == 0 {
 		revived := 0
 		for _, rowid := range wasAdmin {
 			if err := setRole(rowid, restoreAdminRole); err != nil {
@@ -459,6 +526,9 @@ func carryForwardRestoreRoles(ctx context.Context, tx *sql.Tx, live map[string]*
 	case restoreAdminsKeptSnapshot:
 		summary.Warning = fmt.Sprintf("No account that is an admin now exists in the snapshot, so %d admin role(s) or grant(s) of the snapshot were kept, including ones removed since it was taken. Review who is an admin and remove the ones that should not be.", summary.AdminsKeptCount)
 	}
+	if summary.UsableAdmins == 0 && unverifiedOnly > 0 {
+		summary.Warning = strings.TrimSpace(summary.Warning + fmt.Sprintf(" The app's auth.require_verified setting could not be read (%s) and none of its %d admin(s) has a verified email: if the setting is on, no admin can sign in until one verifies their email or a verified account is made an admin.", verified.reason, unverifiedOnly))
+	}
 	if summary.Warning != "" {
 		log.Printf("restore: WARNING: %s (%d usable admin(s) in the restored database)", summary.Warning, summary.UsableAdmins)
 	}
@@ -472,18 +542,26 @@ func restoreInsertGrant(ctx context.Context, tx *sql.Tx, cols []string, values [
 }
 
 // restoreUsableAdminWhere selects, from the candidate's _benmore_users u, the
-// accounts the last-admin guard counts (durableAdminWhere): not deactivated,
-// not held at a temporary password, and admin by the role column or a global
-// admin grant with no expiry. A snapshot can predate a column, which then
-// restricts nothing. auth.require_verified is the app's setting and is not
-// known here: an unverified admin counts.
-func restoreUsableAdminWhere(users, grants *credTable) string {
+// accounts the last-admin guard counts. It IS the guard's condition
+// (durableAdminWhere) whenever the snapshot has every column that reads; a
+// snapshot that predates one gets the same condition without the missing
+// column, which then restricts nothing.
+func restoreUsableAdminWhere(users, grants *credTable, requireVerified bool) string {
+	current := users.has[restoreRoleColumn] && users.has["deactivated_at"] && users.has["password_change_required"] && users.has["verified"] &&
+		(grants == nil || (grants.has["group_id"] && grants.has["expires_at"]))
+	if current {
+		app := &App{Design: &DesignConfig{Auth: map[string]string{"require_verified": strconv.FormatBool(requireVerified)}}}
+		return durableAdminWhere(app, grants != nil)
+	}
 	where := []string{"1"}
 	if users.has["deactivated_at"] {
-		where = append(where, "COALESCE(CAST(u.deactivated_at AS TEXT), '') = ''")
+		where = append(where, accountActiveSQL("u"))
 	}
 	if users.has["password_change_required"] {
 		where = append(where, "COALESCE(u.password_change_required, 0) = 0")
+	}
+	if requireVerified && users.has["verified"] {
+		where = append(where, "COALESCE(u.verified, 0) = 1")
 	}
 	var admin []string
 	if users.has[restoreRoleColumn] {
@@ -496,7 +574,7 @@ func restoreUsableAdminWhere(users, grants *credTable) string {
 				grant += " AND g." + col + " IS NULL"
 			}
 		}
-		admin = append(admin, "EXISTS (SELECT 1 FROM "+restoreRoleGrantsTable+" g WHERE "+grant+")")
+		admin = append(admin, "EXISTS (SELECT 1 FROM main."+restoreRoleGrantsTable+" g WHERE "+grant+")")
 	}
 	if len(admin) == 0 {
 		return "0"
