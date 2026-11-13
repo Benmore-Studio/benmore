@@ -77,6 +77,9 @@ func consumePasskeyChallenge(db *sql.DB, challenge []byte, purpose string, userI
 }
 
 func EnsurePasskeysTable(db *sql.DB) error {
+	// A passkey is added and removed with its audit row in one transaction
+	// (account_audit.go), so the log exists wherever this table does.
+	EnsureAuditLogTable(db)
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS _benmore_passkeys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
@@ -498,12 +501,15 @@ func passkeyRegister(app *App) http.HandlerFunc {
 			passkeyJSONError(w, http.StatusConflict, fmt.Sprintf("you already have %d passkeys; remove one first", passkeyMaxPerUser))
 			return
 		}
+		id, _ := res.LastInsertId()
+		if err := auditAccountEvent(tx, app, accountAuditPasskeyAdded, strconv.FormatInt(id, 10), sess, nil, map[string]any{"name": name}); err != nil {
+			passkeyServerError(w, r, app, err, "could not save the passkey")
+			return
+		}
 		if err := tx.Commit(); err != nil {
 			passkeyServerError(w, r, app, err, "could not save the passkey")
 			return
 		}
-		id, _ := res.LastInsertId()
-		LogAudit(app, "passkey_added", "_benmore_passkeys", strconv.FormatInt(id, 10), sess, nil, map[string]any{"name": name})
 		httpJSON(w, http.StatusOK, map[string]any{"ok": true, "passkey": map[string]any{"id": id, "name": name}})
 	}
 }
@@ -517,6 +523,13 @@ func passkeyList(app *App) http.HandlerFunc {
 		sess := getSession(app, r)
 		if sess == nil || sess.UserID <= 0 {
 			passkeyJSONError(w, http.StatusUnauthorized, "sign in first")
+			return
+		}
+		// The account's sign-in keys, like its sessions and tokens: a scoped
+		// credential lists none of them (changes already need a direct
+		// sign-in). The embedded dashboard's own browser session keeps its
+		// profile page's list (platformPageSession: a marker, not app scopes).
+		if !platformPageSession(app, sess) && !requireAccountManagement(w, sess) {
 			return
 		}
 		rows, err := queryMetadataRows(app.DB, `SELECT id, name, created_at, last_used_at FROM _benmore_passkeys WHERE user_id = ? ORDER BY id`, sess.UserID)
@@ -538,7 +551,13 @@ func passkeyDelete(app *App) http.HandlerFunc {
 			passkeyJSONError(w, http.StatusNotFound, "passkey not found")
 			return
 		}
-		res, err := app.DB.Exec(`DELETE FROM _benmore_passkeys WHERE id = ? AND user_id = ?`, id, sess.UserID)
+		tx, err := app.DB.Begin()
+		if err != nil {
+			passkeyServerError(w, r, app, err, "could not remove the passkey")
+			return
+		}
+		defer tx.Rollback()
+		res, err := tx.Exec(`DELETE FROM _benmore_passkeys WHERE id = ? AND user_id = ?`, id, sess.UserID)
 		if err != nil {
 			passkeyServerError(w, r, app, err, "could not remove the passkey")
 			return
@@ -547,7 +566,13 @@ func passkeyDelete(app *App) http.HandlerFunc {
 			passkeyJSONError(w, http.StatusNotFound, "passkey not found")
 			return
 		}
-		LogAudit(app, "passkey_removed", "_benmore_passkeys", strconv.FormatInt(id, 10), sess, nil, nil)
+		if err = auditAccountEvent(tx, app, accountAuditPasskeyRemoved, strconv.FormatInt(id, 10), sess, nil, nil); err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			passkeyServerError(w, r, app, err, "could not remove the passkey")
+			return
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -560,12 +585,23 @@ func passkeyDeleteAll(app *App) http.HandlerFunc {
 		if sess == nil {
 			return
 		}
-		n, err := revokeAccountPasskeys(app.DB, sess.UserID)
+		tx, err := app.DB.Begin()
 		if err != nil {
 			passkeyServerError(w, r, app, err, "could not remove passkeys")
 			return
 		}
-		LogAudit(app, "passkeys_removed_all", "_benmore_passkeys", "", sess, nil, map[string]any{"removed": n})
+		defer tx.Rollback()
+		n, err := revokeAccountPasskeys(tx, sess.UserID)
+		if err == nil {
+			err = auditAccountEvent(tx, app, accountAuditPasskeysRemovedAll, "", sess, nil, map[string]any{"removed": n})
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			passkeyServerError(w, r, app, err, "could not remove passkeys")
+			return
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": n})
 	}
 }
@@ -673,7 +709,7 @@ func passkeyLogin(app *App) http.HandlerFunc {
 		identifier := authIdentifier(app)
 		query := `SELECT COALESCE(email, ''), deactivated_at, COALESCE(password_change_required,0), COALESCE(verified,0), COALESCE(` + quoteIdent(identifier) + `,'') FROM _benmore_users WHERE id = ?`
 		if err := app.DB.QueryRow(query, userID).Scan(&email, &deactivated, &pendingPasswordChange, &verified, &loginValue); err != nil ||
-			(deactivated.Valid && strings.TrimSpace(deactivated.String) != "") {
+			accountDeactivated(deactivated) {
 			fail()
 			return
 		}
@@ -709,7 +745,7 @@ func passkeyLogin(app *App) http.HandlerFunc {
 		}
 		res, err := tx.Exec(`UPDATE _benmore_passkeys SET sign_count=?,last_used_at=datetime('now')
 			WHERE id=? AND sign_count=? AND EXISTS (SELECT 1 FROM _benmore_users u WHERE u.id=?
-			AND COALESCE(u.deactivated_at,'')='' AND COALESCE(u.password_change_required,0)=0
+			AND `+accountActiveSQL("u")+` AND COALESCE(u.password_change_required,0)=0
 			AND COALESCE(u.email,'')=? AND (?=0 OR COALESCE(u.verified,0)<>0))`,
 			int64(newCount), pkID, signCount, userID, email, requireVerified)
 		if err != nil {
@@ -720,7 +756,7 @@ func passkeyLogin(app *App) http.HandlerFunc {
 			fail()
 			return
 		}
-		if _, err := tx.Exec(`UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=? AND COALESCE(deactivated_at,'')='' AND COALESCE(password_change_required,0)=0`, userID); err != nil {
+		if _, err := tx.Exec(`UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=? AND `+accountActiveSQL("")+` AND COALESCE(password_change_required,0)=0`, userID); err != nil {
 			fail()
 			return
 		}

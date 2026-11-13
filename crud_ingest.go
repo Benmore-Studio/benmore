@@ -207,6 +207,11 @@ func handleStreamingIngest(w http.ResponseWriter, r *http.Request, app *App, tab
 				respondStorageFull(w, app, err)
 				return
 			}
+			// A row the database was too busy to write is not a bad row:
+			// nothing is kept and the whole stream can be sent again.
+			if respondDatabaseBusy(w, r, table+" ingest", err) {
+				return
+			}
 			var metadataErr *validationMetadataError
 			if errors.As(err, &metadataErr) {
 				serverError(w, r, app, table+" ingest", err, "Server error")

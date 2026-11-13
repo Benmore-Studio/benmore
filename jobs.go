@@ -998,7 +998,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 	if err != nil {
 		return nil, fmt.Errorf("the account this job was queued for is missing or must replace its password; not run")
 	}
-	if deactivated.Valid && deactivated.String != "" {
+	if accountDeactivated(deactivated) {
 		return nil, fmt.Errorf("the account this job was queued for is deactivated; not run")
 	}
 	if app.Design != nil && app.Design.Auth["require_verified"] == "true" && verified != 1 {

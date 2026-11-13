@@ -107,6 +107,11 @@ func registerBillingRoutes(mux appRouteRegistrar, app *App) {
 			httpError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
+		// The subscription is the account's own, like its sessions and
+		// tokens: no scope names it, so a scoped credential is refused.
+		if !requireAccountManagement(w, session) {
+			return
+		}
 		row := app.DB.QueryRow(`SELECT id, stripe_subscription_id, status, plan, current_period_end, cancel_at_period_end FROM _benmore_subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`, session.UserID)
 		var sub struct {
 			ID                int64   `json:"id"`
@@ -132,6 +137,9 @@ func registerBillingRoutes(mux appRouteRegistrar, app *App) {
 		session := getSession(app, r)
 		if session == nil {
 			httpError(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		if !requireAccountManagement(w, session) {
 			return
 		}
 		apiKey := GetEnv(app.Dir, cfg.APIKeyEnv)

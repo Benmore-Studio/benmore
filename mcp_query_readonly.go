@@ -40,6 +40,17 @@ func queryReadOnlyRowsCols(ctx context.Context, db *sql.DB, query string, limit 
 }
 
 func queryReadOnlyRowsColsDecrypt(ctx context.Context, db *sql.DB, query string, limit int, decrypt rowDecryptFunc, args ...any) ([]map[string]any, []string, bool, error) {
+	return queryReadOnlyRowsSealed(ctx, db, query, limit, decrypt, nil, args...)
+}
+
+// queryReadOnlyAuthoredRows runs a statement a person wrote (query_db,
+// `benmore sql`, the dashboard console): values computed from the app's
+// encrypted columns come back masked (mcp_query_readonly_sealed.go).
+func queryReadOnlyAuthoredRows(ctx context.Context, app *App, query string, limit int) ([]map[string]any, []string, bool, error) {
+	return queryReadOnlyRowsSealed(ctx, app.DB, query, limit, nil, readOnlySealedColumns(app))
+}
+
+func queryReadOnlyRowsSealed(ctx context.Context, db *sql.DB, query string, limit int, decrypt rowDecryptFunc, sealed map[string]bool, args ...any) ([]map[string]any, []string, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -55,7 +66,13 @@ func queryReadOnlyRowsColsDecrypt(ctx context.Context, db *sql.DB, query string,
 	if !ok {
 		return nil, nil, false, errNoSQLStatement
 	}
-	conn, key, closeConn, err := openReadOnlyQueryConn(ctx, db)
+	authorize := authorizeReadOnlyQuery
+	var reads *readOnlySealedReads
+	if len(sealed) > 0 {
+		reads = &readOnlySealedReads{sealed: sealed}
+		authorize = reads.authorize
+	}
+	conn, key, closeConn, err := openReadOnlyQueryConnWith(ctx, db, authorize)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -69,10 +86,25 @@ func queryReadOnlyRowsColsDecrypt(ctx context.Context, db *sql.DB, query string,
 		return nil, nil, false, err
 	}
 	cols, _ := rows.Columns()
+	var declared []bool
+	compiled := false
+	if reads != nil {
+		// The declared types describe the statement as it was compiled. One the
+		// authorizer has not seen compiled by now was compiled earlier (a
+		// statement cache), perhaps against another schema: not trusted.
+		compiled = reads.selects > 0
+		declared = readOnlyDeclaredColumns(rows, len(cols))
+	}
 	// Read one extra row to distinguish exactly-at-limit from truncated.
 	result, err := scanRowsLimitHookDecrypt(rows, key, limit+1, nil, decrypt)
 	if err != nil {
 		return nil, nil, false, err
+	}
+	if reads != nil && reads.derived(query) {
+		// Read before the next statement on this connection is recorded.
+		selects := reads.selects
+		oneOrigin := compiled && (selects == 1 || !readOnlyMayCombine(ctx, conn, query))
+		readOnlyMaskDerived(result, cols, declared, oneOrigin)
 	}
 	truncated := len(result) > limit
 	if truncated {
@@ -82,6 +114,12 @@ func queryReadOnlyRowsColsDecrypt(ctx context.Context, db *sql.DB, query string,
 }
 
 func openReadOnlyQueryConn(ctx context.Context, db *sql.DB) (conn *sql.Conn, key []byte, closeConn func(), err error) {
+	return openReadOnlyQueryConnWith(ctx, db, authorizeReadOnlyQuery)
+}
+
+// openReadOnlyQueryConnWith pins a read-only connection under authorize, which
+// must answer as authorizeReadOnlyQuery does (it may record what it is asked).
+func openReadOnlyQueryConnWith(ctx context.Context, db *sql.DB, authorize func(action int, arg1, arg2, database string) int) (conn *sql.Conn, key []byte, closeConn func(), err error) {
 	conn, err = db.Conn(ctx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -146,7 +184,7 @@ func openReadOnlyQueryConn(ctx context.Context, db *sql.DB) (conn *sql.Conn, key
 		return nil, nil, nil, err
 	}
 	if err = conn.Raw(func(raw any) error {
-		mustSQLiteConn(raw).RegisterAuthorizer(authorizeReadOnlyQuery)
+		mustSQLiteConn(raw).RegisterAuthorizer(authorize)
 		return nil
 	}); err != nil {
 		closeConn()

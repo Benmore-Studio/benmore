@@ -337,6 +337,14 @@ func designFromAppYAML(raw map[string]any) *DesignConfig {
 				}
 			}
 		}
+		// `identifier: Username` means username: the value is compared to
+		// the lower-case words. One that is none of them keeps meaning
+		// email, and the write gate refuses it.
+		if v, present := config.Auth["identifier"]; present {
+			if canon, ok := canonicalAuthIdentifier(v); ok {
+				config.Auth["identifier"] = canon
+			}
+		}
 	}
 	if m, ok := raw["pwa"].(map[string]any); ok {
 		for k, v := range m {

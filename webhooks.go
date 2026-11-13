@@ -601,7 +601,7 @@ func webhookOwnerIsActiveAdminChecked(db rowQuerier, userID any) (bool, error) {
 		}
 		return false, err
 	}
-	if deactivated.Valid && deactivated.String != "" {
+	if accountDeactivated(deactivated) {
 		return false, nil
 	}
 	if role == "admin" {

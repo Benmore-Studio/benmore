@@ -339,6 +339,18 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 			serverErrorJSON(w, r, app, "_query saved views", err, "query failed")
 			return
 		}
+		// A scoped credential lists the views of the tables it may read
+		// (scoped_credential_routes.go).
+		if scopedCredential(session) {
+			kept := rows[:0]
+			for _, row := range rows {
+				spec, _ := row["spec"].(string)
+				if credentialTableScopeError(session, savedViewTable(spec), "read", savedViewScopeSubject) == nil {
+					kept = append(kept, row)
+				}
+			}
+			rows = kept
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"views": rows})
 	})
 	mux.HandleFunc("POST /api/_query/views", func(w http.ResponseWriter, r *http.Request) {
@@ -360,6 +372,9 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "name and spec required"})
 			return
 		}
+		if !requireCredentialTableScope(w, session, savedViewTable(string(body.Spec)), "write", savedViewScopeSubject) {
+			return
+		}
 		res, err := app.DB.Exec("INSERT INTO _benmore_saved_views (user_id, name, spec) VALUES (?, ?, ?)", session.UserID, body.Name, string(body.Spec))
 		if err != nil {
 			serverErrorJSON(w, r, app, "_query saved views", err, "save failed")
@@ -378,6 +393,18 @@ func registerQueryAPI(mux appRouteRegistrar, app *App) {
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
+		}
+		if scopedCredential(session) {
+			var spec string
+			err := app.DB.QueryRow("SELECT spec FROM _benmore_saved_views WHERE id = ? AND user_id = ?", r.PathValue("id"), session.UserID).Scan(&spec)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				serverErrorJSON(w, r, app, "_query saved views", err, "delete failed")
+				return
+			}
+			// An id that is not the caller's view stays the quiet no-op below.
+			if err == nil && !requireCredentialTableScope(w, session, savedViewTable(spec), "write", savedViewScopeSubject) {
+				return
+			}
 		}
 		app.DB.Exec("DELETE FROM _benmore_saved_views WHERE id = ? AND user_id = ?", r.PathValue("id"), session.UserID)
 		httpJSON(w, http.StatusOK, map[string]any{"status": "deleted"})

@@ -43,7 +43,7 @@ func pendingPasswordChange(app *App, r *http.Request) *passwordChangeIdentity {
 		FROM _benmore_sessions s JOIN _benmore_users u ON u.id=s.user_id
 		WHERE s.id IN (?, ?) AND datetime(s.expires_at)>datetime('now')
 		AND COALESCE(u.password_change_required,0)<>0
-		AND COALESCE(u.deactivated_at,'')=''`, key, token).Scan(&p.SessionID, &p.UserID, &p.Email, &p.Hash)
+		AND `+accountActiveSQL("u"), key, token).Scan(&p.SessionID, &p.UserID, &p.Email, &p.Hash)
 	if err != nil {
 		return nil
 	}
@@ -187,7 +187,7 @@ func handleRequiredPasswordChange(w http.ResponseWriter, r *http.Request, app *A
 	// not authorize this write. The conditional update also makes replay fail.
 	result, err := tx.Exec(`UPDATE _benmore_users SET password_hash=?,password_change_required=0
 		WHERE id=? AND password_hash=? AND COALESCE(password_change_required,0)<>0
-		AND COALESCE(deactivated_at,'')=''
+		AND `+accountActiveSQL("")+`
 		AND EXISTS (SELECT 1 FROM _benmore_sessions WHERE id=? AND user_id=?
 		AND datetime(expires_at)>datetime('now') AND COALESCE(is_impersonation,0)=0
 		AND COALESCE(acting_as_group,'')='' AND COALESCE(scopes,'') IN ('','*'))`,
@@ -291,7 +291,7 @@ func changeSignedInPasswordWith(app *App, session *Session, proofHash, newHash s
 	}
 	result, err := tx.Exec(`UPDATE _benmore_users SET password_hash=?
 		WHERE id=? AND password_hash=? AND COALESCE(password_change_required,0)=0
-		AND COALESCE(deactivated_at,'')=''
+		AND `+accountActiveSQL("")+`
 		AND EXISTS (SELECT 1 FROM _benmore_sessions WHERE id=? AND user_id=?
 		AND datetime(expires_at)>datetime('now') AND COALESCE(is_impersonation,0)=0
 		AND COALESCE(acting_as_group,'')='' AND COALESCE(scopes,'') IN ('','*'))`,

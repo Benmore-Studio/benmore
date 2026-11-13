@@ -531,12 +531,12 @@ func TestOldShapeMigrationFixtureApp(t *testing.T) {
 
 // A statement that names a framework table (`_benmore_*`) or a SQLite one
 // (`sqlite_*`) is never skipped. Such a table is not something the schema
-// lost: the start creates several of them after the migration files, so the
-// statement fails on a new database although it ran on every database that
-// already existed, and skipping it would bring a new instance up without what
-// the file put there (a trigger that expires reset links, a role grant). It
-// fails as on an existing database, with the same text, and nothing of the
-// file stays.
+// lost. A load creates the ones a file has a reason to name before the files
+// (framework_tables_before_migrations.go); this runner is handed a database
+// without them, as for an app that does not get them, and skipping the
+// statement would bring a new instance up without what the file put there (a
+// trigger that expires reset links, a role grant). It fails as on an existing
+// database, with the same text, and nothing of the file stays.
 func TestNewDatabaseNeverSkipsAStatementThatNamesAFrameworkTable(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	for name, tc := range map[string]struct {

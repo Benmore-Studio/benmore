@@ -82,7 +82,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request, app *App, table strin
 	defer tx.Rollback()
 	before, after, refreshTables, err := applyCanonicalUpdateTxContextMode(r.Context(), tx, app, actor, table, id, nil, "", false, true)
 	if err != nil {
-		if respondOwnedField(w, err) || respondStorageFull(w, app, err) || respondDatabaseBusy(w, err) {
+		if respondOwnedField(w, err) || respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, table+" restore", err) {
 			return
 		}
 		var denied *memberOfUpdateError
@@ -103,7 +103,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request, app *App, table strin
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		if !respondStorageFull(w, app, err) && !respondDatabaseBusy(w, err) {
+		if !respondStorageFull(w, app, err) {
 			serverErrorJSON(w, r, app, table+" restore", err, "Commit failed")
 		}
 		return

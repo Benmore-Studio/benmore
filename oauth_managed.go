@@ -24,6 +24,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -356,6 +357,10 @@ func registerManagedOAuthRoutes(mux appRouteRegistrar, app *App, byoConfigured m
 			return
 		}
 		userID, err := oauthFindOrCreateUser(app, a.Email, a.Name, true) // the broker admits provider-verified emails only
+		if errors.Is(err, errOAuthAccountDeactivated) {
+			refuseDeactivatedProviderSignIn(w, r, app, a.Email, a.Provider)
+			return
+		}
 		if err != nil {
 			serverError(w, r, app, "managed oauth", fmt.Errorf("user creation failed: %w", err), "authentication failed")
 			return

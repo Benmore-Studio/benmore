@@ -201,6 +201,9 @@ func buildEmailOpts(ctx *FlowContext, step *FlowStep) (EmailOpts, string, error)
 	if step.Email == nil {
 		return EmailOpts{}, "", fmt.Errorf("email step has no config")
 	}
+	// The message leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	defer beginFlowResponse(ctx)()
 	// Part by part: a substituted value is one recipient (email_recipients.go).
 	to, err := emailRecipients(step.Email.To, func(part string) string { return interpolateCtx(part, ctx) })
 	if err != nil {

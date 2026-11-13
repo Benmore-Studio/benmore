@@ -49,7 +49,8 @@ const handle = await ShareDialog(target, { table: 'notes', id: 1 });
 assert.equal(target.buttons.length, 1);
 assert.ok(target.innerHTML.includes(recipient));
 const failed = status => {
-  assert.equal(responses.at(-1).status, status);
+  // The list request's own answer: a refused list also reads the cached-or-fetched descriptor.
+  assert.equal(responses.filter(r => String(r.path).endsWith('/permissions')).at(-1).status, status);
   assert.ok(target.innerHTML.includes('role="alert"'), `${status} must display a load error`);
   assert.ok(!target.innerHTML.includes('Not shared with anyone.'), 'failed load must not assert no grants');
   assert.ok(!target.innerHTML.includes('<form'), 'failed refresh must remove sharing controls');

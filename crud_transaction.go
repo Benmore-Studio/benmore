@@ -212,9 +212,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 					httpJSON(w, http.StatusNotFound, map[string]any{"error": errUpdateTarget.Error()})
 					return
 				}
-				if !respondDatabaseBusy(w, err) {
-					serverErrorJSON(w, r, app, "_transaction "+op.Action+" "+op.Table, err, "transaction failed")
-				}
+				serverErrorJSON(w, r, app, "_transaction "+op.Action+" "+op.Table, err, "transaction failed")
 				return
 			}
 		}
@@ -227,7 +225,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 			}
 			id, err := txInsert(tx, app, op.Table, op.Data, session)
 			if err != nil {
-				if respondOwnedField(w, err) || respondStorageFull(w, app, err) {
+				if respondOwnedField(w, err) || respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, "_transaction insert "+op.Table, err) {
 					return
 				}
 				status, msg := mutationErrorResponse(app, "transaction insert "+op.Table, err)
@@ -269,7 +267,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 					writeUpdateRequestError(w, r, app, "_transaction update "+op.Table, requestErr)
 					return
 				}
-				if respondDatabaseBusy(w, updateErr) {
+				if respondDatabaseBusy(w, r, "_transaction update "+op.Table, updateErr) {
 					return
 				}
 				httpJSON(w, http.StatusBadRequest, map[string]any{
@@ -287,7 +285,7 @@ func executeCRUDTransaction(w http.ResponseWriter, r *http.Request, app *App, op
 		case "delete":
 			rowID := valueText(op.ID)
 			if err := txDelete(tx, app, op.Table, rowID, session); err != nil {
-				if respondStorageFull(w, app, err) {
+				if respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, "_transaction delete "+op.Table, err) {
 					return
 				}
 				status, msg := http.StatusNotFound, errUpdateTarget.Error()

@@ -272,6 +272,7 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 	ext := strings.ToLower(filepath.Ext(path))
 
 	var issues []string
+	var staleReview string      // gateVerdict.StaleReview
 	rules := map[int]gateRule{} // the rule behind issues[i]
 	add := func(rule gateRule, msg string) {
 		rules[len(issues)] = rule
@@ -472,7 +473,14 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 		} else {
 			_, err = parseAppMCPManifest([]byte(content))
 		}
-		if err != nil {
+		switch {
+		case err == nil:
+		case !gate && appMCPReviewDigestStale(err):
+			// A check of the app as it is: the review no longer binds the
+			// source, which turns only the connector off. Not this file's
+			// error. A write of such a manifest (gate) is refused below.
+			staleReview = appMCPStaleReviewWarning()
+		default:
 			add(gateMCPManifest, err.Error())
 		}
 
@@ -638,7 +646,7 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 	}
 
 	if len(issues) == 0 {
-		return gateVerdict{}, excused
+		return gateVerdict{StaleReview: staleReview}, excused
 	}
 	// Append a recovery footer: agents that hit a rejection often
 	// fall back to Edit instead of re-Writing the corrected content,
@@ -649,7 +657,9 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 		label := flowFileLabel(appDir, path)
 		rename = func(body string) string { return nameFlowFile(body, label) }
 	}
-	return newGateVerdict(issues, rules, rename, writeRejectionFooter), nil
+	verdict := newGateVerdict(issues, rules, rename, writeRejectionFooter)
+	verdict.StaleReview = staleReview
+	return verdict, nil
 }
 
 // writesAppRootFile reports whether path is the app's own <name> at the app

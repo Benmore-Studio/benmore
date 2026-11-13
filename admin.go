@@ -58,6 +58,12 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 	// Feedback admin page
 	if app.FeatureEnabled("testing") {
 		mux.HandleFunc("GET /_admin/feedback", adminAuth(func(w http.ResponseWriter, r *http.Request) {
+			// The page lists _benmore_feedback: hidden in admin.yaml, it
+			// answers like the table's own pages.
+			if app.adminConfig().IsTableHidden(adminFeedbackTable) {
+				notFoundHandler(app)(w, r)
+				return
+			}
 			ServeFeedbackAdmin(w, r, app)
 		}))
 	}
@@ -79,11 +85,13 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			http.Redirect(w, r, "/_admin/tools?error=No+flow+specified", http.StatusSeeOther)
 			return
 		}
-		// Validate the flow path exists, is admin-only, and has no path params
+		// Validate the flow path exists, is one the Tools page lists for
+		// this caller (adminToolsFlow), and has no path params
+		session := getSession(app, r)
 		var targetFlow *Flow
 		for i := range app.Flows {
 			f := &app.Flows[i]
-			if f.Trigger.Path == flowPath && f.Role == "admin" && f.Trigger.Method == "POST" && !strings.Contains(f.Trigger.Path, ":") {
+			if f.Trigger.Path == flowPath && adminToolsFlow(f, session) && !strings.Contains(f.Trigger.Path, ":") {
 				targetFlow = f
 				break
 			}
@@ -93,7 +101,6 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		// Execute the flow by forwarding the request internally
-		session := getSession(app, r)
 		ctx := &FlowContext{
 			App:     app,
 			Writer:  nil, // suppress redirects/responses
@@ -297,12 +304,23 @@ func RegisterAdminRoutes(mux appRouteRegistrar, app *App) {
 // adminShell wraps admin content in a self-contained admin layout with sidebar.
 func adminShell(content, title, activeTable string, app *App, session *Session) string {
 	tables, _ := GetTableNames(app.DB)
+	// A table admin.yaml hides is read by no part of the panel: every read
+	// below asks this one predicate first (as do the dashboard, the record
+	// page's related lists and the write routes).
+	hidden := app.adminConfig()
 
-	// Gather stats
-	var userCount, sessionCount, auditCount int64
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log").Scan(&auditCount)
+	// Header stats, each from a framework table that may be hidden.
+	var headerStats strings.Builder
+	if !hidden.IsTableHidden(adminUsersTable) {
+		var userCount int64
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
+		fmt.Fprintf(&headerStats, `<span style="font-size:11px;color:hsl(var(--muted-foreground));">%d users</span>`, userCount)
+	}
+	if !hidden.IsTableHidden(adminSessionsTable) {
+		var sessionCount int64
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
+		fmt.Fprintf(&headerStats, `<span style="font-size:11px;color:hsl(var(--muted-foreground));">%d sessions</span>`, sessionCount)
+	}
 
 	var sb strings.Builder
 
@@ -346,7 +364,7 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		// admin.yaml: skip tables explicitly hidden by the developer.
 		// This keeps internal/operational tables out of the admin UI
 		// without pulling them out of the schema.
-		if app.adminConfig().IsTableHidden(t) {
+		if hidden.IsTableHidden(t) {
 			continue
 		}
 		var count int64
@@ -380,8 +398,8 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 
 	// Tools link (if app has admin flows)
 	hasAdminFlows := false
-	for _, f := range app.Flows {
-		if f.Role == "admin" && f.Trigger.Method == "POST" {
+	for i := range app.Flows {
+		if adminToolsFlow(&app.Flows[i], session) {
 			hasAdminFlows = true
 			break
 		}
@@ -401,8 +419,8 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 	}
 
 	// Footer: back to app
-	// Feedback link (if enabled)
-	if app.FeatureEnabled("testing") {
+	// Feedback link (if enabled, and its table is not hidden)
+	if app.FeatureEnabled("testing") && !hidden.IsTableHidden(adminFeedbackTable) {
 		fbActive := ""
 		if activeTable == "_feedback" {
 			fbActive = "background:hsl(var(--accent));color:hsl(var(--foreground));font-weight:600;"
@@ -451,10 +469,9 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 				Search everything...
 				<kbd style="font-size:10px;background:hsl(var(--muted));padding:2px 6px;border-radius:4px;">&#8984;K</kbd>
 			</button>
-			<span style="font-size:11px;color:hsl(var(--muted-foreground));">%d users</span>
-			<span style="font-size:11px;color:hsl(var(--muted-foreground));">%d sessions</span>
+			%s
 		</div>
-	</header>`, html.EscapeString(title), userCount, sessionCount))
+	</header>`, html.EscapeString(title), headerStats.String()))
 
 	// Fuzzy search modal
 	sb.WriteString(`<div id="admin-search-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:9998;backdrop-filter:blur(2px);" onclick="closeAdminSearch()"></div>
@@ -477,13 +494,17 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 		var count=a.querySelectorAll('span')[1]?a.querySelectorAll('span')[1].textContent:'';
 		searchItems.push({title:name,sub:count+' records',url:a.href,cat:'Tables'});
 	});`)
-	// Add users to search index
-	userRows, err := queryMetadataRows(app.DB, "SELECT id, email, role FROM _benmore_users ORDER BY id LIMIT 100")
-	if err != nil {
-		// A failed read may carry the rows before it; search none rather
-		// than a list that looks complete.
-		log.Printf("admin search index: %v", err)
-		userRows = nil
+	// Add users to search index (none when the users table is hidden)
+	var userRows []map[string]any
+	if !hidden.IsTableHidden(adminUsersTable) {
+		var err error
+		userRows, err = queryMetadataRows(app.DB, "SELECT id, email, role FROM _benmore_users ORDER BY id LIMIT 100")
+		if err != nil {
+			// A failed read may carry the rows before it; search none rather
+			// than a list that looks complete.
+			log.Printf("admin search index: %v", err)
+			userRows = nil
+		}
 	}
 	// JSON is a valid script literal for any stored value: json.Marshal
 	// escapes quotes, backslashes, line separators and <, > and &, so no
@@ -571,6 +592,16 @@ func adminShell(content, title, activeTable string, app *App, session *Session) 
 	)
 }
 
+// adminToolsFlow reports whether flow is one of the admin's tools: a POST
+// flow whose role gate names the global admin (`role: admin`, also in a list
+// and in any letter case: flowRoleNamesAdmin) and which the caller passes
+// (flowRoleAllowed, the gate the flow's own route applies). The sidebar's
+// Tools link, the Tools page and its runner all ask it; the page and the
+// runner also leave out a flow with a path parameter.
+func adminToolsFlow(f *Flow, session *Session) bool {
+	return f.Trigger.Method == "POST" && flowRoleNamesAdmin(f.Role) && flowRoleAllowed(session, f.Role)
+}
+
 func serveAdminTools(w http.ResponseWriter, r *http.Request, app *App) {
 	session := getSession(app, r)
 	csrfToken := generateCSRFToken()
@@ -590,7 +621,7 @@ func serveAdminTools(w http.ResponseWriter, r *http.Request, app *App) {
 
 	// Render a card for each admin POST flow
 	for _, f := range app.Flows {
-		if f.Role != "admin" || f.Trigger.Method != "POST" {
+		if !adminToolsFlow(&f, session) {
 			continue
 		}
 		path := f.Trigger.Path
@@ -666,34 +697,48 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 
 	var sb strings.Builder
 
-	// --- Row 1: 4 stat cards ---
-	var userCount, sessionCount, pageViews, apiRequests int64
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
-	app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'page_views' AND period = ?", currentPeriod).Scan(&pageViews)
-	app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'api_requests' AND period = ?", currentPeriod).Scan(&apiRequests)
+	// A table admin.yaml hides is left out of every tile and list below: the
+	// panel does not read it (see adminShell).
+	hidden := app.adminConfig()
 
-	sb.WriteString(`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px;">`)
-	statCards := []struct {
+	// --- Row 1: stat cards, each from a framework table ---
+	type statCard struct {
 		label string
 		value int64
 		icon  string
-	}{
-		{"Users", userCount, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`},
-		{"Active Sessions", sessionCount, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`},
-		{"Page Views", pageViews, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`},
-		{"API Requests", apiRequests, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`},
 	}
-	for _, sc := range statCards {
-		sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:20px;">
+	var statCards []statCard
+	if !hidden.IsTableHidden(adminUsersTable) {
+		var userCount int64
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_users").Scan(&userCount)
+		statCards = append(statCards, statCard{"Users", userCount, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`})
+	}
+	if !hidden.IsTableHidden(adminSessionsTable) {
+		var sessionCount int64
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_sessions WHERE datetime(expires_at) > datetime('now')").Scan(&sessionCount)
+		statCards = append(statCards, statCard{"Active Sessions", sessionCount, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`})
+	}
+	if !hidden.IsTableHidden(adminUsageTable) {
+		var pageViews, apiRequests int64
+		app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'page_views' AND period = ?", currentPeriod).Scan(&pageViews)
+		app.DB.QueryRow("SELECT COALESCE(SUM(count), 0) FROM _benmore_usage WHERE metric = 'api_requests' AND period = ?", currentPeriod).Scan(&apiRequests)
+		statCards = append(statCards,
+			statCard{"Page Views", pageViews, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`},
+			statCard{"API Requests", apiRequests, `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`})
+	}
+	if len(statCards) > 0 {
+		sb.WriteString(`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px;">`)
+		for _, sc := range statCards {
+			sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:20px;">
 			<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
 				<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));">%s</div>
 				<div style="color:hsl(var(--muted-foreground));">%s</div>
 			</div>
 			<div style="font-size:2rem;font-weight:700;color:hsl(var(--foreground));">%d</div>
 		</div>`, sc.label, sc.icon, sc.value))
+		}
+		sb.WriteString(`</div>`)
 	}
-	sb.WriteString(`</div>`)
 
 	// --- Row 2: 3 cards (Storage, Total Records, Audit Trail) ---
 	// Storage (DB file size)
@@ -713,7 +758,7 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 	// Total records across non-internal tables
 	var totalRecords int64
 	for _, t := range tables {
-		if strings.HasPrefix(t, "_benmore_") {
+		if strings.HasPrefix(t, "_benmore_") || hidden.IsTableHidden(t) {
 			continue
 		}
 		var c int64
@@ -721,19 +766,22 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 		totalRecords += c
 	}
 
-	// Audit trail entries
-	var auditCount int64
-	app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log").Scan(&auditCount)
-
 	sb.WriteString(`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:32px;">`)
-	row2Cards := []struct {
+	type infoCard struct {
 		label string
 		value string
 		sub   string
-	}{
+	}
+	row2Cards := []infoCard{
 		{"Storage", storageLabel, "data.db file size"},
 		{"Total Records", fmt.Sprintf("%d", totalRecords), "across all app tables"},
-		{"Audit Trail", fmt.Sprintf("%d", auditCount), "total logged mutations"},
+	}
+	showAudit := !hidden.IsTableHidden(adminAuditTable)
+	if showAudit {
+		// Audit trail entries
+		var auditCount int64
+		app.DB.QueryRow("SELECT COUNT(*) FROM _benmore_audit_log").Scan(&auditCount)
+		row2Cards = append(row2Cards, infoCard{"Audit Trail", fmt.Sprintf("%d", auditCount), "total logged mutations"})
 	}
 	for _, c := range row2Cards {
 		sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:20px;">
@@ -755,6 +803,20 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 		</div>`)
 	}
 
+	if !hidden.IsTableHidden(adminUsersTable) {
+		adminDashboardRecentUsers(&sb, app)
+	}
+	if showAudit {
+		adminDashboardRecentActivity(&sb, app)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, adminShell(sb.String(), "Dashboard", "", app, session))
+}
+
+// adminDashboardRecentUsers writes the dashboard's list of the newest
+// accounts.
+func adminDashboardRecentUsers(sb *strings.Builder, app *App) {
 	// --- Recent Users ---
 	sb.WriteString(`<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));margin-bottom:12px;">Recent Users</div>`)
 	sb.WriteString(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;overflow:hidden;margin-bottom:32px;">`)
@@ -804,7 +866,12 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 		sb.WriteString(`<tr><td colspan="5" style="padding:24px;text-align:center;color:hsl(var(--muted-foreground));">No users yet.</td></tr>`)
 	}
 	sb.WriteString(`</tbody></table></div>`)
+}
 
+// adminDashboardRecentActivity writes the dashboard's list of the latest
+// audit rows. A row about a table admin.yaml hides is left out: the line
+// names the table and its row and links to the row's page.
+func adminDashboardRecentActivity(sb *strings.Builder, app *App) {
 	// --- Recent Activity ---
 	sb.WriteString(`<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:hsl(var(--muted-foreground));margin-bottom:12px;">Recent Activity</div>`)
 	sb.WriteString(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;overflow:hidden;">`)
@@ -816,7 +883,12 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 			<th style="text-align:right;padding:10px 16px;font-weight:600;color:hsl(var(--muted-foreground));font-size:11px;text-transform:uppercase;letter-spacing:0.04em;">When</th>
 		</tr></thead><tbody>`)
 
-	auditRows, auditErr := queryMetadataRows(app.DB, "SELECT action, table_name, row_id, user_email, created_at FROM _benmore_audit_log ORDER BY created_at DESC LIMIT 15")
+	query := "SELECT action, table_name, row_id, user_email, created_at FROM _benmore_audit_log"
+	clause, args := adminHiddenRowsClause(app, adminAuditTable, []Column{{Name: "table_name"}})
+	if clause != "" {
+		query += " WHERE " + clause
+	}
+	auditRows, auditErr := queryMetadataRows(app.DB, query+" ORDER BY created_at DESC LIMIT 15", args...)
 	if auditErr != nil {
 		auditRows = nil
 		sb.WriteString(adminReadFailedRow(4, "recent activity", auditErr))
@@ -849,9 +921,6 @@ func serveAdminDashboard(w http.ResponseWriter, r *http.Request, app *App) {
 		sb.WriteString(`<tr><td colspan="4" style="padding:24px;text-align:center;color:hsl(var(--muted-foreground));">No activity recorded yet.</td></tr>`)
 	}
 	sb.WriteString(`</tbody></table></div>`)
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, adminShell(sb.String(), "Dashboard", "", app, session))
 }
 
 func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table string) {
@@ -861,7 +930,7 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	}
 	// admin.yaml: hidden tables are not reachable by URL either, even
 	// if an admin guesses the path. Keeps the hide directive honest.
-	if app.adminConfig().IsTableHidden(table) {
+	if adminTableHidden(app, table) {
 		notFoundHandler(app)(w, r)
 		return
 	}
@@ -873,10 +942,6 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	// The create form still offers hidden columns (write-only); the list
 	// and its search neither show nor match them.
 	createCols := cols
-	// A command-owned column gets no input: a browser submits every input,
-	// blank ones included, and a create that names an owned column is refused
-	// (crud_owned_fields.go). The row takes the column's default.
-	owned := commandOwnedColumns(app, table)
 	cols = adminVisibleColumns(app, table, cols)
 
 	page := queryParamInt(r, "page", 1)
@@ -884,16 +949,26 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 	offset := (page - 1) * perPage
 	search := r.URL.Query().Get("q")
 
-	// Build query
+	// Build query. A framework table's rows about a table admin.yaml hides
+	// are neither listed nor counted.
 	query := "SELECT * FROM " + quoteIdent(table)
+	hiddenRows, hiddenArgs := adminHiddenRowsClause(app, table, createCols)
+	var where []string
 	var args []any
+	if hiddenRows != "" {
+		where = append(where, hiddenRows)
+		args = append(args, hiddenArgs...)
+	}
 	if search != "" {
 		var conditions []string
 		for _, col := range cols {
 			conditions = append(conditions, quoteColumn(table, col.Name)+" LIKE ?")
 			args = append(args, "%"+search+"%")
 		}
-		query += " WHERE " + strings.Join(conditions, " OR ")
+		where = append(where, "("+strings.Join(conditions, " OR ")+")")
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	query += fmt.Sprintf(" ORDER BY id DESC LIMIT %d OFFSET %d", perPage, offset)
 
@@ -908,7 +983,11 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		}
 	}
 	var total int64
-	app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&total)
+	if hiddenRows != "" {
+		app.DB.QueryRow("SELECT COUNT(*) FROM "+quoteIdent(table)+" WHERE "+hiddenRows, hiddenArgs...).Scan(&total)
+	} else {
+		app.DB.QueryRow("SELECT COUNT(*) FROM " + quoteIdent(table)).Scan(&total)
+	}
 
 	csrf := generateCSRFToken()
 	// A read-only table gets no create, edit or delete control.
@@ -1011,17 +1090,19 @@ func serveAdminTable(w http.ResponseWriter, r *http.Request, app *App, table str
 		<div style="padding:20px 24px;"><form method="POST" action="/_admin/api/%s/create">
 		<input type="hidden" name="_csrf" value="%s">`, strings.Title(table), table, csrf))
 
-	userState := adminUserStateColumns(app, table, true)
+	// The form offers an input for exactly the columns this caller's create
+	// stores (requestWritable, built from the sets handleCreate itself
+	// uses). A browser submits every input, blank ones included, so an input
+	// for any other column is a value thrown away (a computed column, a
+	// workflow's state column, deleted_at, the tenant key of an admin stepped
+	// into a tenant, a _benmore_users sign-in column) or a refused request (a
+	// command-owned column, crud_owned_fields.go).
+	writable := requestWritableFor(app, table, getSession(app, r))
 	for _, col := range createCols {
-		// deleted_at: a create never stores it (protectedCreateFields), so an
-		// input for it would be a value thrown away.
-		if col.PK || col.Name == "created_at" || col.Name == "updated_at" || identIs(col.Name, "deleted_at") || col.Name == "user_id" || userState.has(col.Name) {
+		if !writable.column(col, requestCreate) {
 			continue
 		}
 		if col.Name == "password" || col.Name == "password_hash" {
-			continue
-		}
-		if _, isOwned := owned[sqliteIdentifierFold(col.Name)]; isOwned {
 			continue
 		}
 		inputType := "text"
@@ -1052,11 +1133,18 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		notFoundHandler(app)(w, r)
 		return
 	}
-	if app.adminConfig().IsTableHidden(table) {
+	if adminTableHidden(app, table) {
 		notFoundHandler(app)(w, r)
 		return
 	}
-	rows, err := queryNativeRowsWith(app.DB, app, table, "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", id)
+	cols, _ := GetTableColumns(app.DB, table)
+	// A framework table's row about a table admin.yaml hides has no page.
+	query, args := "SELECT * FROM "+quoteIdent(table)+" WHERE id = ?", []any{id}
+	if hiddenRows, hiddenArgs := adminHiddenRowsClause(app, table, cols); hiddenRows != "" {
+		query += " AND " + hiddenRows
+		args = append(args, hiddenArgs...)
+	}
+	rows, err := queryNativeRowsWith(app.DB, app, table, query, args...)
 	if err != nil || len(rows) == 0 {
 		notFoundHandler(app)(w, r)
 		return
@@ -1068,7 +1156,6 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 			return
 		}
 	}
-	cols, _ := GetTableColumns(app.DB, table)
 	// A hidden column is left out of the form, so saving it keeps its value.
 	cols = adminVisibleColumns(app, table, cols)
 	// A command-owned column is shown, not submitted: saving the form would
@@ -1088,8 +1175,26 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 
 	// Edit form (a read-only table shows the same fields with no form to post)
 	readOnly := adminPanelReadOnlyKind(app, table)
+	// The form offers an input for exactly the columns an update stores
+	// (requestWritable, built from the sets the update path itself uses);
+	// every other column is shown and not submitted. With none to edit the
+	// page has no form.
+	writable := requestWritableFor(app, table, getSession(app, r))
+	editable := 0
+	if readOnly == "" {
+		for _, col := range cols {
+			if col.Name != "password_hash" && writable.column(col, requestUpdate) {
+				editable++
+			}
+		}
+	}
 	if readOnly != "" {
 		sb.WriteString(adminReadOnlyNote(table, readOnly))
+	}
+	if editable == 0 {
+		if readOnly == "" {
+			sb.WriteString(`<div style="margin-bottom:16px;padding:10px 14px;font-size:12px;border:1px solid hsl(var(--border));border-radius:6px;background:hsl(var(--muted));color:hsl(var(--muted-foreground));">No column of this record is edited here: each is filled in by the framework or changed through its own endpoint.</div>`)
+		}
 		sb.WriteString(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">`)
 	} else {
 		sb.WriteString(fmt.Sprintf(`<div style="background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:8px;padding:24px;">
@@ -1097,7 +1202,6 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		<input type="hidden" name="_csrf" value="%s">`, table, id, csrf))
 	}
 
-	userState := adminUserStateColumns(app, table, false)
 	for _, col := range cols {
 		val := fmt.Sprintf("%v", row[col.Name])
 		if val == "<nil>" {
@@ -1133,10 +1237,11 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		if strings.Contains(col.Name, "email") {
 			inputType = "email"
 		}
-		if userState.has(col.Name) {
-			// No update writes these columns of a user, so this form only
-			// shows them; the role form below changes role through
-			// /_admin/set-role.
+		if !writable.column(col, requestUpdate) {
+			// No update writes this column (a computed column, a workflow's
+			// state, the tenant key, the owner, the timestamps, a user's
+			// sign-in state), so this form only shows it; the role form
+			// below changes a user's role through /_admin/set-role.
 			if col.Name == "role" {
 				userRole = val
 			}
@@ -1153,7 +1258,7 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 		</div>`, formatColName(col.Name), inputType, col.Name, html.EscapeString(val)))
 	}
 
-	if readOnly != "" {
+	if editable == 0 {
 		sb.WriteString(`</div>`)
 	} else {
 		sb.WriteString(`<button type="submit" style="padding:10px 24px;font-size:13px;font-weight:500;background:hsl(var(--primary));color:hsl(var(--primary-foreground));border:none;border-radius:6px;cursor:pointer;">Save Changes</button></form></div>`)
@@ -1165,7 +1270,8 @@ func serveAdminDetail(w http.ResponseWriter, r *http.Request, app *App, table, i
 	// Related records
 	allTables, _ := GetTableNames(app.DB)
 	for _, otherTable := range allTables {
-		if otherTable == table {
+		// A table admin.yaml hides is not listed under another table's row.
+		if otherTable == table || adminTableHidden(app, otherTable) {
 			continue
 		}
 		fkCol := strings.TrimSuffix(table, "s") + "_id"
@@ -1249,26 +1355,6 @@ func adminVisibleColumns(app *App, table string, cols []Column) []Column {
 		}
 	}
 	return out
-}
-
-// adminUserStateColumns is the set of _benmore_users columns the panel's
-// user forms offer no input for, because no generic create (or update)
-// writes them: role, the password and its gates, the sign-in factor and the
-// rest of protectedCreateFields / protectedUpdateFields. Empty for every
-// other table, whose forms are unchanged.
-func adminUserStateColumns(app *App, table string, create bool) protectedFields {
-	if !identIs(table, "_benmore_users") {
-		return protectedFields{}
-	}
-	if !create {
-		return protectedFields(protectedUpdateFields(app, table))
-	}
-	p := protectedCreateFields(app, table)
-	if app.Group != nil {
-		// An admin's create may name the tenant (handleCreate).
-		delete(p, sqliteIdentifierFold(app.Group.Key))
-	}
-	return p
 }
 
 // adminGlobalRoleForm is the user page's primary-role form. It posts to

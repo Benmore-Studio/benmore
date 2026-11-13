@@ -441,6 +441,55 @@ func TestRestoreSaysWhyNoAuditRowsWereCopied(t *testing.T) {
 	}
 }
 
+// The account security events (a factor enrolled or removed, a backup code
+// spent, an address changed, a token minted or revoked, a session ended, a
+// passkey added or removed) written after the snapshot are in the restored
+// database once each, as written and marked as copied.
+func TestRestoreCarriesAccountSecurityEventAuditRows(t *testing.T) {
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "data.db")
+	db := credentialFixtureDB(t, livePath)
+	session := auditFixtureAccount(t, db)
+	snapshot := filepath.Join(dir, "snapshot.db")
+	snapshotTo(t, db, snapshot)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for action := range accountAuditEventTables {
+		if err := auditAccountEvent(tx, &App{DB: db}, action, "1", session, map[string]any{"was": action}, map[string]any{"is": action}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]carriedAuditRow{}
+	for action := range accountAuditEventTables {
+		want[action] = oneAuditRow(t, db, action)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreDatabase(dir, snapshot); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got := openRO(t, livePath)
+	for action, w := range want {
+		r := oneAuditRow(t, got, action)
+		if r.at != w.at || r.userID != 1 || r.email != "alice@x.test" || r.old != w.old || r.new != w.new || r.old == "" {
+			t.Errorf("%s was copied as %+v, want it as written %+v", action, r, w)
+		}
+		if r.mark == "" {
+			t.Errorf("the copied %s row is not marked", action)
+		}
+	}
+	if s := latestRestoreSummary(t, got); s.AuditRows.Carried != len(want) {
+		t.Fatalf("summary = %+v, want %d rows copied", s.AuditRows, len(want))
+	}
+}
+
 // Every framework writer of an account, role or credential event names one of
 // the copied tables in table_name; the writers of other events do not.
 func TestRestoreAuditTablesCoverTheCredentialEventWriters(t *testing.T) {
@@ -448,7 +497,9 @@ func TestRestoreAuditTablesCoverTheCredentialEventWriters(t *testing.T) {
 		"password_change, password_reset, role_changed, account_purge, impersonate": "_benmore_users",
 		"role_granted, role_revoked, role_expiry_updated, role_expired":             "_benmore_user_roles",
 		"passkey_added, passkey_removed, passkeys_removed_all":                      "_benmore_passkeys",
-		"act_as_start, act_as_end, data_revoke_session":                             "_benmore_sessions",
+		"act_as_start, act_as_end, data_revoke_session, session_revoked":            "_benmore_sessions",
+		"api_token_created, api_token_revoked":                                      "_benmore_api_tokens",
+		"mfa_enrolled, mfa_removed, mfa_backup_code_used, email_changed":            "_benmore_users",
 		"mcp_grant_revoke":              mcpGrantsTable,
 		"mcp_connection_credential_set": appMCPConnectionCredentialsTable,
 	}

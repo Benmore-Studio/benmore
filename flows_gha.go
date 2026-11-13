@@ -240,6 +240,11 @@ func (s *FlowStepGHA) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	*s = FlowStepGHA(decoded)
+	// A respond body written as an unquoted date is the text that was
+	// written (flows_respond_written_text.go).
+	if ghaStepRunType(*s) == "respond" {
+		restoreRespondDateText(node, s.With)
+	}
 	var ordered struct {
 		With struct {
 			Sign struct {
@@ -419,10 +424,11 @@ func parseGHAFlowFile(path string, data []byte) ([]Flow, error) {
 	for _, problem := range append(valueProblems, transactionalSends...) {
 		log.Printf("WARNING: %s: %s", path, problem)
 	}
-	// A respond with no `with:` answers 200 and ends the run: a warning at
-	// write time too.
-	for _, where := range bareRespondSteps(file) {
-		log.Printf("WARNING: %s: %s: %s", path, where, bareRespondProblem)
+	// A respond that answers something other than it reads as (no `with:`,
+	// two bodies, a body YAML does not read as text): a warning at write
+	// time too.
+	for _, problem := range respondShapeProblems(file) {
+		log.Printf("WARNING: %s: %s", path, problem)
 	}
 	// Bounds declared on an input that is not a number are not checked: a
 	// warning at write time, since deployed files carry them.
@@ -1502,13 +1508,15 @@ func withToRespond(with map[string]any) *FlowRespond {
 	// stored as-is, and execStepRespond's interpolateJSONValues only
 	// understood mustache `{{…}}` so any `${{…}}` ref the agent typed
 	// came back to the client as a literal string.
-	if v, ok := with["body"].(string); ok {
+	// Blank text beside a `json:` is no body (respondBodyValue).
+	body := respondBodyValue(with)
+	if v, ok := body.(string); ok {
 		r.Body = normalizeGHARefs(v)
-	} else if v, ok := with["body"].(map[string]any); ok {
+	} else if v, ok := body.(map[string]any); ok {
 		if normalized, ok := normalizeRefsInTree(v).(map[string]any); ok {
 			r.JSON = normalized
 		}
-	} else if v, ok := with["body"].([]any); ok {
+	} else if v, ok := body.([]any); ok {
 		if normalized, ok := normalizeRefsInTree(v).([]any); ok {
 			r.JSONArray = normalized
 		}
@@ -1533,12 +1541,21 @@ func withToRespond(with map[string]any) *FlowRespond {
 	// that JSON value. It used to be dropped, and the step with it.
 	scalar := ""
 	if r.Body == "" && r.JSON == nil && r.JSONArray == nil {
-		for _, key := range []string{"body", "json"} {
+		for _, key := range respondBodyKeys {
 			if scalar = respondScalarBody(with[key]); scalar != "" {
 				break
 			}
 		}
 		r.Body = scalar
+	}
+	// A time that reached here without its source text is sent as text,
+	// never dropped (respondTimeText).
+	if r.Body == "" && r.JSON == nil && r.JSONArray == nil {
+		for _, key := range respondBodyKeys {
+			if r.Body = respondTimeText(with[key]); r.Body != "" {
+				break
+			}
+		}
 	}
 	// Declared content type and response headers, through the allowlist
 	// (flows_respond_headers.go). They used to be accepted and dropped.

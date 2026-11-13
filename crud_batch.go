@@ -151,7 +151,7 @@ func handleBatchCreate(w http.ResponseWriter, r *http.Request, app *App, table s
 			continue // an item naming no writable column is skipped, as before
 		}
 		if err != nil {
-			if respondOwnedField(w, err) || respondStorageFull(w, app, err) {
+			if respondOwnedField(w, err) || respondStorageFull(w, app, err) || respondDatabaseBusy(w, r, table+" batch create", err) {
 				return
 			}
 			status, msg := mutationErrorResponse(app, "batch insert "+table, err)
@@ -366,7 +366,7 @@ func handleBatchUpdate(w http.ResponseWriter, r *http.Request, app *App, table s
 				writeUpdateRequestError(w, r, app, table+" batch update", requestErr)
 				return
 			}
-			if respondDatabaseBusy(w, err) {
+			if respondDatabaseBusy(w, r, table+" batch update", err) {
 				return
 			}
 			httpError(w, "Batch update failed: "+publicConstraintMessage(app, "batch update "+table, err), http.StatusBadRequest)
@@ -483,7 +483,7 @@ func handleBatchDelete(w http.ResponseWriter, r *http.Request, app *App, table s
 			case strings.Contains(err.Error(), "FOREIGN KEY"):
 				httpError(w, fmt.Sprintf("Cannot delete: other records reference this %s. Delete those first.", table), http.StatusConflict)
 			case respondStorageFull(w, app, err):
-			case respondDatabaseBusy(w, err):
+			case respondDatabaseBusy(w, r, table+" batch delete", err):
 			default:
 				httpError(w, "Batch delete failed: "+publicConstraintMessage(app, "batch delete "+table, err), http.StatusBadRequest)
 			}

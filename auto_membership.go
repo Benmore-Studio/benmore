@@ -12,7 +12,7 @@ package main
 //       - sql: |
 //           INSERT INTO channel_members (user_id, channel_id)
 //           SELECT id, {{id}} FROM _benmore_users
-//           WHERE deactivated_at IS NULL OR deactivated_at = ''
+//           WHERE deactivated_at IS NULL
 //
 // Open social spaces (channels, rooms, projects, workspaces, broadcast
 // feeds) ~always want this. Pre-2.7.35 every agent wrote it from
@@ -103,9 +103,8 @@ func buildAutoMembershipHook(parent string, cfg AutoMembershipConfig) Hook {
 		return Hook{}
 	}
 
-	// Default WHERE: every active _benmore_users row. SQLite's empty-
-	// string-vs-NULL on deactivated_at requires both branches.
-	whereClause := "deactivated_at IS NULL OR deactivated_at = ''"
+	// Default WHERE: every active _benmore_users row.
+	whereClause := accountActiveSQL("")
 	if cfg.Members != "" && cfg.Members != "all_users" {
 		// Custom SQL fragment - agent's responsibility to keep it
 		// quoted-correctly. We don't try to parse it.

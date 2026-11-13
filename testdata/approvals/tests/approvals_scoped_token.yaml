@@ -1,0 +1,32 @@
+# A scoped API token is held to its scopes on the approval routes: the table
+# a request names decides, read to read and write to change, as on
+# /api/<table>. The token below carries the scope of a label only.
+scoped_token_needs_the_approval_table_scope:
+  as_user: "tokenowner@test.com"
+  setup:
+    - sql: "INSERT INTO notes (id, title, user_id) VALUES (9401, 'scoped-note', {{user_id}})"
+  steps:
+    - api: "POST /api/_auth/api-tokens"
+      json: {name: "labels only", scopes: "label:write"}
+      save: {tok: "token"}
+      expect: {status: 200}
+    - set_auth: "{{tok}}"
+    - api: "POST /api/_approvals"
+      json: {table: "notes", row_id: "9401", approver_email: "second@test.com", title: "scoped-token-request"}
+      expect:
+        status: 403
+        contains:
+          - "scope denied"
+          - "notes:write"
+    - get: "/api/_approvals?table=notes&row_id=9401"
+      expect: {status: 403, contains: "notes:read"}
+    - sql: "SELECT id FROM _benmore_approvals WHERE title = 'scoped-token-request'"
+      expect: {rows: 0}
+    # The scope it carries names the label, so that request is stored and listed.
+    - api: "POST /api/_approvals"
+      json: {table: "label", row_id: "9401", approver_email: "second@test.com", title: "scoped-token-label"}
+      expect: {status: 200}
+    - get: "/api/_approvals"
+      expect: {status: 200, contains: "scoped-token-label"}
+    - sql: "SELECT id FROM _benmore_approvals WHERE title = 'scoped-token-label' AND status = 'pending'"
+      expect: {rows: 1}

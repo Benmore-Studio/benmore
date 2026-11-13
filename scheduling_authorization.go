@@ -71,7 +71,7 @@ func loadScheduledActorWith(app *App, db mutationQuerier, userID int64, group *s
 		}
 		return nil, fmt.Errorf("task owner is missing or unavailable")
 	}
-	if deactivated.Valid && deactivated.String != "" {
+	if accountDeactivated(deactivated) {
 		return nil, fmt.Errorf("task owner is deactivated")
 	}
 	actor.Verified = verified == 1

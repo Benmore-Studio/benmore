@@ -122,7 +122,7 @@ func recordGroupEligible(ctx context.Context, app *App, ev errorEvent, now time.
 		}
 		if exists != 0 {
 			var purged bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM _benmore_users WHERE id=? AND deactivated_at IS NOT NULL AND trim(CAST(deactivated_at AS TEXT))!='')`, ev.UserID).Scan(&purged); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM _benmore_users WHERE id=? AND `+accountDeactivatedSQL("")+`)`, ev.UserID).Scan(&purged); err != nil {
 				return false, 0, fmt.Errorf("inspect error account tombstone: %w", err)
 			}
 			if purged {

@@ -60,7 +60,7 @@ func TestBuildAutoMembershipHook_DefaultShape(t *testing.T) {
 		`INSERT INTO "channels_members"`,
 		`("user_id", "channel_id")`,
 		"SELECT id, {{id}} FROM _benmore_users",
-		"WHERE deactivated_at IS NULL OR deactivated_at = ''",
+		"WHERE deactivated_at IS NULL ON CONFLICT",
 		"ON CONFLICT DO NOTHING",
 		"/*auto_membership:channels*/",
 	} {

@@ -136,6 +136,14 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": requestBodyDecodeError(err)})
 			return
 		}
+		// A scoped credential schedules only on a table its scopes allow
+		// writing; a flow that names no table is left to the flow rule
+		// (schedulableFlow below). scoped_credential_routes.go.
+		if b.Table != "" || b.Kind != "flow" {
+			if !requireCredentialTableScope(w, session, approvalTableName(app, b.Table), "write", scheduledTaskScopeSubject) {
+				return
+			}
+		}
 		if b.RunAt == "" {
 			httpJSON(w, http.StatusBadRequest, map[string]any{"error": "run_at required: an RFC3339 time or a duration like 2h/30m"})
 			return
@@ -196,8 +204,16 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		q := "SELECT id, kind, title, message, flow, table_name, row_id, run_at, status, fired_at, last_error FROM _benmore_scheduled_tasks WHERE user_id = ?"
 		args := []any{session.UserID}
 		if t := r.URL.Query().Get("table"); t != "" {
+			if !requireCredentialTableScope(w, session, approvalTableName(app, t), "read", scheduledTaskScopeSubject) {
+				return
+			}
 			q += " AND table_name = ?"
 			args = append(args, t)
+		} else {
+			// A scoped credential lists the tasks of the tables it may read.
+			cond, condArgs := credentialTableFilter(app, session, "table_name", "read")
+			q += cond
+			args = append(args, condArgs...)
 		}
 		if rid := r.URL.Query().Get("row_id"); rid != "" {
 			q += " AND row_id = ?"
@@ -221,6 +237,20 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
 			return
+		}
+		// A scoped credential cancels only a task on a table its scopes
+		// allow writing. An id that is not the caller's task is answered
+		// below as for everyone.
+		if scopedCredential(session) {
+			var table string
+			err := app.DB.QueryRow("SELECT COALESCE(table_name, '') FROM _benmore_scheduled_tasks WHERE id = ? AND user_id = ?", r.PathValue("id"), session.UserID).Scan(&table)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				serverErrorJSON(w, r, app, "_schedule", err, "cancel failed")
+				return
+			}
+			if err == nil && !requireCredentialTableScope(w, session, approvalTableName(app, table), "write", scheduledTaskScopeSubject) {
+				return
+			}
 		}
 		// The answer names what is stored: it used to be 200 "cancelled" for
 		// a task that had fired, was running, was not the caller's or did not
@@ -274,6 +304,12 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// The table in the schema's spelling: SQLite resolves a table name in
 		// any letter case, so `Docs` is the app's `docs` and gets its checks.
 		b.Table = approvalTableName(app, b.Table)
+		// Requesting an approval changes the record's approval history: a
+		// scoped credential needs the table's write scope, and a label that
+		// is no table has none to carry (scoped_credential_routes.go).
+		if !requireCredentialTableScope(w, session, b.Table, "write", approvalScopeSubject) {
+			return
+		}
 		// An approval on an app record joins that record's approval history,
 		// which every reader of the record sees (GET below), so only a caller
 		// who can read the record may request one. A table name that is not
@@ -373,8 +409,16 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// table name is a label (requester and approver only, below).
 		t := approvalTableName(app, written)
 		if t != "" {
+			if !requireCredentialTableScope(w, session, t, "read", approvalScopeSubject) {
+				return
+			}
 			q += " AND table_name IN (?, ?)"
 			args = append(args, t, written)
+		} else {
+			// A scoped credential lists the approvals of the tables it may read.
+			cond, condArgs := credentialTableFilter(app, session, "table_name", "read")
+			q += cond
+			args = append(args, condArgs...)
 		}
 		if rid != "" {
 			q += " AND row_id = ?"
@@ -442,12 +486,12 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// email belongs to the account that has proven that address, and one
 		// on a tenant's record only while that account is in the tenant.
 		var isApprover bool
-		var requestedEmail, title string
+		var requestedEmail, title, table string
 		var requestedBy int64
 		id := r.PathValue("id")
 		assigned, assignedArgs := approvalApproverSQL(app, session)
-		scanErr := app.DB.QueryRow("SELECT COALESCE("+assigned+", 0), requested_by, requested_email, title FROM _benmore_approvals WHERE id = ?", append(assignedArgs, id)...).
-			Scan(&isApprover, &requestedBy, &requestedEmail, &title)
+		scanErr := app.DB.QueryRow("SELECT COALESCE("+assigned+", 0), requested_by, requested_email, title, table_name FROM _benmore_approvals WHERE id = ?", append(assignedArgs, id)...).
+			Scan(&isApprover, &requestedBy, &requestedEmail, &title, &table)
 		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 			serverErrorJSON(w, r, app, "_approvals", scanErr, "query failed")
 			return
@@ -460,6 +504,12 @@ func registerSchedulingAPI(mux appRouteRegistrar, app *App) {
 		// non-approver was refused above, so the 403 is no existence oracle).
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "approval not found"})
+			return
+		}
+		// Deciding changes the record's approval: the approver's scoped
+		// credential needs the table's write scope. Checked after the
+		// approver test, so it tells a non-approver nothing.
+		if !requireCredentialTableScope(w, session, table, "write", approvalScopeSubject) {
 			return
 		}
 		// The requester never decides their own request, admin or not (a

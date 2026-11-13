@@ -1,7 +1,8 @@
 [
-  "qa_inventory(app, as?, user?, paths?, max_pages?, follow_links?, surface_only?, width?, height?, budget_seconds?)   # editor role (it signs in as `as`); loads pages, never clicks",
-  "browser_batch(app, journeys[], as?, budget_seconds?)   # editor role; runs up to 40 journeys per call on one Chrome, isolated tab per journey",
-  "browser_check(app, path, as?, actions?, script?, ...)  # single page, fresh Chrome - use for exploratory work",
-  "benmore verify [dir] [--quick|--release]                # runs tests/journeys/*.yaml through browser_batch, resubmitting `pending` until empty",
+  "qa_inventory(app, as?, reason?, user?, paths?, max_pages?, follow_links?, surface_only?, width?, height?, budget_seconds?)   # editor role (it signs in as `as`); loads pages, never clicks",
+  "browser_batch(app, journeys[], as?, reason?, budget_seconds?)   # editor role; runs up to 40 journeys per call on one Chrome, isolated tab per journey",
+  "browser_check(app, path, as?, reason?, actions?, script?, ...)  # single page, fresh Chrome - use for exploratory work",
+  "benmore verify [dir] [--quick|--release] [--reason \"why\"]   # runs tests/journeys/*.yaml through browser_batch, resubmitting `pending` until empty",
+  "`reason` (CLI: --reason \"why\" on benmore verify, benmore ship and benmore qa draft) says why the call signs in as the user(s) named by `as`. An app with `compliance: hipaa` requires it (1-500 characters) whenever `as` is set, refuses the whole call without it before any page is loaded, and keeps it in its audit log with each session the call opens; one reason covers every journey of a batch. Other apps ignore it. See api(at:\"compliance.workforce_reads\").",
   "browser_check, browser_batch and qa_inventory's crawl run against the dev instance only when the app has one; env:\"prod\" is refused (qa_inventory surface_only:true still reads any instance). An app with only a prod instance keeps it as the target."
 ]

@@ -298,6 +298,9 @@ func validateAppYAML(content string) string {
 		if msg := sessionDurationAppYAMLProblem(doc); msg != "" {
 			return msg
 		}
+		if msg := authIdentifierAppYAMLProblem(doc); msg != "" {
+			return msg
+		}
 		for _, key := range authFlagKeys {
 			v, present := authRaw[key]
 			if !present {
@@ -327,6 +330,9 @@ func validateAppYAML(content string) string {
 		}
 	}
 
+	if msg := trustEmailAppYAMLProblem(doc); msg != "" {
+		return msg
+	}
 	if msg := appYAMLSectionKeyViolation(doc); msg != "" {
 		return msg
 	}

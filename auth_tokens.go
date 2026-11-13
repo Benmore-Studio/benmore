@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +31,9 @@ func EnsureAPITokensTable(db *sql.DB) {
 		FOREIGN KEY (user_id) REFERENCES _benmore_users(id)
 	)`)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON _benmore_api_tokens(token_hash)")
+	// A token is minted and revoked with its audit row in one transaction
+	// (account_audit.go), so the log exists wherever this table does.
+	EnsureAuditLogTable(db)
 }
 
 // hashToken computes SHA-256 of a raw token for storage.
@@ -74,7 +78,7 @@ func GetSessionFromAPIToken(db *sql.DB, rawToken string) *Session {
 	if err != nil {
 		return nil // user deleted
 	}
-	if deactivatedAt.Valid && deactivatedAt.String != "" {
+	if accountDeactivated(deactivatedAt) {
 		return nil // deactivated users blocked
 	}
 
@@ -349,7 +353,7 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	expiresAt = capped
 
-	stored, err := insertAPITokenWithinCap(app.DB, session.UserID, body.Name, tokenHash, body.Scopes, expiresAt)
+	stored, err := storeAPITokenAudited(app, session, body.Name, tokenHash, body.Scopes, expiresAt)
 	if err != nil {
 		serverErrorJSON(w, r, app, "api tokens", err, "failed to create token")
 		return
@@ -371,6 +375,40 @@ func handleCreateAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 			return *expiresAt
 		}(),
 	})
+}
+
+// storeAPITokenAudited stores a token the account mints for itself, with its
+// audit row, in one transaction. It reports false, with no error and nothing
+// written, when the account is at its token cap.
+func storeAPITokenAudited(app *App, session *Session, name, tokenHash, scopes string, expiresAt *string) (bool, error) {
+	tx, err := app.DB.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	stored, err := insertAPITokenWithinCap(tx, session.UserID, name, tokenHash, scopes, expiresAt)
+	if err != nil || !stored {
+		return false, err
+	}
+	if err := auditAPITokenCreated(tx, app, session, tokenHash, name, scopes, expiresAt); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// auditAPITokenCreated records the token just stored under tokenHash through
+// tx: its id, name, scopes and expiry. The token and its hash are not values
+// of the row.
+func auditAPITokenCreated(tx *sql.Tx, app *App, actor *Session, tokenHash, name, scopes string, expiresAt *string) error {
+	var id int64
+	if err := tx.QueryRow("SELECT id FROM _benmore_api_tokens WHERE token_hash = ?", tokenHash).Scan(&id); err != nil {
+		return fmt.Errorf("audit %s: %w", accountAuditAPITokenCreated, err)
+	}
+	values := map[string]any{"name": name, "scopes": scopes}
+	if expiresAt != nil {
+		values["expires_at"] = *expiresAt
+	}
+	return auditAccountEvent(tx, app, accountAuditAPITokenCreated, strconv.FormatInt(id, 10), actor, nil, values)
 }
 
 // apiTokenExpiryForSession caps a new API token's expiry at the minting
@@ -447,18 +485,33 @@ func handleRevokeAPIToken(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 
-	// SECURITY: users can only revoke their own tokens
-	result, err := app.DB.Exec(
-		"DELETE FROM _benmore_api_tokens WHERE id = ? AND user_id = ?",
-		id, session.UserID,
-	)
+	// SECURITY: users can only revoke their own tokens. The audit row is
+	// written with the delete, naming the token by id, name and scopes.
+	tx, err := app.DB.Begin()
 	if err != nil {
 		serverErrorJSON(w, r, app, "api tokens", err, "revoke failed")
 		return
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
+	defer tx.Rollback()
+	var tokenID int64
+	var name, scopes string
+	err = tx.QueryRow(
+		"DELETE FROM _benmore_api_tokens WHERE id = ? AND user_id = ? RETURNING id, name, scopes",
+		id, session.UserID,
+	).Scan(&tokenID, &name, &scopes)
+	if errors.Is(err, sql.ErrNoRows) {
 		httpJSON(w, http.StatusNotFound, map[string]any{"error": "token not found"})
+		return
+	}
+	if err == nil {
+		err = auditAccountEvent(tx, app, accountAuditAPITokenRevoked, strconv.FormatInt(tokenID, 10), session,
+			map[string]any{"name": name, "scopes": scopes}, nil)
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		serverErrorJSON(w, r, app, "api tokens", err, "revoke failed")
 		return
 	}
 

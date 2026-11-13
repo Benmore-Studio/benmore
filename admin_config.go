@@ -5,6 +5,7 @@ package main
 import (
 	"log"
 	"os"
+	"sort"
 )
 
 // AdminConfig is Django-ModelAdmin-style customisation of the auto-admin
@@ -85,6 +86,22 @@ func (a *AdminConfig) IsTableHidden(table string) bool {
 		}
 	}
 	return false
+}
+
+// HiddenTables returns the names admin.yaml hides, as written there, for a
+// panel read that leaves out the rows about them (the activity list).
+func (a *AdminConfig) HiddenTables() []string {
+	if a == nil {
+		return nil
+	}
+	var names []string
+	for name, cfg := range a.Tables {
+		if cfg.Hidden {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // VisibleColumns returns the column allowlist for a table, or nil if no

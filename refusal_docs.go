@@ -266,6 +266,7 @@ var gateRuleDocs = map[gateRule]docsRule{
 		{"app.yaml: ws_rooms", "websocket.room_authorization"},
 		{"app.yaml: auth.signup_rate_limit", "auth.signup_limits"},
 		{"app.yaml: auth.", "auth.app_yaml_flags"},
+		{"app.yaml: oauth.", "oauth.configuration_notes"},
 		{"app.yaml: csp.", "csp.gotchas"},
 		{"app.yaml: groups.", "scoping.tenant_bootstrap"},
 		{"app.yaml: encrypted", "encryption.yaml_shape"},
@@ -320,6 +321,12 @@ type gateVerdict struct {
 	Refusal string
 	// Docs is the address of the first issue: a check finding's `docs`.
 	Docs string
+	// StaleReview is set, by a check only, for an mcp.yaml whose review no
+	// longer binds the source: the file is not refused as written and
+	// rewriting it is not the fix, so it is no part of Message. A check
+	// reports it as a warning of its own class (mcp_review). A write of such
+	// a file is still refused, through Message.
+	StaleReview string
 }
 
 // newGateVerdict joins a write's issues the way the gate always has, and a
@@ -375,8 +382,6 @@ var checkSourceDocs = map[string]docsRule{
 		// the way it is written (app_yaml_switch_values.go).
 		{"`recording.", "frontend.ssr_session_recording"},
 		{"`features.", "recovery.configuration_loading"},
-		{"`oauth.", "oauth.configuration_notes"},
-		{"`auth.identifier", "auth.app_yaml_flags"},
 	}},
 	"flows": {At: "flows.checked_values", When: []docsWhen{
 		{"on.request.role", "flows.role_gate"},
@@ -385,7 +390,10 @@ var checkSourceDocs = map[string]docsRule{
 		{"is `mode: async` but has a respond", "async-flows.hint"},
 		{"redirects to a templated", "flows.redirect"},
 		{"shadows the request field", "flows.step_named_request_fields"},
+		// respondShapeProblems: no `with:`, then two bodies or a body
+		// that is not text.
 		{"`run: respond` has no `with:`", "flows.step_types"},
+		{"this `run: respond` ", "flows.respond_bodies"},
 	}},
 	"edge_status":  {At: "flows.edge_error_status"},
 	"step_outputs": {At: "flows.step_output_refs"},
@@ -412,6 +420,8 @@ var checkSourceDocs = map[string]docsRule{
 		{"removes", "connector.destructive_schema"},
 		{"has no predicate tied to the caller", "connector.caller_predicate"}, // appMCPCommandCallerPredicateDocs
 	}},
+	// An mcp.yaml whose review no longer binds the source (connector off).
+	"mcp_review": {At: "connector.stale_review"},
 	"compliance": {At: "audit.flow_writes", When: []docsWhen{
 		{"responds with whole rows of step", "encryption.flow_results"},
 	}},
@@ -487,7 +497,7 @@ const (
 	refusalPromoteUpgrade = "upgrade_required"        // promote on a plan without publishing
 	refusalPlanChangeUse  = "plan_change_use"         // 409, a plan the account's use does not fit
 	refusalConnectorError = "connector_error"         // a failed connector tool call; narrowed by its error_code
-	refusalActAsReason    = "act_as_reason"           // a probe as an app user of a hipaa app with no reason
+	refusalActAsReason    = "act_as_reason"           // acting as an app user of a hipaa app with no reason
 )
 
 // refusalDocs is the address of a runtime refusal: by the stable code its
@@ -514,6 +524,7 @@ var refusalDocs = map[string]docsRule{
 	uploadsDisabledCode:      {At: "uploads.feature_gate"},
 	sharingDisabledCode:      {At: "permissions.sharing_switch"},
 	"storage_limit":          {At: "recovery.storage_limit"},
+	databaseBusyCode:         {At: "recovery.write_lock"},
 	mediaAllowanceCode:       {At: "uploads.storage_allowance"},
 	refusalWorkflowRole:      {At: "workflows.transition_roles"},
 	// Rate limits.
@@ -536,7 +547,7 @@ var refusalDocs = map[string]docsRule{
 	// A scoped credential on a page that requires sign-in, or on its PDF.
 	scopedCredentialPageCode: {At: "auth.credential_limits"},
 	// The admin panel's write routes on a table it only shows.
-	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}, {"is a framework table", "auth.admin_panel_accounts"}, {"is a version history table", "versioning.history_table"}}},
+	"admin_table_read_only": {At: "auth.credential_limits", When: []docsWhen{{"is an audit table", "audit.append_only"}, {"holds role grants", "auth.admin_panel_accounts"}, {"is a framework table", "auth.admin_panel_accounts"}, {"is a version history table", "versioning.history_table"}, {"is a search index table", "auth.admin_panel_tables"}}},
 	// The admin panel's edit of another admin's sign-in identifier.
 	adminIdentifierProtectedCode: {At: "auth.admin_panel_accounts"},
 	// A role change that takes admin away from another admin.
@@ -556,8 +567,9 @@ var refusalDocs = map[string]docsRule{
 		{"collaborator", "collaborators.plans"},
 		{"media storage", "uploads.storage_allowance"},
 	}},
-	// probe_route `as` / `benmore probe --as` on a compliance: hipaa app
-	// with no stated reason.
+	// A session as a named user of a compliance: hipaa app (probe_route or
+	// a headless-browser tool with `as`, `benmore probe --as`) with no
+	// stated reason.
 	refusalActAsReason: {At: "compliance.workforce_reads"},
 	// The app's MCP connector: _meta.docs of a failed tool call, by its
 	// error_code (appMCPErrorCodes).

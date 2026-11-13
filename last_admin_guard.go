@@ -57,7 +57,9 @@ const (
 
 // durableAdminWhere selects, from _benmore_users u, the accounts that count
 // as usable durable admins:
-//   - usable: not deactivated, not held at a temporary password (every
+//   - usable: not deactivated (accountActiveSQL, the session lookup's
+//     reading: a stored empty string is deactivated), not held at a
+//     temporary password (every
 //     session lookup refuses such an account), and verified when the app
 //     sets auth.require_verified (getSession refuses an unverified one);
 //   - durable: admin by the role column, or by a global admin grant with no
@@ -65,7 +67,7 @@ const (
 //     is no longer an admin. Group-scoped admin grants never confer
 //     app-wide admin (Session.GlobalAdmin), so they do not count either.
 func durableAdminWhere(app *App, grants bool) string {
-	where := `COALESCE(CAST(u.deactivated_at AS TEXT), '') = ''
+	where := accountActiveSQL("u") + `
 		AND COALESCE(u.password_change_required, 0) = 0`
 	if appRequiresVerified(app) {
 		where += ` AND COALESCE(u.verified, 0) = 1`

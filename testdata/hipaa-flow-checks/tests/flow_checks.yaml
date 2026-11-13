@@ -137,8 +137,11 @@ api_token_request_shape:
     - api: "POST /api/_auth/api-tokens"
       json: { name: "full", scopes: "*" }
       expect: { status: 200, contains: '"token":"bmr_' }
-    # Minting a token writes no audit row.
-    - sql: "SELECT 1 FROM _benmore_audit_log WHERE user_email = 'minter@test.com'"
+    # Each mint writes one audit row naming the token, never the secret; a
+    # refused request writes none.
+    - sql: "SELECT 1 FROM _benmore_audit_log a JOIN _benmore_api_tokens t ON a.row_id = CAST(t.id AS TEXT) WHERE a.user_email = 'minter@test.com' AND a.action = 'api_token_created' AND a.table_name = '_benmore_api_tokens' AND json_extract(a.new_values, '$.name') = t.name AND json_extract(a.new_values, '$.scopes') = t.scopes"
+      expect: { rows: 2 }
+    - sql: "SELECT 1 FROM _benmore_audit_log WHERE user_email = 'minter@test.com' AND (action <> 'api_token_created' OR COALESCE(new_values, '') LIKE '%bmr_%' OR old_values IS NOT NULL)"
       expect: { rows: 0 }
 
 # hooks.yaml: the hook's write and the audit row its second entry inserts.

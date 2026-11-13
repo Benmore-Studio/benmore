@@ -73,7 +73,7 @@ func resolveImportOwner(db *sql.DB, email string) (int64, string, error) {
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, "", fmt.Errorf("owner must be the email address of an existing user of this app")
 	}
-	rows, err := db.Query(`SELECT id, COALESCE(email, ''), deactivated_at IS NOT NULL
+	rows, err := db.Query(`SELECT id, COALESCE(email, ''), `+accountDeactivatedSQL("")+`
 		FROM _benmore_users WHERE email = ? COLLATE NOCASE LIMIT 2`, email)
 	if err != nil {
 		if strings.Contains(err.Error(), "no such table") {
@@ -114,7 +114,7 @@ func resolveImportOwner(db *sql.DB, email string) (int64, string, error) {
 // deactivated between create and commit.
 func confirmImportOwnerTx(tx *sql.Tx, ownerUserID int64) error {
 	var one int
-	err := tx.QueryRow(`SELECT 1 FROM _benmore_users WHERE id = ? AND deactivated_at IS NULL`, ownerUserID).Scan(&one)
+	err := tx.QueryRow(`SELECT 1 FROM _benmore_users WHERE id = ? AND `+accountActiveSQL(""), ownerUserID).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("the import's owner (user %d) no longer exists or was deactivated since the import was created; nothing was imported", ownerUserID)
 	}

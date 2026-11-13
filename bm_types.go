@@ -921,8 +921,22 @@ declare module 'sdui' {
   export interface UploaderOpts { onUpload?: (res: any) => void; }
   /** File upload wrapper over bm.upload. */
   export function Uploader(target: string | HTMLElement, opts?: UploaderOpts): Promise<{ destroy: () => void }>;
-  /** The per-user /api/_schema descriptor (cached for the session). */
-  export function schema(): Promise<Record<string, any>>;
+  /** One table of the /api/_schema descriptor, as the signed-in caller may use it. */
+  export interface SchemaTable {
+    label: string;
+    fields: Array<Record<string, any>>;
+    /** What this caller may do on the table (the server still decides per row). */
+    ops: { read: boolean; write: boolean; update: boolean; delete: boolean };
+    capabilities: {
+      soft_delete: boolean;
+      /** false while record sharing is turned off for the table (features.sharing / access.<table>.share): a share is refused with sharing_disabled. */
+      sharing: boolean;
+      [capability: string]: boolean;
+    };
+    [key: string]: any;
+  }
+  /** The per-user /api/_schema descriptor, keyed by table (cached for the session). */
+  export function schema(): Promise<Record<string, SchemaTable>>;
   export function clearSchemaCache(): void;
   /** Replace presentation primitives - this is how you ship a design library. */
   export function registerSkin(overrides: SkinPrimitives): void;
@@ -998,7 +1012,7 @@ declare module 'sdui' {
   export function AuditLog(target: string | HTMLElement, opts?: { table?: string; row_id?: string | number; user_id?: string | number; action?: string; limit?: number }): Promise<Handle>;
   /** Pessimistic lock state + acquire/release for a record. */
   export function RecordLock(target: string | HTMLElement, opts: { table: TableName; id: string | number }): Promise<Handle>;
-  /** Per-record ACL share dialog (bm.permissions). */
+  /** Per-record ACL share dialog (bm.permissions). On a table whose record sharing is turned off it shows "Sharing is turned off for this table." in place of the form; grants still stored stay listed and revocable. */
   export function ShareDialog(target: string | HTMLElement, opts: { table: TableName; id: string | number }): Promise<Handle>;
   /** Download the signed-in user's own data (GET /api/_my-data: profile, the rows they own, their audit events) as my-data.json. */
   export function DownloadMyData(target: string | HTMLElement, opts?: { label?: string }): Promise<Handle>;

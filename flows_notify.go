@@ -163,11 +163,15 @@ func execStepNotify(ctx *FlowContext, step *FlowStep) error {
 	if strings.TrimSpace(n.Title) == "" {
 		return fmt.Errorf("notify step requires `with.title`")
 	}
+	// The notification leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	notificationBuilt := beginFlowResponse(ctx)
 	rawID := strings.TrimSpace(interpolateCtx(n.UserID, ctx))
 	title := interpolateCtx(n.Title, ctx)
 	body := interpolateCtx(n.Body, ctx)
 	link := strings.TrimSpace(interpolateCtx(n.Link, ctx))
 	notifType := strings.ToLower(strings.TrimSpace(interpolateCtx(n.Type, ctx)))
+	notificationBuilt()
 	// An unresolved ref must not create a notification: return before
 	// writing and let the dispatcher report the refs (executeStep).
 	ctx.DataMu.Lock()

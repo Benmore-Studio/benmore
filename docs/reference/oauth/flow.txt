@@ -1,1 +1,2 @@
 Redirect the user to /auth/<provider>; the framework handles the callback at /auth/<provider>/callback and sets a session cookie on success.
+A deactivated account (api({at:'auth'}) account_state_signin) gets no session from a provider sign-in: the callback returns to the login page with `Invalid credentials`, and the account is not verified, claimed or given a stored provider token.

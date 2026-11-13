@@ -1009,6 +1009,10 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 		}
 		jobID, jobToken, err := enqueueFlowJob(app.DB, "", flow.Name, payload, nil, flowJobMaxAttempts(flow))
 		if err != nil {
+			// Nothing was queued; the same request can be sent again.
+			if respondDatabaseBusy(w, r, "flow "+flow.Name+" enqueue", err) {
+				return
+			}
 			id := recordRequestError(r, serverErrorDetail("flow "+flow.Name+" enqueue", err))
 			log.Printf("FLOW ASYNC ENQUEUE ERROR [%s]: %s (request %s)", flow.Name, err, id)
 			answerServerError(w, app, http.StatusInternalServerError, id, err, "Internal error")
@@ -1045,7 +1049,10 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 	} else if flow.Transaction {
 		tx, err := app.DB.BeginTx(withWriteTxLabel(ctx.execContext(), "flow:"+flow.Name), nil)
 		if err != nil {
-			log.Printf("FLOW ERROR [%s] begin tx: %s", flow.Name, err)
+			// A busy database gets its one journal line with the answer.
+			if !isDatabaseBusyError(err) {
+				log.Printf("FLOW ERROR [%s] begin tx: %s", flow.Name, err)
+			}
 			ctx.Error = err
 		} else {
 			ctx.Tx = tx
@@ -1088,7 +1095,9 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 			ctx.Tx.Rollback()
 		} else {
 			if err := ctx.Tx.Commit(); err != nil {
-				log.Printf("FLOW ERROR [%s] commit: %s", flow.Name, err)
+				if !isDatabaseBusyError(err) {
+					log.Printf("FLOW ERROR [%s] commit: %s", flow.Name, err)
+				}
 				ctx.Error = err
 			} else {
 				committed = true
@@ -1111,6 +1120,9 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 	if connectorRead && ctx.Error != nil {
 		ctx.Error = appMCPResultFailure("incomplete_result")
 	}
+	// Whether a failed run left a write behind decides if its caller may be
+	// told to send the request again (the busy answer below).
+	wroteDurably := committed || ctx.Writes.keptOutsideTransaction()
 	announceFlowWrites(ctx, committed)
 	// compliance: hipaa - rows whose read could not be audited are never
 	// released: the buffered answer is discarded and the caller gets a 5xx.
@@ -1137,6 +1149,19 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 	// carries; the journal keeps the FLOW ERROR lines.
 	requestID := ""
 	if ctx.Error != nil {
+		// A step (or the begin or commit) the database was too busy to run is
+		// load, not a fault of the flow: 503 with Retry-After and one
+		// DATABASE BUSY line, in place of flow_no_response and the FLOW ERROR
+		// lines (database_busy.go). The answer invites the caller to send the
+		// request again, so it is given only when nothing the run wrote was
+		// kept: its transaction rolled back, or it has none and no statement
+		// before the busy one wrote. A flow without a transaction that had
+		// already written keeps flow_no_response, as does a run its own
+		// handler answered or a time limit ended.
+		if !ctx.Stopped && !wroteDurably && isDatabaseBusyError(ctx.Error) && !(ctx.execCtx != nil && flowStoppedByTimeLimit(ctx)) {
+			writeDatabaseBusy(w, noteDatabaseBusy(r, "flow "+flow.Name, flowFailureDetail(flow, ctx, failure)))
+			return
+		}
 		requestID = recordRequestError(r, flowFailureDetail(flow, ctx, failure))
 		// One line, credential-shaped text redacted: the request log row's
 		// form of the same error, findable with `benmore tail --grep <id>`.

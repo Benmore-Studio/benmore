@@ -1528,32 +1528,65 @@ export async function RecordLock(target, opts) {
   await render();
   return { refresh: render, destroy: () => { el.innerHTML = ''; } };
 }
-// ShareDialog(target, { table, id }) - native list/share and exact grant revoke
+// ShareDialog(target, { table, id }) - native list/share and exact grant revoke.
+// While record sharing is turned off for the table (app.yaml features.sharing
+// or access.<table>.share) there is nothing to submit: the dialog says so in
+// place of its form and keeps the stored grants revocable. The list answer
+// carries the switch (`sharing: "off"`); when the list is refused, the table's
+// descriptor does (`capabilities.sharing === false`); when neither reports it,
+// the share request refused with `sharing_disabled` does.
 export async function ShareDialog(target, opts) {
   const el = resolveEl(target);
   const seg = (v) => { const e = encodeURIComponent(String(v)); if (!e || e === '.' || e === '..') throw new Error('ShareDialog: invalid identifier'); return e; };
   const revokeBase = `/api/${seg(opts.table)}/${seg(opts.id)}/share/`;
   let generation = 0, destroyed = false;
+  // A descriptor that cannot be read, or does not report the switch, says nothing.
+  const describedOff = async () => { try { return (await schema())?.[opts.table]?.capabilities?.sharing === false; } catch (_) { return false; } };
+  const paint = (rows, off) => {
+    const grants = rows.map((p) => `<div class="flex items-center justify-between text-sm px-1"><span>${esc(p.grantee_id)} · ${esc(p.permission)}${off ? ' <span class="text-zinc-500">(no access while sharing is off)</span>' : ''}</span><button data-revoke="${esc(p.id)}" class="text-red-600">Revoke</button></div>`).join('');
+    if (off) {
+      el.innerHTML = `<div data-bm-share data-bm-sharing="off" class="space-y-3"><p data-bm-sharing-off role="status" class="text-sm text-zinc-500">Sharing is turned off for this table.</p>${grants ? `<div data-bm-shares class="space-y-1">${grants}</div>` : ''}</div>`;
+    } else {
+      el.innerHTML = `<div data-bm-share class="space-y-3"><form data-bm-form class="flex gap-2 items-end">${skin.error('')}
+      <label class="flex-1 space-y-1"><span class="text-sm font-medium">Email</span><input name="email" type="email" required class="${inputCls}"></label>
+      <label class="space-y-1"><span class="text-sm font-medium">Access</span><select name="permission" class="${inputCls}"><option value="view">View</option><option value="edit">Edit</option><option value="delete">Delete</option><option value="admin">Admin</option></select></label>
+      ${skin.button({ label: 'Share' })}</form>
+      <div data-bm-shares class="space-y-1">${grants || '<p class="text-sm text-zinc-500">Not shared with anyone.</p>'}</div></div>`;
+      const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); const current = generation;
+        try { await bm.permissions.share(opts.table, opts.id, fd.get('email'), fd.get('permission')); render(); }
+        catch (ex) {
+          if (destroyed || current !== generation) return;
+          // The list did not say so (an older answer, or the switch changed
+          // since it was read): the refusal itself is the signal.
+          if (ex?.code === 'sharing_disabled') { paint(rows, true); return; }
+          errEl.textContent = ex?.message || 'Share failed'; errEl.hidden = false;
+        }
+      });
+    }
+    el.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete(revokeBase + seg(b.getAttribute('data-revoke'))); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
+  };
   const render = async () => {
     if (destroyed) return;
     const current = ++generation;
-    let rows = [];
-    try { const r = await bm.permissions.list(opts.table, opts.id); rows = Array.isArray(r) ? r : (r.permissions || []); }
+    let rows = [], off = false;
+    try { const r = await bm.permissions.list(opts.table, opts.id); rows = Array.isArray(r) ? r : (r.permissions || []); off = !Array.isArray(r) && r.sharing === 'off'; }
     catch (ex) {
+      if (destroyed || current !== generation) return;
+      // Refused while sharing is off: that, not the missing authority, is
+      // what the reader needs to know. No grants are shown without the list.
+      if (ex?.status === 403 && await describedOff()) {
+        if (!destroyed && current === generation) paint([], true);
+        return;
+      }
       if (destroyed || current !== generation) return;
       el.innerHTML = `<div data-bm-share class="space-y-3"><p role="alert" class="text-sm text-red-600">Couldn't load sharing. ${esc(ex?.message || 'Please try again.')}</p><button type="button" data-bm-retry class="px-3 py-2 rounded-md border text-sm">Retry</button></div>`;
       el.querySelector('[data-bm-retry]').addEventListener('click', render);
       return;
     }
     if (destroyed || current !== generation) return;
-    el.innerHTML = `<div data-bm-share class="space-y-3"><form data-bm-form class="flex gap-2 items-end">${skin.error('')}
-      <label class="flex-1 space-y-1"><span class="text-sm font-medium">Email</span><input name="email" type="email" required class="${inputCls}"></label>
-      <label class="space-y-1"><span class="text-sm font-medium">Access</span><select name="permission" class="${inputCls}"><option value="view">View</option><option value="edit">Edit</option><option value="delete">Delete</option><option value="admin">Admin</option></select></label>
-      ${skin.button({ label: 'Share' })}</form>
-      <div data-bm-shares class="space-y-1">${rows.map((p) => `<div class="flex items-center justify-between text-sm px-1"><span>${esc(p.grantee_id)} · ${esc(p.permission)}</span><button data-revoke="${esc(p.id)}" class="text-red-600">Revoke</button></div>`).join('') || '<p class="text-sm text-zinc-500">Not shared with anyone.</p>'}</div></div>`;
-    const form = el.querySelector('form'), errEl = el.querySelector('[data-bm-error]');
-    form.addEventListener('submit', async (e) => { e.preventDefault(); errEl.hidden = true; const fd = new FormData(form); try { await bm.permissions.share(opts.table, opts.id, fd.get('email'), fd.get('permission')); render(); } catch (ex) { errEl.textContent = ex?.message || 'Share failed'; errEl.hidden = false; } });
-    el.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => { try { await bm.api.delete(revokeBase + seg(b.getAttribute('data-revoke'))); render(); } catch (ex) { Toast(ex?.message || 'Failed', { type: 'error' }); } }));
+    paint(rows, off);
   };
   await render();
   return { refresh: render, destroy: () => { destroyed = true; generation++; el.innerHTML = ''; } };
