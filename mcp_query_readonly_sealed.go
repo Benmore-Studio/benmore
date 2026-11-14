@@ -5,7 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"regexp"
+	"errors"
 	"strings"
 
 	"github.com/mattn/go-sqlite3"
@@ -59,6 +59,9 @@ type readOnlySealedReads struct {
 	sealed  map[string]bool
 	selects int
 	read    bool
+	// unrecorded: the statement, or a view it reads, holds a FULL join by
+	// column name.
+	unrecorded bool
 }
 
 func (r *readOnlySealedReads) authorize(action int, arg1, arg2, database string) int {
@@ -90,26 +93,20 @@ func readOnlyDeclaredColumns(rows *sql.Rows, n int) []bool {
 // derived reports whether the statement's computed columns must be masked: it
 // read a sealed column, or it may have without the authorizer knowing: it was
 // never seen compiled (a statement cache would do that; the app DSN sets
-// none), or it holds a FULL join by column name.
+// none), or it, or a view it reads, holds a FULL join by column name.
 // Asked after the last row was stepped, so reads SQLite reports late (a
 // virtual table compiles its own statements while stepping) are counted.
 func (r *readOnlySealedReads) derived(query string) bool {
-	return r.read || r.selects == 0 || readOnlyUnrecordedRead(query)
+	return r.read || r.selects == 0 || r.unrecorded || readOnlyUnrecordedRead(query)
 }
 
 // A join that names its columns (USING, NATURAL) is the one place SQLite reads
-// a column without asking the authorizer: it builds those column references
-// itself. The join condition compares the columns, and a FULL join's result
-// column is coalesce() of both sides, so `SELECT code FROM _benmore_otp a FULL
-// JOIN _benmore_otp b USING (code)` returned a column the authorizer answers
+// a column without asking the authorizer (sql_named_join.go). The join
+// condition compares the columns, and a FULL join's result column is
+// coalesce() of both sides, so `SELECT code FROM _benmore_otp a FULL JOIN
+// _benmore_otp b USING (code)` returned a column the authorizer answers
 // SQLITE_IGNORE for, and `substr(ssn, 2)` over such a join read a sealed
-// column unrecorded. Both keywords must be written bare (a quoted join word is
-// a syntax error) and a keyword cannot touch a letter, digit or underscore, so
-// a word match finds every one; a false match only refuses or masks more.
-var (
-	readOnlyNamedJoinRe = regexp.MustCompile(`(?i)\b(using|natural)\b`)
-	readOnlyFullJoinRe  = regexp.MustCompile(`(?i)\bfull\b`)
-)
+// column unrecorded.
 
 // readOnlyNamedJoinRefusal is the answer to a statement that joins by column
 // name and names a framework table: its credential columns read as NULL only
@@ -117,13 +114,35 @@ var (
 const readOnlyNamedJoinRefusal = "read-only SQL refuses the words USING and NATURAL in a statement that names a framework table (_benmore_*): write the join with ON"
 
 func readOnlyNamedJoinOnFrameworkTable(query string) bool {
-	return readOnlyNamedJoinRe.MatchString(query) && strings.Contains(strings.ToLower(query), "_benmore_")
+	return sqlNamedJoinTouches(query, sqlNamesFrameworkTable) != ""
+}
+
+// errReadOnlyNamedJoinView is the answer to a statement that reads a view
+// whose own text joins a framework table by column name: SQLite compiles the
+// view's text with the statement, as unreported as a join written in it.
+var errReadOnlyNamedJoinView = errors.New(sqlNamedJoinViewRefusal("read-only SQL", "a framework table (_benmore_*)"))
+
+// readOnlyViewTexts returns query with the text of every view it reads
+// (sqlTextsRead), read on the connection that is about to run it, and refuses
+// a view that joins a framework table by column name. Every statement of the
+// read-only executor passes here, the built ones too: the table browser reads
+// a view by its name.
+func readOnlyViewTexts(ctx context.Context, conn sqlViewQuerier, query string) ([]string, error) {
+	views, err := sqlViewTexts(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	texts := sqlTextsRead(query, views)
+	if name, _ := sqlNamedJoinTouchesIn(texts[1:], sqlNamesFrameworkTable); name != "" {
+		return nil, errReadOnlyNamedJoinView
+	}
+	return texts, nil
 }
 
 // readOnlyUnrecordedRead reports a statement whose FULL join by column name
 // can read a sealed column without the authorizer hearing of it.
 func readOnlyUnrecordedRead(query string) bool {
-	return readOnlyFullJoinRe.MatchString(query) && readOnlyNamedJoinRe.MatchString(query)
+	return sqlNamedFullJoin(query)
 }
 
 // readOnlyCompoundWords are the only ways SQLite's grammar joins the rows of

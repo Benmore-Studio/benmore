@@ -19,7 +19,7 @@
   "bm.upload(file, opts)                    - multipart upload to POST /api/_upload; opts = { kind?, filename? } (kind: 'private' for a private file, default a public one); resolves { path, url, filename, size } (api({at:'uploads'}) → sdk_upload)",
   "bm.audit.list(filter)                    - admin audit log",
   "bm.permissions.{share, revoke, list}     - per-row ACLs",
-  "bm.signedUrl(path, opts)                 - time-limited URLs; opts = { ttlSeconds?, record: { table, id } } (record required for private CDN files) or a bare TTL number; default 300s (see api({at:'signed-urls'}))",
+  "bm.signedUrl(path, opts)                 - time-limited URLs; opts = { ttlSeconds?, record: { table, id } } (record required for private CDN files) or a bare TTL number; ttlSeconds is whole seconds or a duration string ('90s', '2h'); default 300s (see api({at:'signed-urls'}))",
   "bm.t(key, vars)                          - i18n (keys typed against i18n/*.yaml)",
   "bm.mfa.{enroll, verify, disable}         - TOTP enrollment + verification",
   "bm.table.before(kind, fn)                - read/write interceptor. kind='read' fires for list/get/count, 'write' for create/update/delete. fn(opts, ctx) where ctx={table, op}; runs in registration order, each return feeds the next, returns an unsubscribe. The canonical multi-tenant scope-injection hook (e.g. inject where[group_id] on every query) - lets you stay on the typed client instead of hand-rolling apiList().",

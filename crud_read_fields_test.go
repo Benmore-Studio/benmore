@@ -20,7 +20,7 @@ import (
 // columns masked with the row's own tenant even when the tenant column is
 // not projected.
 func TestSingleRowReadHonorsFieldsLikeList(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  companies:\n    read: everyone\n  projects:\n    read: everyone\n")
+	app := newTenantRoleApp(t, "access:\n  companies:\n    read: everyone\n  projects:\n    read: everyone\n")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE projects ADD COLUMN api_token TEXT")
 	crudScopeMustExec(t, app.DB, "UPDATE projects SET api_token='tok-hidden', name=CASE id WHEN 1 THEN 'own-tenant-value' ELSE 'other-tenant-value' END")
 	cols, err := GetTableColumns(app.DB, "projects")
@@ -35,6 +35,7 @@ func TestSingleRowReadHonorsFieldsLikeList(t *testing.T) {
 	app.Encrypted = &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{
 		"projects": {{Column: "name", Roles: []string{"company_admin"}}},
 	}}
+	mux := buildAppMux(app, true, "http://localhost")
 	sid, _ := tenantMember(t, app, "fields@example.test", "user", 1, "company_admin")
 
 	get := func(path string) (map[string]any, string) {

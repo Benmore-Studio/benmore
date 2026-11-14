@@ -167,72 +167,85 @@ func TestGitignoreMatcher(t *testing.T) {
 	}
 }
 
-// The table's expectations are git's own: every case is replayed through
-// `git check-ignore`. For a .gitignore the matcher reads in full the answers
-// are equal; for one with a line it does not read, git may ignore more.
-func TestGitignoreMatcherAgreesWithGit(t *testing.T) {
+// gitCheckIgnore lays files out in a new git repository (a ".gitignore" among
+// them is written with its given content, any other file with "x") and
+// returns, sorted, the ones among paths `git check-ignore` reports. It skips
+// the test when git is not installed.
+func gitCheckIgnore(t *testing.T, files map[string]string, paths []string) []string {
+	t.Helper()
 	git, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip("git is not installed")
 	}
+	dir := t.TempDir()
+	home := t.TempDir()
+	// No setting of the machine or of a calling git process may reach
+	// the comparison (a global excludes file, GIT_DIR from a hook).
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "HOME="+home, "XDG_CONFIG_HOME="+home, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	run := func(stdin string, args ...string) (string, error) {
+		cmd := exec.Command(git, args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		cmd.Stdin = strings.NewReader(stdin)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil && stderr.Len() > 0 {
+			t.Logf("git %s: %s", args[0], stderr.String())
+		}
+		return string(out), err
+	}
+	if _, err := run("", "init", "-q"); err != nil {
+		t.Skipf("git init: %v", err)
+	}
+	if _, err := run("", "config", "core.ignorecase", "false"); err != nil {
+		t.Fatal(err)
+	}
+	for file, content := range files {
+		full := filepath.Join(dir, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Exit status 1 with no output means "none of them is ignored".
+	out, err := run(strings.Join(paths, "\x00")+"\x00", "check-ignore", "--stdin", "-z")
+	if exit, ok := err.(*exec.ExitError); err != nil && (!ok || exit.ExitCode() != 1) {
+		t.Fatalf("git check-ignore: %v", err)
+	}
+	var ignored []string
+	for _, file := range strings.Split(out, "\x00") {
+		if file != "" {
+			ignored = append(ignored, file)
+		}
+	}
+	sort.Strings(ignored)
+	return ignored
+}
+
+// The table's expectations are git's own: every case is replayed through
+// `git check-ignore`. For a .gitignore the matcher reads in full the answers
+// are equal; for one with a line it does not read, git may ignore more.
+func TestGitignoreMatcherAgreesWithGit(t *testing.T) {
 	for _, tc := range gitignoreCases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			home := t.TempDir()
-			// No setting of the machine or of a calling git process may reach
-			// the comparison (a global excludes file, GIT_DIR from a hook).
-			var env []string
-			for _, kv := range os.Environ() {
-				if !strings.HasPrefix(kv, "GIT_") {
-					env = append(env, kv)
-				}
-			}
-			env = append(env, "HOME="+home, "XDG_CONFIG_HOME="+home, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
-			run := func(stdin string, args ...string) (string, error) {
-				cmd := exec.Command(git, args...)
-				cmd.Dir = dir
-				cmd.Env = env
-				cmd.Stdin = strings.NewReader(stdin)
-				var stderr strings.Builder
-				cmd.Stderr = &stderr
-				out, err := cmd.Output()
-				if err != nil && stderr.Len() > 0 {
-					t.Logf("git %s: %s", args[0], stderr.String())
-				}
-				return string(out), err
-			}
-			if _, err := run("", "init", "-q"); err != nil {
-				t.Skipf("git init: %v", err)
-			}
-			if _, err := run("", "config", "core.ignorecase", "false"); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(tc.gitignore), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			files := map[string]string{".gitignore": tc.gitignore}
 			for _, file := range tc.files {
-				full := filepath.Join(dir, filepath.FromSlash(file))
-				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
-					t.Fatal(err)
-				}
+				files[file] = "x"
 			}
-			// Exit status 1 with no output means "none of them is ignored".
-			out, err := run(strings.Join(tc.files, "\x00")+"\x00", "check-ignore", "--stdin", "-z")
-			if exit, ok := err.(*exec.ExitError); err != nil && (!ok || exit.ExitCode() != 1) {
-				t.Fatalf("git check-ignore: %v", err)
-			}
+			gitIgnored := gitCheckIgnore(t, files, tc.files)
 			byGit := map[string]bool{}
-			var gitIgnored []string
-			for _, file := range strings.Split(out, "\x00") {
-				if file != "" {
-					byGit[file] = true
-					gitIgnored = append(gitIgnored, file)
-				}
+			for _, file := range gitIgnored {
+				byGit[file] = true
 			}
-			sort.Strings(gitIgnored)
 			for _, file := range tc.ignored {
 				if !byGit[file] {
 					t.Errorf("the matcher ignores %q, git does not (git ignores %q)", file, gitIgnored)
@@ -243,6 +256,95 @@ func TestGitignoreMatcherAgreesWithGit(t *testing.T) {
 			}
 			if tc.partial && len(gitIgnored) == len(tc.ignored) {
 				t.Errorf("case is marked partial, but git and the matcher agree on %q", gitIgnored)
+			}
+		})
+	}
+}
+
+// nestedGitignoreCases: workspaces with a .gitignore below the root. Git reads
+// the .gitignore of every directory on the way down to a file; a deeper one
+// decides before a shallower one, its patterns are relative to its own
+// directory, and nothing below an excluded directory is read at all.
+var nestedGitignoreCases = []struct {
+	name       string
+	gitignores map[string]string
+	files      []string
+	ignored    []string // sorted
+}{
+	{
+		name:       "a nested file adds patterns for its own directory",
+		gitignores: map[string]string{"static/.gitignore": "*.map\n/local.json\ntmp/\n"},
+		files:      []string{"app.js.map", "static/app.js", "static/app.js.map", "static/deep/x.map", "static/local.json", "static/deep/local.json", "local.json", "static/tmp/a.txt", "tmp/a.txt"},
+		ignored:    []string{"static/app.js.map", "static/deep/x.map", "static/local.json", "static/tmp/a.txt"},
+	},
+	{
+		name:       "the root file still applies below a directory with its own",
+		gitignores: map[string]string{".gitignore": "*.json\n", "fixtures/.gitignore": "!keep.json\n"},
+		files:      []string{"a.json", "fixtures/keep.json", "fixtures/deep/keep.json", "fixtures/deep/b.json", "fixtures/c.json", "data/c.json", "fixtures/readme.md"},
+		ignored:    []string{"a.json", "data/c.json", "fixtures/c.json", "fixtures/deep/b.json"},
+	},
+	{
+		name:       "a deeper file decides before a shallower one",
+		gitignores: map[string]string{".gitignore": "!important.log\n", "logs/.gitignore": "*.log\n", "logs/kept/.gitignore": "!*.log\n"},
+		files:      []string{"important.log", "logs/important.log", "logs/a.log", "logs/kept/a.log", "logs/kept/deep/b.log"},
+		ignored:    []string{"logs/a.log", "logs/important.log"},
+	},
+	{
+		name:       "nothing below an excluded directory is read",
+		gitignores: map[string]string{".gitignore": "build/\n", "build/.gitignore": "!*\n", "src/.gitignore": "gen/\n", "src/gen/.gitignore": "!keep.ts\n"},
+		files:      []string{"build/out.js", "build/deep/out.js", "src/gen/keep.ts", "src/gen/a.ts", "src/main.ts"},
+		ignored:    []string{"build/deep/out.js", "build/out.js", "src/gen/a.ts", "src/gen/keep.ts"},
+	},
+	{
+		name:       "ignore everything here but a few",
+		gitignores: map[string]string{"scratch/.gitignore": "*\n!.gitignore\n!keep.md\n"},
+		files:      []string{"scratch/a.txt", "scratch/keep.md", "scratch/sub/b.txt", "keep.md", "a.txt"},
+		ignored:    []string{"scratch/a.txt", "scratch/sub/b.txt"},
+	},
+}
+
+func TestWorkspaceIgnoredFilesReadsNestedGitignores(t *testing.T) {
+	for _, tc := range nestedGitignoreCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for file, content := range tc.gitignores {
+				writeTestFile(t, dir, file, content)
+			}
+			for _, file := range tc.files {
+				writeTestFile(t, dir, file, "x")
+			}
+			got := workspaceIgnoredFiles(dir, tc.files)
+			if !reflect.DeepEqual(got, tc.ignored) {
+				t.Fatalf("ignored %q\n   want %q", got, tc.ignored)
+			}
+		})
+	}
+	// A .gitignore that is not a regular file, or sits below a symbolic link,
+	// is not read.
+	dir := t.TempDir()
+	writeTestFile(t, dir, "real/.gitignore", "*.txt\n")
+	writeTestFile(t, dir, "real/a.txt", "x")
+	if err := os.Symlink("real", filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if got := workspaceIgnoredFiles(dir, []string{"real/a.txt", "link/a.txt"}); !reflect.DeepEqual(got, []string{"real/a.txt"}) {
+		t.Fatalf("ignored %q, want only real/a.txt", got)
+	}
+}
+
+// The nested table's expectations are git's own too.
+func TestWorkspaceIgnoredFilesAgreesWithGit(t *testing.T) {
+	for _, tc := range nestedGitignoreCases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{}
+			for _, file := range tc.files {
+				files[file] = "x"
+			}
+			for file, content := range tc.gitignores {
+				files[file] = content
+			}
+			if got := gitCheckIgnore(t, files, tc.files); !reflect.DeepEqual(got, tc.ignored) {
+				t.Errorf("git ignores %q\n the table says %q", got, tc.ignored)
 			}
 		})
 	}

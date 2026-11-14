@@ -76,7 +76,7 @@ func loadScheduledActorWith(app *App, db mutationQuerier, userID int64, group *s
 	}
 	actor.Verified = verified == 1
 	actor.EmailGrandfathered = grandfathered == 1
-	if app.Design != nil && app.Design.Auth["require_verified"] == "true" && !actor.Verified {
+	if design := app.designConfig(); design != nil && design.Auth["require_verified"] == "true" && !actor.Verified {
 		return nil, fmt.Errorf("task owner must verify their account")
 	}
 	actor.GlobalAdmin = actor.Role == "admin"
@@ -89,7 +89,7 @@ func loadScheduledActorWith(app *App, db mutationQuerier, userID int64, group *s
 	if group != nil {
 		actor.GroupID = *group
 	}
-	if g := app.Group; g != nil && g.Table != "" && g.Key != "" && g.UserField != "" {
+	if g := app.groupConfig(); g != nil && g.Table != "" && g.Key != "" && g.UserField != "" {
 		// Same rules as a request's tenant check (groupMembershipLive): only
 		// live rows count, an email-keyed row needs a verified or
 		// grandfathered address, and an id-keyed row matches the user id.

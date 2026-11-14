@@ -362,22 +362,42 @@ func sweepExpiredRoles(app *App) {
 	}
 	rows.Close()
 	for _, e := range batch {
-		res, err := app.DB.Exec(`
-			DELETE FROM _benmore_user_roles
-			WHERE user_id = ? AND role = ?
-			  AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`,
-			e.userID, e.role)
-		if err != nil {
-			continue
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			// System-driven eviction - no session, no user actor. The
-			// pre-eviction state goes in oldRow so the audit trail shows
-			// "this role existed, was removed by system:expiry".
-			LogAudit(app, "role_expired", "_benmore_user_roles", strconv.FormatInt(e.userID, 10),
-				nil, map[string]any{"user_id": e.userID, "role": e.role}, nil)
+		if err := expireRoleGrant(app, e.userID, e.role); err != nil {
+			log.Printf("rbac: expired grant of %s to user %d was kept: %v", e.role, e.userID, err)
 		}
 	}
+}
+
+// expireRoleGrant deletes one user's expired grants of a role and writes the
+// role_expired audit row in the same transaction. A row that cannot be
+// written keeps the grant for the next sweep: it confers nothing meanwhile
+// (the session loader skips expired grants), and its removal is never left
+// unrecorded.
+func expireRoleGrant(app *App, userID int64, role string) error {
+	tx, err := app.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`
+		DELETE FROM _benmore_user_roles
+		WHERE user_id = ? AND role = ?
+		  AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')`,
+		userID, role)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return err
+	}
+	// System-driven eviction - no session, no user actor. The pre-eviction
+	// state goes in the old values so the audit trail shows "this role
+	// existed, was removed by system:expiry".
+	if err := auditAccountEvent(tx, app, accountAuditRoleExpired, strconv.FormatInt(userID, 10),
+		nil, map[string]any{"user_id": userID, "role": role}, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RegisterRoleRoutes wires the admin endpoints. Mounted from
@@ -637,6 +657,18 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				expires_at = excluded.expires_at,
 				granted_at = CURRENT_TIMESTAMP`,
 			uid, role, groupID, session.UserID, expiresAt)
+		// The audit row is written with the grant: a grant whose row cannot
+		// be written is refused.
+		if err == nil {
+			err = auditAccountEvent(tx, app, accountAuditRoleGranted, strconv.FormatInt(uid, 10),
+				session, nil, map[string]any{
+					"user_id":    uid,
+					"role":       role,
+					"group_id":   groupID,
+					"expires_at": expiresAt,
+					"granted_by": session.UserID,
+				})
+		}
 		if err == nil {
 			err = tx.Commit()
 		}
@@ -644,14 +676,6 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 			serverErrorJSON(w, r, app, "roles grant", fmt.Errorf("grant user_id=%d role=%s: %w", uid, role, err), "grant failed")
 			return
 		}
-		LogAudit(app, "role_granted", "_benmore_user_roles", strconv.FormatInt(uid, 10),
-			session, nil, map[string]any{
-				"user_id":    uid,
-				"role":       role,
-				"group_id":   groupID,
-				"expires_at": expiresAt,
-				"granted_by": session.UserID,
-			})
 		httpJSON(w, http.StatusOK, map[string]any{
 			"user_id":    uid,
 			"role":       role,
@@ -744,16 +768,19 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "grant not found"})
 			return
 		}
-		if err := tx.Commit(); err != nil {
-			serverErrorJSON(w, r, app, "roles update", err, "update failed")
-			return
-		}
-		LogAudit(app, "role_expiry_updated", "_benmore_user_roles", strconv.FormatInt(uid, 10),
+		err = auditAccountEvent(tx, app, accountAuditRoleExpiryUpdated, strconv.FormatInt(uid, 10),
 			session, nil, map[string]any{
 				"user_id":    uid,
 				"role":       role,
 				"expires_at": expiresAt,
 			})
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			serverErrorJSON(w, r, app, "roles update", err, "update failed")
+			return
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": "updated"})
 	})
 
@@ -841,15 +868,11 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 			httpJSON(w, http.StatusNotFound, map[string]any{"error": "grant not found"})
 			return
 		}
-		if err := tx.Commit(); err != nil {
-			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
-			return
-		}
 		auditScope := groupID
 		if revokeAll {
 			auditScope = "all"
 		}
-		LogAudit(app, "role_revoked", "_benmore_user_roles", strconv.FormatInt(uid, 10),
+		err = auditAccountEvent(tx, app, accountAuditRoleRevoked, strconv.FormatInt(uid, 10),
 			session, map[string]any{
 				"user_id":  uid,
 				"role":     role,
@@ -860,6 +883,13 @@ func RegisterRoleRoutes(mux appRouteRegistrar, app *App) {
 				"group_id":   auditScope,
 				"revoked_by": session.UserID,
 			})
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			serverErrorJSON(w, r, app, "roles revoke", err, "revoke failed")
+			return
+		}
 		httpJSON(w, http.StatusOK, map[string]any{"status": "revoked", "group_id": auditScope})
 	})
 }

@@ -98,10 +98,12 @@ func TestCascadeSoftDeleteStaysInDeleterScope(t *testing.T) {
 	} {
 		crudScopeMustExec(t, app.DB, stmt)
 	}
-	app.Hooks = &HookConfig{
-		BeforeDelete: map[string][]Hook{"comments": {{SQL: "SELECT 'pinned comments stay' AS error", When: "pinned = 1"}}},
-		OnDelete:     map[string][]Hook{"comments": {{SQL: "SELECT 1"}}},
-	}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Hooks = &HookConfig{
+			BeforeDelete: map[string][]Hook{"comments": {{SQL: "SELECT 'pinned comments stay' AS error", When: "pinned = 1"}}},
+			OnDelete:     map[string][]Hook{"comments": {{SQL: "SELECT 1"}}},
+		}
+	})
 
 	assertStatus(t, mux, http.MethodDelete, "/api/posts/1", aliceSID, nil, http.StatusOK)
 	if cascadeLive(t, app, "posts", 1) || cascadeLive(t, app, "comments", 1) {

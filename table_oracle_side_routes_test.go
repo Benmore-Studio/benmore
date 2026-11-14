@@ -34,7 +34,9 @@ func TestSideRoutesAnswerUnreadableTablesLikeUnmatchedPaths(t *testing.T) {
 
 	// Share/permissions on an admin-only table answered 403 to a caller who
 	// cannot even list it.
-	app.Access.rules["notes"] = map[AccessOp]string{"all": "admin"}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access.rules["notes"] = map[AccessOp]string{"all": "admin"}
+	})
 	rec = crudScopeRequest(t, mux, http.MethodPost, "/api/notes/1/share", sid, map[string]any{"email": "x@example.com", "permission": "view"})
 	assertUnmatchedAPI(t, "share on unreadable table", rec.Code, rec.Body.String())
 	rec = crudScopeRequest(t, mux, http.MethodGet, "/api/notes/1/permissions", sid, nil)
@@ -43,7 +45,9 @@ func TestSideRoutesAnswerUnreadableTablesLikeUnmatchedPaths(t *testing.T) {
 	assertUnmatchedAPI(t, "revoke on unreadable table", rec.Code, rec.Body.String())
 
 	// A readable table keeps its 403 for a row the caller may not share.
-	app.Access.rules["notes"] = map[AccessOp]string{"read": "everyone"}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access.rules["notes"] = map[AccessOp]string{"read": "everyone"}
+	})
 	rec = crudScopeRequest(t, mux, http.MethodPost, "/api/notes/2/share", sid, map[string]any{"email": "x@example.com", "permission": "view"})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("share of another user's row on a readable table = %d %s, want 403", rec.Code, rec.Body.String())

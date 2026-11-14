@@ -221,7 +221,6 @@ func TestUserTableColumnsAreClassifiedForGenericWrites(t *testing.T) {
 		"username", "email", "phone",
 		"first_name", "last_name", "avatar_url", // profile
 		"verified", "deactivated_at", // account state the panel manages (last-admin guard applies)
-		"last_login_at", // sign-in bookkeeping, read only for display
 	}
 	create, update := protectedCreateFields(f.app, "_benmore_users"), protectedFields(protectedUpdateFields(f.app, "_benmore_users"))
 	cols, err := GetTableColumns(f.db, "_benmore_users")
@@ -350,14 +349,18 @@ func TestAdminPanelIdentifierChangeRevokesCredentials(t *testing.T) {
 		t.Fatalf("the address change has %d audit rows naming the admin and the new address", n)
 	}
 
-	// An admin's own address: allowed, and every session of the account
-	// ends with it, the one that made the change included.
+	// An admin's own address is not changed here
+	// (TestAdminPanelRefusesTheCallersOwnAddress). Where another column signs
+	// the account in, the admin's own change of it is saved, and every
+	// session of the account ends with it, the one that made the change
+	// included.
+	f.app.Design.Auth["identifier"] = "username"
 	second := f.session(userColsAda, "ada@example.com")
-	if w := f.form(ada, "/_admin/api/_benmore_users/update/10", url.Values{"email": {"ada@example.org"}}); w.Code != http.StatusOK || f.user(userColsAda, "email") != "ada@example.org" {
-		t.Fatalf("an admin's own address: %d %s", w.Code, w.Body.String())
+	if w := f.form(ada, "/_admin/api/_benmore_users/update/10", url.Values{"username": {"ada2"}}); w.Code != http.StatusOK || f.user(userColsAda, "username") != "ada2" {
+		t.Fatalf("an admin's own username: %d %s", w.Code, w.Body.String())
 	}
 	if GetSessionFromDB(f.db, ada) != nil || GetSessionFromDB(f.db, second) != nil {
-		t.Fatal("the admin's sessions outlived their own address change")
+		t.Fatal("the admin's sessions outlived their own identifier change")
 	}
 }
 

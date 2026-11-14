@@ -884,7 +884,7 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 	// have persisted bytes even when it returned an error. A public file's
 	// uploader is recorded too, best effort (recordUploadOwner).
 	if err := recordUploadOwner(app, r, destPath); err != nil {
-		return "", "", fmt.Errorf("record upload owner: %w", err)
+		return "", "", &uploadStoreError{err: fmt.Errorf("record upload owner: %w", err), status: http.StatusInternalServerError}
 	}
 
 	if backend != nil {
@@ -906,11 +906,11 @@ func handleFileUploadAt(app *App, r *http.Request, fieldName, folder string, max
 	os.MkdirAll(filepath.Dir(destPath), 0755)
 	dest, err := os.Create(destPath)
 	if err != nil {
-		return "", destPath, fmt.Errorf("save upload: %w", err)
+		return "", destPath, &uploadStoreError{err: fmt.Errorf("save upload: %w", err), status: http.StatusInternalServerError}
 	}
 	defer dest.Close()
 	if _, err := io.Copy(dest, file); err != nil {
-		return "", destPath, fmt.Errorf("write upload: %w", err)
+		return "", destPath, &uploadStoreError{err: fmt.Errorf("write upload: %w", err), status: http.StatusInternalServerError}
 	}
 	return "/" + destPath, destPath, nil
 }
@@ -955,14 +955,36 @@ var errUploadStoreFault = errors.New("save upload: the media store did not accep
 // general terms: its text names the platform's own components, never
 // something the client can change. The account's media allowance, and the
 // errors of local disk or the app's own bucket, pass through.
+//
+// Every one of them but the allowance is an *uploadStoreError: the request
+// was fine and the store failed, so the answer is a 5xx (502 for a store
+// reached over the network, 500 for local disk), never the 400 of a bad
+// request.
 func uploadSaveError(backend StorageBackend, destPath string, err error) error {
 	var allowance *mediaAllowanceError
-	if _, platform := backend.(*CDNStorage); !platform || errors.As(err, &allowance) {
+	if errors.As(err, &allowance) {
 		return fmt.Errorf("save upload: %w", err)
 	}
+	if _, local := backend.(*LocalStorage); local {
+		return &uploadStoreError{err: fmt.Errorf("save upload: %w", err), status: http.StatusInternalServerError}
+	}
+	if _, platform := backend.(*CDNStorage); !platform {
+		return &uploadStoreError{err: fmt.Errorf("save upload: %w", err), status: http.StatusBadGateway}
+	}
 	log.Printf("upload %s: media store: %v", destPath, err)
-	return errUploadStoreFault
+	return &uploadStoreError{err: errUploadStoreFault, status: http.StatusBadGateway}
 }
+
+// uploadStoreError is an upload the server could not store for a reason that
+// is not the client's: the storage backend or the ownership write failed.
+// Its text is the cause, kept server-side; status is the 5xx.
+type uploadStoreError struct {
+	err    error
+	status int
+}
+
+func (e *uploadStoreError) Error() string { return e.err.Error() }
+func (e *uploadStoreError) Unwrap() error { return e.err }
 
 // Names of the upload refusals in refusal_docs.go.
 const (
@@ -989,7 +1011,13 @@ func uploadRefusalStatus(err error) int {
 // paths each mapped the error themselves, and only POST /api/_upload
 // answered the documented 415 and 413; the multipart create and POST
 // /api/_files answered 400 for the same file.
-func writeUploadRefusal(w http.ResponseWriter, err error) {
+//
+// A file the server could not store (*uploadStoreError) is no refusal: it
+// answers its 5xx as a server error does (server_error.go): one general
+// sentence and the request id, the cause in the journal and the request log.
+// The cause used to be the answer, and for local disk it names the server's
+// own directories. The ownership write meeting a busy database answers busy.
+func writeUploadRefusal(w http.ResponseWriter, r *http.Request, app *App, err error) {
 	// The owner account's media allowance on the hosted platform: 507 with
 	// the usage and the way out, like the database limit.
 	if respondMediaAllowance(w, err) {
@@ -1001,7 +1029,15 @@ func writeUploadRefusal(w http.ResponseWriter, err error) {
 	case http.StatusUnsupportedMediaType:
 		httpRefusal(w, err.Error(), status, refusalUploadFileType)
 	default:
-		httpError(w, err.Error(), status)
+		var store *uploadStoreError
+		if !errors.As(err, &store) {
+			httpError(w, err.Error(), status)
+			return
+		}
+		if respondDatabaseBusy(w, r, "upload", err) {
+			return
+		}
+		answerServerErrorJSON(w, app, store.status, noteServerError(r, "upload", err), err, map[string]any{"error": errUploadStoreFault.Error()})
 	}
 }
 
@@ -1080,8 +1116,9 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 			return
 		}
 		// Auth: require a session when the app has auth: configured.
+		var session *Session
 		if NeedsAuth(app) {
-			if session := getSession(app, r); session == nil {
+			if session = getSession(app, r); session == nil {
 				httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 				return
 			}
@@ -1094,6 +1131,11 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 		// CSRF - bypass for bearer.
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpJSON(w, http.StatusForbidden, map[string]any{"error": "invalid CSRF token"})
+			return
+		}
+		// A scoped credential stores a file only for a table it may write
+		// (scoped_credential_routes.go).
+		if !requireUploadTableScope(w, r, app, session) {
 			return
 		}
 
@@ -1118,7 +1160,7 @@ func RegisterUploadRoute(mux appRouteRegistrar, app *App) {
 		// Returns the stored path/URL.
 		savedURL, err := HandleFileUpload(app, r, "file", kind, 0, nil)
 		if err != nil {
-			writeUploadRefusal(w, err)
+			writeUploadRefusal(w, r, app, err)
 			return
 		}
 		if savedURL == "" {

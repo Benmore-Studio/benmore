@@ -1001,7 +1001,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 	if accountDeactivated(deactivated) {
 		return nil, fmt.Errorf("the account this job was queued for is deactivated; not run")
 	}
-	if app.Design != nil && app.Design.Auth["require_verified"] == "true" && verified != 1 {
+	if design := app.designConfig(); design != nil && design.Auth["require_verified"] == "true" && verified != 1 {
 		return nil, fmt.Errorf("the account this job was queued for is not verified; not run")
 	}
 	actor.Verified, actor.EmailGrandfathered = verified == 1, grandfathered == 1
@@ -1031,7 +1031,7 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 	// would still be in it: getSession keeps a cached tenant while its
 	// membership is live and otherwise re-resolves one by email. An admin
 	// keeps the tenant it worked in.
-	if g := app.Group; actor.GroupID != "" && g != nil && g.Table != "" && g.UserField != "" && !actor.IsAdmin() &&
+	if g := app.groupConfig(); actor.GroupID != "" && g != nil && g.Table != "" && g.UserField != "" && !actor.IsAdmin() &&
 		!groupMembershipLive(app.DB, g, actor, actor.GroupID) && ResolveGroupID(app.DB, g, actor.Email) != actor.GroupID {
 		return nil, fmt.Errorf("the account this job was queued for is no longer a member of the job's tenant; not run")
 	}
@@ -1054,9 +1054,9 @@ func flowJobActorCheck(app *App, flow *Flow, saved *flowJobActorSnapshot, data m
 		if !slices.Contains(kept, actor.Role) {
 			actor.Role = ""
 		}
-		if app.Roles != nil {
-			actor.accessTables = app.Roles.accessTables
-			if roleScopes := app.Roles.sessionRoleScopes(actor, kept); roleScopes != "" {
+		if roles := app.rolesConfig(); roles != nil {
+			actor.accessTables = roles.accessTables
+			if roleScopes := roles.sessionRoleScopes(actor, kept); roleScopes != "" {
 				actor.Scopes = intersectScopes(actor.Scopes, roleScopes)
 			} else {
 				actor.Scopes = "_none_:read"
@@ -1216,6 +1216,7 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 	}
 
 	executeSteps(ctx, targetFlow.Steps)
+	sealFlowTxReadAudit(ctx)
 	if ctx.Tx != nil {
 		if ctx.Error != nil {
 			rbErr := ctx.Tx.Rollback()
@@ -1252,7 +1253,7 @@ func executeFlowJob(app *App, flowName string, data map[string]any) error {
 // (`old_<col>` follows its column), as a row read from the database has it.
 func restoreJobRowIntegers(app *App, table string, row map[string]any) {
 	var columns []Column
-	for _, t := range app.Tables {
+	for _, t := range app.tableList() {
 		if strings.EqualFold(t.Name, table) {
 			columns = t.Columns
 			break
@@ -1295,10 +1296,11 @@ func executeHookJob(app *App, data map[string]any) error {
 	_, commandEffect := data[appMCPEffectKey]
 
 	// Refuse ambiguous tenant routing before running any hook effect.
-	if hook.WS != nil && app.Group != nil && app.Group.Key != "" {
-		group := rowData[app.Group.Key]
+	groupConfig := app.groupConfig()
+	if hook.WS != nil && groupConfig != nil && groupConfig.Key != "" {
+		group := rowData[groupConfig.Key]
 		if group == nil || valueText(group) == "" || valueText(group) == "0" {
-			return fmt.Errorf("ws hook requires the row's tenant key %q", app.Group.Key)
+			return fmt.Errorf("ws hook requires the row's tenant key %q", groupConfig.Key)
 		}
 	}
 	hookErr := executeHookResult(app, hook, table, rowData)
@@ -1323,11 +1325,13 @@ func executeHookJob(app *App, data map[string]any) error {
 			userID         int64
 			public         bool
 		}
-		app.mu.RLock()
+		// No app.mu here: each helper reads the published configuration
+		// under the lock itself, and a second read lock taken inside this one
+		// would deadlock behind a reload waiting to publish.
 		targets := canonicalHookRefreshTargets(app, hook.SQL, "")
 		tenant := ""
-		if app.Group != nil && app.Group.Key != "" {
-			tenant = hookRowText(rowData, app.Group.Key)
+		if groupConfig != nil && groupConfig.Key != "" {
+			tenant = hookRowText(rowData, groupConfig.Key)
 		}
 		owner := hookRowText(rowData, "user_id")
 		refreshes := make([]hookRefresh, 0, len(targets))
@@ -1335,7 +1339,6 @@ func executeHookJob(app *App, data map[string]any) error {
 			groupID, userID, public := triggeredWriteScope(app, target, tenant, owner)
 			refreshes = append(refreshes, hookRefresh{table: target, groupID: groupID, userID: userID, public: public})
 		}
-		app.mu.RUnlock()
 		for _, r := range refreshes {
 			if r.public {
 				BroadcastUnscoped(app, r.table, "refresh")
@@ -1637,8 +1640,8 @@ func jobPayloadHiddenKey(app *App, key string) bool {
 	if appSecretColumn(nil, "", key) || strings.HasSuffix(key, blindColSuffix) {
 		return true
 	}
-	if app != nil && app.Encrypted != nil {
-		for _, defs := range app.Encrypted.Fields {
+	if encrypted := app.encryptedConfig(); encrypted != nil {
+		for _, defs := range encrypted.Fields {
 			for _, def := range defs {
 				if strings.EqualFold(def.Column, key) {
 					return true

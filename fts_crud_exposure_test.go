@@ -3,9 +3,7 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -18,10 +16,7 @@ import (
 // user's owner-scoped rows straight out of `notes_fts`.
 func TestFTSIndexTablesAreNotCRUDExposed(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, body TEXT)`)
 	tables := []Table{{Name: "notes", Columns: []Column{

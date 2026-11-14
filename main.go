@@ -12,7 +12,7 @@ import (
 // version is the release version. It defaults to the value baked here and is
 // overridden at release time via -ldflags "-X main.version=<tag>" (see the
 // public edition's .goreleaser.yaml).
-var version = "2.7.333"
+var version = "2.7.334"
 
 type appMCPCLIUsageError string
 
@@ -238,8 +238,8 @@ func usageText() string {
   benmore test [dir] [--app|--framework] [--json]
 ` + operatorUsageText() + `  benmore mcp inspect <appdir> --json   Inspect source connector candidates
   benmore mcp generate <appdir> --openapi <file> --out <file>
-  benmore mcp check <appdir>            Validate source connector bindings
-  benmore mcp review <appdir> --reviewed   Bind reviewed manifest to current source
+  benmore mcp check <appdir> [--summary]   Validate source connector bindings (JSON; --summary for a short text)
+  benmore mcp review <appdir> --reviewed [--summary]   Bind reviewed manifest to current source
 ` + docsUsageLines + `  benmore version [--json]
   benmore help [all|<command>]      Common workflows; all = this list; <command> = one command
 ` + platformUsageText()

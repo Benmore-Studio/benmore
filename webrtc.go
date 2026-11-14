@@ -110,6 +110,13 @@ func defaultSTUN() iceServer {
 // shape. Credentials are minted per app and caller, never shared.
 func RegisterWebRTCRoute(mux appRouteRegistrar, app *App) {
 	mux.HandleFunc("GET /api/_webrtc/ice", func(w http.ResponseWriter, r *http.Request) {
+		// TURN credentials are minted for the account, and no table scope
+		// names them: a scoped credential is refused, unless the app hands
+		// them to anonymous callers too (then it is answered as one).
+		if session := getSession(app, r); scopedCredential(session) && !broadcastAllowAnon(app) {
+			requireAccountManagement(w, session)
+			return
+		}
 		ice := []iceServer{defaultSTUN()}
 		if principal := turnPrincipal(app, r); principal != "" {
 			ice = buildICEServers(app, principal)
@@ -330,7 +337,7 @@ func cloudflareTURNCreds(app *App, scope, principal string) []iceServer {
 // address and spend the app's turnMintLimiter budget). "" means the caller
 // gets STUN only.
 func turnPrincipal(app *App, r *http.Request) string {
-	if sess := getSession(app, r); sess != nil && sess.UserID > 0 {
+	if sess := getSession(app, r); sess != nil && sess.UserID > 0 && !scopedCredential(sess) {
 		return fmt.Sprintf("user:%d", sess.UserID)
 	}
 	if broadcastAllowAnon(app) {

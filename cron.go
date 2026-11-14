@@ -723,6 +723,7 @@ func runCronJob(app *App, j CronJob, data map[string]any) (err error) {
 	// step.Retry, step.OnError, and ctx.Stopped exactly like every other
 	// step-running surface. ctx.Error carries the first step failure.
 	executeSteps(ctx, steps)
+	sealFlowTxReadAudit(ctx)
 
 	if ctx.Tx != nil {
 		if ctx.Error != nil {

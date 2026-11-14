@@ -20,14 +20,23 @@ package main
 //	{"error":"database_busy","message":"the database is busy, retry shortly",
 //	 "request_id":"<id>","docs":"recovery.write_lock"}
 //
-// Every server error of a route under /api/ passes through serverErrorStatus
-// or serverErrorJSONBody (server_error.go), which give this answer for a busy
-// error, so a route does not have to remember to. A route that answers a
-// write error itself (the 400 of a constraint refusal) asks
-// respondDatabaseBusy first, and a failed flow (on any path) gives it in
-// place of flow_no_response when nothing the run wrote was kept. Routes
-// outside /api/ (pages, form posts, the admin panel, sign-in) keep their own
-// answers.
+// Every server error passes through serverErrorStatus or serverErrorJSONBody
+// (server_error.go), which give this answer for a busy error, so a route does
+// not have to remember to. A route that answers a write error itself (the 400
+// of a constraint refusal, a form's redirect with ?error=) asks
+// respondDatabaseBusy or respondDatabaseBusyText first, and a failed flow (on
+// any path) gives it in place of flow_no_response when nothing the run wrote
+// was kept.
+//
+// The status and headers are the same on every route. The body is the JSON
+// above under /api/, on a JSON route and for a caller that asked for JSON
+// (wantsJSON); a page, a form post or the admin panel answers the same
+// sentence as text, the way a text route answers a server error:
+//
+//	The database is busy, retry shortly (request id: <id>)
+//
+// A sign-in, sign-up or reset form that could not write never answers with a
+// sentence about the caller's credentials or input for it.
 //
 // A busy answer is load, not a fault: it writes one DATABASE BUSY line to the
 // journal, not a SERVER ERROR or FLOW ERROR line, and a 503 is never reported
@@ -47,6 +56,8 @@ const (
 	// databaseBusyCode is the stable `error` value of the busy answer.
 	databaseBusyCode    = "database_busy"
 	databaseBusyMessage = "the database is busy, retry shortly"
+	// databaseBusyText is the sentence of the text form (a page, a form post).
+	databaseBusyText = "The database is busy, retry shortly"
 	// databaseBusyRetryAfter is the Retry-After of the busy answer, in
 	// seconds: the wait was already the busy timeout long, and a write
 	// transaction is over in well under a second unless something is wrong.
@@ -70,6 +81,25 @@ func respondDatabaseBusy(w http.ResponseWriter, r *http.Request, where string, e
 		return false
 	}
 	writeDatabaseBusy(w, noteDatabaseBusy(r, where, serverErrorDetail(where, err)))
+	return true
+}
+
+// respondDatabaseBusyText is respondDatabaseBusy for a route whose own
+// answers are pages, redirects or text: the JSON body under /api/ and for a
+// caller that asked for JSON, the text form otherwise.
+func respondDatabaseBusyText(w http.ResponseWriter, r *http.Request, where string, err error) bool {
+	if apiRoute(r) || (r != nil && wantsJSON(r)) {
+		return respondDatabaseBusy(w, r, where, err)
+	}
+	if !isDatabaseBusyError(err) {
+		return false
+	}
+	id := noteDatabaseBusy(r, where, serverErrorDetail(where, err))
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Set("Retry-After", databaseBusyRetryAfter)
+	h.Set(requestIDHeader, id)
+	http.Error(w, databaseBusyText+" (request id: "+id+")", http.StatusServiceUnavailable)
 	return true
 }
 

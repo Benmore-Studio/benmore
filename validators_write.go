@@ -597,6 +597,13 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 			add(gateComputedYAML, msg)
 		}
 
+	case writesAppRootFile(appDir, path, "admin.yaml"):
+		// Write gate and `benmore check` only: a deployed file with a key
+		// the panel does not read still loads (admin_config.go).
+		if msg := adminYAMLViolation(content); msg != "" {
+			add(gateAdminYAML, msg)
+		}
+
 	case writesAppRootFile(appDir, path, "retention.yaml"):
 		// The load's own reader (retention_document.go), so the gate and
 		// the load cannot disagree. A deployed file with a problem still
@@ -607,7 +614,13 @@ func writeGateVerdict(appDir, path, content string, gate, deferred bool, pending
 
 	case ext == ".yaml" || ext == ".yml":
 		if msg := validateYAMLSyntax(content); msg != "" {
-			add(gateYAMLSyntax, fmt.Sprintf("yaml syntax in %s: %s", path, msg))
+			// A test file has a key of its own: `benmore test` fails the
+			// file too (testrunner.go).
+			if isAppTestFile(appRelativeFile(appDir, path)) {
+				add(gateTestYAMLSyntax, fmt.Sprintf("yaml syntax in %s: %s", path, msg))
+			} else {
+				add(gateYAMLSyntax, fmt.Sprintf("yaml syntax in %s: %s", path, msg))
+			}
 		}
 		// A schema.yaml beside a hand-written schema.sql makes the next
 		// load overwrite that file (schema_file_switch.go).

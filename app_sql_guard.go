@@ -37,7 +37,15 @@ package main
 //   - for a `compliance: hipaa` app, UPDATE and DELETE on the audit tables
 //     and an INSERT that replaces (REPLACE INTO, INSERT OR REPLACE; lexer,
 //     as for RENAME TO), so append-only does not depend on the triggers being
-//     there.
+//     there; and CREATE TRIGGER with a body that writes an audit table at
+//     all (sqlTriggerBodyAuditWrite).
+//
+// The scope lasts as long as SQLite may compile the statement: SQLite
+// compiles a statement again at its first step after the schema changed and
+// asks the authorizer again, and a query's rows are stepped after the driver
+// call has returned. The rows of a marked query and every run of a statement
+// prepared from marked text therefore carry the scope too (appSQLRows,
+// benmoreStmt).
 //
 // Still allowed: reading and writing ROWS of framework tables (INSERT into
 // the audit tables included), DDL on the app's own tables, and DROP TABLE of
@@ -125,6 +133,9 @@ type appSQLScope struct {
 	frameworkTriggers map[string]int
 	dropping          string
 	implicit          int
+	// drops: the text holds a DROP, so frameworkTriggers is counted again
+	// whenever the statement may be compiled again.
+	drops bool
 }
 
 // appSQLRefusedError replaces SQLite's "not authorized".
@@ -295,9 +306,9 @@ func (s *appSQLScope) authorizeMigration(action int, arg1, arg2 string) int {
 // begin is the check made before the statement is compiled, for what the
 // authorizer is not told: the new name of ALTER TABLE ... RENAME TO, and for a
 // hipaa app that an INSERT replaces the row it conflicts with (REPLACE INTO,
-// INSERT OR REPLACE) and what the body of a CREATE TRIGGER will do when it
-// fires, in a statement the framework runs outside any scope. Neither may
-// depend on the audit tables' own triggers being there.
+// INSERT OR REPLACE) and that the body of a CREATE TRIGGER writes an audit
+// table when it fires, in a statement the framework runs outside any scope.
+// Neither may depend on the audit tables' own triggers being there.
 func (s *appSQLScope) begin(query string) error {
 	rename := !s.migration && containsFold(query, "rename")
 	replace := s.hipaa && containsFold(query, "replace")
@@ -307,7 +318,7 @@ func (s *appSQLScope) begin(query string) error {
 	}
 	toks := sqlTokenize(query)
 	if table := sqlTriggerBodyAuditWrite(toks); trigger && table != "" {
-		s.refuse("%s is append-only under compliance: hipaa: %s may not create a trigger that updates, deletes or replaces its rows.%s", table, s.who(), s.docs())
+		s.refuse("%s is append-only under compliance: hipaa: %s may not create a trigger that writes to it. Add audit rows with an INSERT in a flow step or a hook.%s", table, s.who(), s.docs())
 		return s.end(sqlite3.ErrAuth)
 	}
 	for _, stmt := range sqlTokenStatements(toks) {
@@ -405,12 +416,22 @@ func sqlReplaceTarget(toks []sqlToken) string {
 }
 
 // sqlTriggerBodyAuditWrite names the audit table a CREATE TRIGGER statement in
-// toks would update, delete from or replace rows of when it fires, "" when
-// there is none. A trigger's body is compiled when the trigger fires, by
-// whichever statement fires it, so the authorizer of the statement that
-// creates it is told nothing about the body. A plain INSERT is not a rewrite.
+// toks would write when it fires, "" when there is none. A trigger's body is
+// compiled when the trigger fires, by whichever statement fires it, so the
+// authorizer of the statement that creates it is told nothing about the body.
+//
+// Any write counts, a plain INSERT included: SQLite runs a trigger's INSERT
+// with the conflict policy of the statement that fires the trigger, so
+// `INSERT INTO _benmore_audit_log (id, ...)` in a body replaces audit row id
+// whenever an `INSERT OR REPLACE` or `UPDATE OR REPLACE` on the trigger's
+// table fires it.
+//
+// The statement is read from its TRIGGER keyword to the END that follows a
+// `;`, which only the body's own end does: SQLite accepts BEGIN, END and
+// TRIGGER as plain names (`SELECT 1 AS end`, a column called begin), so
+// counting BEGIN, CASE and END would stop before the write.
 func sqlTriggerBodyAuditWrite(toks []sqlToken) string {
-	name := func(i int) string {
+	audit := func(i int) string {
 		table, _ := sqlObjectName(toks, i)
 		if auditAppendOnlyTable(table) {
 			return sqliteIdentifierFold(table)
@@ -418,40 +439,24 @@ func sqlTriggerBodyAuditWrite(toks []sqlToken) string {
 		return ""
 	}
 	for i := 0; i < len(toks); i++ {
-		if !sqlDDLWord(toks, i, "TRIGGER") {
+		// CREATE [TEMP | TEMPORARY] TRIGGER
+		if !sqlDDLWord(toks, i, "TRIGGER") || (!sqlDDLWord(toks, i-1, "CREATE") && !sqlDDLWord(toks, i-2, "CREATE")) {
 			continue
 		}
-		// The body runs from BEGIN to its END; a CASE inside has an END too.
-		for i++; i < len(toks) && !sqlDDLWord(toks, i, "BEGIN"); i++ {
-		}
-		depth, insert := 1, ""
-		for i++; i < len(toks) && depth > 0; i++ {
-			switch {
-			case sqlDDLWord(toks, i, "CASE"):
-				depth++
-			case sqlDDLWord(toks, i, "END"):
-				depth--
+		for i++; i < len(toks); i++ {
+			if sqlDDLWord(toks, i, "END") && toks[i-1].kind == sqlTokPunct && toks[i-1].text == ";" {
+				break
 			}
 			var table string
 			switch {
-			case toks[i].kind == sqlTokPunct && toks[i].text == ";":
-				insert = ""
-			case sqlDDLWord(toks, i, "UPDATE") && sqlDDLWord(toks, i-1, "DO"):
-				table = insert // INSERT INTO <audit> ... ON CONFLICT DO UPDATE
+			case sqlDDLWord(toks, i, "INTO"): // INSERT [OR ...] INTO, REPLACE INTO
+				table = audit(i + 1)
 			case sqlDDLWord(toks, i, "UPDATE") && sqlDDLWord(toks, i+1, "OR"):
-				table = name(i + 3)
+				table = audit(i + 3)
 			case sqlDDLWord(toks, i, "UPDATE"):
-				table = name(i + 1)
-			case sqlDDLWord(toks, i, "DELETE") && sqlDDLWord(toks, i+1, "FROM"):
-				table = name(i + 2)
-			case sqlDDLWord(toks, i, "REPLACE") && sqlDDLWord(toks, i+1, "INTO"):
-				table = name(i + 2)
-			case sqlDDLWord(toks, i, "INSERT") && sqlDDLWord(toks, i+1, "OR") && sqlDDLWord(toks, i+2, "REPLACE") && sqlDDLWord(toks, i+3, "INTO"):
-				table = name(i + 4)
-			case sqlDDLWord(toks, i, "INSERT") && sqlDDLWord(toks, i+1, "OR") && sqlDDLWord(toks, i+3, "INTO"):
-				insert = name(i + 4)
-			case sqlDDLWord(toks, i, "INSERT") && sqlDDLWord(toks, i+1, "INTO"):
-				insert = name(i + 2)
+				table = audit(i + 1)
+			case sqlDDLWord(toks, i, "FROM") && sqlDDLWord(toks, i-1, "DELETE"):
+				table = audit(i + 1)
 			}
 			if table != "" {
 				return table
@@ -591,11 +596,68 @@ func (c *benmoreConn) beginAppSQL(query string) (string, *appSQLScope, error) {
 	if err := scope.begin(query); err != nil {
 		return query, nil, err
 	}
-	if containsFold(query, "drop") {
+	scope.drops = containsFold(query, "drop")
+	c.openAppSQL(scope)
+	return query, scope, nil
+}
+
+// openAppSQL makes scope the scope of what this connection compiles next.
+// Caller holds c.gate and ends it with endAppSQL.
+func (c *benmoreConn) openAppSQL(scope *appSQLScope) {
+	if scope.drops {
 		scope.frameworkTriggers = c.frameworkTriggerCounts()
 	}
 	c.appSQL = scope
-	return query, scope, nil
+}
+
+// reopenAppSQL opens a new scope of the kind a statement was prepared under,
+// for one run of it; nil for a statement prepared from unmarked text. Caller
+// holds c.gate.
+func (c *benmoreConn) reopenAppSQL(prepared *appSQLScope) *appSQLScope {
+	if prepared == nil {
+		return nil
+	}
+	scope := &appSQLScope{hipaa: prepared.hipaa, migration: prepared.migration, drops: prepared.drops}
+	c.openAppSQL(scope)
+	return scope
+}
+
+// appSQLRows are the rows of a marked query. database/sql steps them after
+// QueryContext has returned, the first step included, and SQLite compiles the
+// statement again at that step when another connection changed the schema in
+// between. `SELECT 1; DROP TRIGGER IF EXISTS <framework trigger>` compiled to
+// nothing while the trigger was not there, and dropped it at the step, where
+// no scope applied. Every step runs inside the query's scope.
+type appSQLRows struct {
+	*sqlite3.SQLiteRows
+	c       *benmoreConn
+	scope   *appSQLScope
+	stepped bool
+}
+
+// scopedRows keeps scope on rows; rows as they are when the query was not
+// marked.
+func (c *benmoreConn) scopedRows(rows driver.Rows, scope *appSQLScope) driver.Rows {
+	if r, ok := rows.(*sqlite3.SQLiteRows); ok && scope != nil {
+		return &appSQLRows{SQLiteRows: r, c: c, scope: scope}
+	}
+	return rows
+}
+
+func (r *appSQLRows) Next(dest []driver.Value) error {
+	c := r.c
+	c.gate.Lock()
+	if r.stepped {
+		c.appSQL = r.scope
+	} else {
+		// The step that may compile again: count the triggers as they are now.
+		r.stepped = true
+		c.openAppSQL(r.scope)
+	}
+	err := r.SQLiteRows.Next(dest)
+	c.appSQL = nil
+	c.gate.Unlock()
+	return r.scope.end(err)
 }
 
 // frameworkTriggerCounts is appSQLScope.frameworkTriggers for this

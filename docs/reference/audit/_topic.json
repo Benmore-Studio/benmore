@@ -11,6 +11,7 @@
     "flow_writes",
     "flow_writes_example",
     "account_events",
+    "sign_ins",
     "values_format",
     "absent_values",
     "control_plane",

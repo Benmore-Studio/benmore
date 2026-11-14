@@ -63,7 +63,15 @@ func credCount(t *testing.T, db *sql.DB, query string, args ...any) int {
 
 func snapshotTo(t *testing.T, db *sql.DB, path string) {
 	t.Helper()
-	if _, err := db.Exec("VACUUM INTO ?", path); err != nil {
+	// Through a second, read-only connection, as the product's own backups are
+	// taken: the served driver allows no attached database, and VACUUM INTO
+	// attaches its target.
+	var seq int
+	var name, file string
+	if err := db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqliteVacuumInto(file, path); err != nil {
 		t.Fatal(err)
 	}
 }

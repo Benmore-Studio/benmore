@@ -478,7 +478,8 @@ a{color:inherit;border:1px solid currentColor;border-radius:8px;padding:10px 20p
 // a manifest for apps with only a site name or brand color; a static page
 // registers a worker only when the app asked for one.
 func pwaConfigured(app *App) bool {
-	return app != nil && app.Design != nil && len(app.Design.PWA) > 0
+	design := app.designConfig()
+	return design != nil && len(design.PWA) > 0
 }
 
 var (

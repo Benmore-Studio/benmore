@@ -14,9 +14,11 @@ import (
 func TestSignedURL_SoftDeletedRecordCannotAuthorize(t *testing.T) {
 	app, mux, cleanup := signedURLApp(t)
 	defer cleanup()
-	mustExec(t, app.DB, "ALTER TABLE docs ADD COLUMN deleted_at DATETIME")
-	app.Tables = []Table{{Name: "docs", Columns: []Column{{Name: "id"}, {Name: "user_id"}, {Name: "file_url"}, {Name: "deleted_at"}}}}
-	app.Access = &AccessConfig{rules: map[string]map[AccessOp]string{"docs": {OpRead: "everyone"}}}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		mustExec(t, app.DB, "ALTER TABLE docs ADD COLUMN deleted_at DATETIME")
+		app.Tables = []Table{{Name: "docs", Columns: []Column{{Name: "id"}, {Name: "user_id"}, {Name: "file_url"}, {Name: "deleted_at"}}}}
+		app.Access = &AccessConfig{rules: map[string]map[AccessOp]string{"docs": {OpRead: "everyone"}}}
+	})
 
 	tok := createCrudScopeSession(t, app, "reader@example.com", "user", "", "")
 	if code, _ := mintSignedURL(t, mux, tok, "path=private/secret.pdf&record_table=docs&record_id=1"); code != http.StatusOK {

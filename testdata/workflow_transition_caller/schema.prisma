@@ -9,3 +9,14 @@ model Request {
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
   @@map("requests")
 }
+
+// An approver reads every notice; only its author changes it (app.yaml).
+model Notice {
+  id        Int      @id @default(autoincrement())
+  title     String
+  status    String   @default("draft")           // moved only by workflows.yaml
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+  @@map("notices")
+}

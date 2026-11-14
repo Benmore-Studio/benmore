@@ -593,6 +593,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		revokePasskeys := formFlagTrue(r.FormValue("revoke_passkeys"))
 		userEmail, err := changeSignedInPasswordWith(app, session, proofHash, string(newHash), revokePasskeys)
 		if err != nil {
+			if respondDatabaseBusyText(w, r, "password change", err) {
+				return
+			}
 			log.Printf("settings: password change for user %d: %v", session.UserID, err)
 			settingsRedirect(w, r, app, "Unable to change password")
 			return
@@ -625,6 +628,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		parseSettingsForm(w, r)
+		// A JSON body carries the same fields, as on /settings/password: the
+		// CSRF and current-password checks below read them from r.Form.
+		mergeJSONBodyIntoForm(r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return
@@ -662,6 +668,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		if err := requestEmailChange(app, r, session.UserID, newEmail); err != nil {
 			var failure *emailChangeFailure
 			if errors.As(err, &failure) {
+				if respondDatabaseBusyText(w, r, "email change", failure.cause) {
+					return
+				}
 				noteServerError(r, "email change", failure.cause)
 			}
 			settingsRedirect(w, r, app, err.Error())
@@ -689,6 +698,9 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 			return
 		}
 		parseSettingsForm(w, r)
+		// A JSON body carries `confirm` like a form; the CSRF and
+		// direct-sign-in checks below are the same for every encoding.
+		mergeJSONBodyIntoForm(r)
 		if !validateCSRF(r) {
 			httpError(w, "Invalid CSRF", http.StatusForbidden)
 			return
@@ -708,9 +720,13 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 
 		// Every framework credential and identifier goes, atomically; the
 		// row is left as a non-login tombstone (deleteOwnAccount).
-		if err := deleteOwnAccount(app, session); err != nil {
+		files, err := deleteOwnAccount(r.Context(), app, session)
+		if err != nil {
 			if errors.Is(err, errLastDurableAdmin) {
 				settingsRedirect(w, r, app, "You are this app's last admin. Make another account an admin first, then delete this one.")
+				return
+			}
+			if respondDatabaseBusyText(w, r, "account deletion", err) {
 				return
 			}
 			log.Printf("settings: account deletion for user %d: %v", session.UserID, err)
@@ -720,6 +736,15 @@ func registerSettingsRoutes(mux appRouteRegistrar, app *App) {
 		invalidateRequestSession(r)
 
 		clearSessionCookies(w, app.DevMode)
+		// A page that asked for JSON learns what happened to the private
+		// files the account had uploaded: the counts, or that they were
+		// left to the app's own erasure flow (account_delete_uploads.go).
+		if wantsJSON(r) {
+			body := map[string]any{"ok": true, "deleted": true, "redirect": app.Paths.Login}
+			files.addTo(body)
+			httpJSON(w, http.StatusOK, body)
+			return
+		}
 		http.Redirect(w, r, app.Paths.Login, http.StatusSeeOther)
 	})
 }

@@ -133,6 +133,9 @@ func handleRequiredPasswordChange(w http.ResponseWriter, r *http.Request, app *A
 		renderPasswordChange(w, r, app, message, status)
 	}
 	failInternal := func(err error) {
+		if respondDatabaseBusyText(w, r, "password change", err) {
+			return
+		}
 		fail(serverErrorMessage(w, r, app, "password change", err, "Unable to change password"), http.StatusInternalServerError)
 	}
 	// Delegated, scoped and support sessions may not manage credentials.

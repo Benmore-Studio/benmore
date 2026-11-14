@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -63,7 +64,7 @@ func parseFlows(content string) []Flow {
 			case "secret":
 				current.Secret = val
 			case "auth":
-				current.Auth = normalizeFlowAuth(val, current.Name)
+				current.Auth = normalizeFlowAuth(val, current.Name, log.Printf)
 			case "role":
 				current.Role = val
 			}

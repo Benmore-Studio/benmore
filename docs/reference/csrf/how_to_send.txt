@@ -1,1 +1,1 @@
-Either an `X-CSRF-Token` HTTP header OR a `_csrf` form field. Required on all cookie-auth mutations (POST, PATCH, DELETE).
+Either an `X-CSRF-Token` HTTP header OR a `_csrf` form field. Required on all cookie-auth mutations (POST, PATCH, DELETE). A flow route reads the `_csrf` field of a URL-encoded form only: with a JSON or multipart body, send the header.

@@ -15,7 +15,8 @@ package main
 // One source of truth: the keys a mapping takes are the yaml tags of the
 // struct the runner decodes it into (AppTestCase and what it holds), read by
 // reflection, and which action checks which `expect` key is the `step` tag on
-// those same fields. Nothing here lists a key.
+// those same fields. Nothing here lists a key but the two of a `users:` entry,
+// which is an email or a mapping and so reads itself (AppTestUser).
 
 import (
 	"fmt"
@@ -257,13 +258,81 @@ func yamlNodeAt(n *yaml.Node, path ...any) (key, value *yaml.Node) {
 	return key, n
 }
 
+// AppTestUser is one `users:` entry: an account the test creates before its
+// setup runs. An entry is an email (role `user`), or a mapping of `email` and
+// the `role` the account has in the test.
+type AppTestUser struct {
+	Email string
+	Role  string // "" for an entry that names none: `user` for a new account
+	// problem is why the runner refuses the test for this entry
+	// (appTestCaseProblems), nil when it reads the entry in full.
+	problem *appTestProblem
+}
+
+const (
+	// appTestUserShape is what a `users:` entry may be, in a refusal.
+	appTestUserShape = "an entry is an email, or a mapping of `email` and `role`"
+	// appTestUserPlace stands for the entry's place in a problem's text
+	// until the entry's number is known.
+	appTestUserPlace = "\x00"
+)
+
+// UnmarshalYAML reads one `users:` entry. It never fails the decode: an
+// entry it cannot read in full is a problem of its own test, with its line,
+// where a decode error would fail every test of the file. The
+// appTestUserPlace of a problem's text is the entry's place (`users` entry N).
+func (u *AppTestUser) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	refuse := func(kind, key string, line int, text string) {
+		if u.problem == nil {
+			u.problem = &appTestProblem{Kind: kind, Key: key, In: "users", Line: line, Text: text}
+		}
+	}
+	switch node.Kind {
+	case yaml.ScalarNode:
+		u.Email = node.Value
+	case yaml.MappingNode:
+		known := map[string]bool{"email": true, "role": true}
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, value := node.Content[i], node.Content[i+1]
+			if value.Kind == yaml.AliasNode && value.Alias != nil {
+				value = value.Alias
+			}
+			switch {
+			case !known[key.Value]:
+				text := fmt.Sprintf("unknown key `%s` in ", key.Value) + appTestUserPlace
+				if near := nearestKnownKey(key.Value, known); near != "" {
+					text += fmt.Sprintf(" (did you mean `%s`?)", near)
+				} else {
+					text += " (the keys there: `email`, `role`)"
+				}
+				refuse("unknown_key", key.Value, key.Line, text)
+			case value.Kind != yaml.ScalarNode:
+				refuse("bad_value", "users."+key.Value, key.Line, "`"+key.Value+"` of "+appTestUserPlace+" is not text")
+			case key.Value == "email":
+				u.Email = value.Value
+			default:
+				u.Role = value.Value
+			}
+		}
+		if strings.TrimSpace(u.Email) == "" {
+			refuse("bad_value", "users.email", node.Line, appTestUserPlace+" has no `email` ("+appTestUserShape+")")
+		}
+	default:
+		refuse("bad_value", "users", node.Line, appTestUserPlace+" is a list ("+appTestUserShape+")")
+	}
+	return nil
+}
+
 // appTestProblem is one reason a test is failed instead of run.
 type appTestProblem struct {
 	// Kind: unknown_key, no_steps, no_action, many_actions, unchecked_expect,
 	// bad_value or empty_setup.
 	Kind string
 	Key  string // the key the problem is about, when it is about one
-	In   string // unknown_key: the mapping holding it (test, setup, step, expect, files)
+	In   string // unknown_key: the mapping holding it (test, setup, step, expect, files, users)
 	Line int    // 0 when the test has no source line (a generated test)
 	Text string
 }
@@ -363,6 +432,13 @@ func appTestCaseProblems(tc AppTestCase, node *yaml.Node) []appTestProblem {
 	if len(tc.Steps) == 0 {
 		out = append(out, appTestProblem{Kind: "no_steps", Line: lineOf("steps"),
 			Text: "the test has no steps, so it checks nothing (`steps:` takes a list of steps)"})
+	}
+	for i, user := range tc.Users {
+		if user.problem != nil {
+			found := *user.problem
+			found.Text = strings.Replace(found.Text, appTestUserPlace, fmt.Sprintf("`users` entry %d", i+1), 1)
+			out = append(out, found)
+		}
 	}
 	for i, setup := range tc.Setup {
 		if strings.TrimSpace(setup.SQL) == "" {

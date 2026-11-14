@@ -170,6 +170,9 @@ func createPasswordSignInSession(app *App, id int64, email, groupID, binding str
 	}
 	token, err := createSignInSessionTx(tx, id, email, groupID, app.SessionDuration)
 	if err == nil {
+		err = auditSignIn(tx, app, "password", id, email)
+	}
+	if err == nil {
 		_, err = tx.Exec("UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=?", id)
 	}
 	if err == nil {
@@ -218,6 +221,9 @@ func tokenExchangeSessionTx(app *App, id int64, email, groupID, scopes, binding,
 	}
 	token, err = insertSessionRow(tx, id, email, groupID, app.SessionDuration, scopes, loginAtTokenExchange)
 	if err == nil {
+		err = auditSignIn(tx, app, "token_exchange", id, email)
+	}
+	if err == nil {
 		_, err = tx.Exec("UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=?", id)
 	}
 	if err == nil {
@@ -254,6 +260,7 @@ func completeInlineMFALogin(w http.ResponseWriter, r *http.Request, app *App, id
 	if !validateMFACodeWith(tx, id, code) {
 		tx.Rollback()
 		recordLoginAttempt(app.DB, mfaKey, false)
+		auditSignInRefused(app, "totp", "invalid_code", id, email)
 		authRedirect(w, r, app.Paths.Login, "Invalid MFA code")
 		return
 	}
@@ -262,6 +269,9 @@ func completeInlineMFALogin(w http.ResponseWriter, r *http.Request, app *App, id
 		otpCode, otpToken, err = prepareLoginOTPTx(app, tx, id, email, key, binding)
 	} else {
 		sessionID, err = createSignInSessionTx(tx, id, email, groupID, app.SessionDuration)
+		if err == nil {
+			err = auditSignIn(tx, app, "totp", id, email)
+		}
 	}
 	if err == nil {
 		_, err = tx.Exec("UPDATE _benmore_users SET last_login_at=datetime('now') WHERE id=?", id)

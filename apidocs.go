@@ -174,7 +174,7 @@ func generateAPIDocs(app *App, viewer docsViewer) map[string]any {
 	// Pages
 	pages := make([]map[string]string, 0)
 	for route, page := range app.Pages {
-		if !viewer.showsPage(page) {
+		if !viewer.showsPage(app, page) {
 			continue
 		}
 		p := map[string]string{"route": route, "file": page.File}
@@ -1163,7 +1163,7 @@ func renderDocsMarkdownFor(app *App, viewer docsViewer) string {
 		sb.WriteString("## Pages\n\n")
 		routes := make([]string, 0, len(app.Pages))
 		for route, page := range app.Pages {
-			if viewer.showsPage(page) {
+			if viewer.showsPage(app, page) {
 				routes = append(routes, route)
 			}
 		}

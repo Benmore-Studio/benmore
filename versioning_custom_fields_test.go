@@ -11,7 +11,7 @@ import (
 func TestCustomFieldAddPreservesAllEncryptedHistory(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "rollback"}[corrupt], func(t *testing.T) {
-			app, _ := newCrudScopeTestApp(t)
+			app := newCrudScopeApp(t)
 			token := createCrudScopeSession(t, app, "history-admin@example.com", "admin", "", "")
 			path := filepath.Join(app.Dir, "data.db")
 			key := bytesKey(0x31)

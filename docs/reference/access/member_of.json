@@ -15,6 +15,7 @@
     "Roster rule (the membership table scoped by itself, `room_members: member-of:room_members(room_id, member_id)`): a member sees and, under `all:`, edits only the membership rows of rooms they belong to.",
     "member-of REPLACES owner scoping on the governed op (members see each other's rows - that's the point). Record-level ACL grants (permissions API) still OR in.",
     "Admins (not stepped into a tenant) bypass, like every mode. Malformed declarations fail closed - a typo 404s the endpoint instead of widening it; the write-time validator catches the syntax.",
-    "Real-time: WS/SSE mutation events for member-of tables carry only {table, action} - clients re-fetch through the gated API, so no row data leaks to non-members. To gate the WS ROOM itself (who may join/broadcast), pair with ws_rooms: - see api({at:'websocket'})."
+    "Real-time: WS/SSE mutation events for member-of tables carry only {table, action} - clients re-fetch through the gated API, so no row data leaks to non-members. To gate the WS ROOM itself (who may join/broadcast), pair with ws_rooms: - see api({at:'websocket'}).",
+    "A rule that names a membership table or column the app does not have is accepted and loads, and every request it gates fails for everyone but admins (a server error, never rows). `benmore check` and the answer to a write of app.yaml warn about it once per table and rule, naming the operations it is written for and the app's tables or the membership table's columns. A membership table or view that one of the app's migrations/ files creates counts as present, and its columns are not judged from the sources."
   ]
 }

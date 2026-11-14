@@ -16,6 +16,10 @@ import (
 func generatedTimestampFixture(t *testing.T, prismaTouch, encrypted bool) (*App, *http.ServeMux, string, string) {
 	t.Helper()
 	app, mux := newCrudScopeTestApp(t)
+	// That mux is wanted for the framework tables it creates; the routes under
+	// test are registered below. Its workers end here, so the configuration
+	// this fixture and its tests set is not written under them.
+	quiesceTestApp(t, app)
 	attribute := ""
 	if prismaTouch {
 		attribute = " @updatedAt"

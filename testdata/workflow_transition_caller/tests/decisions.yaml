@@ -97,3 +97,63 @@ a_transition_hook_reads_the_state_it_leaves:
     - api: "POST /api/requests/7006/transition"
       json: { to: "ordered" }
       expect: { status: 422, contains: "condition not met" }
+
+a_before_update_hook_reads_the_stored_values_on_an_edit:
+  as_user: "eve@decisions.test"
+  as_role: "approver"
+  setup:
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7201, 'Submitted desk', 1000, 'submitted', 99999)"
+    - sql: "INSERT INTO requests (id, title, amount_cents, status, user_id) VALUES (7202, 'Eves draft', 1000, 'draft', {{user_id}})"
+  steps:
+    # old_status and old_amount_cents are the row as stored, in `when:` and
+    # in the hook SQL.
+    - api: "PATCH /api/requests/7201"
+      json: { amount_cents: 5000 }
+      expect: { status: 422, contains: "the amount of a submitted request cannot go up (it is 1000)" }
+    - sql: "SELECT id FROM requests WHERE id = 7201 AND amount_cents = 1000"
+      expect: { rows: 1 }
+    - api: "PATCH /api/requests/batch"
+      json: { ids: [7201], fields: { amount_cents: 6000 } }
+      expect: { status: 422, contains: "cannot go up" }
+    - sql: "SELECT id FROM requests WHERE id = 7201 AND amount_cents = 1000"
+      expect: { rows: 1 }
+    - api: "PATCH /api/requests/7201"
+      json: { amount_cents: 500 }
+      expect: { status: 200 }
+    - api: "PATCH /api/requests/7202"
+      json: { amount_cents: 5000 }
+      expect: { status: 200 }
+    - sql: "SELECT id FROM requests WHERE (id = 7201 AND amount_cents = 500) OR (id = 7202 AND amount_cents = 5000)"
+      expect: { rows: 2 }
+
+a_reader_who_may_not_change_a_row_is_offered_no_move:
+  as_user: "dan@decisions.test"
+  as_role: "approver"
+  setup:
+    - sql: "INSERT INTO notices (id, title, status, user_id) VALUES (7101, 'Someone elses notice', 'draft', 99999)"
+    - sql: "INSERT INTO notices (id, title, status, user_id) VALUES (7102, 'Dans notice', 'draft', {{user_id}})"
+  steps:
+    # An approver reads the notice; only its author changes it, so no move
+    # is offered and the route refuses the one a reader tries.
+    - get: "/api/notices/7101"
+      expect: { status: 200, contains: "Someone elses notice" }
+    - get: "/api/notices/7101/transitions"
+      expect:
+        status: 200
+        json: { current: draft }
+        contains: '"transitions":[]'
+    - api: "POST /api/notices/7101/transition"
+      json: { to: "published" }
+      expect: { status: 404 }
+    - sql: "SELECT id FROM notices WHERE id = 7101 AND status = 'draft'"
+      expect: { rows: 1 }
+    # The author is offered the move and makes it.
+    - get: "/api/notices/7102/transitions"
+      expect:
+        status: 200
+        contains: '"to":"published"'
+    - api: "POST /api/notices/7102/transition"
+      json: { to: "published" }
+      expect:
+        status: 200
+        json: { from: draft, to: published }

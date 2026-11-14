@@ -3,6 +3,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -55,6 +57,8 @@ const (
 	adminReadOnlyFramework  = "framework"
 	adminReadOnlyHistory    = "history"
 	adminReadOnlyIndex      = "index"
+	adminReadOnlyEngine     = "engine"
+	adminReadOnlyConfig     = "config"
 )
 
 // frameworkTablePrefix starts the name of every table the framework owns.
@@ -104,7 +108,9 @@ const versionHistorySuffix = "_history"
 
 // adminPanelReadOnlyKind reports why the admin panel does not write table:
 // the name rule (adminReadOnlyKind), then version history, then the engine's
-// own tables (adminEngineOwnedTable). "" for a table it writes.
+// own tables (the sqlite_ prefix, adminEngineOwnedTable), then admin.yaml's
+// `readonly: true`. ""
+// for a table it writes.
 func adminPanelReadOnlyKind(app *App, table string) string {
 	if kind := adminReadOnlyKind(table); kind != "" {
 		return kind
@@ -112,8 +118,19 @@ func adminPanelReadOnlyKind(app *App, table string) string {
 	if adminVersionHistoryTable(app, table) {
 		return adminReadOnlyHistory
 	}
+	// SQLite's own tables (sqlite_sequence, sqlite_stat1, the schema table):
+	// the engine reserves the prefix, so the name is the rule. They are
+	// ordinary tables to PRAGMA table_list, and a generic write on one failed
+	// as a 400 or a 500 instead of being refused.
+	if strings.HasPrefix(sqliteIdentifierFold(table), "sqlite_") {
+		return adminReadOnlyEngine
+	}
 	if adminEngineOwnedTable(app, table) {
 		return adminReadOnlyIndex
+	}
+	// admin.yaml `readonly: true`: the app's choice, for any table.
+	if app.adminConfig().TableReadOnly(table) {
+		return adminReadOnlyConfig
 	}
 	return ""
 }
@@ -189,6 +206,12 @@ func adminReadOnlyMessage(table, kind string) string {
 	if kind == adminReadOnlyIndex {
 		return table + " is a search index table: the admin panel shows it and never writes it. SQLite keeps its rows as the rows of the indexed table change; none can be added, edited or deleted here."
 	}
+	if kind == adminReadOnlyEngine {
+		return table + " is one of the database engine's own tables: the admin panel never writes it. SQLite keeps its rows; none can be added, edited or deleted here."
+	}
+	if kind == adminReadOnlyConfig {
+		return table + " is read-only in admin.yaml: the admin panel shows it and never writes it. Its rows are changed by the app itself (its API and flows); none can be added, edited or deleted here while its admin.yaml entry says `readonly: true`."
+	}
 	if kind == adminReadOnlyGrants {
 		return table + " holds role grants: the admin panel shows it and never writes it. Grant, extend and revoke roles with POST, PATCH and DELETE /api/_auth/users/<id>/roles/<role>, and change the primary role on the user's page."
 	}
@@ -231,7 +254,8 @@ func adminTableHidden(app *App, table string) bool {
 // old and new values of every change), the read audit, locks, custom fields,
 // imports. The condition applies to a table whose name carries the framework
 // prefix and which has that column; an app table's own column of that name
-// is the app's data.
+// is the app's data. The jobs table names the table inside its payload
+// (adminHiddenJobsClause).
 func adminHiddenRowsClause(app *App, table string, cols []Column) (string, []any) {
 	if !strings.HasPrefix(sqliteIdentifierFold(table), frameworkTablePrefix) {
 		return "", nil
@@ -239,6 +263,9 @@ func adminHiddenRowsClause(app *App, table string, cols []Column) (string, []any
 	names := app.adminConfig().HiddenTables()
 	if len(names) == 0 {
 		return "", nil
+	}
+	if identIs(table, adminJobsTable) {
+		return adminHiddenJobsClause(app, names)
 	}
 	for _, col := range cols {
 		if identIs(col.Name, "table_name") {
@@ -272,4 +299,84 @@ func adminRefuseTableWrite(w http.ResponseWriter, r *http.Request, app *App, tab
 		"message": adminReadOnlyMessage(table, kind),
 	}, "admin_table_read_only"))
 	return true
+}
+
+// adminPanelWriteKey marks a request the admin panel's write route hands to
+// the generic create and update handlers.
+type adminPanelWriteKey struct{}
+
+// adminPanelWrite returns r marked as a panel write.
+func adminPanelWrite(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), adminPanelWriteKey{}, true))
+}
+
+// adminRefusedReadOnlyColumn answers a panel create or update that names a
+// column admin.yaml lists under the table's `readonly:` and reports whether
+// it did. The handlers call it with the field names they parsed (form, JSON
+// or multipart alike), so the panel's forms, which have no input for such a
+// column, and a request written by hand get one answer. Any other request
+// (the app's own /api/<table>) passes: admin.yaml is a panel setting.
+func adminRefusedReadOnlyColumn(w http.ResponseWriter, r *http.Request, app *App, table string, fields []string) bool {
+	if r.Context().Value(adminPanelWriteKey{}) == nil {
+		return false
+	}
+	config := app.adminConfig()
+	for _, field := range fields {
+		if config.IsReadonly(table, field) {
+			httpJSON(w, http.StatusForbidden, withRefusalDocs(map[string]any{
+				"error":   "admin_column_read_only",
+				"table":   table,
+				"column":  field,
+				"message": fmt.Sprintf("%s.%s is read-only in admin.yaml: the admin panel shows it and never writes it. Nothing was saved; send the request without it.", table, field),
+			}, "admin_column_read_only"))
+			return true
+		}
+	}
+	return false
+}
+
+// adminJobsTable holds queued work; a job of a hook, a webhook subscription
+// or a data-event flow carries the row that raised it.
+const adminJobsTable = "_benmore_jobs"
+
+// adminHiddenJobsClause leaves the jobs about a hidden table out of the jobs
+// pages: a hook or webhook-subscription job names its table in the payload,
+// and a data-event flow's job is named for a flow that runs on that table's
+// rows. Each carries the row, which is what hiding the table keeps out of the
+// panel. CASE, not AND: json_extract fails on a payload that is not JSON.
+func adminHiddenJobsClause(app *App, hidden []string) (string, []any) {
+	args := make([]any, len(hidden))
+	for i, name := range hidden {
+		args[i] = name
+	}
+	marks := "?" + strings.Repeat(", ?", len(hidden)-1)
+	clause := "CASE WHEN json_valid(payload) THEN COALESCE(json_extract(payload, '$._hook.table'), json_extract(payload, '$._webhook_subscription.table'), '') ELSE '' END COLLATE NOCASE NOT IN (" + marks + ")"
+	var flows []any
+	app.mu.RLock()
+	for _, flow := range app.Flows {
+		if strings.HasPrefix(flow.Trigger.Type, "on_") && app.Admin.IsTableHidden(flow.Trigger.Table) {
+			flows = append(flows, flow.Name)
+		}
+	}
+	app.mu.RUnlock()
+	if len(flows) > 0 {
+		clause += " AND NOT (job_type = 'flow' AND flow_name IN (?" + strings.Repeat(", ?", len(flows)-1) + "))"
+		args = append(args, flows...)
+	}
+	return "(" + clause + ")", args
+}
+
+// adminShownRows prepares rows read for a panel page. A job's payload is
+// shown as GET /api/_jobs/<id> returns it (redactJobPayloadForRead): the
+// stored copy holds every column of the row that queued it, the hidden ones
+// included.
+func adminShownRows(app *App, table string, rows []map[string]any) []map[string]any {
+	if identIs(table, adminJobsTable) {
+		for _, row := range rows {
+			if _, has := row["payload"]; has {
+				row["payload"] = redactJobPayloadForRead(app, row["payload"])
+			}
+		}
+	}
+	return rows
 }

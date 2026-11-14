@@ -10,6 +10,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -54,16 +55,20 @@ func runAppMCPCLI(args []string, out io.Writer) error {
 		}
 	}
 	if len(args) < 2 {
-		return appMCPCLIUsageError("usage: benmore mcp {inspect <appdir> --json|check <appdir>|review <appdir> --reviewed|generate <appdir> --openapi <file> --out <file>}")
+		return appMCPCLIUsageError("usage: benmore mcp {inspect <appdir> --json|check <appdir> [--summary]|review <appdir> --reviewed [--summary]|generate <appdir> --openapi <file> --out <file>}")
 	}
 	switch args[0] {
 	case "review":
-		if len(args) != 3 || args[2] != "--reviewed" {
-			return appMCPCLIUsageError("usage: benmore mcp review <appdir> --reviewed (bind a manifest to source you have reviewed; does not enable access)")
+		dir, flags, ok := appMCPCLIDirAndFlags(args[1:], "--reviewed", "--summary")
+		if !ok || !flags["--reviewed"] {
+			return appMCPCLIUsageError("usage: benmore mcp review <appdir> --reviewed [--summary] (bind a manifest to source you have reviewed; does not enable access)")
 		}
-		report, err := reviewAppMCPSource(args[1])
+		report, err := reviewAppMCPSource(dir)
 		if err != nil {
 			return err
+		}
+		if flags["--summary"] {
+			return writeAppMCPSummary(out, "review", report)
 		}
 		return json.NewEncoder(out).Encode(report)
 	case "generate":
@@ -83,9 +88,18 @@ func runAppMCPCLI(args []string, out io.Writer) error {
 			return appMCPCLIUsageError("usage: benmore mcp inspect <appdir> --json")
 		}
 	case "check":
-		if len(args) != 2 {
-			return appMCPCLIUsageError("usage: benmore mcp check <appdir>")
+		dir, flags, ok := appMCPCLIDirAndFlags(args[1:], "--summary")
+		if !ok {
+			return appMCPCLIUsageError("usage: benmore mcp check <appdir> [--summary]")
 		}
+		if flags["--summary"] {
+			report, err := inspectAppMCPSource(dir)
+			if err != nil {
+				return err
+			}
+			return writeAppMCPSummary(out, "check", report)
+		}
+		args = []string{"check", dir}
 	default:
 		return appMCPCLIUsageError(fmt.Sprintf("unknown local connector command %q", args[0]))
 	}
@@ -98,12 +112,116 @@ func runAppMCPCLI(args []string, out io.Writer) error {
 	return encoder.Encode(report)
 }
 
+// appMCPCLIDirAndFlags reads `<appdir>` and the given switches from args, in
+// any order, each switch at most once. ok is false for anything else.
+func appMCPCLIDirAndFlags(args []string, allowed ...string) (dir string, flags map[string]bool, ok bool) {
+	flags = map[string]bool{}
+	for _, arg := range args {
+		switch {
+		case slices.Contains(allowed, arg) && !flags[arg]:
+			flags[arg] = true
+		case strings.HasPrefix(arg, "-") || dir != "":
+			return "", nil, false
+		default:
+			dir = arg
+		}
+	}
+	return dir, flags, dir != ""
+}
+
+// appMCPSummaryToolsShown is how many reviewed tools a summary names.
+const appMCPSummaryToolsShown = 40
+
+// writeAppMCPSummary prints the short form of an inspection, for a person:
+// `benmore mcp check <appdir> --summary` and `mcp review ... --summary`. The
+// document itself (the default output, which scripts read) lists every route,
+// flow, page and source file of the app and passes 100 KB for a small one.
+func writeAppMCPSummary(out io.Writer, command string, report *appMCPInspection) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "mcp %s: ", command)
+	if report.SourceValid {
+		b.WriteString("source valid")
+	} else {
+		b.WriteString("source NOT valid")
+	}
+	if !report.ConnectorEnabled {
+		b.WriteString("; no mcp.yaml: the app declares no connector\n")
+	} else {
+		plural := "s"
+		if len(report.ReviewedTools) == 1 {
+			plural = ""
+		}
+		fmt.Fprintf(&b, ", %d reviewed tool%s\n", len(report.ReviewedTools), plural)
+		if command == "review" {
+			b.WriteString("mcp.yaml now carries these digests. Review binds the manifest to this source; it does not enable access.\n")
+		}
+		fmt.Fprintf(&b, "contract_digest: %s\nexecution_digest: %s\n", report.ContractDigest, report.ExecutionDigest)
+		var tools []string
+		for _, tool := range report.ReviewedTools {
+			name, _ := tool["name"].(string)
+			effect, _ := tool["effect"].(string)
+			if approval, _ := tool["approval"].(string); approval != "" && approval != "none" {
+				effect += ", approval " + approval
+			}
+			tools = append(tools, fmt.Sprintf("%s (%s)", name, effect))
+		}
+		if len(tools) > appMCPSummaryToolsShown {
+			tools = append(tools[:appMCPSummaryToolsShown], fmt.Sprintf("and %d more", len(tools)-appMCPSummaryToolsShown))
+		}
+		if len(tools) > 0 {
+			fmt.Fprintf(&b, "tools: %s\n", strings.Join(tools, ", "))
+		}
+	}
+	kinds, states := map[string]int{}, map[string]int{}
+	for _, entry := range report.Inventory {
+		kinds[entry.Kind]++
+		states[entry.State]++
+	}
+	fmt.Fprintf(&b, "inventory: %d entries (%s); %s\n", len(report.Inventory), appMCPSummaryCounts(kinds), appMCPSummaryCounts(states))
+	if len(report.Warnings) == 0 {
+		b.WriteString("warnings: none\n")
+	} else {
+		fmt.Fprintf(&b, "warnings: %d\n", len(report.Warnings))
+		for _, warning := range report.Warnings {
+			fmt.Fprintf(&b, "  - %s\n", warning)
+		}
+	}
+	if len(report.Unmeasured) > 0 {
+		fmt.Fprintf(&b, "not checked here: %s\n", strings.Join(report.Unmeasured, ", "))
+	}
+	b.WriteString("The whole document, as JSON: benmore mcp check <appdir>\n")
+	_, err := io.WriteString(out, b.String())
+	return err
+}
+
+// appMCPSummaryCounts words a count per name, largest first: "12 crud, 3 ui_source".
+func appMCPSummaryCounts(counts map[string]int) string {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[name], name))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func writeAppMCPCLIHelp(out io.Writer, command string) error {
 	usage := map[string]string{
-		"":         "App-facing MCP source commands (no framework source checkout needed):\n  benmore mcp review <appdir> --reviewed\n  benmore mcp inspect <appdir> --json\n  benmore mcp check <appdir>\n  benmore mcp generate <appdir> --openapi <file> --out <file>\n\nRead benmore docs connector for the complete native manifest and hosted setup.\nReview accepts authored manifests without digests; runtime/upload checks require generated top-level digests. Review again after source edits. Source checks do not enable access.\nCloud/platform owner controls: benmore mcp status|enable|disable <app> --env dev|prod\n",
-		"review":   "Usage: benmore mcp review <appdir> --reviewed\nAfter you review the app source and manifest, bind their digests. This does not enable access.\n",
+		"":         "App-facing MCP source commands (no framework source checkout needed):\n  benmore mcp review <appdir> --reviewed [--summary]\n  benmore mcp inspect <appdir> --json\n  benmore mcp check <appdir> [--summary]\n  benmore mcp generate <appdir> --openapi <file> --out <file>\n\nRead benmore docs connector for the complete native manifest and hosted setup.\nReview accepts authored manifests without digests; runtime/upload checks require generated top-level digests. Review again after source edits. Source checks do not enable access.\nCloud/platform owner controls: benmore mcp status|enable|disable <app> --env dev|prod\n",
+		"review":   "Usage: benmore mcp review <appdir> --reviewed [--summary]\nAfter you review the app source and manifest, bind their digests. This does not enable access.\nPrints the inspection document as JSON; --summary prints the verdict, digests, tools and warnings instead.\n",
 		"inspect":  "Usage: benmore mcp inspect <appdir> --json\nRead-only inventory of reviewed source bindings and unmeasured runtime gates.\n",
-		"check":    "Usage: benmore mcp check <appdir>\nRead-only check of the reviewed manifest and source bindings.\n",
+		"check":    "Usage: benmore mcp check <appdir> [--summary]\nRead-only check of the reviewed manifest and source bindings.\nPrints the inspection document as JSON; --summary prints the verdict, digests, tools and warnings instead.\n",
 		"generate": "Usage: benmore mcp generate <appdir> --openapi <file> --out <file>\nWrite disabled OpenAPI candidates to a new output file; candidates are not deployable manifests.\n",
 	}
 	help, ok := usage[command]

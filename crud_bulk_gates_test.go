@@ -525,18 +525,26 @@ func TestDatabaseBusyWriteAnswers503(t *testing.T) {
 			t.Errorf("%s: a busy answer kept a stack (%d frames) or an error export (%q)", name, len(slot.pcs), slot.exportError)
 		}
 	}
-	// The shared server-error answers give it for a route under /api/ only:
-	// a page, a form post or the admin panel keeps its own 500.
+	// The shared server-error answers give it on every route. A text route
+	// outside /api/ (a page, a form post, the admin panel) says it as text;
+	// under /api/ and from a JSON route the body is JSON.
 	busy := sqlite3.Error{Code: sqlite3.ErrBusy}
-	for path, want := range map[string]int{"/api/t": http.StatusServiceUnavailable, "/settings/profile": http.StatusInternalServerError} {
+	for _, path := range []string{"/api/t", "/settings/profile"} {
 		for name, answer := range map[string]func(http.ResponseWriter, *http.Request){
 			"serverError":     func(w http.ResponseWriter, r *http.Request) { serverError(w, r, &App{}, "t", busy, "Save failed") },
 			"serverErrorJSON": func(w http.ResponseWriter, r *http.Request) { serverErrorJSON(w, r, &App{}, "t", busy, "save failed") },
 		} {
 			w := httptest.NewRecorder()
 			captureLog(t, func() { answer(w, httptest.NewRequest("POST", "https://app.example.com"+path, nil)) })
-			if w.Code != want || (want == http.StatusServiceUnavailable) != (w.Header().Get("Retry-After") == "1") {
-				t.Errorf("%s on %s: %d Retry-After=%q, want %d", name, path, w.Code, w.Header().Get("Retry-After"), want)
+			if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" || w.Header().Get(requestIDHeader) == "" {
+				t.Errorf("%s on %s: %d Retry-After=%q, want 503", name, path, w.Code, w.Header().Get("Retry-After"))
+			}
+			text := name == "serverError" && path == "/settings/profile"
+			if got := strings.HasPrefix(w.Body.String(), "The database is busy, retry shortly (request id: "); got != text {
+				t.Errorf("%s on %s: body %q, text form = %v", name, path, w.Body.String(), text)
+			}
+			if !text && decodeJSONAnswer(t, w)["error"] != "database_busy" {
+				t.Errorf("%s on %s: body %s", name, path, w.Body.String())
 			}
 		}
 	}

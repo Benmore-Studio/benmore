@@ -304,6 +304,37 @@ func TestRestoreDoesNotCountADeactivatedAdminAsUsable(t *testing.T) {
 	}
 }
 
+// The same holds for an admin whose deactivated_at holds an empty string or
+// blanks: no session resolves for it, so it is not a usable admin either.
+func TestRestoreDoesNotCountAnEmptyStringDeactivatedAdminAsUsable(t *testing.T) {
+	for _, stored := range storedDeactivations {
+		t.Run(stored.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db := roleFixtureDB(t, filepath.Join(dir, "data.db"))
+			roleFixtureUsers(t, db, [2]string{"old", "admin"}, [2]string{"bob", "user"})
+			snapshot := filepath.Join(dir, "snapshot.db")
+			snapshotTo(t, db, snapshot)
+			credExec(t, db, `UPDATE _benmore_users SET deactivated_at = ? WHERE username = 'old'`, stored.value)
+			credExec(t, db, `UPDATE _benmore_users SET role = 'admin' WHERE username = 'bob'`)
+
+			got, summary := restoreRoleFixture(t, db, dir, snapshot)
+			// The snapshot has bob as a user. He keeps the admin role he
+			// holds now only when the restore would otherwise leave no admin
+			// who can sign in.
+			wantRole, wantKept := "user", ""
+			if stored.deactivated {
+				wantRole, wantKept = "admin", restoreAdminsKeptLive
+			}
+			if role := roleOf(t, got, "bob"); role != wantRole {
+				t.Errorf("bob = %q, want %q", role, wantRole)
+			}
+			if r := summary.Roles; r.AdminsKept != wantKept || r.UsableAdmins != 1 {
+				t.Errorf("role summary = %+v, want admins kept %q and 1 usable admin", *r, wantKept)
+			}
+		})
+	}
+}
+
 // With no readable live database nothing says which roles were taken away:
 // they stay as the snapshot has them and the summary says so.
 func TestRestoreLeavesRolesWhenLiveIsUnreadable(t *testing.T) {

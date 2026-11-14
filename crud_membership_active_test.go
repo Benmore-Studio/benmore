@@ -24,7 +24,7 @@ func TestDeactivatedMemberCannotReactivateOwnMembership(t *testing.T) {
 }
 
 func testDeactivatedMemberCannotReactivate(t *testing.T, access, peerRole string) {
-	app, mux := newTenantRoleFixture(t, access)
+	app := newTenantRoleApp(t, access)
 	crudScopeMustExec(t, app.DB, "ALTER TABLE company_members ADD COLUMN user_id INTEGER")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE company_members ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 	app.Group.ActiveField = "active"
@@ -37,6 +37,7 @@ func testDeactivatedMemberCannotReactivate(t *testing.T, access, peerRole string
 			app.Tables[i].Columns = cols
 		}
 	}
+	mux := buildAppMux(app, true, "http://localhost")
 	sid, uid := tenantMember(t, app, "lead@example.com", "user", 1, "company_admin")
 	var row int64
 	if err := app.DB.QueryRow("SELECT id FROM company_members WHERE email = 'lead@example.com'").Scan(&row); err != nil {

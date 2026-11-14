@@ -1619,12 +1619,71 @@ func TestSessionHasGroup(t *testing.T) {
 func newTestApp(t *testing.T) (*App, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
+	app := &App{Dir: dir, DB: openTestAppDB(t, dir)}
+	return app, app.Shutdown
+}
+
+// openTestAppDB opens dir's data.db as a served app opens it: the framework
+// driver with the product connection string (WAL, foreign keys enforced, a
+// 10 s busy wait, the write lock taken when a transaction begins).
+//
+// Every fixture that builds a mux needs it. A mux starts workers that write
+// (the context graph rebuild, the job worker's lease sweep) while the test
+// sends requests. On the bare "sqlite3" driver a request that meets one of
+// them is refused at once with "database is locked": a transaction that reads
+// before it writes asks for a lock upgrade, which SQLite never waits for.
+func openTestAppDB(t *testing.T, dir string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := &App{Dir: dir, DB: db}
-	return app, app.Shutdown
+	return db
+}
+
+// rebuildTestMux applies change to an app that already has a mux and returns
+// the mux of the changed configuration.
+//
+// A mux's workers read the app's configuration: the context graph rebuild
+// reads pages, flows, hooks, roles, the group and the encrypted fields with
+// no lock, so a test that assigns one of them after its fixture built a mux
+// writes under a reader. Configure the app before its first mux where the
+// test allows it. A test that changes the configuration between requests
+// uses this instead. It follows a reload: the running worker generation is
+// stopped, the configuration is replaced and the routes are built again.
+// Unlike a reload it first waits for the stopped workers and for queued
+// realtime deliveries, which is what orders the change after every reader.
+func rebuildTestMux(t *testing.T, app *App, dev bool, baseURL string, change func()) *http.ServeMux {
+	t.Helper()
+	quiesceTestApp(t, app)
+	change()
+	mux, err := buildAppMuxChecked(app, dev, baseURL)
+	if err != nil {
+		t.Fatalf("rebuild mux: %v", err)
+	}
+	return mux
+}
+
+// quiesceTestApp is the first half of rebuildTestMux: it ends the app's
+// running worker generation, as a reload does, and returns once those workers
+// and every queued realtime delivery have finished. A test that builds a new
+// mux for each request calls it before changing the configuration between
+// two of them.
+func quiesceTestApp(t *testing.T, app *App) {
+	t.Helper()
+	realtimeFlush()
+	app.mu.Lock()
+	if app.Stop != nil {
+		select {
+		case <-app.Stop:
+		default:
+			close(app.Stop)
+		}
+	}
+	app.Stop = make(chan struct{})
+	app.mu.Unlock()
+	app.workerWG.Wait()
+	app.jobWG.Wait()
 }
 
 func mustExec(t *testing.T, db *sql.DB, q string) {

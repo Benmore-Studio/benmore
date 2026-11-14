@@ -158,11 +158,16 @@ func execStepWS(ctx *FlowContext, step *FlowStep) error {
 	if step.WS == nil || step.WS.Room == "" {
 		return fmt.Errorf("ws step requires room")
 	}
+	// The message leaves out the app's declared blind-index columns
+	// (flows_respond_blind_index.go).
+	messageBuilt := beginFlowResponse(ctx)
+	defer messageBuilt()
 	room := interpolateCtx(step.WS.Room, ctx)
 	if room == "" {
 		return fmt.Errorf("ws step room interpolated to empty string")
 	}
 	payload := interpolateCtxJSON(step.WS.Payload, ctx)
+	messageBuilt()
 	if payload == "" {
 		payload = "{}"
 	}

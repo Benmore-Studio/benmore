@@ -3,7 +3,6 @@
 package main
 
 import (
-	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,10 +17,7 @@ import (
 func ssrTestApp(t *testing.T) *App {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	t.Cleanup(func() { _ = db.Close() })
 	crudScopeMustExec(t, db, `CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, body TEXT)`)
 	app := &App{

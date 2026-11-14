@@ -106,7 +106,9 @@ func TestReportSourcesOwnerScopeAndLiteralFilters(t *testing.T) {
 		t.Fatalf("legacy compatibility: %d %s", w.Code, w.Body.String())
 	}
 	// The page's extra owner constraint also applies to an otherwise broader table.
-	app.Access = accessFromYAML(t, "access:\n  notes: {read: everyone}\n")
+	mux = rebuildTestMux(t, app, false, "https://report.example.invalid", func() {
+		app.Access = accessFromYAML(t, "access:\n  notes: {read: everyone}\n")
+	})
 	if got := reportFixtureRows(t, ssrGet(mux, "/mine", owner)); len(got) != 1 || got[0]["title"] != "owner-visible" {
 		t.Fatalf("page owner restriction: %#v", got)
 	}
@@ -149,11 +151,15 @@ func TestReportSourcesPreserveFailureStatusAndTokenScopes(t *testing.T) {
 			t.Fatalf("%s failure can be cached: %q", tc.route, got)
 		}
 	}
-	app.Access = accessFromYAML(t, "access:\n  notes: {read: off}\n")
+	mux = rebuildTestMux(t, app, false, "https://report.example.invalid", func() {
+		app.Access = accessFromYAML(t, "access:\n  notes: {read: off}\n")
+	})
 	if w := ssrGet(mux, "/report", owner); w.Code != 404 {
 		t.Fatalf("disabled table status %d: %s", w.Code, w.Body.String())
 	}
-	app.Access = accessFromYAML(t, "access:\n  notes: {read: anon}\n")
+	mux = rebuildTestMux(t, app, false, "https://report.example.invalid", func() {
+		app.Access = accessFromYAML(t, "access:\n  notes: {read: anon}\n")
+	})
 	if w := ssrGet(mux, "/mine", ""); w.Code != 401 {
 		t.Fatalf("owner page without identity status %d: %s", w.Code, w.Body.String())
 	}

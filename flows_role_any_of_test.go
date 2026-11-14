@@ -306,7 +306,7 @@ func TestDeployedFlowRoleWithAnEmptyNameAdmitsOnlyAGlobalAdmin(t *testing.T) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
-	flows, err := loadFlowsChecked(dir, true)
+	flows, err := loadFlowsCheckedFromSourcesSkipping(dir, true, nil, false, log.Printf) // as the serving load, which logs
 	log.SetOutput(os.Stderr)
 	if err != nil || len(flows) != 1 {
 		t.Fatalf("loaded %d flows, err %v: a deployed file must keep loading", len(flows), err)

@@ -401,10 +401,11 @@ func tenantRootTable(app *App, table string) bool {
 
 // groupSharedTable reports a table the app declares in groups.shared.
 func groupSharedTable(app *App, table string) bool {
-	if app == nil || app.Group == nil {
+	group := app.groupConfig()
+	if group == nil {
 		return false
 	}
-	for _, t := range app.Group.Shared {
+	for _, t := range group.Shared {
 		if sqliteIdentifierFold(t) == sqliteIdentifierFold(table) {
 			return true
 		}

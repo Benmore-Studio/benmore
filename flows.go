@@ -311,6 +311,7 @@ func runFlowEventTransaction(ctx *FlowContext, f Flow, execute func(*FlowContext
 	}
 
 	execute(ctx)
+	sealFlowTxReadAudit(ctx)
 	committed := false
 	if ctx.Tx != nil {
 		if ctx.Error != nil {
@@ -344,8 +345,8 @@ func flowEventRowTaint(app *App, table string, row map[string]any) map[string]bo
 		"user_email": true, "user_role": true, "user_roles": true, "user_group_id": true,
 		"_group_id": true, "_group_key": true,
 	}
-	if app != nil && app.Group != nil && app.Group.Key != "" {
-		trusted[app.Group.Key] = true
+	if group := app.groupConfig(); group != nil && group.Key != "" {
+		trusted[group.Key] = true
 	}
 	if app != nil {
 		for _, key := range []string{"user_email", "user_role", "user_roles", "user_group_id"} {
@@ -722,6 +723,16 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 	// GET/HEAD/OPTIONS are nullipotent by convention and skip the check.
 	switch r.Method {
 	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		// A flow reads nothing from a multipart body. validateCSRF looks for
+		// its token with r.FormValue, which parses a multipart body unless
+		// the form is already parsed; only a POST had parsed it (above), so a
+		// cookie request to a PUT, PATCH or DELETE flow handed that body's
+		// text fields to a later `run: parse` step and had its `_csrf` field
+		// accepted, where a POST and a Bearer request read neither. ParseForm
+		// reads the query and an urlencoded body only.
+		if r.Form == nil {
+			_ = r.ParseForm()
+		}
 		// Connector dispatch (connectorRead) is an in-process call whose request
 		// carries no cookie; it is recognized only through an unexported context
 		// value no HTTP request can supply.
@@ -918,12 +929,12 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 		// rows with a TRUSTED value (e.g. `WHERE <group_key> = :_group_id`)
 		// instead of trusting a request-supplied group id. This is bound,
 		// never request-tainted, so it stays usable even from sql_dynamic.
-		if app.Group != nil && app.Group.Key != "" && session.EffectiveHasGroup() && !session.IsAdminBypass() {
+		if group := app.groupConfig(); group != nil && group.Key != "" && session.EffectiveHasGroup() && !session.IsAdminBypass() {
 			gid := session.EffectiveGroupID()
 			ctx.Params["_group_id"] = gid
 			ctx.Data["_group_id"] = gid
-			ctx.Data["_group_key"] = app.Group.Key
-			ctx.Params["_group_key"] = app.Group.Key
+			ctx.Data["_group_key"] = group.Key
+			ctx.Params["_group_key"] = group.Key
 		}
 	}
 
@@ -1087,6 +1098,9 @@ func executeFlowHTTPAsWithAPIClient(app *App, flow *Flow, w http.ResponseWriter,
 		ctx.FailedStep, ctx.FailedType = ctx.respondFailureStep, "respond"
 		ctx.errorResponse = true
 	}
+	// compliance: hipaa - the run's read events commit with its writes, or
+	// the run rolls back.
+	sealFlowTxReadAudit(ctx)
 
 	// Commit or rollback transaction
 	committed := false

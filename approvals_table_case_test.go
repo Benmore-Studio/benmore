@@ -73,9 +73,10 @@ func TestApprovalTableNameInAnotherCaseKeepsTheTenantBound(t *testing.T) {
 	if rec := approvalDecide(t, mux, tok["aappr"], okID, "approved"); rec.Code != http.StatusOK || approvalNotifications(t, app, "aappr@example.com") != 1 {
 		t.Fatalf("in-tenant approver decide: %d %s", rec.Code, rec.Body.String())
 	}
-	// A name that matches no table in any case stays a label for any account.
-	_, _, labelID := approvalRequest(t, mux, tok["areq"], "Expense-Claim", "Q3-17", "bappr@example.com", "Travel")
-	if rec := approvalDecide(t, mux, tok["bappr"], labelID, "approved"); rec.Code != http.StatusOK || approvalStoredTable(t, app, labelID) != "Expense-Claim" {
+	// A name that matches no table in any case stays a label, stored as
+	// written, for an approver in the requester's tenant.
+	_, _, labelID := approvalRequest(t, mux, tok["areq"], "Expense-Claim", "Q3-17", "aappr@example.com", "Travel")
+	if rec := approvalDecide(t, mux, tok["aappr"], labelID, "approved"); rec.Code != http.StatusOK || approvalStoredTable(t, app, labelID) != "Expense-Claim" {
 		t.Errorf("approver of a label: %d %s", rec.Code, rec.Body.String())
 	}
 }

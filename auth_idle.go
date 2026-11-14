@@ -72,10 +72,11 @@ func idleTimeoutText(d time.Duration) string {
 // app (idleTimeoutAppYAMLProblem); should one get here it is ignored, and under
 // hipaa it falls back to the 15m ceiling.
 func idleTimeoutFor(app *App) time.Duration {
-	if app.Design == nil {
+	design := app.designConfig()
+	if design == nil {
 		return 0
 	}
-	if v, set := app.Design.Auth["idle_timeout"]; set {
+	if v, set := design.Auth["idle_timeout"]; set {
 		if d, ok := parseIdleTimeout(v); ok && (!app.hipaa() || (d > 0 && d <= hipaaMaxIdleTimeout)) {
 			return d
 		}

@@ -190,6 +190,7 @@ func TestSecurityTxtRouteServesOverrideOr404(t *testing.T) {
 		t.Fatalf("no contact: %d %q", rec.Code, rec.Body.String())
 	}
 
+	quiesceTestApp(t, app)
 	app.Design.SEO["security_contact"] = "security@example.test"
 	rec := get(t, app)
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "text/plain; charset=utf-8" ||
@@ -245,6 +246,7 @@ func TestSSRPagesLinkTheStaticFaviconAndFaviconICOFallsBack(t *testing.T) {
 	}
 
 	// seo.favicon still wins, and only one icon is linked.
+	quiesceTestApp(t, app)
 	app.Design.SEO["favicon"] = "/static/brand.png"
 	body := serve(t, app, "/").Body.String()
 	if !strings.Contains(body, `<link rel="icon" href="/static/brand.png`) || strings.Count(body, `rel="icon"`) != 1 {

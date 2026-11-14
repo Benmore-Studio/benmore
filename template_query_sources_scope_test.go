@@ -340,7 +340,9 @@ func TestReportSourceTenantMetadataAndAuthoring(t *testing.T) {
 	ssrLoadPages(t, app, map[string]string{"bad.html": strings.Replace(valid, "case_documents", "reference_bulletins", 1)})
 	mux := buildAppMux(app, false, "https://offline-report.example.invalid")
 	reportPacketDenied(t, ssrGet(mux, "/bad", sid), 400)
-	app.Group = nil
+	mux = rebuildTestMux(t, app, false, "https://offline-report.example.invalid", func() {
+		app.Group = nil
+	})
 	reportPacketDenied(t, ssrGet(mux, "/my-evidence", sid), 400)
 }
 

@@ -12,9 +12,10 @@ import (
 // lock to any anonymous visitor. It now needs a session, and only a caller
 // who may edit the row is told who holds it.
 func TestLockStatusHidesHolderFromAnonAndReadOnlyCallers(t *testing.T) {
-	app, mux := newCrudScopeTestApp(t)
+	app := newCrudScopeApp(t)
 	EnsureLocksTable(app.DB)
 	app.Access.rules["notes"] = map[AccessOp]string{"read": "anon", "update": "admin"}
+	mux := buildAppMux(app, true, "http://localhost")
 	reader := createCrudScopeSession(t, app, "reader@example.com", "user", "", "")
 	if _, err := app.DB.Exec(`INSERT INTO _benmore_locks (table_name, row_id, user_id, user_email, expires_at)
 		VALUES ('notes', '1', 99, 'editor@example.com', datetime('now', '+1 hour'))`); err != nil {
@@ -35,9 +36,10 @@ func TestLockStatusHidesHolderFromAnonAndReadOnlyCallers(t *testing.T) {
 // A table the caller may not read answers the lock routes exactly like an
 // unmatched /api path (security.md 14f), not a distinct {"error":"not found"}.
 func TestLockRoutesUnreadableTableAnswersUnmatched(t *testing.T) {
-	app, mux := newCrudScopeTestApp(t)
+	app := newCrudScopeApp(t)
 	EnsureLocksTable(app.DB)
 	app.Access.rules["notes"] = map[AccessOp]string{"all": "admin"}
+	mux := buildAppMux(app, true, "http://localhost")
 	user := createCrudScopeSession(t, app, "plain@example.com", "user", "", "")
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		rec := crudScopeRequest(t, mux, method, "/api/notes/1/lock", user, nil)
@@ -72,9 +74,10 @@ func TestCheckLockIgnoresExpiredWithoutWriting(t *testing.T) {
 // An anonymous PATCH on an `update: anon` table holds no lock, so any lock
 // blocks it, as DELETE and batch already did.
 func TestAnonymousPatchHonoursRecordLock(t *testing.T) {
-	app, mux := newCrudScopeTestApp(t)
+	app := newCrudScopeApp(t)
 	EnsureLocksTable(app.DB)
 	app.Access.rules["notes"] = map[AccessOp]string{"read": "anon", "update": "anon"}
+	mux := buildAppMux(app, true, "http://localhost")
 	if _, err := app.DB.Exec(`INSERT INTO _benmore_locks (table_name, row_id, user_id, user_email, expires_at)
 		VALUES ('notes', '1', 99, 'editor@example.com', datetime('now', '+1 hour'))`); err != nil {
 		t.Fatal(err)

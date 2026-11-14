@@ -17,7 +17,7 @@ import (
 // empty string and a NULL. A gotmpl page selects the same columns.
 func maskedValueFixture(t *testing.T) (*App, *http.ServeMux) {
 	t.Helper()
-	app, mux := legacyQueryFixture(t, map[string]string{
+	app := legacyQueryApp(t, map[string]string{
 		"masked.html": legacyQueryPage("", "SELECT id, budget, ratio, motto, empty_note, null_note, private_note FROM projects ORDER BY id"),
 	})
 	for _, col := range []string{"budget INTEGER", "ratio REAL", "motto TEXT", "empty_note TEXT", "null_note TEXT"} {
@@ -40,7 +40,7 @@ func maskedValueFixture(t *testing.T) (*App, *http.ServeMux) {
 			app.Tables[i].Columns = cols
 		}
 	}
-	return app, mux
+	return app, buildAppMux(app, false, legacyQueryBaseURL)
 }
 
 // assertConstantMask checks one masked globex row: every non-NULL encrypted

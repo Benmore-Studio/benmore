@@ -25,9 +25,10 @@ package main
 // meant for the caller. (A single-record read whose query fails still answers
 // its 404 and only records the failure, through noteServerError.) A capacity
 // answer has its own responder: 507 storage full (storage_limit.go) and 503
-// database busy (database_busy.go). A server error of a route under /api/
-// whose cause is a busy database is answered as busy here, in
-// serverErrorStatus and serverErrorJSONBody, so no route has to check for it.
+// database busy (database_busy.go). A server error whose cause is a busy
+// database is answered as busy here, in serverErrorStatus,
+// serverErrorJSONBody and serverErrorWithDetail, so no route has to check for
+// it.
 // Flows record their failures through recordRequestError next to their own
 // FLOW ERROR lines.
 
@@ -140,9 +141,8 @@ func serverError(w http.ResponseWriter, r *http.Request, app *App, where string,
 // its refusals answered JSON (Round 2 B15).
 func serverErrorStatus(w http.ResponseWriter, r *http.Request, app *App, status int, where string, err error, public string) {
 	api := apiRoute(r)
-	// A busy database is load, not a fault (database_busy.go). A route
-	// outside /api/ (a page, a form post) keeps its own answer.
-	if api && respondDatabaseBusy(w, r, where, err) {
+	// A busy database is load, not a fault (database_busy.go).
+	if respondDatabaseBusyText(w, r, where, err) {
 		return
 	}
 	id := noteServerError(r, where, err)
@@ -177,6 +177,9 @@ func answerServerError(w http.ResponseWriter, app *App, status int, id string, e
 // shaped text redacted) and the request id, as text/plain that no cache keeps.
 // The caller decides; everyone else gets serverError's generic text.
 func serverErrorWithDetail(w http.ResponseWriter, r *http.Request, where string, err error, public string) {
+	if respondDatabaseBusyText(w, r, where, err) {
+		return
+	}
 	id := noteServerError(r, where, err)
 	w.Header().Set(requestIDHeader, id)
 	w.Header().Set("Cache-Control", "no-store")
@@ -212,7 +215,7 @@ func serverErrorJSON(w http.ResponseWriter, r *http.Request, app *App, where str
 // keys than "error" (kept as they are) or another 5xx status. body["error"] is
 // the generic text; the request id is added as "request_id".
 func serverErrorJSONBody(w http.ResponseWriter, r *http.Request, app *App, status int, where string, err error, body map[string]any) {
-	if apiRoute(r) && respondDatabaseBusy(w, r, where, err) {
+	if respondDatabaseBusy(w, r, where, err) {
 		return
 	}
 	answerServerErrorJSON(w, app, status, noteServerError(r, where, err), err, body)

@@ -163,7 +163,7 @@ func whenColumns(app *App, q mutationQuerier, table string, row map[string]any) 
 	var tableCols []Column
 	found := false
 	if app != nil {
-		for _, t := range app.Tables {
+		for _, t := range app.tableList() {
 			if t.Name == table {
 				tableCols, found = t.Columns, true
 				break

@@ -151,12 +151,16 @@ func TestMemberOfParentRecognition(t *testing.T) {
 	// Successful creates queued realtime delivery using the current policy.
 	// Finish that delivery before this fixture replaces the policy in place.
 	realtimeFlush()
-	app.Access = accessFromYAML(t, "access:\n  notes: member-of:note_readers(ref, member_id)\n")
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access = accessFromYAML(t, "access:\n  notes: member-of:note_readers(ref, member_id)\n")
+	})
 	if rec := crudScopeRequest(t, mux, http.MethodPost, "/api/notes", sid, map[string]any{"body": "n2"}); rec.Code == http.StatusOK {
 		t.Fatalf("an unprovable parent was accepted: %s", rec.Body.String())
 	}
 	realtimeFlush()
-	app.Access = accessFromYAML(t, "access:\n  posts: member-of:space_members(area_id, member_id)\n")
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access = accessFromYAML(t, "access:\n  posts: member-of:space_members(area_id, member_id)\n")
+	})
 	// posts: the foreign key points elsewhere, so it is not the parent.
 	if rec := crudScopeRequest(t, mux, http.MethodPost, "/api/posts", sid, map[string]any{"body": "p"}); rec.Code == http.StatusOK {
 		t.Fatalf("a table the join column does not reference was treated as the parent: %s", rec.Body.String())

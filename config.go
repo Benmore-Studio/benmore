@@ -1433,6 +1433,87 @@ func (app *App) i18nConfig() *I18n {
 	return app.I18n
 }
 
+// The accessors below are for code that runs beside a reload: a background
+// worker (jobs, scheduled tasks, workflow timeouts) and the helpers it shares
+// with request handlers. Each returns the object a reload last published; take
+// it once and read that copy, so one piece of work sees one configuration.
+// None may be called with app.mu held (a second read lock deadlocks behind a
+// waiting reload). A nil app has no configuration.
+func (app *App) tableList() []Table {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Tables
+}
+func (app *App) hookConfig() *HookConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Hooks
+}
+func (app *App) workflowConfig() *WorkflowConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Workflows
+}
+func (app *App) groupConfig() *GroupConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Group
+}
+func (app *App) accessConfig() *AccessConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Access
+}
+func (app *App) rolesConfig() *RolesConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Roles
+}
+func (app *App) encryptedConfig() *EncryptedFieldConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Encrypted
+}
+func (app *App) designConfig() *DesignConfig {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Design
+}
+
+// partialSources is the partials/ map pages expand <include> from.
+func (app *App) partialSources() map[string]string {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.Partials
+}
+
 // sessionRoleScopes is ResolveScopesForRoles for the roles session s holds,
 // plus the built-in admin role. `user` and `admin` always exist (grants and
 // /_admin/set-role accept both without a roles: entry), and a global admin

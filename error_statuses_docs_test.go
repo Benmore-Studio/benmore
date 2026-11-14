@@ -388,7 +388,7 @@ func TestHeldAPITokenIsToldToSignInAndSetupAnswers403(t *testing.T) {
 // returned, and under compliance: hipaa refuses the read when the event
 // cannot be written.
 func TestAuditLogReadIsRecordedInTheReadAudit(t *testing.T) {
-	app, _ := newCrudScopeTestApp(t)
+	app := newCrudScopeApp(t)
 	EnsureAuditLogTable(app.DB)
 	app.Design = &DesignConfig{Auth: map[string]string{"read_audit": "notes"}}
 	InitReadAudit(app, true)

@@ -81,9 +81,20 @@ func feedbackReadAllowed(app *App, session *Session) bool {
 		return false
 	}
 	if app.FeatureEnabled("testing") {
-		return true
+		// Any sign-in of a draft reads the inbox, but not a credential
+		// narrowed to some table's scopes.
+		return !scopedCredential(session)
 	}
 	return session.IsAdminConsole()
+}
+
+// feedbackSubmitAllowed refuses a scoped credential on POST /api/_feedback.
+// A signed-in submission is stored under the account's address and skips the
+// anonymous limit, and no table scope names the inbox, so a credential
+// narrowed for an integration may not write there as the account. Signed-out
+// visitors and full sign-ins pass.
+func feedbackSubmitAllowed(w http.ResponseWriter, session *Session) bool {
+	return session == nil || requireAccountManagement(w, session)
 }
 
 // feedbackSubmitCSRF gates POST /api/_feedback. Submission is open to
@@ -407,6 +418,9 @@ func registerDemoRoutes(mux appRouteRegistrar, app *App, password string) {
 				return
 			}
 		}
+		if !feedbackSubmitAllowed(w, session) {
+			return
+		}
 		if !feedbackSubmitCSRF(w, r, session) {
 			return
 		}
@@ -564,6 +578,9 @@ func RegisterFeedbackAPI(mux appRouteRegistrar, app *App) {
 	// auto-attached.
 	mux.HandleFunc("POST /api/_feedback", func(w http.ResponseWriter, r *http.Request) {
 		session := getSession(app, r)
+		if !feedbackSubmitAllowed(w, session) {
+			return
+		}
 		if !feedbackSubmitCSRF(w, r, session) {
 			return
 		}
@@ -609,6 +626,9 @@ func RegisterFeedbackAPI(mux appRouteRegistrar, app *App) {
 		session := getSession(app, r)
 		if session == nil {
 			httpJSON(w, http.StatusUnauthorized, map[string]any{"error": "login required"})
+			return
+		}
+		if !requireAccountManagement(w, session) {
 			return
 		}
 		if !feedbackReadAllowed(app, session) {

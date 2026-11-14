@@ -13,7 +13,7 @@ import (
 // workflow state column starts in its initial state, a foreign key must name
 // a parent the founder can read, and constraint errors stay generic.
 func TestGroupBootstrapOrgInsertUsesCreateGates(t *testing.T) {
-	app, mux := newTenantRoleFixture(t, "access:\n  projects: role:company_admin\n")
+	app := newTenantRoleApp(t, "access:\n  projects: role:company_admin\n")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN showcase_project_id INTEGER REFERENCES projects(id)")
 	crudScopeMustExec(t, app.DB, "CREATE UNIQUE INDEX companies_name ON companies(name)")
@@ -32,6 +32,7 @@ func TestGroupBootstrapOrgInsertUsesCreateGates(t *testing.T) {
 		States:      []string{"pending", "approved"},
 		Transitions: map[string]map[string]Transition{"pending": {"approved": {Role: "admin"}}},
 	}}}
+	mux := buildAppMux(app, true, "http://localhost")
 
 	founder := createCrudScopeSession(t, app, "founder@example.com", "user", "", "")
 

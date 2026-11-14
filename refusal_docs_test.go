@@ -507,10 +507,13 @@ func TestWriteGateRefusalAddressesEachIssue(t *testing.T) {
 	if verdict, _ = writeGateVerdict(dir, "schema.prisma", refusalTestSchema, true, false, nil); verdict != (gateVerdict{}) {
 		t.Errorf("a clean file has a verdict: %+v", verdict)
 	}
-	// A rule on the exemption list answers as it always has: no line.
-	verdict, _ = writeGateVerdict(dir, "tests/smoke.yaml", "a: [1\n", true, false, nil)
-	if !strings.Contains(verdict.Message, "yaml syntax") || verdict.Refusal != verdict.Message || verdict.Docs != "" {
-		t.Errorf("an exempt rule's refusal changed: %+v", verdict)
+	// A YAML file no validator owns that does not parse names the key about
+	// its kind: a test file's, or the one for any other YAML file.
+	for file, want := range map[string]string{"tests/smoke.yaml": "verification.test_file_load", "tests/journeys/home.yaml": "verification.yaml_syntax", "data/seed.yaml": "verification.yaml_syntax"} {
+		verdict, _ = writeGateVerdict(dir, file, "a: [1\n", true, false, nil)
+		if !strings.Contains(verdict.Message, "yaml syntax in "+file) || !strings.Contains(verdict.Refusal, "\n"+docsLine(want)+"\n") || verdict.Docs != want {
+			t.Errorf("%s: a YAML syntax error does not name %s: %+v", file, want, verdict)
+		}
 	}
 	// A refusal raised after the validators gets the same line.
 	if got := gateRefusal(gateSchemaDrop, "schema.prisma not written: it removes the model of a table that still holds data"); !strings.HasSuffix(got, "\n"+docsLine("schema.removed_models")) {

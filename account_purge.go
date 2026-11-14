@@ -370,6 +370,11 @@ func purgeAuditLogIdentity(tx *sql.Tx, uid int64, email string) error {
 // caller removes them with deleteAppMCPArtifactBytes once tx commits.
 func purgeAccountTx(c context.Context, app *App, tx *sql.Tx, uid int64, userCols, sessionCols map[string]bool, actorID int64, actorEmail string) (deleted int64, artifactRefs []string, err error) {
 	var oldEmail sql.NullString
+	// The claim is not the "may this account act?" reading (accountActiveSQL):
+	// it takes every row that is not a tombstone yet, and deactivated_at
+	// holding a time is what marks a claimed one. A row holding an empty
+	// string or blanks is deactivated for every reader, but it was never
+	// claimed, so it is still taken here and can be erased.
 	claim := `UPDATE _benmore_users SET deactivated_at=datetime('now') WHERE id=? AND (deactivated_at IS NULL OR trim(CAST(deactivated_at AS TEXT))='') RETURNING email`
 	if err := tx.QueryRow(claim, uid).Scan(&oldEmail); err != nil {
 		if err == sql.ErrNoRows {

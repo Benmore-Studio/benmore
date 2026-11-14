@@ -601,7 +601,7 @@ the workspace, `deploy` prints how many files it left there, and `sync-status`
 lists them as `kept_local`, not as drift. Keep scratch files and credentials in
 such a directory or outside the app directory, and source the app needs in a
 plain one (`.gitignore` does not decide what is uploaded; `deploy` warns after
-uploading a file the root `.gitignore` excludes, see `api(at:"sync-status.excludes")`).
+uploading a file a `.gitignore` excludes, see `api(at:"sync-status.excludes")`).
 
 Feature packs are the clone mechanism for reusable app pieces:
 

@@ -320,3 +320,59 @@ func TestPDFPrintsNoBrowserHeaderOrFooter(t *testing.T) {
 		t.Errorf("page numbers from a CSS page margin box drew %q, want only the characters of \"1 / 2\" and \"2 / 2\"", drawn)
 	}
 }
+
+// A page with `engine: raw` is the author's whole document: a browser gets it
+// as written (plus the CSRF tag), never inside the page shell. GET /pdf
+// wrapped it in the shell anyway, so the renderer was handed a document
+// inside a document: two <html> elements, the shell's title and scripts
+// around the author's own. The renderer gets what the browser gets.
+func TestPDFRouteHandsTheRendererARawPageUnwrapped(t *testing.T) {
+	docPath, _ := capturingPDFChrome(t)
+	app := pdfEverythingOnApp(t)
+	const authored = `<!doctype html><html lang="en"><head><title>Statement 7</title><style>h1{color:#135}</style></head><body><h1>Statement 7</h1><form method="post" action="/api/ack"><button>Seen</button></form></body></html>`
+	statement := &Page{File: "statement.html", Route: "/statement"}
+	setPageAttrsFromSource(statement, "---\nengine: raw\n---\n"+authored) // as the page loader does
+	app.Pages["/statement"] = statement
+	mux := http.NewServeMux()
+	RegisterPDFRoutes(mux, app)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/pdf/statement", nil))
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/pdf" {
+		t.Fatalf("GET /pdf/statement: %d %q", w.Code, w.Body.String())
+	}
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("the renderer never fetched the document: %v", err)
+	}
+	doc := string(raw)
+	if !strings.HasPrefix(doc, `<!doctype html><html lang="en"><head>`) {
+		t.Errorf("the printed raw page does not start with the author's document: %.120q", doc)
+	}
+	for _, once := range []string{"<html", "<title>", "<body", "</html>", `name="csrf-token"`} {
+		if n := strings.Count(doc, once); n != 1 {
+			t.Errorf("the printed raw page holds %q %d time(s), want 1: the shell is wrapped around it", once, n)
+		}
+	}
+	for _, kept := range []string{"<title>Statement 7</title>", "h1{color:#135}", "<h1>Statement 7</h1>", `name="_csrf"`} {
+		if !strings.Contains(doc, kept) {
+			t.Errorf("the printed raw page lost %q", kept)
+		}
+	}
+	for _, shell := range []string{tailwindPath, htmxPath, "tailwind.config", `content="kept"`, ".receipt-theme", "function filterTable(", "Built with Benmore"} {
+		if strings.Contains(doc, shell) {
+			t.Errorf("the printed raw page carries the shell's %q", shell)
+		}
+	}
+	for name, marker := range browserOnlyLayoutMarkers {
+		if strings.Contains(doc, marker) {
+			t.Errorf("the printed raw page carries the %s (%q)", name, marker)
+		}
+	}
+	// What a browser is served for the same page (each render mints its own
+	// CSRF token).
+	token := regexp.MustCompile(`(name="csrf-token" content="|name="_csrf" value=")[^"]*"`)
+	doc = token.ReplaceAllString(doc, `${1}"`)
+	if served := token.ReplaceAllString(string(rawPageDocument(authored, app)), `${1}"`); served != doc {
+		t.Errorf("the printed raw page differs from the served one:\nprinted %q\nserved  %q", doc, served)
+	}
+}

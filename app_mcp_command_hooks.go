@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -326,8 +327,15 @@ func appMCPCommandNeedsRowParity(cap *appMCPCommandCapability, table, action str
 func appMCPCommandHookEffectsSupported(cap *appMCPCommandCapability, table, action string) error {
 	before, on := appMCPHookSets(cap.generation.hooks, action)
 	enrolled := commandTableSet(cap.effectTables())
+	// Read here, before any hook scope opens (commandViewTexts).
+	if _, err := cap.commandViewTexts(); err != nil {
+		return fmt.Errorf("command target has unsupported canonical hooks: %w", err)
+	}
 	for index, set := range []map[string][]Hook{before, on} {
 		for _, hook := range set[table] {
+			if err := commandHookNamedJoinError(cap, hook.SQL, hook.When); err != nil {
+				return fmt.Errorf("command target has unsupported canonical hooks: %w", err)
+			}
 			if !appMCPCommandHookIsSQL(hook) {
 				if index == 0 {
 					return errors.New("command target has unsupported canonical hooks (before-hooks must be read-only SQL)")
@@ -355,6 +363,64 @@ func appMCPCommandHookEffectsSupported(cap *appMCPCommandCapability, table, acti
 					return fmt.Errorf("command %s hook on %q writes table %q, which is not revision-enrolled", action, table, write.Table)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// commandHookDeniedRead is the tables the hook scope denies every read of
+// (authorizeCommandHook): the connector's own stores and SQLite's schema
+// tables. A join by column name is not reported to that authorizer
+// (sql_named_join.go), so a hook's SQL or `when:` (and a workflow transition's
+// `when:`, judged in the same scope) holding one and naming such a table is
+// refused from its text, before any command write.
+func commandHookDeniedRead(name string) bool {
+	folded := strings.ToLower(name)
+	return strings.Contains(folded, "_benmore_mcp_") || strings.Contains(folded, "sqlite_")
+}
+
+var commandHookNamedJoinRefusal = sqlNamedJoinRefusal("an approved command", "a connector store (_benmore_mcp_*) or a schema table (sqlite_*)")
+
+// commandViewTexts returns the text of the database's views, read once in the
+// command's transaction: nothing in a command changes a view. It is first
+// asked before a hooked write runs any hook, because a transition condition
+// is judged inside the hook scope, which denies the schema tables to the
+// reading as it does to the hook. The database's views only: the hook scope
+// denies every read of a temporary object. nil without a transaction.
+func (cap *appMCPCommandCapability) commandViewTexts() (map[string][]string, error) {
+	if cap == nil || cap.tx == nil {
+		return nil, nil
+	}
+	if !cap.viewTextsRead {
+		ctx := cap.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := cap.withInternalRead(func() (err error) {
+			cap.viewTexts, err = sqlMainViewTexts(ctx, cap.tx)
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("the database's views could not be read: %w", err)
+		}
+		cap.viewTextsRead = true
+	}
+	return cap.viewTexts, nil
+}
+
+// commandHookNamedJoinError refuses hook or condition text that joins a table
+// of commandHookDeniedRead by column name, in the text itself or in a view it
+// reads.
+func commandHookNamedJoinError(cap *appMCPCommandCapability, texts ...string) error {
+	views, err := cap.commandViewTexts()
+	if err != nil {
+		return err
+	}
+	for _, text := range texts {
+		if name, viaView := sqlNamedJoinTouchesIn(sqlTextsRead(text, views), commandHookDeniedRead); name != "" {
+			if viaView {
+				return errors.New(sqlNamedJoinViewRefusal("an approved command", "a connector store (_benmore_mcp_*) or a schema table (sqlite_*)"))
+			}
+			return errors.New(commandHookNamedJoinRefusal)
 		}
 	}
 	return nil
@@ -594,11 +660,13 @@ func (exec *appMCPCommandExecution) executeHookedWrite(step *FlowStep, args []an
 				if hasBefore {
 					// As for a CRUD update, hook SQL placeholders are the
 					// columns the command changed; `when:` sees the row.
-					sqlRow := event
+					// Both carry old_<column> from the pre-write row.
+					whenRow, sqlRow := event, event
 					if action == "update" {
-						sqlRow = submittedHookRow(event, &cap.actor)
+						whenRow = withPreviousValues(event, oldRows[i])
+						sqlRow = withPreviousValues(submittedHookRow(event, &cap.actor), oldRows[i])
 					}
-					if err := fireBeforeHooksRows(ctxTx, view, action, key, event, sqlRow); err != nil {
+					if err := fireBeforeHooksRows(ctxTx, view, action, key, whenRow, sqlRow); err != nil {
 						return newAppMCPCommandHookError(table, action, err, true)
 					}
 				}
@@ -753,6 +821,9 @@ func appMCPValidateWorkflowTransition(cap *appMCPCommandCapability, tx appMCPCon
 		if transition.Role != "" && !appMCPCommandHasWorkflowRole(cap, tx, workflow.Table, transition.Role) {
 			return errors.New(workflowRoleRequired(transition.Role))
 		}
+		if err := commandHookNamedJoinError(cap, transition.When); err != nil {
+			return fmt.Errorf("workflow transition condition: %w", err)
+		}
 		if transition.When != "" {
 			// The same row the CRUD transition route judges the condition
 			// over: the stored row, old_<column> and the actor's session keys.
@@ -812,14 +883,14 @@ func appMCPCommandHasWorkflowRole(cap *appMCPCommandCapability, tx appMCPContext
 	}
 	query := "SELECT " + quoteColumn(app.Group.Table, roleField) + " FROM main." + quoteIdent(app.Group.Table) + " WHERE " + quoteColumn(app.Group.Table, app.Group.UserField) + " = ?" + tenant + membershipLiveConds(app.Group, app.Group.Table, "", appColumnChecker(app, app.Group.Table))
 	var role string
-	// Exact, as the CRUD transition route compares (hasWorkflowRole), and
+	// Compared as the CRUD transition route compares (hasWorkflowRole), and
 	// from the same (oldest) membership row.
 	if oldestMembershipRow(func(order string) error {
 		return tx.tx.QueryRowContext(tx.ctx, query+order, args...).Scan(&role)
 	}, quoteColumn(app.Group.Table, roleField)) != nil {
 		return false
 	}
-	return slices.Contains(roles, role)
+	return workflowMembershipRoleAllowed(app, table, roles, role)
 }
 
 func appMCPEnqueueTransitionHooks(cap *appMCPCommandCapability, tx appMCPContextTx, table string, before, after map[string]any) error {

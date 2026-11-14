@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -42,10 +41,7 @@ func encIncludeApp(t *testing.T) (*App, *http.ServeMux, func()) {
 	}
 
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 
 	mustExec(t, db, `CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, secret_note TEXT)`)
 	mustExec(t, db, `CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER, title TEXT,
@@ -185,10 +181,7 @@ func TestEncryptedAsOf_MaskedForUnauthorizedRole(t *testing.T) {
 	defer func() { appEncryptionKey = oldKey }()
 
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 	defer db.Close()
 	mustExec(t, db, `CREATE TABLE vaults (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, secret TEXT, created_at TEXT DEFAULT '2000-01-01')`)
 	cfg := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{
@@ -239,10 +232,7 @@ func TestEncryptedCursor_MaskedForUnauthorizedRole(t *testing.T) {
 	defer func() { appEncryptionKey = oldKey }()
 
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3_benmore", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 	defer db.Close()
 	mustExec(t, db, `CREATE TABLE vaults (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, secret TEXT)`)
 	cfg := &EncryptedFieldConfig{Fields: map[string][]EncryptedFieldDef{
@@ -291,10 +281,7 @@ func TestEncryptedCursor_MaskedForUnauthorizedRole(t *testing.T) {
 func signedURLApp(t *testing.T) (*App, *http.ServeMux, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := openTestAppDB(t, dir)
 
 	// The private file on disk + a `docs` row (owned by user 1) that
 	// references it via file_url stored in the /api/_upload return shape.

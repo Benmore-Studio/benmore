@@ -14,3 +14,11 @@ requests:
       draft:    { when: "old_user_id = user_id" }                    # only the requester
     approved:
       ordered:  { role: approver, when: "amount_cents <= 100000" }
+# A reader who may not change a notice is offered no move.
+notices:
+  table: notices
+  field: status
+  initial: draft
+  transitions:
+    draft:
+      published: {}

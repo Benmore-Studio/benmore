@@ -192,6 +192,13 @@ func TestScopedAdminCredentialCannotStopAnotherUsersBroadcast(t *testing.T) {
 	stop := func(tok, slug string) int {
 		return crudScopeRequest(t, f.mux, http.MethodPost, "/api/_broadcast/stop", tok, map[string]any{"slug": slug}).Code
 	}
+	// The slugs here match no ws_rooms pattern, so a scoped credential reaches
+	// them only with a wildcard write scope (scoped_credential_routes.go).
+	// With one, the admin-console rule is what decides.
+	anyRoom := map[string]string{
+		"admin token *:write":   auditToken(t, f.app, f.allowed["admin session"], "*:write"),
+		"admin session *:write": CreateSession(f.app.DB, f.adminID, "admin@example.com", "", time.Hour, "*:write"),
+	}
 	n := 0
 	for name, tok := range f.allowed {
 		n++
@@ -201,7 +208,7 @@ func TestScopedAdminCredentialCannotStopAnotherUsersBroadcast(t *testing.T) {
 			t.Fatalf("%s stop of another user's stream = %d, still live = %v; want it stopped", name, code, live(slug))
 		}
 	}
-	for name, tok := range f.delegated {
+	for name, tok := range anyRoom {
 		n++
 		slug := fmt.Sprintf("theirs-%d", n)
 		publish(slug, f.otherID)
@@ -213,6 +220,20 @@ func TestScopedAdminCredentialCannotStopAnotherUsersBroadcast(t *testing.T) {
 		publish(mine, f.adminID)
 		if code := stop(tok, mine); code != http.StatusOK || live(mine) {
 			t.Errorf("%s stop of its own stream = %d, still live = %v; want it stopped", name, code, live(mine))
+		}
+	}
+	// Scopes that name only a table stop no stream in a room they do not
+	// cover, the account's own included.
+	for name, tok := range f.delegated {
+		n++
+		for _, c := range []struct {
+			slug      string
+			publisher int64
+		}{{fmt.Sprintf("theirs-%d", n), f.otherID}, {fmt.Sprintf("mine-%d", n), f.adminID}} {
+			publish(c.slug, c.publisher)
+			if code := stop(tok, c.slug); code != http.StatusForbidden || !live(c.slug) {
+				t.Errorf("%s stop of %s = %d, still live = %v; want 403 and the stream kept", name, c.slug, code, live(c.slug))
+			}
 		}
 	}
 }

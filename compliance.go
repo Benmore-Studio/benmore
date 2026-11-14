@@ -177,7 +177,8 @@ func mfaRequiredRoles(app *App) string {
 
 // hipaa reports whether the app opted into `compliance: hipaa`.
 func (a *App) hipaa() bool {
-	return a != nil && a.Design != nil && a.Design.Compliance == complianceHIPAA
+	design := a.designConfig()
+	return design != nil && design.Compliance == complianceHIPAA
 }
 
 // hipaaPublicUploadRefusal is the answer to a public upload kind in a hipaa app.

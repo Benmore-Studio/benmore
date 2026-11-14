@@ -199,6 +199,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 		writeOwnedFieldRefusal(w, v)
 		return
 	}
+	// An admin.yaml read-only column named by an admin panel create
+	// (admin_read_only.go), and the address of an account made there
+	// (user_identifier_update.go).
+	if adminRefusedReadOnlyColumn(w, r, app, table, createKeys) {
+		return
+	}
+	if refusal := userAddressRefusal(app, table, r.Form.Get("email")); refusal != nil {
+		writeUpdateRequestError(w, r, app, table+" create", refusal)
+		return
+	}
 
 	if idempotencyKey != "" && session == nil {
 		httpJSON(w, 401, map[string]any{"error": "idempotency requires authentication"})
@@ -254,7 +264,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, app *App, table string
 					storedUploads = append(storedUploads, dest)
 				}
 				if err != nil {
-					writeUploadRefusal(w, err)
+					writeUploadRefusal(w, r, app, err)
 					return
 				}
 				if path != "" {

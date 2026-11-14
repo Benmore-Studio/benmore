@@ -245,6 +245,12 @@ func execStepSQL(ctx *FlowContext, step *FlowStep) error {
 		if !isReadOnlyQuery(query) {
 			return fmt.Errorf("connector SQL must be one read-only statement")
 		}
+		if readOnlyNamedJoinOnFrameworkTable(query) {
+			return errors.New(connectorNamedJoinRefusal)
+		}
+		if _, err := readOnlyViewTexts(ctx.Request.Context(), ctx.mcpReadConn, query); err != nil {
+			return connectorViewError(err)
+		}
 		startsWithRowProducer = true
 	}
 	// The prefix checks above are the historical routing, and a step without
@@ -781,6 +787,12 @@ func execStepSQLDynamic(ctx *FlowContext, step *FlowStep) error {
 		defer ctx.transactionMutex().Unlock()
 		if !isReadOnlyQuery(query) {
 			return fmt.Errorf("connector SQL must be one read-only statement")
+		}
+		if readOnlyNamedJoinOnFrameworkTable(query) {
+			return errors.New(connectorNamedJoinRefusal)
+		}
+		if _, err := readOnlyViewTexts(ctx.Request.Context(), ctx.mcpReadConn, query); err != nil {
+			return connectorViewError(err)
 		}
 		startsWithRowProducer = true
 	}

@@ -216,7 +216,7 @@ func serveHTMLBytes(w http.ResponseWriter, r *http.Request, app *App, data []byt
 	// pages are unaffected.
 	if app != nil {
 		staticRoot := filepath.Join(app.Dir, "static")
-		data = []byte(processIncludesWithReader(string(data), app.Partials, staticRoot, func(name string) ([]byte, error) {
+		data = []byte(processIncludesWithReader(string(data), app.partialSources(), staticRoot, func(name string) ([]byte, error) {
 			return app.readIncludeSource("static", name)
 		}))
 	}

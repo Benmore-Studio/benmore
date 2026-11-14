@@ -29,6 +29,12 @@ func appSQLGuardApp(t *testing.T, hipaa bool) *App {
 	db.SetMaxOpenConns(1)
 	app := &App{Dir: dir, DB: db, Design: &DesignConfig{}}
 	t.Cleanup(app.Shutdown)
+	// A refused statement is reported in the background, which creates this
+	// table at its first report: there from the start, so the schema
+	// comparisons below never race with it.
+	if err := ensureErrorGroups(db); err != nil {
+		t.Fatal(err)
+	}
 	for _, stmt := range []string{
 		`CREATE TABLE _benmore_audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, table_name TEXT NOT NULL, row_id TEXT, user_email TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE TABLE _benmore_read_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_id TEXT, query_type TEXT NOT NULL, user_id INTEGER NOT NULL, user_email TEXT NOT NULL)`,
@@ -379,7 +385,7 @@ func TestPageQueryRefusesDDLOnFrameworkObjects(t *testing.T) {
 		}
 	}
 	mustExec(t, app.DB, `INSERT INTO notes (body) VALUES ('seen')`)
-	rows, _, err := queryPageRows(context.Background(), app.DB, newPageQueryPolicy(app, nil, nil, false), &appSQLScope{hipaa: true}, `SELECT body FROM notes`)
+	rows, _, err := queryPageRows(context.Background(), app.DB, newPageQueryPolicy(app, nil, nil, false), &appSQLScope{hipaa: true}, nil, `SELECT body FROM notes`)
 	if err != nil || len(rows) != 1 || rows[0]["body"] != "seen" {
 		t.Fatalf("page SELECT = %v, err %v", rows, err)
 	}

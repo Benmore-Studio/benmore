@@ -25,12 +25,14 @@ func (e *appMCPCommandCompileError) Error() string { return e.err.Error() }
 func (e *appMCPCommandCompileError) Unwrap() error { return e.err }
 
 func loadFlowsCheckedFromSources(dir string, allowLegacy bool, captured map[string][]byte) ([]Flow, error) {
-	return loadFlowsCheckedFromSourcesSkipping(dir, allowLegacy, captured, false)
+	return loadFlowsCheckedFromSourcesSkipping(dir, allowLegacy, captured, false, nil)
 }
 
 // loadFlowsCheckedFromSourcesSkipping with skipInvalidCommands leaves out (and
 // logs) command flow files that do not compile, for a connector-withheld load.
-func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured map[string][]byte, skipInvalidCommands bool) ([]Flow, error) {
+// warn receives what the files load with (flowLoadWarn); nil for a reader
+// that is not the load that serves the app.
+func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured map[string][]byte, skipInvalidCommands bool, warn flowLoadWarn) ([]Flow, error) {
 	paths := []string{"flows.yaml"}
 	if captured == nil {
 		entries, err := os.ReadDir(filepath.Join(dir, "flows"))
@@ -142,12 +144,12 @@ func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured 
 		_, on := shape["on"]
 		_, jobs := shape["jobs"]
 		if on || jobs {
-			flows, err = parseGHAFlowFile(path, data)
+			flows, err = parseGHAFlowFileWarn(path, data, warn)
 		} else if path == "flows.yaml" {
 			if !allowLegacy {
 				continue
 			}
-			flows, err = parseLegacyFlowsYAML(data)
+			flows, err = parseLegacyFlowsYAMLWarn(data, warn)
 		} else {
 			err = fmt.Errorf("expected file-level on and jobs")
 		}
@@ -163,7 +165,7 @@ func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured 
 			if flow.Trigger.Type == "http" && strings.TrimSpace(flow.Role) != "" {
 				if problem := flowRoleGateProblem(flow.Role, roleGateContext()); problem != "" && !roleProblems[problem] {
 					roleProblems[problem] = true
-					log.Printf("WARNING: %s: %s", filepath.ToSlash(path), problem)
+					warn.printf("WARNING: %s: %s", filepath.ToSlash(path), problem)
 				}
 			}
 		}
@@ -182,6 +184,10 @@ func loadFlowsCheckedFromSourcesSkipping(dir string, allowLegacy bool, captured 
 
 // Legacy root maps remain a runtime compatibility format, not an error fallback.
 func parseLegacyFlowsYAML(data []byte) ([]Flow, error) {
+	return parseLegacyFlowsYAMLWarn(data, log.Printf)
+}
+
+func parseLegacyFlowsYAMLWarn(data []byte, warn flowLoadWarn) ([]Flow, error) {
 	if err := rejectLegacyHandledStatuses(data); err != nil {
 		return nil, err
 	}
@@ -207,7 +213,7 @@ func parseLegacyFlowsYAML(data []byte) ([]Flow, error) {
 		if err := checkConvertedSteps(steps); err != nil {
 			return nil, fmt.Errorf("flow %s: %w", name, err)
 		}
-		flows = append(flows, Flow{Name: name, Trigger: parseTrigger(f.Trigger), Verify: f.Verify, Secret: f.Secret, Transaction: f.Transaction, Auth: normalizeFlowAuth(f.Auth, name), Role: canonicalFlowRole(f.Role), Permissions: f.Permissions, Steps: steps})
+		flows = append(flows, Flow{Name: name, Trigger: parseTrigger(f.Trigger), Verify: f.Verify, Secret: f.Secret, Transaction: f.Transaction, Auth: normalizeFlowAuth(f.Auth, name, warn), Role: canonicalFlowRole(f.Role), Permissions: f.Permissions, Steps: steps})
 	}
 	return flows, nil
 }

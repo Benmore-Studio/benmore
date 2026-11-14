@@ -309,6 +309,8 @@ export interface QueryFetchOpts {
   staleTime?: number;
   staleMs?: number;
   force?: boolean;
+  /** The read is polling (X-Benmore-Background: 1), not activity for auth.idle_timeout. Not part of the request or the cache key. */
+  background?: boolean;
   live?: boolean;
 }
 
@@ -405,8 +407,8 @@ export const permissions: {
   revoke(table: string, id: number | string, email: string): Promise<void>;
   list(table: string, id: number | string): Promise<unknown>;
 };
-/** Time-limited URL for a file. Default lifetime 300s; audio/video default to 4h so playback does not outlive the link (max 6h). */
-export function signedUrl(path: string, opts?: number | { ttl?: number; ttlSeconds?: number; record?: { table: string; id: number | string } }): Promise<string>;
+/** Time-limited URL for a file. Default lifetime 300s; audio/video default to 4h so playback does not outlive the link (max 6h). ttlSeconds (alias ttl) is whole seconds (120) or a duration string ('90s', '2h'). */
+export function signedUrl(path: string, opts?: number | { ttl?: number | string; ttlSeconds?: number | string; record?: { table: string; id: number | string } }): Promise<string>;
 export function t(key: string, vars?: Record<string, string | number>): string;
 export const broadcast: {
   publish(slug: string, stream: MediaStream): Promise<BroadcastPublisher>;

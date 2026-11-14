@@ -74,7 +74,9 @@ func TestOwnerOrRoleCreateWithoutOwnerColumnNeedsRole(t *testing.T) {
 	// Complete the successful creates' async audience checks before changing
 	// the fixture's group configuration outside the normal reload lifecycle.
 	realtimeFlush()
-	app.Group = nil
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Group = nil
+	})
 	assertStatus(t, mux, http.MethodPost, "/api/brokers", plain, map[string]any{"name": "planted"}, http.StatusForbidden)
 	assertStatus(t, mux, http.MethodPost, "/api/brokers", member, map[string]any{"name": "planted"}, http.StatusForbidden)
 	if s := getSession(app, authzReq("GET", "/", global, "")); !tableModeAllowed(app, "brokers", OpWrite, "owner_or_role:clinic_staff", s, 0) {

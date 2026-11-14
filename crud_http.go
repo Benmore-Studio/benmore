@@ -166,7 +166,7 @@ func coerceBoolString(s string) string {
 }
 
 func hasColumn(app *App, table, column string) bool {
-	for _, t := range app.Tables {
+	for _, t := range app.tableList() {
 		if sqliteIdentifierFold(t.Name) == sqliteIdentifierFold(table) {
 			for _, c := range t.Columns {
 				if sqliteIdentifierFold(c.Name) == sqliteIdentifierFold(column) {

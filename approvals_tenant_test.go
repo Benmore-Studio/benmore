@@ -25,6 +25,13 @@ import (
 //	loner        no tenant
 func approvalsTenantApp(t *testing.T) (*App, *http.ServeMux, map[string]string) {
 	t.Helper()
+	return approvalsTenantFixture(t, nil)
+}
+
+// approvalsTenantFixture is approvalsTenantApp with configure applied to the
+// app before its routes are built (more tables, rules or groups: settings).
+func approvalsTenantFixture(t *testing.T, configure func(app *App)) (*App, *http.ServeMux, map[string]string) {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite3_benmore", sqliteAppDSN(filepath.Join(dir, "data.db"), dir))
 	if err != nil {
@@ -64,6 +71,9 @@ func approvalsTenantApp(t *testing.T) (*App, *http.ServeMux, map[string]string) 
 		t.Fatal(err)
 	}
 	EnsureSessionsTable(app.DB)
+	if err := EnsureUserRolesTable(app.DB); err != nil {
+		t.Fatal(err)
+	}
 	EnsureNotificationsTable(app.DB)
 	EnsureSchedulingTables(app.DB)
 	tokens := map[string]string{}
@@ -90,6 +100,9 @@ func approvalsTenantApp(t *testing.T) (*App, *http.ServeMux, map[string]string) 
 	crudScopeMustExec(t, db, `INSERT INTO claims (org_id, user_id, title) VALUES ('org-a', 1, 'taxi')`)
 	crudScopeMustExec(t, db, `INSERT INTO plans (org_id, user_id, title) VALUES ('org-a', 1, 'roadmap')`)
 	crudScopeMustExec(t, db, `INSERT INTO notes (user_id, title) VALUES (1, 'memo')`)
+	if configure != nil {
+		configure(app)
+	}
 	return app, buildAppMux(app, true, "http://localhost"), tokens
 }
 
@@ -234,14 +247,14 @@ func TestApprovalApproverMustBelongToTheRecordTenant(t *testing.T) {
 }
 
 // Where no tenant is involved an approval reaches any account, as before: a
-// record with no tenant value, a table without the tenant key, and a
-// free-form label that names no table.
+// record with no tenant value and a table with neither the tenant key nor a
+// membership rule. (A free-form label takes the requester's tenant:
+// TestApprovalOnALabelStaysInTheRequestersTenant.)
 func TestApprovalsWithoutATenantReachAnyAccount(t *testing.T) {
 	app, mux, tok := approvalsTenantApp(t)
 	for i, c := range []struct{ requester, table, rowID string }{
 		{"loner", "purchase_requests", "2"}, // a record that carries no tenant
 		{"areq", "notes", "1"},              // a table without the tenant key
-		{"areq", "expense-claim", "Q3-17"},  // a label, not a table
 	} {
 		title := fmt.Sprintf("No tenant %d", i)
 		code, _, id := approvalRequest(t, mux, tok[c.requester], c.table, c.rowID, "bappr@example.com", title)

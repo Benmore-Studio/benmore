@@ -54,6 +54,10 @@ func loadAppWithOptions(dir string, opts appLoadOptions) (app *App, err error) {
 	for _, problem := range config.mcpToolProblems {
 		log.Printf("  WARNING: MCP %s", appMCPToolProblemsNotice(problem))
 	}
+	// A check load reports these as findings; the load that serves logs them.
+	if !opts.checkOnly {
+		config.logFlowWarnings()
+	}
 	nextEnv, err := config.stageEnvironment(dir)
 	if err != nil {
 		return nil, fmt.Errorf("environment: %w", err)

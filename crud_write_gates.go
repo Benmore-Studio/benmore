@@ -52,8 +52,9 @@ func identIs(name, want string) bool {
 // account endpoints write, beside password_hash, role and
 // password_change_required (protected on every table): the TOTP factor (a
 // pending enrollment is a value of totp_secret too), its backup codes, the
-// spent-code watermark, the setup nonce, and the mark that an address was
-// trusted before verification was required. The admin panel runs generic
+// spent-code watermark, the setup nonce, the mark that an address was
+// trusted before verification was required, and the time of the last
+// sign-in. The admin panel runs generic
 // create and update on this table; through it one admin replaced or cleared
 // another admin's factor, and a new row was seeded with one. This is the one
 // list: a column the framework adds to _benmore_users joins it or the
@@ -63,6 +64,9 @@ func identIs(name, want string) bool {
 var userSignInStateColumns = []string{
 	"totp_secret", "backup_codes", "mfa_last_totp", "mfa_last_totp_at", mfaSetupNonceColumn,
 	"email_grandfathered",
+	// Written by every completed sign-in. A value typed into the panel made
+	// an account look used (or never used) to whoever reviews it.
+	"last_login_at",
 }
 
 // protectedCreateFields is the mass-assignment set for a create on table:
@@ -103,11 +107,12 @@ func protectedCreateFields(app *App, table string) protectedFields {
 // supplied would survive a create that omits the base column and any update
 // of the sibling alone, detaching the row from equality search.
 func blindIndexSiblingColumns(app *App, table string) []string {
-	if app == nil || app.Encrypted == nil {
+	encrypted := app.encryptedConfig()
+	if encrypted == nil {
 		return nil
 	}
 	var cols []string
-	for t, defs := range app.Encrypted.Fields {
+	for t, defs := range encrypted.Fields {
 		if !identIs(t, table) {
 			continue
 		}

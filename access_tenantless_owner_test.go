@@ -496,7 +496,9 @@ func TestTenantlessMemberOwnMembershipRowEmailKeyed(t *testing.T) {
 	app, mux := tenantlessOwnerAppWithRules(t, map[string]map[AccessOp]string{})
 	crudScopeMustExec(t, app.DB, `ALTER TABLE team_members ADD COLUMN email TEXT`)
 	refreshTableColumns(t, app, "team_members")
-	app.Group.UserField = "email"
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Group.UserField = "email"
+	})
 	_ = createCrudScopeSession(t, app, "abe@example.com", "user", "1", "")    // user 1
 	sam := createCrudScopeSession(t, app, "sam@example.com", "user", "1", "") // user 2
 	uma := createCrudScopeSession(t, app, "uma@example.com", "user", "1", "") // user 3, address not proven
@@ -530,7 +532,9 @@ func TestTenantlessMemberOwnMembershipRowEmailKeyed(t *testing.T) {
 
 	// A read rule declared `self` on the membership table is the builder's
 	// own owner rule: every row whose user_id is theirs, as before.
-	app.Access = &AccessConfig{rules: map[string]map[AccessOp]string{"team_members": {"read": "self"}}}
+	mux = rebuildTestMux(t, app, true, "http://localhost", func() {
+		app.Access = &AccessConfig{rules: map[string]map[AccessOp]string{"team_members": {"read": "self"}}}
+	})
 	assertListedIDs(t, mux, sam, "/api/team_members", []int{2, 3})
 }
 

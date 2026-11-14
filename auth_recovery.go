@@ -200,15 +200,22 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
 		return
 	}
+	// A write the database could not take answers 503, the link still
+	// unused; any other fault keeps the form's "Server error".
+	writeFault := func(err error) {
+		if !respondDatabaseBusyText(w, r, "password reset", err) {
+			authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		}
+	}
 	tx, err := app.DB.Begin()
 	if err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec("UPDATE _benmore_password_resets SET used=1 WHERE token = ? AND used=0 AND type='reset' AND datetime(expires_at)>datetime('now')", hashResetToken(token))
 	if err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	if n, err := result.RowsAffected(); err != nil || n != 1 {
@@ -217,19 +224,23 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 	}
 	result, err = tx.Exec("UPDATE _benmore_users SET password_hash=?,password_change_required=0 WHERE id=? AND COALESCE(password_hash,'')=?", string(hash), userID, previousHash)
 	if err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	if n, err := result.RowsAffected(); err != nil || n != 1 {
 		authRedirect(w, r, app.Paths.ResetPassword, "Credentials changed. Request a new reset link.")
 		return
 	}
-	if err := clearUnverifiedAccountMFA(tx, userID); err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+	factorRemoved, err := clearUnverifiedAccountMFA(tx, userID)
+	if err == nil && factorRemoved {
+		err = auditMFARemovedBy(tx, app, userID, email, "password_reset")
+	}
+	if err != nil {
+		writeFault(err)
 		return
 	}
 	if err := revokePasswordCredentials(tx, userID); err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	// Passkeys are sign-ins of their own, registered from sessions the old
@@ -237,15 +248,15 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 	// someone who registered the address first, or who held a session), so
 	// they go with the sessions; the owner can add new ones once signed in.
 	if _, err := revokeAccountPasskeys(tx, userID); err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	if _, err := tx.Exec(`INSERT INTO _benmore_audit_log(action,table_name,row_id,user_id,user_email) VALUES ('password_reset','_benmore_users',?,?,?)`, userID, userID, email); err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		authRedirect(w, r, app.Paths.ResetPassword, "Server error")
+		writeFault(err)
 		return
 	}
 	invalidateRequestSession(r) // the account's sessions are gone
@@ -263,18 +274,27 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request, app *App) {
 // was never verified. A reset link proves the mailbox, but an unverified
 // account may have been registered, and enrolled, by someone else; their
 // authenticator would survive the reset and lock the real owner out. A
-// verified account keeps its factor.
-func clearUnverifiedAccountMFA(tx *sql.Tx, userID int64) error {
+// verified account keeps its factor. removed says an active factor went (a
+// pending enrollment is none), which the caller records as mfa_removed.
+func clearUnverifiedAccountMFA(tx *sql.Tx, userID int64) (removed bool, err error) {
 	var cols int
 	if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info('_benmore_users') WHERE name IN ('totp_secret', 'backup_codes', 'mfa_last_totp', 'mfa_last_totp_at')").Scan(&cols); err != nil {
-		return err
+		return false, err
 	}
 	if cols != 4 {
-		return nil // MFA columns are added together at startup
+		return false, nil // MFA columns are added together at startup
 	}
-	_, err := tx.Exec(`UPDATE _benmore_users SET totp_secret = NULL, backup_codes = NULL, mfa_last_totp = NULL, mfa_last_totp_at = NULL
+	enrolled, err := accountMFAEnrolled(tx, userID)
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(`UPDATE _benmore_users SET totp_secret = NULL, backup_codes = NULL, mfa_last_totp = NULL, mfa_last_totp_at = NULL
 		WHERE id = ? AND COALESCE(verified, 0) = 0`, userID)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return enrolled && n == 1, err
 }
 
 // revokeOtherCredentials deletes every session and API token of an account

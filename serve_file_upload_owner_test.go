@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"mime"
 	"mime/multipart"
@@ -230,10 +229,7 @@ func TestDeleteUploadRefusesAnotherUsersCopiedPrivateReference(t *testing.T) {
 func tenantUploadApp(t *testing.T) (*App, *http.ServeMux, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openTestAppDB(t, dir)
 	mustExec(t, db, `CREATE TABLE _benmore_permissions (resource_type TEXT, resource_id INTEGER, grant_type TEXT, grantee_id TEXT, permission TEXT, expires_at TEXT)`)
 	mustExec(t, db, `CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, org_id TEXT, file_url TEXT)`)
 	app := &App{

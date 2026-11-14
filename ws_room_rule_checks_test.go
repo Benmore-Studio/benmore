@@ -162,8 +162,8 @@ func TestWSRoomRuleUnknownTableOrColumnIsWarned(t *testing.T) {
   "lobby": room_members(unused_for_a_literal, member_id)
 `)
 	all := strings.Join(got, "\n")
-	if len(got) != 3 {
-		t.Errorf("%d warnings, want 3 (one per broken rule):\n%s", len(got), all)
+	if len(got) != 4 {
+		t.Errorf("%d warnings, want 4 (one per broken rule, one for the column a literal pattern never reads):\n%s", len(got), all)
 	}
 	for _, want := range []string{
 		`ws_rooms."bad-:id"`, "nosuchtable", "room_members, rooms",
@@ -175,10 +175,27 @@ func TestWSRoomRuleUnknownTableOrColumnIsWarned(t *testing.T) {
 			t.Errorf("the warnings lack %q:\n%s", want, all)
 		}
 	}
-	for _, not := range []string{`"good-:id"`, `"lobby"`} {
-		if strings.Contains(all, not) {
-			t.Errorf("a working rule %s is warned about:\n%s", not, all)
+	if strings.Contains(all, `"good-:id"`) {
+		t.Errorf("a working rule is warned about:\n%s", all)
+	}
+	// A pattern without a placeholder never reads its join column, so a
+	// column that does not exist there changes nothing: the warning says the
+	// rule works and that the name is not read, never that joins are refused.
+	for _, w := range got {
+		if !strings.Contains(w, `ws_rooms."lobby"`) {
+			continue
 		}
+		for _, want := range []string{"room_members.unused_for_a_literal", "no placeholder", "never read", "works as written"} {
+			if !strings.Contains(w, want) {
+				t.Errorf("the literal pattern's warning lacks %q: %s", want, w)
+			}
+		}
+		if strings.Contains(w, "refused for everyone") {
+			t.Errorf("the literal pattern's warning says joins are refused: %s", w)
+		}
+	}
+	if !strings.Contains(all, `ws_rooms."lobby"`) {
+		t.Errorf("the join column of a literal pattern that the table does not have is not named:\n%s", all)
 	}
 
 	// At run time the broken rules refuse a member and a working one admits.

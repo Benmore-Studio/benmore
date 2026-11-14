@@ -545,7 +545,11 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, app *App, provi
 
 	// Create session
 	groupID := ResolveGroupID(app.DB, app.Group, email)
-	sessionID := createSignInSession(app.DB, userID, email, groupID, app.SessionDuration)
+	sessionID := createAuditedSignInSession(app, "oauth", userID, email, groupID)
+	if sessionID == "" {
+		serverError(w, r, app, "oauth", errors.New("the sign-in session could not be created"), "authentication failed")
+		return
+	}
 	http.SetCookie(w, sessionCookie(sessionID, app.DevMode, app.SessionDuration))
 
 	// CLI auth flow (platform only): mint a hosted-platform CLI api_token and

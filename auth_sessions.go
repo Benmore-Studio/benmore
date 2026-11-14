@@ -741,13 +741,21 @@ func supportSessionStarterLive(db mutationQuerier, supportID string, strict bool
 // DeleteSessionFromDB removes the session a token authenticates (logout,
 // cleanup of a minted session), whether its row is hashed or legacy.
 func DeleteSessionFromDB(db *sql.DB, token string) {
+	_ = deleteSessionFromDB(db, token)
+}
+
+// deleteSessionFromDB is DeleteSessionFromDB for a caller that must not
+// report a session ended while its row is still there (sign-out).
+func deleteSessionFromDB(db *sql.DB, token string) error {
 	key, ok := presentedSessionKey(token)
 	if !ok {
-		return
+		return nil
 	}
-	if _, err := db.Exec("DELETE FROM _benmore_sessions WHERE id IN (?, ?)", key, token); err != nil {
+	_, err := db.Exec("DELETE FROM _benmore_sessions WHERE id IN (?, ?)", key, token)
+	if err != nil {
 		log.Printf("ERROR deleting session: %s", err)
 	}
+	return err
 }
 
 // CleanExpiredSessions removes expired sessions periodically.
@@ -1007,6 +1015,9 @@ func applySessionRoleScopes(app *App, session *Session) *Session {
 
 func applySessionRoleScopesWith(app *App, db rowQuerier, session *Session, schema string) (*Session, error) {
 	var roleErr error
+	// One published configuration for the whole resolution (a reload may
+	// publish while this runs in a request or a background worker).
+	group, roles := app.groupConfig(), app.rolesConfig()
 	// Tenant role from the membership table (v2.7.164): when the
 	// developer declares `groups.role_field`, the member's in-tenant
 	// role (e.g. member_role on company_members) joins session.Roles
@@ -1014,22 +1025,22 @@ func applySessionRoleScopesWith(app *App, db rowQuerier, session *Session, schem
 	// enforce against the membership table directly. Runs BEFORE the
 	// scope union below so a `roles:` mapping for the tenant role also
 	// contributes its scopes.
-	if app.Group != nil && app.Group.RoleField != "" && session.EffectiveHasGroup() {
+	if group != nil && group.RoleField != "" && session.EffectiveHasGroup() {
 		var mr string
 		var err error
 		if schema == "main" {
-			mr, err = resolveMembershipRoleForSessionWith(db, app.Group, session, session.EffectiveGroupID(), schema)
+			mr, err = resolveMembershipRoleForSessionWith(db, group, session, session.EffectiveGroupID(), schema)
 		} else {
 			// An id-keyed membership row names the user id, not the email:
 			// looked up only by email it never matched, so the tenant role of
 			// an id-keyed app was never loaded here. A column that holds
 			// addresses under another name keeps matching by email.
-			if !emailKeyedColumn(app.Group.UserField) {
-				mr, err = resolveMembershipRoleForSessionWith(db, app.Group, session, session.EffectiveGroupID(), schema)
+			if !emailKeyedColumn(group.UserField) {
+				mr, err = resolveMembershipRoleForSessionWith(db, group, session, session.EffectiveGroupID(), schema)
 			}
-			if mr == "" && err == nil && membershipAddressMatch(app.Group, session.Email) &&
-				(emailKeyedColumn(app.Group.UserField) || sessionGrantEmail(session) != "") {
-				mr, err = resolveMembershipRoleWith(db, app.Group, session.Email, session.EffectiveGroupID(), schema)
+			if mr == "" && err == nil && membershipAddressMatch(group, session.Email) &&
+				(emailKeyedColumn(group.UserField) || sessionGrantEmail(session) != "") {
+				mr, err = resolveMembershipRoleWith(db, group, session.Email, session.EffectiveGroupID(), schema)
 			}
 		}
 		roleErr = err
@@ -1055,13 +1066,13 @@ func applySessionRoleScopesWith(app *App, db rowQuerier, session *Session, schem
 	// first API call). Undefined roles must NOT get full access. The one
 	// exception is the built-in admin role of a global admin, which holds
 	// every scope unless roles: declares it (sessionRoleScopes).
-	if app.Roles != nil {
-		session.accessTables = app.Roles.accessTables
+	if roles != nil {
+		session.accessTables = roles.accessTables
 		held := session.Roles
 		if len(held) == 0 {
 			held = []string{session.Role}
 		}
-		roleScopes := app.Roles.sessionRoleScopes(session, held)
+		roleScopes := roles.sessionRoleScopes(session, held)
 		if roleScopes != "" {
 			session.Scopes = intersectScopes(session.Scopes, roleScopes)
 		} else {

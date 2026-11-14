@@ -1364,7 +1364,9 @@ export const permissions = {
 // stay aligned with the live shape.
 // signedUrl(path, opts) - mint a time-limited URL for a file.
 //   opts can be a number (ttlSeconds, back-compat) OR
-//   { ttlSeconds?, record?: { table, id } }.
+//   { ttlSeconds?, record?: { table, id } }. ttlSeconds is whole seconds
+//   (300) or a duration string ("90s", "2h"), as the endpoint reads
+//   expires_in: at least 1s, at most 6h.
 // PRIVATE files on the platform media CDN REQUIRE `record` - the row that
 // owns the file. The server authorizes the signature against THAT record's
 // access policy (roles, perms, scopes, group/owner/ACL), not just a logged-in
@@ -2265,13 +2267,15 @@ function tableRead(tableName, opts) {
   // Separate client control options (which never affect the server result)
   // from the server-affecting query spec. Only the spec may influence the
   // cache key, otherwise two identical reads that differ only in staleTime/
-  // force/live would fragment into distinct cache entries and defeat dedupe.
-  const { staleTime, staleMs, force, live, key, ...serverOpts } = opts || {};
+  // force/live/background would fragment into distinct cache entries and
+  // defeat dedupe. background marks the request as polling (fetch honours
+  // it); it is never sent in the query.
+  const { staleTime, staleMs, force, live, background, key, ...serverOpts } = opts || {};
   const spec = { ...serverOpts, table: tableName };
   // The default is read()'s ['query', spec] key shape, so that a
   // bm.query.table('posts') and bm.query.read({ table: 'posts' }) targeting
   // identical rows collapse onto one shared cache entry.
-  return { spec, key: key || defaultReadKey(spec), control: { staleTime, staleMs, force, live } };
+  return { spec, key: key || defaultReadKey(spec), control: { staleTime, staleMs, force, live, background } };
 }
 
 function ensureQueryLiveInvalidation() {
@@ -2421,8 +2425,8 @@ export const query = {
     }, opts);
   },
   table(tableName, opts = {}) {
-    // Forward every client control option (staleTime/staleMs/force/live) so
-    // none are silently dropped.
+    // Forward every client control option (staleTime/staleMs/force/live/
+    // background) so none are silently dropped.
     const { spec, key, control } = tableRead(tableName, opts);
     return query.read(spec, { ...control, key });
   },

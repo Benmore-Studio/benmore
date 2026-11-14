@@ -331,8 +331,11 @@ func registerErrorCaptureRoute(mux appRouteRegistrar, app *App) {
 		body.Message = truncateRunes(body.Message, clientErrorMessageMax)
 		body.Source = truncateRunes(clientErrorLocation(body.Source), 500)
 		body.URL = truncateRunes(clientErrorLocation(body.URL), 500)
+		// A report is filed under the account only for a full sign-in: a
+		// credential narrowed to some tables is recorded as a signed-out
+		// visitor is (scoped_credential_routes.go).
 		userID := int64(0)
-		if s := getSession(app, r); s != nil {
+		if s := getSession(app, r); s != nil && !scopedCredential(s) {
 			userID = s.UserID
 			body.UserEmail = s.Email
 		}

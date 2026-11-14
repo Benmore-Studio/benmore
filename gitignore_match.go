@@ -1,9 +1,10 @@
 package main
 
 // A .gitignore matcher for an app workspace, written here because the CLI
-// cannot rely on git being installed. It reads ONE file (the workspace root's
-// .gitignore) and answers "would git leave this path out?" for slash paths
-// relative to that root.
+// cannot rely on git being installed. gitignoreMatcher is ONE parsed
+// .gitignore and answers "would git leave this path out?" for slash paths
+// relative to the directory that holds it; workspaceGitignores (below) puts
+// the root file and the nested ones together the way git does.
 //
 // Understood: blank lines, `#` comments, `*`, `?`, `**` as a whole path
 // segment (`**/x`, `x/**`, `a/**/b`), a leading `/` (and any other inner `/`)
@@ -22,7 +23,9 @@ package main
 import (
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -229,4 +232,101 @@ func gitignoreGlob(pattern, name string) bool {
 		p++
 	}
 	return p == len(pattern)
+}
+
+// workspaceGitignores answers "would git leave this path out?" for a whole
+// workspace: the root .gitignore and the .gitignore of every directory on the
+// way down to the path, as git reads them. A deeper file decides before a
+// shallower one, its patterns are relative to its own directory, and nothing
+// below an excluded directory is consulted (git does not read a .gitignore
+// there, so it cannot re-include anything). Files are read on first use.
+//
+// Not read: .git/info/exclude, a global excludes file, and a .gitignore below
+// a symbolic link (git does not follow one).
+type workspaceGitignores struct {
+	root  string
+	byDir map[string]*gitignoreMatcher // by slash path from root, "" for the root; nil when there is none
+	plain map[string]bool              // whether a directory is one all the way down from the root (no link)
+}
+
+func newWorkspaceGitignores(root string) *workspaceGitignores {
+	return &workspaceGitignores{root: root, byDir: map[string]*gitignoreMatcher{}, plain: map[string]bool{}}
+}
+
+// matcher returns the parsed .gitignore of dir, or nil when dir has none or
+// is reached through a symbolic link.
+func (w *workspaceGitignores) matcher(dir string) *gitignoreMatcher {
+	if m, seen := w.byDir[dir]; seen {
+		return m
+	}
+	var m *gitignoreMatcher
+	if w.plainDir(dir) {
+		m = loadWorkspaceGitignore(filepath.Join(w.root, filepath.FromSlash(dir)))
+	}
+	w.byDir[dir] = m
+	return m
+}
+
+// plainDir reports whether dir and every directory above it, up to the root,
+// is a directory and not a link to one.
+func (w *workspaceGitignores) plainDir(dir string) bool {
+	if dir == "" || dir == "." {
+		return true
+	}
+	if plain, seen := w.plain[dir]; seen {
+		return plain
+	}
+	plain := w.plainDir(path.Dir(dir))
+	if plain {
+		info, err := os.Lstat(filepath.Join(w.root, filepath.FromSlash(dir)))
+		plain = err == nil && info.IsDir()
+	}
+	w.plain[dir] = plain
+	return plain
+}
+
+// Ignored reports whether git would leave rel out: a slash path relative to
+// the workspace root, a directory when isDir.
+func (w *workspaceGitignores) Ignored(rel string, isDir bool) bool {
+	rel = strings.Trim(strings.TrimPrefix(rel, "./"), "/")
+	if rel == "" || rel == "." {
+		return false
+	}
+	segs := strings.Split(rel, "/")
+	// Each directory on the way down, then the path itself: the first one
+	// that is excluded excludes everything below it.
+	for i := 1; i <= len(segs); i++ {
+		dir := isDir || i < len(segs)
+		// The .gitignore next to this entry first, then each one above it;
+		// the first file with a matching line decides.
+		for d := i - 1; d >= 0; d-- {
+			m := w.matcher(strings.Join(segs[:d], "/"))
+			if m == nil || len(m.rules) == 0 {
+				continue
+			}
+			rule := m.decide(segs[d:i], dir)
+			if rule == nil {
+				continue
+			}
+			if !rule.Negate {
+				return true
+			}
+			break
+		}
+	}
+	return false
+}
+
+// workspaceIgnoredFiles returns, sorted, the files among rels (slash paths
+// relative to root) that the workspace's .gitignore files exclude.
+func workspaceIgnoredFiles(root string, rels []string) []string {
+	ignores := newWorkspaceGitignores(root)
+	var ignored []string
+	for _, rel := range rels {
+		if ignores.Ignored(rel, false) {
+			ignored = append(ignored, rel)
+		}
+	}
+	sort.Strings(ignored)
+	return ignored
 }

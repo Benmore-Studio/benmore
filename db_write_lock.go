@@ -426,8 +426,9 @@ func (c *benmoreConn) QueryContext(ctx context.Context, query string, args []dri
 	c.gate.Unlock()
 	if err != nil {
 		c.noteIfBusy(ctx, err, "could not run a query")
+		return rows, err
 	}
-	return rows, err
+	return c.scopedRows(rows, scope), nil
 }
 
 func (c *benmoreConn) Exec(query string, args []driver.Value) (driver.Result, error) {
@@ -462,7 +463,7 @@ func (c *benmoreConn) PrepareContext(ctx context.Context, query string) (driver.
 		return nil, err
 	}
 	if s, ok := stmt.(*sqlite3.SQLiteStmt); ok {
-		return &benmoreStmt{SQLiteStmt: s, c: c}, nil
+		return &benmoreStmt{SQLiteStmt: s, c: c, appSQL: scope}, nil
 	}
 	return stmt, nil
 }
@@ -684,13 +685,19 @@ func (t *benmoreReadTx) Rollback() error { return t.end("ROLLBACK") }
 type benmoreStmt struct {
 	*sqlite3.SQLiteStmt
 	c *benmoreConn
+	// appSQL: the statement was prepared from marked text. SQLite compiles it
+	// again when it runs after a schema change, so every run opens a scope of
+	// the same kind (app_sql_guard.go).
+	appSQL *appSQLScope
 }
 
 func (s *benmoreStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	if err := s.c.enter(); err != nil {
 		return nil, err
 	}
+	scope := s.c.reopenAppSQL(s.appSQL)
 	res, err := s.SQLiteStmt.ExecContext(ctx, args)
+	err = s.c.endAppSQL(scope, err)
 	s.c.gate.Unlock()
 	if err != nil {
 		s.c.noteIfBusy(ctx, err, "could not write")
@@ -702,12 +709,15 @@ func (s *benmoreStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 	if err := s.c.enter(); err != nil {
 		return nil, err
 	}
+	scope := s.c.reopenAppSQL(s.appSQL)
 	rows, err := s.SQLiteStmt.QueryContext(ctx, args)
+	err = s.c.endAppSQL(scope, err)
 	s.c.gate.Unlock()
 	if err != nil {
 		s.c.noteIfBusy(ctx, err, "could not run a query")
+		return rows, err
 	}
-	return rows, err
+	return s.c.scopedRows(rows, scope), nil
 }
 
 func (s *benmoreStmt) Exec(args []driver.Value) (driver.Result, error) {

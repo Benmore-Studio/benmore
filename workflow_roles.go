@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -83,6 +84,39 @@ func workflowRoleRequired(required string) string {
 		return fmt.Sprintf("role '%s' required for this transition", strings.TrimSpace(required))
 	}
 	return fmt.Sprintf("one of the roles '%s' required for this transition", strings.Join(names, "', '"))
+}
+
+// workflowTenantBound reports whether a role held inside one tenant (the
+// membership role, a grant scoped to the tenant) counts for a transition on
+// table, as tableModeAllowed counts it for a `role:` access rule: the table
+// carries the tenant key, or the app lists it in groups.shared. An app with
+// no tenant key has no tenants to bound.
+func workflowTenantBound(app *App, table string) bool {
+	if app == nil {
+		return true
+	}
+	// The published group configuration, read under the reload lock.
+	group := app.groupConfig()
+	return group == nil || group.Key == "" || hasColumn(app, table, group.Key) || groupSharedTable(app, table)
+}
+
+// workflowMembershipRoleAllowed reports whether the caller's membership role
+// in the effective tenant (memberRole, "" when there is none) satisfies a
+// transition's role list on table: an exact match on a listed name.
+//
+// `admin` (any letter case) is the exception on a table the tenant does not
+// bound (workflowTenantBound): there it is the app's global admin, as a flow's
+// `role: admin` is (flowRoleAllowed) and as a `role:admin` access rule on the
+// table is (tableModeAllowed). Such a table has no tenant column to keep one
+// tenant's admin to its own rows, and with groups.bootstrap.founding_role
+// "admin" every account that founds a tenant holds a role of that name. That
+// holds for `admin` in a list too. The CRUD transition route (hasWorkflowRole)
+// and an approved command (appMCPCommandHasWorkflowRole) both decide here.
+func workflowMembershipRoleAllowed(app *App, table string, roles []string, memberRole string) bool {
+	if memberRole == "" || !slices.Contains(roles, memberRole) {
+		return false
+	}
+	return !strings.EqualFold(memberRole, "admin") || workflowTenantBound(app, table)
 }
 
 // workflowBuiltinRoles are the role names the runtime knows without any

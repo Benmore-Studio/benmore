@@ -10,7 +10,7 @@ import (
 )
 
 func TestQueryEncryptedOperationsRefuseCiphertextResults(t *testing.T) {
-	app, mux := newTenantEncryptionFixture(t)
+	app := newTenantEncryptionApp(t)
 	crudScopeMustExec(t, app.DB, "ALTER TABLE companies ADD COLUMN private_amount INTEGER")
 	app.Encrypted.Fields["companies"] = append(app.Encrypted.Fields["companies"], EncryptedFieldDef{Column: "private_amount", Roles: []string{"company_admin"}})
 	if err := InstallEncryptionTriggers(app.DB, app.Encrypted); err != nil {
@@ -26,6 +26,7 @@ func TestQueryEncryptedOperationsRefuseCiphertextResults(t *testing.T) {
 			}
 		}
 	}
+	mux := buildAppMux(app, true, "http://localhost")
 	for _, actor := range []struct{ name, primary, membership string }{
 		{"admin", "admin", "viewer"},
 		{"tenant_reviewer", "user", "company_admin"},

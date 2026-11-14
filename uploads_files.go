@@ -42,8 +42,9 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 		// session comes from headers and cookies, not the body), as
 		// /api/_upload does: otherwise anonymous slow bodies could hold every
 		// slot and turn all uploads away with 503.
+		var session *Session
 		if authRequired {
-			if session := getSession(app, r); session == nil {
+			if session = getSession(app, r); session == nil {
 				httpError(w, "authentication required", http.StatusUnauthorized)
 				return
 			}
@@ -57,6 +58,11 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 		defer release()
 		if !isBearerAuth(r) && !validateCSRF(r) {
 			httpError(w, "CSRF validation failed", http.StatusForbidden)
+			return
+		}
+		// A scoped credential stores a file only for a table it may write
+		// (scoped_credential_routes.go).
+		if !requireUploadTableScope(w, r, app, session) {
 			return
 		}
 
@@ -80,7 +86,7 @@ func RegisterFileUploadRoute(mux appRouteRegistrar, app *App) {
 
 		path, err := HandleFileUpload(app, r, "file", "_files", 0, nil)
 		if err != nil {
-			writeUploadRefusal(w, err)
+			writeUploadRefusal(w, r, app, err)
 			return
 		}
 		if path == "" {

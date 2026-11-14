@@ -20,6 +20,12 @@ package main
 // action (*:read), which covers every name. Unscoped credentials ("" or "*"),
 // an ordinary sign-in included, never reach checkScope here: role scopes keep
 // deciding only what they decided before on these routes.
+//
+// A broadcast slug and a WebSocket room are rooms like a presence slug
+// (roomScopeError), and an upload names its table in a `table` field
+// (requireUploadTableScope). The routes that act for the account and name no
+// table at all (push devices, usage, feedback, TURN credentials) refuse a
+// scoped credential through requireAccountManagement, as billing does.
 
 import (
 	"encoding/json"
@@ -101,22 +107,57 @@ func credentialTableFilter(app *App, session *Session, column, action string) (s
 	return " AND " + column + " IN (?" + strings.Repeat(",?", len(args)-1) + ")", args
 }
 
-// presenceScopeError applies the rule to a presence slug. A slug is a room
-// name: a room declared under ws_rooms is bound to its membership table, so
-// that table's scope decides; a slug no ws_rooms pattern matches names no
-// table.
-func presenceScopeError(app *App, session *Session, slug, action string) error {
+// roomScopeError applies the rule to a room name: a presence slug, a
+// broadcast slug, a WebSocket room. A room declared under ws_rooms is bound
+// to its membership table, so that table's scope decides (read to watch,
+// list or join, write to be present, publish or send); a name no ws_rooms
+// pattern matches names no table.
+func roomScopeError(app *App, session *Session, room, action string) error {
 	if !scopedCredential(session) {
 		return nil
 	}
 	table := ""
-	for _, wr := range app.wsRoomRules() {
-		if _, ok := matchWSRoomPattern(wr.Pattern, slug); ok && wr.Rule != nil {
-			table = wr.Rule.Table
-			break
+	if app != nil {
+		for _, wr := range app.wsRoomRules() {
+			if _, ok := matchWSRoomPattern(wr.Pattern, room); ok && wr.Rule != nil {
+				table = wr.Rule.Table
+				break
+			}
 		}
 	}
-	return credentialTableScopeError(session, table, action, "a presence room no ws_rooms pattern binds to a membership table")
+	return credentialTableScopeError(session, table, action, "a room no ws_rooms pattern binds to a membership table")
+}
+
+// requireRoomScope answers the standard scope refusal for roomScopeError and
+// reports whether the handler may continue.
+func requireRoomScope(w http.ResponseWriter, app *App, session *Session, room, action string) bool {
+	err := roomScopeError(app, session, room, action)
+	if err == nil {
+		return true
+	}
+	httpJSON(w, http.StatusForbidden, scopeDeniedBody(err))
+	return false
+}
+
+// requireUploadTableScope applies the rule to POST /api/_upload and
+// /api/_files. A stored file belongs to no table until a record names it, so
+// a scoped credential says which table the upload is for in the `table`
+// field (form or query) and needs that table's write scope; a name that is
+// no app table names none.
+func requireUploadTableScope(w http.ResponseWriter, r *http.Request, app *App, session *Session) bool {
+	if !scopedCredential(session) {
+		return true
+	}
+	table := ""
+	if name := strings.TrimSpace(r.FormValue("table")); name != "" {
+		for _, t := range app.Tables {
+			if identIs(t.Name, name) {
+				table = t.Name
+				break
+			}
+		}
+	}
+	return requireCredentialTableScope(w, session, table, "write", "an upload without a `table` field naming an app table")
 }
 
 // savedViewTable is the table a saved view's spec queries, "" when the spec

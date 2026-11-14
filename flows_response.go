@@ -44,7 +44,15 @@ func execStepRedirect(ctx *FlowContext, step *FlowStep) error {
 // site.
 func flowRedirectTarget(ctx *FlowContext, step *FlowStep) (string, error) {
 	raw := step.Redirect
+	// A target built from step values leaves out the app's declared
+	// blind-index columns (flows_respond_blind_index.go). A target the
+	// author wrote out is sent as written.
+	targetBuilt := beginFlowResponse(ctx)
 	target := strings.TrimSpace(interpolateCtx(raw, ctx))
+	if target != strings.TrimSpace(raw) {
+		target = flowResponseURL(ctx, target)
+	}
+	targetBuilt()
 	label := step.Name
 	if label == "" {
 		label = "redirect"

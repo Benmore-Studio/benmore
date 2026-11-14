@@ -4,3 +4,7 @@ before_update:
   requests:
     - sql: "SELECT 'an ordered request needs a purchase order number' AS error"
       when: "status = 'ordered' AND old_status = 'approved' AND coalesce(po_number, '') = ''"
+    # On every update old_<column> is the stored value: an edit may lower the
+    # amount of a request that left draft, never raise it.
+    - sql: "SELECT 'the amount of a submitted request cannot go up (it is ' || {{old_amount_cents}} || ')' AS error"
+      when: "old_status != 'draft' AND amount_cents > old_amount_cents"
